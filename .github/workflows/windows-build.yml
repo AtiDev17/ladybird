@@ -5,20 +5,17 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
-  workflow_dispatch: # Allows you to trigger the build manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build-windows:
-    # Note: If you have access to larger runners, change this to 'windows-latest-8-core' 
     runs-on: windows-latest
     
     env:
-      # Instruct vcpkg to use the native GitHub Actions cache backend
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-      # Instruct CMake (used under the hood by Ladybird) to use sccache
-      CMAKE_C_COMPILER_LAUNCHER: sccache
+      # We move away from x-gha and use standard caching
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
+      CMAKE_C_COMPILER_LAUNCHer: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
-      # Instruct sccache to use the native GitHub Actions cache backend
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -30,7 +27,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      # REQUIRED FOR VCPKG CACHE: Exposes the internal GitHub Actions cache tokens to vcpkg
+      # Expose GitHub Actions cache environment variables for sccache
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v7
         with:
@@ -38,27 +35,39 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      # REQUIRED FOR SCCACHE: Installs the mozilla sccache wrapper
+      # Setup sccache for Ladybird code compilation
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
-      # The build instructions specify that pkg-config is required for vcpkg to work on Windows
+      # MANUAL VCPKG CACHE: This is the critical fix.
+      # It saves the pre-compiled binaries for Qt6, ffmpeg, skia, etc.
+      - name: Restore vcpkg binary cache
+        id: cache-vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          # The key uses the hash of vcpkg.json so it updates when dependencies change
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json', 'Meta/CMake/vcpkg/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
       - name: Install dependencies
         run: |
           choco install pkgconfiglite -y
+          # Ensure the cache directory exists so vcpkg doesn't error out
+          if not exist "${{ github.workspace }}\vcpkg_cache" mkdir "${{ github.workspace }}\vcpkg_cache"
+        shell: cmd
 
-      # Ladybird requires a VS command prompt environment for the Clang-CL experimental build
       - name: Build Ladybird
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          # We pass the cache location to the build script
           py Meta\ladybird.py build
 
-      # Upload the compiled binaries as a downloadable artifact
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ladybird-windows-x64
-          # Adjust this path if Ladybird outputs the executable to a different specific folder
           path: Build/release/bin/
           retention-days: 14
