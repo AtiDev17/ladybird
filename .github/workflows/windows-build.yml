@@ -1,0 +1,42 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch: # Allows you to trigger the build manually from the Actions tab
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The build instructions specify that pkg-config is required for vcpkg to work on Windows
+      - name: Install dependencies
+        run: |
+          choco install pkgconfiglite -y
+
+      # Ladybird requires a VS command prompt environment for the Clang-CL experimental build
+      - name: Build Ladybird
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          py Meta\ladybird.py build
+
+      # Upload the compiled binaries as a downloadable artifact
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladybird-windows-x64
+          # Adjust this path if Ladybird outputs the executable to a different specific folder
+          path: Build/release/bin/
+          retention-days: 14
