@@ -50,6 +50,7 @@ jobs:
           key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json', 'Meta/CMake/vcpkg/vcpkg.json') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-
+          save-always: true
 
       - name: Install dependencies
         run: |
