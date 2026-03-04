@@ -25,7 +25,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Cleanly injects the MSVC C++ compiler environment into the runner
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -53,13 +52,27 @@ jobs:
       - name: Build Ladybird
         run: py Meta\ladybird.py build
 
-      # Stages the exe, dlls, and UI resources side-by-side so Ladybird can find them
+      # DYNAMIC PACKAGING: Automatically hunts down the UI resources so Ladybird doesn't crash on startup
       - name: Package Artifacts
         run: |
+          Write-Host "Creating packaging directories..."
           New-Item -ItemType Directory -Force -Path "ladybird-package\bin"
           New-Item -ItemType Directory -Force -Path "ladybird-package\share"
+          
+          Write-Host "Copying compiled executables..."
           Copy-Item -Path "Build\release\bin\*" -Destination "ladybird-package\bin\" -Recurse -Force
-          Copy-Item -Path "share\*" -Destination "ladybird-package\share\" -Recurse -Force
+          
+          Write-Host "Dynamically locating the resource folder..."
+          $shareDir = Get-ChildItem -Path . -Filter "share" -Recurse -Directory | Where-Object { Test-Path "$($_.FullName)\Lagom" } | Select-Object -First 1
+          
+          if ($shareDir) {
+              Write-Host "Found resources at: $($shareDir.FullName)"
+              Copy-Item -Path "$($shareDir.FullName)\*" -Destination "ladybird-package\share\" -Recurse -Force
+              Write-Host "Packaging successful."
+          } else {
+              Write-Host "ERROR: Could not find the resource folder. Ladybird will crash on startup."
+              exit 1
+          }
         shell: pwsh
 
       - name: Upload Artifacts
