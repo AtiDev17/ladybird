@@ -14,9 +14,8 @@ jobs:
     env:
       # We move away from x-gha and use standard caching
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
-      CMAKE_C_COMPILER_LAUNCHer: sccache
-      CMAKE_CXX_COMPILER_LAUNCHER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
     steps:
       - name: Checkout repository
@@ -27,17 +26,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Expose GitHub Actions cache environment variables for sccache
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v7
+      # Setup ccache as a drop-in replacement for sccache
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.14
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      # Setup sccache for Ladybird code compilation
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
+          key: ${{ runner.os }}-ccache
+          max-size: 2G # Adjust this based on your repository's needs
 
       # MANUAL VCPKG CACHE: This is the critical fix.
       # It saves the pre-compiled binaries for Qt6, ffmpeg, skia, etc.
