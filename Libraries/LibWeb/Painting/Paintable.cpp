@@ -16,6 +16,7 @@
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/DisplayListRecordingContext.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/StackingContext.h>
 
@@ -64,20 +65,6 @@ String Paintable::debug_description() const
     return MUST(String::formatted("{}({})", class_name(), layout_node().debug_description()));
 }
 
-void Paintable::resolve_paint_properties()
-{
-    auto const& cv = computed_values();
-    m_visible = cv.visibility() == CSS::Visibility::Visible && cv.opacity() != 0;
-
-    m_visible_for_hit_testing = true;
-    if (auto dom_node = this->dom_node(); dom_node && dom_node->is_inert()) {
-        // https://html.spec.whatwg.org/multipage/interaction.html#inert-subtrees
-        // When a node is inert:
-        // - Hit-testing must act as if the 'pointer-events' CSS property were set to 'none'.
-        m_visible_for_hit_testing = false;
-    }
-}
-
 DOM::Document const& Paintable::document() const
 {
     return layout_node().document();
@@ -105,7 +92,9 @@ CSS::ImmutableComputedValues const& Paintable::computed_values() const
 
 bool Paintable::visible_for_hit_testing() const
 {
-    return m_visible_for_hit_testing && computed_values().pointer_events() != CSS::PointerEvents::None;
+    if (auto node = dom_node(); node && node->is_inert())
+        return false;
+    return computed_values().pointer_events() != CSS::PointerEvents::None;
 }
 
 void Paintable::set_dom_node(GC::Ptr<DOM::Node> dom_node)
@@ -205,20 +194,13 @@ void Paintable::paint_inspector_overlay(DisplayListRecordingContext& context) co
     display_list_recorder.set_accumulated_visual_context({});
 }
 
-void Paintable::set_needs_display(InvalidateDisplayList should_invalidate_display_list)
+void Paintable::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
-    auto& document = this->document();
-    if (should_invalidate_display_list == InvalidateDisplayList::Yes)
-        document.invalidate_display_list();
-
-    auto* containing_block = this->containing_block();
-    if (!containing_block)
-        return;
-
-    if (!is<PaintableWithLines>(*containing_block))
-        return;
-    for (auto const& fragment : as<PaintableWithLines>(*containing_block).fragments())
-        document.set_needs_display(fragment.absolute_rect(), InvalidateDisplayList::No);
+    if (should_invalidate_display_list == InvalidateDisplayList::Yes) {
+        if (auto* containing_block = this->containing_block())
+            containing_block->invalidate_paint_cache();
+    }
+    document().set_needs_repaint(Badge<Painting::Paintable> {}, should_invalidate_display_list);
 }
 
 CSSPixelPoint Paintable::box_type_agnostic_position() const
@@ -289,18 +271,6 @@ Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, 
     }
 
     return radii_px;
-}
-
-void Paintable::set_needs_paint_only_properties_update(bool needs_update)
-{
-    if (needs_update == m_needs_paint_only_properties_update)
-        return;
-
-    m_needs_paint_only_properties_update = needs_update;
-
-    if (needs_update) {
-        document().set_needs_to_resolve_paint_only_properties();
-    }
 }
 
 // https://drafts.csswg.org/css-pseudo-4/#highlight-styling
@@ -379,6 +349,17 @@ Paintable::SelectionStyle Paintable::selection_style() const
     }
 
     return default_style;
+}
+
+void Paintable::set_selection_state(SelectionState state)
+{
+    if (m_selection_state == state)
+        return;
+    m_selection_state = state;
+    if (auto* box = as_if<PaintableBox>(this))
+        box->invalidate_paint_cache();
+    else if (auto* containing_block = this->containing_block())
+        containing_block->invalidate_paint_cache();
 }
 
 void Paintable::scroll_ancestor_to_offset_into_view(size_t offset)

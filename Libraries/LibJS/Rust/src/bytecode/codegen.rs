@@ -3501,12 +3501,13 @@ fn generate_update_expression(
                     let key = generator.intern_property_key(&property_ident.name);
                     let result = emit_update_op(generator, op, prefixed, &value);
                     let cache2 = generator.next_property_lookup_cache();
-                    generator.emit(Instruction::PutNormalById {
+                    generator.emit(Instruction::PutById {
                         base: base.operand(),
                         property: key,
                         src: value.operand(),
                         cache_index: cache2,
                         base_identifier: None,
+                        kind: 0,
                     });
                     Some(result)
                 } else if let ExpressionKind::PrivateIdentifier(priv_ident) = &property.inner {
@@ -3565,6 +3566,9 @@ fn generate_assignment_expression(
                     generator.pending_lhs_name = Some(generator.intern_identifier(&ident.name));
                     let rhs_val = generate_expression(rhs, generator, None)?;
                     generator.pending_lhs_name = None;
+                    if ident.is_local() {
+                        emit_tdz_check_if_needed(generator, ident);
+                    }
                     emit_set_variable(generator, ident, &rhs_val);
                     return Some(rhs_val);
                 }
@@ -3832,12 +3836,13 @@ fn generate_assignment_expression(
                         generator.emit_mov(&dst, &rhs_val);
                         let key = generator.intern_property_key(&ident.name);
                         let cache2 = generator.next_property_lookup_cache();
-                        generator.emit(Instruction::PutNormalById {
+                        generator.emit(Instruction::PutById {
                             base: base.operand(),
                             property: key,
                             src: dst.operand(),
                             cache_index: cache2,
                             base_identifier: None,
+                            kind: 0,
                         });
                         generator.emit(Instruction::Jump { target: end_block });
                         generator.switch_to_basic_block(lhs_block);
@@ -3851,12 +3856,13 @@ fn generate_assignment_expression(
                     emit_compound_assignment(generator, op, &dst, &old_val, &rhs_val);
                     let key = generator.intern_property_key(&ident.name);
                     let cache2 = generator.next_property_lookup_cache();
-                    generator.emit(Instruction::PutNormalById {
+                    generator.emit(Instruction::PutById {
                         base: base.operand(),
                         property: key,
                         src: dst.operand(),
                         cache_index: cache2,
                         base_identifier: None,
+                        kind: 0,
                     });
                     return Some(dst);
                 } else if let ExpressionKind::PrivateIdentifier(priv_ident) = &property.inner {
@@ -3985,12 +3991,13 @@ fn emit_super_put(
     } else if let ExpressionKind::Identifier(ident) = &property.inner {
         let key = generator.intern_property_key(&ident.name);
         let cache = generator.next_property_lookup_cache();
-        generator.emit(Instruction::PutNormalByIdWithThis {
+        generator.emit(Instruction::PutByIdWithThis {
             base: base.operand(),
             this_value: this_value.operand(),
             property: key,
             src: value.operand(),
             cache_index: cache,
+            kind: 0,
         });
     }
 }
@@ -4177,20 +4184,22 @@ fn emit_put_normal_by_value(
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         let cache = generator.next_property_lookup_cache();
-        generator.emit(Instruction::PutNormalById {
+        generator.emit(Instruction::PutById {
             base: base.operand(),
             property: key,
             src: src.operand(),
             cache_index: cache,
             base_identifier,
+            kind: 0,
         });
         return;
     }
-    generator.emit(Instruction::PutNormalByValue {
+    generator.emit(Instruction::PutByValue {
         base: base.operand(),
         property: property.operand(),
         src: src.operand(),
         base_identifier,
+        kind: 0,
     });
 }
 
@@ -4204,20 +4213,22 @@ fn emit_put_normal_by_value_with_this(
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         let cache = generator.next_property_lookup_cache();
-        generator.emit(Instruction::PutNormalByIdWithThis {
+        generator.emit(Instruction::PutByIdWithThis {
             base: base.operand(),
             this_value: this_value.operand(),
             property: key,
             src: src.operand(),
             cache_index: cache,
+            kind: 0,
         });
         return;
     }
-    generator.emit(Instruction::PutNormalByValueWithThis {
+    generator.emit(Instruction::PutByValueWithThis {
         base: base.operand(),
         property: property.operand(),
         this_value: this_value.operand(),
         src: src.operand(),
+        kind: 0,
     });
 }
 
@@ -4239,30 +4250,33 @@ fn emit_put_by_value(
         let cache = generator.next_property_lookup_cache();
         match kind {
             PutKind::Own => {
-                generator.emit(Instruction::PutOwnById {
+                generator.emit(Instruction::PutById {
                     base: base.operand(),
                     property: key,
                     src: src.operand(),
                     cache_index: cache,
                     base_identifier: None,
+                    kind: 4,
                 });
             }
             PutKind::Getter => {
-                generator.emit(Instruction::PutGetterById {
+                generator.emit(Instruction::PutById {
                     base: base.operand(),
                     property: key,
                     src: src.operand(),
                     cache_index: cache,
                     base_identifier: None,
+                    kind: 1,
                 });
             }
             PutKind::Setter => {
-                generator.emit(Instruction::PutSetterById {
+                generator.emit(Instruction::PutById {
                     base: base.operand(),
                     property: key,
                     src: src.operand(),
                     cache_index: cache,
                     base_identifier: None,
+                    kind: 2,
                 });
             }
         }
@@ -4270,29 +4284,58 @@ fn emit_put_by_value(
     }
     match kind {
         PutKind::Own => {
-            generator.emit(Instruction::PutOwnByValue {
+            generator.emit(Instruction::PutByValue {
                 base: base.operand(),
                 property: property.operand(),
                 src: src.operand(),
                 base_identifier: None,
+                kind: 4,
             });
         }
         PutKind::Getter => {
-            generator.emit(Instruction::PutGetterByValue {
+            generator.emit(Instruction::PutByValue {
                 base: base.operand(),
                 property: property.operand(),
                 src: src.operand(),
                 base_identifier: None,
+                kind: 1,
             });
         }
         PutKind::Setter => {
-            generator.emit(Instruction::PutSetterByValue {
+            generator.emit(Instruction::PutByValue {
                 base: base.operand(),
                 property: property.operand(),
                 src: src.operand(),
                 base_identifier: None,
+                kind: 2,
             });
         }
+    }
+}
+
+/// Emit a ThrowIfTDZ check for a local identifier if needed, matching C++
+/// Generator::emit_tdz_check_if_needed. This is used before assigning to a
+/// variable to ensure TDZ semantics for let/const bindings.
+fn emit_tdz_check_if_needed(generator: &mut Generator, ident: &Identifier) {
+    if !ident.is_local() {
+        return;
+    }
+    let local_index = ident.local_index.get();
+    let needs_tdz_check = if ident.local_type.get() == Some(LocalType::Argument) {
+        !generator.is_argument_initialized(local_index)
+    } else {
+        generator.is_local_lexically_declared(local_index)
+            && !generator.is_local_initialized(local_index)
+    };
+    if needs_tdz_check {
+        let local = generator.resolve_local(local_index, ident.local_type.get().unwrap());
+        if ident.local_type.get() == Some(LocalType::Argument) {
+            let empty = generator.add_constant_empty();
+            generator.emit_mov(&local, &empty);
+        }
+        generator.emit(Instruction::ThrowIfTDZ {
+            src: local.operand(),
+        });
     }
 }
 
@@ -4354,12 +4397,13 @@ fn emit_put_to_member(
     } else if let ExpressionKind::Identifier(ident) = &property.inner {
         let key = generator.intern_property_key(&ident.name);
         let cache = generator.next_property_lookup_cache();
-        generator.emit(Instruction::PutNormalById {
+        generator.emit(Instruction::PutById {
             base: base.operand(),
             property: key,
             src: value.operand(),
             cache_index: cache,
             base_identifier: base_id,
+            kind: 0,
         });
     } else if let ExpressionKind::PrivateIdentifier(priv_ident) = &property.inner {
         let id = generator.intern_identifier(&priv_ident.name);
@@ -4604,12 +4648,13 @@ fn emit_store_to_evaluated_reference(
             cache,
             base_identifier,
         } => {
-            generator.emit(Instruction::PutNormalById {
+            generator.emit(Instruction::PutById {
                 base: base.operand(),
                 property: *property,
                 src: value.operand(),
                 cache_index: *cache,
                 base_identifier: *base_identifier,
+                kind: 0,
             });
         }
         EvaluatedReference::PrivateMember { base, property } => {
@@ -4632,12 +4677,13 @@ fn emit_store_to_evaluated_reference(
             cache,
             this_value,
         } => {
-            generator.emit(Instruction::PutNormalByIdWithThis {
+            generator.emit(Instruction::PutByIdWithThis {
                 base: base.operand(),
                 this_value: this_value.operand(),
                 property: *property,
                 src: value.operand(),
                 cache_index: *cache,
+                kind: 0,
             });
         }
     }
@@ -5360,12 +5406,13 @@ fn generate_object_expression(
                         }
                     };
                     let cache = generator.next_property_lookup_cache();
-                    generator.emit(Instruction::PutOwnById {
+                    generator.emit(Instruction::PutById {
                         base: dst.operand(),
                         property: property_key,
                         src: value.operand(),
                         cache_index: cache,
                         base_identifier: None,
+                        kind: 4,
                     });
                 }
             }
@@ -5400,12 +5447,13 @@ fn generate_object_expression(
             ObjectPropertyType::ProtoSetter => {
                 let key = generator.intern_property_key(utf16!("__proto__"));
                 let cache = generator.next_property_lookup_cache();
-                generator.emit(Instruction::PutPrototypeById {
+                generator.emit(Instruction::PutById {
                     base: dst.operand(),
                     property: key,
                     src: value.operand(),
                     cache_index: cache,
                     base_identifier: None,
+                    kind: 3,
                 });
             }
         }
@@ -5433,11 +5481,12 @@ fn emit_object_property_set_by_key(
 ) {
     if is_computed {
         let key_val = generate_expression_or_undefined(key, generator, None);
-        generator.emit(Instruction::PutOwnByValue {
+        generator.emit(Instruction::PutByValue {
             base: object.operand(),
             property: key_val.operand(),
             src: value.operand(),
             base_identifier: None,
+            kind: 4,
         });
         return;
     }
@@ -5464,21 +5513,23 @@ fn emit_object_property_set_by_key(
         }
         ExpressionKind::NumericLiteral(n) => {
             let key_val = generator.add_constant_number(*n);
-            generator.emit(Instruction::PutOwnByValue {
+            generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
+                kind: 4,
             });
         }
         _ => {
             // Computed key
             let key_val = generate_expression_or_undefined(key, generator, None);
-            generator.emit(Instruction::PutOwnByValue {
+            generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
+                kind: 4,
             });
         }
     }
@@ -5497,20 +5548,22 @@ fn emit_object_accessor_by_key(
         let property_key = generator.intern_property_key(name);
         let cache = generator.next_property_lookup_cache();
         if is_getter {
-            generator.emit(Instruction::PutGetterById {
+            generator.emit(Instruction::PutById {
                 base: object.operand(),
                 property: property_key,
                 src: value.operand(),
                 cache_index: cache,
                 base_identifier: None,
+                kind: 1,
             });
         } else {
-            generator.emit(Instruction::PutSetterById {
+            generator.emit(Instruction::PutById {
                 base: object.operand(),
                 property: property_key,
                 src: value.operand(),
                 cache_index: cache,
                 base_identifier: None,
+                kind: 2,
             });
         }
     };
@@ -5518,18 +5571,20 @@ fn emit_object_accessor_by_key(
     let emit_by_value = |generator: &mut Generator, key: &Expression| {
         let key_val = generate_expression_or_undefined(key, generator, None);
         if is_getter {
-            generator.emit(Instruction::PutGetterByValue {
+            generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
+                kind: 1,
             });
         } else {
-            generator.emit(Instruction::PutSetterByValue {
+            generator.emit(Instruction::PutByValue {
                 base: object.operand(),
                 property: key_val.operand(),
                 src: value.operand(),
                 base_identifier: None,
+                kind: 2,
             });
         }
     };

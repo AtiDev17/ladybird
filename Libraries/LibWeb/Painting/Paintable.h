@@ -63,7 +63,11 @@ public:
 
     void detach_from_layout_node();
 
-    [[nodiscard]] bool is_visible() const { return m_visible; }
+    [[nodiscard]] bool is_visible() const
+    {
+        auto const& cv = computed_values();
+        return cv.visibility() == CSS::Visibility::Visible && cv.opacity() != 0;
+    }
     [[nodiscard]] bool is_positioned() const { return m_positioned; }
     [[nodiscard]] bool is_fixed_position() const { return m_fixed_position; }
     [[nodiscard]] bool is_sticky_position() const { return m_sticky_position; }
@@ -111,9 +115,7 @@ public:
 
     GC::Ptr<HTML::Navigable> navigable() const;
 
-    virtual void set_needs_display(InvalidateDisplayList = InvalidateDisplayList::Yes);
-    void set_needs_paint_only_properties_update(bool);
-    [[nodiscard]] bool needs_paint_only_properties_update() const { return m_needs_paint_only_properties_update; }
+    virtual void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
 
     PaintableBox* containing_block() const;
 
@@ -146,7 +148,7 @@ public:
     };
 
     SelectionState selection_state() const { return m_selection_state; }
-    void set_selection_state(SelectionState state) { m_selection_state = state; }
+    void set_selection_state(SelectionState state);
 
     // https://drafts.csswg.org/css-pseudo-4/#highlight-styling
     struct TextDecorationStyle {
@@ -166,8 +168,6 @@ public:
         }
     };
     [[nodiscard]] SelectionStyle selection_style() const;
-
-    MUST_UPCALL virtual void resolve_paint_properties();
 
     [[nodiscard]] String debug_description() const;
 
@@ -196,13 +196,7 @@ private:
     bool m_absolutely_positioned : 1 { false };
     bool m_floating : 1 { false };
     bool m_inline : 1 { false };
-    bool m_visible : 1 { true };
-    bool m_visible_for_hit_testing : 1 { true };
-
     CSS::Display m_display;
-
-protected:
-    bool m_needs_paint_only_properties_update : 1 { true };
 };
 
 inline DOM::Node* HitTestResult::dom_node()

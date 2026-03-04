@@ -127,6 +127,15 @@ public:
 
     u32 passed_argument_count { 0 };
 
+    // Non-standard: Inline frame linkage for the bytecode interpreter.
+    // When a JS-to-JS call is inlined in the dispatch loop, these fields
+    // allow the Return handler to restore the caller's frame.
+    ExecutionContext* caller_frame { nullptr };
+    u32 caller_return_pc { 0 };
+    GC::Ptr<Bytecode::Executable> caller_executable;
+    u32 caller_dst_raw { 0 };
+    bool caller_is_construct { false };
+
 private:
     friend class Bytecode::Interpreter;
 
@@ -139,29 +148,6 @@ private:
 };
 
 static_assert(IsTriviallyDestructible<ExecutionContext>);
-
-#define ALLOCATE_EXECUTION_CONTEXT_ON_NATIVE_STACK_WITHOUT_CLEARING_ARGS(execution_context, \
-    registers_and_locals_count,                                                             \
-    constants_count,                                                                        \
-    arguments_count)                                                                        \
-    auto execution_context_size = sizeof(JS::ExecutionContext)                              \
-        + (((registers_and_locals_count) + (constants_count) + (arguments_count))           \
-            * sizeof(JS::Value));                                                           \
-                                                                                            \
-    void* execution_context_memory = alloca(execution_context_size);                        \
-                                                                                            \
-    execution_context = new (execution_context_memory)                                      \
-        JS::ExecutionContext((registers_and_locals_count), (constants_count), (arguments_count));
-
-#define ALLOCATE_EXECUTION_CONTEXT_ON_NATIVE_STACK(execution_context, registers_and_locals_count, \
-    constants_count, arguments_count)                                                             \
-    ALLOCATE_EXECUTION_CONTEXT_ON_NATIVE_STACK_WITHOUT_CLEARING_ARGS(execution_context,           \
-        registers_and_locals_count, constants_count, arguments_count);                            \
-    do {                                                                                          \
-        for (size_t i = 0; i < execution_context->arguments.size(); i++) {                        \
-            execution_context->arguments[i] = JS::js_undefined();                                 \
-        }                                                                                         \
-    } while (0)
 
 struct StackTraceElement {
     ExecutionContext* execution_context { nullptr };

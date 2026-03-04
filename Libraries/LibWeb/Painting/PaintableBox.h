@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/CSS/StyleValues/GridTrackSizeListStyleValue.h>
 #include <LibWeb/Forward.h>
@@ -16,6 +17,7 @@
 #include <LibWeb/Painting/BoxModelMetrics.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/DisplayList.h>
+#include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintableFragment.h>
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
@@ -24,6 +26,7 @@
 namespace Web::Painting {
 
 WEB_API void set_paint_viewport_scrollbars(bool enabled);
+ResolvedCSSFilter resolve_css_filter(CSS::Filter const& computed_filter, PaintableBox const& paintable_box);
 
 class WEB_API PaintableBox : public Paintable {
     GC_CELL(PaintableBox, Paintable);
@@ -144,7 +147,7 @@ public:
 
     void set_overflow_data(OverflowData data) { m_overflow_data = move(data); }
 
-    virtual void set_needs_display(InvalidateDisplayList = InvalidateDisplayList::Yes) override;
+    virtual void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes) override;
 
     [[nodiscard]] virtual TraversalDecision hit_test(CSSPixelPoint position, HitTestType type, Function<TraversalDecision(HitTestResult)> const& callback) const override;
     Optional<HitTestResult> hit_test(CSSPixelPoint, HitTestType) const;
@@ -194,30 +197,19 @@ public:
 
     BorderRadiiData normalized_border_radii_data(ShrinkRadiiForBorders shrink = ShrinkRadiiForBorders::No) const;
 
-    BorderRadiiData const& border_radii_data() const { return m_border_radii_data; }
-    void set_border_radii_data(BorderRadiiData const& border_radii_data) { m_border_radii_data = border_radii_data; }
+    BorderRadiiData border_radii_data() const;
 
-    void set_box_shadow_data(Vector<ShadowData> box_shadow_data) { m_box_shadow_data = move(box_shadow_data); }
-    Vector<ShadowData> const& box_shadow_data() const { return m_box_shadow_data; }
-
-    void set_outline_data(Optional<BordersData> outline_data) { m_outline_data = outline_data; }
-    Optional<BordersData> const& outline_data() const { return m_outline_data; }
-
-    void set_outline_offset(CSSPixels outline_offset) { m_outline_offset = outline_offset; }
-    CSSPixels outline_offset() const { return m_outline_offset; }
+    Optional<BordersData> outline_data() const;
+    CSSPixels outline_offset() const;
 
     void set_filter(ResolvedCSSFilter filter) { m_filter = move(filter); }
     ResolvedCSSFilter const& filter() const { return m_filter; }
-
-    void set_backdrop_filter(ResolvedCSSFilter backdrop_filter) { m_backdrop_filter = move(backdrop_filter); }
-    ResolvedCSSFilter const& backdrop_filter() const { return m_backdrop_filter; }
 
     Optional<CSSPixelRect> get_clip_rect() const;
 
     virtual bool wants_mouse_events() const override;
 
     CSSPixelRect transform_reference_box() const;
-    virtual void resolve_paint_properties() override;
 
     RefPtr<ScrollFrame const> nearest_scroll_frame() const;
 
@@ -242,6 +234,25 @@ public:
     [[nodiscard]] auto accumulated_visual_context() const { return m_accumulated_visual_context; }
     void set_accumulated_visual_context_for_descendants(auto state) { m_accumulated_visual_context_for_descendants = move(state); }
     [[nodiscard]] auto accumulated_visual_context_for_descendants() const { return m_accumulated_visual_context_for_descendants; }
+
+    static constexpr size_t paint_phase_count = to_underlying(PaintPhase::Overlay) + 1;
+
+    void invalidate_paint_cache() const { m_cached_phase_commands = {}; }
+
+    bool has_cached_commands(PaintPhase phase) const
+    {
+        return m_cached_phase_commands[to_underlying(phase)].has_value();
+    }
+
+    Vector<DisplayListCommand> const& cached_commands(PaintPhase phase) const
+    {
+        return m_cached_phase_commands[to_underlying(phase)].value();
+    }
+
+    void set_cached_commands(PaintPhase phase, Vector<DisplayListCommand> commands) const
+    {
+        m_cached_phase_commands[to_underlying(phase)] = move(commands);
+    }
 
     [[nodiscard]] RefPtr<ScrollFrame const> enclosing_scroll_frame() const { return m_enclosing_scroll_frame; }
     [[nodiscard]] Optional<int> scroll_frame_id() const;
@@ -319,13 +330,7 @@ private:
     Optional<BordersDataWithElementKind> m_override_borders_data;
     Optional<TableCellCoordinates> m_table_cell_coordinates;
 
-    BorderRadiiData m_border_radii_data;
-    Vector<ShadowData> m_box_shadow_data;
-    Optional<BordersData> m_outline_data;
-    CSSPixels m_outline_offset { 0 };
-
     ResolvedCSSFilter m_filter;
-    ResolvedCSSFilter m_backdrop_filter;
 
     Optional<CSSPixels> m_scroll_thumb_grab_position;
     Optional<ScrollDirection> m_scroll_thumb_dragging_direction;
@@ -333,14 +338,14 @@ private:
     mutable bool m_draw_enlarged_vertical_scrollbar { false };
     bool m_has_non_invertible_css_transform { false };
 
-    ResolvedBackground m_resolved_background;
-
     OwnPtr<StickyInsets> m_sticky_insets;
 
     RefPtr<CSS::GridTrackSizeListStyleValue const> m_used_values_for_grid_template_columns;
     RefPtr<CSS::GridTrackSizeListStyleValue const> m_used_values_for_grid_template_rows;
 
     BoxModelMetrics m_box_model;
+
+    mutable Array<Optional<Vector<DisplayListCommand>>, paint_phase_count> m_cached_phase_commands;
 };
 
 }

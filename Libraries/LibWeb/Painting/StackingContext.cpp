@@ -31,9 +31,28 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
 {
     TemporaryChange save_nesting_level(context.display_list_recorder().m_save_nesting_level, 0);
 
-    if (auto const* paintable_box = as_if<PaintableBox>(paintable))
-        context.display_list_recorder().set_accumulated_visual_context(paintable_box->accumulated_visual_context());
-    paintable.paint(context, phase);
+    auto const* paintable_box = as_if<PaintableBox>(paintable);
+
+    if (paintable_box) {
+        // Text fragments in a PaintableWithLines are content of the block container.
+        // They need the descendants' visual context, not the element's own visual context.
+        if (is<PaintableWithLines>(paintable) && phase == PaintPhase::Foreground)
+            context.display_list_recorder().set_accumulated_visual_context(paintable_box->accumulated_visual_context_for_descendants());
+        else
+            context.display_list_recorder().set_accumulated_visual_context(paintable_box->accumulated_visual_context());
+    }
+
+    bool const skip_cache = !paintable_box || context.should_show_line_box_borders();
+    if (!skip_cache && paintable_box->has_cached_commands(phase)) {
+        context.display_list_recorder().replay_cached_commands(paintable_box->cached_commands(phase));
+    } else if (!skip_cache) {
+        auto capture = context.display_list_recorder().begin_command_capture();
+        paintable.paint(context, phase);
+        paintable_box->set_cached_commands(phase, capture.take());
+    } else {
+        paintable.paint(context, phase);
+    }
+
     context.display_list_recorder().set_accumulated_visual_context({});
 
     VERIFY(context.display_list_recorder().m_save_nesting_level == 0);
@@ -299,6 +318,10 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
 
     auto const& computed_values = paintable_box().computed_values();
     auto mask_image = computed_values.mask_image();
+
+    if (mask_image) {
+        mask_image->resolve_for_size(paintable_box().layout_node_with_style_and_box_metrics(), paintable_box().absolute_padding_box_rect().size());
+    }
 
     auto effective_state = paintable_box().accumulated_visual_context();
     context.display_list_recorder().set_accumulated_visual_context(effective_state);
