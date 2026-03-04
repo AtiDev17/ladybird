@@ -1142,7 +1142,11 @@ pub fn generate_statement(
             expression,
             field_name,
         } => {
-            generator.pending_lhs_name = Some(generator.intern_identifier(field_name));
+            // Only set pending_lhs_name for compile-time-known keys (non-empty names).
+            // For computed keys, field_name is empty and the name is set at runtime.
+            if !field_name.is_empty() {
+                generator.pending_lhs_name = Some(generator.intern_identifier(field_name));
+            }
             let value = generate_expression_or_undefined(expression, generator, None);
             generator.pending_lhs_name = None;
             generator.emit(Instruction::Return {
@@ -3867,10 +3871,11 @@ fn generate_assignment_expression(
                         let rhs_block = generator.make_block();
                         let lhs_block = generator.make_block();
                         let end_block = generator.make_block();
-                        let dst = choose_dst(generator, preferred_dst);
                         emit_logical_jump(generator, op, &old_val, rhs_block, lhs_block);
                         generator.switch_to_basic_block(rhs_block);
                         let rhs_val = generate_expression(rhs, generator, None)?;
+                        // Allocate dst after RHS evaluation to match C++ register order.
+                        let dst = choose_dst(generator, preferred_dst);
                         generator.emit_mov(&dst, &rhs_val);
                         let id2 = generator.intern_identifier(&priv_ident.name);
                         generator.emit(Instruction::PutPrivateById {
@@ -4294,48 +4299,22 @@ fn emit_put_by_value(
 fn emit_set_variable(generator: &mut Generator, ident: &Identifier, value: &ScopedOperand) {
     if ident.is_local() {
         if ident.declaration_kind.get() == Some(DeclarationKind::Const) {
-            // Emit TDZ check before const assignment error, matching C++ which
-            // calls emit_tdz_check_if_needed() in the caller before emit_set_variable().
-            let local_index = ident.local_index.get();
-            let needs_tdz = if ident.local_type.get() == Some(LocalType::Argument) {
-                !generator.is_argument_initialized(local_index)
-            } else {
-                generator.is_local_lexically_declared(local_index)
-                    && !generator.is_local_initialized(local_index)
-            };
-            if needs_tdz {
-                let local = generator.resolve_local(local_index, ident.local_type.get().unwrap());
-                generator.emit(Instruction::ThrowIfTDZ {
-                    src: local.operand(),
-                });
-            }
+            // The caller is responsible for emitting ThrowIfTDZ before calling
+            // emit_set_variable(), matching the C++ pipeline behavior.
             generator.emit(Instruction::ThrowConstAssignment {});
             return;
         }
         let local_index = ident.local_index.get();
         let local = generator.resolve_local(local_index, ident.local_type.get().unwrap());
-        // Match C++ emit_set_variable: skip self-move entirely (no TDZ check needed
-        // either, since the value was already read with a TDZ check at the use site).
+        // Match C++ emit_set_variable: skip self-move entirely.
         let is_variable_self_move = ident.local_type.get() == Some(LocalType::Variable)
             && value.operand().is_local()
             && value.operand().index() == local_index;
         if is_variable_self_move {
             return;
         }
-        // TDZ check: throw ReferenceError if assigning to an uninitialized let/const binding.
-        // For arguments, check argument initialization tracking.
-        // For variables, check is_lexically_declared && !is_initialized.
-        let needs_tdz = if ident.local_type.get() == Some(LocalType::Argument) {
-            !generator.is_argument_initialized(local_index)
-        } else {
-            generator.is_local_lexically_declared(local_index)
-                && !generator.is_local_initialized(local_index)
-        };
-        if needs_tdz {
-            generator.emit(Instruction::ThrowIfTDZ {
-                src: local.operand(),
-            });
-        }
+        // No TDZ check here: the caller is responsible for checking TDZ
+        // before calling emit_set_variable(), matching C++ pipeline behavior.
         generator.emit(Instruction::Mov {
             dst: local.operand(),
             src: value.operand(),
@@ -4518,18 +4497,34 @@ fn emit_evaluate_member_reference(
     } = &target.inner
     {
         let is_super = matches!(object.inner, ExpressionKind::Super);
-        let base = generate_expression_or_undefined(object, generator, None);
 
         if is_super {
+            // Match C++ order: ResolveThisBinding first, then ResolveSuperBase.
             let this_value = emit_resolve_this_binding(generator);
+            let base = generator.allocate_register();
+            generator.emit(Instruction::ResolveSuperBase {
+                dst: base.operand(),
+            });
             if *computed {
                 let property = generate_expression_or_undefined(property, generator, None);
-                let saved_property = generator.allocate_register();
-                generator.emit_mov(&saved_property, &property);
-                EvaluatedReference::SuperMember {
-                    base,
-                    property: saved_property,
-                    this_value,
+                // If the computed property is a constant string (e.g. super["minutes"]),
+                // optimize to SuperMemberId to match the C++ pipeline.
+                if let Some(key) = generator.try_constant_string_to_property_key(&property) {
+                    let cache = generator.next_property_lookup_cache();
+                    EvaluatedReference::SuperMemberId {
+                        base,
+                        property: key,
+                        cache,
+                        this_value,
+                    }
+                } else {
+                    let saved_property = generator.allocate_register();
+                    generator.emit_mov(&saved_property, &property);
+                    EvaluatedReference::SuperMember {
+                        base,
+                        property: saved_property,
+                        this_value,
+                    }
                 }
             } else if let ExpressionKind::Identifier(ident) = &property.inner {
                 let key = generator.intern_property_key(&ident.name);
@@ -4543,29 +4538,46 @@ fn emit_evaluate_member_reference(
             } else {
                 unreachable!("non-computed super member property must be an identifier")
             }
-        } else if *computed {
-            let property = generate_expression_or_undefined(property, generator, None);
-            let saved_property = generator.allocate_register();
-            generator.emit_mov(&saved_property, &property);
-            EvaluatedReference::Member {
-                base,
-                property: saved_property,
-                base_identifier: None,
-            }
-        } else if let ExpressionKind::Identifier(ident) = &property.inner {
-            let key = generator.intern_property_key(&ident.name);
-            let cache = generator.next_property_lookup_cache();
-            EvaluatedReference::MemberId {
-                base,
-                property: key,
-                cache,
-                base_identifier: None,
-            }
-        } else if let ExpressionKind::PrivateIdentifier(priv_ident) = &property.inner {
-            let id = generator.intern_identifier(&priv_ident.name);
-            EvaluatedReference::PrivateMember { base, property: id }
         } else {
-            unreachable!("non-computed member property must be an identifier or private identifier")
+            let base = generate_expression_or_undefined(object, generator, None);
+            if *computed {
+                let property = generate_expression_or_undefined(property, generator, None);
+                // If the computed property is a constant string (e.g. obj["key"]),
+                // optimize to MemberId to match the C++ pipeline.
+                if let Some(key) = generator.try_constant_string_to_property_key(&property) {
+                    let cache = generator.next_property_lookup_cache();
+                    EvaluatedReference::MemberId {
+                        base,
+                        property: key,
+                        cache,
+                        base_identifier: None,
+                    }
+                } else {
+                    let saved_property = generator.allocate_register();
+                    generator.emit_mov(&saved_property, &property);
+                    EvaluatedReference::Member {
+                        base,
+                        property: saved_property,
+                        base_identifier: None,
+                    }
+                }
+            } else if let ExpressionKind::Identifier(ident) = &property.inner {
+                let key = generator.intern_property_key(&ident.name);
+                let cache = generator.next_property_lookup_cache();
+                EvaluatedReference::MemberId {
+                    base,
+                    property: key,
+                    cache,
+                    base_identifier: None,
+                }
+            } else if let ExpressionKind::PrivateIdentifier(priv_ident) = &property.inner {
+                let id = generator.intern_identifier(&priv_ident.name);
+                EvaluatedReference::PrivateMember { base, property: id }
+            } else {
+                unreachable!(
+                    "non-computed member property must be an identifier or private identifier"
+                )
+            }
         }
     } else {
         unreachable!("emit_evaluate_member_reference called on non-member expression")
@@ -4641,10 +4653,13 @@ fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value
             property,
             computed,
         } => {
-            let is_super = matches!(object.inner, ExpressionKind::Super);
-            let base = generate_expression_or_undefined(object, generator, None);
-            if is_super {
+            if matches!(object.inner, ExpressionKind::Super) {
+                // Match C++ order: ResolveThisBinding first, then ResolveSuperBase.
                 let this_value = emit_resolve_this_binding(generator);
+                let base = generator.allocate_register();
+                generator.emit(Instruction::ResolveSuperBase {
+                    dst: base.operand(),
+                });
                 emit_super_put(
                     generator,
                     &base,
@@ -4655,6 +4670,7 @@ fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value
                     None,
                 );
             } else {
+                let base = generate_expression_or_undefined(object, generator, None);
                 emit_put_to_member(generator, &base, property, *computed, value, None);
             }
         }
@@ -5718,8 +5734,8 @@ fn generate_arguments_array(
         element_count: u32_from_usize(arg_ops.len()),
         elements: arg_ops,
     });
-    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-    drop(arg_holders);
+    // NB: arg_holders stays alive until function return, matching C++ where
+    // the args Vector keeps registers held through the spread arguments loop.
 
     for argument in &arguments[first_spread..] {
         let val = generate_expression_or_undefined(&argument.value, generator, None);
@@ -5730,6 +5746,7 @@ fn generate_arguments_array(
         });
     }
 
+    drop(arg_holders);
     dst
 }
 
@@ -5748,9 +5765,12 @@ fn generate_class_expression(
     preferred_dst: Option<&ScopedOperand>,
 ) -> Option<ScopedOperand> {
     let has_super = data.super_class.is_some();
+    // Always consume pending_lhs_name. Named classes don't use it, but we
+    // must clear it to prevent it from leaking to nested expressions.
     let lhs_name = if data.name.is_none() {
         generator.pending_lhs_name.take()
     } else {
+        generator.pending_lhs_name = None;
         None
     };
 
@@ -8415,6 +8435,15 @@ fn needs_block_declaration_instantiation(scope: &ScopeData) -> bool {
                     && !name_ident.is_local()
                 {
                     return true;
+                }
+            }
+            StatementKind::UsingDeclaration { declarations } => {
+                for declaration in declarations {
+                    let mut names = Vec::new();
+                    collect_target_names(&declaration.target, &mut names);
+                    if !names.is_empty() {
+                        return true;
+                    }
                 }
             }
             _ => {}
