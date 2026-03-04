@@ -12,6 +12,7 @@ jobs:
     runs-on: windows-latest
     
     env:
+      # We move away from x-gha and use standard caching
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -25,14 +26,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Setup ccache as a drop-in replacement for sccache
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2.14
         with:
           key: ${{ runner.os }}-ccache
           # Increased to 10G to prevent cache eviction thrashing for Ladybird
-          max-size: 10G
+          max-size: 10G 
 
-      # IMPROVEMENT: Use actions/cache/restore instead of standard actions/cache
+      # MANUAL VCPKG CACHE (RESTORE):
       - name: Restore vcpkg binary cache
         id: cache-vcpkg-restore
         uses: actions/cache/restore@v4
@@ -45,6 +47,7 @@ jobs:
       - name: Install dependencies
         run: |
           choco install pkgconfiglite -y
+          # Ensure the cache directory exists so vcpkg doesn't error out
           if not exist "${{ github.workspace }}\vcpkg_cache" mkdir "${{ github.workspace }}\vcpkg_cache"
         shell: cmd
 
@@ -52,6 +55,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          # We pass the cache location to the build script
           py Meta\ladybird.py build
 
       - name: Upload Artifacts
@@ -61,12 +65,12 @@ jobs:
           path: Build/release/bin/
           retention-days: 14
 
-      # IMPROVEMENT: Explicitly save the vcpkg cache at the very end
-      # `if: always()` ensures this runs even if the compilation step fails
+      # MANUAL VCPKG CACHE (SAVE):
+      # Runs even if the build fails, so partial vcpkg builds are saved
       - name: Save vcpkg binary cache
         uses: actions/cache/save@v4
         if: always()
         with:
           path: ${{ github.workspace }}/vcpkg_cache
-          # Re-use the key evaluated during the restore step
+          # Re-use the exact key evaluated during the restore step
           key: ${{ steps.cache-vcpkg-restore.outputs.cache-primary-key }}
