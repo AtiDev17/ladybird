@@ -1,0 +1,74 @@
+name: Windows Build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Restore vcpkg binary cache
+        id: cache-vcpkg
+        uses: actions/cache@v5.0.3
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
+      - name: Restore sccache
+        uses: actions/cache@v5.0.3
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ runner.os }}-sccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          choco install pkgconfiglite -y
+          
+          if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) {
+              New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache"
+          }
+          if (!(Test-Path "${{ github.workspace }}/.sccache")) {
+              New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/.sccache"
+          }
+
+      - name: Build Ladybird
+        shell: pwsh
+        run: |
+          python Meta/ladybird.py build
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-windows-x64
+          path: Build/release/bin/
+          retention-days: 14
