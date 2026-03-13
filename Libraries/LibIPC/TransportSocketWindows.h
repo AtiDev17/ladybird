@@ -9,7 +9,7 @@
 
 #include <AK/Queue.h>
 #include <LibCore/Socket.h>
-#include <LibIPC/File.h>
+#include <LibIPC/Attachment.h>
 
 namespace IPC {
 
@@ -42,14 +42,12 @@ public:
     };
     struct Message {
         Vector<u8> bytes;
-        Queue<File> fds; // always empty, present to avoid OS #ifdefs in Connection.cpp
+        Queue<Attachment> attachments; // always empty, present to avoid OS #ifdefs in Connection.cpp
     };
     ShouldShutdown read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&&);
 
     // Obnoxious name to make it clear that this is a dangerous operation.
     ErrorOr<int> release_underlying_transport_for_transfer();
-
-    ErrorOr<IPC::File> clone_for_transfer();
 
 private:
     ErrorOr<void> duplicate_handles(Bytes, Vector<size_t> const& handle_offsets);

@@ -139,6 +139,49 @@ describe("correct behavior", () => {
         });
     });
 
+    test("timeZone identifiers are not canonicalized", () => {
+        ["Etc/UTC", "Etc/GMT", "GMT"].forEach(timeZone => {
+            const dtf = new Intl.DateTimeFormat("en", { timeZone: timeZone });
+            expect(dtf.resolvedOptions().timeZone).toBe(timeZone);
+        });
+
+        const calcutta = new Intl.DateTimeFormat("en", { timeZone: "Asia/Calcutta" });
+        expect(calcutta.resolvedOptions().timeZone).toBe("Asia/Calcutta");
+    });
+
+    test("timeZone lookup is case-insensitive but preserves IANA casing", () => {
+        const dtf = new Intl.DateTimeFormat("en", { timeZone: "america/new_york" });
+        expect(dtf.resolvedOptions().timeZone).toBe("America/New_York");
+
+        const utc = new Intl.DateTimeFormat("en", { timeZone: "utc" });
+        expect(utc.resolvedOptions().timeZone).toBe("UTC");
+
+        const etcUtc = new Intl.DateTimeFormat("en", { timeZone: "etc/utc" });
+        expect(etcUtc.resolvedOptions().timeZone).toBe("Etc/UTC");
+    });
+
+    test("deprecated islamic calendars fall back to a supported calendar", () => {
+        const availableCalendars = Intl.supportedValuesOf("calendar");
+
+        // "islamic" and "islamic-rgsa" are deprecated and should fall back.
+        const islamic = new Intl.DateTimeFormat("en", { calendar: "islamic" });
+        const islamicCalendar = islamic.resolvedOptions().calendar;
+        expect(islamicCalendar).not.toBe("islamic");
+        expect(availableCalendars.includes(islamicCalendar)).toBeTrue();
+
+        const islamicRgsa = new Intl.DateTimeFormat("en", { calendar: "islamic-rgsa" });
+        const islamicRgsaCalendar = islamicRgsa.resolvedOptions().calendar;
+        expect(islamicRgsaCalendar).not.toBe("islamic-rgsa");
+        expect(availableCalendars.includes(islamicRgsaCalendar)).toBeTrue();
+
+        // Locale extension should also be handled.
+        const islamicExt = new Intl.DateTimeFormat("en-u-ca-islamic");
+        expect(islamicExt.resolvedOptions().calendar).not.toBe("islamic");
+
+        const islamicRgsaExt = new Intl.DateTimeFormat("en-u-ca-islamic-rgsa");
+        expect(islamicRgsaExt.resolvedOptions().calendar).not.toBe("islamic-rgsa");
+    });
+
     test("dateStyle", () => {
         const en = new Intl.DateTimeFormat("en");
         expect(en.resolvedOptions().dateStyle).toBeUndefined();

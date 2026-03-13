@@ -367,7 +367,7 @@ pub unsafe extern "C" fn icu_calendar_date_to_iso_date(
     })
 }
 
-fn calendar_month_code_to_iso_date_impl(
+fn iso_year_and_month_code_to_iso_date_impl(
     calendar_name: &str,
     month_code_string: &str,
     iso_year: i32,
@@ -422,7 +422,7 @@ fn calendar_month_code_to_iso_date_impl(
 /// `calendar` must point to a valid UTF-8 string of `calendar_length` bytes.
 /// `month_code` must point to a valid UTF-8 string of `month_code_length` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn icu_calendar_month_code_to_iso_date(
+pub unsafe extern "C" fn icu_iso_year_and_month_code_to_iso_date(
     calendar: *const u8,
     calendar_length: usize,
     iso_year: i32,
@@ -434,10 +434,64 @@ pub unsafe extern "C" fn icu_calendar_month_code_to_iso_date(
         let calendar_name = ascii_string_from_ffi(calendar, calendar_length);
         let month_code_string = ascii_string_from_ffi(month_code, month_code_length);
 
-        iso_date_to_ffi(calendar_month_code_to_iso_date_impl(
+        iso_date_to_ffi(iso_year_and_month_code_to_iso_date_impl(
             calendar_name,
             month_code_string,
             iso_year,
+            day,
+        ))
+    })
+}
+
+fn calendar_year_and_month_code_to_iso_date_impl(
+    calendar_name: &str,
+    arithmetic_year: i32,
+    month_code_string: &str,
+    day: u8,
+) -> Option<FfiISODate> {
+    let calendar = make_calendar(calendar_name)?;
+    let month_code = parse_month_code(month_code_string)?;
+
+    let extended_year = if is_chinese_or_dangi(calendar_name) {
+        chinese_or_dangi_extended_year(&calendar, arithmetic_year)?
+    } else {
+        arithmetic_year
+    };
+
+    let date = Date::try_new_from_codes(None, extended_year, month_code, day, calendar).ok()?;
+    if date.month().standard_code != month_code || date.day_of_month().0 != day {
+        return None;
+    }
+
+    let iso_date = date.to_iso();
+
+    Some(FfiISODate {
+        year: iso_date.extended_year(),
+        month: iso_date.month().ordinal as u8,
+        day: iso_date.day_of_month().0,
+    })
+}
+
+/// # Safety
+/// `calendar` must point to a valid UTF-8 string of `calendar_length` bytes.
+/// `month_code` must point to a valid UTF-8 string of `month_code_length` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn icu_calendar_year_and_month_code_to_iso_date(
+    calendar: *const u8,
+    calendar_length: usize,
+    arithmetic_year: i32,
+    month_code: *const u8,
+    month_code_length: usize,
+    day: u8,
+) -> FfiOptionalISODate {
+    abort_on_panic(|| {
+        let calendar_name = ascii_string_from_ffi(calendar, calendar_length);
+        let month_code_string = ascii_string_from_ffi(month_code, month_code_length);
+
+        iso_date_to_ffi(calendar_year_and_month_code_to_iso_date_impl(
+            calendar_name,
+            arithmetic_year,
+            month_code_string,
             day,
         ))
     })
