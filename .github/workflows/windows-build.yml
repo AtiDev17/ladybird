@@ -70,5 +70,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ladybird-windows-x64
-          path: Build/release/bin/
+          path: |
+            Build/release/bin/
+            Build/release/res/
           retention-days: 14
