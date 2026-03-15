@@ -66,14 +66,14 @@ jobs:
         run: |
           python Meta/ladybird.py build
 
-      - name: Package Ladybird (CMake Install)
+      - name: Copy Resources for Packaging
         shell: pwsh
         run: |
-          cmake --install Build/release --prefix ladybird-package
+          Copy-Item -Path Base/res -Destination Build/release/bin/res -Recurse -Force
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ladybird-windows-x64
-          path: ladybird-package/
+          path: Build/release/bin/
           retention-days: 14
