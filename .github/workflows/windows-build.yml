@@ -10,7 +10,7 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
-    
+
     env:
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
       CMAKE_C_COMPILER_LAUNCHER: sccache
@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           choco install pkgconfiglite -y
-          
+
           if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) {
               New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache"
           }
@@ -66,11 +66,14 @@ jobs:
         run: |
           python Meta/ladybird.py build
 
+      - name: Package Ladybird (CMake Install)
+        shell: pwsh
+        run: |
+          cmake --install Build/release --prefix ladybird-package
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ladybird-windows-x64
-          path: |
-            Build/release/bin/
-            Build/release/res/
+          path: ladybird-package/
           retention-days: 14
