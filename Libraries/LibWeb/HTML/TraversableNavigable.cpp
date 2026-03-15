@@ -980,9 +980,8 @@ TraversableNavigable::CheckIfUnloadingIsCanceledResult TraversableNavigable::che
             }));
 
             // 5. Wait for eventsFired to be true.
-            main_thread_event_loop().spin_until(GC::create_function(heap(), [&] {
-                return events_fired;
-            }));
+            main_thread_event_loop().spin_processing_tasks_with_source_until(Task::Source::NavigationAndTraversal,
+                GC::create_function(heap(), [&] { return events_fired; }));
 
             // 6. If finalStatus is not "continue", then return finalStatus.
             if (final_status != CheckIfUnloadingIsCanceledResult::Continue)
@@ -1017,9 +1016,8 @@ TraversableNavigable::CheckIfUnloadingIsCanceledResult TraversableNavigable::che
     }
 
     // 8. Wait for completedTasks to be totalTasks.
-    main_thread_event_loop().spin_until(GC::create_function(heap(), [&] {
-        return completed_tasks == total_tasks;
-    }));
+    main_thread_event_loop().spin_processing_tasks_with_source_until(Task::Source::NavigationAndTraversal,
+        GC::create_function(heap(), [&] { return completed_tasks == total_tasks; }));
 
     // 9. Return finalStatus.
     return final_status;
@@ -1284,14 +1282,14 @@ void TraversableNavigable::destroy_top_level_traversable()
     // 1. Let browsingContext be traversable's active browsing context.
     auto browsing_context = active_browsing_context();
 
-    // 2. For each historyEntry in traversable's session history entries:
+    // 2. For each historyEntry in traversable's session history entries [[ in what order? ]]:
     for (auto& history_entry : m_session_history_entries) {
         // 1. Let document be historyEntry's document.
         auto document = history_entry->document();
 
-        // 2. If document is not null, then destroy document.
+        // 2. If document is not null, then destroy a document and its descendants given document.
         if (document)
-            document->destroy();
+            document->destroy_a_document_and_its_descendants();
     }
 
     // 3. Remove browsingContext.
@@ -1306,6 +1304,8 @@ void TraversableNavigable::destroy_top_level_traversable()
 
     // 5. Remove traversable from the user agent's top-level traversable set.
     user_agent_top_level_traversable_set().remove(this);
+
+    // FIXME: 6. Invoke WebDriver BiDi navigable destroyed with traversable.
 
     // FIXME: Figure out why we need to do this... we shouldn't be leaking Navigables for all time.
     //        However, without this, we can keep stale destroyed traversables around.

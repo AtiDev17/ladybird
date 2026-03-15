@@ -4581,104 +4581,103 @@ void Document::make_unsalvageable([[maybe_unused]] String reason)
     set_salvageable(false);
 }
 
-struct DocumentDestructionState : public GC::Cell {
-    GC_CELL(DocumentDestructionState, GC::Cell);
-    GC_DECLARE_ALLOCATOR(DocumentDestructionState);
+struct DocumentLifecycleState : public GC::Cell {
+    GC_CELL(DocumentLifecycleState, GC::Cell);
+    GC_DECLARE_ALLOCATOR(DocumentLifecycleState);
 
     static constexpr int TIMEOUT_MS = 15000;
 
-    DocumentDestructionState(GC::Ref<Document> document, size_t remaining, GC::Ptr<GC::Function<void()>> after)
+    DocumentLifecycleState(GC::Ref<Document> document, size_t remaining, GC::Ref<GC::Function<void()>> finish_callback)
         : remaining_children(remaining)
         , document(document)
-        , after_all(after)
+        , finish_callback(finish_callback)
         , timeout(Platform::Timer::create_single_shot(heap(), TIMEOUT_MS, GC::create_function(heap(), [this] {
             if (remaining_children > 0)
-                dbgln("FIXME: Document destruction timed out with {} remaining children", remaining_children);
+                dbgln("FIXME: Document unload/destruction timed out with {} remaining children", remaining_children);
         })))
     {
         timeout->start();
     }
 
-    virtual void visit_edges(GC::Cell::Visitor& visitor) override
+    virtual void visit_edges(Visitor& visitor) override
     {
         Base::visit_edges(visitor);
         visitor.visit(document);
-        visitor.visit(after_all);
+        visitor.visit(finish_callback);
         visitor.visit(timeout);
     }
 
-    void increment_destroyed()
+    void did_process_child()
     {
-        --remaining_children;
-        if (remaining_children > 0)
+        if (--remaining_children > 0)
             return;
         timeout->stop();
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(document), GC::create_function(heap(), [document = move(document), after_all = move(after_all)] {
-            document->destroy();
-            if (after_all)
-                after_all->function()();
-        }));
+        queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(document), finish_callback);
     }
 
     size_t remaining_children { 0 };
     GC::Ref<Document> document;
-    GC::Ptr<GC::Function<void()>> after_all;
+    GC::Ref<GC::Function<void()>> finish_callback;
     GC::Ref<Platform::Timer> timeout;
 };
 
-GC_DEFINE_ALLOCATOR(DocumentDestructionState);
+GC_DEFINE_ALLOCATOR(DocumentLifecycleState);
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
 void Document::destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void()>> after_all_destruction)
 {
     // 1. If document is not fully active, then:
     if (!is_fully_active()) {
-        // 1. Let reason be a string from user-agent specific blocking reasons.
-        //    If none apply, then let reason be "masked".
+        // 1. Let reason be a string from user-agent specific blocking reasons. If none apply, then let reason be
+        //    "masked".
         // FIXME: user-agent specific blocking reasons.
         auto reason = "masked"_string;
 
         // 2. Make document unsalvageable given document and reason.
         make_unsalvageable(reason);
 
-        // FIXME: 3. If document's node navigable is a top-level traversable,
-        //           build not restored reasons for a top-level traversable and its descendants given document's node navigable.
+        // FIXME: 3. If document's node navigable is a top-level traversable, build not restored reasons for a top-level
+        //    traversable and its descendants given document's node navigable.
     }
 
     // 2. Let childNavigables be document's child navigables.
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = document_tree_child_navigables();
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = navigable()->child_navigables();
 
-    // NOTE: Not in the spec but we could avoid allocating destruction state in case there's no child navigables.
+    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
+    //    perform the following steps:
+    auto finish_callback = GC::create_function(heap(), [document = this, after_all_destruction] {
+        // 1. Destroy document.
+        document->destroy();
+
+        // 2. If afterAllDestruction was given, then run it.
+        if (after_all_destruction)
+            after_all_destruction->function()();
+    });
+
+    // AD-HOC: We avoid allocating a DocumentLifecycleState in case there's no child navigables.
     if (child_navigables.is_empty()) {
-        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), GC::create_function(heap(), [document = this, after_all_destruction] {
-            // 1. Destroy document.
-            document->destroy();
-
-            // 2. If afterAllDestruction was given, then run it.
-            if (after_all_destruction)
-                after_all_destruction->function()();
-        }));
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), finish_callback);
         return;
     }
 
     // 3. Let numberDestroyed be 0.
-    auto destruction_state = heap().allocate<DocumentDestructionState>(*this, child_navigables.size(), after_all_destruction);
+    auto destruction_state = heap().allocate<DocumentLifecycleState>(*this, child_navigables.size(), finish_callback);
 
     // 4. For each childNavigable of childNavigables, queue a global task on the navigation and traversal task source
     //    given childNavigable's active window to perform the following steps:
     for (auto& child_navigable : child_navigables) {
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(), GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
-            // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
-            auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->increment_destroyed(); });
+        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
+            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
+                // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
+                auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->did_process_child(); });
 
-            // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
-            child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
-        }));
+                // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
+                child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
+            }));
     }
 
-    // NOTE: Both of subsequent steps are handled by DocumentDestructionState.
     // 5. Wait until numberDestroyed equals childNavigable's size.
-    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to perform the following steps:
+    // NB: This is handled by destruction_state.
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#abort-a-document
@@ -4771,10 +4770,11 @@ void Document::unload(GC::Ptr<Document>)
 
     // FIXME: 3. If newDocument is not given, then set unloadTimingInfo to null.
 
-    // FIXME: 4. Otherwise, if newDocument's event loop is not oldDocument's event loop, then the user agent may be unloading oldDocument in parallel. In that case, the user agent should
-    //           set unloadTimingInfo to null.
+    // FIXME: 4. Otherwise, if newDocument's event loop is not oldDocument's event loop, then the user agent may be unloading
+    //    oldDocument in parallel. In that case, the user agent should set unloadTimingInfo to null.
 
-    // 5. Let intendToStoreInBfcache be true if the user agent intends to keep oldDocument alive in a session history entry, such that it can later be used for history traversal.
+    // 5. Let intendToStoreInBfcache be true if the user agent intends to keep oldDocument alive in a session history
+    //    entry, such that it can later be used for history traversal.
     auto intend_to_store_in_bfcache = false;
 
     // 6. Let eventLoop be oldDocument's relevant agent's event loop.
@@ -4787,26 +4787,28 @@ void Document::unload(GC::Ptr<Document>)
     m_unload_counter += 1;
 
     // 9. If intendToKeepInBfcache is false, then set oldDocument's salvageable state to false.
-    if (!intend_to_store_in_bfcache) {
+    if (!intend_to_store_in_bfcache)
         m_salvageable = false;
-    }
 
     // 10. If oldDocument's page showing is true:
     if (m_page_showing) {
         // 1. Set oldDocument's page showing to false.
         m_page_showing = false;
 
-        // 2. Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's salvageable state.
+        // 2. Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's
+        //    salvageable state.
         as<HTML::Window>(relevant_global_object(*this)).fire_a_page_transition_event(HTML::EventNames::pagehide, m_salvageable);
 
         // 3. Update the visibility state of oldDocument to "hidden".
         update_the_visibility_state(HTML::VisibilityState::Hidden);
     }
 
-    // FIXME: 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high resolution time given newDocument's relevant global object, coarsened
-    //            given oldDocument's relevant settings object's cross-origin isolated capability.
+    // FIXME: 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
 
-    // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global object, with legacy target override flag set.
+    // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global
+    //     object, with legacy target override flag set.
     if (!m_salvageable) {
         // then fire an event named unload at document's relevant global object, with legacy target override flag set.
         // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
@@ -4815,8 +4817,9 @@ void Document::unload(GC::Ptr<Document>)
         as<HTML::Window>(relevant_global_object(*this)).dispatch_event(event);
     }
 
-    // FIXME: 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high resolution time given newDocument's relevant global object, coarsened
-    //            given oldDocument's relevant settings object's cross-origin isolated capability.
+    // FIXME: 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
 
     // 14. Decrease eventLoop's termination nesting level by 1.
     event_loop.decrement_termination_nesting_level();
@@ -4827,18 +4830,19 @@ void Document::unload(GC::Ptr<Document>)
 
     // FIXME: 17. Set oldDocument's has been scrolled by the user to false.
 
-    // FIXME: 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other applicable specifications.
+    // FIXME: 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other
+    //     applicable specifications.
 
     // 19. If oldDocument's salvageable state is false, then destroy oldDocument.
-    if (!m_salvageable) {
-        // NOTE: Document is destroyed from Document::unload_a_document_and_its_descendants()
-    }
+    if (!m_salvageable)
+        destroy();
 
     // 20. Decrease oldDocument's unload counter by 1.
     m_unload_counter -= 1;
 
-    // FIXME: 21. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's origin is the same as oldDocument's origin, then set
-    //            newDocument's previous document unload timing to unloadTimingInfo.
+    // FIXME: 21. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's
+    //     origin is the same as oldDocument's origin, then set newDocument's previous document unload timing to
+    //     unloadTimingInfo.
 
     did_stop_being_active_document_in_navigable();
 }
@@ -4846,66 +4850,49 @@ void Document::unload(GC::Ptr<Document>)
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
 void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_document, GC::Ptr<GC::Function<void()>> after_all_unloads)
 {
-    // Specification defines this algorithm in the following steps:
-    // 1. Recursively unload (and destroy) documents in descendant navigables
-    // 2. Unload (and destroy) this document.
-    //
-    // Implementation of the spec will fail in the following scenario:
-    // 1. Unload iframe's (has attribute name="test") document
-    //    1.1. Destroy iframe's document
-    // 2. Unload iframe's parent document
-    //    2.1. Dispatch "unload" event
-    //       2.2. In "unload" event handler run `window["test"]`
-    //          2.2.1. Execute Window::document_tree_child_navigable_target_name_property_set()
-    //             2.2.1.1. Fail to access iframe's navigable active document because it was destroyed on step 1.1
-    //
-    // We change the algorithm to:
-    // 1. Unload all descendant documents without destroying them
-    // 2. Unload this document
-    // 3. Destroy all descendant documents
-    // 4. Destroy this document
-    //
-    // This way we maintain the invariant that all navigable containers present in the DOM tree
-    // have an active document while the document is being unloaded.
+    // FIXME: 1. Assert: this is running within document's node navigable's traversable navigable's session history traversal
+    //    queue.
 
-    IGNORE_USE_IN_ESCAPING_LAMBDA size_t number_unloaded = 0;
+    // 2. Let childNavigables be document's child navigables.
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = navigable()->child_navigables();
 
-    auto navigable = this->navigable();
+    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
+    //    perform the following steps:
+    auto finish_callback = GC::create_function(heap(), [document = this, new_document, after_all_unloads] {
+        // FIXME: 1. If firePageSwapSteps is given, then run firePageSwapSteps.
 
-    Vector<GC::Root<HTML::Navigable>> descendant_navigables;
-    for (auto& other_navigable : HTML::all_navigables()) {
-        // AD-HOC: Skip destroyed navigables. When an iframe is removed,
-        //         destroy_the_child_navigable() marks its navigable as destroyed
-        //         synchronously, but removal from all_navigables() happens later
-        //         in an async callback. If we count destroyed navigables here,
-        //         the unload tasks we queue for them can be removed by
-        //         Document::destroy() (which clears tasks for its document),
-        //         causing the spin_until below to wait forever.
-        if (other_navigable->has_been_destroyed())
-            continue;
-        if (navigable->is_ancestor_of(*other_navigable))
-            descendant_navigables.append(other_navigable);
+        // 2. Unload document, passing along newDocument if it is not null.
+        document->unload(new_document);
+
+        // 3. If afterAllUnloads was given, then run it.
+        if (after_all_unloads)
+            after_all_unloads->function()();
+    });
+
+    // AD-HOC: We avoid allocating a DocumentLifecycleState in case there's no child navigables.
+    if (child_navigables.is_empty()) {
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), finish_callback);
+        return;
     }
 
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto unloaded_documents_count = descendant_navigables.size() + 1;
+    // 3. Let numberUnloaded be 0.
+    auto unload_state = heap().allocate<DocumentLifecycleState>(*this, child_navigables.size(), finish_callback);
 
-    HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*this), GC::create_function(heap(), [&number_unloaded, this, new_document] {
-        unload(new_document);
-        ++number_unloaded;
-    }));
+    // 4. For each childNavigable of childNavigables [[ in what order? ]], queue a global task on the navigation and
+    //    traversal task source given childNavigable's active window to perform the following steps:
+    for (auto& child_navigable : child_navigables) {
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
+            GC::create_function(heap(), [&heap = heap(), unload_state, child_navigable = child_navigable.ptr()] {
+                // 1. Let incrementUnloaded be an algorithm step which increments numberUnloaded.
+                auto increment_unloaded = GC::create_function(heap, [unload_state] { unload_state->did_process_child(); });
 
-    for (auto& descendant_navigable : descendant_navigables) {
-        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, *descendant_navigable->active_window(), GC::create_function(heap(), [&number_unloaded, descendant_navigable = descendant_navigable.ptr()] {
-            descendant_navigable->active_document()->unload();
-            ++number_unloaded;
-        }));
+                // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
+                child_navigable->active_document()->unload_a_document_and_its_descendants({}, increment_unloaded);
+            }));
     }
 
-    HTML::main_thread_event_loop().spin_until(GC::create_function(heap(), [&] {
-        return number_unloaded == unloaded_documents_count;
-    }));
-
-    destroy_a_document_and_its_descendants(move(after_all_unloads));
+    // 5. Wait until numberUnloaded equals childNavigables's size.
+    // NB: This is handled by unload_state.
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
