@@ -1,0 +1,94 @@
+name: Windows Build
+
+on:
+push:
+branches: [ master ]
+pull_request:
+branches: [ master ]
+workflow_dispatch:
+
+concurrency:
+group: ${{ github.workflow }}-${{ github.ref }}
+cancel-in-progress: true
+
+jobs:
+build:
+runs-on: windows-latest
+timeout-minutes: 240
+
+env:
+CMAKE_C_COMPILER_LAUNCHER: sccache
+CMAKE_CXX_COMPILER_LAUNCHER: sccache
+SCCACHE_GHA_ENABLED: "true"
+VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+steps:
+- uses: actions/checkout@v6
+with:
+fetch-depth: 1
+
+- uses: ilammy/msvc-dev-cmd@v1.13.0
+
+- uses: actions/setup-python@v5
+with:
+python-version: '3.12'
+
+- uses: mozilla-actions/sccache-action@v0.0.9
+
+- name: Cache vcpkg
+uses: actions/cache@v5
+with:
+path: ${{ github.workspace }}/vcpkg_cache
+key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}
+restore-keys: |
+${{ runner.os }}-vcpkg-
+
+- name: Setup
+shell: pwsh
+run: |
+$maxRetries = 3
+for ($i=1; $i -le $maxRetries; $i++) {
+try { choco install pkgconfiglite -y; break }
+catch { if ($i -eq $maxRetries) { throw }; Start-Sleep -Seconds 10 }
+}
+
+if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) { New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache" }
+
+- name: Build
+shell: pwsh
+run: |
+sccache --start-server
+python Meta/ladybird.py build
+sccache --show-stats
+sccache --stop-server
+
+- name: Package
+if: success()
+shell: pwsh
+run: |
+cmake --install Build/release --prefix ladybird-package
+
+Copy-Item "Build/release/bin/*.exe" -Destination "ladybird-package/bin/" -Force
+Copy-Item "Build/release/bin/*.dll" -Destination "ladybird-package/bin/" -Force
+
+$vcpkgBin = "Build/release/vcpkg_installed/x64-windows/bin"
+if (Test-Path $vcpkgBin) {
+Copy-Item "$vcpkgBin/*.dll" -Destination "ladybird-package/bin/" -Force
+}
+
+$deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+if (Test-Path "ladybird-package/bin/Ladybird.exe") {
+& $deployTool "ladybird-package/bin/Ladybird.exe" --dir "ladybird-package/bin" --no-translations --compiler-runtime
+}
+
+if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "ladybird-package/LICENSE.txt" }
+$hash = git rev-parse --short HEAD
+"Commit: $hash`nBuild Date: $(Get-Date)" | Out-File -FilePath "ladybird-package/version.txt"
+
+- name: Upload Artifact
+uses: actions/upload-artifact@v7
+with:
+name: ladybird-windows-x64
+path: ladybird-package/
+retention-days: 7
