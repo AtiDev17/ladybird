@@ -17,9 +17,8 @@ jobs:
     timeout-minutes: 240
 
     env:
-      CMAKE_C_COMPILER_LAUNCHER: sccache
-      CMAKE_CXX_COMPILER_LAUNCHER: sccache
-      SCCACHE_GHA_ENABLED: "true" 
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -30,21 +29,26 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
 
-      - uses: actions/setup-python@v5
+      - name: Setup Environment
+        uses: ./.github/actions/setup
         with:
-          python-version: '3.12'
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          type: 'build'
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Cache vcpkg
-        uses: actions/cache@v5
+      - name: Restore Caches
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
         with:
-          path: ${{ github.workspace }}/vcpkg_cache
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}
-          restore-keys: |
-            ${{ runner.os }}-vcpkg-
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
 
-      - name: Setup
+      - name: Setup Windows Specific Tools
         shell: pwsh
         run: |
           $maxRetries = 3
@@ -58,10 +62,7 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          sccache --start-server
           python Meta/ladybird.py build
-          sccache --show-stats
-          sccache --stop-server
 
       - name: Package
         if: success()
@@ -92,3 +93,13 @@ jobs:
           name: ladybird-windows-x64
           path: ladybird-package/
           retention-days: 7
+          
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'x86_64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
