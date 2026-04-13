@@ -5,13 +5,12 @@ $5f9e2ffb class-environment.js:9:1
     [0] = Undefined
 
 block0:
-  [   0] GetLexicalEnvironment dst:reg4
-  [   8] GetGlobal dst:reg6, `console`
-  [  20] GetById dst:reg7, base:reg6, `log` (console.log)
-  [  40] GetGlobal dst:reg9, `classWithName`
-  [  58] Call dst:reg8, callee:reg9, this_value:Undefined, classWithName
-  [  78] Call dst:reg5, callee:reg7, this_value:reg6, console.log, arguments:[reg8]
-  [  a0] End value:reg5
+  [   0] GetGlobal dst:reg6, `console`
+  [  18] GetById dst:reg7, base:reg6, `log` (console.log)
+  [  38] GetGlobal dst:reg9, `classWithName`
+  [  50] Call dst:reg8, callee:reg9, this_value:Undefined, classWithName
+  [  70] Call dst:reg5, callee:reg7, this_value:reg6, console.log, arguments:[reg8]
+  [  98] End value:reg5
 
 
 classWithName$8829de8e class-environment.js:2:13
@@ -28,12 +27,11 @@ block0:
   [  18] CreateVariable `Foo`, is_immutable:true, is_global:false, is_strict:false
   [  28] SetLexicalEnvironment environment:reg4
   [  30] NewClass dst:C~0, class_environment:reg5, class_blueprint_index:0, element_keys:[element_keys:String("method")]
-  [  58] Mov dst:reg7, src:C~0
-  [  68] CallConstruct dst:reg6, callee:reg7, C
-  [  80] GetById dst:reg7, base:reg6, `method`
-  [  a0] Call dst:reg5, callee:reg7, this_value:reg6, <object>.method
-  [  c0] StrictlyEquals dst:reg6, lhs:reg5, rhs:C~0
-  [  d0] Return value:reg6
+  [  58] CallConstruct dst:reg6, callee:C~0, C
+  [  70] GetById dst:reg7, base:reg6, `method`
+  [  90] Call dst:reg5, callee:reg7, this_value:reg6, <object>.method
+  [  b0] StrictlyEquals dst:reg6, lhs:reg5, rhs:C~0
+  [  c0] Return value:reg6
 
 
 Foo$811c9dc5
@@ -43,8 +41,7 @@ Foo$811c9dc5
     [0] = Undefined
 
 block0:
-  [   0] GetLexicalEnvironment dst:reg4
-  [   8] End value:Undefined
+  [   0] End value:Undefined
 
 
 method$e3fa2040 class-environment.js:4:13
@@ -52,9 +49,8 @@ method$e3fa2040 class-environment.js:4:13
   Blocks:    1
 
 block0:
-  [   0] GetLexicalEnvironment dst:reg4
-  [   8] GetBinding dst:reg5, `Foo`
-  [  20] Return value:reg5
+  [   0] GetBinding dst:reg5, `Foo`
+  [  18] Return value:reg5
 
 
 true

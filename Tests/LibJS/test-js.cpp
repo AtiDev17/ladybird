@@ -37,7 +37,7 @@ TESTJS_GLOBAL_FUNCTION(evaluate_source, evaluateSource)
     if (script.is_error())
         return vm.throw_completion<JS::SyntaxError>(script.error().first().to_string());
 
-    return vm.bytecode_interpreter().run(script.value());
+    return vm.run(script.value());
 }
 
 TESTJS_GLOBAL_FUNCTION(run_queued_promise_jobs, runQueuedPromiseJobs)
@@ -73,7 +73,7 @@ TESTJS_GLOBAL_FUNCTION(mark_as_garbage, markAsGarbage)
     auto& variable_name = argument.as_string();
 
     // In native functions we don't have a lexical environment so get the outer via the execution stack.
-    auto outer_environment = vm.execution_context_stack().last_matching([&](auto& execution_context) {
+    auto outer_environment = vm.last_execution_context_matching([&](auto* execution_context) {
         return execution_context->lexical_environment != nullptr;
     });
     if (!outer_environment.has_value())
