@@ -92,57 +92,89 @@ jobs:
 
           "@echo off`r`nstart `"`" `"%~dp0bin\Ladybird.exe`"" | Out-File -FilePath "$pkgDir/Launch Ladybird.bat" -Encoding ASCII
 
-          $batScript = @"
+          $batScript = @'
+          <# :
           @echo off
+          setlocal
+          echo ============================================
+          echo      Ladybird Windows Update Tool
+          echo ============================================
+          echo.
           echo Please ensure Ladybird is closed before updating.
-          
-          PowerShell -NoProfile -ExecutionPolicy Bypass -Command "& { `
-              `$ErrorActionPreference = 'Stop'; `
-              `$localCommit = 'unknown'; `
-              if (Test-Path 'version.txt') { `
-                  `$lines = Get-Content 'version.txt'; `
-                  if (`$lines[0] -match 'Commit: ([a-f0-9]+)') { `$localCommit = `$matches[1] } `
-              } `
-              `
-              Write-Host 'Checking for updates from AtiDev17/ladybird...'; `
-              `$releases = try { Invoke-RestMethod 'https://api.github.com/repos/AtiDev17/ladybird/releases' } catch { `$null }; `
-              `
-              if (!`$releases) { `
-                  Write-Host 'Failed to query GitHub for releases.' -ForegroundColor Red; `
-                  exit 1 `
-              } `
-              `
-              `$release = `$releases[0]; `
-              `$remoteCommit = 'unknown'; `
-              if (`$release.body -match 'Commit: ([a-f0-9]+)') { `$remoteCommit = `$matches[1] } `
-              `
-              if (`$localCommit -ne 'unknown' -and `$localCommit -eq `$remoteCommit) { `
-                  Write-Host 'Ladybird is already up to date!' -ForegroundColor Green; `
-                  exit 0 `
-              } `
-              `
-              Write-Host 'New version found! Downloading...' -ForegroundColor Cyan; `
-              `$asset = `$release.assets | Where-Object { `$_.name -eq 'ladybird-windows-x64.zip' }; `
-              `
-              if (`$asset) { `
-                  `$tmp = Join-Path `$env:TEMP 'LadybirdUpdate'; `
-                  if (Test-Path `$tmp) { Remove-Item `$tmp -Recurse -Force }; `
-                  New-Item -Type Directory `$tmp | Out-Null; `
-                  `
-                  Invoke-WebRequest -Uri `$asset.browser_download_url -OutFile `"`$tmp\update.zip`"; `
-                  Write-Host 'Extracting and installing...'; `
-                  Expand-Archive -Path `"`$tmp\update.zip`" -DestinationPath `$tmp -Force; `
-                  `
-                  Get-ChildItem -Path `"`$tmp\Ladybird`" | Copy-Item -Destination '.' -Recurse -Force; `
-                  `
-                  Remove-Item `$tmp -Recurse -Force; `
-                  Write-Host 'Update complete! You can now launch Ladybird.' -ForegroundColor Green; `
-              } else { `
-                  Write-Host 'No Windows release asset found.' -ForegroundColor Red; `
-              } `
-          }"
-          pause
-          "@
+          echo Checking for updates...
+
+          powershell -noprofile -executionpolicy bypass -command "iex ((Get-Content '%~f0') -join \"`n\")"
+
+          echo.
+          echo Press any key to exit...
+          pause >nul
+          goto :EOF
+          #>
+
+          $ProgressPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
+          $localCommit = 'unknown'
+
+          if (Test-Path 'version.txt') {
+              $lines = Get-Content 'version.txt'
+              if ($lines[0] -match 'Commit: ([a-f0-9]+)') { 
+                  $localCommit = $matches[1] 
+              }
+          }
+
+          Write-Host "Local Version:  $localCommit"
+
+          $releases = try { 
+              Invoke-RestMethod 'https://api.github.com/repos/AtiDev17/ladybird/releases' 
+          } catch { 
+              $null 
+          }
+
+          if (!$releases) {
+              Write-Host 'Error: Could not connect to GitHub API.' -ForegroundColor Red
+              exit 1
+          }
+
+          $release = $releases[0]
+          $remoteCommit = 'unknown'
+          if ($release.body -match 'Commit: ([a-f0-9]+)') { 
+              $remoteCommit = $matches[1] 
+          }
+
+          Write-Host "Remote Version: $remoteCommit"
+
+          if ($localCommit -ne 'unknown' -and $localCommit -eq $remoteCommit) {
+              Write-Host 'Ladybird is already up to date!' -ForegroundColor Green
+              exit 0
+          }
+
+          Write-Host 'New version detected!' -ForegroundColor Cyan
+          $asset = $release.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
+
+          if ($asset) {
+              $tmp = Join-Path $env:TEMP 'LadybirdUpdate'
+              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+              New-Item -Type Directory $tmp | Out-Null
+              
+              Write-Host 'Downloading update...' -ForegroundColor Yellow
+              Start-BitsTransfer -Source $asset.browser_download_url -Destination "$tmp\update.zip"
+              
+              Write-Host 'Extracting files...' -ForegroundColor Yellow
+              Expand-Archive -Path "$tmp\update.zip" -DestinationPath $tmp -Force
+              
+              Write-Host 'Installing...' -ForegroundColor Yellow
+              if (Test-Path "$tmp\Ladybird") {
+                  Get-ChildItem -Path "$tmp\Ladybird" | Copy-Item -Destination '.' -Recurse -Force
+                  Write-Host 'Update successful!' -ForegroundColor Green
+              } else {
+                  Write-Host 'Error: Update package format is invalid.' -ForegroundColor Red
+              }
+              
+              Remove-Item $tmp -Recurse -Force
+          } else {
+              Write-Host 'Error: No Windows release asset found on GitHub.' -ForegroundColor Red
+          }
+          '@
 
           $batScript | Out-File -FilePath "$pkgDir/Update Ladybird.bat" -Encoding ASCII
 
