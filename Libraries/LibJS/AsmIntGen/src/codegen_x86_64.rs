@@ -5,8 +5,12 @@
  */
 
 use crate::parser::{AsmInstruction, Handler, ObjectFormat, Operand, Program};
-use crate::registers::{resolve_register, Arch};
-use crate::shared::{get_immediate_value, resolve_field_ref, resolve_label, substitute_macro, uniquify_macro_labels, w, HandlerState};
+use crate::registers::{Arch, resolve_register};
+use crate::shared::{
+    HandlerState, ResolvedMemoryIndex, get_immediate_value, resolve_adjacent_memory_pair,
+    resolve_field_ref, resolve_label, resolve_memory_operand, substitute_macro,
+    uniquify_macro_labels, w,
+};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -178,10 +182,7 @@ fn generate_entry_point(out: &mut String, program: &Program) {
         .get("VM_RUNNING_EXECUTION_CONTEXT")
         .copied()
         .expect("VM_RUNNING_EXECUTION_CONTEXT constant required");
-    w!(
-        out,
-        "    mov QWORD PTR [rbp - 48], rcx  # save VM*"
-    );
+    w!(out, "    mov QWORD PTR [rbp - 48], rcx  # save VM*");
     w!(
         out,
         "    mov rbx, QWORD PTR [rcx + {interp_ctx}]  # exec_ctx"
@@ -318,26 +319,24 @@ fn resolve_op(op: &Operand, handler: &Handler, program: &Program) -> String {
             match (index, scale) {
                 (Some(idx), Some(sc)) => {
                     let idx_r = resolve_register(idx, Arch::X86_64).unwrap_or_else(|| idx.clone());
-                    // Check if 'sc' is a field reference (e.g. [pb, pc, m_cache]).
                     if let Some(field_offset) = resolve_field_ref(sc, handler, program) {
                         format!("[{base_r} + {idx_r} + {field_offset}]")
                     } else {
-                        let sc_val = program
+                        let scale = program
                             .constants
                             .get(sc.as_str())
                             .copied()
                             .unwrap_or_else(|| sc.parse().expect("invalid scale value"));
-                        format!("[{base_r} + {idx_r} * {sc_val}]")
+                        format!("[{base_r} + {idx_r} * {scale}]")
                     }
                 }
                 (Some(idx), None) => {
-                    // idx could be a field ref, immediate offset, constant, or register
-                    if let Some(val) = resolve_field_ref(idx, handler, program) {
-                        format!("[{base_r} + {val}]")
-                    } else if let Some(val) = program.constants.get(idx.as_str()) {
-                        format!("[{base_r} + {val}]")
-                    } else if let Ok(val) = idx.parse::<i64>() {
-                        format!("[{base_r} + {val}]")
+                    if let Some(offset) = resolve_field_ref(idx, handler, program) {
+                        format!("[{base_r} + {offset}]")
+                    } else if let Some(offset) = program.constants.get(idx.as_str()) {
+                        format!("[{base_r} + {offset}]")
+                    } else if let Ok(offset) = idx.parse::<i64>() {
+                        format!("[{base_r} + {offset}]")
                     } else {
                         let idx_r =
                             resolve_register(idx, Arch::X86_64).unwrap_or_else(|| idx.clone());
@@ -364,7 +363,34 @@ fn resolve_op(op: &Operand, handler: &Handler, program: &Program) -> String {
     }
 }
 
-fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, program: &Program, state: &mut HandlerState) {
+fn format_x86_memory_operand(mem: &crate::shared::ResolvedMemoryOperand) -> String {
+    match &mem.index {
+        ResolvedMemoryIndex::None => format!("[{}]", mem.base),
+        ResolvedMemoryIndex::Imm(offset) => format!("[{} + {}]", mem.base, offset),
+        ResolvedMemoryIndex::Reg(index) => format!("[{} + {}]", mem.base, index),
+        ResolvedMemoryIndex::RegScale(index, scale) => {
+            format!("[{} + {} * {}]", mem.base, index, scale)
+        }
+        ResolvedMemoryIndex::RegImm(index, 0) => format!("[{} + {}]", mem.base, index),
+        ResolvedMemoryIndex::RegImm(index, offset) => {
+            format!("[{} + {} + {}]", mem.base, index, offset)
+        }
+    }
+}
+
+fn resolve_pair_memory_op(op: &Operand, handler: &Handler, program: &Program) -> String {
+    let mem = resolve_memory_operand(op, handler, program, Arch::X86_64)
+        .expect("x86_64 pair memory operands should always resolve");
+    format_x86_memory_operand(&mem)
+}
+
+fn emit_instruction(
+    out: &mut String,
+    insn: &AsmInstruction,
+    handler: &Handler,
+    program: &Program,
+    state: &mut HandlerState,
+) {
     let m = &insn.mnemonic;
 
     match m.as_str() {
@@ -760,6 +786,52 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
             }
         }
 
+        "load_pair64" => {
+            if insn.operands.len() >= 4 {
+                resolve_adjacent_memory_pair(
+                    &insn.operands[2],
+                    &insn.operands[3],
+                    handler,
+                    program,
+                    Arch::X86_64,
+                    8,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("invalid load_pair64 in handler '{}': {error}", handler.name)
+                });
+
+                let dst1 = resolve_op(&insn.operands[0], handler, program);
+                let dst2 = resolve_op(&insn.operands[1], handler, program);
+                let mem1 = resolve_pair_memory_op(&insn.operands[2], handler, program);
+                let mem2 = resolve_pair_memory_op(&insn.operands[3], handler, program);
+                w!(out, "    mov {dst1}, QWORD PTR {mem1}");
+                w!(out, "    mov {dst2}, QWORD PTR {mem2}");
+            }
+        }
+
+        "load_pair32" => {
+            if insn.operands.len() >= 4 {
+                resolve_adjacent_memory_pair(
+                    &insn.operands[2],
+                    &insn.operands[3],
+                    handler,
+                    program,
+                    Arch::X86_64,
+                    4,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("invalid load_pair32 in handler '{}': {error}", handler.name)
+                });
+
+                let dst1 = resolve_op(&insn.operands[0], handler, program);
+                let dst2 = resolve_op(&insn.operands[1], handler, program);
+                let mem1 = resolve_pair_memory_op(&insn.operands[2], handler, program);
+                let mem2 = resolve_pair_memory_op(&insn.operands[3], handler, program);
+                w!(out, "    mov {}, DWORD PTR {mem1}", to_32bit_reg(&dst1));
+                w!(out, "    mov {}, DWORD PTR {mem2}", to_32bit_reg(&dst2));
+            }
+        }
+
         // load8 dst_reg, [base, offset] - Load 8-bit value (zero-extended to 64-bit)
         "load8" => {
             if insn.operands.len() >= 2 {
@@ -845,6 +917,58 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
                 let mem = resolve_op(&insn.operands[0], handler, program);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 w!(out, "    mov QWORD PTR {mem}, {src}");
+            }
+        }
+
+        "store_pair64" => {
+            if insn.operands.len() >= 4 {
+                resolve_adjacent_memory_pair(
+                    &insn.operands[0],
+                    &insn.operands[1],
+                    handler,
+                    program,
+                    Arch::X86_64,
+                    8,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "invalid store_pair64 in handler '{}': {error}",
+                        handler.name
+                    )
+                });
+
+                let mem1 = resolve_pair_memory_op(&insn.operands[0], handler, program);
+                let mem2 = resolve_pair_memory_op(&insn.operands[1], handler, program);
+                let src1 = resolve_op(&insn.operands[2], handler, program);
+                let src2 = resolve_op(&insn.operands[3], handler, program);
+                w!(out, "    mov QWORD PTR {mem1}, {src1}");
+                w!(out, "    mov QWORD PTR {mem2}, {src2}");
+            }
+        }
+
+        "store_pair32" => {
+            if insn.operands.len() >= 4 {
+                resolve_adjacent_memory_pair(
+                    &insn.operands[0],
+                    &insn.operands[1],
+                    handler,
+                    program,
+                    Arch::X86_64,
+                    4,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "invalid store_pair32 in handler '{}': {error}",
+                        handler.name
+                    )
+                });
+
+                let mem1 = resolve_pair_memory_op(&insn.operands[0], handler, program);
+                let mem2 = resolve_pair_memory_op(&insn.operands[1], handler, program);
+                let src1 = resolve_op(&insn.operands[2], handler, program);
+                let src2 = resolve_op(&insn.operands[3], handler, program);
+                w!(out, "    mov DWORD PTR {mem1}, {}", to_32bit_reg(&src1));
+                w!(out, "    mov DWORD PTR {mem2}, {}", to_32bit_reg(&src2));
             }
         }
 
@@ -1080,9 +1204,8 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
         // Architecture-neutral branch operations.
         // These encode the comparison and branch as a single DSL operation,
         // freeing backends from x86 flag-register semantics.
-        "branch_eq" | "branch_ne" | "branch_ge_unsigned"
-        | "branch_lt_signed" | "branch_le_signed"
-        | "branch_gt_signed" | "branch_ge_signed" => {
+        "branch_eq" | "branch_ne" | "branch_ge_unsigned" | "branch_lt_signed"
+        | "branch_le_signed" | "branch_gt_signed" | "branch_ge_signed" => {
             // branch_XX a, b, label  =>  cmp a, b; jXX label
             if insn.operands.len() == 3 {
                 let a = resolve_op(&insn.operands[0], handler, program);
@@ -1137,18 +1260,41 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
         }
 
         "branch_bits_set" | "branch_bits_clear" => {
-            // branch_bits_set a, mask, label  =>  test a, mask; jnz label
+            // branch_bits_set a, mask, label
             if insn.operands.len() == 3 {
                 let a = resolve_op(&insn.operands[0], handler, program);
-                let mask = resolve_op(&insn.operands[1], handler, program);
                 let label = resolve_label(&insn.operands[2], handler);
-                let cc = match m.as_str() {
+                let test_cc = match m.as_str() {
                     "branch_bits_set" => "jnz",
                     "branch_bits_clear" => "jz",
                     _ => unreachable!(),
                 };
-                w!(out, "    test {a}, {mask}");
-                w!(out, "    {cc} {label}");
+                let bit_cc = match m.as_str() {
+                    "branch_bits_set" => "jc",
+                    "branch_bits_clear" => "jnc",
+                    _ => unreachable!(),
+                };
+
+                if let Some(mask) = get_immediate_value(&insn.operands[1], program) {
+                    let mask = mask as u64;
+                    if mask >> 32 == 0 {
+                        let a32 = to_32bit_reg(&a);
+                        w!(out, "    test {a32}, {mask}");
+                        w!(out, "    {test_cc} {label}");
+                    } else if mask.is_power_of_two() {
+                        w!(out, "    bt {a}, {}", mask.trailing_zeros());
+                        w!(out, "    {bit_cc} {label}");
+                    } else {
+                        panic!(
+                            "x86_64 branch_bits requires a low-32-bit mask or a single-bit 64-bit mask in handler '{}', got {mask:#x}",
+                            handler.name
+                        );
+                    }
+                } else {
+                    let mask = resolve_op(&insn.operands[1], handler, program);
+                    w!(out, "    test {a}, {mask}");
+                    w!(out, "    {test_cc} {label}");
+                }
             }
         }
 
@@ -1181,8 +1327,11 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
         // Floating-point compare-and-branch operations.
         // Consecutive branch_fp_* with the same operands share one ucomisd,
         // since ucomisd sets all the flags these branches test.
-        "branch_fp_unordered" | "branch_fp_equal" | "branch_fp_less"
-        | "branch_fp_less_or_equal" | "branch_fp_greater"
+        "branch_fp_unordered"
+        | "branch_fp_equal"
+        | "branch_fp_less"
+        | "branch_fp_less_or_equal"
+        | "branch_fp_greater"
         | "branch_fp_greater_or_equal" => {
             if insn.operands.len() == 3 {
                 let a = resolve_op(&insn.operands[0], handler, program);
@@ -1286,5 +1435,92 @@ fn to_32bit_reg(reg: &str) -> String {
         "r14" => "r14d".to_string(),
         "r15" => "r15d".to_string(),
         _ => reg.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{Handler, ObjectFormat, Program};
+    use bytecode_def::OpLayout;
+
+    fn test_program() -> Program {
+        Program {
+            constants: HashMap::new(),
+            macros: HashMap::new(),
+            handlers: Vec::new(),
+            op_layouts: HashMap::from([(
+                "Call".into(),
+                OpLayout {
+                    field_offsets: HashMap::new(),
+                    size: None,
+                },
+            )]),
+            opcode_list: Vec::new(),
+            object_format: ObjectFormat::MachO,
+            has_jscvt: false,
+        }
+    }
+
+    fn call_handler() -> Handler {
+        Handler {
+            name: "Call".into(),
+            size: None,
+            instructions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preserves_scaled_index_memory_operands() {
+        let program = test_program();
+        let handler = call_handler();
+        let memory = Operand::Memory {
+            base: "t0".into(),
+            index: Some("t8".into()),
+            scale: Some("8".into()),
+        };
+
+        assert_eq!(resolve_op(&memory, &handler, &program), "[rax + r11 * 8]");
+    }
+
+    #[test]
+    fn formats_pair_memory_regimm_zero_without_invalid_scale() {
+        let program = test_program();
+        let handler = call_handler();
+        let memory = Operand::Memory {
+            base: "t6".into(),
+            index: Some("t3".into()),
+            scale: Some("0".into()),
+        };
+
+        assert_eq!(
+            resolve_pair_memory_op(&memory, &handler, &program),
+            "[r9 + rsi]"
+        );
+    }
+
+    #[test]
+    fn lowers_high_single_bit_branch_mask_with_bt() {
+        let mut program = test_program();
+        program
+            .constants
+            .insert("HIGH_BIT".into(), 0x1_0000_0000);
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "branch_bits_clear".into(),
+            operands: vec![
+                Operand::Register("t2".into()),
+                Operand::Constant("HIGH_BIT".into()),
+                Operand::Label(".slow".into()),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(&mut out, &instruction, &handler, &program, &mut state);
+
+        assert!(out.contains("bt rdx, 32"));
+        assert!(out.contains("jnc .Lasm_Call.slow"));
+        assert!(!out.contains("test rdx, 4294967296"));
     }
 }
