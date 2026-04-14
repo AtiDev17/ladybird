@@ -271,8 +271,6 @@ u64 asm_helper_empty_string(u64);
 u64 asm_helper_single_ascii_character_string(u64 encoded_value);
 u64 asm_helper_single_utf16_code_unit_string(u64 encoded_value);
 i64 asm_try_inline_call(VM*, u32 pc);
-i64 asm_pop_inline_frame(VM*, u32 pc);
-i64 asm_pop_inline_frame_end(VM*, u32 pc);
 i64 asm_try_put_by_id_cache(VM*, u32 pc);
 i64 asm_try_get_by_id_cache(VM*, u32 pc);
 i64 asm_slow_path_initialize_lexical_binding(VM*, u32 pc);
@@ -854,59 +852,37 @@ i64 asm_try_put_by_value_holey_array(VM* vm, u32 pc)
     return 0;
 }
 
-// Try to inline a JS-to-JS call. Returns 0 on success (callee frame pushed),
-// 1 on failure (caller should fall through to slow path).
+// Try to inline a JS-to-JS call by building the callee frame through the
+// shared VM::push_inline_frame() helper. Returns 0 on success (callee frame
+// pushed) and 1 on failure (caller should keep handling the Call itself).
 i64 asm_try_inline_call(VM* vm, u32 pc)
 {
     auto* bytecode = vm->current_executable().bytecode.data();
     auto& insn = *reinterpret_cast<Op::Call const*>(&bytecode[pc]);
+
     auto callee = vm->get(insn.callee());
-    if (!callee.is_object())
-        return 1;
-    auto& callee_object = callee.as_object();
-    if (!is<ECMAScriptFunctionObject>(callee_object))
-        return 1;
-    auto& callee_function = static_cast<ECMAScriptFunctionObject&>(callee_object);
-    if (callee_function.kind() != FunctionKind::Normal
-        || callee_function.is_class_constructor()
-        || !callee_function.bytecode_executable())
+    if (!callee.is_object()) [[unlikely]]
         return 1;
 
-    u32 return_pc = pc + insn.length();
+    auto& callee_object = callee.as_object();
+    if (!is<ECMAScriptFunctionObject>(callee_object)) [[unlikely]]
+        return 1;
+
+    auto& callee_function = static_cast<ECMAScriptFunctionObject&>(callee_object);
+    if (!callee_function.can_inline_call()) [[unlikely]]
+        return 1;
 
     auto* callee_context = vm->push_inline_frame(
-        callee_function, *callee_function.bytecode_executable(),
-        insn.arguments(), return_pc, insn.dst().raw(),
-        vm->get(insn.this_value()), nullptr, false);
+        callee_function,
+        callee_function.inline_call_executable(),
+        insn.arguments(),
+        pc + insn.length(),
+        insn.dst().raw(),
+        vm->get(insn.this_value()),
+        nullptr,
+        false);
 
-    if (!callee_context) [[unlikely]]
-        return 1;
-
-    return 0;
-}
-
-// Pop an inline frame after Return. Returns 0 on success.
-i64 asm_pop_inline_frame(VM* vm, u32 pc)
-{
-    auto* bytecode = vm->current_executable().bytecode.data();
-    auto& insn = *reinterpret_cast<Op::Return const*>(&bytecode[pc]);
-    auto value = vm->get(insn.value());
-    if (value.is_special_empty_value())
-        value = js_undefined();
-    vm->pop_inline_frame(value);
-    return 0;
-}
-
-// Pop an inline frame after End. Returns 0 on success.
-i64 asm_pop_inline_frame_end(VM* vm, u32 pc)
-{
-    auto* bytecode = vm->current_executable().bytecode.data();
-    auto& insn = *reinterpret_cast<Op::End const*>(&bytecode[pc]);
-    auto value = vm->get(insn.value());
-    if (value.is_special_empty_value())
-        value = js_undefined();
-    vm->pop_inline_frame(value);
-    return 0;
+    return callee_context ? 0 : 1;
 }
 
 // Fast cache-only PutById. Tries all cache entries for ChangeOwnProperty and
