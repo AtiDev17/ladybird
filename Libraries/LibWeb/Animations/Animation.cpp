@@ -46,8 +46,12 @@ GC::Ref<Animation> Animation::create(JS::Realm& realm, GC::Ptr<AnimationEffect> 
     return animation;
 }
 
-WebIDL::ExceptionOr<GC::Ref<Animation>> Animation::construct_impl(JS::Realm& realm, GC::Ptr<AnimationEffect> effect, Optional<GC::Ptr<AnimationTimeline>> timeline)
+GC::Ref<Animation> Animation::construct_impl(JS::Realm& realm, GC::Ptr<AnimationEffect> effect, Optional<GC::Ptr<AnimationTimeline>> timeline)
 {
+    // NB: If the timeline argument was not present, pass an OptionalNone so 'create' treats it as missing.
+    if (realm.vm().argument_count() < 2)
+        return create(realm, effect, OptionalNone {});
+
     return create(realm, effect, timeline);
 }
 
