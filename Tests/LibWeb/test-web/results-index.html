@@ -45,7 +45,7 @@
         header {
             display: flex;
             align-items: center;
-            justify-content: space-between;
+            gap: 16px;
             margin-bottom: 24px;
             padding-bottom: 16px;
             border-bottom: 1px solid var(--border-primary);
@@ -58,6 +58,12 @@
             display: flex;
             align-items: center;
             gap: 12px;
+        }
+
+        .title-timestamp {
+            color: var(--text-secondary);
+            font-size: 18px;
+            font-weight: normal;
         }
 
         h1::before {
@@ -274,6 +280,25 @@
             border-color: var(--accent-green);
         }
 
+        #copy-run-command-btn {
+            margin-left: auto;
+            width: auto;
+            height: auto;
+            padding: 10px;
+            gap: 8px;
+            border-radius: 6px;
+        }
+
+        #copy-run-command-btn .stat-label {
+            margin-top: 0;
+        }
+
+        .copy-btn-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
         .expand-icon {
             color: var(--text-muted);
             transition: transform 0.2s ease;
@@ -337,6 +362,13 @@
             height: 500px;
             border: none;
             background: white;
+        }
+
+        .inline-file-frame {
+            width: 100%;
+            height: 75vh;
+            border: none;
+            overflow: auto;
         }
 
         .preview-image {
@@ -575,7 +607,11 @@
 <body>
     <div class="container">
         <header>
-            <h1>Test Results</h1>
+            <h1>
+                <span>Test Results</span>
+                <span class="title-timestamp" id="page-timestamp"></span>
+            </h1>
+            <button class="copy-btn" id="copy-run-command-btn"></button>
             <div class="search-box">
                 <span class="search-icon">&#128269;</span>
                 <input type="text" id="search" placeholder="Filter tests..." autocomplete="off">
@@ -596,11 +632,27 @@
         let currentIndex = -1;
         let testElements = [];
 
+        function setCopyButtonContents(btn, icon) {
+            if (btn.id !== 'copy-run-command-btn') return btn.innerHTML = icon;
+            btn.innerHTML = `<span class="stat-label">Copy Run Cmd</span><span class="copy-btn-icon">${icon}</span>`;
+        }
+
+        function renderHeader(data) {
+            const date = new Date(data.generatedAt * 1000);
+            const pad2 = (value) => String(value).padStart(2, '0');
+            document.getElementById('page-timestamp').textContent = `${date.getFullYear()}/${pad2(date.getMonth() + 1)}/${pad2(date.getDate())} at ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+            const copyRunCommandButton = document.getElementById('copy-run-command-btn');
+            setCopyButtonContents(copyRunCommandButton, copySvg);
+            copyRunCommandButton.title = data.invocationCommandLine;
+            copyRunCommandButton.onclick = e => copyText(e, copyRunCommandButton, data.invocationCommandLine);
+        }
+
         function loadResults() {
             if (typeof RESULTS_DATA === 'undefined') {
                 document.getElementById('content').innerHTML = '<div class="empty-state"><h2>No Results</h2><p>results.js not found</p></div>';
                 return;
             }
+            renderHeader(RESULTS_DATA);
             renderResults(RESULTS_DATA);
             setupKeyboardNav();
         }
@@ -608,10 +660,9 @@
         function renderResults(data) {
             const content = document.getElementById('content');
 
-            if (data.tests.length === 0) {
-                content.innerHTML = '<div class="empty-state"><h2>All Tests Passed!</h2><p>No failing tests to display.</p></div>';
-                return;
-            }
+            const items = data.hasLogs
+                ? [{ name: 'test-dumps/results/helper-process-logs.html', mode: 'LOGS', inlineFileResult: 'helper-process-logs.html' }, ...data.tests]
+                : data.tests;
 
             let html = `
                 <div class="summary">
@@ -638,33 +689,41 @@
                 </div>
                 <div class="test-list" id="testList">
             `;
-
-            for (const test of data.tests) {
-                const testId = test.name.replace(/[^a-zA-Z0-9]/g, '-');
-                const tabs = buildTabs(test);
-
-                html += `
-                    <div class="test-item" data-name="${test.name.toLowerCase()}" id="test-${testId}">
-                        <div class="test-header" onclick="toggleTest('${testId}')">
-                            <span class="result-badge ${test.result}">${test.result}</span>
-                            <span class="mode-badge">${test.mode}</span>
-                            <span class="test-name">${test.name}</span>
-                            <button class="copy-btn" onclick="copyTestName(event, this, '${test.name}')" title="Copy test path">${copySvg}</button>
-                            <span class="expand-icon">&#9654;</span>
-                        </div>
-                        <div class="test-content">
-                            <div class="tab-bar">${tabs.bar}</div>
-                            <div class="preview-container" id="preview-${testId}">
-                                <div class="loading">Select a tab to view content</div>
-                            </div>
-                        </div>
-                    </div>
-                `;
+            for (const test of items) {
+                html += renderResultItem(test);
             }
-
             html += '</div>';
+            if (items.every(test => test.mode === 'LOGS')) {
+                html += '<div class="empty-state"><h2>All items Passed!</h2><p>No failing items to display.</p></div>';
+            }
             content.innerHTML = html;
             testElements = Array.from(document.querySelectorAll('.test-item'));
+        }
+
+        function renderResultItem(item) {
+            const testId = item.name.replace(/[^a-zA-Z0-9]/g, '-');
+            const tabs = item.inlineFileResult ? null : buildTabs(item);
+
+            let html = `
+                <div class="test-item" data-name="${item.name.toLowerCase()}" id="test-${testId}">
+                    <div class="test-header" onclick="toggleTest('${testId}')">
+                        ${item.result ? `<span class="result-badge ${item.result}">${item.result}</span>` : ''}
+                        ${item.mode ? `<span class="mode-badge">${item.mode}</span>` : ''}
+                        <span class="test-name">${item.name}</span>
+                        ${item.result ? `<button class="copy-btn" onclick="copyText(event, this, '${item.name}')" title="Copy test path">${copySvg}</button>` : ''}
+                        <span class="expand-icon">&#9654;</span>
+                    </div>
+                    <div class="test-content">`;
+            if (tabs) {
+                html += `<div class="tab-bar">${tabs.bar}</div>
+                        <div class="preview-container" id="preview-${testId}">
+                            <div class="loading">Select a tab to view content</div>
+                        </div>`;
+            } else if (item.inlineFileResult) {
+                html += `<iframe class="inline-file-frame" src="${item.inlineFileResult}"></iframe>`;
+            }
+            html += `</div></div>`;
+            return html;
         }
 
         function buildTabs(test) {
@@ -678,8 +737,7 @@
                 tabs.push({ id: 'compare', label: 'Compare', expected: `${test.name}.expected.png`, actual: `${test.name}.actual.png`, diff: `${test.name}.diff.png`, pixelErrors: test.pixelErrors, maxChannelDiff: test.maxChannelDiff, type: 'imageDiff' });
             }
 
-            if (test.hasStdout) tabs.push({ id: 'stdout', label: 'stdout', file: `${test.name}.stdout.html`, type: 'text' });
-            if (test.hasStderr) tabs.push({ id: 'stderr', label: 'stderr', file: `${test.name}.stderr.html`, type: 'text' });
+            if (test.hasLogs) tabs.push({ id: 'std-logs', label: 'std logs', file: `${test.name}.logs.html`, type: 'text' });
 
             const bar = tabs.map((t, i) =>
                 `<button class="tab-btn${i === 0 ? ' active' : ''}" onclick="showTab('${test.name.replace(/[^a-zA-Z0-9]/g, '-')}', ${JSON.stringify(t).replace(/"/g, '&quot;')}, this)">${t.label}</button>`
@@ -688,13 +746,13 @@
             return { bar, tabs };
         }
 
-        function copyTestName(event, btn, name) {
-            event.stopPropagation();
-            navigator.clipboard.writeText(name).then(function() {
-                btn.innerHTML = checkSvg;
+        function copyText(event, btn, text) {
+            event?.stopPropagation();
+            navigator.clipboard.writeText(text).then(function() {
+                setCopyButtonContents(btn, checkSvg);
                 btn.classList.add('copied');
                 setTimeout(function() {
-                    btn.innerHTML = copySvg;
+                    setCopyButtonContents(btn, copySvg);
                     btn.classList.remove('copied');
                 }, 1500);
             });
