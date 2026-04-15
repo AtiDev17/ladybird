@@ -6,11 +6,23 @@
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
 
+#    include <AK/Array.h>
 #    include <AK/Format.h>
 #    include <AK/Vector.h>
 #    include <LibGfx/VulkanImage.h>
 
 namespace Gfx {
+
+static uint32_t find_memory_type_index(VkPhysicalDeviceMemoryProperties const& memory_properties, VkMemoryRequirements const& memory_requirements, VkMemoryPropertyFlags required_flags)
+{
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        auto const property_flags = memory_properties.memoryTypes[i].propertyFlags;
+        if ((memory_requirements.memoryTypeBits & (1u << i)) && (property_flags & required_flags) == required_flags)
+            return i;
+    }
+
+    return memory_properties.memoryTypeCount;
+}
 
 VulkanImage::~VulkanImage()
 {
@@ -67,7 +79,7 @@ void VulkanImage::transition_layout(VkImageLayout old_layout, VkImageLayout new_
     vkQueueWaitIdle(context.graphics_queue);
 }
 
-int VulkanImage::get_dma_buf_fd()
+int VulkanImage::get_dma_buf_fd() const
 {
     VkMemoryGetFdInfoKHR get_fd_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
@@ -84,7 +96,7 @@ int VulkanImage::get_dma_buf_fd()
     return fd;
 }
 
-ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, uint32_t num_modifiers, uint64_t const* modifiers)
+ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
 {
     VkDrmFormatModifierPropertiesListEXT format_mod_props_list = {};
     format_mod_props_list.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
@@ -102,14 +114,15 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     Vector<uint64_t> format_mods;
     for (VkDrmFormatModifierPropertiesEXT const& props : format_mod_props) {
         if ((props.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && (props.drmFormatModifierPlaneCount == 1)) {
-            for (uint32_t i = 0; i < num_modifiers; ++i) {
-                if (modifiers[i] == props.drmFormatModifier) {
-                    format_mods.append(props.drmFormatModifier);
-                    break;
-                }
-            }
+            if (modifiers.contains_slow(props.drmFormatModifier))
+                format_mods.append(props.drmFormatModifier);
         }
     }
+
+    // If the caller requested specific DRM modifiers and none are supported for a renderable image,
+    // fail here so higher-level code can fall back to a different backing-store type.
+    if (!modifiers.is_empty() && format_mods.is_empty())
+        return Error::from_string_literal("no supported DRM format modifiers for shared image");
 
     NonnullRefPtr<VulkanImage> image = make_ref_counted<VulkanImage>(context);
     VkImageDrmFormatModifierListCreateInfoEXT image_drm_format_modifier_list_info = {
@@ -155,12 +168,18 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     vkGetImageMemoryRequirements(context.logical_device, image->image, &mem_reqs);
     VkPhysicalDeviceMemoryProperties mem_props;
     vkGetPhysicalDeviceMemoryProperties(context.physical_device, &mem_props);
-    uint32_t mem_type_idx;
-    for (mem_type_idx = 0; mem_type_idx < mem_props.memoryTypeCount; ++mem_type_idx) {
-        if ((mem_reqs.memoryTypeBits & (1 << mem_type_idx)) && (mem_props.memoryTypes[mem_type_idx].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            break;
+    bool const is_linear_image = format_mods.size() == 1 && format_mods[0] == DRM_FORMAT_MOD_LINEAR;
+    uint32_t mem_type_idx = mem_props.memoryTypeCount;
+
+    if (is_linear_image) {
+        mem_type_idx = find_memory_type_index(mem_props, mem_reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (mem_type_idx == mem_props.memoryTypeCount) {
+            mem_type_idx = find_memory_type_index(mem_props, mem_reqs, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         }
+    } else {
+        mem_type_idx = find_memory_type_index(mem_props, mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
+
     if (mem_type_idx == mem_props.memoryTypeCount) {
         return Error::from_string_literal("unable to find suitable image memory type");
     }

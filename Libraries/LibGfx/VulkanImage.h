@@ -11,6 +11,7 @@
 #    include <AK/Assertions.h>
 #    include <AK/NonnullRefPtr.h>
 #    include <AK/RefCounted.h>
+#    include <AK/Span.h>
 #    include <LibGfx/VulkanContext.h>
 #    include <libdrm/drm_fourcc.h>
 
@@ -31,7 +32,7 @@ struct VulkanImage : public RefCounted<VulkanImage> {
     } info;
     VulkanContext const& context;
 
-    int get_dma_buf_fd();
+    int get_dma_buf_fd() const;
     void transition_layout(VkImageLayout old_layout, VkImageLayout new_layout);
     VulkanImage(VulkanContext const& context)
         : context(context)
@@ -52,7 +53,7 @@ static inline uint32_t vk_format_to_drm_format(VkFormat format)
     }
 }
 
-ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, uint32_t num_modifiers, uint64_t const* modifiers);
+ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers);
 
 }
 
