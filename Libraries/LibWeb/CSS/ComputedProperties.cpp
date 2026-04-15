@@ -1166,6 +1166,7 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
                     break;
                 }
             } else if (item->is_counter()) {
+                content_data.counter_style_dependencies.append(item->as_counter().counter_style()->as_counter_style().resolve_counter_style(element_reference.style_scope()));
                 content_data.data.append(item->as_counter().resolve(element_reference));
             } else if (item->is_image()) {
                 content_data.data.append(NonnullRefPtr { const_cast<ImageStyleValue&>(item->as_image()) });
@@ -1182,6 +1183,7 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
                 if (item->is_string()) {
                     alt_text_builder.append(item->as_string().string_value());
                 } else if (item->is_counter()) {
+                    content_data.counter_style_dependencies.append(item->as_counter().counter_style()->as_counter_style().resolve_counter_style(element_reference.style_scope()));
                     alt_text_builder.append(item->as_counter().resolve(element_reference));
                 } else {
                     dbgln("`{}` is not supported in `content` alt-text (yet?)", item->to_string(SerializationMode::Normal));
@@ -1195,9 +1197,9 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
 
     switch (value.to_keyword()) {
     case Keyword::None:
-        return { { ContentData::Type::None, {} }, quote_nesting_level };
+        return { { ContentData::Type::None, {}, {} }, quote_nesting_level };
     case Keyword::Normal:
-        return { { ContentData::Type::Normal, {} }, quote_nesting_level };
+        return { { ContentData::Type::Normal, {}, {} }, quote_nesting_level };
     default:
         break;
     }
@@ -1308,7 +1310,7 @@ TextTransform ComputedProperties::text_transform() const
     return keyword_to_text_transform(value.to_keyword()).release_value();
 }
 
-ListStyleType ComputedProperties::list_style_type(HashMap<FlyString, NonnullRefPtr<CSS::CounterStyle const>> const& registered_counter_styles) const
+ListStyleType ComputedProperties::list_style_type(StyleScope const& style_scope) const
 {
     auto const& value = property(PropertyID::ListStyleType);
 
@@ -1318,7 +1320,7 @@ ListStyleType ComputedProperties::list_style_type(HashMap<FlyString, NonnullRefP
     if (value.is_string())
         return value.as_string().string_value().to_string();
 
-    return value.as_counter_style().resolve_counter_style(registered_counter_styles);
+    return value.as_counter_style().resolve_counter_style(style_scope);
 }
 
 ListStylePosition ComputedProperties::list_style_position() const

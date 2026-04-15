@@ -17,7 +17,7 @@ class CounterStyle : public RefCounted<CounterStyle> {
 public:
     static NonnullRefPtr<CounterStyle const> decimal();
     static NonnullRefPtr<CounterStyle const> disc();
-    static NonnullRefPtr<CounterStyle const> from_counter_style_definition(CounterStyleDefinition const&, HashMap<FlyString, NonnullRefPtr<CounterStyle const>> const&);
+    static NonnullRefPtr<CounterStyle const> from_counter_style_definition(CounterStyleDefinition const&, StyleScope const&);
 
     static NonnullRefPtr<CounterStyle const> create(FlyString name, CounterStyleAlgorithm algorithm, CounterStyleNegativeSign negative_sign, FlyString prefix, FlyString suffix, Vector<CounterStyleRangeEntry> range, Optional<FlyString> fallback, CounterStylePad pad)
     {
@@ -38,6 +38,7 @@ public:
 
     Optional<String> generate_an_initial_representation_for_the_counter_value(i64 value) const;
     bool uses_a_negative_sign() const;
+    bool equals(CounterStyle const&) const;
 
     virtual ~CounterStyle() = default;
 
@@ -83,6 +84,6 @@ private:
     CounterStylePad m_pad;
 };
 
-String generate_a_counter_representation(RefPtr<CounterStyle const> const& counter_style, HashMap<FlyString, NonnullRefPtr<CounterStyle const>> const& registered_counter_styles, i32 value);
+String generate_a_counter_representation(RefPtr<CounterStyle const> const& counter_style, StyleScope const& style_scope, i32 value);
 
 }
