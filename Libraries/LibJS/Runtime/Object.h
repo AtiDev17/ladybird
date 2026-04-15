@@ -225,7 +225,9 @@ public:
     using IntrinsicAccessor = Value (*)(Realm&);
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
 
+    void define_native_function(Realm&, PropertyKey const&, NativeFunctionPointer, i32 length, PropertyAttributes attributes, Optional<Bytecode::Builtin> builtin = {});
     void define_native_function(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)>, i32 length, PropertyAttributes attributes, Optional<Bytecode::Builtin> builtin = {});
+    void define_native_accessor(Realm&, PropertyKey const&, NativeFunctionPointer getter, NativeFunctionPointer setter, PropertyAttributes attributes);
     void define_native_accessor(Realm&, PropertyKey const&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> getter, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> setter, PropertyAttributes attributes);
     void define_native_javascript_backed_function(PropertyKey const&, GC::Ref<NativeJavaScriptBackedFunction> function, i32 length, PropertyAttributes attributes);
 
@@ -254,9 +256,11 @@ public:
     virtual bool is_global_object() const { return false; }
     virtual bool is_proxy_object() const { return false; }
     virtual bool is_native_function() const { return false; }
+    [[nodiscard]] bool is_raw_native_function() const { return m_flags & Flag::IsRawNativeFunction; }
     [[nodiscard]] bool is_ecmascript_function_object() const { return m_flags & Flag::IsECMAScriptFunctionObject; }
     void set_is_ecmascript_function_object() { m_flags |= Flag::IsECMAScriptFunctionObject; }
     void set_is_function() { m_flags |= Flag::IsFunction; }
+    void set_is_raw_native_function() { m_flags |= Flag::IsRawNativeFunction; }
     void clear_is_function() { m_flags &= ~Flag::IsFunction; }
     virtual bool is_array_iterator() const { return false; }
     virtual bool is_raw_json_object() const { return false; }
@@ -285,8 +289,7 @@ public:
     // B.3.7 The [[IsHTMLDDA]] Internal Slot, https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
     virtual bool is_htmldda() const { return false; }
 
-    bool has_parameter_map() const { return m_flags & Flag::HasParameterMap; }
-    void set_has_parameter_map() { m_flags |= Flag::HasParameterMap; }
+    bool has_parameter_map() const { return shape().has_parameter_map(); }
 
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -370,7 +373,7 @@ protected:
 private:
     struct Flag {
         static constexpr u8 IsExtensible = 1 << 0;
-        static constexpr u8 HasParameterMap = 1 << 1;
+        static constexpr u8 IsRawNativeFunction = 1 << 1;
         static constexpr u8 HasMagicalLengthProperty = 1 << 2;
         static constexpr u8 IsTypedArray = 1 << 3;
         static constexpr u8 MayInterfereWithIndexedPropertyAccess = 1 << 4;
