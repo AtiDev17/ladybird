@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2020-2021, the SerenityOS developers.
- * Copyright (c) 2021-2024, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -85,6 +85,14 @@ public:
         return m_eof;
     }
 
+    // NB: If offset is 0, this is the same as next_token().
+    [[nodiscard]] T const& peek_token(size_t offset)
+    {
+        if (m_index + offset < m_tokens.size())
+            return m_tokens[m_index + offset];
+        return m_eof;
+    }
+
     // https://drafts.csswg.org/css-syntax/#token-stream-empty
     [[nodiscard]] bool is_empty() const
     {
@@ -141,31 +149,6 @@ public:
     bool has_next_token()
     {
         return !is_empty();
-    }
-
-    // Deprecated, used in older versions of the spec.
-    T const& current_token()
-    {
-        if (m_index < 1 || (m_index - 1) >= m_tokens.size())
-            return m_eof;
-
-        return m_tokens.at(m_index - 1);
-    }
-
-    // Deprecated
-    T const& peek_token(size_t offset = 0)
-    {
-        if (remaining_token_count() <= offset)
-            return m_eof;
-
-        return m_tokens.at(m_index + offset);
-    }
-
-    // Deprecated, was used in older versions of the spec.
-    void reconsume_current_input_token()
-    {
-        if (m_index > 0)
-            --m_index;
     }
 
     StateTransaction begin_transaction() { return StateTransaction(*this); }

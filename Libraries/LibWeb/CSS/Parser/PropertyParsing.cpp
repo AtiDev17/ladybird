@@ -93,9 +93,11 @@ RefPtr<StyleValue const> Parser::parse_all_as_single_keyword_value(TokenStream<C
 RefPtr<StyleValueList const> Parser::parse_simple_comma_separated_value_list(PropertyID property_id, TokenStream<ComponentValue>& tokens)
 {
     return parse_comma_separated_value_list(tokens, [this, property_id](auto& tokens) -> RefPtr<StyleValue const> {
-        if (auto value = parse_css_value_for_property(property_id, tokens))
+        auto transaction = tokens.begin_transaction();
+        if (auto value = parse_css_value_for_property(property_id, tokens)) {
+            transaction.commit();
             return value;
-        tokens.reconsume_current_input_token();
+        }
         return nullptr;
     });
 }
@@ -475,24 +477,24 @@ Parser::ParseErrorOr<NonnullRefPtr<StyleValue const>> Parser::parse_css_value(Pr
     auto context_guard = push_temporary_value_parsing_context(property_id);
 
     SubstitutionFunctionsPresence substitution_presence;
+    {
+        // NB: This transaction is intentionally never committed. This loop just examines the tokens and doesn't want
+        //     to permanently consume anything.
+        auto transaction = tokens.begin_transaction();
+        while (tokens.has_next_token()) {
+            auto const& token = tokens.consume_a_token();
 
-    tokens.mark();
-    while (tokens.has_next_token()) {
-        auto const& token = tokens.consume_a_token();
+            if (token.is(Token::Type::Semicolon))
+                return ParseError::SyntaxError;
 
-        if (token.is(Token::Type::Semicolon)) {
-            tokens.reconsume_current_input_token();
-            return ParseError::SyntaxError;
+            // https://drafts.csswg.org/css-values-5/#resolve-property
+            // If a property value contains one or more arbitrary substitution functions, and all of those functions are
+            // themselves syntactically valid according to their argument grammars, the entire value’s grammar must be
+            // assumed to be valid at parse time.
+            if (collect_arbitrary_substitution_function_presence(token, substitution_presence).is_error())
+                return ParseError::SyntaxError;
         }
-
-        // https://drafts.csswg.org/css-values-5/#resolve-property
-        // If a property value contains one or more arbitrary substitution functions, and all of those functions are
-        // themselves syntactically valid according to their argument grammars, the entire value’s grammar must be
-        // assumed to be valid at parse time.
-        if (collect_arbitrary_substitution_function_presence(token, substitution_presence).is_error())
-            return ParseError::SyntaxError;
     }
-    tokens.restore_a_mark();
 
     auto parse_all_as = [](auto& tokens, auto&& callback) -> ParseErrorOr<NonnullRefPtr<StyleValue const>> {
         tokens.discard_whitespace();
@@ -1331,11 +1333,18 @@ RefPtr<StyleValue const> Parser::parse_background_value(TokenStream<ComponentVal
             continue;
         }
 
-        auto value_and_property = parse_css_value_for_properties(remaining_layer_properties, tokens);
-        if (!value_and_property.has_value())
-            return nullptr;
-        auto& value = value_and_property->style_value;
-        auto property = value_and_property->property;
+        Optional<PropertyAndValue> property_and_value;
+        {
+            auto value_transaction = tokens.begin_transaction();
+            property_and_value = parse_css_value_for_properties(remaining_layer_properties, tokens);
+            if (!property_and_value.has_value())
+                return nullptr;
+            // FIXME: background-repeat can't be parsed fully with parse_css_value_for_properties(), so don't commit
+            //        the transaction, and then parse it manually below.
+            if (property_and_value->property != PropertyID::BackgroundRepeat)
+                value_transaction.commit();
+        }
+        auto& [property, value] = *property_and_value;
         remove_property(remaining_layer_properties, property);
 
         switch (property) {
@@ -1397,7 +1406,7 @@ RefPtr<StyleValue const> Parser::parse_background_value(TokenStream<ComponentVal
         }
         case PropertyID::BackgroundRepeat: {
             VERIFY(!background_repeat);
-            tokens.reconsume_current_input_token();
+            // NB: The tokens for this didn't get consumed, see above. So we parse it fully now.
             if (auto maybe_repeat = parse_single_repeat_style_value(property, tokens)) {
                 background_repeat = maybe_repeat.release_nonnull();
                 tokens.discard_whitespace();
@@ -2590,7 +2599,7 @@ RefPtr<StyleValue const> Parser::parse_font_value(TokenStream<ComponentValue>& t
 
         // <font-variant-css2> = normal | small-caps
         // So, we handle that manually instead of trying to parse the font-variant property.
-        if (!font_variant && tokens.peek_token().is_ident("small-caps"sv)) {
+        if (!font_variant && tokens.next_token().is_ident("small-caps"sv)) {
             tokens.discard_a_token(); // small-caps
 
             font_variant = ShorthandStyleValue::create(PropertyID::FontVariant,
@@ -2616,7 +2625,7 @@ RefPtr<StyleValue const> Parser::parse_font_value(TokenStream<ComponentValue>& t
 
         // <font-width-css3> = normal | ultra-condensed | extra-condensed | condensed | semi-condensed | semi-expanded | expanded | extra-expanded | ultra-expanded
         // So again, we do this manually.
-        if (!font_width && tokens.peek_token().is(Token::Type::Ident)) {
+        if (!font_width && tokens.next_token().is(Token::Type::Ident)) {
             auto font_width_transaction = tokens.begin_transaction();
             if (auto keyword = parse_keyword_value(tokens)) {
                 if (keyword_to_font_width(keyword->to_keyword()).has_value()) {
@@ -3253,11 +3262,18 @@ RefPtr<StyleValue const> Parser::parse_mask_value(TokenStream<ComponentValue>& t
             continue;
         }
 
-        auto value_and_property = parse_css_value_for_properties(remaining_layer_properties, tokens);
-        if (!value_and_property.has_value())
-            return nullptr;
-        auto& value = value_and_property->style_value;
-        auto property = value_and_property->property;
+        Optional<PropertyAndValue> property_and_value;
+        {
+            auto value_transaction = tokens.begin_transaction();
+            property_and_value = parse_css_value_for_properties(remaining_layer_properties, tokens);
+            if (!property_and_value.has_value())
+                return nullptr;
+            // FIXME: mask-repeat can't be parsed fully with parse_css_value_for_properties(), so don't commit
+            //        the transaction, and then parse it manually below.
+            if (property_and_value->property != PropertyID::MaskRepeat)
+                value_transaction.commit();
+        }
+        auto& [property, value] = *property_and_value;
         remove_property(remaining_layer_properties, property);
 
         switch (property) {
@@ -3291,7 +3307,7 @@ RefPtr<StyleValue const> Parser::parse_mask_value(TokenStream<ComponentValue>& t
         // <repeat-style>
         case PropertyID::MaskRepeat: {
             VERIFY(!mask_repeat);
-            tokens.reconsume_current_input_token();
+            // NB: The tokens for this didn't get consumed, see above. So we parse it fully now.
             if (auto maybe_repeat = parse_single_repeat_style_value(property, tokens)) {
                 mask_repeat = maybe_repeat.release_nonnull();
                 tokens.discard_whitespace();
@@ -4132,13 +4148,21 @@ RefPtr<StyleValue const> Parser::parse_text_decoration_value(TokenStream<Compone
 
     auto transaction = tokens.begin_transaction();
     while (tokens.has_next_token()) {
-        auto property_and_value = parse_css_value_for_properties(remaining_longhands, tokens);
-        if (!property_and_value.has_value())
-            return nullptr;
-        auto& value = property_and_value->style_value;
-        remove_property(remaining_longhands, property_and_value->property);
+        Optional<PropertyAndValue> property_and_value;
+        {
+            auto value_transaction = tokens.begin_transaction();
+            property_and_value = parse_css_value_for_properties(remaining_longhands, tokens);
+            if (!property_and_value.has_value())
+                return nullptr;
+            // FIXME: text-decoration-line can't be parsed fully with parse_css_value_for_properties(), so don't commit
+            //        the transaction, and then parse it manually below.
+            if (property_and_value->property != PropertyID::TextDecorationLine)
+                value_transaction.commit();
+        }
+        auto& [property, value] = *property_and_value;
+        remove_property(remaining_longhands, property);
 
-        switch (property_and_value->property) {
+        switch (property) {
         case PropertyID::TextDecorationColor: {
             VERIFY(!decoration_color);
             decoration_color = value.release_nonnull();
@@ -4146,7 +4170,7 @@ RefPtr<StyleValue const> Parser::parse_text_decoration_value(TokenStream<Compone
         }
         case PropertyID::TextDecorationLine: {
             VERIFY(!decoration_line);
-            tokens.reconsume_current_input_token();
+            // NB: The tokens for this didn't get consumed, see above. So we parse it fully now.
             auto parsed_decoration_line = parse_text_decoration_line_value(tokens);
             if (!parsed_decoration_line)
                 return nullptr;
