@@ -7,10 +7,9 @@
 
 #include "ColorMixStyleValue.h"
 #include <AK/TypeCasts.h>
+#include <LibWeb/CSS/ColorInterpolation.h>
 #include <LibWeb/CSS/Interpolation.h>
-#include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorInterpolationMethodStyleValue.h>
-#include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/Layout/Node.h>
 
 namespace Web::CSS {
@@ -196,14 +195,6 @@ ColorMixStyleValue::PercentageNormalizationResult ColorMixStyleValue::normalize_
 // https://drafts.csswg.org/css-color-5/#color-mix-result
 Optional<Color> ColorMixStyleValue::to_color(ColorResolutionContext color_resolution_context) const
 {
-    // FIXME: Take the color space and hue interpolation method into account.
-    // The current implementation only uses oklab interpolation.
-    auto from_color = m_properties.first_component.color->to_color(color_resolution_context);
-    auto to_color = m_properties.second_component.color->to_color(color_resolution_context);
-
-    if (!from_color.has_value() || !to_color.has_value())
-        return {};
-
     auto p1 = m_properties.first_component.percentage
         ? Optional<Percentage>(Percentage::from_style_value(*m_properties.first_component.percentage))
         : Optional<Percentage> {};
@@ -212,10 +203,22 @@ Optional<Color> ColorMixStyleValue::to_color(ColorResolutionContext color_resolu
         : Optional<Percentage> {};
     auto normalized = normalize_percentage_pair(p1, p2);
 
-    auto result = interpolate_color(from_color.value(), to_color.value(), normalized.second_percentage.as_fraction(), ColorSyntax::Modern);
+    auto color_interpolation_method = m_properties.color_interpolation_method
+        ? m_properties.color_interpolation_method->as_color_interpolation_method().color_interpolation_method()
+        : ColorInterpolationMethodStyleValue::ColorInterpolationMethod { RectangularColorSpace::Oklab };
+
+    auto interpolated = perform_color_interpolation(*m_properties.first_component.color, *m_properties.second_component.color, normalized.second_percentage.as_fraction(), color_interpolation_method, color_resolution_context);
+    if (!interpolated.has_value())
+        return {};
+
     if (normalized.alpha_multiplier < 1.0)
-        result.set_alpha(static_cast<u8>(result.alpha() * normalized.alpha_multiplier));
-    return result;
+        interpolated->components.set_alpha(interpolated->components.alpha() * normalized.alpha_multiplier);
+
+    auto style_value = style_value_for_interpolated_color(*interpolated);
+    if (!style_value)
+        return {};
+
+    return style_value->to_color(color_resolution_context);
 }
 
 ValueComparingNonnullRefPtr<StyleValue const> ColorMixStyleValue::absolutized(ComputationContext const& context) const
@@ -231,26 +234,24 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorMixStyleValue::absolutized(Co
         .calculation_resolution_context = CalculationResolutionContext::from_computation_context(context),
     };
     auto absolutized_color_interpolation_method = m_properties.color_interpolation_method ? ValueComparingRefPtr<StyleValue const> { m_properties.color_interpolation_method->absolutized(context) } : nullptr;
-    auto absolutized_first_color = m_properties.first_component.color->absolutized(context);
-    auto absolutized_second_color = m_properties.second_component.color->absolutized(context);
 
-    auto from_color = absolutized_first_color->to_color(color_resolution_context);
-    auto to_color = absolutized_second_color->to_color(color_resolution_context);
     auto delta = Percentage::from_style_value(normalized_percentages.p2).as_fraction();
 
-    if (from_color.has_value() && to_color.has_value()) {
-        // FIXME: Interpolation should produce a StyleValue of some kind instead of a Gfx::Color, and use the interpolation color space.
-        auto interpolated_color = interpolate_color(from_color.value(), to_color.value(), delta, ColorSyntax::Modern);
-        return ColorFunctionStyleValue::create(
-            "srgb"sv,
-            NumberStyleValue::create(interpolated_color.red() / 255.0f),
-            NumberStyleValue::create(interpolated_color.green() / 255.0f),
-            NumberStyleValue::create(interpolated_color.blue() / 255.0f),
-            NumberStyleValue::create(interpolated_color.alpha() / 255.0f));
+    auto color_interpolation_method = absolutized_color_interpolation_method
+        ? absolutized_color_interpolation_method->as_color_interpolation_method().color_interpolation_method()
+        : ColorInterpolationMethodStyleValue::ColorInterpolationMethod { RectangularColorSpace::Oklab };
+
+    if (auto interpolated = perform_color_interpolation(*m_properties.first_component.color, *m_properties.second_component.color, delta, color_interpolation_method, color_resolution_context); interpolated.has_value()) {
+        if (normalized_percentages.alpha_multiplier < 1.0)
+            interpolated->components.set_alpha(interpolated->components.alpha() * normalized_percentages.alpha_multiplier);
+        if (auto style_value = style_value_for_interpolated_color(*interpolated))
+            return style_value.release_nonnull();
     }
 
     // Fall back to returning a color-mix() with absolutized values if we can't compute completely.
     // Currently, this is only the case if one of our colors relies on `currentcolor`, as that does not compute to a color value.
+    auto absolutized_first_color = m_properties.first_component.color->absolutized(context);
+    auto absolutized_second_color = m_properties.second_component.color->absolutized(context);
     if (absolutized_first_color == m_properties.first_component.color && normalized_percentages.p1 == m_properties.first_component.percentage
         && absolutized_second_color == m_properties.second_component.color && normalized_percentages.p2 == m_properties.second_component.percentage)
         return *this;
