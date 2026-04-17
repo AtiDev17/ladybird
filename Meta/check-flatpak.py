@@ -57,6 +57,15 @@ vcpkg_not_linux = [
     "pthread",
 ]
 
+# List of libraries that are behind vcpkg manifest features and only
+# installed for specific GUI frameworks (e.g. GTK), not the Qt flatpak.
+vcpkg_feature_only = [
+    "gtk",
+    "libadwaita",
+    "wayland",
+    "wayland-protocols",
+]
+
 
 class DepMatch(Enum):
     Match = (0,)
@@ -71,9 +80,11 @@ def get_baseline_version(baseline, name):
         subprocess.run(cmd, stdout=subprocess.PIPE, shell=True, check=True)
 
     # Query the current vcpkg baseline for its version of this package, this becomes the reference for linting
+    # Clear GIT_DIR so git operates on the vcpkg repo, not the parent repo (pre-commit sets GIT_DIR)
+    env = {k: v for k, v in os.environ.items() if k != "GIT_DIR"}
     cmd = f"cd {VCPKG_REPO} && git show {baseline}:versions/baseline.json 2> /dev/null | grep -E -A 3 -e '\"{name}\"'"
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, shell=True, check=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, shell=True, check=True, env=env)
 
         if not result.returncode:
             json_string = result.stdout.decode("utf-8").replace("\n", "").removesuffix(",")
@@ -167,7 +178,7 @@ def check_vcpkg_vs_flatpak_versioning():
                     flatpak.append(name)
 
         # Remove excluded dependencies from the vcpkg list
-        for name in flatpak_runtime_libs + vcpkg_not_linux:
+        for name in flatpak_runtime_libs + vcpkg_not_linux + vcpkg_feature_only:
             if name in vcpkg:
                 del vcpkg[name]
 
