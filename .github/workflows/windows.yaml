@@ -221,6 +221,15 @@ jobs:
           $hash = (Get-FileHash -Path "ladybird-windows-x64.zip" -Algorithm SHA256).Hash
           $hash | Out-File -FilePath "ladybird-windows-x64.zip.sha256" -Encoding ASCII
 
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: ladybird-windows-x64
+          path: |
+            ladybird-windows-x64.zip
+          retention-days: 14
+
       - name: Validate Build Stability
         shell: pwsh
         run: |
@@ -258,15 +267,6 @@ jobs:
           }
           
           Stop-Process -Id $proc.Id -Force
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v7
-        if: success()
-        with:
-          name: ladybird-windows-x64
-          path: |
-            ladybird-windows-x64.zip
-          retention-days: 14
           
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2.6.2
