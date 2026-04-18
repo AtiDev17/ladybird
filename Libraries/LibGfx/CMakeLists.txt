@@ -118,6 +118,9 @@ find_package(harfbuzz REQUIRED)
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG avif WebP::webp WebP::webpdecoder
             WebP::webpdemux WebP::libwebpmux skia harfbuzz)
 
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libgfx_rust FFI_HEADER RustFFI.h)
+target_link_libraries(LibGfx PRIVATE libgfx_rust)
+
 if (HAS_FONTCONFIG)
     target_link_libraries(LibGfx PRIVATE Fontconfig::Fontconfig)
 endif()

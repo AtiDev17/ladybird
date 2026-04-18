@@ -1,0 +1,13 @@
+[package]
+name = "libgfx_rust"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+yuv = "0.8"
+
+[build-dependencies]
+cbindgen = "0.29"

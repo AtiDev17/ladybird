@@ -14,7 +14,7 @@ TEST_CASE(adopt_specified_values_ignores_reserved_and_unspecified_values)
         Media::MatrixCoefficients::BT709, Media::VideoFullRangeFlag::Studio
     };
 
-    cicp.adopt_specified_values({ Media::ColorPrimaries::Reserved, Media::TransferCharacteristics::Reserved,
+    cicp.adopt_specified_values({ static_cast<Media::ColorPrimaries>(0), static_cast<Media::TransferCharacteristics>(0),
         Media::MatrixCoefficients::Unspecified, Media::VideoFullRangeFlag::Unspecified });
 
     EXPECT(cicp.color_primaries() == Media::ColorPrimaries::BT709);

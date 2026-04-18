@@ -35,7 +35,8 @@ ColorSpace::ColorSpace(ColorSpace const& other)
 
 ColorSpace& ColorSpace::operator=(ColorSpace const& other)
 {
-    m_color_space = make<Details::ColorSpaceImpl>(other.m_color_space->color_space);
+    if (this != &other)
+        m_color_space = make<Details::ColorSpaceImpl>(other.m_color_space->color_space);
     return *this;
 }
 
@@ -50,47 +51,82 @@ ColorSpace::ColorSpace(NonnullOwnPtr<Details::ColorSpaceImpl>&& color_space)
 
 ErrorOr<ColorSpace> ColorSpace::from_cicp(Media::CodingIndependentCodePoints cicp)
 {
-    if (cicp.matrix_coefficients() != Media::MatrixCoefficients::Identity)
-        return Error::from_string_literal("Unsupported matrix coefficients for CICP");
+    auto gamut = TRY([&] -> ErrorOr<skcms_Matrix3x3> {
+        if (cicp.color_primaries() == Media::ColorPrimaries::XYZ)
+            return SkNamedGamut::kXYZ;
 
-    if (cicp.video_full_range_flag() != Media::VideoFullRangeFlag::Full)
-        return Error::from_string_literal("Unsupported matrix coefficients for CICP");
+        auto primaries = TRY([&] -> ErrorOr<SkColorSpacePrimaries> {
+            switch (cicp.color_primaries()) {
+            case Media::ColorPrimaries::BT709:
+            case Media::ColorPrimaries::Unspecified:
+                return SkNamedPrimaries::kRec709;
+            case Media::ColorPrimaries::BT470M:
+                return SkNamedPrimaries::kRec470SystemM;
+            case Media::ColorPrimaries::BT470BG:
+                return SkNamedPrimaries::kRec470SystemBG;
+            case Media::ColorPrimaries::BT601:
+                return SkNamedPrimaries::kRec601;
+            case Media::ColorPrimaries::SMPTE240:
+                return SkNamedPrimaries::kSMPTE_ST_240;
+            case Media::ColorPrimaries::GenericFilm:
+                return SkNamedPrimaries::kGenericFilm;
+            case Media::ColorPrimaries::BT2020:
+                return SkNamedPrimaries::kRec2020;
+            case Media::ColorPrimaries::XYZ:
+                VERIFY_NOT_REACHED();
+            case Media::ColorPrimaries::SMPTE431:
+                return SkNamedPrimaries::kSMPTE_RP_431_2;
+            case Media::ColorPrimaries::SMPTE432:
+                return SkNamedPrimaries::kSMPTE_EG_432_1;
+            case Media::ColorPrimaries::EBU3213:
+                return SkNamedPrimaries::kITU_T_H273_Value22;
+            }
+            return Error::from_string_literal("Illegal color primaries");
+        }());
+        skcms_Matrix3x3 result;
+        VERIFY(primaries.toXYZD50(&result));
+        return result;
+    }());
 
-    skcms_Matrix3x3 gamut = SkNamedGamut::kSRGB;
-    switch (cicp.color_primaries()) {
-    case Media::ColorPrimaries::BT709:
-        gamut = SkNamedGamut::kSRGB;
-        break;
-    case Media::ColorPrimaries::BT2020:
-        gamut = SkNamedGamut::kRec2020;
-        break;
-    case Media::ColorPrimaries::XYZ:
-        gamut = SkNamedGamut::kXYZ;
-        break;
-    case Media::ColorPrimaries::SMPTE432:
-        gamut = SkNamedGamut::kDisplayP3;
-        break;
-    default:
-        return Error::from_string_literal("FIXME: Unsupported color primaries");
-    }
-
-    skcms_TransferFunction transfer_function = SkNamedTransferFn::kSRGB;
-    switch (cicp.transfer_characteristics()) {
-    case Media::TransferCharacteristics::Linear:
-        transfer_function = SkNamedTransferFn::kLinear;
-        break;
-    case Media::TransferCharacteristics::SRGB:
-        transfer_function = SkNamedTransferFn::kSRGB;
-        break;
-    case Media::TransferCharacteristics::SMPTE2084:
-        transfer_function = SkNamedTransferFn::kPQ;
-        break;
-    case Media::TransferCharacteristics::HLG:
-        transfer_function = SkNamedTransferFn::kHLG;
-        break;
-    default:
-        return Error::from_string_literal("FIXME: Unsupported transfer function");
-    }
+    auto transfer_function = TRY([&] -> ErrorOr<skcms_TransferFunction> {
+        switch (cicp.transfer_characteristics()) {
+        case Media::TransferCharacteristics::BT709:
+        case Media::TransferCharacteristics::Unspecified:
+        case Media::TransferCharacteristics::BT601:
+        case Media::TransferCharacteristics::BT2020BitDepth10:
+        case Media::TransferCharacteristics::BT2020BitDepth12:
+            // This isn't technically correct, but Chromium has set the precedent that these are treated as sRGB as an
+            // optimization. Using the actual transfer characteristics will produce output inconsistent with other
+            // browsers, so we unfortunately have to follow suit.
+            return SkNamedTransferFn::kSRGB;
+        case Media::TransferCharacteristics::BT470M:
+            return SkNamedTransferFn::kRec470SystemM;
+        case Media::TransferCharacteristics::BT470BG:
+            return SkNamedTransferFn::kRec470SystemBG;
+        case Media::TransferCharacteristics::SMPTE240:
+            return SkNamedTransferFn::kSMPTE_ST_240;
+        case Media::TransferCharacteristics::Linear:
+            return SkNamedTransferFn::kLinear;
+        case Media::TransferCharacteristics::Log100:
+        case Media::TransferCharacteristics::Log100Sqrt10:
+            return Error::from_string_literal("Logarithmic transfer characteristics are unsupported.");
+        case Media::TransferCharacteristics::IEC61966:
+            return SkNamedTransferFn::kIEC61966_2_4;
+        case Media::TransferCharacteristics::BT1361:
+            return Error::from_string_literal("BT.1361 transfer characteristics are not supported.");
+        case Media::TransferCharacteristics::SRGB:
+            return SkNamedTransferFn::kSRGB;
+        case Media::TransferCharacteristics::SMPTE2084:
+            return SkNamedTransferFn::kPQ;
+        case Media::TransferCharacteristics::SMPTE428:
+            return SkNamedTransferFn::kSMPTE_ST_428_1;
+        case Media::TransferCharacteristics::HLG:
+            // FIXME: This will need to change to use the HLG transfer function when the surface we're painting to
+            //        supports HDR.
+            return SkNamedTransferFn::kSRGB;
+        }
+        return Error::from_string_literal("Illegal transfer characteristics");
+    }());
 
     return ColorSpace { make<Details::ColorSpaceImpl>(SkColorSpace::MakeRGB(transfer_function, gamut)) };
 }

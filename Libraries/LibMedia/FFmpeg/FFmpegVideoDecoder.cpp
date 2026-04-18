@@ -164,25 +164,7 @@ DecoderErrorOr<NonnullOwnPtr<VideoFrame>> FFmpegVideoDecoder::get_decoded_frame(
             }
         }();
         auto cicp = CodingIndependentCodePoints { color_primaries, transfer_characteristics, matrix_coefficients, color_range };
-
         cicp.adopt_specified_values(container_cicp);
-
-        // BT.470 M, B/G, BT.601, BT.709 and BT.2020 have a similar transfer function to sRGB, so other applications
-        // (Chromium, VLC) forgo transfer characteristics conversion. We will emulate that behavior by
-        // handling those as sRGB instead, which causes no transfer function change in the output,
-        // unless display color management is later implemented.
-        switch (cicp.transfer_characteristics()) {
-        case TransferCharacteristics::BT470BG:
-        case TransferCharacteristics::BT470M:
-        case TransferCharacteristics::BT601:
-        case TransferCharacteristics::BT709:
-        case TransferCharacteristics::BT2020BitDepth10:
-        case TransferCharacteristics::BT2020BitDepth12:
-            cicp.set_transfer_characteristics(TransferCharacteristics::SRGB);
-            break;
-        default:
-            break;
-        }
 
         size_t bit_depth = [&] {
             switch (m_frame->format) {
@@ -242,6 +224,8 @@ DecoderErrorOr<NonnullOwnPtr<VideoFrame>> FFmpegVideoDecoder::get_decoded_frame(
         Bytes buffers[] = { yuv_data->y_data(), yuv_data->u_data(), yuv_data->v_data() };
         Gfx::Size<size_t> plane_sizes[] = { y_plane_size, uv_plane_size, uv_plane_size };
 
+        auto component_size = bit_depth <= 8 ? 1 : 2;
+
         for (u32 plane = 0; plane < 3; plane++) {
             VERIFY(m_frame->linesize[plane] != 0);
             if (m_frame->linesize[plane] < 0)
@@ -252,30 +236,14 @@ DecoderErrorOr<NonnullOwnPtr<VideoFrame>> FFmpegVideoDecoder::get_decoded_frame(
             VERIFY(source != nullptr);
             auto destination = buffers[plane];
 
-            if (bit_depth > 8) {
-                // For 10/12-bit content, normalize values to fill the full 16-bit unorm range.
-                // Use bit replication: (value << shift) | (value >> inverse_shift)
-                auto const shift = 16 - bit_depth;
-                auto const inverse_shift = bit_depth - shift;
-                auto samples_per_row = plane_size.width();
-                auto source_stride = m_frame->linesize[plane];
+            auto output_line_size = plane_size.width() * component_size;
+            VERIFY(output_line_size <= static_cast<size_t>(m_frame->linesize[plane]));
 
-                for (size_t row = 0; row < plane_size.height(); row++) {
-                    auto const* src_row = reinterpret_cast<u16 const*>(source + (row * source_stride));
-                    auto* dest_row = reinterpret_cast<u16*>(destination.data() + (row * samples_per_row * sizeof(u16)));
-                    for (size_t i = 0; i < samples_per_row; i++)
-                        dest_row[i] = static_cast<u16>((src_row[i] << shift) | (src_row[i] >> inverse_shift));
-                }
-            } else {
-                auto output_line_size = plane_size.width();
-                VERIFY(output_line_size <= static_cast<size_t>(m_frame->linesize[plane]));
-
-                auto* dest_ptr = destination.data();
-                for (size_t row = 0; row < plane_size.height(); row++) {
-                    memcpy(dest_ptr, source, output_line_size);
-                    source += m_frame->linesize[plane];
-                    dest_ptr += output_line_size;
-                }
+            auto* dest_ptr = destination.data();
+            for (size_t row = 0; row < plane_size.height(); row++) {
+                memcpy(dest_ptr, source, output_line_size);
+                source += m_frame->linesize[plane];
+                dest_ptr += output_line_size;
             }
         }
 

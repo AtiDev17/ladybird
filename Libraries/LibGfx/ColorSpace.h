@@ -44,7 +44,7 @@ private:
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 
-    explicit ColorSpace(NonnullOwnPtr<Details::ColorSpaceImpl>&& color_pace);
+    explicit ColorSpace(NonnullOwnPtr<Details::ColorSpaceImpl>&&);
 
     NonnullOwnPtr<Details::ColorSpaceImpl> m_color_space;
 };

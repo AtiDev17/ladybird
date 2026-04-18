@@ -9,6 +9,8 @@
 #include <AK/Error.h>
 #include <AK/FixedArray.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/NonnullRefPtr.h>
+#include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 #include <LibMedia/Subsampling.h>
@@ -42,7 +44,11 @@ public:
     Bytes u_data();
     Bytes v_data();
 
-    SkYUVAPixmaps const& skia_yuva_pixmaps() const;
+    ErrorOr<NonnullRefPtr<Bitmap>> to_bitmap() const;
+
+    SkYUVAPixmaps make_pixmaps() const;
+
+    void expand_samples_to_full_16_bit_range();
 
 private:
     explicit YUVData(NonnullOwnPtr<Details::YUVDataImpl>);

@@ -91,7 +91,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_vkimage(NonnullRefPt
     // Note, we're implicitly giving Skia a reference to vulkan_image. It will eventually be released by the callback function.
     vulkan_image->ref();
     sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), rt, origin_to_sk_origin(origin), vk_format_to_sk_color_type(vulkan_image->info.format),
-        nullptr, nullptr, release_vulkan_image, vulkan_image.ptr());
+        SkColorSpace::MakeSRGB(), nullptr, release_vulkan_image, vulkan_image.ptr());
     return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
 }
 #endif
@@ -143,7 +143,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_shared_image_buffer(
     GrMtlTextureInfo mtl_info;
     mtl_info.fTexture = sk_ret_cfp(metal_texture->texture());
     auto backend_render_target = GrBackendRenderTargets::MakeMtl(metal_texture->width(), metal_texture->height(), mtl_info);
-    auto surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), backend_render_target, origin_to_sk_origin(origin), kBGRA_8888_SkColorType, nullptr, nullptr);
+    auto surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), backend_render_target, origin_to_sk_origin(origin), kBGRA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr);
     return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
 }
 #endif

@@ -41,20 +41,15 @@ struct ImmutableBitmapImpl {
     SkBitmap sk_bitmap;
     RefPtr<Gfx::Bitmap> bitmap;
     ColorSpace color_space;
-    OwnPtr<YUVData> yuv_data;
 };
 
 int ImmutableBitmap::width() const
 {
-    if (m_impl->yuv_data)
-        return m_impl->yuv_data->size().width();
     return m_impl->sk_image->width();
 }
 
 int ImmutableBitmap::height() const
 {
-    if (m_impl->yuv_data)
-        return m_impl->yuv_data->size().height();
     return m_impl->sk_image->height();
 }
 
@@ -151,7 +146,7 @@ ErrorOr<BitmapExportResult> ImmutableBitmap::export_to_byte_buffer(ExportFormat 
     if (width > 0 && height > 0) {
         if (format == ExportFormat::RGB888) {
             // 24 bit RGB is not supported by Skia, so we need to handle this format ourselves.
-            auto raw_buffer = buffer.data();
+            auto* raw_buffer = buffer.data();
             for (auto y = 0; y < height; y++) {
                 auto target_y = flags & ExportFlags::FlipY ? height - y - 1 : y;
                 for (auto x = 0; x < width; x++) {
@@ -206,109 +201,41 @@ RefPtr<Gfx::Bitmap const> ImmutableBitmap::bitmap() const
     return m_impl->bitmap;
 }
 
-bool ImmutableBitmap::is_yuv_backed() const
-{
-    return m_impl->yuv_data != nullptr;
-}
-
 ErrorOr<NonnullRefPtr<ImmutableBitmap>> ImmutableBitmap::create_from_yuv(NonnullOwnPtr<YUVData> yuv_data)
 {
-    // Hold onto the YUVData to lazily create the SkImage later.
+    auto color_space = TRY(ColorSpace::from_cicp(yuv_data->cicp()));
+
+    auto context = SkiaBackendContext::the();
+    auto* gr_context = context ? context->sk_context() : nullptr;
+
+    if (!gr_context) {
+        auto bitmap = TRY(yuv_data->to_bitmap());
+        return create(move(bitmap), move(color_space));
+    }
+
+    if (yuv_data->bit_depth() > 8)
+        yuv_data->expand_samples_to_full_16_bit_range();
+
+    context->lock();
+    auto sk_image = SkImages::TextureFromYUVAPixmaps(
+        gr_context,
+        yuv_data->make_pixmaps(),
+        skgpu::Mipmapped::kNo,
+        false,
+        color_space.color_space<sk_sp<SkColorSpace>>());
+    context->unlock();
+
+    if (!sk_image)
+        return Error::from_string_literal("Failed to upload YUV data");
+
     ImmutableBitmapImpl impl {
-        .context = nullptr,
-        .sk_image = nullptr,
+        .context = context,
+        .sk_image = move(sk_image),
         .sk_bitmap = {},
         .bitmap = nullptr,
         .color_space = {},
-        .yuv_data = move(yuv_data),
     };
     return adopt_ref(*new ImmutableBitmap(make<ImmutableBitmapImpl>(move(impl))));
-}
-
-static sk_sp<SkColorSpace> color_space_from_cicp(Media::CodingIndependentCodePoints const& cicp)
-{
-    auto gamut = [&] {
-        if (cicp.color_primaries() == Media::ColorPrimaries::XYZ)
-            return SkNamedGamut::kXYZ;
-
-        auto primaries = [&] {
-            switch (cicp.color_primaries()) {
-            case Media::ColorPrimaries::Reserved:
-            case Media::ColorPrimaries::Unspecified:
-                return SkNamedPrimaries::kRec709;
-            case Media::ColorPrimaries::XYZ:
-                VERIFY_NOT_REACHED();
-            case Media::ColorPrimaries::BT709:
-                return SkNamedPrimaries::kRec709;
-            case Media::ColorPrimaries::BT470M:
-                return SkNamedPrimaries::kRec470SystemM;
-            case Media::ColorPrimaries::BT470BG:
-                return SkNamedPrimaries::kRec470SystemBG;
-            case Media::ColorPrimaries::BT601:
-                return SkNamedPrimaries::kRec601;
-            case Media::ColorPrimaries::SMPTE240:
-                return SkNamedPrimaries::kSMPTE_ST_240;
-            case Media::ColorPrimaries::GenericFilm:
-                return SkNamedPrimaries::kGenericFilm;
-            case Media::ColorPrimaries::BT2020:
-                return SkNamedPrimaries::kRec2020;
-            case Media::ColorPrimaries::SMPTE431:
-                return SkNamedPrimaries::kSMPTE_RP_431_2;
-            case Media::ColorPrimaries::SMPTE432:
-                return SkNamedPrimaries::kSMPTE_EG_432_1;
-            case Media::ColorPrimaries::EBU3213:
-                return SkNamedPrimaries::kITU_T_H273_Value22;
-            }
-            return SkNamedPrimaries::kRec709;
-        }();
-        skcms_Matrix3x3 result;
-        VERIFY(primaries.toXYZD50(&result));
-        return result;
-    }();
-
-    auto transfer_function = [&] {
-        switch (cicp.transfer_characteristics()) {
-        case Media::TransferCharacteristics::Unspecified:
-        case Media::TransferCharacteristics::Reserved:
-            return SkNamedTransferFn::kRec709;
-        case Media::TransferCharacteristics::BT709:
-            return SkNamedTransferFn::kRec709;
-        case Media::TransferCharacteristics::BT470M:
-            return SkNamedTransferFn::kRec470SystemM;
-        case Media::TransferCharacteristics::BT470BG:
-            return SkNamedTransferFn::kRec470SystemBG;
-        case Media::TransferCharacteristics::BT601:
-            return SkNamedTransferFn::kRec601;
-        case Media::TransferCharacteristics::SMPTE240:
-            return SkNamedTransferFn::kSMPTE_ST_240;
-        case Media::TransferCharacteristics::Linear:
-            return SkNamedTransferFn::kLinear;
-        case Media::TransferCharacteristics::Log100:
-        case Media::TransferCharacteristics::Log100Sqrt10:
-            dbgln("Logarithmic transfer characteristics are not supported, using sRGB.");
-            return SkNamedTransferFn::kSRGB;
-        case Media::TransferCharacteristics::IEC61966:
-            return SkNamedTransferFn::kIEC61966_2_4;
-        case Media::TransferCharacteristics::BT1361:
-            dbgln("BT.1361 transfer characteristics are not supported, using sRGB.");
-            return SkNamedTransferFn::kSRGB;
-        case Media::TransferCharacteristics::SRGB:
-            return SkNamedTransferFn::kSRGB;
-        case Media::TransferCharacteristics::BT2020BitDepth10:
-            return SkNamedTransferFn::kRec2020_10bit;
-        case Media::TransferCharacteristics::BT2020BitDepth12:
-            return SkNamedTransferFn::kRec2020_12bit;
-        case Media::TransferCharacteristics::SMPTE2084:
-            return SkNamedTransferFn::kPQ;
-        case Media::TransferCharacteristics::SMPTE428:
-            return SkNamedTransferFn::kSMPTE_ST_428_1;
-        case Media::TransferCharacteristics::HLG:
-            return SkNamedTransferFn::kHLG;
-        }
-        return SkNamedTransferFn::kRec709;
-    }();
-
-    return SkColorSpace::MakeRGB(transfer_function, gamut);
 }
 
 bool ImmutableBitmap::ensure_sk_image(SkiaBackendContext& context) const
@@ -325,39 +252,14 @@ bool ImmutableBitmap::ensure_sk_image(SkiaBackendContext& context) const
 
     auto* gr_context = context.sk_context();
 
-    // Bitmap-backed: try to upload raster image to GPU texture
-    if (m_impl->sk_image) {
-        if (!gr_context)
-            return true; // No GPU, but raster image is still usable
-        auto gpu_image = SkImages::TextureFromImage(gr_context, m_impl->sk_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
-        if (gpu_image) {
-            m_impl->context = context;
-            m_impl->sk_image = move(gpu_image);
-        }
-        return true;
-    }
-
-    // YUV-backed: GPU is required to decode YUV to RGB
-    VERIFY(m_impl->yuv_data);
-
+    VERIFY(m_impl->sk_image);
     if (!gr_context)
-        return false; // No GPU, cannot create image from YUV data
-
-    auto const& pixmaps = m_impl->yuv_data->skia_yuva_pixmaps();
-    auto color_space = color_space_from_cicp(m_impl->yuv_data->cicp());
-
-    auto sk_image = SkImages::TextureFromYUVAPixmaps(
-        gr_context,
-        pixmaps,
-        skgpu::Mipmapped::kNo,
-        false,
-        color_space);
-
-    if (!sk_image)
-        return false;
-
-    m_impl->context = context;
-    m_impl->sk_image = move(sk_image);
+        return true; // No GPU, but raster image is still usable
+    auto gpu_image = SkImages::TextureFromImage(gr_context, m_impl->sk_image.get(), skgpu::Mipmapped::kNo, skgpu::Budgeted::kYes);
+    if (gpu_image) {
+        m_impl->context = context;
+        m_impl->sk_image = move(gpu_image);
+    }
     return true;
 }
 
@@ -378,7 +280,7 @@ static SkAlphaType to_skia_alpha_type(Gfx::AlphaType alpha_type)
     }
 }
 
-NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> bitmap, ColorSpace color_space)
+NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> const& bitmap, ColorSpace color_space)
 {
     SkBitmap sk_bitmap;
     auto info = SkImageInfo::Make(bitmap->width(), bitmap->height(), to_skia_color_type(bitmap->format()), to_skia_alpha_type(bitmap->alpha_type()), color_space.color_space<sk_sp<SkColorSpace>>());
@@ -390,14 +292,13 @@ NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> bit
         .context = nullptr,
         .sk_image = move(sk_image),
         .sk_bitmap = move(sk_bitmap),
-        .bitmap = move(bitmap),
+        .bitmap = bitmap,
         .color_space = move(color_space),
-        .yuv_data = nullptr,
     };
     return adopt_ref(*new ImmutableBitmap(make<ImmutableBitmapImpl>(move(impl))));
 }
 
-NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> bitmap, AlphaType alpha_type, ColorSpace color_space)
+NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> const& bitmap, AlphaType alpha_type, ColorSpace color_space)
 {
     // Convert the source bitmap to the right alpha type on a mismatch. We want to do this when converting from a
     // Bitmap to an ImmutableBitmap, since at that point we usually know the right alpha type to use in context.
@@ -410,7 +311,7 @@ NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create(NonnullRefPtr<Bitmap> bit
     return create(source_bitmap, move(color_space));
 }
 
-NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create_snapshot_from_painting_surface(NonnullRefPtr<PaintingSurface> painting_surface)
+NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create_snapshot_from_painting_surface(NonnullRefPtr<PaintingSurface> const& painting_surface)
 {
     painting_surface->lock_context();
     auto sk_image = painting_surface->sk_image_snapshot<sk_sp<SkImage>>();
@@ -422,12 +323,11 @@ NonnullRefPtr<ImmutableBitmap> ImmutableBitmap::create_snapshot_from_painting_su
         .sk_bitmap = {},
         .bitmap = nullptr,
         .color_space = {},
-        .yuv_data = nullptr,
     };
     return adopt_ref(*new ImmutableBitmap(make<ImmutableBitmapImpl>(move(impl))));
 }
 
-ImmutableBitmap::ImmutableBitmap(NonnullOwnPtr<ImmutableBitmapImpl> impl)
+ImmutableBitmap::ImmutableBitmap(NonnullOwnPtr<ImmutableBitmapImpl>&& impl)
     : m_impl(move(impl))
 {
 }
