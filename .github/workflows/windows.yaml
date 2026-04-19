@@ -250,8 +250,10 @@ jobs:
                   Write-Host "Build Failed: Ladybird crashed or exited immediately with code $($proc.ExitCode)" -ForegroundColor Red
                   exit 1
               }
+
               
-              if (![string]::IsNullOrWhiteSpace($proc.MainWindowTitle)) {
+              $title = $proc.MainWindowTitle
+              if (![string]::IsNullOrWhiteSpace($title) -and $title -notmatch '\.exe') {
                   Write-Host "Build Verified: Window detected with title '$($proc.MainWindowTitle)'" -ForegroundColor Green
                   $success = $true
                   break
