@@ -6082,19 +6082,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::Ed25519 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -6115,6 +6120,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
@@ -6122,12 +6130,6 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED25519::import_key(
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -6590,19 +6592,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::Ed448 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed448 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -6623,6 +6630,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 57)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
@@ -6630,12 +6640,6 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the Ed448 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -6665,7 +6669,9 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> ED448::import_key(
         auto data = move(key_data.get<ByteBuffer>());
 
         // 3. If the length in bits of data is not 448 then throw a DataError.
-        if (data.size() * 8 != 448)
+        // AD-HOC: The spec has a typo with the size of the key length
+        //         See spec comment: https://github.com/w3c/webcrypto/pull/425#discussion_r3070135408
+        if (data.size() * 8 != 456)
             return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
         // 4. Let algorithm be a new KeyAlgorithm object.
@@ -7319,19 +7325,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
+
+            ::Crypto::Curves::X25519 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
 
             // 2. Let key be a new CryptoKey object that represents the X25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -7352,19 +7363,15 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X25519::import_key([[maybe_unused]] Web:
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 32)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the X25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
@@ -7936,19 +7943,24 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (!jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing d field"_utf16);
+            auto private_key = TRY(base64_url_bytes_decode(m_realm, jwk.d.value()));
+            if (private_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the X25519 private key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto private_key_base_64 = jwk.d.value();
-            auto private_key_or_error = decode_base64url(private_key_base_64);
-            if (private_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto private_key = private_key_or_error.release_value();
+            ::Crypto::Curves::X448 curve;
+            auto derived_public_key = TRY_OR_THROW_OOM(m_realm->vm(), curve.generate_public_key(private_key));
+            if (derived_public_key != public_key)
+                return WebIDL::DataError::create(m_realm, "Invalid key pair"_utf16);
+
+            // 2. Let key be a new CryptoKey object that represents the X448 private key identified by interpreting jwk according to Section 2 of [RFC8037].
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { private_key });
 
             // 3. Set the [[type]] internal slot of Key to "private".
@@ -7969,19 +7981,16 @@ WebIDL::ExceptionOr<GC::Ref<CryptoKey>> X448::import_key(
             // o  The parameter "x" MUST be present and contain the public key encoded using the base64url [RFC4648] encoding.
             if (!jwk.x.has_value())
                 return WebIDL::DataError::create(m_realm, "Missing x field"_utf16);
+            auto public_key = TRY(base64_url_bytes_decode(m_realm, jwk.x.value()));
+            if (public_key.size() != 56)
+                return WebIDL::DataError::create(m_realm, "Invalid key length"_utf16);
 
             // o  The parameter "d" MUST be present for private keys and contain the private key encoded using the base64url encoding.
             //    This parameter MUST NOT be present for public keys.
             if (jwk.d.has_value())
                 return WebIDL::DataError::create(m_realm, "Present d field"_utf16);
 
-            // 2. Let key be a new CryptoKey object that represents the Ed25519 public key identified by interpreting jwk according to Section 2 of [RFC8037].
-            auto public_key_base_64 = jwk.x.value();
-            auto public_key_or_error = decode_base64url(public_key_base_64);
-            if (public_key_or_error.is_error()) {
-                return WebIDL::DataError::create(m_realm, "Failed to decode base64"_utf16);
-            }
-            auto public_key = public_key_or_error.release_value();
+            // 2. Let key be a new CryptoKey object that represents the X448 public key identified by interpreting jwk according to Section 2 of [RFC8037].
             key = CryptoKey::create(m_realm, CryptoKey::InternalKeyData { public_key });
 
             // 3. Set the [[type]] internal slot of Key to "public".
