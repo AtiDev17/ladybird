@@ -26,12 +26,22 @@ enum class InsideNthChildPseudoClass {
     Yes,
 };
 
+enum class HasArgumentScope : u8 {
+    ChildrenOnly,
+    AllDescendants,
+    NextSiblingOnly,
+    AllFollowingSiblings,
+    Complex,
+};
+
 struct InvalidationPlan;
 
 struct DescendantInvalidationRule {
     InvalidationSet match_set;
     bool match_any { false };
     NonnullRefPtr<InvalidationPlan> payload;
+
+    bool operator==(DescendantInvalidationRule const&) const;
 };
 
 enum class SiblingInvalidationReach {
@@ -44,6 +54,8 @@ struct SiblingInvalidationRule {
     InvalidationSet match_set;
     bool match_any { false };
     NonnullRefPtr<InvalidationPlan> payload;
+
+    bool operator==(SiblingInvalidationRule const&) const;
 };
 
 struct InvalidationPlan final : RefCounted<InvalidationPlan> {
@@ -51,11 +63,19 @@ struct InvalidationPlan final : RefCounted<InvalidationPlan> {
 
     bool is_empty() const;
     void include_all_from(InvalidationPlan const&);
+    bool operator==(InvalidationPlan const&) const;
 
     bool invalidate_self { false };
     bool invalidate_whole_subtree { false };
     Vector<DescendantInvalidationRule> descendant_rules;
     Vector<SiblingInvalidationRule> sibling_rules;
+};
+
+struct HasInvalidationMetadata {
+    Selector const* relative_selector { nullptr };
+    HasArgumentScope scope { HasArgumentScope::Complex };
+
+    bool operator==(HasInvalidationMetadata const&) const = default;
 };
 
 struct StyleInvalidationData;
@@ -64,11 +84,11 @@ void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const&
 
 struct StyleInvalidationData {
     HashMap<InvalidationSet::Property, NonnullRefPtr<InvalidationPlan>> invalidation_plans;
-    HashTable<FlyString> ids_used_in_has_selectors;
-    HashTable<FlyString> class_names_used_in_has_selectors;
-    HashTable<FlyString> attribute_names_used_in_has_selectors;
-    HashTable<FlyString> tag_names_used_in_has_selectors;
-    HashTable<PseudoClass> pseudo_classes_used_in_has_selectors;
+    HashMap<FlyString, Vector<HasInvalidationMetadata>> ids_used_in_has_selectors;
+    HashMap<FlyString, Vector<HasInvalidationMetadata>> class_names_used_in_has_selectors;
+    HashMap<FlyString, Vector<HasInvalidationMetadata>> attribute_names_used_in_has_selectors;
+    HashMap<FlyString, Vector<HasInvalidationMetadata>> tag_names_used_in_has_selectors;
+    HashMap<PseudoClass, Vector<HasInvalidationMetadata>> pseudo_classes_used_in_has_selectors;
 
     void build_invalidation_sets_for_selector(Selector const& selector);
 };

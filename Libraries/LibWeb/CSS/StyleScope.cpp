@@ -374,6 +374,15 @@ void StyleScope::collect_selector_insights(Selector const& selector, SelectorIns
             if (simple_selector.type == Selector::SimpleSelector::Type::PseudoClass) {
                 if (simple_selector.pseudo_class().type == PseudoClass::Has) {
                     insights.has_has_selectors = true;
+                    for (auto const& argument_selector : simple_selector.pseudo_class().argument_selector_list) {
+                        for (auto const& relative_compound_selector : argument_selector->compound_selectors()) {
+                            if (relative_compound_selector.combinator == Selector::Combinator::NextSibling
+                                || relative_compound_selector.combinator == Selector::Combinator::SubsequentSibling) {
+                                insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator = true;
+                                break;
+                            }
+                        }
+                    }
                 }
                 for (auto const& argument_selector : simple_selector.pseudo_class().argument_selector_list) {
                     collect_selector_insights(*argument_selector, insights);
@@ -773,6 +782,21 @@ bool StyleScope::have_has_selectors() const
     return m_selector_insights->has_has_selectors;
 }
 
+bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
+{
+    if (!has_valid_rule_cache())
+        return true;
+
+    build_rule_cache_if_needed();
+    return m_selector_insights->has_has_selectors_with_relative_selector_that_has_sibling_combinator;
+}
+
+bool StyleScope::have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
+{
+    build_rule_cache_if_needed();
+    return m_selector_insights->has_has_selectors_with_relative_selector_that_has_sibling_combinator;
+}
+
 DOM::Document& StyleScope::document() const
 {
     return m_node->document();
@@ -816,30 +840,67 @@ void StyleScope::invalidate_style_of_elements_affected_by_has()
         return;
     }
 
+    auto& counters = document().style_invalidation_counters();
+    ++counters.has_ancestor_walk_invocations;
+
+    auto is_in_has_scope = [](DOM::Element const& element) {
+        return element.in_has_scope()
+            || element.affected_by_has_pseudo_class_in_subject_position()
+            || element.affected_by_has_pseudo_class_in_non_subject_position();
+    };
+
+    auto is_in_subtree_of_has_relative_selector_with_sibling_combinator = [](DOM::Element const& element) {
+        return element.in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator()
+            || element.affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator();
+    };
+
     HashTable<DOM::Element*> elements_already_invalidated_for_has;
     auto nodes = move(m_pending_nodes_for_style_invalidation_due_to_presence_of_has);
+    bool should_scan_ancestor_siblings = have_has_selectors_with_relative_selector_that_has_sibling_combinator();
     for (auto& node : nodes) {
+        Vector<DOM::Element*, 16> has_scope_ancestors;
+        bool should_delay_ancestor_sibling_scans = false;
         for (auto* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
             if (!ancestor->is_element())
                 continue;
             auto& element = static_cast<DOM::Element&>(*ancestor);
 
-            if (elements_already_invalidated_for_has.set(&element) != AK::HashSetResult::InsertedNewEntry)
+            // Terminate the upward walk once we reach an element that no :has()
+            // anchor has ever observed. Its style cannot be affected by a mutation
+            // further down the tree, so neither can anything above it.
+            if (!is_in_has_scope(element))
                 break;
 
-            element.invalidate_style_if_affected_by_has();
+            has_scope_ancestors.append(&element);
+            should_delay_ancestor_sibling_scans |= is_in_subtree_of_has_relative_selector_with_sibling_combinator(element);
+        }
 
-            auto* parent = ancestor->parent_or_shadow_host();
+        for (auto* element : has_scope_ancestors) {
+            VERIFY(element);
+
+            if (elements_already_invalidated_for_has.set(element) != AK::HashSetResult::InsertedNewEntry)
+                continue;
+
+            ++counters.has_ancestor_walk_visits;
+            element->invalidate_style_if_affected_by_has();
+
+            auto* parent = element->parent_or_shadow_host();
             if (!parent)
                 return;
 
             // If any ancestor's sibling was tested against selectors like ".a:has(+ .b)" or ".a:has(~ .b)"
             // its style might be affected by the change in descendant node.
+            if (!should_scan_ancestor_siblings)
+                continue;
+            if (should_delay_ancestor_sibling_scans && !is_in_subtree_of_has_relative_selector_with_sibling_combinator(*element))
+                continue;
             parent->for_each_child_of_type<DOM::Element>([&](auto& ancestor_sibling_element) {
+                ++counters.has_ancestor_sibling_element_checks;
                 if (ancestor_sibling_element.affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator()) {
                     if (elements_already_invalidated_for_has.set(&ancestor_sibling_element) != AK::HashSetResult::InsertedNewEntry)
                         return IterationDecision::Continue;
 
+                    ++counters.has_ancestor_walk_visits;
                     ancestor_sibling_element.invalidate_style_if_affected_by_has();
                 }
                 return IterationDecision::Continue;

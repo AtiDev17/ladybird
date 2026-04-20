@@ -439,7 +439,11 @@ void Node::invalidate_style(StyleInvalidationReason reason)
     auto& style_scope = root().is_shadow_root() ? static_cast<ShadowRoot&>(root()).style_scope() : document().style_scope();
 
     if (style_scope.may_have_has_selectors()) {
-        if (reason == StyleInvalidationReason::NodeRemove) {
+        // On insertion and removal the mutated node itself is uninteresting to the
+        // :has() walker (a freshly inserted node has no :has() scope flags yet, and
+        // a removed node is about to leave the tree). Start the walk at the parent,
+        // which was in scope before and reliably carries the correct flags.
+        if (reason == StyleInvalidationReason::NodeRemove || reason == StyleInvalidationReason::NodeInsertBefore) {
             if (auto* parent = parent_or_shadow_host(); parent) {
                 style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*parent);
                 parent->for_each_child_of_type<Element>([&](auto& element) {
@@ -539,10 +543,18 @@ void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::Invalida
     }
 
     bool properties_used_in_has_selectors = false;
+    auto& counters = document().style_invalidation_counters();
     for (auto const& property : properties) {
-        properties_used_in_has_selectors |= document().style_computer().invalidation_property_used_in_has_selector(property, style_scope);
-        if (shadow_style_scope)
-            properties_used_in_has_selectors |= document().style_computer().invalidation_property_used_in_has_selector(property, *shadow_style_scope);
+        if (auto const* metadata = document().style_computer().has_invalidation_metadata_for_property(property, style_scope)) {
+            properties_used_in_has_selectors = true;
+            counters.has_invalidation_metadata_candidates += metadata->size();
+        }
+        if (shadow_style_scope) {
+            if (auto const* metadata = document().style_computer().has_invalidation_metadata_for_property(property, *shadow_style_scope)) {
+                properties_used_in_has_selectors = true;
+                counters.has_invalidation_metadata_candidates += metadata->size();
+            }
+        }
     }
     if (properties_used_in_has_selectors) {
         style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
@@ -1844,6 +1856,7 @@ void Node::set_needs_style_update(bool value)
     m_needs_style_update = value;
 
     if (m_needs_style_update) {
+        ++document().style_invalidation_counters().style_invalidations;
         for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
             if (ancestor->m_child_needs_style_update)
                 break;

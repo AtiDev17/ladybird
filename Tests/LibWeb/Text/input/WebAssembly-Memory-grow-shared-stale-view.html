@@ -1,0 +1,43 @@
+<!doctype html>
+<script src="include.js"></script>
+<script>
+    test(() => {
+        // regression test for the stale-view case on shared WebAssembly.Memory.
+        // A typed array created from the old memory.buffer before grow() should still read and write the same underlying memory after the grow.
+        const mem = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });
+        const oldView = new Uint8Array(mem.buffer);
+        oldView[0x0] = 0xde;
+        oldView[0x1] = 0xad;
+        oldView[0x2] = 0xbe;
+        oldView[0x3] = 0xef;
+
+        mem.grow(1);
+
+        const newView = new Uint8Array(mem.buffer);
+        // verify array created from the new memory.buffer after grow() reads the same underlying memory before the grow.
+        println(`newView[0x0]: 0x${newView[0x0].toString(16)}`);
+        println(`newView[0x1]: 0x${newView[0x1].toString(16)}`);
+        println(`newView[0x2]: 0x${newView[0x2].toString(16)}`);
+        println(`newView[0x3]: 0x${newView[0x3].toString(16)}`);
+
+        // verify array created from the new memory.buffer before grow() reads the same underlying memory after the grow.
+        newView[0x4] = 0xab;
+        newView[0x5] = 0xad;
+        newView[0x6] = 0x1d;
+        newView[0x7] = 0xea;
+        println(`oldView[0x4]: 0x${oldView[0x4].toString(16)}`);
+        println(`oldView[0x5]: 0x${oldView[0x5].toString(16)}`);
+        println(`oldView[0x6]: 0x${oldView[0x6].toString(16)}`);
+        println(`oldView[0x7]: 0x${oldView[0x7].toString(16)}`);
+
+        // verify array created from the new memory.buffer before grow() writes the same underlying memory after the grow.
+        oldView[0x8] = 0xca;
+        oldView[0x9] = 0xfe;
+        oldView[0xa] = 0xba;
+        oldView[0xb] = 0xbe;
+        println(`newView[0x8]: 0x${newView[0x8].toString(16)}`);
+        println(`newView[0x9]: 0x${newView[0x9].toString(16)}`);
+        println(`newView[0xa]: 0x${newView[0xa].toString(16)}`);
+        println(`newView[0xb]: 0x${newView[0xb].toString(16)}`);
+    });
+</script>
