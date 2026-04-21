@@ -100,7 +100,7 @@ static RefPtr<Line::Editor> s_editor;
 #endif
 static String s_history_path = String {};
 [[maybe_unused]] static int s_repl_line_level = 0;
-static bool s_keep_running_repl = true;
+[[maybe_unused]] static bool s_keep_running_repl = true;
 static int s_exit_code = 0;
 
 static ErrorOr<void> print_inline(JS::Value value, Stream& stream)

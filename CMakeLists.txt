@@ -21,7 +21,7 @@ if (CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg.cmake$")
     set(CMAKE_PROJECT_ladybird_INCLUDE_BEFORE "Meta/CMake/vcpkg/generate_vcpkg_toolchain_variables.cmake")
     if (LADYBIRD_GUI_FRAMEWORK STREQUAL "Qt" OR LADYBIRD_GUI_FRAMEWORK STREQUAL "Gtk")
         string(TOLOWER "${LADYBIRD_GUI_FRAMEWORK}" framework_feature)
-        set(VCPKG_MANIFEST_FEATURES "${framework_feature}")
+        set(VCPKG_MANIFEST_FEATURES "${framework_feature}" CACHE STRING "" FORCE)
     endif()
 endif()
 
@@ -42,9 +42,6 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# We need to find OpenSSL in order to link it explicitly with all targets.
-find_package(OpenSSL REQUIRED)
-
 # Ensure that when single-value arguments are passed to `cmake_parse_arguments()`
 # with no or empty string arguments, they are still defined.
 if (POLICY CMP0174)
@@ -54,12 +51,6 @@ endif()
 set(LADYBIRD_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LADYBIRD_SOURCE_DIR}/Meta/CMake")
 
-if(NOT COMMAND ladybird_option)
-    macro(ladybird_option)
-        set(${ARGV})
-    endmacro()
-endif()
-
 include(check_for_dependencies)
 include(gui_framework)
 include(cmake_options NO_POLICY_SCOPE)
@@ -68,11 +59,6 @@ include(compile_options)
 if(ENABLE_ALL_THE_DEBUG_MACROS)
     include(all_the_debug_macros)
 endif()
-
-find_package(Threads REQUIRED)
-# FIXME: This global link libraries is required to workaround linker issues (on some systems)
-# from the Ladybird import. See https://github.com/SerenityOS/serenity/issues/16847
-link_libraries(Threads::Threads)
 
 if (ENABLE_LAGOM_CCACHE)
     include(setup_ccache)
@@ -138,13 +124,6 @@ include_directories(${CMAKE_BINARY_DIR}/Services)
 
 include(lagom_install)
 
-if (WIN32)
-    find_package(pthread REQUIRED)
-    find_package(mman REQUIRED)
-endif()
-
-find_package(mimalloc CONFIG REQUIRED)
-
 include(rust_crate)
 include(targets)
 
@@ -193,10 +172,7 @@ add_custom_target(lint-shell-scripts
     USES_TERMINAL
 )
 
-find_package(Python3 COMPONENTS Interpreter)
-if (Python3_FOUND)
-    add_custom_target(check-style
-        COMMAND ${Python3_EXECUTABLE} "${ladybird_SOURCE_DIR}/Meta/check-style.py"
-        USES_TERMINAL
-    )
-endif()
+add_custom_target(check-style
+    COMMAND ${Python3_EXECUTABLE} "${ladybird_SOURCE_DIR}/Meta/check-style.py"
+    USES_TERMINAL
+)

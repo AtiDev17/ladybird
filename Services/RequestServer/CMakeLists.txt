@@ -1,7 +1,3 @@
-set(CMAKE_AUTOMOC OFF)
-set(CMAKE_AUTORCC OFF)
-set(CMAKE_AUTOUIC OFF)
-
 set(SOURCES
     ConnectionFromClient.cpp
     CURL.cpp
@@ -28,9 +24,6 @@ endif()
 
 add_library(requestserverservice ${RS_LIB_TYPE} ${SOURCES} ${GENERATED_SOURCES})
 ladybird_generated_sources(requestserverservice)
-
-find_package(PkgConfig)
-find_package(CURL REQUIRED)
 
 add_executable(RequestServer main.cpp)
 
