@@ -85,8 +85,14 @@ jobs:
           }
 
           $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
-          if (Test-Path "$pkgDir/bin/Ladybird.exe") {
-              & $deployTool "$pkgDir/bin/Ladybird.exe" --dir "$pkgDir/bin" --no-translations --compiler-runtime
+          if ($deployTool) {
+              Get-ChildItem -Path "$pkgDir/bin" -Filter "*.exe" | ForEach-Object {
+                  $exePath = $_.FullName
+                  $process = Start-Process -FilePath $deployTool -ArgumentList "`"$exePath`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+                  if ($process.ExitCode -ne 0) {
+                      Write-Host "Note: $($_.Name) is not a Qt executable. Skipping..." -ForegroundColor DarkGray
+                  }
+              }
           }
 
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$pkgDir/LICENSE.txt" }
