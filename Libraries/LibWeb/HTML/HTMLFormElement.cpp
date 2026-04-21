@@ -1011,6 +1011,19 @@ Optional<JS::Value> HTMLFormElement::item_value(size_t index) const
     return {};
 }
 
+bool HTMLFormElement::is_supported_property_name(FlyString const& name) const
+{
+    // NB: This is a simplified version of ::supported_property_names() that does not require sorting or allocations.
+    for (auto const& candidate : m_associated_elements) {
+        if (is_form_control(*candidate, *this) || is<HTMLImageElement>(*candidate)) {
+            if (first_is_one_of(name, candidate->id(), candidate->name()))
+                return true;
+        }
+    }
+
+    return m_past_names_map.contains(name);
+}
+
 // https://html.spec.whatwg.org/multipage/forms.html#the-form-element:supported-property-names
 Vector<FlyString> HTMLFormElement::supported_property_names() const
 {
@@ -1075,10 +1088,9 @@ Vector<FlyString> HTMLFormElement::supported_property_names() const
     // 5. Sort sourced names by tree order of the element entry of each tuple, sorting entries with the same element by
     //    putting entries whose source is id first, then entries whose source is name, and finally entries whose source
     //    is past, and sorting entries with the same element and source by their age, oldest first.
-    // FIXME: Require less const casts here by changing the signature of DOM::Node::compare_document_position
     quick_sort(sourced_names, [](auto const& lhs, auto const& rhs) -> bool {
         if (lhs.element != rhs.element)
-            return const_cast<DOM::Element*>(lhs.element.ptr())->compare_document_position(const_cast<DOM::Element*>(rhs.element.ptr())) & DOM::Node::DOCUMENT_POSITION_FOLLOWING;
+            return lhs.element->is_before(*rhs.element);
         if (lhs.source != rhs.source)
             return lhs.source < rhs.source;
         return lhs.age < rhs.age;
@@ -1095,13 +1107,7 @@ Vector<FlyString> HTMLFormElement::supported_property_names() const
             continue;
         names.set(entry.name, AK::HashSetExistingEntryBehavior::Keep);
     }
-
-    Vector<FlyString> result;
-    result.ensure_capacity(names.size());
-    for (auto const& name : names)
-        result.unchecked_append(name);
-
-    return result;
+    return names.values();
 }
 
 // https://html.spec.whatwg.org/multipage/forms.html#dom-form-nameditem
