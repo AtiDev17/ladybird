@@ -1858,7 +1858,7 @@
     "initial": "1",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "fill-rule": {
@@ -1983,7 +1983,7 @@
     "initial": "1",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "font": {
@@ -2190,7 +2190,7 @@
     "multiplicity": "list",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "number",
+      "number [-∞,∞]",
       "opentype-tag"
     ],
     "valid-identifiers": [
@@ -3016,7 +3016,7 @@
     "__comment": "FIXME: `add(<integer>)` is also valid but we can't represent that here yet.",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "integer"
+      "integer [-∞,∞]"
     ],
     "valid-identifiers": [
       "auto-add"
@@ -3188,7 +3188,7 @@
     "initial": "1",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "order": {
@@ -3894,7 +3894,7 @@
     "initial": "0",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "shape-margin": {
@@ -3942,7 +3942,7 @@
     "initial": "1",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "stroke": {
@@ -4013,7 +4013,7 @@
     "initial": "1",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "opacity"
+      "opacity-value"
     ]
   },
   "stroke-width": {
@@ -4378,7 +4378,7 @@
     "multiplicity": "coordinating-list",
     "requires-computation": "cascaded-value",
     "valid-types": [
-      "time"
+      "time [-∞,∞]"
     ]
   },
   "transition-duration": {

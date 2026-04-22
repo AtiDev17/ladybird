@@ -510,7 +510,7 @@ Optional<MediaFeatureValue> Parser::parse_media_feature_value(MediaFeatureID med
             if (media_feature_accepts_type(media_feature, MediaFeatureValueType::Boolean)) {
                 auto transaction = tokens.begin_transaction();
                 tokens.discard_whitespace();
-                if (auto integer = parse_integer_value(tokens)) {
+                if (auto integer = parse_integer_value(tokens, infinite_integer_range)) {
                     if (integer->is_calculated() || first_is_one_of(integer->as_integer().integer(), 0, 1)) {
                         transaction.commit();
                         return MediaFeatureValue(MediaFeatureValue::Type::Integer, integer.release_nonnull());
@@ -521,7 +521,7 @@ Optional<MediaFeatureValue> Parser::parse_media_feature_value(MediaFeatureID med
             // Integer
             if (media_feature_accepts_type(media_feature, MediaFeatureValueType::Integer)) {
                 auto transaction = tokens.begin_transaction();
-                if (auto integer = parse_integer_value(tokens)) {
+                if (auto integer = parse_integer_value(tokens, infinite_integer_range)) {
                     transaction.commit();
                     return MediaFeatureValue(MediaFeatureValue::Type::Integer, integer.release_nonnull());
                 }
@@ -531,7 +531,7 @@ Optional<MediaFeatureValue> Parser::parse_media_feature_value(MediaFeatureID med
             if (media_feature_accepts_type(media_feature, MediaFeatureValueType::Length)) {
                 auto transaction = tokens.begin_transaction();
                 tokens.discard_whitespace();
-                if (auto length = parse_length_value(tokens)) {
+                if (auto length = parse_length_value(tokens, infinite_range)) {
                     transaction.commit();
                     return MediaFeatureValue(MediaFeatureValue::Type::Length, length.release_nonnull());
                 }
@@ -547,7 +547,7 @@ Optional<MediaFeatureValue> Parser::parse_media_feature_value(MediaFeatureID med
                 // value type doesn't allow 'unitless zeroes'."
                 if (tokens.has_next_token()) {
                     auto const& token = tokens.next_token();
-                    if (auto calc = parse_calculated_value(token); calc && calc->as_calculated().resolves_to_number()) {
+                    if (auto calc = parse_calculated_value(token, { .accepted_ranges_by_type = { { ValueType::Number, infinite_range } } }); calc && calc->as_calculated().resolves_to_number()) {
                         if (auto resolved_number = calc->as_calculated().resolve_number({}); resolved_number.has_value() && *resolved_number == 0) {
                             tokens.discard_a_token();
                             transaction.commit();
@@ -571,7 +571,7 @@ Optional<MediaFeatureValue> Parser::parse_media_feature_value(MediaFeatureID med
             if (media_feature_accepts_type(media_feature, MediaFeatureValueType::Resolution)) {
                 auto transaction = tokens.begin_transaction();
                 tokens.discard_whitespace();
-                if (auto resolution = parse_resolution_value(tokens)) {
+                if (auto resolution = parse_resolution_value(tokens, infinite_range)) {
                     transaction.commit();
                     return MediaFeatureValue(MediaFeatureValue::Type::Resolution, resolution.release_nonnull());
                 }

@@ -61,9 +61,6 @@ struct NegateNode {
 
 }
 
-struct SyntaxParsingContext {
-    ValueType type;
-};
 struct FunctionContext {
     StringView name;
 };
@@ -72,25 +69,13 @@ struct DescriptorContext {
     DescriptorID descriptor;
 };
 enum SpecialContext : u8 {
-    AngularColorStopList,
-    BorderRadius,
     CanvasContextGenericValue,
-    CubicBezierFunctionXCoordinate,
     DOMMatrixInitString,
-    FontStyleAngle,
-    GridTrackRepeatCount,
     MediaCondition,
-    OnScreenCanvasContextFontValue,
-    RadialSizeLengthPercentage,
-    RandomValueSharingFixedValue,
-    RatioComponent,
-    ShadowBlurRadius,
-    StepsIntervalsJumpNone,
-    StepsIntervalsNormal,
-    TranslateZArgument,
+    OnScreenCanvasContextFontValue
 };
 // FIXME: Use PropertyNameAndID instead of PropertyID as the context, for registered custom properties.
-using ValueParsingContext = Variant<PropertyID, FunctionContext, DescriptorContext, SpecialContext, SyntaxParsingContext>;
+using ValueParsingContext = Variant<PropertyID, FunctionContext, DescriptorContext, SpecialContext>;
 
 enum class ParsingMode {
     Normal,
@@ -178,7 +163,7 @@ public:
 
     NonnullRefPtr<StyleValue const> parse_with_a_syntax(Vector<ComponentValue> const& input, SyntaxNode const& syntax);
 
-    RefPtr<CalculatedStyleValue const> parse_calculated_value(ComponentValue const&);
+    RefPtr<CalculatedStyleValue const> parse_calculated_value(ComponentValue const&, CalculationContext&&);
     RefPtr<TreeCountingFunctionStyleValue const> parse_tree_counting_function(TokenStream<ComponentValue>&, TreeCountingFunctionStyleValue::ComputedType);
 
     OwnPtr<BooleanExpression> parse_if_condition(TokenStream<ComponentValue>&);
@@ -453,26 +438,27 @@ private:
     RefPtr<StyleValue const> parse_contain_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_container_type_value(TokenStream<ComponentValue>&);
     RefPtr<StringStyleValue const> parse_opentype_tag_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_opacity_value(TokenStream<ComponentValue>&);
+    RefPtr<StyleValue const> parse_opacity_value_value(TokenStream<ComponentValue>&);
     RefPtr<FontSourceStyleValue const> parse_font_source_value(TokenStream<ComponentValue>&);
 
     RefPtr<StyleValue const> parse_anchor(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_anchor_size(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_angle_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_angle_percentage_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_flex_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_frequency_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_frequency_percentage_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_integer_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_length_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_length_percentage_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_number_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_number_percentage_value(TokenStream<ComponentValue>& tokens);
+    RefPtr<StyleValue const> parse_angle_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_angle_percentage_value(TokenStream<ComponentValue>&, NumericRange const& accepted_angle_range, NumericRange const& accepted_percentage_range);
+    RefPtr<StyleValue const> parse_flex_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_frequency_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_frequency_percentage_value(TokenStream<ComponentValue>&, NumericRange const& accepted_frequency_range, NumericRange const& accepted_percentage_range);
+    RefPtr<StyleValue const> parse_integer_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_length_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_length_percentage_value(TokenStream<ComponentValue>&, NumericRange const& accepted_length_range, NumericRange const& accepted_percentage_range);
+    RefPtr<StyleValue const> parse_number_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_number_percentage_value(TokenStream<ComponentValue>& tokens, NumericRange const& accepted_number_range, NumericRange const& accepted_percentage_range);
+    RefPtr<StyleValue const> parse_percentage_value(TokenStream<ComponentValue>& tokens, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_resolution_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_time_value(TokenStream<ComponentValue>&, NumericRange const& accepted_range);
+    RefPtr<StyleValue const> parse_time_percentage_value(TokenStream<ComponentValue>&, NumericRange const& accepted_time_range, NumericRange const& accepted_percentage_range);
+
     RefPtr<StyleValue const> parse_number_percentage_none_value(TokenStream<ComponentValue>& tokens);
-    RefPtr<StyleValue const> parse_percentage_value(TokenStream<ComponentValue>& tokens);
-    RefPtr<StyleValue const> parse_resolution_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_time_value(TokenStream<ComponentValue>&);
-    RefPtr<StyleValue const> parse_time_percentage_value(TokenStream<ComponentValue>&);
 
     RefPtr<StyleValue const> parse_view_timeline_inset_value(TokenStream<ComponentValue>&);
     RefPtr<ScrollFunctionStyleValue const> parse_scroll_function_value(TokenStream<ComponentValue>&);
