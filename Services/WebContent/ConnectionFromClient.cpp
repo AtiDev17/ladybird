@@ -1070,7 +1070,8 @@ void ConnectionFromClient::request_internal_page_info(u64 page_id, WebView::Page
     }
 
     auto buffer = MUST(Core::AnonymousBuffer::create_with_size(builder.length()));
-    memcpy(buffer.data<void>(), builder.string_view().characters_without_null_termination(), builder.length());
+    if (builder.length() > 0)
+        memcpy(buffer.data<void>(), builder.string_view().characters_without_null_termination(), builder.length());
     async_did_get_internal_page_info(page_id, type, buffer);
 }
 

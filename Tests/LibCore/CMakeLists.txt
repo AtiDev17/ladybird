@@ -1,4 +1,5 @@
 set(TEST_SOURCES
+    TestLibCoreAnonymousBuffer.cpp
     TestLibCoreArgsParser.cpp
     TestLibCoreDeferredInvoke.cpp
     TestLibCoreEventLoop.cpp
