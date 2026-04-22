@@ -267,7 +267,7 @@ if (!hasTestWaitClass()) {{
         wait_class));
 }
 
-static auto wait_for_crash_test_completion = generate_wait_for_test_string("test-wait"sv);
+static auto wait_for_test_completion = generate_wait_for_test_string("test-wait"sv);
 static auto wait_for_reftest_completion = generate_wait_for_test_string("reftest-wait"sv);
 
 static ErrorOr<void> generate_result_files(ReadonlySpan<Test> tests, ReadonlySpan<TestCompletion> non_passing_tests)
@@ -500,11 +500,15 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
     };
 
     if (test.mode == TestMode::Layout) {
-        view.on_load_finish = [&view, &context, test_index, url, on_test_complete = move(on_test_complete)](auto const& loaded_url) {
+        view.on_load_finish = [&view, url](auto const& loaded_url) {
             // We don't want subframe loads to trigger the test finish.
             if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
                 return;
 
+            view.run_javascript(wait_for_test_completion);
+        };
+
+        view.on_test_finish = [&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
             // NOTE: We take a screenshot here to force the lazy layout of SVG-as-image documents to happen.
             //       It also causes a lot more code to run, which is good for finding bugs. :^)
             view.take_screenshot()->when_resolved([&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
@@ -589,7 +593,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
 
             auto& test = context.tests[test_index];
             test.did_finish_loading = true;
-            view.run_javascript(wait_for_crash_test_completion);
+            view.run_javascript(wait_for_test_completion);
 
             if (test.did_finish_test)
                 on_test_complete();
