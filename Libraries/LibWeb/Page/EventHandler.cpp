@@ -974,11 +974,10 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
 
 void EventHandler::clear_mousedown_tracking()
 {
-    m_mousedown_button = {};
-    m_mousedown_modifiers = UIEvents::KeyModifier::Mod_None;
     m_mousedown_target = nullptr;
     m_mousedown_visual_viewport_position = {};
     m_mousedown_click_count = 0;
+    m_mousedown_target_is_drag_candidate = false;
 }
 
 void EventHandler::stop_updating_selection()
@@ -1016,7 +1015,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
     });
 
     if (should_ignore_device_input_event()) {
-        if (is_dragging_element()) {
+        if (m_mousedown_target_is_drag_candidate) {
             auto result = handle_drag_and_drop_event(DragEvent::Type::Drop, visual_viewport_position, screen_position, button, buttons, modifiers, {});
             set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
             return result;
@@ -1351,8 +1350,6 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     if (!parent_element_for_event_dispatch(*paintable, node, layout_node))
         return EventResult::Dropped;
 
-    m_mousedown_button = button;
-    m_mousedown_modifiers = modifiers;
     m_mousedown_target = node;
     m_mousedown_visual_viewport_position = visual_viewport_position;
 
@@ -1365,9 +1362,11 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     if (button == UIEvents::MouseButton::Secondary)
         maybe_show_context_menu(*node, coordinates, screen_position, viewport_position, buttons, modifiers);
 #if defined(AK_OS_MACOS)
-    if (button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::KeyModifier::Mod_Ctrl) != 0)
+    else if (button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::KeyModifier::Mod_Ctrl) != 0)
         maybe_show_context_menu(*node, coordinates, screen_position, viewport_position, buttons, modifiers);
 #endif
+    else
+        m_mousedown_target_is_drag_candidate = button == UIEvents::MouseButton::Primary;
 
     // NB: Dispatching an event may have disturbed the world.
     if (m_navigable->active_document() != document)
@@ -1385,7 +1384,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
 EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 buttons, u32 modifiers)
 {
     if (should_ignore_device_input_event()) {
-        if (is_dragging_element())
+        if (m_mousedown_target_is_drag_candidate)
             return handle_drag_and_drop_event(DragEvent::Type::DragMove, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, {});
         return EventResult::Dropped;
     }
@@ -1402,7 +1401,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
     if (!paint_root())
         return EventResult::Dropped;
 
-    if (is_dragging_element()) {
+    if (m_mousedown_target_is_drag_candidate) {
         static constexpr CSSPixels DRAG_THRESHOLD = 5;
         auto delta = visual_viewport_position - *m_mousedown_visual_viewport_position;
 
@@ -1415,6 +1414,9 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
                 return EventResult::Handled;
             }
+
+            if (result == EventResult::Cancelled)
+                m_mousedown_target_is_drag_candidate = false;
 
             // NB: Dispatching an event may have disturbed the world.
             if (m_navigable->active_document() != document)
@@ -1508,7 +1510,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 EventResult EventHandler::handle_mouseleave()
 {
     if (should_ignore_device_input_event()) {
-        if (is_dragging_element()) {
+        if (m_mousedown_target_is_drag_candidate) {
             auto result = handle_drag_and_drop_event(DragEvent::Type::DragEnd, {}, {}, UIEvents::MouseButton::Primary, UIEvents::MouseButton::Primary, 0, {});
             set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Arrow);
             return result;
@@ -2140,14 +2142,6 @@ bool EventHandler::should_ignore_device_input_event() const
     // From the moment that the user agent is to initiate the drag-and-drop operation, until the end of the drag-and-drop
     // operation, device input events (e.g. mouse and keyboard events) must be suppressed.
     return m_drag_and_drop_event_handler->has_ongoing_drag_and_drop_operation();
-}
-
-bool EventHandler::is_dragging_element() const
-{
-    return m_mousedown_target
-        && m_mousedown_visual_viewport_position.has_value()
-        && m_mousedown_button == UIEvents::MouseButton::Primary
-        && (m_mousedown_modifiers & UIEvents::KeyModifier::Mod_Ctrl) == 0;
 }
 
 void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const

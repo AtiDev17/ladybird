@@ -9,13 +9,8 @@
 #include <LibWeb/CSS/ColorInterpolation.h>
 #include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
-#include <LibWeb/CSS/StyleValues/HSLColorStyleValue.h>
-#include <LibWeb/CSS/StyleValues/HWBColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LCHLikeColorStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LabLikeColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
-#include <LibWeb/CSS/StyleValues/RGBColorStyleValue.h>
 
 namespace Web::CSS {
 
@@ -121,42 +116,10 @@ static MissingComponents extract_missing_components(StyleValue const& style_valu
         return {};
 
     auto const& color = style_value.as_color();
-    switch (color.color_type()) {
-    case ColorStyleValue::ColorType::HSL: {
-        auto const& hsl = as<HSLColorStyleValue>(color);
-        return { is_component_none(hsl.h()), is_component_none(hsl.s()), is_component_none(hsl.l()), is_component_none(hsl.alpha()) };
-    }
-    case ColorStyleValue::ColorType::HWB: {
-        auto const& hwb = as<HWBColorStyleValue>(color);
-        return { is_component_none(hwb.h()), is_component_none(hwb.w()), is_component_none(hwb.b()), is_component_none(hwb.alpha()) };
-    }
-    case ColorStyleValue::ColorType::Lab: {
-        auto const& lab = as<LabColorStyleValue>(color);
-        return { is_component_none(lab.l()), is_component_none(lab.a()), is_component_none(lab.b()), is_component_none(lab.alpha()) };
-    }
-    case ColorStyleValue::ColorType::OKLab: {
-        auto const& oklab = as<OKLabColorStyleValue>(color);
-        return { is_component_none(oklab.l()), is_component_none(oklab.a()), is_component_none(oklab.b()), is_component_none(oklab.alpha()) };
-    }
-    case ColorStyleValue::ColorType::LCH: {
-        auto const& lch = as<LCHColorStyleValue>(color);
-        return { is_component_none(lch.l()), is_component_none(lch.c()), is_component_none(lch.h()), is_component_none(lch.alpha()) };
-    }
-    case ColorStyleValue::ColorType::OKLCH: {
-        auto const& oklch = as<OKLCHColorStyleValue>(color);
-        return { is_component_none(oklch.l()), is_component_none(oklch.c()), is_component_none(oklch.h()), is_component_none(oklch.alpha()) };
-    }
-    case ColorStyleValue::ColorType::RGB: {
-        auto const& rgb = as<RGBColorStyleValue>(color);
-        return { is_component_none(rgb.r()), is_component_none(rgb.g()), is_component_none(rgb.b()), is_component_none(rgb.alpha()) };
-    }
-    default:
-        if (color.is_color_function()) {
-            auto const& func = as<ColorFunctionStyleValue>(color);
-            return { is_component_none(func.channel(0)), is_component_none(func.channel(1)), is_component_none(func.channel(2)), is_component_none(func.alpha()) };
-        }
+    if (!color.color_type().has_value())
         return {};
-    }
+    auto const& function = as<ColorFunctionStyleValue>(color);
+    return { is_component_none(function.channel(0)), is_component_none(function.channel(1)), is_component_none(function.channel(2)), is_component_none(function.alpha()) };
 }
 
 // https://drafts.csswg.org/css-color-4/#interpolation-missing
@@ -315,28 +278,28 @@ static ValueComparingNonnullRefPtr<StyleValue const> style_value_from_rectangula
 
     switch (space) {
     case RectangularColorSpace::Lab:
-        return LabLikeColorStyleValue::create<LabColorStyleValue>(c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::Lab, c1, c2, c3, alpha);
     case RectangularColorSpace::Oklab:
-        return LabLikeColorStyleValue::create<OKLabColorStyleValue>(c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::OKLab, c1, c2, c3, alpha);
     case RectangularColorSpace::Srgb:
-        return ColorFunctionStyleValue::create("srgb"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::sRGB, c1, c2, c3, alpha);
     case RectangularColorSpace::SrgbLinear:
-        return ColorFunctionStyleValue::create("srgb-linear"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::sRGBLinear, c1, c2, c3, alpha);
     case RectangularColorSpace::DisplayP3:
-        return ColorFunctionStyleValue::create("display-p3"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::DisplayP3, c1, c2, c3, alpha);
     case RectangularColorSpace::DisplayP3Linear:
-        return ColorFunctionStyleValue::create("display-p3-linear"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::DisplayP3Linear, c1, c2, c3, alpha);
     case RectangularColorSpace::A98Rgb:
-        return ColorFunctionStyleValue::create("a98-rgb"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::A98RGB, c1, c2, c3, alpha);
     case RectangularColorSpace::ProphotoRgb:
-        return ColorFunctionStyleValue::create("prophoto-rgb"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::ProPhotoRGB, c1, c2, c3, alpha);
     case RectangularColorSpace::Rec2020:
-        return ColorFunctionStyleValue::create("rec2020"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::Rec2020, c1, c2, c3, alpha);
     case RectangularColorSpace::Xyz:
     case RectangularColorSpace::XyzD65:
-        return ColorFunctionStyleValue::create("xyz-d65"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::XYZD65, c1, c2, c3, alpha);
     case RectangularColorSpace::XyzD50:
-        return ColorFunctionStyleValue::create("xyz-d50"sv, c1, c2, c3, alpha);
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::XYZD50, c1, c2, c3, alpha);
     }
     VERIFY_NOT_REACHED();
 }
@@ -349,7 +312,7 @@ static ValueComparingNonnullRefPtr<StyleValue const> style_value_from_polar_colo
     case PolarColorSpace::Hsl: {
         // HSL/HWB resolve to sRGB in computed values, so convert and express as color(srgb ...).
         auto srgb = Gfx::hsl_to_srgb(components);
-        return ColorFunctionStyleValue::create("srgb"sv,
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::sRGB,
             NumberStyleValue::create(srgb[0]),
             NumberStyleValue::create(srgb[1]),
             NumberStyleValue::create(srgb[2]),
@@ -357,20 +320,20 @@ static ValueComparingNonnullRefPtr<StyleValue const> style_value_from_polar_colo
     }
     case PolarColorSpace::Hwb: {
         auto srgb = Gfx::hwb_to_srgb(components);
-        return ColorFunctionStyleValue::create("srgb"sv,
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::sRGB,
             NumberStyleValue::create(srgb[0]),
             NumberStyleValue::create(srgb[1]),
             NumberStyleValue::create(srgb[2]),
             alpha);
     }
     case PolarColorSpace::Lch:
-        return LCHLikeColorStyleValue::create<LCHColorStyleValue>(
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::LCH,
             number_or_none(components[0], missing.component(0)),
             number_or_none(components[1], missing.component(1)),
             number_or_none(components[2], missing.component(2)),
             alpha);
     case PolarColorSpace::Oklch:
-        return LCHLikeColorStyleValue::create<OKLCHColorStyleValue>(
+        return ColorFunctionStyleValue::create(ColorStyleValue::ColorType::OKLCH,
             number_or_none(components[0], missing.component(0)),
             number_or_none(components[1], missing.component(1)),
             number_or_none(components[2], missing.component(2)),
@@ -385,6 +348,9 @@ static Optional<Gfx::ColorComponents> style_value_to_color_components(StyleValue
         return {};
 
     auto const& color = style_value.as_color();
+    auto color_type = color.color_type();
+    if (!color_type.has_value())
+        return {};
     auto resolve_alpha = [&](StyleValue const& alpha_sv) -> Optional<float> {
         auto result = ColorStyleValue::resolve_alpha(alpha_sv, context);
         if (!result.has_value())
@@ -392,12 +358,12 @@ static Optional<Gfx::ColorComponents> style_value_to_color_components(StyleValue
         return static_cast<float>(result.value());
     };
 
-    switch (color.color_type()) {
+    switch (*color_type) {
     case ColorStyleValue::ColorType::HSL: {
-        auto const& hsl = as<HSLColorStyleValue>(color);
-        auto h = ColorStyleValue::resolve_hue(hsl.h(), context);
-        auto s = ColorStyleValue::resolve_with_reference_value(hsl.s(), 100.0f, context);
-        auto l = ColorStyleValue::resolve_with_reference_value(hsl.l(), 100.0f, context);
+        auto const& hsl = as<ColorFunctionStyleValue>(color);
+        auto h = ColorStyleValue::resolve_hue(hsl.channel(0), context);
+        auto s = ColorStyleValue::resolve_with_reference_value(hsl.channel(1), 100.0f, context);
+        auto l = ColorStyleValue::resolve_with_reference_value(hsl.channel(2), 100.0f, context);
         auto a = resolve_alpha(hsl.alpha());
         if (!h.has_value() || !s.has_value() || !l.has_value() || !a.has_value())
             return {};
@@ -405,60 +371,60 @@ static Optional<Gfx::ColorComponents> style_value_to_color_components(StyleValue
         return Gfx::ColorComponents { static_cast<float>(h.value()), static_cast<float>(s.value() / 100.0), static_cast<float>(l.value() / 100.0), a.value() };
     }
     case ColorStyleValue::ColorType::HWB: {
-        auto const& hwb = as<HWBColorStyleValue>(color);
-        auto h = ColorStyleValue::resolve_hue(hwb.h(), context);
-        auto w = ColorStyleValue::resolve_with_reference_value(hwb.w(), 100.0f, context);
-        auto b = ColorStyleValue::resolve_with_reference_value(hwb.b(), 100.0f, context);
+        auto const& hwb = as<ColorFunctionStyleValue>(color);
+        auto h = ColorStyleValue::resolve_hue(hwb.channel(0), context);
+        auto w = ColorStyleValue::resolve_with_reference_value(hwb.channel(1), 100.0f, context);
+        auto b = ColorStyleValue::resolve_with_reference_value(hwb.channel(2), 100.0f, context);
         auto a = resolve_alpha(hwb.alpha());
         if (!h.has_value() || !w.has_value() || !b.has_value() || !a.has_value())
             return {};
         return Gfx::ColorComponents { static_cast<float>(h.value()), static_cast<float>(w.value() / 100.0), static_cast<float>(b.value() / 100.0), a.value() };
     }
     case ColorStyleValue::ColorType::Lab: {
-        auto const& lab = as<LabColorStyleValue>(color);
-        auto l = ColorStyleValue::resolve_with_reference_value(lab.l(), 100.0f, context);
-        auto a_comp = ColorStyleValue::resolve_with_reference_value(lab.a(), 125.0f, context);
-        auto b_comp = ColorStyleValue::resolve_with_reference_value(lab.b(), 125.0f, context);
+        auto const& lab = as<ColorFunctionStyleValue>(color);
+        auto l = ColorStyleValue::resolve_with_reference_value(lab.channel(0), 100.0f, context);
+        auto a_comp = ColorStyleValue::resolve_with_reference_value(lab.channel(1), 125.0f, context);
+        auto b_comp = ColorStyleValue::resolve_with_reference_value(lab.channel(2), 125.0f, context);
         auto a = resolve_alpha(lab.alpha());
         if (!l.has_value() || !a_comp.has_value() || !b_comp.has_value() || !a.has_value())
             return {};
         return Gfx::ColorComponents { static_cast<float>(l.value()), static_cast<float>(a_comp.value()), static_cast<float>(b_comp.value()), a.value() };
     }
     case ColorStyleValue::ColorType::OKLab: {
-        auto const& oklab = as<OKLabColorStyleValue>(color);
-        auto l = ColorStyleValue::resolve_with_reference_value(oklab.l(), 1.0f, context);
-        auto a_comp = ColorStyleValue::resolve_with_reference_value(oklab.a(), 0.4f, context);
-        auto b_comp = ColorStyleValue::resolve_with_reference_value(oklab.b(), 0.4f, context);
+        auto const& oklab = as<ColorFunctionStyleValue>(color);
+        auto l = ColorStyleValue::resolve_with_reference_value(oklab.channel(0), 1.0f, context);
+        auto a_comp = ColorStyleValue::resolve_with_reference_value(oklab.channel(1), 0.4f, context);
+        auto b_comp = ColorStyleValue::resolve_with_reference_value(oklab.channel(2), 0.4f, context);
         auto a = resolve_alpha(oklab.alpha());
         if (!l.has_value() || !a_comp.has_value() || !b_comp.has_value() || !a.has_value())
             return {};
         return Gfx::ColorComponents { static_cast<float>(l.value()), static_cast<float>(a_comp.value()), static_cast<float>(b_comp.value()), a.value() };
     }
     case ColorStyleValue::ColorType::LCH: {
-        auto const& lch = as<LCHColorStyleValue>(color);
-        auto l = ColorStyleValue::resolve_with_reference_value(lch.l(), 100.0f, context);
-        auto c = ColorStyleValue::resolve_with_reference_value(lch.c(), 150.0f, context);
-        auto h = ColorStyleValue::resolve_hue(lch.h(), context);
+        auto const& lch = as<ColorFunctionStyleValue>(color);
+        auto l = ColorStyleValue::resolve_with_reference_value(lch.channel(0), 100.0f, context);
+        auto c = ColorStyleValue::resolve_with_reference_value(lch.channel(1), 150.0f, context);
+        auto h = ColorStyleValue::resolve_hue(lch.channel(2), context);
         auto a = resolve_alpha(lch.alpha());
         if (!l.has_value() || !c.has_value() || !h.has_value() || !a.has_value())
             return {};
         return Gfx::ColorComponents { static_cast<float>(l.value()), static_cast<float>(c.value()), static_cast<float>(h.value()), a.value() };
     }
     case ColorStyleValue::ColorType::OKLCH: {
-        auto const& oklch = as<OKLCHColorStyleValue>(color);
-        auto l = ColorStyleValue::resolve_with_reference_value(oklch.l(), 1.0f, context);
-        auto c = ColorStyleValue::resolve_with_reference_value(oklch.c(), 0.4f, context);
-        auto h = ColorStyleValue::resolve_hue(oklch.h(), context);
+        auto const& oklch = as<ColorFunctionStyleValue>(color);
+        auto l = ColorStyleValue::resolve_with_reference_value(oklch.channel(0), 1.0f, context);
+        auto c = ColorStyleValue::resolve_with_reference_value(oklch.channel(1), 0.4f, context);
+        auto h = ColorStyleValue::resolve_hue(oklch.channel(2), context);
         auto a = resolve_alpha(oklch.alpha());
         if (!l.has_value() || !c.has_value() || !h.has_value() || !a.has_value())
             return {};
         return Gfx::ColorComponents { static_cast<float>(l.value()), static_cast<float>(c.value()), static_cast<float>(h.value()), a.value() };
     }
     case ColorStyleValue::ColorType::RGB: {
-        auto const& rgb = as<RGBColorStyleValue>(color);
-        auto r = ColorStyleValue::resolve_with_reference_value(rgb.r(), 255.0f, context);
-        auto g = ColorStyleValue::resolve_with_reference_value(rgb.g(), 255.0f, context);
-        auto b = ColorStyleValue::resolve_with_reference_value(rgb.b(), 255.0f, context);
+        auto const& rgb = as<ColorFunctionStyleValue>(color);
+        auto r = ColorStyleValue::resolve_with_reference_value(rgb.channel(0), 255.0f, context);
+        auto g = ColorStyleValue::resolve_with_reference_value(rgb.channel(1), 255.0f, context);
+        auto b = ColorStyleValue::resolve_with_reference_value(rgb.channel(2), 255.0f, context);
         auto a = resolve_alpha(rgb.alpha());
         if (!r.has_value() || !g.has_value() || !b.has_value() || !a.has_value())
             return {};
@@ -620,8 +586,11 @@ static void mark_powerless_hue_after_conversion(
     StyleValue const& style_value, PolarColorSpace polar_color_space,
     ComponentCategories const& target_categories)
 {
-    if (style_value.is_color() && color_type_matches_polar_space(style_value.as_color().color_type(), polar_color_space))
-        return;
+    if (style_value.is_color()) {
+        auto color_type = style_value.as_color().color_type();
+        if (color_type.has_value() && color_type_matches_polar_space(*color_type, polar_color_space))
+            return;
+    }
 
     bool has_zero_colorfulness = false;
     for (size_t i = 0; i < 3; ++i) {
@@ -676,7 +645,10 @@ static ColorSyntax color_syntax_for_interpolation(StyleValue const& style_value)
         return ColorSyntax::Legacy;
 
     auto const& color = style_value.as_color();
-    switch (color.color_type()) {
+    auto color_type = color.color_type();
+    if (!color_type.has_value())
+        return color.color_syntax();
+    switch (*color_type) {
     case ColorStyleValue::ColorType::RGB:
     case ColorStyleValue::ColorType::HSL:
     case ColorStyleValue::ColorType::HWB:
@@ -688,8 +660,11 @@ static ColorSyntax color_syntax_for_interpolation(StyleValue const& style_value)
 
 static ComponentCategories source_categories_for_interpolation(StyleValue const& style_value)
 {
-    if (style_value.is_color())
-        return categories_for_color_type(style_value.as_color().color_type());
+    if (style_value.is_color()) {
+        if (auto color_type = style_value.as_color().color_type(); color_type.has_value())
+            return categories_for_color_type(*color_type);
+        return { ComponentCategory::NotAnalogous, ComponentCategory::NotAnalogous, ComponentCategory::NotAnalogous };
+    }
     return { ComponentCategory::Red, ComponentCategory::Green, ComponentCategory::Blue };
 }
 
@@ -742,7 +717,7 @@ static Optional<Gfx::ColorComponents> resolve_interpolation_color_to_srgb(
     if (color.native_components.has_value()) {
         color.srgb_components = native_components_to_srgb(
             color.native_components.value(),
-            style_value.as_color().color_type());
+            style_value.as_color().color_type().value());
         return color.srgb_components;
     }
 
@@ -792,7 +767,7 @@ static Gfx::ColorComponents convert_interpolation_color_to_rectangular_space(
     ColorResolutionContext const& color_resolution_context)
 {
     if (color.native_components.has_value() && style_value.is_color()
-        && color_type_matches_rectangular_space(style_value.as_color().color_type(), space)) {
+        && color_type_matches_rectangular_space(style_value.as_color().color_type().value(), space)) {
         return color.native_components.value();
     }
 
@@ -808,7 +783,7 @@ static Gfx::ColorComponents convert_interpolation_color_to_polar_space(
     ColorResolutionContext const& color_resolution_context)
 {
     if (color.native_components.has_value() && style_value.is_color()
-        && color_type_matches_polar_space(style_value.as_color().color_type(), space)) {
+        && color_type_matches_polar_space(style_value.as_color().color_type().value(), space)) {
         return color.native_components.value();
     }
 

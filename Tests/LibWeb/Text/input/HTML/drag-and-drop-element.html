@@ -31,36 +31,42 @@
         };
 
         target.addEventListener("dragenter", e => {
-            printEvent("dragenter", e);
+            printEvent("target: dragenter", e);
             e.preventDefault();
         });
         target.addEventListener("dragover", e => {
-            printEvent("dragover", e);
+            printEvent("target: dragover", e);
             e.preventDefault();
         });
         target.addEventListener("dragleave", e => {
             printEvent("dragleave", e);
         });
         target.addEventListener("drop", e => {
-            printEvent("drop", e);
+            printEvent("target: drop", e);
             println(`    text/plain: '${e.dataTransfer.getData("text/plain")}'`);
             println(`    text/uri-list: '${e.dataTransfer.getData("text/uri-list")}'`);
             e.preventDefault();
         });
 
-        let sourceEvents = [];
         source.addEventListener("dragstart", e => {
             e.dataTransfer.setData("text/plain", "hello");
-            sourceEvents.push("dragstart");
+            println("source: dragstart");
         });
         source.addEventListener("dragend", e => {
-            sourceEvents.push(`dragend:${e.dataTransfer.dropEffect}`);
+            println(`source: dragend:${e.dataTransfer.dropEffect}`);
         });
 
-        let noDragStarted = false;
+        nodrag.addEventListener("mousedown", () => {
+            println("nodrag: mousedown");
+        });
+        nodrag.addEventListener("mousemove", () => {
+            println("nodrag: mousemove");
+        });
         nodrag.addEventListener("dragstart", () => {
-            console.log("DRAG");
-            noDragStarted = true;
+            println("nodrag: dragstart");
+        });
+        nodrag.addEventListener("mouseup", () => {
+            println("nodrag: mouseup");
         });
 
         link.addEventListener("dragstart", e => {
@@ -78,13 +84,11 @@
         internals.mouseMove(50, 125);
         internals.mouseMove(50, 50);
         internals.mouseUp(50, 50);
-        println(`    source events: ${sourceEvents.join(",")}`);
 
         println("\nDrag non-draggable div:");
         internals.mouseDown(50, 250);
         internals.mouseMove(50, 275);
         internals.mouseUp(50, 275);
-        println(`    drag started: ${noDragStarted}`);
 
         println("\nDrag link:");
         internals.mouseDown(50, 350);
@@ -107,6 +111,20 @@
             },
             { once: true }
         );
+        internals.mouseDown(50, 150);
+        internals.mouseMove(50, 125);
+        internals.mouseMove(50, 50);
+        internals.mouseMove(55, 50);
+        internals.mouseUp(50, 50);
+
+        println("\nMousedown cancelled (prevents dragstart):");
+        source.addEventListener(
+            "mousedown",
+            e => {
+                println(`source: ${e.type} (cancelling)`);
+                e.preventDefault();
+            },
+            { once: true });
         internals.mouseDown(50, 150);
         internals.mouseMove(50, 125);
         internals.mouseMove(50, 50);

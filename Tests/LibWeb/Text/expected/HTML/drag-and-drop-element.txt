@@ -1,25 +1,28 @@
 Drag div:
-dragenter
+source: dragstart
+target: dragenter
     types: text/plain
-dragover
+target: dragover
     types: text/plain
-drop
+target: drop
     types: text/plain
     text/plain: 'hello'
     text/uri-list: ''
-    source events: dragstart,dragend:copy
+source: dragend:copy
 
 Drag non-draggable div:
-    drag started: false
+nodrag: mousedown
+nodrag: mousemove
+nodrag: mouseup
 
 Drag link:
 dragstart
     types: text/uri-list
-dragenter
+target: dragenter
     types: text/uri-list
-dragover
+target: dragover
     types: text/uri-list
-drop
+target: drop
     types: text/uri-list
     text/plain: ''
     text/uri-list: 'https://example.com/'
@@ -27,14 +30,18 @@ drop
 Drag image:
 dragstart
     types: text/uri-list
-dragenter
+target: dragenter
     types: text/uri-list
-dragover
+target: dragover
     types: text/uri-list
-drop
+target: drop
     types: text/uri-list
     text/plain: ''
     text/uri-list: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=='
 
 Dragstart cancelled:
+source: dragstart
 dragstart (cancelling)
+
+Mousedown cancelled (prevents dragstart):
+source: mousedown (cancelling)
