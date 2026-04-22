@@ -13,6 +13,7 @@
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Event.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -79,6 +80,29 @@ Layout::VideoBox const* HTMLVideoElement::layout_node() const
     return static_cast<Layout::VideoBox const*>(Node::layout_node());
 }
 
+void HTMLVideoElement::set_intrinsic_video_dimensions(Optional<Gfx::Size<u32>> dimensions)
+{
+    if (m_intrinsic_video_dimensions == dimensions)
+        return;
+    m_intrinsic_video_dimensions = dimensions;
+
+    // Whenever the natural width or natural height of the video changes (including, for example, because the
+    // selected video track was changed), if the element's readyState attribute is not HAVE_NOTHING,
+    // AD-HOC: We also use this to set the resolution in the steps that advance the ready state to HAVE_METADATA,
+    //         otherwise we could assert the readyState condition, since any other calls should already have metadata.
+    //         Also, the spec is not explicit on whether to fire the event when the element is emptied, but the check
+    //         for HAVE_NOTHING implies that it should not fire in that case. Therefore, skip the event if the
+    //         dimensions are not available. This matches other browsers.
+    if (dimensions.has_value()) {
+        // the user agent must queue a media element task given the media element to fire an event named resize at the media element.
+        queue_a_media_element_task([this] {
+            dispatch_event(DOM::Event::create(this->realm(), HTML::EventNames::resize));
+        });
+    }
+
+    update_natural_dimensions();
+}
+
 // https://html.spec.whatwg.org/multipage/media.html#dom-video-videowidth
 u32 HTMLVideoElement::video_width() const
 {
@@ -87,7 +111,12 @@ u32 HTMLVideoElement::video_width() const
     // is HAVE_NOTHING, then the attributes must return 0.
     if (ready_state() == ReadyState::HaveNothing)
         return 0;
-    return m_video_width;
+    if (m_intrinsic_video_dimensions.has_value())
+        return m_intrinsic_video_dimensions->width();
+    // AD-HOC: If the natural dimensions are not available, return 0. The non-normative text says that it should
+    //         return 0 if the dimensions are not known. The HAVE_NOTHING check is likely assumed to cover this
+    //         possibility.
+    return 0;
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-video-videoheight
@@ -98,7 +127,61 @@ u32 HTMLVideoElement::video_height() const
     // is HAVE_NOTHING, then the attributes must return 0.
     if (ready_state() == ReadyState::HaveNothing)
         return 0;
-    return m_video_height;
+    if (m_intrinsic_video_dimensions.has_value())
+        return m_intrinsic_video_dimensions->height();
+    // AD-HOC: If the natural dimensions is not available, return 0. The non-normative text says that it should
+    //         return 0 if the dimensions are not known. The HAVE_NOTHING check is likely assumed to cover this
+    //         possibility.
+    return 0;
+}
+
+void HTMLVideoElement::update_intrinsic_video_dimensions()
+{
+    if (selected_video_track_sink() == nullptr) {
+        set_intrinsic_video_dimensions({});
+        return;
+    }
+
+    auto current_frame = selected_video_track_sink()->current_frame();
+    if (current_frame == nullptr)
+        return;
+
+    auto current_frame_size = current_frame->size().to_type<u32>();
+    if (current_frame_size == m_intrinsic_video_dimensions)
+        return;
+    set_intrinsic_video_dimensions(current_frame_size);
+}
+
+void HTMLVideoElement::update_natural_dimensions()
+{
+    // https://html.spec.whatwg.org/multipage/media.html#concept-video-intrinsic-width
+    // The natural width of a video element's playback area is the natural width of the poster frame, if that is
+    // available and the element currently represents its poster frame; otherwise, it is the natural width of the video
+    // resource, if that is available; otherwise the natural width is missing.
+
+    // The natural height of a video element's playback area is the natural height of the poster frame, if that is
+    // available and the element currently represents its poster frame; otherwise it is the natural height of the video
+    // resource, if that is available; otherwise the natural height is missing.
+    auto natural_dimensions = m_intrinsic_video_dimensions.map([](Gfx::Size<u32> size) { return size.to_type<CSSPixels>(); });
+
+    if (current_representation() == Representation::PosterFrame && m_poster_frame)
+        natural_dimensions = m_poster_frame->size().to_type<CSSPixels>();
+
+    if (natural_dimensions == m_natural_dimensiosn)
+        return;
+
+    set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLVideoElementNaturalDimensionsChanged);
+    m_natural_dimensiosn = natural_dimensions;
+}
+
+Optional<Gfx::Size<u32>> HTMLVideoElement::natural_media_size() const
+{
+    return m_intrinsic_video_dimensions;
+}
+
+Optional<CSSPixelSize> HTMLVideoElement::natural_element_size() const
+{
+    return m_natural_dimensiosn;
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#attr-video-poster
@@ -107,24 +190,33 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
     auto& realm = this->realm();
     auto& vm = realm.vm();
 
-    m_poster_frame = nullptr;
-
     // 1. If there is an existing instance of this algorithm running for this video element, abort that instance of
     //    this algorithm without changing the poster frame.
     if (m_fetch_controller)
         m_fetch_controller->stop_fetch();
 
+    static constexpr auto finalize = [](HTMLVideoElement& self, RefPtr<Gfx::Bitmap> poster_frame) {
+        self.m_poster_frame = move(poster_frame);
+        self.m_load_event_delayer.clear();
+        self.m_fetch_controller = nullptr;
+        self.update_natural_dimensions();
+    };
+
     // 2. If the poster attribute's value is the empty string or if the attribute is absent, then there is no poster
     //    frame; return.
-    if (!poster.has_value() || poster->is_empty())
+    if (!poster.has_value() || poster->is_empty()) {
+        finalize(*this, nullptr);
         return {};
+    }
 
     // 3. Let url be the result of encoding-parsing a URL given the poster attribute's value, relative to the element's node document.
     auto url_record = document().encoding_parse_url(*poster);
 
     // 4. If url is failure, then return.
-    if (!url_record.has_value())
+    if (!url_record.has_value()) {
+        finalize(*this, nullptr);
         return {};
+    }
 
     // 5. Let request be a new request whose URL is the resulting URL record, client is the element's node document's
     //    relevant settings object, destination is "image", initiator type is "video", credentials mode is "include",
@@ -142,38 +234,53 @@ WebIDL::ExceptionOr<void> HTMLVideoElement::determine_element_poster_frame(Optio
     m_load_event_delayer.emplace(document());
 
     // 7. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
-    fetch_algorithms_input.process_response = [this](auto response) mutable {
-        ScopeGuard guard { [&] { m_load_event_delayer.clear(); } };
-
-        auto& realm = this->realm();
-        auto& global = document().realm().global_object();
-
-        if (response->is_network_error())
+    fetch_algorithms_input.process_response = [weak_self = GC::Weak(*this)](auto response) {
+        if (!weak_self)
             return;
+        auto& self = *weak_self;
+        auto& realm = self.realm();
+        auto& global = self.document().realm().global_object();
+
+        if (response->is_network_error()) {
+            finalize(self, nullptr);
+            return;
+        }
 
         if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect) {
             auto& filtered_response = static_cast<Fetch::Infrastructure::FilteredResponse&>(*response);
             response = filtered_response.internal_response();
         }
 
-        auto on_image_data_read = GC::create_function(heap(), [this](ByteBuffer image_data) mutable {
-            m_fetch_controller = nullptr;
-
+        auto on_image_data_read = GC::create_function(self.heap(), [weak_self](ByteBuffer image_data) {
+            if (!weak_self)
+                return;
             // 6. If an image is thus obtained, the poster frame is that image. Otherwise, there is no poster frame.
             (void)Platform::ImageCodecPlugin::the().decode_image(
                 image_data,
-                [strong_this = GC::Root(*this)](Web::Platform::DecodedImage& image) -> ErrorOr<void> {
+                [weak_self](Web::Platform::DecodedImage& image) -> ErrorOr<void> {
+                    if (!weak_self)
+                        return {};
+                    RefPtr<Gfx::Bitmap> poster_frame;
                     if (!image.frames.is_empty())
-                        strong_this->m_poster_frame = move(image.frames[0].bitmap);
+                        poster_frame = move(image.frames[0].bitmap);
+                    finalize(*weak_self, move(poster_frame));
                     return {};
                 },
-                [](auto&) {});
+                [weak_self](auto&) {
+                    if (!weak_self)
+                        return;
+                    finalize(*weak_self, nullptr);
+                });
         });
 
         VERIFY(response->body());
-        auto empty_algorithm = GC::create_function(heap(), [](JS::Value) { });
+        auto on_body_read_error = GC::create_function(self.heap(), [weak_self](JS::Value) {
+            if (!weak_self)
+                return;
+            finalize(*weak_self, nullptr);
+        });
 
-        response->body()->fully_read(realm, on_image_data_read, empty_algorithm, GC::Ref { global });
+        response->body()->fully_read(realm, on_image_data_read, on_body_read_error, GC::Ref { global });
     };
 
     m_fetch_controller = Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
@@ -189,8 +296,7 @@ HTMLVideoElement::Representation HTMLVideoElement::current_representation() cons
     // -> When no video data is available (the element's readyState attribute is either HAVE_NOTHING, or HAVE_METADATA
     //    but no video data has yet been obtained at all, or the element's readyState attribute is any subsequent value
     //    but the media resource does not have a video channel)
-    if (ready_state() == HTML::HTMLMediaElement::ReadyState::HaveNothing
-        || (ready_state() >= HTML::HTMLMediaElement::ReadyState::HaveMetadata && video_tracks()->length() == 0)) {
+    if (ready_state() == ReadyState::HaveNothing || video_tracks()->length() == 0) {
         // The video element represents its poster frame, if any, or else transparent black with no intrinsic dimensions.
         return poster_frame() ? Representation::PosterFrame : Representation::TransparentBlack;
     }

@@ -89,7 +89,7 @@ void HTMLMediaElement::initialize(JS::Realm& realm)
     Base::initialize(realm);
 
     m_audio_tracks = realm.create<AudioTrackList>(realm);
-    m_video_tracks = realm.create<VideoTrackList>(realm);
+    m_video_tracks = realm.create<VideoTrackList>(realm, this);
     m_text_tracks = realm.create<TextTrackList>(realm);
     m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
 
@@ -459,6 +459,7 @@ void HTMLMediaElement::set_current_playback_position(double playback_position)
         reached_end_of_media_playback();
 
     upon_has_ended_playback_possibly_changed();
+    update_natural_dimensions();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-duration
@@ -1279,6 +1280,7 @@ void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
             // NOTE: We do this step before creating the updateMedia task so that we can invoke the failure callback.
             auto maybe_verify_response_failure = self->verify_response_or_get_failure_reason(response, byte_range);
             if (maybe_verify_response_failure.has_value()) {
+                fetch_data->stream->close();
                 fetch_data->failure_callback(maybe_verify_response_failure.value());
                 return;
             }
@@ -1328,6 +1330,8 @@ void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
                     return;
                 if (fetch_generation != weak_self->m_current_fetch_generation)
                     return;
+
+                weak_self->m_remote_fetch_data->stream->close();
                 weak_self->queue_a_media_element_task([self = weak_self.as_nonnull()] {
                     self->process_media_data(FetchingStatus::Interrupted);
                 });
@@ -1546,10 +1550,20 @@ void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML:
     auto previous_track = m_selected_video_track;
 
     m_selected_video_track = video_track;
-    if (video_track)
+    if (video_track) {
         m_selected_video_track_sink = m_playback_manager->get_or_create_the_displaying_video_sink_for_track(video_track->track_in_playback_manager());
-    else
+        auto sink_update_result = m_selected_video_track_sink->update();
+        if (sink_update_result == Media::DisplayingVideoSinkUpdateResult::NewFrameAvailable) {
+            ensure_external_content_source().update(m_selected_video_track_sink->current_frame());
+            update_intrinsic_video_dimensions();
+            set_needs_repaint();
+        } else if (auto* video_element = as_if<HTMLVideoElement>(this)) {
+            auto const& video_data = video_track->track_in_playback_manager().video_data();
+            video_element->set_intrinsic_video_dimensions(Gfx::Size<u32>(video_data.pixel_width, video_data.pixel_height));
+        }
+    } else {
         m_selected_video_track_sink = nullptr;
+    }
 
     if (previous_track)
         m_playback_manager->remove_the_displaying_video_sink_for_track(previous_track->track_in_playback_manager());
@@ -1564,6 +1578,7 @@ void HTMLMediaElement::update_video_frame_and_timeline()
         auto sink_update_result = m_selected_video_track_sink->update();
         if (sink_update_result == Media::DisplayingVideoSinkUpdateResult::NewFrameAvailable) {
             ensure_external_content_source().update(m_selected_video_track_sink->current_frame());
+            update_intrinsic_video_dimensions();
             set_needs_repaint();
         }
     }
@@ -1696,12 +1711,8 @@ void HTMLMediaElement::on_metadata_parsed()
     //    named resize at the media element.
     auto* video_element = as_if<HTMLVideoElement>(*this);
     if (m_selected_video_track && video_element) {
-        video_element->set_video_height(m_selected_video_track->track_in_playback_manager().video_data().pixel_height);
-        video_element->set_video_width(m_selected_video_track->track_in_playback_manager().video_data().pixel_width);
-
-        queue_a_media_element_task([this] {
-            dispatch_event(DOM::Event::create(this->realm(), HTML::EventNames::resize));
-        });
+        auto const& video_data = m_selected_video_track->track_in_playback_manager().video_data();
+        video_element->set_intrinsic_video_dimensions(Gfx::Size<u32>(video_data.pixel_width, video_data.pixel_height));
     }
 
     // 6. Set the readyState attribute to HAVE_METADATA.
@@ -1739,7 +1750,9 @@ void HTMLMediaElement::on_metadata_parsed()
         });
     }
 
-    // AD-HOC: If we've already got buffered data, we need to upgrade the readyState further than HAVE_METADATA.
+    // AD-HOC: Now that we've enabled one of each available track type, the playback manager can be started. If this
+    //         causes the playback manager to exit the initial state, the ready state should change.
+    m_playback_manager->start();
     update_ready_state();
 }
 
@@ -1969,6 +1982,9 @@ void HTMLMediaElement::forget_media_resource_specific_tracks()
     m_audio_tracks->remove_all_tracks();
     m_video_tracks->remove_all_tracks();
     m_playback_manager.clear();
+
+    // NB: At this point, we no longer have any selected tracks to derive the video dimensions from.
+    update_intrinsic_video_dimensions();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#ready-states:media-element-3
@@ -1982,6 +1998,7 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
 
     ScopeGuard guard { [&] {
         upon_has_ended_playback_possibly_changed();
+        update_natural_dimensions();
         set_needs_style_update(true);
     } };
 
@@ -2121,9 +2138,10 @@ void HTMLMediaElement::update_ready_state()
     auto current_time = m_playback_manager->current_time();
     auto ranges = m_playback_manager->buffered_time_ranges();
     auto current_range = ranges.range_at_or_after(current_time);
-    auto has_future_data = m_playback_manager->has_future_data();
+    auto available_data = m_playback_manager->available_data();
 
-    if (!has_future_data && !current_range.has_value()) {
+    if (available_data == Media::AvailableData::None
+        || (available_data == Media::AvailableData::Current && !current_range.has_value())) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_METADATA.
         set_ready_state(ReadyState::HaveMetadata);
         // 2. Abort these steps.
@@ -2142,7 +2160,7 @@ void HTMLMediaElement::update_ready_state()
 
     // -> If HTMLMediaElement's buffered contains a TimeRanges that includes the current playback position and
     //    enough data to ensure uninterrupted playback:
-    if (has_future_data && (playable_duration >= have_enough_data_duration || current_range_end >= duration)) {
+    if (available_data == Media::AvailableData::Future && (playable_duration >= have_enough_data_duration || current_range_end >= duration)) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_ENOUGH_DATA.
         set_ready_state(ReadyState::HaveEnoughData);
 
@@ -2155,7 +2173,7 @@ void HTMLMediaElement::update_ready_state()
 
     // -> If HTMLMediaElement's buffered contains a TimeRanges that includes the current playback position and
     //    some time beyond the current playback position:
-    if (has_future_data && playable_duration > AK::Duration::zero()) {
+    if (available_data == Media::AvailableData::Future && playable_duration > AK::Duration::zero()) {
         // 1. Set the HTMLMediaElement's readyState attribute to HAVE_FUTURE_DATA.
         set_ready_state(ReadyState::HaveFutureData);
 
@@ -2474,6 +2492,7 @@ void HTMLMediaElement::set_show_poster(bool show_poster)
 
     m_show_poster = show_poster;
 
+    update_natural_dimensions();
     set_needs_repaint();
 }
 
@@ -2492,6 +2511,7 @@ void HTMLMediaElement::set_paused(bool paused)
             document().page().client().page_did_change_audio_play_state(AudioPlayState::Paused);
     }
 
+    update_natural_dimensions();
     set_needs_repaint();
     set_needs_style_update(true);
 }

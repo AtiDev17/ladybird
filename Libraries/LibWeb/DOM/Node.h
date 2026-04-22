@@ -53,6 +53,7 @@ enum class ShouldComputeRole {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
+    X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
     X(KeyframeEffect)                                 \
     X(LayoutTreeUpdate)                               \

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, Gregory Bertilson <gregory@ladybird.org>
+ * Copyright (c) 2022-2026, Gregory Bertilson <gregory@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -7,7 +7,7 @@
 #include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegDemuxer.h>
-#include <LibMedia/PlaybackStates/PausedStateHandler.h>
+#include <LibMedia/PlaybackStates/StartingStateHandler.h>
 #include <LibMedia/Providers/AudioDataProvider.h>
 #include <LibMedia/Providers/GenericTimeProvider.h>
 #include <LibMedia/Providers/VideoDataProvider.h>
@@ -146,7 +146,7 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
 NonnullOwnPtr<PlaybackManager> PlaybackManager::create()
 {
     auto playback_manager = adopt_own(*new (nothrow) PlaybackManager());
-    playback_manager->m_handler = make<PausedStateHandler>(*playback_manager, RESUMING_SUSPEND_TIMEOUT_MS);
+    playback_manager->m_handler = make<StartingStateHandler>(*playback_manager);
     playback_manager->m_handler->on_enter();
     return playback_manager;
 }
@@ -261,17 +261,14 @@ void PlaybackManager::set_up_data_providers()
 
 void PlaybackManager::track_started_buffering(Track const& track)
 {
-    bool was_buffering = state() == PlaybackState::Buffering;
     m_tracks_still_buffering.set(track);
-    if (!was_buffering)
-        m_handler->enter_buffering();
+    m_handler->enter_buffering();
 }
 
 void PlaybackManager::track_stopped_buffering(Track const& track)
 {
-    bool was_buffering = state() == PlaybackState::Buffering;
     m_tracks_still_buffering.remove(track);
-    if (was_buffering && m_tracks_still_buffering.is_empty())
+    if (m_tracks_still_buffering.is_empty())
         m_handler->exit_buffering();
 }
 
@@ -349,12 +346,12 @@ void PlaybackManager::enable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(!track_data.enabled);
+    track_data.enabled = true;
     if (m_audio_sink) {
         VERIFY(m_audio_sink->provider(track) == nullptr);
         m_audio_sink->set_provider(track, track_data.provider);
+        m_tracks_still_buffering.set(track);
     }
-    track_data.enabled = true;
-    m_tracks_still_buffering.set(track);
     m_handler->on_track_enabled(track);
 }
 
@@ -387,6 +384,11 @@ bool PlaybackManager::track_is_enabled(Track const& track) const
     return true;
 }
 
+void PlaybackManager::start()
+{
+    m_handler->start();
+}
+
 void PlaybackManager::play()
 {
     m_handler->play();
@@ -413,9 +415,9 @@ PlaybackState PlaybackManager::state()
     return m_handler->state();
 }
 
-bool PlaybackManager::has_future_data()
+AvailableData PlaybackManager::available_data()
 {
-    return m_handler->has_future_data();
+    return m_handler->available_data();
 }
 
 TimeRanges PlaybackManager::buffered_time_ranges() const
