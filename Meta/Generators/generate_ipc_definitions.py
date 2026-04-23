@@ -299,12 +299,15 @@ def parse(contents: str) -> List[Endpoint]:
 
 def constructor_for_message(name: str, parameters: List[Parameter]) -> str:
     if not parameters:
-        return f"{name}() {{}}"
+        return f"{name}() = default;"
 
     params = ", ".join(f"{p.type} {p.name}" for p in parameters)
-    initializers = ", ".join(f"m_{p.name}(move({p.name}))" for p in parameters)
+    initializers = "\n        , ".join(f"m_{p.name}(move({p.name}))" for p in parameters)
 
-    return f"{name}({params}) : {initializers} {{}}"
+    return f"""{name}({params})
+        : {initializers}
+    {{
+    }}"""
 
 
 def write_message_ids_enum(out: TextIO, endpoint: Endpoint) -> None:
@@ -339,15 +342,16 @@ public:""")
         out.write(f"\n    typedef class {response_type} ResponseType;\n")
 
     out.write(f"""
+    {constructor_for_message(pascal_name, parameters)}
+
     {pascal_name}({pascal_name} const&) = default;
     {pascal_name}({pascal_name}&&) = default;
     {pascal_name}& operator=({pascal_name} const&) = default;
-    {constructor_for_message(pascal_name, parameters)}
 """)
 
     if len(parameters) == 1:
         out.write(f"""
-    template <typename WrappedReturnType>
+    template<typename WrappedReturnType>
     requires(!SameAs<WrappedReturnType, {parameters[0].type}>)
     {pascal_name}(WrappedReturnType&& value)
         : m_{parameters[0].name}(forward<WrappedReturnType>(value))
@@ -356,14 +360,12 @@ public:""")
 """)
 
     out.write(f"""
-    virtual ~{pascal_name}() override = default;
-
     static constexpr u32 ENDPOINT_MAGIC = {endpoint.magic};
 
     virtual u32 endpoint_magic() const override {{ return ENDPOINT_MAGIC; }}
     virtual i32 message_id() const override {{ return (int)MessageID::{pascal_name}; }}
     static i32 static_message_id() {{ return (int)MessageID::{pascal_name}; }}
-    virtual const char* message_name() const override {{ return "{endpoint.name}::{pascal_name}"; }}
+    virtual StringView message_name() const override {{ return "{endpoint.name}::{pascal_name}"sv; }}
 
     static ErrorOr<NonnullOwnPtr<{pascal_name}>> decode(Stream& stream, Queue<IPC::Attachment>& attachments)
     {{
@@ -412,7 +414,7 @@ public:""")
             out.write(f"\n    {parameter.type} {parameter.name}() const {{ return m_{parameter.name}; }}\n")
         else:
             out.write(f"""
-    const {parameter.type}& {parameter.name}() const {{ return m_{parameter.name}; }}
+    {parameter.type} const& {parameter.name}() const {{ return m_{parameter.name}; }}
     {parameter.type} take_{parameter.name}() {{ return move(m_{parameter.name}); }}
 """)
 
@@ -465,7 +467,7 @@ def write_proxy_method(
 
         signature_params.append(f"{type} {parameter.name}")
 
-    out.write(f"\n    {return_type} {method_name}({', '.join(signature_params)}) {{")
+    out.write(f"\n    {return_type} {method_name}({', '.join(signature_params)})\n    {{")
 
     if not is_synchronous and not is_try and not is_unicode_string_overload:
         for parameter in parameters:
@@ -489,7 +491,7 @@ def write_proxy_method(
         sync_call = f"m_connection.template send_sync<Messages::{endpoint.name}::{pascal_name}>({call_args})"
 
         if return_type == "void":
-            out.write(f"\n        (void) {sync_call};")
+            out.write(f"\n        (void){sync_call};")
         elif len(message.outputs) == 1:
             output = message.outputs[0]
             accessor = output.name if is_primitive_or_simple_type(output.type) else f"take_{output.name}"
@@ -498,17 +500,10 @@ def write_proxy_method(
             out.write(f"\n        return move(*{sync_call});")
     elif is_try:
         out.write(f"""
-        auto result = m_connection.template send_sync_but_allow_failure<Messages::{endpoint.name}::{pascal_name}>({call_args});
-        if (!result) {{
-            m_connection.shutdown();
-            return IPC::ErrorCode::PeerDisconnected;
-        }}
-""")
-
-        if inner_return_type != "void":
-            out.write("        return move(*result);\n")
-        else:
-            out.write("        return { };\n")
+        if (auto result = m_connection.template send_sync_but_allow_failure<Messages::{endpoint.name}::{pascal_name}>({call_args}))
+            return {"{}" if inner_return_type == "void" else "move(*result)"};
+        m_connection.shutdown();
+        return IPC::ErrorCode::PeerDisconnected;""")
     else:
         # Async messages silently ignore send failures (e.g. peer disconnected).
         out.write(f"""
@@ -539,7 +534,8 @@ public:
 
     {endpoint.name}Proxy(IPC::Connection<LocalEndpoint, PeerEndpoint>& connection, Tag)
         : m_connection(connection)
-    {{ }}
+    {{
+    }}
 """)
 
     for message in endpoint.messages:
@@ -574,9 +570,8 @@ public:
         FixedMemoryStream stream {{ buffer }};
         auto message_endpoint_magic = TRY(stream.read_value<u32>());
 
-        if (message_endpoint_magic != {endpoint.magic}) {{
+        if (message_endpoint_magic != static_magic())
             return Error::from_string_literal("Endpoint magic number mismatch, not my message!");
-        }}
 
         auto message_id = TRY(stream.read_value<i32>());
 
@@ -591,7 +586,7 @@ public:
             pascal_name = pascal_case(name)
             out.write(f"""
         case (int)Messages::{endpoint.name}::MessageID::{pascal_name}:
-            return TRY(Messages::{endpoint.name}::{pascal_name}::decode(stream, attachments));""")
+            return Messages::{endpoint.name}::{pascal_name}::decode(stream, attachments);""")
 
     out.write(f"""
         default:
@@ -600,7 +595,6 @@ public:
 
         VERIFY_NOT_REACHED();
     }}
-
 }};
 """)
 
@@ -621,9 +615,12 @@ public:
 
     for message in endpoint.messages:
         pascal_name = pascal_case(message.name)
-        out.write(f"""
-        case (int)Messages::{endpoint.name}::MessageID::{pascal_name}:
-            return handle_{pascal_name}(*message);""")
+        out.write(f"\n        case (int)Messages::{endpoint.name}::MessageID::{pascal_name}:\n")
+
+        if message.inputs:
+            out.write(f"            return handle_{message.name}(*message);")
+        else:
+            out.write(f"            return handle_{message.name}();")
 
     out.write(f"""
         default:
@@ -634,9 +631,6 @@ public:
 
     for message in endpoint.messages:
         pascal_name = pascal_case(message.name)
-        request_cast = (
-            f"[[maybe_unused]] auto& request = static_cast<Messages::{endpoint.name}::{pascal_name}&>(message);"
-        )
 
         arg_parts: List[str] = []
         for parameter in message.inputs:
@@ -644,22 +638,23 @@ public:
             arg_parts.append(f"request.{accessor}()")
         arguments = ", ".join(arg_parts)
 
-        out.write(
-            f"\n    NEVER_INLINE ErrorOr<OwnPtr<IPC::MessageBuffer>> handle_{pascal_name}(IPC::Message& message)\n    {{\n"
-        )
+        out.write(f"\n    NEVER_INLINE ErrorOr<OwnPtr<IPC::MessageBuffer>> handle_{message.name}(")
+
+        if message.inputs:
+            out.write("IPC::Message& message)\n    {\n")
+            out.write(f"        auto& request = static_cast<Messages::{endpoint.name}::{pascal_name}&>(message);\n")
+        else:
+            out.write(")\n    {\n")
 
         if not message.is_synchronous:
-            out.write(f"        {request_cast}\n")
             out.write(f"        {message.name}({arguments});\n")
             out.write("        return nullptr;\n")
         elif not message.outputs:
             response_pascal_name = pascal_case(message.response_name())
-            out.write(f"        {request_cast}\n")
             out.write(f"        {message.name}({arguments});\n")
-            out.write(f"        auto response = Messages::{endpoint.name}::{response_pascal_name} {{ }};\n")
+            out.write(f"        auto response = Messages::{endpoint.name}::{response_pascal_name} {{}};\n")
             out.write("        return make<IPC::MessageBuffer>(TRY(response.encode()));\n")
         else:
-            out.write(f"        {request_cast}\n")
             out.write(f"        auto response = {message.name}({arguments});\n")
             out.write("        return make<IPC::MessageBuffer>(TRY(response.encode()));\n")
 
