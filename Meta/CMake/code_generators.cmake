@@ -11,11 +11,11 @@ function(embed_as_string name source_file output source_variable_name)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_custom_command(
         OUTPUT "${output}"
-        COMMAND "${Python3_EXECUTABLE}" "${LADYBIRD_SOURCE_DIR}/Meta/embed_as_string.py" "${source_file}" -o "${output}.tmp" -n "${source_variable_name}" ${namespace_arg}
+        COMMAND "${Python3_EXECUTABLE}" "${LADYBIRD_SOURCE_DIR}/Meta/Generators/embed_as_string.py" "${source_file}" -o "${output}.tmp" -n "${source_variable_name}" ${namespace_arg}
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${output}.tmp" "${output}"
         COMMAND "${CMAKE_COMMAND}" -E remove "${output}.tmp"
         VERBATIM
-        DEPENDS "${LADYBIRD_SOURCE_DIR}/Meta/embed_as_string.py"
+        DEPENDS "${LADYBIRD_SOURCE_DIR}/Meta/Generators/embed_as_string.py"
         MAIN_DEPENDENCY "${source_file}"
     )
 
@@ -27,13 +27,14 @@ function(compile_ipc source output)
     if (NOT IS_ABSOLUTE ${source})
         set(source ${CMAKE_CURRENT_SOURCE_DIR}/${source})
     endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_custom_command(
         OUTPUT ${output}
-        COMMAND $<TARGET_FILE:Lagom::IPCCompiler> ${source} -o ${output}.tmp
+        COMMAND "${Python3_EXECUTABLE}" "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate_ipc_definitions.py" --input ${source} --output ${output}.tmp
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${output}.tmp ${output}
         COMMAND "${CMAKE_COMMAND}" -E remove ${output}.tmp
         VERBATIM
-        DEPENDS Lagom::IPCCompiler
+        DEPENDS "${LADYBIRD_SOURCE_DIR}/Meta/Generators/generate_ipc_definitions.py"
         MAIN_DEPENDENCY ${source}
     )
     get_filename_component(output_name ${output} NAME)
