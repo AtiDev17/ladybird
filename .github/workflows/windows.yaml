@@ -95,6 +95,8 @@ jobs:
               }
           }
 
+          Remove-Item -Path "$pkgDir/bin/vc_redist.x64.exe" -Force -ErrorAction SilentlyContinue
+
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$pkgDir/LICENSE.txt" }
           
           "Commit: ${{ github.sha }}`nBuild Date: $(Get-Date)" | Out-File -FilePath "$pkgDir/version.txt"
