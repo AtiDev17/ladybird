@@ -210,6 +210,7 @@ struct Dictionary {
     ByteString parent_name;
     Vector<DictionaryMember> members;
     HashMap<ByteString, ByteString> extended_attributes;
+    ByteString module_own_path;
     bool is_original_definition { true };
 };
 
@@ -219,6 +220,7 @@ struct Typedef {
 };
 
 struct Enumeration {
+    ByteString module_own_path;
     OrderedHashTable<ByteString> values;
     OrderedHashMap<ByteString, ByteString> translated_cpp_names;
     HashMap<ByteString, ByteString> extended_attributes;
@@ -278,6 +280,7 @@ public:
     bool is_namespace { false };
     bool is_mixin { false };
     bool is_callback_interface { false };
+    bool is_partial { false };
 
     HashMap<ByteString, ByteString> extended_attributes;
 
@@ -329,7 +332,6 @@ public:
     ByteString global_mixin_class;
 
     ByteString module_own_path;
-    Vector<Module&> imported_modules;
 
     OrderedHashMap<ByteString, Vector<Function&>> overload_sets;
     OrderedHashMap<ByteString, Vector<Function&>> static_overload_sets;
@@ -352,8 +354,6 @@ public:
 struct Module {
     ByteString module_own_path;
     Optional<Interface&> interface;
-    Vector<Module&> imported_modules;
-    Vector<ByteString> imported_files;
 };
 
 class UnionType : public Type {
@@ -439,6 +439,7 @@ public:
     Interface& add_mixin(NonnullOwnPtr<Interface>);
     Module& add_module(NonnullOwnPtr<Module>);
     Module* find_parsed_module(ByteString const& module_path);
+    void resolve();
 
     HashMap<ByteString, Interface*> interfaces;
     Vector<NonnullOwnPtr<Interface>> owned_interfaces;

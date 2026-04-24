@@ -11,11 +11,10 @@
  */
 
 #include "IDLGenerators.h"
-#include "Namespaces.h"
 #include <AK/Array.h>
 #include <AK/LexicalPath.h>
 #include <AK/NumericLimits.h>
-#include <AK/Queue.h>
+#include <AK/QuickSort.h>
 #include <AK/RefPtr.h>
 #include <LibIDL/ExposedTo.h>
 #include <LibIDL/Types.h>
@@ -27,175 +26,12 @@ Vector<StringView> g_header_search_paths;
 template<typename ParameterType>
 static void generate_to_cpp(SourceGenerator& generator, ParameterType& parameter, ByteString const& js_name, ByteString const& js_suffix, ByteString const& cpp_name, Context const&, bool optional = false, Optional<ByteString> optional_default_value = {}, bool variadic = false, size_t recursion_depth = 0);
 
-// FIXME: Generate this automatically somehow.
-static bool is_platform_object(Type const& type)
+// https://webidl.spec.whatwg.org/#dfn-platform-object
+static bool is_platform_object(Context const& context, Type const& type)
 {
-    // NOTE: This is a hand-curated subset of platform object types that are actually relevant
-    // in places where this function is used. If you add IDL code and get compile errors, you
-    // might simply need to add another type here.
-    static constexpr Array types = {
-        "AbortSignal"sv,
-        "Animation"sv,
-        "AnimationEffect"sv,
-        "AnimationTimeline"sv,
-        "Attr"sv,
-        "AudioBuffer"sv,
-        "AudioContext"sv,
-        "AudioListener"sv,
-        "AudioNode"sv,
-        "AudioParam"sv,
-        "AudioScheduledSourceNode"sv,
-        "AudioTrack"sv,
-        "BaseAudioContext"sv,
-        "Blob"sv,
-        "CacheStorage"sv,
-        "CanvasGradient"sv,
-        "CanvasPattern"sv,
-        "CanvasRenderingContext2D"sv,
-        "ClipboardItem"sv,
-        "CloseWatcher"sv,
-        "Credential"sv,
-        "CredentialsContainer"sv,
-        "CryptoKey"sv,
-        "CSSKeywordValue"sv,
-        "CSSNumericArray"sv,
-        "CSSNumericValue"sv,
-        "CSSStyleValue"sv,
-        "CSSTransformComponent"sv,
-        "CSSUnitValue"sv,
-        "CSSUnparsedValue"sv,
-        "CSSVariableReferenceValue"sv,
-        "CustomElementRegistry"sv,
-        "CustomStateSet"sv,
-        "DataTransfer"sv,
-        "Document"sv,
-        "DocumentType"sv,
-        "DOMMatrix"sv,
-        "DOMMatrixReadOnly"sv,
-        "DOMRectReadOnly"sv,
-        "DynamicsCompressorNode"sv,
-        "ElementInternals"sv,
-        "EventTarget"sv,
-        "External"sv,
-        "FederatedCredential"sv,
-        "File"sv,
-        "FileList"sv,
-        "FontFace"sv,
-        "FormData"sv,
-        "Gamepad"sv,
-        "GamepadButton"sv,
-        "GamepadHapticActuator"sv,
-        "HTMLCollection"sv,
-        "IDBCursor"sv,
-        "IDBCursorWithValue"sv,
-        "IDBIndex"sv,
-        "IDBKeyRange"sv,
-        "IDBObjectStore"sv,
-        "IDBRecord"sv,
-        "IDBTransaction"sv,
-        "ImageBitmap"sv,
-        "ImageData"sv,
-        "Instance"sv,
-        "IntersectionObserverEntry"sv,
-        "KeyframeEffect"sv,
-        "MediaKeySystemAccess"sv,
-        "MediaList"sv,
-        "MediaDeviceInfo"sv,
-        "MediaDevices"sv,
-        "MediaSource"sv,
-        "Memory"sv,
-        "MediaStream"sv,
-        "MediaStreamTrack"sv,
-        "MediaStreamTrackEvent"sv,
-        "MessagePort"sv,
-        "Module"sv,
-        "MutationRecord"sv,
-        "NamedNodeMap"sv,
-        "NavigationDestination"sv,
-        "NavigationHistoryEntry"sv,
-        "Node"sv,
-        "OffscreenCanvas"sv,
-        "OffscreenCanvasRenderingContext2D"sv,
-        "Origin"sv,
-        "PasswordCredential"sv,
-        "Path2D"sv,
-        "PerformanceEntry"sv,
-        "PerformanceMark"sv,
-        "PerformanceNavigation"sv,
-        "PeriodicWave"sv,
-        "ReadableStreamBYOBReader"sv,
-        "ReadableStreamDefaultReader"sv,
-        "RadioNodeList"sv,
-        "Range"sv,
-        "ReadableStream"sv,
-        "Request"sv,
-        "Response"sv,
-        "Selection"sv,
-        "ServiceWorkerContainer"sv,
-        "ServiceWorkerRegistration"sv,
-        "SVGLength"sv,
-        "SVGNumber"sv,
-        "SVGTransform"sv,
-        "ShadowRoot"sv,
-        "SourceBuffer"sv,
-        "SpeechGrammar"sv,
-        "SpeechGrammarList"sv,
-        "SpeechRecognition"sv,
-        "SpeechRecognitionAlternative"sv,
-        "SpeechRecognitionPhrase"sv,
-        "SpeechRecognitionResult"sv,
-        "SpeechRecognitionResultList"sv,
-        "SpeechSynthesis"sv,
-        "SpeechSynthesisUtterance"sv,
-        "SpeechSynthesisVoice"sv,
-        "Storage"sv,
-        "Table"sv,
-        "Text"sv,
-        "TextMetrics"sv,
-        "TextTrack"sv,
-        "TimeRanges"sv,
-        "TrustedHTML"sv,
-        "TrustedScript"sv,
-        "TrustedScriptURL"sv,
-        "TrustedTypePolicy"sv,
-        "TrustedTypePolicyFactory"sv,
-        "URLSearchParams"sv,
-        "VTTRegion"sv,
-        "VideoTrack"sv,
-        "VideoTrackList"sv,
-        "ViewTransition"sv,
-        "WebGL2RenderingContext"sv,
-        "WebGLActiveInfo"sv,
-        "WebGLBuffer"sv,
-        "WebGLFramebuffer"sv,
-        "WebGLObject"sv,
-        "WebGLProgram"sv,
-        "WebGLQuery"sv,
-        "WebGLRenderbuffer"sv,
-        "WebGLRenderingContext"sv,
-        "WebGLSampler"sv,
-        "WebGLShader"sv,
-        "WebGLShaderPrecisionFormat"sv,
-        "WebGLSync"sv,
-        "WebGLTexture"sv,
-        "WebGLTransformFeedback"sv,
-        "WebGLUniformLocation"sv,
-        "WebGLVertexArrayObject"sv,
-        "WebGLVertexArrayObjectOES"sv,
-        "Window"sv,
-        "WindowProxy"sv,
-        "WritableStream"sv,
-        "XPathResult"sv,
-        "XRSession"sv,
-        "XRWebGLLayer"sv,
-    };
-    if (type.name().ends_with("Element"sv))
-        return true;
-    if (type.name().ends_with("Event"sv))
-        return true;
-    if (types.span().contains_slow(type.name()))
-        return true;
-    return false;
+    // Platform objects are objects that implement an interface.
+    // NB: WindowProxy is a special case as it is not defined over IDL, but implements the Window interface.
+    return context.interfaces.contains(type.name()) || type.name() == "WindowProxy"sv;
 }
 
 // https://webidl.spec.whatwg.org/#idl-buffer-source-types
@@ -222,14 +58,61 @@ static bool is_javascript_builtin_buffer_source_type(Type const& type)
     return types.span().contains_slow(type.name());
 }
 
-static ByteString cpp_type_name(Type const& type)
+static ByteString interface_cpp_type_name(Interface const& interface)
 {
-    if (libweb_interface_namespaces.span().contains_slow(type.name())) {
-        // e.g. Document.getSelection which returns Selection, which is in the Selection namespace.
-        return ByteString::formatted("{}::{}", type.name(), type.name());
+    if (!interface.fully_qualified_name.is_empty())
+        return interface.fully_qualified_name;
+    return interface.implemented_name;
+}
+
+static ByteString interface_cpp_type_name(Context const& context, Type const& type)
+{
+    if (type.name() == "WindowProxy"sv)
+        return "HTML::WindowProxy";
+
+    auto interface = context.interfaces.get(type.name());
+    if (interface.has_value())
+        return interface_cpp_type_name(**interface);
+
+    return type.name();
+}
+
+static ByteString cpp_namespace_for_module_path(ByteString const& module_own_path)
+{
+    auto path = LexicalPath { module_own_path };
+    auto parts = path.parts_view();
+    for (size_t i = 0; i + 2 < parts.size(); ++i) {
+        if (parts[i] != "LibWeb"sv)
+            continue;
+
+        return parts[i + 1].to_byte_string();
     }
+
+    if (parts.size() >= 2)
+        return parts[parts.size() - 2].to_byte_string();
+
+    return {};
+}
+
+static ByteString dictionary_cpp_type_name(Context const& context, ByteString const& name)
+{
+    if (auto it = context.dictionaries.find(name); it != context.dictionaries.end()) {
+        auto namespace_name = cpp_namespace_for_module_path(it->value.module_own_path);
+        if (!namespace_name.is_empty())
+            return ByteString::formatted("{}::{}", namespace_name, name);
+    }
+
+    return name;
+}
+
+static ByteString cpp_type_name(Type const& type, Context const& context)
+{
+    if (is_platform_object(context, type))
+        return interface_cpp_type_name(context, type);
     if (is_javascript_builtin_buffer_source_type(type))
         return ByteString::formatted("JS::{}", type.name());
+    if (context.dictionaries.contains(type.name()))
+        return dictionary_cpp_type_name(context, type.name());
     return type.name();
 }
 
@@ -289,14 +172,14 @@ static ByteString union_type_to_variant(UnionType const& union_type, Context con
 
 CppType idl_type_name_to_cpp_type(Type const& type, Context const& context)
 {
-    if (is_platform_object(type))
-        return { .name = ByteString::formatted("GC::Root<{}>", type.name()), .sequence_storage_type = SequenceStorageType::RootVector };
+    if (is_platform_object(context, type))
+        return { .name = ByteString::formatted("GC::Root<{}>", interface_cpp_type_name(context, type)), .sequence_storage_type = SequenceStorageType::RootVector };
 
     if (is_javascript_builtin_buffer_source_type(type))
         return { .name = ByteString::formatted("GC::Root<JS::{}>", type.name()), .sequence_storage_type = SequenceStorageType::RootVector };
 
     if (auto const* callback_interface = callback_interface_for_type(context, type))
-        return { .name = ByteString::formatted("GC::Root<{}>", callback_interface->implemented_name), .sequence_storage_type = SequenceStorageType::RootVector };
+        return { .name = ByteString::formatted("GC::Root<{}>", interface_cpp_type_name(*callback_interface)), .sequence_storage_type = SequenceStorageType::RootVector };
 
     if (context.callback_functions.contains(type.name()))
         return { .name = "GC::Root<WebIDL::CallbackType>", .sequence_storage_type = SequenceStorageType::RootVector };
@@ -388,12 +271,8 @@ CppType idl_type_name_to_cpp_type(Type const& type, Context const& context)
         return { .name = union_type_to_variant(union_type, context), .sequence_storage_type = SequenceStorageType::Vector };
     }
 
-    if (!type.is_nullable()) {
-        for (auto& dictionary : context.dictionaries) {
-            if (type.name() == dictionary.key)
-                return { .name = type.name(), .sequence_storage_type = SequenceStorageType::Vector };
-        }
-    }
+    if (!type.is_nullable() && context.dictionaries.contains(type.name()))
+        return { .name = dictionary_cpp_type_name(context, type.name()), .sequence_storage_type = SequenceStorageType::Vector };
 
     if (context.enumerations.contains(type.name()))
         return { .name = type.name(), .sequence_storage_type = SequenceStorageType::Vector };
@@ -438,57 +317,203 @@ static void generate_include_for_iterator(auto& generator, auto& iterator_path)
 )~~~");
 }
 
-static void generate_include_for_interface(auto& generator, Interface const& interface)
+static ByteString relative_module_path(ByteString const& module_own_path)
 {
-    auto forked_generator = generator.fork();
-    auto path_string = interface.module_own_path;
+    auto path_string = module_own_path;
     for (auto& search_path : g_header_search_paths) {
-        if (!interface.module_own_path.starts_with(search_path))
+        if (!module_own_path.starts_with(search_path))
             continue;
-        auto relative_path = *LexicalPath::relative_path(interface.module_own_path, search_path);
+        auto relative_path = *LexicalPath::relative_path(module_own_path, search_path);
         if (relative_path.length() < path_string.length())
             path_string = relative_path;
     }
 
+    return path_string;
+}
+
+static void generate_include_for_module(auto& generator, Module const& module)
+{
+    auto forked_generator = generator.fork();
+    auto path_string = relative_module_path(module.module_own_path);
     LexicalPath include_path { path_string };
-    ByteString include_title = interface.implemented_name.is_empty() ? include_path.title().to_byte_string() : interface.implemented_name;
+    ByteString include_title = include_path.title().to_byte_string();
+    if (module.interface.has_value() && !module.interface->implemented_name.is_empty())
+        include_title = module.interface->implemented_name;
     forked_generator.set("include.path", ByteString::formatted("{}/{}.h", include_path.dirname(), include_title));
     forked_generator.append(R"~~~(
 #include <@include.path@>
 )~~~");
 }
 
-static void emit_includes_for_all_imports(auto& interface, auto& generator, bool is_iterator = false, bool is_async_iterator = false)
+static Module const& module_for_path(Context const& context, ByteString const& module_own_path)
 {
-    Queue<Module const*> modules;
-    HashTable<ByteString> paths_imported;
+    for (auto const& module : context.owned_modules) {
+        if (module->module_own_path == module_own_path)
+            return *module;
+    }
 
-    auto enqueue_imports = [&paths_imported, &modules](auto& imported_modules) {
-        for (auto& imported_module : imported_modules) {
-            if (!paths_imported.contains(imported_module.module_own_path))
-                modules.enqueue(&imported_module);
-        }
+    VERIFY_NOT_REACHED();
+}
+
+static bool module_will_generate_code(Module const& module)
+{
+    return module.interface.has_value() && module.interface->will_generate_code();
+}
+
+static void add_module_include_dependency(Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included, Module const& module)
+{
+    if (!module_will_generate_code(module))
+        return;
+    if (paths_included.set(module.module_own_path) != AK::HashSetResult::InsertedNewEntry)
+        return;
+    modules_to_include.append(&module);
+}
+
+static void add_interface_include_dependency(Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included, Interface const& interface)
+{
+    add_module_include_dependency(modules_to_include, paths_included, module_for_path(interface.context, interface.module_own_path));
+}
+
+static void add_dictionary_include_dependency(Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included, Interface const& interface, ByteString const& dictionary_name)
+{
+    auto it = interface.context.dictionaries.find(dictionary_name);
+    if (it == interface.context.dictionaries.end())
+        return;
+    add_module_include_dependency(modules_to_include, paths_included, module_for_path(interface.context, it->value.module_own_path));
+}
+
+static void add_enumeration_include_dependency(Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included, Interface const& interface, ByteString const& enumeration_name)
+{
+    auto it = interface.context.enumerations.find(enumeration_name);
+    if (it == interface.context.enumerations.end())
+        return;
+    add_module_include_dependency(modules_to_include, paths_included, module_for_path(interface.context, it->value.module_own_path));
+}
+
+static void collect_interface_include_dependencies(Interface const& interface, Type const& type, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included);
+
+static void collect_interface_include_dependencies(Interface const& interface, Vector<Parameter> const& parameters, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included)
+{
+    for (auto const& parameter : parameters)
+        collect_interface_include_dependencies(interface, *parameter.type, modules_to_include, paths_included);
+}
+
+static void collect_interface_include_dependencies(Interface const& interface, Function const& function, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included)
+{
+    collect_interface_include_dependencies(interface, *function.return_type, modules_to_include, paths_included);
+    collect_interface_include_dependencies(interface, function.parameters, modules_to_include, paths_included);
+}
+
+static void collect_interface_include_dependencies(Interface const& interface, CallbackFunction const& callback_function, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included)
+{
+    collect_interface_include_dependencies(interface, *callback_function.return_type, modules_to_include, paths_included);
+    collect_interface_include_dependencies(interface, callback_function.parameters, modules_to_include, paths_included);
+}
+
+static void collect_interface_include_dependencies(Interface const& interface, Dictionary const& dictionary, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included)
+{
+    if (!dictionary.parent_name.is_empty()) {
+        add_dictionary_include_dependency(modules_to_include, paths_included, interface, dictionary.parent_name);
+        if (auto parent_dictionary = interface.context.dictionaries.find(dictionary.parent_name); parent_dictionary != interface.context.dictionaries.end())
+            collect_interface_include_dependencies(interface, parent_dictionary->value, modules_to_include, paths_included);
+    }
+
+    for (auto const& member : dictionary.members)
+        collect_interface_include_dependencies(interface, *member.type, modules_to_include, paths_included);
+}
+
+static void collect_interface_include_dependencies(Interface const& interface, Type const& type, Vector<Module const*>& modules_to_include, HashTable<ByteString>& paths_included)
+{
+    if (auto referenced_interface = interface.context.interfaces.get(type.name()); referenced_interface.has_value())
+        add_interface_include_dependency(modules_to_include, paths_included, *referenced_interface.value());
+
+    add_dictionary_include_dependency(modules_to_include, paths_included, interface, type.name());
+    add_enumeration_include_dependency(modules_to_include, paths_included, interface, type.name());
+
+    if (auto dictionary = interface.context.dictionaries.find(type.name()); dictionary != interface.context.dictionaries.end())
+        collect_interface_include_dependencies(interface, dictionary->value, modules_to_include, paths_included);
+
+    if (auto partial_dictionaries = interface.context.partial_dictionaries.find(type.name()); partial_dictionaries != interface.context.partial_dictionaries.end()) {
+        for (auto const& partial_dictionary : partial_dictionaries->value)
+            collect_interface_include_dependencies(interface, partial_dictionary, modules_to_include, paths_included);
+    }
+
+    if (auto callback_function = interface.context.callback_functions.find(type.name()); callback_function != interface.context.callback_functions.end())
+        collect_interface_include_dependencies(interface, callback_function->value, modules_to_include, paths_included);
+
+    if (type.is_parameterized()) {
+        for (auto const& parameter : type.as_parameterized().parameters())
+            collect_interface_include_dependencies(interface, *parameter, modules_to_include, paths_included);
+        return;
+    }
+
+    if (type.is_union()) {
+        for (auto const& member_type : type.as_union().member_types())
+            collect_interface_include_dependencies(interface, *member_type, modules_to_include, paths_included);
+    }
+}
+
+static void emit_includes_for_all_dependencies(auto& interface, auto& generator, bool is_iterator = false, bool is_async_iterator = false)
+{
+    Vector<Module const*> modules_to_include;
+    HashTable<ByteString> paths_included;
+
+    add_interface_include_dependency(modules_to_include, paths_included, interface);
+
+    if (!interface.parent_name.is_empty()) {
+        auto parent_interface = interface.context.interfaces.get(interface.parent_name);
+        VERIFY(parent_interface.has_value());
+        add_interface_include_dependency(modules_to_include, paths_included, *parent_interface.value());
+    }
+
+    auto collect_optional_type_include_dependencies = [&](auto const& optional) {
+        if (optional.has_value())
+            collect_interface_include_dependencies(interface, **optional, modules_to_include, paths_included);
+    };
+    auto collect_optional_function_include_dependencies = [&](auto const& optional) {
+        if (optional.has_value())
+            collect_interface_include_dependencies(interface, *optional, modules_to_include, paths_included);
     };
 
-    paths_imported.set(interface.module_own_path);
-    enqueue_imports(interface.imported_modules);
-
-    if (interface.will_generate_code())
-        generate_include_for_interface(generator, interface);
-
-    while (!modules.is_empty()) {
-        auto module = modules.dequeue();
-        if (paths_imported.contains(module->module_own_path))
-            continue;
-
-        paths_imported.set(module->module_own_path);
-        enqueue_imports(module->imported_modules);
-
-        if (!module->interface.has_value() || !module->interface->will_generate_code())
-            continue;
-
-        generate_include_for_interface(generator, module->interface.value());
+    for (auto const& attribute : interface.attributes)
+        collect_interface_include_dependencies(interface, *attribute.type, modules_to_include, paths_included);
+    for (auto const& attribute : interface.static_attributes)
+        collect_interface_include_dependencies(interface, *attribute.type, modules_to_include, paths_included);
+    for (auto const& constant : interface.constants)
+        collect_interface_include_dependencies(interface, *constant.type, modules_to_include, paths_included);
+    for (auto const& constructor : interface.constructors)
+        collect_interface_include_dependencies(interface, constructor.parameters, modules_to_include, paths_included);
+    for (auto const& function : interface.functions)
+        collect_interface_include_dependencies(interface, function, modules_to_include, paths_included);
+    for (auto const& function : interface.static_functions)
+        collect_interface_include_dependencies(interface, function, modules_to_include, paths_included);
+    collect_optional_type_include_dependencies(interface.value_iterator_type);
+    if (interface.pair_iterator_types.has_value()) {
+        collect_interface_include_dependencies(interface, *interface.pair_iterator_types->template get<0>(), modules_to_include, paths_included);
+        collect_interface_include_dependencies(interface, *interface.pair_iterator_types->template get<1>(), modules_to_include, paths_included);
     }
+    collect_optional_type_include_dependencies(interface.async_value_iterator_type);
+    collect_interface_include_dependencies(interface, interface.async_value_iterator_parameters, modules_to_include, paths_included);
+    collect_optional_type_include_dependencies(interface.set_entry_type);
+    collect_optional_type_include_dependencies(interface.map_key_type);
+    collect_optional_type_include_dependencies(interface.map_value_type);
+    collect_optional_function_include_dependencies(interface.named_property_getter);
+    collect_optional_function_include_dependencies(interface.named_property_setter);
+    collect_optional_function_include_dependencies(interface.indexed_property_getter);
+    collect_optional_function_include_dependencies(interface.indexed_property_setter);
+    collect_optional_function_include_dependencies(interface.named_property_deleter);
+    for (auto const& dictionary_name : interface.own_dictionaries) {
+        auto dictionary = interface.context.dictionaries.find(dictionary_name);
+        VERIFY(dictionary != interface.context.dictionaries.end());
+        collect_interface_include_dependencies(interface, dictionary->value, modules_to_include, paths_included);
+    }
+
+    quick_sort(modules_to_include, [](auto const* a, auto const* b) {
+        return a->module_own_path < b->module_own_path;
+    });
+
+    for (auto const* included_module : modules_to_include)
+        generate_include_for_module(generator, *included_module);
 
     if (is_iterator) {
         auto iterator_path = ByteString::formatted("{}Iterator", interface.fully_qualified_name.replace("::"sv, "/"sv, ReplaceMode::All));
@@ -764,7 +789,7 @@ static void generate_dictionary_to_cpp(SourceGenerator& generator, Context const
 
 static void generate_callback_interface_to_cpp(SourceGenerator& scoped_generator, IDL::Type const& type, IDL::Interface const& callback_interface)
 {
-    scoped_generator.set("cpp_type", callback_interface.implemented_name);
+    scoped_generator.set("cpp_type", interface_cpp_type_name(callback_interface));
 
     if (type.is_nullable()) {
         scoped_generator.append(R"~~~(
@@ -1325,7 +1350,7 @@ static void generate_union_to_cpp(SourceGenerator& scoped_generator, ParameterTy
 
     if (dictionary_type) {
         auto dictionary_generator = union_generator.fork();
-        dictionary_generator.set("dictionary.type", dictionary_type->name());
+        dictionary_generator.set("dictionary.type", dictionary_cpp_type_name(context, dictionary_type->name()));
 
         // The lambda must take the JS::Value to convert as a parameter instead of capturing it in order to support union types being variadic.
         dictionary_generator.append(R"~~~(
@@ -1398,7 +1423,7 @@ static void generate_union_to_cpp(SourceGenerator& scoped_generator, ParameterTy
             [[maybe_unused]] auto& @js_name@@js_suffix@_object = @js_name@@js_suffix@.as_object();
 )~~~");
 
-    bool includes_platform_object = any_of(types, [](auto const& type) { return is_platform_object(type); });
+    bool includes_platform_object = any_of(types, [&context](auto const& type) { return is_platform_object(context, type); });
 
     if (includes_platform_object) {
         // 5. If V is a platform object, then:
@@ -1410,11 +1435,11 @@ static void generate_union_to_cpp(SourceGenerator& scoped_generator, ParameterTy
 
         //    1. If types includes an interface type that V implements, then return the IDL value that is a reference to the object V.
         for (auto& type : types) {
-            if (!IDL::is_platform_object(type))
+            if (!IDL::is_platform_object(context, type))
                 continue;
 
             auto union_platform_object_type_generator = union_generator.fork();
-            union_platform_object_type_generator.set("platform_object_type", type->name());
+            union_platform_object_type_generator.set("platform_object_type", interface_cpp_type_name(context, *type));
 
             union_platform_object_type_generator.append(R"~~~(
                 if (auto* @js_name@@js_suffix@_result = as_if<@platform_object_type@>(@js_name@@js_suffix@_object))
@@ -1844,7 +1869,7 @@ static void generate_to_cpp(SourceGenerator& generator, ParameterType& parameter
     auto const& type = parameter.type;
     scoped_generator.set("parameter.type.name", type->name());
 
-    scoped_generator.set("parameter.type.name.normalized", cpp_type_name(*type));
+    scoped_generator.set("parameter.type.name.normalized", cpp_type_name(*type, context));
 
     scoped_generator.set("parameter.name", parameter.name);
 
@@ -1858,7 +1883,7 @@ static void generate_to_cpp(SourceGenerator& generator, ParameterType& parameter
         generate_to_integral(scoped_generator, parameter, optional, optional_default_value);
     } else if (auto const* callback_interface = callback_interface_for_type(context, parameter.type)) {
         generate_callback_interface_to_cpp(scoped_generator, *parameter.type, *callback_interface);
-    } else if (IDL::is_platform_object(*parameter.type)) {
+    } else if (IDL::is_platform_object(context, *parameter.type)) {
         generate_platform_object_to_cpp(scoped_generator, *parameter.type, optional);
     } else if (parameter.type->is_floating_point()) {
         generate_floating_point_to_cpp(scoped_generator, *parameter.type, optional, optional_default_value);
@@ -2031,7 +2056,7 @@ static void generate_wrap_statement(SourceGenerator& generator, ByteString const
     if (optional_uses_value_access)
         value_non_optional = ByteString::formatted("{}.value()", value);
     scoped_generator.set("value_non_optional", value_non_optional);
-    scoped_generator.set("type", cpp_type_name(type));
+    scoped_generator.set("type", cpp_type_name(type, context));
     scoped_generator.set("result_expression", result_expression);
     scoped_generator.set("recursion_depth", ByteString::number(recursion_depth));
     scoped_generator.set("iteration_index", ByteString::number(iteration_index));
@@ -2110,7 +2135,7 @@ static void generate_wrap_statement(SourceGenerator& generator, ByteString const
         // If the type is a platform object we currently return a Vector<GC::Root<T>> from the
         // C++ implementation, thus allowing us to unwrap the element (a handle) like below.
         // This might need to change if we switch to a RootVector.
-        if (is_platform_object(sequence_generic_type.parameters().first())) {
+        if (is_platform_object(context, sequence_generic_type.parameters().first())) {
             scoped_generator.append(R"~~~(
         auto* wrapped_element@recursion_depth@ = &(*element@recursion_depth@);
 )~~~");
@@ -3186,13 +3211,14 @@ static void generate_dictionaries(SourceGenerator& generator, IDL::Interface con
             continue;
         auto dictionary_generator = generator.fork();
         dictionary_generator.set("dictionary.name", make_input_acceptable_cpp(it->key));
+        dictionary_generator.set("dictionary.cpp_type", dictionary_cpp_type_name(interface.context, it->key));
         dictionary_generator.set("dictionary.name:snakecase", make_input_acceptable_cpp(it->key.to_snakecase()));
         dictionary_generator.append(R"~~~(
-JS::Value @dictionary.name:snakecase@_to_value(JS::Realm&, @dictionary.name@ const&);
-JS::Value @dictionary.name:snakecase@_to_value(JS::Realm& realm, @dictionary.name@ const& dictionary)
+JS::Value @dictionary.name:snakecase@_to_value(JS::Realm&, @dictionary.cpp_type@ const&);
+JS::Value @dictionary.name:snakecase@_to_value(JS::Realm& realm, @dictionary.cpp_type@ const& dictionary)
 {
     auto& vm = realm.vm();
-    @dictionary.name@ copy = dictionary;
+    @dictionary.cpp_type@ copy = dictionary;
 )~~~");
         // FIXME: Support generating wrap statements for lvalues and get rid of the copy above
         auto dictionary_type = adopt_ref(*new Type(it->key, false));
@@ -3591,6 +3617,7 @@ static void generate_named_properties_object_definitions(IDL::Interface const& i
     SourceGenerator generator { builder };
 
     generator.set("name", interface.name);
+    generator.set("fully_qualified_name", interface.fully_qualified_name);
     generator.set("parent_name", interface.parent_name);
     generator.set("prototype_base_class", interface.prototype_base_class);
     generator.set("named_properties_class", ByteString::formatted("{}Properties", interface.name));
@@ -3644,7 +3671,7 @@ JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> @named_properties_class@
     auto& realm = this->realm();
 
     // 1. Let A be the interface for the named properties object O.
-    using A = @name@;
+    using A = @fully_qualified_name@;
 
     // 2. Let object be O.[[Realm]]'s global object.
     // 3. Assert: object implements A.
@@ -3761,7 +3788,7 @@ static void generate_prototype_or_global_mixin_initialization(IDL::Interface con
     generator.set("prototype_name", interface.prototype_class); // Used for Global Mixin
 
     if (interface.pair_iterator_types.has_value()) {
-        generator.set("iterator_name", ByteString::formatted("{}Iterator", interface.name));
+        generator.set("iterator_name", ByteString::formatted("{}Iterator", interface.fully_qualified_name));
     }
 
     bool define_on_existing_object = is_global_interface || generate_unforgeables == GenerateUnforgeables::Yes;
@@ -4423,7 +4450,7 @@ static void generate_prototype_or_global_mixin_definitions(IDL::Interface const&
     generator.set("prototype_name", interface.prototype_class); // Used for Global Mixin
 
     if (interface.pair_iterator_types.has_value()) {
-        generator.set("iterator_name", ByteString::formatted("{}Iterator", interface.name));
+        generator.set("iterator_name", ByteString::formatted("{}Iterator", interface.fully_qualified_name));
     }
 
     if (interface.is_callback_interface)
@@ -4973,7 +5000,7 @@ JS_DEFINE_NATIVE_FUNCTION(@class_name@::values)
     // https://webidl.spec.whatwg.org/#js-asynchronous-iterable
     if (interface.async_value_iterator_type.has_value()) {
         auto iterator_generator = generator.fork();
-        iterator_generator.set("iterator_name"sv, MUST(String::formatted("{}AsyncIterator", interface.name)));
+        iterator_generator.set("iterator_name"sv, ByteString::formatted("{}AsyncIterator", interface.fully_qualified_name));
         iterator_generator.append(R"~~~(
 JS_DEFINE_NATIVE_FUNCTION(@class_name@::values)
 {
@@ -5001,7 +5028,8 @@ JS_DEFINE_NATIVE_FUNCTION(@class_name@::values)
     if (interface.set_entry_type.has_value()) {
         auto setlike_generator = generator.fork();
         auto const& set_entry_type = *interface.set_entry_type.value();
-        setlike_generator.set("value_type", set_entry_type.name());
+        auto value_type = cpp_type_name(set_entry_type, interface.context);
+        setlike_generator.set("value_type", value_type);
 
         if (set_entry_type.is_string()) {
             setlike_generator.set("value_type_check", R"~~~(
@@ -5016,7 +5044,7 @@ JS_DEFINE_NATIVE_FUNCTION(@class_name@::values)
         return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "{0}");
     }}
 )~~~",
-                    set_entry_type.name())));
+                    value_type)));
         }
 
         setlike_generator.append(R"~~~(
@@ -5416,65 +5444,6 @@ private:
     generator.append(R"~~~(
 };
 )~~~");
-}
-
-static void generate_using_namespace_definitions(SourceGenerator& generator)
-{
-    generator.append(R"~~~(
-// FIXME: This is a total hack until we can figure out the namespace for a given type somehow.
-using namespace Web::Animations;
-using namespace Web::Clipboard;
-using namespace Web::ContentSecurityPolicy;
-using namespace Web::CookieStore;
-using namespace Web::CredentialManagement;
-using namespace Web::Crypto;
-using namespace Web::CSS;
-using namespace Web::DOM;
-using namespace Web::DOMURL;
-using namespace Web::Encoding;
-using namespace Web::EncryptedMediaExtensions;
-using namespace Web::EntriesAPI;
-using namespace Web::EventTiming;
-using namespace Web::Fetch;
-using namespace Web::FileAPI;
-using namespace Web::Gamepad;
-using namespace Web::Geolocation;
-using namespace Web::Geometry;
-using namespace Web::HighResolutionTime;
-using namespace Web::HTML;
-using namespace Web::IndexedDB;
-using namespace Web::Internals;
-using namespace Web::IntersectionObserver;
-using namespace Web::MediaCapabilitiesAPI;
-using namespace Web::MediaCapture;
-using namespace Web::MediaSourceExtensions;
-using namespace Web::NavigationTiming;
-using namespace Web::NotificationsAPI;
-using namespace Web::PerformanceTimeline;
-using namespace Web::RequestIdleCallback;
-using namespace Web::ResizeObserver;
-using namespace Web::ResourceTiming;
-using namespace Web::Selection;
-using namespace Web::Serial;
-using namespace Web::ServiceWorker;
-using namespace Web::Speech;
-using namespace Web::StorageAPI;
-using namespace Web::Streams;
-using namespace Web::SVG;
-using namespace Web::TrustedTypes;
-using namespace Web::UIEvents;
-using namespace Web::URLPattern;
-using namespace Web::UserTiming;
-using namespace Web::WebAssembly;
-using namespace Web::WebAudio;
-using namespace Web::WebGL;
-using namespace Web::WebGL::Extensions;
-using namespace Web::WebIDL;
-using namespace Web::WebVTT;
-using namespace Web::WebXR;
-using namespace Web::XHR;
-using namespace Web::XPath;
-)~~~"sv);
 }
 
 // https://webidl.spec.whatwg.org/#define-the-operations
@@ -6153,6 +6122,7 @@ static void generate_implementation_prologue(IDL::Interface const& interface, St
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
@@ -6188,8 +6158,7 @@ static void generate_implementation_prologue(IDL::Interface const& interface, St
 )~~~");
     }
 
-    emit_includes_for_all_imports(interface, generator, interface.pair_iterator_types.has_value(), interface.async_value_iterator_type.has_value());
-    generate_using_namespace_definitions(generator);
+    emit_includes_for_all_dependencies(interface, generator, interface.pair_iterator_types.has_value(), interface.async_value_iterator_type.has_value());
 
     generator.append(R"~~~(
 namespace Web::Bindings {

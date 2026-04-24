@@ -35,12 +35,14 @@ struct FontFaceKey {
     FlyString family_name;
     FontWeightRange weight;
     int slope { 0 };
-    [[nodiscard]] u32 hash() const { return pair_int_hash(family_name.ascii_case_insensitive_hash(), pair_int_hash(weight.hash(), slope)); }
+    int width { 100 };
+    [[nodiscard]] u32 hash() const { return pair_int_hash(family_name.ascii_case_insensitive_hash(), pair_int_hash(weight.hash(), pair_int_hash(slope, width))); }
     [[nodiscard]] bool operator==(FontFaceKey const& other) const
     {
         return family_name.equals_ignoring_ascii_case(other.family_name)
             && weight == other.weight
-            && slope == other.slope;
+            && slope == other.slope
+            && width == other.width;
     }
 };
 
@@ -130,7 +132,7 @@ private:
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_ascending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
     RefPtr<Gfx::FontCascadeList const> find_matching_font_weight_descending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const;
     NonnullRefPtr<Gfx::FontCascadeList const> compute_font_for_style_values_impl(StyleValue const& font_family, CSSPixels const& font_size, int font_slope, double font_weight, Percentage const& font_width, FontOpticalSizing font_optical_sizing, HashMap<FlyString, double> const& font_variation_settings, FontFeatureData const& font_feature_data) const;
-    RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FlyString const& family_name, int weight, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const;
+    RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values) const;
 
     HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values_for_family(FlyString const& family_name) const;
 

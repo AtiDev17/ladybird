@@ -1,13 +1,9 @@
-#import <FileAPI/Blob.idl>
-#import <DOMURL/URLSearchParams.idl>
-#import <MediaSourceExtensions/MediaSource.idl>
-
 // https://url.spec.whatwg.org/#url
 [Exposed=*, LegacyWindowAlias=webkitURL, ImplementedAs=DOMURL]
 interface URL {
     constructor(USVString url, optional USVString base);
 
-    [ImplementedAs=parse_for_bindings] static DOMURL? parse(USVString url, optional USVString base);
+    [ImplementedAs=parse_for_bindings] static URL? parse(USVString url, optional USVString base);
     static boolean canParse(USVString url, optional USVString base);
 
     stringifier attribute USVString href;

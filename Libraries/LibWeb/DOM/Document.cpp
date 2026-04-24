@@ -514,6 +514,8 @@ Document::Document(JS::Realm& realm, URL::URL const& url, TemporaryDocumentForFr
         .has_legacy_override_built_ins_interface_extended_attribute = true,
     };
 
+    m_is_decoded_svg = m_page->client().is_svg_page_client();
+
     m_cursor_blink_timer = Core::Timer::create_repeating(500, [this] {
         auto cursor_position = this->cursor_position();
         if (!cursor_position)
@@ -2099,13 +2101,17 @@ void Document::invalidate_style_for_elements_affected_by_pseudo_class_change(CSS
             return false;
 
         SelectorEngine::MatchContext context;
-        if (SelectorEngine::matches(selector, element, {}, context))
-            return true;
-        if (SelectorEngine::matches(selector, { element, CSS::PseudoElement::Before }, {}, context))
-            return true;
-        if (SelectorEngine::matches(selector, { element, CSS::PseudoElement::After }, {}, context))
-            return true;
-        return false;
+        auto const& target_pseudo = selector.target_pseudo_element();
+        if (!target_pseudo.has_value())
+            return SelectorEngine::matches(selector, element, {}, context);
+        switch (target_pseudo->type()) {
+        case CSS::PseudoElement::Before:
+            return SelectorEngine::matches(selector, { element, CSS::PseudoElement::Before }, {}, context);
+        case CSS::PseudoElement::After:
+            return SelectorEngine::matches(selector, { element, CSS::PseudoElement::After }, {}, context);
+        default:
+            return false;
+        }
     };
 
     auto matches_different_set_of_rules_after_state_change = [&](Element& element) {
@@ -6876,11 +6882,6 @@ void Document::register_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& sha
 void Document::unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& shadow_root)
 {
     m_shadow_roots.remove(shadow_root);
-}
-
-bool Document::is_decoded_svg() const
-{
-    return page().client().is_svg_page_client();
 }
 
 // https://drafts.csswg.org/css-position-4/#add-an-element-to-the-top-layer
