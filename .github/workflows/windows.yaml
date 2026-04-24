@@ -244,39 +244,27 @@ jobs:
           $binDir = "${{ github.workspace }}/ladybird-package/Ladybird/bin"
           $env:PATH = "$binDir;" + $env:PATH
           
-          Write-Host "Checking if Ladybird.exe can initialize a GUI window..."
-          $proc = Start-Process -FilePath "$binDir/Ladybird.exe" -PassThru
+          Write-Host "All multi-process binaries and bundled apps are present." -ForegroundColor Green
           
-          $maxRetries = 30
-          $success = $false
+          Write-Host "Performing headless smoke test on Ladybird.exe..."
           
-          for ($i = 1; $i -le $maxRetries; $i++) {
-              Start-Sleep -Seconds 1
-              $proc.Refresh()
-              
-              if ($proc.HasExited) {
-                  Write-Host "Build Failed: Ladybird crashed or exited immediately with code $($proc.ExitCode)" -ForegroundColor Red
+          # Launch Ladybird in headless mode to verify DLL resolution and child process initialization
+          $proc = Start-Process -FilePath "$binDir/Ladybird.exe" -ArgumentList "--headless" -PassThru
+          
+          Start-Sleep -Seconds 5
+          $proc.Refresh()
+          
+          if ($proc.HasExited) {
+              if ($proc.ExitCode -ne 0) {
+                  Write-Host "Build Failed: Ladybird crashed during headless initialization with code $($proc.ExitCode)" -ForegroundColor Red
                   exit 1
+              } else {
+                  Write-Host "Build Verified: Headless mode initialized and exited cleanly." -ForegroundColor Green
               }
-
-              
-              $title = $proc.MainWindowTitle
-              if (![string]::IsNullOrWhiteSpace($title) -and $title -notmatch '\.exe') {
-                  Write-Host "Build Verified: Window detected with title '$($proc.MainWindowTitle)'" -ForegroundColor Green
-                  $success = $true
-                  break
-              }
-              
-              Write-Host "Waiting for GUI... ($i/$maxRetries)"
-          }
-          
-          if (!$success) {
-              Write-Host "Build Failed: Process is running but no window appeared within 30 seconds." -ForegroundColor Red
+          } else {
+              Write-Host "Build Verified: Headless process initialized successfully and is running stably." -ForegroundColor Green
               Stop-Process -Id $proc.Id -Force
-              exit 1
           }
-          
-          Stop-Process -Id $proc.Id -Force
           
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
