@@ -44,12 +44,11 @@
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/EasingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/EdgeStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FitContentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FlexStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontSourceStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FontVariantAlternatesFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FrequencyStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTrackPlacementStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTrackSizeListStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
@@ -70,7 +69,6 @@
 #include <LibWeb/CSS/StyleValues/RectStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RepeatStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ScrollFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/SuperellipseStyleValue.h>
@@ -80,7 +78,6 @@
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
 #include <LibWeb/CSS/StyleValues/UnicodeRangeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ViewFunctionStyleValue.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Infra/CharacterTypes.h>
@@ -1245,7 +1242,7 @@ RefPtr<StyleValue const> Parser::parse_keyword_value(TokenStream<ComponentValue>
 }
 
 // https://drafts.csswg.org/scroll-animations-1/#funcdef-scroll
-RefPtr<ScrollFunctionStyleValue const> Parser::parse_scroll_function_value(TokenStream<ComponentValue>& tokens)
+RefPtr<FunctionStyleValue const> Parser::parse_scroll_function_value(TokenStream<ComponentValue>& tokens)
 {
     // <scroll()> = scroll( [ <scroller> || <axis> ]? )
     auto transaction = tokens.begin_transaction();
@@ -1253,8 +1250,11 @@ RefPtr<ScrollFunctionStyleValue const> Parser::parse_scroll_function_value(Token
     if (!function_token.is_function("scroll"sv))
         return nullptr;
 
-    Optional<Scroller> scroller;
-    Optional<Axis> axis;
+    StyleValueTuple tuple;
+    tuple.resize_with_default_value(2, nullptr);
+
+    bool has_scroller = false;
+    bool has_axis = false;
 
     auto argument_tokens = TokenStream { function_token.function().value };
 
@@ -1270,37 +1270,38 @@ RefPtr<ScrollFunctionStyleValue const> Parser::parse_scroll_function_value(Token
             return nullptr;
 
         if (auto maybe_scroller = keyword_to_scroller(keyword_value->to_keyword()); maybe_scroller.has_value()) {
-            if (scroller.has_value())
+            if (has_scroller)
                 return nullptr;
 
-            scroller = maybe_scroller;
+            // NB: The default value of <scroller> `nearest` is omitted from the serialization.
+            if (maybe_scroller.value() != Scroller::Nearest)
+                tuple[TupleStyleValue::Indices::ScrollFunction::Scroller] = keyword_value;
+
+            has_scroller = true;
             continue;
         }
 
         if (auto maybe_axis = keyword_to_axis(keyword_value->to_keyword()); maybe_axis.has_value()) {
-            if (axis.has_value())
+            if (has_axis)
                 return nullptr;
 
-            axis = maybe_axis;
+            // NB: The default value of <axis> `block` is omitted from the serialization.
+            if (maybe_axis.value() != Axis::Block)
+                tuple[TupleStyleValue::Indices::ScrollFunction::Axis] = keyword_value;
+
+            has_axis = true;
             continue;
         }
 
         return nullptr;
     }
 
-    // By default, scroll() references the block axis of the nearest ancestor scroll container.
-    if (!scroller.has_value())
-        scroller = Scroller::Nearest;
-
-    if (!axis.has_value())
-        axis = Axis::Block;
-
     transaction.commit();
-    return ScrollFunctionStyleValue::create(scroller.value(), axis.value());
+    return FunctionStyleValue::create("scroll"_fly_string, TupleStyleValue::create(move(tuple)));
 }
 
 // https://drafts.csswg.org/scroll-animations-1/#funcdef-view
-RefPtr<ViewFunctionStyleValue const> Parser::parse_view_function_value(TokenStream<ComponentValue>& tokens)
+RefPtr<FunctionStyleValue const> Parser::parse_view_function_value(TokenStream<ComponentValue>& tokens)
 {
     // <view()> = view( [ <axis> || <'view-timeline-inset'> ]? )
     auto transaction = tokens.begin_transaction();
@@ -1310,8 +1311,11 @@ RefPtr<ViewFunctionStyleValue const> Parser::parse_view_function_value(TokenStre
 
     auto context_guard = push_temporary_value_parsing_context(FunctionContext { "view"sv });
 
-    Optional<Axis> axis;
-    RefPtr<StyleValue const> inset;
+    StyleValueTuple tuple;
+    tuple.resize_with_default_value(2, nullptr);
+
+    bool has_axis = false;
+    bool has_inset = false;
 
     auto argument_tokens = TokenStream { function_token.function().value };
 
@@ -1322,33 +1326,36 @@ RefPtr<ViewFunctionStyleValue const> Parser::parse_view_function_value(TokenStre
             break;
 
         if (auto inset_value = parse_view_timeline_inset_value(argument_tokens); inset_value) {
-            if (inset)
+            if (has_inset)
                 return nullptr;
 
-            inset = inset_value;
+            auto const& inset_values = inset_value->as_value_list().values();
+
+            // NB: The default value of <'view-timeline-inset'> `auto auto` is omitted from the serialization.
+            if (inset_values[0]->to_keyword() != Keyword::Auto || inset_values[1]->to_keyword() != Keyword::Auto)
+                tuple[TupleStyleValue::Indices::ViewFunction::Inset] = inset_value;
+
+            has_inset = true;
             continue;
         }
 
         if (auto keyword_value = parse_keyword_value(argument_tokens); keyword_value && keyword_to_axis(keyword_value->to_keyword()).has_value()) {
-            if (axis.has_value())
+            if (has_axis)
                 return nullptr;
 
-            axis = keyword_to_axis(keyword_value->to_keyword());
+            // NB: The default value of <axis> `block` is omitted from the serialization.
+            if (keyword_value->to_keyword() != Keyword::Block)
+                tuple[TupleStyleValue::Indices::ViewFunction::Axis] = keyword_value;
+
+            has_axis = true;
             continue;
         }
 
         return nullptr;
     }
 
-    // By default, view() references the block axis
-    if (!axis.has_value())
-        axis = Axis::Block;
-
-    if (!inset)
-        inset = StyleValueList::create({ KeywordStyleValue::create(Keyword::Auto), KeywordStyleValue::create(Keyword::Auto) }, StyleValueList::Separator::Space);
-
     transaction.commit();
-    return ViewFunctionStyleValue::create(axis.value(), inset.release_nonnull());
+    return FunctionStyleValue::create("view"_fly_string, TupleStyleValue::create(move(tuple)));
 }
 
 // https://www.w3.org/TR/CSS2/visufx.html#value-def-shape
@@ -3481,14 +3488,14 @@ RefPtr<RadialSizeStyleValue const> Parser::parse_radial_size(TokenStream<Compone
     return RadialSizeStyleValue::create(values);
 }
 
-RefPtr<FitContentStyleValue const> Parser::parse_fit_content_value(TokenStream<ComponentValue>& tokens)
+RefPtr<StyleValue const> Parser::parse_fit_content_value(TokenStream<ComponentValue>& tokens)
 {
     auto transaction = tokens.begin_transaction();
     auto& component_value = tokens.consume_a_token();
 
     if (component_value.is_ident("fit-content"sv)) {
         transaction.commit();
-        return FitContentStyleValue::create();
+        return KeywordStyleValue::create(Keyword::FitContent);
     }
 
     if (!component_value.is_function())
@@ -3507,7 +3514,7 @@ RefPtr<FitContentStyleValue const> Parser::parse_fit_content_value(TokenStream<C
         return nullptr;
 
     transaction.commit();
-    return FitContentStyleValue::create(length_percentage_value.release_nonnull());
+    return FunctionStyleValue::create("fit-content"_fly_string, length_percentage_value.release_nonnull());
 }
 
 RefPtr<StyleValue const> Parser::parse_font_style_value(TokenStream<ComponentValue>& tokens)
@@ -3595,7 +3602,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            stylistic = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::Stylistic, move(feature_value_names));
+            stylistic = FunctionStyleValue::create("stylistic"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -3605,7 +3612,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            styleset = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::Styleset, move(feature_value_names));
+            styleset = FunctionStyleValue::create("styleset"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -3615,7 +3622,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            character_variant = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::CharacterVariant, move(feature_value_names));
+            character_variant = FunctionStyleValue::create("character-variant"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -3625,7 +3632,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            swash = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::Swash, move(feature_value_names));
+            swash = FunctionStyleValue::create("swash"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -3635,7 +3642,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            ornaments = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::Ornaments, move(feature_value_names));
+            ornaments = FunctionStyleValue::create("ornaments"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -3645,7 +3652,7 @@ RefPtr<StyleValue const> Parser::parse_font_variant_alternates_value(TokenStream
                 return nullptr;
 
             transaction.commit();
-            annotation = FontVariantAlternatesFunctionStyleValue::create(FontFeatureValueType::Annotation, move(feature_value_names));
+            annotation = FunctionStyleValue::create("annotation"_fly_string, StyleValueList::create(move(feature_value_names), StyleValueList::Separator::Comma));
             continue;
         }
 
@@ -4629,7 +4636,7 @@ Optional<ExplicitGridTrack> Parser::parse_grid_track_size(TokenStream<ComponentV
             if (function_tokens.has_next_token())
                 return {};
             transaction.commit();
-            return ExplicitGridTrack(GridSize(FitContentStyleValue::create(maybe_length_percentage.release_nonnull())));
+            return ExplicitGridTrack(GridSize(FunctionStyleValue::create("fit-content"_fly_string, maybe_length_percentage.release_nonnull())));
         }
     }
 

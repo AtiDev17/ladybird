@@ -22,10 +22,10 @@
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FitContentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FlexStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FrequencyStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTrackSizeListStyleValue.h>
 #include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -1720,21 +1720,22 @@ static RefPtr<StyleValue const> interpolate_value_impl(DOM::Element& element, Ca
 
         return FontStyleStyleValue::create(*keyword_to_font_style_keyword(interpolated_font_style->to_keyword()));
     }
-    case StyleValue::Type::FitContent: {
-        auto const& from_length_percentage = from.as_fit_content().length_percentage_style_value();
-        auto const& to_length_percentage = to.as_fit_content().length_percentage_style_value();
-        if (!from_length_percentage || !to_length_percentage)
-            return {};
-
-        auto interpolated_length_percentage = interpolate_value_impl(element, calculation_context, *from_length_percentage, *to_length_percentage, delta, allow_discrete);
-        if (!interpolated_length_percentage)
-            return {};
-
-        return FitContentStyleValue::create(interpolated_length_percentage.release_nonnull());
-    }
     case StyleValue::Type::Flex: {
         auto interpolated_value = interpolate_raw(from.as_flex().flex().to_fr(), to.as_flex().flex().to_fr(), delta, calculation_context.accepted_ranges_by_type.get(ValueType::Flex));
         return FlexStyleValue::create(Flex::make_fr(interpolated_value));
+    }
+    case StyleValue::Type::Function: {
+        auto const& from_function = from.as_function();
+        auto const& to_function = to.as_function();
+
+        if (from_function.name() != to_function.name())
+            return {};
+
+        auto interpolated_value = interpolate_value(element, calculation_context, from_function.value(), to_function.value(), delta, allow_discrete);
+        if (!interpolated_value)
+            return {};
+
+        return FunctionStyleValue::create(from_function.name(), interpolated_value.release_nonnull());
     }
     case StyleValue::Type::Integer: {
         // https://drafts.csswg.org/css-values/#combine-integers
@@ -2485,21 +2486,22 @@ RefPtr<StyleValue const> composite_value(PropertyID property_id, StyleValue cons
 
         return {};
     }
-    case StyleValue::Type::FitContent: {
-        auto underlying_length_percentage = underlying_value.as_fit_content().length_percentage_style_value();
-        auto animated_length_percentage = animated_value.as_fit_content().length_percentage_style_value();
-        if (!underlying_length_percentage || !animated_length_percentage)
-            return {};
-
-        auto composited_length_percentage = composite_value(property_id, *underlying_length_percentage, *animated_length_percentage, composite_operation);
-        if (!composited_length_percentage)
-            return {};
-
-        return FitContentStyleValue::create(composited_length_percentage.release_nonnull());
-    }
     case StyleValue::Type::Flex: {
         auto result = composite_raw_values(underlying_value.as_flex().flex().to_fr(), animated_value.as_flex().flex().to_fr());
         return FlexStyleValue::create(Flex::make_fr(result));
+    }
+    case StyleValue::Type::Function: {
+        auto const& underlying_function = underlying_value.as_function();
+        auto const& animated_function = animated_value.as_function();
+
+        if (underlying_function.name() != animated_function.name())
+            return {};
+
+        auto composited_value = composite_value(property_id, underlying_function.value(), animated_function.value(), composite_operation);
+        if (!composited_value)
+            return {};
+
+        return FunctionStyleValue::create(underlying_function.name(), composited_value.release_nonnull());
     }
     case StyleValue::Type::GridTrackSizeList: {
         auto underlying_list = underlying_value.as_grid_track_size_list().grid_track_size_list();

@@ -24,9 +24,8 @@
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FitContentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FontVariantAlternatesFunctionStyleValue.h>
+#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridAutoFlowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTemplateAreaStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GridTrackPlacementStyleValue.h>
@@ -41,7 +40,6 @@
 #include <LibWeb/CSS/StyleValues/PositionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RectStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RepeatStyleStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ScrollFunctionStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ScrollbarColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
@@ -1474,11 +1472,12 @@ Optional<FontVariantAlternates> ComputedProperties::font_variant_alternates() co
             continue;
         }
 
-        if (value->is_font_variant_alternates_function()) {
-            auto const& function = value->as_font_variant_alternates_function();
+        if (value->is_function()) {
+            auto function_type = font_feature_value_type_from_string(value->as_function().name()).release_value();
+            auto const& names = value->as_function().value()->as_value_list().values();
 
-            for (auto const& name : function.names())
-                alternates.font_feature_value_entries.append({ function.function_type(), string_from_style_value(name) });
+            for (auto const& name : names)
+                alternates.font_feature_value_entries.append({ function_type, string_from_style_value(name) });
 
             continue;
         }
@@ -2019,15 +2018,23 @@ Vector<ComputedProperties::AnimationProperties> ComputedProperties::animations(D
             // <scroll()>
             // Use the scroll progress timeline indicated by the given scroll() function. See Scroll-driven Animations
             // § 2.2.1 The scroll() notation.
-            if (animation_timeline_style_value->is_scroll_function()) {
-                auto const& scroll_function = animation_timeline_style_value->as_scroll_function();
+            if (animation_timeline_style_value->is_function() && animation_timeline_style_value->as_function().name() == "scroll"_fly_string) {
+                auto const& arguments = animation_timeline_style_value->as_function().value()->as_tuple().tuple();
+
+                auto const& scroller = arguments[TupleStyleValue::Indices::ScrollFunction::Scroller]
+                    ? keyword_to_scroller(arguments[TupleStyleValue::Indices::ScrollFunction::Scroller]->to_keyword()).value()
+                    : Scroller::Nearest;
+
+                auto const& axis = arguments[TupleStyleValue::Indices::ScrollFunction::Axis]
+                    ? Animations::css_axis_to_bindings_scroll_axis(keyword_to_axis(arguments[TupleStyleValue::Indices::ScrollFunction::Axis]->to_keyword()).value())
+                    : Bindings::ScrollAxis::Block;
 
                 Animations::ScrollTimeline::AnonymousSource source {
-                    .scroller = scroll_function.scroller(),
+                    .scroller = scroller,
                     .target = abstract_element,
                 };
 
-                return Animations::ScrollTimeline::create(abstract_element.element().realm(), abstract_element.document(), source, Animations::css_axis_to_bindings_scroll_axis(scroll_function.axis()));
+                return Animations::ScrollTimeline::create(abstract_element.element().realm(), abstract_element.document(), source, axis);
             }
 
             //<view()>

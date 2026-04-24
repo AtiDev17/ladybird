@@ -230,7 +230,6 @@ set(SOURCES
     CSS/StyleSheetInvalidation.cpp
     CSS/StyleSheetList.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
-    CSS/StyleValues/AddFunctionStyleValue.cpp
     CSS/StyleValues/AnchorStyleValue.cpp
     CSS/StyleValues/AnchorSizeStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
@@ -258,10 +257,9 @@ set(SOURCES
     CSS/StyleValues/EasingStyleValue.cpp
     CSS/StyleValues/EdgeStyleValue.cpp
     CSS/StyleValues/FilterValueListStyleValue.cpp
-    CSS/StyleValues/FitContentStyleValue.cpp
+    CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
     CSS/StyleValues/FontStyleStyleValue.cpp
-    CSS/StyleValues/FontVariantAlternatesFunctionStyleValue.cpp
     CSS/StyleValues/GridAutoFlowStyleValue.cpp
     CSS/StyleValues/GridTemplateAreaStyleValue.cpp
     CSS/StyleValues/GridTrackPlacementStyleValue.cpp
@@ -283,7 +281,6 @@ set(SOURCES
     CSS/StyleValues/RectStyleValue.cpp
     CSS/StyleValues/RepeatStyleStyleValue.cpp
     CSS/StyleValues/ScrollbarColorStyleValue.cpp
-    CSS/StyleValues/ScrollFunctionStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
     CSS/StyleValues/StyleValue.cpp
@@ -296,7 +293,6 @@ set(SOURCES
     CSS/StyleValues/TupleStyleValue.cpp
     CSS/StyleValues/UnicodeRangeStyleValue.cpp
     CSS/StyleValues/UnresolvedStyleValue.cpp
-    CSS/StyleValues/ViewFunctionStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
     CSS/SystemColor.cpp
