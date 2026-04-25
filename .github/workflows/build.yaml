@@ -1,0 +1,390 @@
+name: Multi-OS Build Pipeline
+
+on:
+  push:
+    branches: [ test ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          type: 'build'
+
+      - name: Restore Caches
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'Windows'
+          arch: 'x86_64'
+          toolchain: 'ClangCL'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+
+      - name: Setup Windows Specific Tools
+        shell: pwsh
+        run: |
+          $maxRetries = 3
+          for ($i=1; $i -le $maxRetries; $i++) {
+            try { choco install pkgconfiglite -y; break }
+            catch { if ($i -eq $maxRetries) { throw }; Start-Sleep -Seconds 10 }
+          }
+          if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) { New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache" }
+
+      - name: Build
+        shell: pwsh
+        run: python Meta/ladybird.py build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkgDir = "ladybird-package/Ladybird"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+          
+          cmake --install Build/release --prefix $pkgDir
+          
+          Copy-Item "Build/release/bin/*.exe" -Destination "$pkgDir/bin/" -Force
+          Copy-Item "Build/release/bin/*.dll" -Destination "$pkgDir/bin/" -Force
+
+          $vcpkgBin = "Build/release/vcpkg_installed/x64-windows/bin"
+          if (Test-Path $vcpkgBin) { Copy-Item "$vcpkgBin/*.dll" -Destination "$pkgDir/bin/" -Force }
+
+          $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if ($deployTool) {
+              Get-ChildItem -Path "$pkgDir/bin" -Filter "*.exe" | ForEach-Object {
+                  $exePath = $_.FullName
+                  $process = Start-Process -FilePath $deployTool -ArgumentList "`"$exePath`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+              }
+          }
+
+          Remove-Item -Path "$pkgDir/bin/vc_redist.x64.exe" -Force -ErrorAction SilentlyContinue
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$pkgDir/LICENSE.txt" }
+          "Commit: ${{ github.sha }}`nBuild Date: $(Get-Date)" | Out-File -FilePath "$pkgDir/version.txt"
+          "@echo off`r`nstart `"`" `"%~dp0bin\Ladybird.exe`"" | Out-File -FilePath "$pkgDir/Launch Ladybird.bat" -Encoding ASCII
+
+          $batScript = @'
+          <# :
+          @echo off
+          setlocal
+          echo ============================================
+          echo      Ladybird Windows Update Tool
+          echo ============================================
+          powershell -noprofile -executionpolicy bypass -command "iex ((Get-Content '%~f0') -join \"`n\")"
+          pause >nul
+          goto :EOF
+          #>
+          $ProgressPreference = 'Continue'; $ErrorActionPreference = 'Stop'
+          if (Get-Process Ladybird -ErrorAction SilentlyContinue) { Write-Host "Error: Ladybird is running. Please close it." -ForegroundColor Red; exit 1 }
+          $localCommit = 'unknown'
+          if (Test-Path 'version.txt') { $lines = Get-Content 'version.txt'; if ($lines[0] -match 'Commit: ([a-f0-9]+)') { $localCommit = $matches[1] } }
+          
+          $headers = @{ "User-Agent" = "Ladybird-Windows-Updater" }
+          $releases = try { Invoke-RestMethod -Uri 'https://api.github.com/repos/AtiDev17/ladybird/releases' -Headers $headers } catch { $null }
+          if (!$releases) { Write-Host 'Error: Could not connect to API.' -ForegroundColor Red; exit 1 }
+          
+          $release = $releases[0]
+          $remoteCommit = 'unknown'
+          if ($release.body -match 'Commit: ([a-f0-9]+)') { $remoteCommit = $matches[1] }
+          
+          if ($localCommit -ne 'unknown' -and $localCommit -eq $remoteCommit) { Write-Host 'Already up to date!' -ForegroundColor Green; exit 0 }
+          
+          $asset = $release.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
+          $hashAsset = $release.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip.sha256' }
+          if ($asset -and $hashAsset) {
+              $tmp = Join-Path $env:TEMP 'LadybirdUpdate'
+              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+              New-Item -Type Directory $tmp | Out-Null
+              
+              Start-BitsTransfer -Source $asset.browser_download_url -Destination "$tmp\update.zip"
+              Start-BitsTransfer -Source $hashAsset.browser_download_url -Destination "$tmp\update.sha256"
+              
+              $expectedHash = (Get-Content "$tmp\update.sha256").Trim().ToUpper()
+              $actualHash = (Get-FileHash -Path "$tmp\update.zip" -Algorithm SHA256).Hash.ToUpper()
+              
+              if ($expectedHash -ne $actualHash) { Write-Host 'Hash mismatch!' -ForegroundColor Red; Remove-Item $tmp -Recurse -Force; exit 1 }
+              Expand-Archive -Path "$tmp\update.zip" -DestinationPath $tmp -Force
+              Get-ChildItem -Path "$tmp\Ladybird" | Copy-Item -Destination '.' -Recurse -Force
+              Remove-Item $tmp -Recurse -Force
+              Write-Host 'Update successful!' -ForegroundColor Green
+          } else { Write-Host 'Error: Update assets missing.' -ForegroundColor Red }
+          '@
+          $batScript | Out-File -FilePath "$pkgDir/Update Ladybird.bat" -Encoding ASCII
+
+          Compress-Archive -Path "ladybird-package/Ladybird" -DestinationPath "ladybird-windows-x64.zip" -Force
+          (Get-FileHash -Path "ladybird-windows-x64.zip" -Algorithm SHA256).Hash | Out-File -FilePath "ladybird-windows-x64.zip.sha256" -Encoding ASCII
+
+      - name: Validate Build Stability
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "ladybird-package/Ladybird/bin/Ladybird.exe" -ArgumentList "--headless" -PassThru
+          Start-Sleep -Seconds 5
+          $proc.Refresh()
+          if ($proc.HasExited -and $proc.ExitCode -ne 0) { exit 1 } else { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-windows-x64
+          path: ladybird-windows-x64.zip*
+          retention-days: 14
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'x86_64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
+
+  build-linux:
+    name: Build Linux (x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'Linux'
+          arch: 'x86_64'
+          toolchain: 'Clang'
+          type: 'build'
+
+      - name: Restore Caches
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'Linux'
+          arch: 'x86_64'
+          toolchain: 'Clang'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+
+      - name: Build
+        run: python Meta/ladybird.py build
+
+      - name: Package
+        run: |
+          mkdir -p ladybird-package/Ladybird
+          cmake --install Build/release --prefix ladybird-package/Ladybird
+          if [ -f "LICENSE" ]; then cp LICENSE ladybird-package/Ladybird/LICENSE.txt; fi
+          echo "Commit: ${{ github.sha }}" > ladybird-package/Ladybird/version.txt
+          
+          # Generate Linux Update script
+          cat << 'EOF' > ladybird-package/Ladybird/Update\ Ladybird.sh
+          #!/usr/bin/env bash
+          set -e
+          cd "$(dirname "$0")"
+          echo "============================================"
+          echo "     Ladybird Linux Update Tool"
+          echo "============================================"
+          if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
+          
+          LOCAL_COMMIT="unknown"
+          if[ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
+          
+          API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
+          LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
+          REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit: [a-f0-9]*' | head -1 | awk '{print $NF}')
+          
+          if [ "$LOCAL_COMMIT" != "unknown" ] &&[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          
+          ASSET_NAME="ladybird-linux-x64.tar.gz"
+          ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
+          HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
+          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          
+          TMP_DIR=$(mktemp -d)
+          curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
+          curl -L -s -o "$TMP_DIR/$ASSET_NAME.sha256" "$HASH_URL"
+          
+          cd "$TMP_DIR"
+          sha256sum -c "$ASSET_NAME.sha256" || { echo "Hash mismatch!"; exit 1; }
+          cd - > /dev/null
+          
+          tar -xzf "$TMP_DIR/$ASSET_NAME" --strip-components=1 -C .
+          rm -rf "$TMP_DIR"
+          echo "Update successful! Launch Ladybird using ./bin/Ladybird"
+          EOF
+          chmod +x ladybird-package/Ladybird/Update\ Ladybird.sh
+
+          tar -czvf ladybird-linux-x64.tar.gz -C ladybird-package Ladybird
+          sha256sum ladybird-linux-x64.tar.gz | awk '{print $1}' > ladybird-linux-x64.tar.gz.sha256
+
+      - name: Validate Build Stability
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          ./ladybird-package/Ladybird/bin/Ladybird --headless &
+          PID=$!
+          sleep 5
+          if ! kill -0 $PID 2>/dev/null; then echo "Build Failed: Ladybird crashed."; exit 1; fi
+          kill $PID
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-linux-x64
+          path: ladybird-linux-x64.tar.gz*
+          retention-days: 14
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'x86_64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
+
+  build-macos:
+    name: Build macOS (ARM64)
+    runs-on: macos-14
+    timeout-minutes: 240
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'macOS'
+          arch: 'arm64'
+          toolchain: 'Clang'
+          type: 'build'
+
+      - name: Restore Caches
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'macOS'
+          arch: 'arm64'
+          toolchain: 'Clang'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+
+      - name: Build
+        run: python Meta/ladybird.py build
+
+      - name: Package
+        run: |
+          mkdir -p ladybird-package
+          cp -r Build/release/bin/Ladybird.app ladybird-package/
+          echo "Commit: ${{ github.sha }}" > ladybird-package/version.txt
+          
+          # Generate macOS Update script
+          cat << 'EOF' > ladybird-package/Update\ Ladybird.command
+          #!/usr/bin/env bash
+          set -e
+          cd "$(dirname "$0")"
+          echo "============================================"
+          echo "     Ladybird macOS Update Tool"
+          echo "============================================"
+          if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
+          
+          LOCAL_COMMIT="unknown"
+          if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
+          
+          API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
+          LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
+          REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
+          
+          if [ "$LOCAL_COMMIT" != "unknown" ] &&[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          
+          ASSET_NAME="ladybird-macos-arm64.zip"
+          ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
+          HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
+          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          
+          TMP_DIR=$(mktemp -d)
+          curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
+          curl -L -s -o "$TMP_DIR/$ASSET_NAME.sha256" "$HASH_URL"
+          
+          cd "$TMP_DIR"
+          shasum -a 256 -c "$ASSET_NAME.sha256" || { echo "Hash mismatch!"; exit 1; }
+          cd - > /dev/null
+          
+          unzip -qo "$TMP_DIR/$ASSET_NAME" -d .
+          # Remove Apple Quarantine attribute so it runs without "App is damaged" errors
+          xattr -rc Ladybird.app || true 
+          rm -rf "$TMP_DIR"
+          echo "Update successful! You can now launch Ladybird.app"
+          EOF
+          chmod +x ladybird-package/Update\ Ladybird.command
+
+          cd ladybird-package
+          zip -qr ../ladybird-macos-arm64.zip Ladybird.app version.txt "Update Ladybird.command"
+          cd ..
+          shasum -a 256 ladybird-macos-arm64.zip | awk '{print $1}' > ladybird-macos-arm64.zip.sha256
+
+      - name: Validate Build Stability
+        run: |
+          ./ladybird-package/Ladybird.app/Contents/MacOS/Ladybird --headless &
+          PID=$!
+          sleep 5
+          if ! kill -0 $PID 2>/dev/null; then echo "Build Failed: Ladybird crashed."; exit 1; fi
+          kill $PID
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-macos-arm64
+          path: ladybird-macos-arm64.zip*
+          retention-days: 14
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'arm64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
