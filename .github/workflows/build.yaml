@@ -53,6 +53,16 @@ jobs:
           toolchain: 'ClangCL'
           type: 'build'
 
+      - name: Setup Windows Specific Tools
+        shell: pwsh
+        run: |
+          $maxRetries = 3
+          for ($i=1; $i -le $maxRetries; $i++) {
+            try { choco install pkgconfiglite ccache -y; break }
+            catch { if ($i -eq $maxRetries) { throw }; Start-Sleep -Seconds 10 }
+          }
+          if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) { New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache" }
+
       - name: Restore Caches
         id: cache-restore
         uses: ./.github/actions/cache-restore
@@ -63,16 +73,6 @@ jobs:
           cache_key_extra: 'NORMAL'
           ccache_path: '${{ github.workspace }}/.ccache'
           vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
-
-      - name: Setup Windows Specific Tools
-        shell: pwsh
-        run: |
-          $maxRetries = 3
-          for ($i=1; $i -le $maxRetries; $i++) {
-            try { choco install pkgconfiglite -y; break }
-            catch { if ($i -eq $maxRetries) { throw }; Start-Sleep -Seconds 10 }
-          }
-          if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) { New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache" }
 
       - name: Build
         shell: pwsh
@@ -510,11 +510,10 @@ jobs:
       - name: Build on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          sync: sshfs
+          envs: 'MAKEJOBS=2'
           prepare: |
             pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
           run: |
-            export MAKEJOBS=2
             python3 Meta/ladybird.py build
             
             mkdir -p ladybird-package/Ladybird
