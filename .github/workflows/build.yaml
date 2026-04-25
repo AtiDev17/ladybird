@@ -476,6 +476,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Accept Android SDK Licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
       - name: Setup Environment
         uses: ./.github/actions/setup
         with:
@@ -514,12 +517,17 @@ jobs:
           version: '14.2'
           architecture: x86-64
           run: |
-            # Tell pkg to ignore minor version mismatches between the VM and the repo
             sudo env IGNORE_OSVERSION=yes pkg update -f
-            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
+            
+            # Added llvm19 to the package list
+            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19
             
             export MAKEJOBS=2
-            python3 Meta/ladybird.py build
+            export CC=/usr/local/bin/clang19
+            export CXX=/usr/local/bin/clang++19
+            
+            # Pass the explicit compilers to the build script
+            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
             
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
