@@ -469,6 +469,11 @@ jobs:
     timeout-minutes: 240
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -479,6 +484,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle' # <--- Enables massive caching for the Android Gradle Build
 
       - name: Accept Android SDK Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
@@ -490,6 +496,17 @@ jobs:
           arch: 'arm64'
           toolchain: 'Clang'
           type: 'build'
+
+      - name: Restore Caches
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'Android'
+          arch: 'arm64'
+          toolchain: 'Clang'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
 
       - name: Build APK
         run: |
@@ -503,7 +520,17 @@ jobs:
           name: ladybird-android-apk
           path: UI/Android/app/build/outputs/apk/release/*.apk
           retention-days: 14
-          
+
+      - name: Save Caches
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'arm64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
+
   build-freebsd:
     name: Build FreeBSD (x64 VM)
     runs-on: ubuntu-latest
@@ -514,6 +541,17 @@ jobs:
         with:
           fetch-depth: 1
           
+      - name: Restore Caches (Host)
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'FreeBSD'
+          arch: 'x86_64'
+          toolchain: 'Clang'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+
       - name: Build on FreeBSD
         uses: cross-platform-actions/action@v1
         with:
@@ -523,18 +561,21 @@ jobs:
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
             
-            # Added perl5 as it is required by libvpx's configure script
-            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5
+            # Added ccache to the install list so the VM can actually use the cache
+            sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5
             
-            # Ensure FreeBSD's package binaries are prioritized in the PATH
             export PATH="/usr/local/bin:$PATH"
-            
             export MAKEJOBS=2
             export CC=/usr/local/bin/clang19
             export CXX=/usr/local/bin/clang++19
-            
-            # This is the magic line that fixes the FreeBSD vcpkg failure
             export VCPKG_FORCE_SYSTEM_BINARIES=1
+            
+            # Map the host cache folders into the FreeBSD environment
+            export CMAKE_C_COMPILER_LAUNCHER=ccache
+            export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+            export CCACHE_DIR="${PWD}/.ccache"
+            export CCACHE_BASEDIR="${PWD}"
+            export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
             
@@ -549,6 +590,16 @@ jobs:
           path: ladybird-freebsd-x64.tar.gz
           retention-days: 14
 
+      - name: Save Caches (Host)
+        uses: ./.github/actions/cache-save
+        if: always()
+        with:
+          arch: 'x86_64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
+
   build-riscv:
     name: Build Linux (RISC-V 64)
     runs-on: ubuntu-latest
@@ -558,6 +609,17 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Restore Caches (Host)
+        id: cache-restore
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'Linux'
+          arch: 'riscv64'
+          toolchain: 'Clang'
+          cache_key_extra: 'NORMAL'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
 
       - name: Emulate RISC-V Build
         uses: uraimo/run-on-arch-action@v3
@@ -572,7 +634,6 @@ jobs:
             --volume "${PWD}/artifacts:/artifacts"
           install: |
             apt-get update -y
-            # Note: I added npm and nodejs to this list, as Ladybird's build requires them!
             apt-get install -y sudo nodejs npm autoconf autoconf-archive automake bison build-essential ccache cmake curl fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
             
             useradd -m builder
@@ -580,7 +641,14 @@ jobs:
             chown -R builder:builder .
             
             sudo -u builder bash -c '
-              set -e # <--- THIS WILL FORCE IT TO FAIL LOUDLY IF AN ERROR OCCURS
+              set -e 
+              
+              # Map the host cache folders into the emulator
+              export CMAKE_C_COMPILER_LAUNCHER=ccache
+              export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+              export CCACHE_DIR="${PWD}/.ccache"
+              export CCACHE_BASEDIR="${PWD}"
+              export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
               
               export MAKEJOBS=2
               export VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -598,9 +666,12 @@ jobs:
           path: artifacts/ladybird-linux-riscv64.tar.gz
           retention-days: 14
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v7
+      - name: Save Caches (Host)
+        uses: ./.github/actions/cache-save
+        if: always()
         with:
-          name: ladybird-linux-riscv64
-          path: artifacts/ladybird-linux-riscv64.tar.gz
-          retention-days: 14
+          arch: 'riscv64'
+          ccache_path: '${{ github.workspace }}/.ccache'
+          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
+          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
