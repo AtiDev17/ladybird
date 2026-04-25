@@ -80,11 +80,21 @@ FontLoader::FontLoader(FontComputer& font_computer, RuleOrDeclaration rule_or_de
     , m_family_name(move(family_name))
     , m_unicode_ranges(move(unicode_ranges))
     , m_urls(move(urls))
-    , m_on_load(move(on_load))
 {
+    if (on_load)
+        m_subscribers.append(*on_load);
 }
 
 FontLoader::~FontLoader() = default;
+
+void FontLoader::subscribe(GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>> callback)
+{
+    if (m_has_completed) {
+        callback->function()(m_typeface);
+        return;
+    }
+    m_subscribers.append(callback);
+}
 
 void FontLoader::visit_edges(Visitor& visitor)
 {
@@ -95,7 +105,7 @@ void FontLoader::visit_edges(Visitor& visitor)
     else if (auto* block = m_rule_or_declaration.value.get_pointer<RuleOrDeclaration::StyleDeclaration>())
         visitor.visit(block->parent_rule);
     visitor.visit(m_fetch_controller);
-    visitor.visit(m_on_load);
+    visitor.visit(m_subscribers);
 }
 
 bool FontLoader::is_loading() const
@@ -195,12 +205,11 @@ void FontLoader::font_did_load_or_fail(RefPtr<Gfx::Typeface const> typeface)
     if (typeface) {
         m_typeface = typeface.release_nonnull();
         m_font_computer->clear_computed_font_cache(m_family_name);
-        if (m_on_load)
-            m_on_load->function()(m_typeface);
-    } else {
-        if (m_on_load)
-            m_on_load->function()(nullptr);
     }
+    m_has_completed = true;
+    for (auto& callback : m_subscribers)
+        callback->function()(m_typeface);
+    m_subscribers.clear();
     m_fetch_controller = nullptr;
 }
 
@@ -268,8 +277,18 @@ struct FontComputer::MatchingFontCandidate {
 
         auto font_list = Gfx::FontCascadeList::create();
         for (auto const& face : it->value) {
-            if (auto face_fonts = face->font_with_point_size(point_size, variations, shape_features))
+            if (auto face_fonts = face->font_with_point_size(point_size, variations, shape_features)) {
                 font_list->extend(*face_fonts);
+                continue;
+            }
+            // Unloaded subset face: surface it as a pending entry so the fetch only
+            // fires once font_for_code_point() sees a codepoint in its unicode-range.
+            if (face->has_urls() && face->has_non_default_unicode_range()) {
+                GC::Root<FontFace> rooted_face(*face);
+                font_list->add_pending_face(face->unicode_ranges(), [rooted_face = move(rooted_face)] {
+                    const_cast<FontFace&>(*rooted_face).load();
+                });
+            }
         }
         if (font_list->is_empty())
             return {};
@@ -283,6 +302,8 @@ void FontComputer::visit_edges(Visitor& visitor)
     visitor.visit(m_document);
     for (auto& [_, faces] : m_font_faces)
         visitor.visit(faces);
+    for (auto& [_, loader] : m_loaders_by_url)
+        visitor.visit(loader);
 }
 
 RefPtr<Gfx::FontCascadeList const> FontComputer::find_matching_font_weight_ascending(Vector<MatchingFontCandidate> const& candidates, int target_weight, float font_size_in_pt, Gfx::FontVariationSettings const& variations, FontFeatureData const& font_feature_data, HashMap<FontFeatureValueKey, Vector<u32>> const& font_feature_values, bool inclusive) const
@@ -757,7 +778,16 @@ GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face
         }
     };
 
-    return heap().allocate<FontLoader>(*this, rule_or_declaration, font_face.font_family(), font_face.unicode_ranges(), move(urls), move(on_load));
+    auto key = urls.first().to_string();
+    if (auto it = m_loaders_by_url.find(key); it != m_loaders_by_url.end()) {
+        if (on_load)
+            it->value->subscribe(*on_load);
+        return it->value;
+    }
+
+    auto loader = heap().allocate<FontLoader>(*this, rule_or_declaration, font_face.font_family(), font_face.unicode_ranges(), move(urls), move(on_load));
+    m_loaders_by_url.set(move(key), loader);
+    return loader;
 }
 
 void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
@@ -771,12 +801,18 @@ void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
             auto font_face = FontFace::create_css_connected(document().realm(), *font_face_rule);
             document().fonts()->add_css_connected_font(font_face);
 
-            // NB: Load via FontFace::load(), to satisfy this requirement:
-            // https://drafts.csswg.org/css-font-loading/#font-face-load
-            // User agents can initiate font loads on their own, whenever they determine that a given font face is
-            // necessary to render something on the page. When this happens, they must act as if they had called the
-            // corresponding FontFace’s load() method described here.
-            font_face->load();
+            if (font_face->has_non_default_unicode_range()) {
+                // Register for matching, but defer loading until a rendered codepoint
+                // actually falls in this face's unicode-range.
+                register_font_face(font_face);
+            } else {
+                // NB: Load via FontFace::load(), to satisfy this requirement:
+                // https://drafts.csswg.org/css-font-loading/#font-face-load
+                // User agents can initiate font loads on their own, whenever they determine that a given font face is
+                // necessary to render something on the page. When this happens, they must act as if they had called the
+                // corresponding FontFace’s load() method described here.
+                font_face->load();
+            }
         }
 
         if (auto* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(*rule))
