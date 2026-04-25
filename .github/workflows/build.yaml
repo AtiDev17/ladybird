@@ -508,20 +508,29 @@ jobs:
           fetch-depth: 1
           
       - name: Build on FreeBSD
-        uses: vmactions/freebsd-vm@v1
+        uses: cross-platform-actions/action@v1
         with:
-          envs: 'MAKEJOBS=2'
-          usesh: true
-          release: "14.1" # Forces a newer, stable image that boots faster and avoids AnyVM timeouts
-          prepare: |
-            pkg update -f
-            pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
+          operating_system: freebsd
+          version: '14.1'
+          architecture: x86-64
           run: |
+            # In cross-platform-actions we need sudo to install packages
+            sudo pkg update -f
+            sudo pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
+            
+            export MAKEJOBS=2
             python3 Meta/ladybird.py build
             
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-freebsd-x64
+          path: ladybird-freebsd-x64.tar.gz
+          retention-days: 14
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
