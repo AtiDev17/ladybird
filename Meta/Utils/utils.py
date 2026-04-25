@@ -57,3 +57,40 @@ def string_hash(string: str) -> int:
     h = (h + (h << 15)) & 0xFFFFFFFF
 
     return h
+
+
+def title_casify(dashy_name: str) -> str:
+    return "".join(part[0].upper() + part[1:] for part in dashy_name.split("-") if part)
+
+
+def camel_casify(dashy_name: str) -> str:
+    parts = [part for part in dashy_name.split("-") if part]
+    if not parts:
+        return ""
+    result = [parts[0]]
+    for part in parts[1:]:
+        result.append(part[0].upper() + part[1:])
+    return "".join(result)
+
+
+def snake_casify(dashy_name: str, trim_leading_underscores: bool = False) -> str:
+    snake_case = dashy_name.replace("-", "_")
+    if trim_leading_underscores:
+        snake_case = snake_case.lstrip("_")
+    return snake_case
+
+
+def underlying_type_for_enum(member_count: int) -> str:
+    if member_count <= 0xFF:
+        return "u8"
+    if member_count <= 0xFFFF:
+        return "u16"
+    if member_count <= 0xFFFFFFFF:
+        return "u32"
+    return "u64"
+
+
+def make_name_acceptable_cpp(name: str) -> str:
+    if name == "float":
+        return "float_"
+    return name
