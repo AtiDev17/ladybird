@@ -206,8 +206,22 @@ jobs:
         run: |
           mkdir -p ladybird-package/Ladybird
           cmake --install Build/release --prefix ladybird-package/Ladybird
+          
+          # Linux requires third-party .so files to be copied into the deployment package
+          mkdir -p ladybird-package/Ladybird/lib
+          cp -a Build/release/vcpkg_installed/x64-linux/lib/*.so* ladybird-package/Ladybird/lib/ 2>/dev/null || true
+          
           if [ -f "LICENSE" ]; then cp LICENSE ladybird-package/Ladybird/LICENSE.txt; fi
           echo "Commit: ${{ github.sha }}" > ladybird-package/Ladybird/version.txt
+          
+          # Generate Linux Launch Script to set LD_LIBRARY_PATH
+          cat << 'EOF' > "ladybird-package/Ladybird/Launch Ladybird.sh"
+          #!/usr/bin/env bash
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$SCRIPT_DIR/lib64:$LD_LIBRARY_PATH"
+          exec "$SCRIPT_DIR/bin/Ladybird" "$@"
+          EOF
+          chmod +x "ladybird-package/Ladybird/Launch Ladybird.sh"
           
           # Generate Linux Update script
           cat << 'EOF' > "ladybird-package/Ladybird/Update Ladybird.sh"
@@ -220,7 +234,7 @@ jobs:
           if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
           
           LOCAL_COMMIT="unknown"
-          if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
+          if[ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
           
           API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
@@ -231,7 +245,7 @@ jobs:
           ASSET_NAME="ladybird-linux-x64.tar.gz"
           ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
           HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
-          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          if [ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
           
           TMP_DIR=$(mktemp -d)
           curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
@@ -243,7 +257,7 @@ jobs:
           
           tar -xzf "$TMP_DIR/$ASSET_NAME" --strip-components=1 -C .
           rm -rf "$TMP_DIR"
-          echo "Update successful! Launch Ladybird using ./bin/Ladybird"
+          echo "Update successful! Launch Ladybird using ./Launch Ladybird.sh"
           EOF
           chmod +x "ladybird-package/Ladybird/Update Ladybird.sh"
 
@@ -253,11 +267,28 @@ jobs:
       - name: Validate Build Stability
         run: |
           export QT_QPA_PLATFORM=offscreen
-          ./ladybird-package/Ladybird/bin/Ladybird --headless &
+          ./ladybird-package/Ladybird/Launch\ Ladybird.sh --headless &
           PID=$!
           sleep 5
-          if ! kill -0 $PID 2>/dev/null; then echo "Build Failed: Ladybird crashed."; exit 1; fi
-          kill $PID
+          if ! kill -0 $PID 2>/dev/null; then
+            wait $PID
+            if [ $? -ne 0 ]; then
+              echo "Build Failed: Ladybird crashed."
+              exit 1
+            fi
+            echo "Build Verified: Headless mode completed successfully."
+          else
+            kill $PID
+            echo "Build Verified: Process is stable."
+          fi
+
+      - name: Upload Headless Screenshot
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ladybird-linux-screenshot
+          path: ~/Downloads/*.png
+          retention-days: 14
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
@@ -339,12 +370,12 @@ jobs:
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
           REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
           
-          if [ "$LOCAL_COMMIT" != "unknown" ] &&[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          if[ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
           
           ASSET_NAME="ladybird-macos-arm64.zip"
           ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
           HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
-          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          if [ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
           
           TMP_DIR=$(mktemp -d)
           curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
@@ -372,8 +403,25 @@ jobs:
           ./ladybird-package/Ladybird.app/Contents/MacOS/Ladybird --headless &
           PID=$!
           sleep 5
-          if ! kill -0 $PID 2>/dev/null; then echo "Build Failed: Ladybird crashed."; exit 1; fi
-          kill $PID
+          if ! kill -0 $PID 2>/dev/null; then
+            wait $PID
+            if[ $? -ne 0 ]; then
+              echo "Build Failed: Ladybird crashed."
+              exit 1
+            fi
+            echo "Build Verified: Headless mode completed successfully."
+          else
+            kill $PID
+            echo "Build Verified: Process is stable."
+          fi
+
+      - name: Upload Headless Screenshot
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ladybird-macos-screenshot
+          path: ~/Downloads/*.png
+          retention-days: 14
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
