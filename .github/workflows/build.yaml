@@ -247,7 +247,7 @@ jobs:
           find Build/release/lib -name "*.so*" -exec cp -d {} $APPDIR/usr/lib/ \; 2>/dev/null || true
           
           # Copy Qt Plugins safely
-          if[ -d "Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/plugins" ]; then
+          if [ -d "Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/plugins" ]; then
               cp -r Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/plugins $APPDIR/usr/
           fi
           
@@ -396,7 +396,7 @@ jobs:
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
           REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
           
-          if[ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          if [ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
           
           ASSET_NAME="${{ matrix.artifact_name }}.zip"
           ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
@@ -431,7 +431,7 @@ jobs:
           sleep 5
           if ! kill -0 $PID 2>/dev/null; then
             wait $PID
-            if[ $? -ne 0 ]; then
+            if [ $? -ne 0 ]; then
               echo "Build Failed: Ladybird crashed."
               exit 1
             fi
