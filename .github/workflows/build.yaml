@@ -541,6 +541,9 @@ jobs:
         with:
           fetch-depth: 1
           
+      - name: Install ccache on Host
+        run: sudo apt-get update && sudo apt-get install -y ccache
+
       - name: Restore Caches (Host)
         id: cache-restore
         uses: ./.github/actions/cache-restore
@@ -560,8 +563,6 @@ jobs:
           architecture: x86-64
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
-            
-            # Added ccache to the install list so the VM can actually use the cache
             sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5
             
             export PATH="/usr/local/bin:$PATH"
@@ -570,7 +571,6 @@ jobs:
             export CXX=/usr/local/bin/clang++19
             export VCPKG_FORCE_SYSTEM_BINARIES=1
             
-            # Map the host cache folders into the FreeBSD environment
             export CMAKE_C_COMPILER_LAUNCHER=ccache
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
             export CCACHE_DIR="${PWD}/.ccache"
@@ -610,6 +610,9 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Install ccache on Host
+        run: sudo apt-get update && sudo apt-get install -y ccache
+
       - name: Restore Caches (Host)
         id: cache-restore
         uses: ./.github/actions/cache-restore
@@ -629,9 +632,13 @@ jobs:
           githubToken: ${{ github.token }}
           setup: |
             mkdir -p "${PWD}/artifacts"
-            chmod 777 "${PWD}/artifacts" 
+            # Ensure the cache directories exist and are writable by the container user
+            mkdir -p "${PWD}/.ccache" "${PWD}/vcpkg_cache"
+            chmod -R 777 "${PWD}/artifacts" "${PWD}/.ccache" "${PWD}/vcpkg_cache"
           dockerRunArgs: |
             --volume "${PWD}/artifacts:/artifacts"
+            --volume "${PWD}/.ccache:${PWD}/.ccache"
+            --volume "${PWD}/vcpkg_cache:${PWD}/vcpkg_cache"
           install: |
             apt-get update -y
             apt-get install -y sudo nodejs npm autoconf autoconf-archive automake bison build-essential ccache cmake curl fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
@@ -642,8 +649,6 @@ jobs:
             
             sudo -u builder bash -c '
               set -e 
-              
-              # Map the host cache folders into the emulator
               export CMAKE_C_COMPILER_LAUNCHER=ccache
               export CMAKE_CXX_COMPILER_LAUNCHER=ccache
               export CCACHE_DIR="${PWD}/.ccache"
