@@ -167,7 +167,7 @@ jobs:
 
   build-linux:
     name: Build Linux (x64)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
@@ -210,7 +210,7 @@ jobs:
           echo "Commit: ${{ github.sha }}" > ladybird-package/Ladybird/version.txt
           
           # Generate Linux Update script
-          cat << 'EOF' > ladybird-package/Ladybird/Update\ Ladybird.sh
+          cat << 'EOF' > "ladybird-package/Ladybird/Update Ladybird.sh"
           #!/usr/bin/env bash
           set -e
           cd "$(dirname "$0")"
@@ -220,7 +220,7 @@ jobs:
           if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
           
           LOCAL_COMMIT="unknown"
-          if[ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
+          if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
           
           API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
@@ -245,7 +245,7 @@ jobs:
           rm -rf "$TMP_DIR"
           echo "Update successful! Launch Ladybird using ./bin/Ladybird"
           EOF
-          chmod +x ladybird-package/Ladybird/Update\ Ladybird.sh
+          chmod +x "ladybird-package/Ladybird/Update Ladybird.sh"
 
           tar -czvf ladybird-linux-x64.tar.gz -C ladybird-package Ladybird
           sha256sum ladybird-linux-x64.tar.gz | awk '{print $1}' > ladybird-linux-x64.tar.gz.sha256
@@ -278,7 +278,7 @@ jobs:
 
   build-macos:
     name: Build macOS (ARM64)
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 240
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
@@ -320,7 +320,7 @@ jobs:
           echo "Commit: ${{ github.sha }}" > ladybird-package/version.txt
           
           # Generate macOS Update script
-          cat << 'EOF' > ladybird-package/Update\ Ladybird.command
+          cat << 'EOF' > "ladybird-package/Update Ladybird.command"
           #!/usr/bin/env bash
           set -e
           cd "$(dirname "$0")"
@@ -357,7 +357,7 @@ jobs:
           rm -rf "$TMP_DIR"
           echo "Update successful! You can now launch Ladybird.app"
           EOF
-          chmod +x ladybird-package/Update\ Ladybird.command
+          chmod +x "ladybird-package/Update Ladybird.command"
 
           cd ladybird-package
           zip -qr ../ladybird-macos-arm64.zip Ladybird.app version.txt "Update Ladybird.command"
