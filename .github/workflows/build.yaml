@@ -208,9 +208,13 @@ jobs:
           mkdir -p ladybird-package/Ladybird
           cmake --install Build/release --prefix ladybird-package/Ladybird
           
-          # Forcefully find any shared libraries in the build directory and copy them safely (dereferencing symlinks)
+          # Forcefully find any shared libraries in the build directory and copy them safely
           mkdir -p ladybird-package/Ladybird/lib
           find Build/release -name "*.so*" -exec cp -L {} ladybird-package/Ladybird/lib/ \; 2>/dev/null || true
+          
+          # STRIP DEBUG SYMBOLS to shrink the package size by 80%+
+          find ladybird-package/Ladybird/lib -name "*.so*" -exec strip --strip-unneeded {} + 2>/dev/null || true
+          strip --strip-unneeded ladybird-package/Ladybird/bin/Ladybird 2>/dev/null || true
           
           if [ -f "LICENSE" ]; then cp LICENSE ladybird-package/Ladybird/LICENSE.txt; fi
           echo "Commit: ${{ github.sha }}" > ladybird-package/Ladybird/version.txt
