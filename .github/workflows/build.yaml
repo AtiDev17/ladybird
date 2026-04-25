@@ -460,7 +460,7 @@ jobs:
 
   build-android:
     name: Build Android (APK)
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     continue-on-error: true
     timeout-minutes: 240
     env:
@@ -510,7 +510,7 @@ jobs:
       - name: Build on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          usesh: true
+          sync: sshfs
           prepare: |
             pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
           run: |
