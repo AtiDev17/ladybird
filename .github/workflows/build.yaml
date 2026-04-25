@@ -558,19 +558,31 @@ jobs:
           githubToken: ${{ github.token }}
           setup: |
             mkdir -p "${PWD}/artifacts"
+            # Give everyone write access so the container user can save the tarball here
+            chmod 777 "${PWD}/artifacts" 
           dockerRunArgs: |
             --volume "${PWD}/artifacts:/artifacts"
           install: |
             apt-get update -y
-            apt-get install -y autoconf autoconf-archive automake bison build-essential ccache cmake curl fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
-          run: |
-            export MAKEJOBS=2
-            export VCPKG_FORCE_SYSTEM_BINARIES=1
-            python3 Meta/ladybird.py build
+            # Added sudo to the install list
+            apt-get install -y sudo autoconf autoconf-archive automake bison build-essential ccache cmake curl fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
             
-            mkdir -p ladybird-package/Ladybird
-            cmake --install Build/release --prefix ladybird-package/Ladybird
-            tar -czvf /artifacts/ladybird-linux-riscv64.tar.gz -C ladybird-package Ladybird
+            # Create a non-root user to safely run the build
+            useradd -m builder
+          run: |
+            # Give the builder user ownership of the Ladybird source code
+            chown -R builder:builder .
+            
+            # Run the build sequence as the non-root builder user
+            sudo -u builder bash -c '
+              export MAKEJOBS=2
+              export VCPKG_FORCE_SYSTEM_BINARIES=1
+              python3 Meta/ladybird.py build
+              
+              mkdir -p ladybird-package/Ladybird
+              cmake --install Build/release --prefix ladybird-package/Ladybird
+              tar -czvf /artifacts/ladybird-linux-riscv64.tar.gz -C ladybird-package Ladybird
+            '
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
