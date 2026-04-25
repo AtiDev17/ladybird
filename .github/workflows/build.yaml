@@ -532,13 +532,6 @@ jobs:
           path: ladybird-freebsd-x64.tar.gz
           retention-days: 14
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: ladybird-freebsd-x64
-          path: ladybird-freebsd-x64.tar.gz
-          retention-days: 14
-
   build-riscv:
     name: Build Linux (RISC-V 64)
     runs-on: ubuntu-latest
