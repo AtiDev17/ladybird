@@ -203,77 +203,56 @@ jobs:
       - name: Build
         run: python Meta/ladybird.py build
 
-      - name: Package
+      - name: Package (AppImage)
         run: |
-          mkdir -p ladybird-package/Ladybird
-          cmake --install Build/release --prefix ladybird-package/Ladybird
+          export APPDIR="ladybird-AppDir"
+          mkdir -p $APPDIR/usr
           
-          # Find any shared libraries and copy them
-          # Using -d preserves symlinks so we don't duplicate files!
-          mkdir -p ladybird-package/Ladybird/lib
-          find Build/release -name "*.so*" -exec cp -d {} ladybird-package/Ladybird/lib/ \; 2>/dev/null || true
+          # Install Ladybird into the AppDir
+          cmake --install Build/release --prefix $APPDIR/usr
           
-          # STRIP DEBUG SYMBOLS (only on actual files, ignoring symlinks)
-          find ladybird-package/Ladybird/lib -name "*.so*" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
-          strip --strip-unneeded ladybird-package/Ladybird/bin/Ladybird 2>/dev/null || true
+          # Copy shared libraries and preserve symlinks
+          mkdir -p $APPDIR/usr/lib
+          find Build/release/vcpkg_installed/x64-linux/lib -name "*.so*" -exec cp -d {} $APPDIR/usr/lib/ \; 2>/dev/null || true
+          find Build/release/lib -name "*.so*" -exec cp -d {} $APPDIR/usr/lib/ \; 2>/dev/null || true
           
-          if [ -f "LICENSE" ]; then cp LICENSE ladybird-package/Ladybird/LICENSE.txt; fi
-          echo "Commit: ${{ github.sha }}" > ladybird-package/Ladybird/version.txt
+          # Copy Qt Plugins safely
+          if[ -d "Build/release/vcpkg_installed/x64-linux/plugins" ]; then
+              cp -r Build/release/vcpkg_installed/x64-linux/plugins $APPDIR/usr/
+          fi
           
-          # Generate Linux Launch Script to set LD_LIBRARY_PATH
-          cat << 'EOF' > "ladybird-package/Ladybird/Launch Ladybird.sh"
+          # Strip debug symbols to reduce file size (only true files)
+          find $APPDIR/usr/lib -name "*.so*" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
+          find $APPDIR/usr/plugins -name "*.so*" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
+          strip --strip-unneeded $APPDIR/usr/bin/Ladybird 2>/dev/null || true
+          
+          # Copy standard Linux Desktop assets
+          cp Meta/CMake/freedesktop/org.ladybird.Ladybird.desktop $APPDIR/
+          cp Meta/CMake/freedesktop/org.ladybird.Ladybird.svg $APPDIR/
+          
+          # Create the AppRun entrypoint
+          cat << 'EOF' > $APPDIR/AppRun
           #!/usr/bin/env bash
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$SCRIPT_DIR/lib64:$LD_LIBRARY_PATH"
-          exec "$SCRIPT_DIR/bin/Ladybird" "$@"
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib64:${LD_LIBRARY_PATH}"
+          export QT_PLUGIN_PATH="$HERE/usr/plugins"
+          exec "$HERE/usr/bin/Ladybird" "$@"
           EOF
-          chmod +x "ladybird-package/Ladybird/Launch Ladybird.sh"
+          chmod +x $APPDIR/AppRun
           
-          # Generate Linux Update script
-          cat << 'EOF' > "ladybird-package/Ladybird/Update Ladybird.sh"
-          #!/usr/bin/env bash
-          set -e
-          cd "$(dirname "$0")"
-          echo "============================================"
-          echo "     Ladybird Linux Update Tool"
-          echo "============================================"
-          if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
+          # Download appimagetool and extract it (bypassing libfuse requirement)
+          wget -c -nv "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract
           
-          LOCAL_COMMIT="unknown"
-          if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
-          
-          API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
-          LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
-          REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
-          
-          if[ "$LOCAL_COMMIT" != "unknown" ] &&[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
-          
-          ASSET_NAME="ladybird-linux-x64.tar.gz"
-          ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
-          HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
-          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
-          
-          TMP_DIR=$(mktemp -d)
-          curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
-          curl -L -s -o "$TMP_DIR/$ASSET_NAME.sha256" "$HASH_URL"
-          
-          cd "$TMP_DIR"
-          sha256sum -c "$ASSET_NAME.sha256" || { echo "Hash mismatch!"; exit 1; }
-          cd - > /dev/null
-          
-          tar -xzf "$TMP_DIR/$ASSET_NAME" --strip-components=1 -C .
-          rm -rf "$TMP_DIR"
-          echo "Update successful! Launch Ladybird using ./Launch Ladybird.sh"
-          EOF
-          chmod +x "ladybird-package/Ladybird/Update Ladybird.sh"
-
-          tar -czvf ladybird-linux-x64.tar.gz -C ladybird-package Ladybird
-          sha256sum ladybird-linux-x64.tar.gz | awk '{print $1}' > ladybird-linux-x64.tar.gz.sha256
+          # Build the final AppImage!
+          ARCH=x86_64 ./squashfs-root/AppRun $APPDIR ladybird-linux-x64.AppImage
+          sha256sum ladybird-linux-x64.AppImage | awk '{print $1}' > ladybird-linux-x64.AppImage.sha256
 
       - name: Validate Build Stability
         run: |
           export QT_QPA_PLATFORM=offscreen
-          ./ladybird-package/Ladybird/Launch\ Ladybird.sh --headless &
+          ./ladybird-linux-x64.AppImage --appimage-extract-and-run --headless &
           PID=$!
           sleep 5
           if ! kill -0 $PID 2>/dev/null; then
@@ -300,7 +279,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ladybird-linux-x64
-          path: ladybird-linux-x64.tar.gz*
+          path: ladybird-linux-x64.AppImage*
           retention-days: 14
 
       - name: Save Caches
@@ -360,6 +339,13 @@ jobs:
           cp -r Build/release/bin/Ladybird.app ladybird-package/
           echo "Commit: ${{ github.sha }}" > ladybird-package/version.txt
           
+          # Native code-signing for macOS multi-process architecture based on debug.plist
+          if[ -f "Meta/debug.plist" ]; then
+              codesign -s - -v -f --entitlements Meta/debug.plist ladybird-package/Ladybird.app
+          else
+              codesign -s - -v -f ladybird-package/Ladybird.app
+          fi
+
           # Generate macOS Update script
           cat << 'EOF' > "ladybird-package/Update Ladybird.command"
           #!/usr/bin/env bash
@@ -371,18 +357,18 @@ jobs:
           if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
           
           LOCAL_COMMIT="unknown"
-          if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
+          if[ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
           
           API_URL="https://api.github.com/repos/AtiDev17/ladybird/releases"
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
           REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
           
-          if[ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          if [ "$LOCAL_COMMIT" != "unknown" ] &&[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
           
           ASSET_NAME="ladybird-macos-arm64.zip"
           ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
           HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
-          if [ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          if[ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
           
           TMP_DIR=$(mktemp -d)
           curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
