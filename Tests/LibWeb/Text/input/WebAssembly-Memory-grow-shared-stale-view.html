@@ -4,40 +4,43 @@
     test(() => {
         // regression test for the stale-view case on shared WebAssembly.Memory.
         // A typed array created from the old memory.buffer before grow() should still read and write the same underlying memory after the grow.
-        const mem = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });
-        const oldView = new Uint8Array(mem.buffer);
-        oldView[0x0] = 0xde;
-        oldView[0x1] = 0xad;
-        oldView[0x2] = 0xbe;
-        oldView[0x3] = 0xef;
+        const mem = new WebAssembly.Memory({ initial: 1, maximum: 1000, shared: true });
+        const firstView = new Uint8Array(mem.buffer);
 
         mem.grow(1);
+        const secondView = new Uint8Array(mem.buffer);
 
-        const newView = new Uint8Array(mem.buffer);
-        // verify array created from the new memory.buffer after grow() reads the same underlying memory before the grow.
-        println(`newView[0x0]: 0x${newView[0x0].toString(16)}`);
-        println(`newView[0x1]: 0x${newView[0x1].toString(16)}`);
-        println(`newView[0x2]: 0x${newView[0x2].toString(16)}`);
-        println(`newView[0x3]: 0x${newView[0x3].toString(16)}`);
+        mem.grow(100);
+        const thirdView = new Uint8Array(mem.buffer);
 
-        // verify array created from the new memory.buffer before grow() reads the same underlying memory after the grow.
-        newView[0x4] = 0xab;
-        newView[0x5] = 0xad;
-        newView[0x6] = 0x1d;
-        newView[0x7] = 0xea;
-        println(`oldView[0x4]: 0x${oldView[0x4].toString(16)}`);
-        println(`oldView[0x5]: 0x${oldView[0x5].toString(16)}`);
-        println(`oldView[0x6]: 0x${oldView[0x6].toString(16)}`);
-        println(`oldView[0x7]: 0x${oldView[0x7].toString(16)}`);
+        // Writes through the newest view must be visible through the oldest view
+        thirdView[0x0] = 0x11;
+        thirdView[0x1] = 0x22;
+        thirdView[0x2] = 0x33;
+        thirdView[0x3] = 0x44;
+        println(`firstView[0x0]: 0x${firstView[0x0].toString(16)}`);
+        println(`firstView[0x1]: 0x${firstView[0x1].toString(16)}`);
+        println(`firstView[0x2]: 0x${firstView[0x2].toString(16)}`);
+        println(`firstView[0x3]: 0x${firstView[0x3].toString(16)}`);
 
-        // verify array created from the new memory.buffer before grow() writes the same underlying memory after the grow.
-        oldView[0x8] = 0xca;
-        oldView[0x9] = 0xfe;
-        oldView[0xa] = 0xba;
-        oldView[0xb] = 0xbe;
-        println(`newView[0x8]: 0x${newView[0x8].toString(16)}`);
-        println(`newView[0x9]: 0x${newView[0x9].toString(16)}`);
-        println(`newView[0xa]: 0x${newView[0xa].toString(16)}`);
-        println(`newView[0xb]: 0x${newView[0xb].toString(16)}`);
+        // Writes through the oldest view must be visible through the newest view.
+        firstView[0x4] = 0x55;
+        firstView[0x5] = 0x66;
+        firstView[0x6] = 0x77;
+        firstView[0x7] = 0x88;
+        println(`thirdView[0x4]: 0x${thirdView[0x4].toString(16)}`);
+        println(`thirdView[0x5]: 0x${thirdView[0x5].toString(16)}`);
+        println(`thirdView[0x6]: 0x${thirdView[0x6].toString(16)}`);
+        println(`thirdView[0x7]: 0x${thirdView[0x7].toString(16)}`);
+
+        // And via the intermediate view.
+        secondView[0x8] = 0x99;
+        secondView[0x9] = 0xaa;
+        secondView[0xa] = 0xbb;
+        secondView[0xb] = 0xcc;
+        println(`firstView[0x8]: 0x${firstView[0x8].toString(16)}`);
+        println(`firstView[0x9]: 0x${firstView[0x9].toString(16)}`);
+        println(`firstView[0xa]: 0x${firstView[0xa].toString(16)}`);
+        println(`firstView[0xb]: 0x${firstView[0xb].toString(16)}`);
     });
 </script>

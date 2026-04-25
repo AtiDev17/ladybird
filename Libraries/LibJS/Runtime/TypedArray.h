@@ -43,8 +43,8 @@ public:
     ArrayBuffer* viewed_array_buffer() const { return m_viewed_array_buffer; }
 
     // Cached raw pointer: viewed_array_buffer->buffer().data() + byte_offset.
-    // nullptr means "not cached, use slow path". This avoids chasing through
-    // ArrayBuffer -> DataBlock -> Variant -> ByteBuffer -> inline/outline on every access.
+    // nullptr means "not cached, use slow path". This is only safe for
+    // fixed-length ArrayBuffers that own stable backing storage.
     u8* cached_data_ptr() const { return m_data; }
     void set_cached_data_ptr(u8* ptr) { m_data = ptr; }
 
@@ -91,7 +91,7 @@ protected:
 
     void update_cached_data_ptr()
     {
-        if (!m_viewed_array_buffer || m_viewed_array_buffer->is_detached() || !m_viewed_array_buffer->is_fixed_length()) {
+        if (!m_viewed_array_buffer || !m_viewed_array_buffer->can_cache_typed_array_view_data_pointer()) {
             m_data = nullptr;
             return;
         }

@@ -99,7 +99,6 @@ public:
 
     void detach_buffer();
     void register_cached_typed_array_view(TypedArrayBase&);
-    void refresh_cached_typed_array_view_data_pointers();
 
     // 25.1.3.4 IsDetachedBuffer ( arrayBuffer ), https://tc39.es/ecma262/#sec-isdetachedbuffer
     bool is_detached() const
@@ -120,6 +119,11 @@ public:
 
         // 2. Return true.
         return true;
+    }
+
+    bool can_cache_typed_array_view_data_pointer() const
+    {
+        return !is_detached() && is_fixed_length() && m_data_block.byte_buffer.has<ByteBuffer>();
     }
 
     // 25.2.2.2 IsSharedArrayBuffer ( obj ), https://tc39.es/ecma262/#sec-issharedarraybuffer

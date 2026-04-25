@@ -261,17 +261,6 @@ void ArrayBuffer::detach_buffer()
     m_data_block.byte_buffer = Empty {};
 }
 
-void ArrayBuffer::refresh_cached_typed_array_view_data_pointers()
-{
-    if (m_data_block.byte_buffer.has<Empty>())
-        return;
-    auto* new_base = buffer().data();
-    for (auto& view : m_cached_views) {
-        if (view.viewed_array_buffer() == this)
-            view.set_cached_data_ptr(new_base + view.byte_offset());
-    }
-}
-
 void ArrayBuffer::register_cached_typed_array_view(TypedArrayBase& view)
 {
     m_cached_views.set(view);
