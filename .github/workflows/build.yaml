@@ -511,12 +511,12 @@ jobs:
         uses: cross-platform-actions/action@v1
         with:
           operating_system: freebsd
-          version: '14.1'
+          version: '14.2'
           architecture: x86-64
           run: |
-            # In cross-platform-actions we need sudo to install packages
-            sudo pkg update -f
-            sudo pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
+            # Tell pkg to ignore minor version mismatches between the VM and the repo
+            sudo env IGNORE_OSVERSION=yes pkg update -f
+            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git
             
             export MAKEJOBS=2
             python3 Meta/ladybird.py build
@@ -524,6 +524,13 @@ jobs:
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ladybird-freebsd-x64
+          path: ladybird-freebsd-x64.tar.gz
+          retention-days: 14
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
