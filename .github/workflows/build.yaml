@@ -513,11 +513,11 @@ jobs:
           HOME: /Users/runner
         run: |
           # 1. Patch Gradle file to NOT delete our environment variables!
-          sed -i '' '/environment = mapOf/,/)/d' UI/Android/app/build.gradle
+          sed -i '' '/environment = mapOf/,/)/d' UI/Android/build.gradle.kts
           
-          # 2. Patch Gradle file to explicitly build the 'install' target, 
-          # bypassing ladybird.py's bug that defaults to the 'ladybird' target.
-          sed -i '' 's/"install", "--preset"/"build", "install", "--preset"/' UI/Android/app/build.gradle
+          # 2. Patch Gradle file to force the python script to build the 'install' target,
+          # bypassing the bug where it defaults to the 'Ladybird' target.
+          sed -i '' 's/"install", "--preset"/"build", "--target", "install", "--preset"/' UI/Android/build.gradle.kts
           
           cd UI/Android
           chmod +x ./gradlew
