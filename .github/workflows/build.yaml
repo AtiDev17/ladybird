@@ -563,18 +563,25 @@ jobs:
           operating_system: freebsd
           version: '14.2'
           architecture: x86-64
-          memory: '5G' # <-- CRITICAL FIX: Increase memory to prevent OOM kills
+          memory: '5G'
           run: |
+            # Disable strict exit-on-error so we can catch and print the logs
+            set +e 
+
             sudo env IGNORE_OSVERSION=yes pkg update -f
             
-            # CRITICAL FIX: Added 'gcc' to the end of this list for libvpx generic-gnu fallback
-            sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm yasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 diffutils gettext gcc
-            
+            # 1. Install exact packages from official instructions + required CI tools (rust, llvm19, git)
+            # Note: Explicitly REMOVED yasm, keeping only nasm as per official docs.
+            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 gettext ccache
+
+            # 2. Fix potential Perl hardcoding issues in generic-gnu targets
+            sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
+
             export PATH="/usr/local/bin:$PATH"
-            export MAKEJOBS=2
-            export VCPKG_MAX_CONCURRENCY=2 # <-- CRITICAL FIX: Stop vcpkg from spawning 3+ jobs
             export CC=/usr/local/bin/clang19
             export CXX=/usr/local/bin/clang++19
+            export MAKEJOBS=2
+            export VCPKG_MAX_CONCURRENCY=2
             export VCPKG_FORCE_SYSTEM_BINARIES=1
             export CMAKE_C_COMPILER_LAUNCHER=ccache
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -582,7 +589,26 @@ jobs:
             export CCACHE_BASEDIR="${PWD}"
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
+            echo "Starting Ladybird Build..."
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
+            BUILD_STATUS=$?
+
+            # 3. If build fails, print the hidden vcpkg logs before exiting
+            if [ $BUILD_STATUS -ne 0 ]; then
+              echo "=========================================================="
+              echo "BUILD FAILED. Dumping vcpkg logs for libvpx debugging:"
+              echo "=========================================================="
+              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-err.log || echo "libvpx Err log not found."
+              echo "----------------------------------------------------------"
+              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-out.log || echo "libvpx Out log not found."
+              echo "----------------------------------------------------------"
+              cat Build/release/vcpkg-manifest-install.log || echo "vcpkg-manifest log not found."
+              exit 1
+            fi
+            
+            # Re-enable strict error checking for packaging
+            set -e
+
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
