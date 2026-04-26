@@ -510,8 +510,15 @@ jobs:
 
       - name: Build APK
         env:
-          HOME: /Users/runner 
+          HOME: /Users/runner
         run: |
+          # 1. Patch Gradle file to NOT delete our environment variables!
+          sed -i '' '/environment = mapOf/,/)/d' UI/Android/app/build.gradle
+          
+          # 2. Patch Gradle file to explicitly build the 'install' target, 
+          # bypassing ladybird.py's bug that defaults to the 'ladybird' target.
+          sed -i '' 's/"install", "--preset"/"build", "install", "--preset"/' UI/Android/app/build.gradle
+          
           cd UI/Android
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
@@ -573,11 +580,7 @@ jobs:
             # Fix potential Perl path issues in generic-gnu targets
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
-            # ====================================================================
-            # CRITICAL FIX: libvpx uses a custom bash configure script that drops
-            # linker flags. We create a compiler wrapper to FORCE the inclusion 
-            # of -pthread at the compiler binary level so it can't be ignored!
-            # ====================================================================
+            # Compiler wrapper to force -pthread for libvpx
             echo '#!/bin/sh' > /tmp/clang-wrapper
             echo 'exec /usr/local/bin/clang19 -pthread "$@"' >> /tmp/clang-wrapper
             chmod +x /tmp/clang-wrapper
@@ -587,11 +590,8 @@ jobs:
             chmod +x /tmp/clang++-wrapper
 
             export PATH="/usr/local/bin:$PATH"
-            
-            # Point CC and CXX to our new wrappers
             export CC=/tmp/clang-wrapper
             export CXX=/tmp/clang++-wrapper
-            
             export MAKEJOBS=2
             export VCPKG_MAX_CONCURRENCY=2
             export VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -603,15 +603,24 @@ jobs:
             
             echo "Starting Ladybird Build..."
             
-            # Catch errors to print Vcpkg logs if it fails again
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
               echo "=========================================================="
-              echo "BUILD FAILED. Dumping vcpkg logs for libvpx debugging:"
+              echo "BUILD FAILED. Dumping latest Vcpkg logs:"
               echo "=========================================================="
-              echo "--- ERROR LOG (build-x64-freebsd-dynamic-rel-err.log) ---"
-              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-err.log || echo "Err log not found."
-              echo "--- OUTPUT LOG (build-x64-freebsd-dynamic-rel-out.log) ---"
-              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-out.log || echo "Out log not found."
+              
+              # Automatically find the most recently modified log file and print it!
+              LATEST_LOG=$(find Build/vcpkg/buildtrees -type f -name "*.log" | xargs ls -t | head -n 1)
+              if [ -n "$LATEST_LOG" ]; then
+                echo "--- Showing contents of: $LATEST_LOG ---"
+                tail -n 200 "$LATEST_LOG"
+              else
+                echo "Could not find any logs."
+              fi
+              
+              echo "=========================================================="
+              echo "Checking libjxl specifically:"
+              cat Build/vcpkg/buildtrees/libjxl/install-x64-freebsd-dynamic-rel-out.log | tail -n 100 || true
+              
               exit 1
             }
             
