@@ -512,13 +512,18 @@ jobs:
         env:
           HOME: /Users/runner
         run: |
-          # 1. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
-          # so our GitHub Actions environment variables (like HOME and CCACHE) are inherited!
+          # 1. Hide Homebrew from PATH to prevent macOS pkg-config from poisoning the Android cross-compilation
+          export PATH=$(echo $PATH | sed -e 's/:\/opt\/homebrew\/bin//' -e 's/^\/opt\/homebrew\/bin://')
+          
+          # 2. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
+          # so our GitHub Actions environment variables (like HOME and PATH) are inherited!
           perl -i -ne 'print unless /environment = mapOf/ .. /^\s*\)/' UI/Android/build.gradle.kts
           
-          # 2. Patch Gradle file to explicitly call 'build' and put the 'install' target at the END
-          # so argparse doesn't accidentally pass the preset flag to Ninja!
+          # 3. Fix Host Tools compile target order (which succeeded in your last run!)
           sed -i '' 's/"install", "--preset", "Host_Tools"/"build", "--preset", "Host_Tools", "install"/' UI/Android/build.gradle.kts
+          
+          # 4. Inject Vcpkg toolchain directly into Gradle to guarantee CMake can see the Android dependencies!
+          sed -i '' 's/"-DVCPKG_TARGET_ANDROID=ON"/"-DVCPKG_TARGET_ANDROID=ON", "-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}\/Build\/vcpkg\/scripts\/buildsystems\/vcpkg.cmake"/' UI/Android/build.gradle.kts
           
           cd UI/Android
           chmod +x ./gradlew
@@ -575,26 +580,26 @@ jobs:
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
             
-            # Install packages from official instructions
-            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 gettext ccache
+            # Added `libiconv` explicitly to the install list
+            sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 gettext ccache libiconv
 
             # Fix potential Perl path issues in generic-gnu targets
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
-            # Compiler wrapper to force -pthread for libvpx
+            # ====================================================================
+            # COMPILER WRAPPERS: 
+            # 1. Force -pthread for libvpx 
+            # 2. Force -liconv for sdl3 (and point it to /usr/local for GNU iconv)
+            # ====================================================================
             echo '#!/bin/sh' > /tmp/clang-wrapper
-            echo 'exec /usr/local/bin/clang19 -pthread "$@"' >> /tmp/clang-wrapper
+            echo 'exec /usr/local/bin/clang19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang-wrapper
             chmod +x /tmp/clang-wrapper
 
             echo '#!/bin/sh' > /tmp/clang++-wrapper
-            echo 'exec /usr/local/bin/clang++19 -pthread "$@"' >> /tmp/clang++-wrapper
+            echo 'exec /usr/local/bin/clang++19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang++-wrapper
             chmod +x /tmp/clang++-wrapper
 
-            # ====================================================================
-            # CRITICAL FIX for "No space left on device":
-            # Tell vcpkg to aggressively delete temporary build files and downloads
-            # as soon as each package finishes, saving ~15GB+ of disk space!
-            # ====================================================================
+            # Aggressively clean vcpkg temp files to prevent "No space left on device"
             sed -i '' 's/"-B",/"-DVCPKG_INSTALL_OPTIONS=--clean-after-build;--clean-downloads-after-build", "-B",/' Meta/ladybird.py
 
             export PATH="/usr/local/bin:$PATH"
@@ -607,8 +612,6 @@ jobs:
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
             export CCACHE_DIR="${PWD}/.ccache"
             export CCACHE_BASEDIR="${PWD}"
-            
-            # Restrict ccache size to save even more VM disk space
             export CCACHE_MAXSIZE="2G" 
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
@@ -618,6 +621,7 @@ jobs:
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
+            
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
