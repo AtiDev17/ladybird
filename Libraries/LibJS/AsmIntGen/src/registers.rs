@@ -11,7 +11,28 @@ pub enum Arch {
 }
 
 /// DSL register names and their platform mappings.
-/// All of pc, pb, values, exec_ctx, dispatch are callee-saved so they survive C++ calls.
+///
+/// All of pc, pb, values, exec_ctx, dispatch are callee-saved so they
+/// survive C++ calls.
+///
+/// `temporaries` and `fp_temporaries` are the public DSL temp pool: every
+/// listed register is exposed as `tN`/`ftN` and is available to the
+/// register allocator for named temporaries. Registers that the codegen
+/// itself uses as hidden scratch are deliberately *excluded* from these
+/// lists so they cannot collide with user-visible names.
+///
+/// Reserved codegen scratch (not in the temp pool):
+/// - x86_64: none -- the codegen's hidden scratch (rax, rcx, rdx, r11,
+///   xmm3) overlaps with t0/t1/t2/t8/ft3, and the per-instruction
+///   metadata in `instructions.rs` records exactly when each is killed.
+///   The named-temp allocator avoids those registers across the affected
+///   instructions; positional `tN` users are responsible for knowing the
+///   convention.
+/// - aarch64: x9, x10 are universal scratch in the codegen (large-imm
+///   materialization, dispatch tail, pair-memory base computation), and
+///   d16 is FPR scratch for double-to-int32 round-trip checks. x21
+///   caches `pb + pc` for fast dispatch; x22/x23/x24 hold pinned tag
+///   constants. None of these are addressable by DSL name.
 pub struct RegisterMapping {
     pub pc: &'static str,
     pub pb: &'static str,
@@ -42,10 +63,10 @@ pub const AARCH64_REGS: RegisterMapping = RegisterMapping {
     values: "x27",
     exec_ctx: "x28",
     dispatch: "x19",
-    temporaries: &[
-        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-        "x14", "x15", "x16", "x17",
-    ],
+    // x9 and x10 are reserved as codegen scratch (see the comment on
+    // RegisterMapping). The public pool is t0..t8 = x0..x8, matching the
+    // x86_64 temp count.
+    temporaries: &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"],
     fp_temporaries: &["d0", "d1", "d2", "d3"],
     sp: "sp",
     fp: "x29",
@@ -58,7 +79,10 @@ pub fn mapping_for(arch: Arch) -> &'static RegisterMapping {
     }
 }
 
-/// Resolve a DSL register name to a platform register name.
+/// Resolve a DSL register name to a platform register name. Only the
+/// pinned names are publicly addressable; named temporaries declared via
+/// `temp` / `ftemp` are mapped to physical registers by the allocator
+/// and substituted into the IR before this function is reached.
 pub fn resolve_register(name: &str, arch: Arch) -> Option<String> {
     let m = mapping_for(arch);
     match name {
@@ -69,24 +93,35 @@ pub fn resolve_register(name: &str, arch: Arch) -> Option<String> {
         "dispatch" => Some(m.dispatch.to_string()),
         "sp" => Some(m.sp.to_string()),
         "fp" => Some(m.fp.to_string()),
-        _ => {
-            // t0-t9 -> temporaries
-            if let Some(idx_str) = name.strip_prefix('t') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if idx < m.temporaries.len() {
-                        return Some(m.temporaries[idx].to_string());
-                    }
-                }
-            }
-            // ft0-ft3 -> fp temporaries
-            if let Some(idx_str) = name.strip_prefix("ft") {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if idx < m.fp_temporaries.len() {
-                        return Some(m.fp_temporaries[idx].to_string());
-                    }
-                }
-            }
-            None
-        }
+        _ => None,
+    }
+}
+
+/// Encoding-cost score for a physical register. Lower is cheaper, so the
+/// allocator should prefer assigning hot named temporaries to low-cost
+/// registers.
+///
+/// On x86_64:
+///   * `rax` is the cheapest. Many arithmetic and logical instructions have
+///     a 1-byte-shorter accumulator-form encoding when the destination is
+///     `rax`/`eax` (e.g. `add eax, imm32` is one byte shorter than
+///     `add r/m32, imm32`).
+///   * The remaining "classic" GPRs (`rcx`, `rdx`, `rbx`, `rsi`, `rdi`)
+///     fit in three encoding bits, so 32-bit forms do not need a REX
+///     prefix at all -- saving one byte per instruction compared to the
+///     "modern" GPRs.
+///   * `r8`..`r15` always need REX.B (or REX.R) to extend the register
+///     field, so they are the most expensive to encode.
+///
+/// On aarch64 every general-purpose register encodes the same way, so the
+/// cost is uniformly zero.
+pub fn register_cost(name: &str, arch: Arch) -> u32 {
+    match arch {
+        Arch::X86_64 => match name {
+            "rax" | "eax" => 0,
+            "rcx" | "rdx" | "rbx" | "rsi" | "rdi" | "ecx" | "edx" | "ebx" | "esi" | "edi" => 1,
+            _ => 2,
+        },
+        Arch::Aarch64 => 0,
     }
 }
