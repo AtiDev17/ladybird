@@ -573,6 +573,14 @@ jobs:
             # Fix potential Perl path issues in generic-gnu targets
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
+            # ====================================================================
+            # CRITICAL FIX: Force -pthread globally for Vcpkg on FreeBSD 
+            # to fix the libvpx "undefined symbol: pthread_create" linker error
+            # ====================================================================
+            echo 'string(APPEND VCPKG_C_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
+            echo 'string(APPEND VCPKG_CXX_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
+            echo 'string(APPEND VCPKG_LINKER_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
+
             export PATH="/usr/local/bin:$PATH"
             export CC=/usr/local/bin/clang19
             export CXX=/usr/local/bin/clang++19
@@ -587,7 +595,7 @@ jobs:
             
             echo "Starting Ladybird Build..."
             
-            # Use '||' to catch the error inline so the VM doesn't immediately kill the SSH session!
+            # Use '||' to catch the error inline so the VM doesn't immediately kill the SSH session
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
               echo "=========================================================="
               echo "BUILD FAILED. Dumping vcpkg logs for libvpx debugging:"
