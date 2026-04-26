@@ -516,9 +516,9 @@ jobs:
           # so our GitHub Actions environment variables (like HOME and CCACHE) are inherited!
           perl -i -ne 'print unless /environment = mapOf/ .. /^\s*\)/' UI/Android/build.gradle.kts
           
-          # 2. Patch Gradle file to explicitly call the 'build' subcommand with the 'install' target
-          # Resulting command: ladybird.py build install --preset Host_Tools
-          sed -i '' 's/"install", "--preset"/"build", "install", "--preset"/' UI/Android/build.gradle.kts
+          # 2. Patch Gradle file to explicitly call 'build' and put the 'install' target at the END
+          # so argparse doesn't accidentally pass the preset flag to Ninja!
+          sed -i '' 's/"install", "--preset", "Host_Tools"/"build", "--preset", "Host_Tools", "install"/' UI/Android/build.gradle.kts
           
           cd UI/Android
           chmod +x ./gradlew
