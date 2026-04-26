@@ -512,8 +512,9 @@ jobs:
         env:
           HOME: /Users/runner
         run: |
-          # 1. Patch Gradle file to NOT delete our environment variables!
-          sed -i '' '/environment = mapOf/,/)/d' UI/Android/build.gradle.kts
+          # 1. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
+          # so our GitHub Actions environment variables (like HOME and CCACHE) are inherited!
+          perl -i -ne 'print unless /environment = mapOf/ .. /^\s*\)/' UI/Android/build.gradle.kts
           
           # 2. Patch Gradle file to force the python script to build the 'install' target,
           # bypassing the bug where it defaults to the 'Ladybird' target.
