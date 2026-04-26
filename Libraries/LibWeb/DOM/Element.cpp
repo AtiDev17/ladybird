@@ -35,6 +35,7 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StyleSheetInvalidation.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -897,6 +898,9 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
 {
     VERIFY(parent());
 
+    auto& counters = document().style_invalidation_counters();
+    counters.element_style_recomputations++;
+
     m_style_uses_attr_css_function = false;
     m_style_uses_var_css_function = false;
     m_style_uses_tree_counting_function = false;
@@ -994,8 +998,10 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
     if (had_list_marker || m_computed_properties->display().is_list_item())
         recompute_pseudo_element_style(CSS::PseudoElement::Marker);
 
-    if (invalidation.is_none())
+    if (invalidation.is_none()) {
+        counters.element_style_noop_recomputations++;
         return invalidation;
+    }
 
     if (!invalidation.rebuild_layout_tree && unsafe_layout_node()) {
         // If we're keeping the layout tree, we can just apply the new style to the existing layout tree.
@@ -1027,6 +1033,9 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
 
 CSS::RequiredInvalidationAfterStyleChange Element::recompute_inherited_style()
 {
+    auto& counters = document().style_invalidation_counters();
+    counters.element_inherited_style_recomputations++;
+
     auto computed_properties = this->computed_properties();
     VERIFY(m_cascaded_properties);
     VERIFY(computed_properties);
@@ -1074,8 +1083,10 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_inherited_style()
         invalidation |= CSS::compute_property_invalidation(property_id, old_value.ptr(), &computed_properties->property(property_id));
     }
 
-    if (invalidation.is_none() && property_values_affected_by_inherited_style.is_empty())
+    if (invalidation.is_none() && property_values_affected_by_inherited_style.is_empty()) {
+        counters.element_inherited_style_noop_recomputations++;
         return invalidation;
+    }
 
     AbstractElement abstract_element { *this };
 
@@ -1086,8 +1097,10 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_inherited_style()
         invalidation |= CSS::compute_property_invalidation(static_cast<CSS::PropertyID>(property_id), old_value.ptr(), &new_value);
     }
 
-    if (invalidation.is_none())
+    if (invalidation.is_none()) {
+        counters.element_inherited_style_noop_recomputations++;
         return invalidation;
+    }
 
     // NB: unsafe_layout_node() because we're applying recomputed inherited styles during
     //     style recalculation, before layout has been updated.
@@ -3069,6 +3082,15 @@ void Element::invalidate_style_after_attribute_change(FlyString const& attribute
 
     changed_properties.append({ .type = CSS::InvalidationSet::Property::Type::Attribute, .value = attribute_name });
     invalidate_style(StyleInvalidationReason::ElementAttributeChange, changed_properties, style_invalidation_options);
+
+    // If this element hosts a shadow root whose stylesheets have :host()-matching rules, the shadow tree's computed
+    // styles can depend on this host's attributes. Mark the shadow subtree dirty so those rules re-evaluate.
+    if (auto shadow_root = this->shadow_root()) {
+        if (CSS::determine_shadow_root_stylesheet_effects(*shadow_root).may_match_shadow_host) {
+            shadow_root->set_entire_subtree_needs_style_update(true);
+            shadow_root->set_needs_style_update(true);
+        }
+    }
 }
 
 bool Element::is_hidden() const
@@ -4421,20 +4443,33 @@ void Element::attribute_changed(FlyString const& local_name, Optional<String> co
         m_inline_style->set_declarations_from_text(value.value_or(""_string));
         prefetch_inline_style_image_resources(*m_inline_style, document());
         set_needs_style_update(true);
-    } else if (local_name == HTML::AttributeNames::dir) {
-        // https://html.spec.whatwg.org/multipage/dom.html#attr-dir
-        if (value_or_empty.equals_ignoring_ascii_case("ltr"sv))
-            m_dir = Dir::Ltr;
-        else if (value_or_empty.equals_ignoring_ascii_case("rtl"sv))
-            m_dir = Dir::Rtl;
-        else if (value_or_empty.equals_ignoring_ascii_case("auto"sv))
-            m_dir = Dir::Auto;
-        else
-            m_dir = {};
-    } else if (local_name == HTML::AttributeNames::lang) {
-        for_each_in_inclusive_subtree_of_type<Element>([](auto& element) {
-            element.invalidate_lang_value();
+    } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
+        bool const is_dir = local_name == HTML::AttributeNames::dir;
+        if (is_dir) {
+            // https://html.spec.whatwg.org/multipage/dom.html#attr-dir
+            if (value_or_empty.equals_ignoring_ascii_case("ltr"sv))
+                m_dir = Dir::Ltr;
+            else if (value_or_empty.equals_ignoring_ascii_case("rtl"sv))
+                m_dir = Dir::Rtl;
+            else if (value_or_empty.equals_ignoring_ascii_case("auto"sv))
+                m_dir = Dir::Auto;
+            else
+                m_dir = {};
+        }
+        // dir and lang both inherit, so all descendants' :dir() / :lang() matches and direction-dependent layout/text
+        // need to be recomputed.
+        for_each_shadow_including_inclusive_descendant([is_dir](auto& node) {
+            if (auto* element = as_if<Element>(node)) {
+                if (!is_dir)
+                    element->invalidate_lang_value();
+                element->set_needs_style_update(true);
+            }
             return TraversalDecision::Continue;
+        });
+        // :has(:dir(...)) and :has(:lang(...)) on ancestors aren't keyed on any property the regular invalidation
+        // plan tracks, so explicitly schedule the :has() ancestor walk here.
+        for_each_style_scope_which_may_observe_the_node([this](CSS::StyleScope& scope) {
+            scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
         });
     } else if (local_name == HTML::AttributeNames::part) {
         m_parts.clear();
@@ -4447,6 +4482,19 @@ void Element::attribute_changed(FlyString const& local_name, Optional<String> co
         }
         if (m_part_list)
             m_part_list->associated_attribute_changed(value_or_empty);
+        // ::part(...) rules in the outer scope target this element by part name, so the element's computed style must
+        // be recomputed when its part tokens change.
+        set_needs_style_update(true);
+    } else if (local_name == HTML::AttributeNames::exportparts) {
+        // When exportparts changes on a shadow host, elements with part tokens inside its shadow tree may newly become
+        // or stop being targets of ::part() rules in the outer scope.
+        if (auto shadow_root = this->shadow_root()) {
+            shadow_root->for_each_in_subtree_of_type<Element>([](Element& element) {
+                if (!element.part_names().is_empty())
+                    element.set_needs_style_update(true);
+                return TraversalDecision::Continue;
+            });
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes:concept-element-attributes-change-ext
@@ -4577,10 +4625,8 @@ Optional<String> Element::lang() const
 
         // 3. If the node's parent is a shadow root
         //      Use the language of that shadow root's host.
-        if (auto parent = parent_element()) {
-            if (parent->is_shadow_root())
-                return parent->shadow_root()->host()->lang().value_or({});
-        }
+        if (auto* parent = this->parent(); parent && parent->is_shadow_root())
+            return static_cast<ShadowRoot const&>(*parent).host()->lang().value_or({});
 
         // 4. If the node's parent element is not null
         //      Use the language of that parent element.

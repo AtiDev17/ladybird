@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="structural-matrix.js"></script>
+<script>
+    test(() => {
+        const stressScopes = [
+            "document",
+            "document-styled-use-shadow",
+            "shadow-internal",
+            "shadow-host",
+        ];
+        const modes = [
+            "warm",
+            "cold",
+            "pseudo-warm",
+            "pseudo-cold",
+        ];
+
+        for (const scope of stressScopes) {
+            for (const selectorCase of attributeMutationCases) {
+                for (const mode of modes)
+                    runDescendantStressCase(scope, selectorCase, mode, { suite: "descendant attribute" });
+            }
+        }
+    });
+</script>

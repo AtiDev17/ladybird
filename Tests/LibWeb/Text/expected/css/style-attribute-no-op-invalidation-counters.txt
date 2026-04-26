@@ -1,0 +1,2 @@
+setting identical style text: 1 invalidations
+setting changed style text: 1 invalidations

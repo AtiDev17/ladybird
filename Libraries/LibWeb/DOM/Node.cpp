@@ -431,31 +431,79 @@ static bool reason_may_affect_has_selectors(StyleInvalidationReason reason)
         StyleInvalidationReason::SettingsChange);
 }
 
-void Node::invalidate_style(StyleInvalidationReason reason)
+CSS::StyleScope& Node::style_scope()
 {
-    if (is_character_data())
-        return;
+    auto& root = this->root();
+    if (auto* shadow_root = as_if<ShadowRoot>(root)) {
+        if (shadow_root->uses_document_style_sheets())
+            return document().style_scope();
+        return shadow_root->style_scope();
+    }
+    return document().style_scope();
+}
 
-    auto& style_scope = root().is_shadow_root() ? static_cast<ShadowRoot&>(root()).style_scope() : document().style_scope();
+void Node::for_each_style_scope_which_may_observe_the_node(Function<void(CSS::StyleScope&)> const& callback)
+{
+    HashTable<CSS::StyleScope*> visited_scopes;
+    auto visit = [&](CSS::StyleScope& scope) {
+        if (visited_scopes.set(&scope) != AK::HashSetResult::InsertedNewEntry)
+            return;
+        callback(scope);
+    };
 
-    if (style_scope.may_have_has_selectors()) {
-        // On insertion and removal the mutated node itself is uninteresting to the
-        // :has() walker (a freshly inserted node has no :has() scope flags yet, and
-        // a removed node is about to leave the tree). Start the walk at the parent,
-        // which was in scope before and reliably carries the correct flags.
-        if (reason == StyleInvalidationReason::NodeRemove || reason == StyleInvalidationReason::NodeInsertBefore) {
-            if (auto* parent = parent_or_shadow_host(); parent) {
-                style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*parent);
-                parent->for_each_child_of_type<Element>([&](auto& element) {
-                    if (element.affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator())
-                        element.invalidate_style_if_affected_by_has();
-                    return IterationDecision::Continue;
-                });
-            }
-        } else if (reason_may_affect_has_selectors(reason)) {
-            style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
+    visit(style_scope());
+
+    if (auto* element = as_if<Element>(*this)) {
+        if (auto shadow_root = element->shadow_root())
+            visit(shadow_root->style_scope());
+    }
+
+    for (auto* ancestor = parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        visit(ancestor->style_scope());
+        if (auto* element = as_if<Element>(*ancestor)) {
+            if (auto shadow_root = element->shadow_root())
+                visit(shadow_root->style_scope());
         }
     }
+}
+
+void Node::invalidate_style(StyleInvalidationReason reason)
+{
+    auto& style_scope = this->style_scope();
+
+    auto schedule_has_walk_for_parent = [reason](CSS::StyleScope& scope, Node& parent) {
+        if (!scope.may_have_has_selectors())
+            return;
+        scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(parent);
+        if (reason == StyleInvalidationReason::NodeRemove || reason == StyleInvalidationReason::NodeInsertBefore) {
+            parent.for_each_child_of_type<Element>([&](auto& element) {
+                if (element.affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator())
+                    element.invalidate_style_if_affected_by_has();
+                return IterationDecision::Continue;
+            });
+        }
+    };
+
+    // On insertion and removal the mutated node itself is uninteresting to the
+    // :has() walker (a freshly inserted node has no :has() scope flags yet, and
+    // a removed node is about to leave the tree). Start the walk at the parent,
+    // which was in scope before and reliably carries the correct flags.
+    if (reason == StyleInvalidationReason::NodeRemove || reason == StyleInvalidationReason::NodeInsertBefore) {
+        if (auto* parent = parent_or_shadow_host(); parent) {
+            // Walk every scope that can observe the parent, including enclosing and hosted shadow roots, so :has() in
+            // :host(), ::slotted(), and ::part() selectors can react to the mutation.
+            parent->for_each_style_scope_which_may_observe_the_node([&](CSS::StyleScope& scope) {
+                schedule_has_walk_for_parent(scope, *parent);
+            });
+        }
+    } else if (style_scope.may_have_has_selectors() && reason_may_affect_has_selectors(reason)) {
+        style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
+    }
+
+    // Character data nodes have no style of their own, so once :has() ancestor invalidation has been scheduled there
+    // is nothing else to do.
+    if (is_character_data())
+        return;
 
     if (!needs_style_update() && !document().needs_full_style_update()) {
         dbgln_if(STYLE_INVALIDATION_DEBUG, "Invalidate style ({}): {}", to_string(reason), debug_description());
@@ -535,13 +583,20 @@ void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::Invalida
     if (is_character_data())
         return;
 
-    auto& root = this->root();
-    auto& style_scope = root.is_shadow_root() ? static_cast<ShadowRoot&>(root).style_scope() : document().style_scope();
-    CSS::StyleScope* shadow_style_scope = nullptr;
-    if (auto* element = as_if<Element>(this); element && element->is_shadow_host()) {
-        if (auto element_shadow_root = element->shadow_root())
-            shadow_style_scope = &element_shadow_root->style_scope();
-    }
+    auto& style_scope = this->style_scope();
+
+    // Collect every shadow scope this mutation can flip, in addition to the root scope. This includes:
+    //   - The element's own shadow root (if it's a shadow host).
+    //   - Every enclosing shadow host's shadow root, for :host(...:has(...)) and ::slotted(...) rules in those scopes
+    //     that observe property changes on this element or its light-DOM children.
+    //   - The document scope and any outer shadow root scopes when this element lives inside a shadow tree, for
+    //     ::part(...:has(...)) rules in the outer document or containing shadow root.
+    Vector<GC::Ref<CSS::StyleScope>, 4> additional_scopes;
+    for_each_style_scope_which_may_observe_the_node([&](CSS::StyleScope& scope) {
+        if (&scope == &style_scope)
+            return;
+        additional_scopes.append(scope);
+    });
 
     bool properties_used_in_has_selectors = false;
     auto& counters = document().style_invalidation_counters();
@@ -550,8 +605,8 @@ void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::Invalida
             properties_used_in_has_selectors = true;
             counters.has_invalidation_metadata_candidates += metadata->size();
         }
-        if (shadow_style_scope) {
-            if (auto const* metadata = document().style_computer().has_invalidation_metadata_for_property(property, *shadow_style_scope)) {
+        for (auto& scope : additional_scopes) {
+            if (auto const* metadata = document().style_computer().has_invalidation_metadata_for_property(property, scope)) {
                 properties_used_in_has_selectors = true;
                 counters.has_invalidation_metadata_candidates += metadata->size();
             }
@@ -559,8 +614,8 @@ void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::Invalida
     }
     if (properties_used_in_has_selectors) {
         style_scope.schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
-        if (shadow_style_scope)
-            shadow_style_scope->schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
+        for (auto& scope : additional_scopes)
+            scope->schedule_ancestors_style_invalidation_due_to_presence_of_has(*this);
     }
 
     if (options.invalidate_self)
@@ -573,8 +628,10 @@ void Node::invalidate_style(StyleInvalidationReason reason, Vector<CSS::Invalida
 
     if (invalidate_for_style_scope(style_scope))
         return;
-    if (shadow_style_scope)
-        (void)invalidate_for_style_scope(*shadow_style_scope);
+    for (auto& scope : additional_scopes) {
+        if (invalidate_for_style_scope(scope))
+            return;
+    }
 }
 
 Utf16String Node::child_text_content() const
