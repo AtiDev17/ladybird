@@ -58,7 +58,7 @@ jobs:
         run: |
           $maxRetries = 3
           for ($i=1; $i -le $maxRetries; $i++) {
-            try { choco install pkgconfiglite ccache -y; break }
+            try { choco install pkgconfiglite ccache -y --allow-empty-checksums; break }
             catch { if ($i -eq $maxRetries) { throw }; Start-Sleep -Seconds 10 }
           }
           if (!(Test-Path "${{ github.workspace }}/vcpkg_cache")) { New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg_cache" }
