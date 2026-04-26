@@ -509,11 +509,12 @@ jobs:
           vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
 
       - name: Build APK
+        env:
+          HOME: /Users/runner 
         run: |
-          export LADYBIRD_HOST_TOOLS_ONLY=ON
           cd UI/Android
           chmod +x ./gradlew
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease --no-daemon
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
