@@ -590,6 +590,13 @@ jobs:
             echo 'exec /usr/local/bin/clang++19 -pthread "$@"' >> /tmp/clang++-wrapper
             chmod +x /tmp/clang++-wrapper
 
+            # ====================================================================
+            # CRITICAL FIX for "No space left on device":
+            # Tell vcpkg to aggressively delete temporary build files and downloads
+            # as soon as each package finishes, saving ~15GB+ of disk space!
+            # ====================================================================
+            sed -i '' 's/"-B",/"-DVCPKG_INSTALL_OPTIONS=--clean-after-build;--clean-downloads-after-build", "-B",/' Meta/ladybird.py
+
             export PATH="/usr/local/bin:$PATH"
             export CC=/tmp/clang-wrapper
             export CXX=/tmp/clang++-wrapper
@@ -600,35 +607,17 @@ jobs:
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
             export CCACHE_DIR="${PWD}/.ccache"
             export CCACHE_BASEDIR="${PWD}"
+            
+            # Restrict ccache size to save even more VM disk space
+            export CCACHE_MAXSIZE="2G" 
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
             echo "Starting Ladybird Build..."
-            
-            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
-              echo "=========================================================="
-              echo "BUILD FAILED. Dumping latest Vcpkg logs:"
-              echo "=========================================================="
-              
-              # Automatically find the most recently modified log file and print it!
-              LATEST_LOG=$(find Build/vcpkg/buildtrees -type f -name "*.log" | xargs ls -t | head -n 1)
-              if [ -n "$LATEST_LOG" ]; then
-                echo "--- Showing contents of: $LATEST_LOG ---"
-                tail -n 200 "$LATEST_LOG"
-              else
-                echo "Could not find any logs."
-              fi
-              
-              echo "=========================================================="
-              echo "Checking libjxl specifically:"
-              cat Build/vcpkg/buildtrees/libjxl/install-x64-freebsd-dynamic-rel-out.log | tail -n 100 || true
-              
-              exit 1
-            }
+            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
             
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
-
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
