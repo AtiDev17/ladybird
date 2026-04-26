@@ -512,17 +512,14 @@ jobs:
         env:
           HOME: /Users/runner
         run: |
-          # 1. Hide Homebrew from PATH to prevent macOS pkg-config from poisoning the Android cross-compilation
-          export PATH=$(echo $PATH | sed -e 's/:\/opt\/homebrew\/bin//' -e 's/^\/opt\/homebrew\/bin://')
-          
-          # 2. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
-          # so our GitHub Actions environment variables (like HOME and PATH) are inherited!
+          # 1. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
+          # so our GitHub Actions environment variables (like HOME and CCACHE) are inherited!
           perl -i -ne 'print unless /environment = mapOf/ .. /^\s*\)/' UI/Android/build.gradle.kts
           
-          # 3. Fix Host Tools compile target order (which succeeded in your last run!)
+          # 2. Patch Gradle file to explicitly call 'build' and put the 'install' target at the END
           sed -i '' 's/"install", "--preset", "Host_Tools"/"build", "--preset", "Host_Tools", "install"/' UI/Android/build.gradle.kts
           
-          # 4. Inject Vcpkg toolchain directly into Gradle to guarantee CMake can see the Android dependencies!
+          # 3. Inject Vcpkg toolchain directly into Gradle to guarantee CMake can see the Android dependencies!
           sed -i '' 's/"-DVCPKG_TARGET_ANDROID=ON"/"-DVCPKG_TARGET_ANDROID=ON", "-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}\/Build\/vcpkg\/scripts\/buildsystems\/vcpkg.cmake"/' UI/Android/build.gradle.kts
           
           cd UI/Android
@@ -580,17 +577,10 @@ jobs:
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
             
-            # Added `libiconv` explicitly to the install list
             sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 gettext ccache libiconv
 
-            # Fix potential Perl path issues in generic-gnu targets
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
-            # ====================================================================
-            # COMPILER WRAPPERS: 
-            # 1. Force -pthread for libvpx 
-            # 2. Force -liconv for sdl3 (and point it to /usr/local for GNU iconv)
-            # ====================================================================
             echo '#!/bin/sh' > /tmp/clang-wrapper
             echo 'exec /usr/local/bin/clang19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang-wrapper
             chmod +x /tmp/clang-wrapper
@@ -599,7 +589,6 @@ jobs:
             echo 'exec /usr/local/bin/clang++19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang++-wrapper
             chmod +x /tmp/clang++-wrapper
 
-            # Aggressively clean vcpkg temp files to prevent "No space left on device"
             sed -i '' 's/"-B",/"-DVCPKG_INSTALL_OPTIONS=--clean-after-build;--clean-downloads-after-build", "-B",/' Meta/ladybird.py
 
             export PATH="/usr/local/bin:$PATH"
@@ -616,7 +605,16 @@ jobs:
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
             echo "Starting Ladybird Build..."
-            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
+            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
+              echo "=========================================================="
+              echo "BUILD FAILED. Dumping ANGLE logs for debugging:"
+              echo "=========================================================="
+              echo "--- INSTALL LOG ---"
+              cat Build/vcpkg/buildtrees/angle/install-x64-freebsd-dynamic-rel-out.log | tail -n 150 || echo "Install log not found."
+              echo "--- BUILD LOG ---"
+              cat Build/vcpkg/buildtrees/angle/build-x64-freebsd-dynamic-rel-out.log | tail -n 150 || echo "Build log not found."
+              exit 1
+            }
             
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
