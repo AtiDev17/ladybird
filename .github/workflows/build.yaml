@@ -565,16 +565,12 @@ jobs:
           architecture: x86-64
           memory: '5G'
           run: |
-            # Disable strict exit-on-error so we can catch and print the logs
-            set +e 
-
             sudo env IGNORE_OSVERSION=yes pkg update -f
             
-            # 1. Install exact packages from official instructions + required CI tools (rust, llvm19, git)
-            # Note: Explicitly REMOVED yasm, keeping only nasm as per official docs.
+            # Install packages from official instructions
             sudo env IGNORE_OSVERSION=yes pkg install -y autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 gettext ccache
 
-            # 2. Fix potential Perl hardcoding issues in generic-gnu targets
+            # Fix potential Perl path issues in generic-gnu targets
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
             export PATH="/usr/local/bin:$PATH"
@@ -590,25 +586,19 @@ jobs:
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
             echo "Starting Ladybird Build..."
-            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
-            BUILD_STATUS=$?
-
-            # 3. If build fails, print the hidden vcpkg logs before exiting
-            if [ $BUILD_STATUS -ne 0 ]; then
+            
+            # Use '||' to catch the error inline so the VM doesn't immediately kill the SSH session!
+            python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
               echo "=========================================================="
               echo "BUILD FAILED. Dumping vcpkg logs for libvpx debugging:"
               echo "=========================================================="
-              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-err.log || echo "libvpx Err log not found."
-              echo "----------------------------------------------------------"
-              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-out.log || echo "libvpx Out log not found."
-              echo "----------------------------------------------------------"
-              cat Build/release/vcpkg-manifest-install.log || echo "vcpkg-manifest log not found."
+              echo "--- ERROR LOG (build-x64-freebsd-dynamic-rel-err.log) ---"
+              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-err.log || echo "Err log not found."
+              echo "--- OUTPUT LOG (build-x64-freebsd-dynamic-rel-out.log) ---"
+              cat Build/vcpkg/buildtrees/libvpx/build-x64-freebsd-dynamic-rel-out.log || echo "Out log not found."
               exit 1
-            fi
+            }
             
-            # Re-enable strict error checking for packaging
-            set -e
-
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
@@ -625,82 +615,6 @@ jobs:
         if: always()
         with:
           arch: 'x86_64'
-          ccache_path: '${{ github.workspace }}/.ccache'
-          ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
-          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
-          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
-
-  build-riscv:
-    name: Build Linux (RISC-V 64)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 720 
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-
-      - name: Install ccache on Host
-        run: sudo apt-get update && sudo apt-get install -y ccache
-
-      - name: Restore Caches (Host)
-        id: cache-restore
-        uses: ./.github/actions/cache-restore
-        with:
-          os: 'Linux'
-          arch: 'riscv64'
-          toolchain: 'Clang'
-          cache_key_extra: 'NORMAL'
-          ccache_path: '${{ github.workspace }}/.ccache'
-          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
-
-      - name: Emulate RISC-V Build
-        uses: uraimo/run-on-arch-action@v3
-        with:
-          arch: riscv64
-          distro: ubuntu24.04
-          githubToken: ${{ github.token }}
-          setup: |
-            mkdir -p "${PWD}/artifacts"
-            mkdir -p "${PWD}/.ccache" "${PWD}/vcpkg_cache"
-            chmod -R 777 "${PWD}/artifacts" "${PWD}/.ccache" "${PWD}/vcpkg_cache"
-          dockerRunArgs: |
-            --volume "${PWD}/artifacts:/artifacts"
-            --volume "${PWD}/.ccache:${PWD}/.ccache"
-            --volume "${PWD}/vcpkg_cache:${PWD}/vcpkg_cache"
-          install: |
-            apt-get update -y
-            apt-get install -y sudo nodejs npm autoconf autoconf-archive automake bison build-essential ccache cmake curl libcurl4-openssl-dev libidn2-dev libpsl-dev fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
-            useradd -m builder
-          run: |
-            chown -R builder:builder .
-            sudo -u builder bash -c '
-              set -e 
-              export CMAKE_C_COMPILER_LAUNCHER=ccache
-              export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-              export CCACHE_DIR="${PWD}/.ccache"
-              export CCACHE_BASEDIR="${PWD}"
-              export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
-              export MAKEJOBS=2
-              export VCPKG_FORCE_SYSTEM_BINARIES=1
-              python3 Meta/ladybird.py build
-              mkdir -p ladybird-package/Ladybird
-              cmake --install Build/release --prefix ladybird-package/Ladybird
-              tar -czvf /artifacts/ladybird-linux-riscv64.tar.gz -C ladybird-package Ladybird
-            '
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: ladybird-linux-riscv64
-          path: artifacts/ladybird-linux-riscv64.tar.gz
-          retention-days: 14
-
-      - name: Save Caches (Host)
-        uses: ./.github/actions/cache-save
-        if: always()
-        with:
-          arch: 'riscv64'
           ccache_path: '${{ github.workspace }}/.ccache'
           ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
           vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
