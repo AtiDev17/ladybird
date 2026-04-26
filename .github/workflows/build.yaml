@@ -242,29 +242,23 @@ jobs:
           export APPDIR="ladybird-AppDir"
           mkdir -p $APPDIR/usr
           
-          # Install Ladybird into the AppDir
           cmake --install Build/release --prefix $APPDIR/usr
           
-          # Copy shared libraries and preserve symlinks
           mkdir -p $APPDIR/usr/lib
           find Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/lib -name "*.so*" -exec cp -d {} $APPDIR/usr/lib/ \; 2>/dev/null || true
           find Build/release/lib -name "*.so*" -exec cp -d {} $APPDIR/usr/lib/ \; 2>/dev/null || true
           
-          # Copy Qt Plugins safely
           if [ -d "Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/plugins" ]; then
               cp -r Build/release/vcpkg_installed/${{ matrix.vcpkg_triplet }}/plugins $APPDIR/usr/
           fi
           
-          # Strip debug symbols to reduce file size
           find $APPDIR/usr/lib -name "*.so*" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
           find $APPDIR/usr/plugins -name "*.so*" -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
           strip --strip-unneeded $APPDIR/usr/bin/Ladybird 2>/dev/null || true
           
-          # Copy standard Linux Desktop assets
           cp Meta/CMake/freedesktop/org.ladybird.Ladybird.desktop $APPDIR/
           cp Meta/CMake/freedesktop/org.ladybird.Ladybird.svg $APPDIR/
           
-          # Create the AppRun entrypoint
           cat << 'EOF' > $APPDIR/AppRun
           #!/usr/bin/env bash
           HERE="$(dirname "$(readlink -f "${0}")")"
@@ -274,12 +268,10 @@ jobs:
           EOF
           chmod +x $APPDIR/AppRun
           
-          # Download appimagetool (Architecture Specific)
           wget -c -nv "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage"
           chmod +x appimagetool-${{ matrix.appimage_arch }}.AppImage
           ./appimagetool-${{ matrix.appimage_arch }}.AppImage --appimage-extract
           
-          # Build the final AppImage!
           ARCH=${{ matrix.appimage_arch }} ./squashfs-root/AppRun $APPDIR ${{ matrix.artifact_name }}.AppImage
           sha256sum ${{ matrix.artifact_name }}.AppImage | awk '{print $1}' > ${{ matrix.artifact_name }}.AppImage.sha256
 
@@ -292,13 +284,10 @@ jobs:
           if ! kill -0 $PID 2>/dev/null; then
             wait $PID
             if [ $? -ne 0 ]; then
-              echo "Build Failed: Ladybird crashed."
               exit 1
             fi
-            echo "Build Verified: Headless mode completed successfully."
           else
             kill $PID
-            echo "Build Verified: Process is stable."
           fi
 
       - name: Upload Artifacts
@@ -376,14 +365,12 @@ jobs:
           cp -r Build/release/bin/Ladybird.app ladybird-package/
           echo "Commit: ${{ github.sha }}" > ladybird-package/version.txt
           
-          # Native code-signing for macOS multi-process architecture based on debug.plist
           if [ -f "Meta/debug.plist" ]; then
               codesign -s - -v -f --deep --entitlements Meta/debug.plist ladybird-package/Ladybird.app
           else
               codesign -s - -v -f --deep ladybird-package/Ladybird.app
           fi
 
-          # Generate macOS Update script
           cat << 'EOF' > "ladybird-package/Update Ladybird.command"
           #!/usr/bin/env bash
           set -e
@@ -391,7 +378,7 @@ jobs:
           echo "============================================"
           echo "     Ladybird macOS Update Tool"
           echo "============================================"
-          if pgrep -x "Ladybird" > /dev/null; then echo "Error: Ladybird is running. Please close it."; exit 1; fi
+          if pgrep -x "Ladybird" > /dev/null; then exit 1; fi
           
           LOCAL_COMMIT="unknown"
           if [ -f "version.txt" ]; then LOCAL_COMMIT=$(grep "Commit:" version.txt | awk '{print $2}'); fi
@@ -400,26 +387,24 @@ jobs:
           LATEST_JSON=$(curl -s -H "User-Agent: Ladybird-Updater" "$API_URL")
           REMOTE_COMMIT=$(echo "$LATEST_JSON" | grep -o '"body": ".*Commit:[a-f0-9]*' | head -1 | awk '{print $NF}')
           
-          if [ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then echo "Already up to date!"; exit 0; fi
+          if [ "$LOCAL_COMMIT" != "unknown" ] && [ "$LOCAL_COMMIT" == "$REMOTE_COMMIT" ]; then exit 0; fi
           
           ASSET_NAME="${{ matrix.artifact_name }}.zip"
           ASSET_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME" | head -1 | awk -F'"' '{print $4}')
           HASH_URL=$(echo "$LATEST_JSON" | grep '"browser_download_url":' | grep "$ASSET_NAME.sha256" | head -1 | awk -F'"' '{print $4}')
-          if [ -z "$ASSET_URL" ]; then echo "Error: Assets not found."; exit 1; fi
+          if [ -z "$ASSET_URL" ]; then exit 1; fi
           
           TMP_DIR=$(mktemp -d)
           curl -L -s -o "$TMP_DIR/$ASSET_NAME" "$ASSET_URL"
           curl -L -s -o "$TMP_DIR/$ASSET_NAME.sha256" "$HASH_URL"
           
           cd "$TMP_DIR"
-          shasum -a 256 -c "$ASSET_NAME.sha256" || { echo "Hash mismatch!"; exit 1; }
+          shasum -a 256 -c "$ASSET_NAME.sha256" || exit 1
           cd - > /dev/null
           
           unzip -qo "$TMP_DIR/$ASSET_NAME" -d .
-          # Remove Apple Quarantine attribute so it runs without "App is damaged" errors
           xattr -rc Ladybird.app || true 
           rm -rf "$TMP_DIR"
-          echo "Update successful! You can now launch Ladybird.app"
           EOF
           chmod +x "ladybird-package/Update Ladybird.command"
 
@@ -436,13 +421,10 @@ jobs:
           if ! kill -0 $PID 2>/dev/null; then
             wait $PID
             if [ $? -ne 0 ]; then
-              echo "Build Failed: Ladybird crashed."
               exit 1
             fi
-            echo "Build Verified: Headless mode completed successfully."
           else
             kill $PID
-            echo "Build Verified: Process is stable."
           fi
 
       - name: Upload Artifacts
@@ -512,15 +494,11 @@ jobs:
         env:
           HOME: /Users/runner
         run: |
-          # 1. Use Perl to safely delete the multi-line `environment = mapOf(...)` block 
-          # so our GitHub Actions environment variables (like HOME and CCACHE) are inherited!
           perl -i -ne 'print unless /environment = mapOf/ .. /^\s*\)/' UI/Android/build.gradle.kts
           
-          # 2. Patch Gradle file to explicitly call 'build' and put the 'install' target at the END
           sed -i '' 's/"install", "--preset", "Host_Tools"/"build", "--preset", "Host_Tools", "install"/' UI/Android/build.gradle.kts
           
-          # 3. Inject Vcpkg toolchain directly into Gradle to guarantee CMake can see the Android dependencies!
-          sed -i '' 's/"-DVCPKG_TARGET_ANDROID=ON"/"-DVCPKG_TARGET_ANDROID=ON", "-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}\/Build\/vcpkg\/scripts\/buildsystems\/vcpkg.cmake"/' UI/Android/build.gradle.kts
+          sed -i '' 's|"-DVCPKG_TARGET_ANDROID=ON"|"-DVCPKG_TARGET_ANDROID=ON", "-DVCPKG_TARGET_TRIPLET=arm64-android", "-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}/Build/vcpkg/scripts/buildsystems/vcpkg.cmake", "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE='"$(ls -d $ANDROID_HOME/ndk/* | tail -n 1)/build/cmake/android.toolchain.cmake"'"|' UI/Android/build.gradle.kts
           
           cd UI/Android
           chmod +x ./gradlew
@@ -582,11 +560,11 @@ jobs:
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
             echo '#!/bin/sh' > /tmp/clang-wrapper
-            echo 'exec /usr/local/bin/clang19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang-wrapper
+            echo 'exec /usr/local/bin/clang19 -pthread -I/usr/local/include -L/usr/local/lib -liconv -DEGL_TEXTURE_RECTANGLE_ANGLE=0x34A6 -Wno-macro-redefined "$@"' >> /tmp/clang-wrapper
             chmod +x /tmp/clang-wrapper
 
             echo '#!/bin/sh' > /tmp/clang++-wrapper
-            echo 'exec /usr/local/bin/clang++19 -pthread -I/usr/local/include -L/usr/local/lib -liconv "$@"' >> /tmp/clang++-wrapper
+            echo 'exec /usr/local/bin/clang++19 -pthread -I/usr/local/include -L/usr/local/lib -liconv -DEGL_TEXTURE_RECTANGLE_ANGLE=0x34A6 -Wno-macro-redefined "$@"' >> /tmp/clang++-wrapper
             chmod +x /tmp/clang++-wrapper
 
             sed -i '' 's/"-B",/"-DVCPKG_INSTALL_OPTIONS=--clean-after-build;--clean-downloads-after-build", "-B",/' Meta/ladybird.py
@@ -604,15 +582,9 @@ jobs:
             export CCACHE_MAXSIZE="2G" 
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
             
-            echo "Starting Ladybird Build..."
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
-              echo "=========================================================="
-              echo "BUILD FAILED. Dumping ANGLE logs for debugging:"
-              echo "=========================================================="
-              echo "--- INSTALL LOG ---"
-              cat Build/vcpkg/buildtrees/angle/install-x64-freebsd-dynamic-rel-out.log | tail -n 150 || echo "Install log not found."
-              echo "--- BUILD LOG ---"
-              cat Build/vcpkg/buildtrees/angle/build-x64-freebsd-dynamic-rel-out.log | tail -n 150 || echo "Build log not found."
+              cat Build/vcpkg/buildtrees/angle/install-x64-freebsd-dynamic-rel-out.log | tail -n 150 || true
+              cat Build/vcpkg/buildtrees/angle/build-x64-freebsd-dynamic-rel-out.log | tail -n 150 || true
               exit 1
             }
             
