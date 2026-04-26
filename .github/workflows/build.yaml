@@ -563,11 +563,16 @@ jobs:
           operating_system: freebsd
           version: '14.2'
           architecture: x86-64
+          memory: '5G' # <-- CRITICAL FIX: Increase memory to prevent OOM kills
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
-            sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm yasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 diffutils gettext
+            
+            # CRITICAL FIX: Added 'gcc' to the end of this list for libvpx generic-gnu fallback
+            sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm yasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 diffutils gettext gcc
+            
             export PATH="/usr/local/bin:$PATH"
             export MAKEJOBS=2
+            export VCPKG_MAX_CONCURRENCY=2 # <-- CRITICAL FIX: Stop vcpkg from spawning 3+ jobs
             export CC=/usr/local/bin/clang19
             export CXX=/usr/local/bin/clang++19
             export VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -576,6 +581,7 @@ jobs:
             export CCACHE_DIR="${PWD}/.ccache"
             export CCACHE_BASEDIR="${PWD}"
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
+            
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
