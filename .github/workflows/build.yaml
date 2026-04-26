@@ -574,16 +574,24 @@ jobs:
             sudo ln -sf /usr/local/bin/perl /usr/bin/perl || true
 
             # ====================================================================
-            # CRITICAL FIX: Force -pthread globally for Vcpkg on FreeBSD 
-            # to fix the libvpx "undefined symbol: pthread_create" linker error
+            # CRITICAL FIX: libvpx uses a custom bash configure script that drops
+            # linker flags. We create a compiler wrapper to FORCE the inclusion 
+            # of -pthread at the compiler binary level so it can't be ignored!
             # ====================================================================
-            echo 'string(APPEND VCPKG_C_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
-            echo 'string(APPEND VCPKG_CXX_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
-            echo 'string(APPEND VCPKG_LINKER_FLAGS " -pthread")' >> Meta/CMake/vcpkg/release-triplets/x64-freebsd-dynamic.cmake
+            echo '#!/bin/sh' > /tmp/clang-wrapper
+            echo 'exec /usr/local/bin/clang19 -pthread "$@"' >> /tmp/clang-wrapper
+            chmod +x /tmp/clang-wrapper
+
+            echo '#!/bin/sh' > /tmp/clang++-wrapper
+            echo 'exec /usr/local/bin/clang++19 -pthread "$@"' >> /tmp/clang++-wrapper
+            chmod +x /tmp/clang++-wrapper
 
             export PATH="/usr/local/bin:$PATH"
-            export CC=/usr/local/bin/clang19
-            export CXX=/usr/local/bin/clang++19
+            
+            # Point CC and CXX to our new wrappers
+            export CC=/tmp/clang-wrapper
+            export CXX=/tmp/clang++-wrapper
+            
             export MAKEJOBS=2
             export VCPKG_MAX_CONCURRENCY=2
             export VCPKG_FORCE_SYSTEM_BINARIES=1
@@ -595,7 +603,7 @@ jobs:
             
             echo "Starting Ladybird Build..."
             
-            # Use '||' to catch the error inline so the VM doesn't immediately kill the SSH session
+            # Catch errors to print Vcpkg logs if it fails again
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX" || {
               echo "=========================================================="
               echo "BUILD FAILED. Dumping vcpkg logs for libvpx debugging:"
