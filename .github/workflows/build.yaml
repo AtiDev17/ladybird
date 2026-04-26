@@ -456,6 +456,7 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_BASEDIR: ${{ github.workspace }}
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg_cache,readwrite"
+      VCPKG_KEEP_ENV_VARS: "VCPKG_BINARY_SOURCES"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -498,7 +499,12 @@ jobs:
           
           sed -i '' 's/"install", "--preset", "Host_Tools"/"build", "--preset", "Host_Tools", "install"/' UI/Android/build.gradle.kts
           
-          sed -i '' 's|"-DVCPKG_TARGET_ANDROID=ON"|"-DVCPKG_TARGET_ANDROID=ON", "-DVCPKG_TARGET_TRIPLET=arm64-android", "-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}/Build/vcpkg/scripts/buildsystems/vcpkg.cmake", "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE='"$(ls -d $ANDROID_HOME/ndk/* | tail -n 1)/build/cmake/android.toolchain.cmake"'"|' UI/Android/build.gradle.kts
+          NDK_VER=$(grep 'ndkVersion' UI/Android/build.gradle.kts | grep -o '"[^"]*"' | tr -d '"' | head -n 1)
+          if [ -z "$NDK_VER" ]; then NDK_VER="29.0.13599879"; fi
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;$NDK_VER"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VER"
+          
+          sed -i '' "s|\"-DVCPKG_TARGET_ANDROID=ON\"|\"-DVCPKG_TARGET_ANDROID=ON\", \"-DVCPKG_TARGET_TRIPLET=arm64-android\", \"-DCMAKE_TOOLCHAIN_FILE=\${sourceDir}/Build/vcpkg/scripts/buildsystems/vcpkg.cmake\", \"-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake\"|" UI/Android/build.gradle.kts
           
           cd UI/Android
           chmod +x ./gradlew
