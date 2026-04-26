@@ -484,7 +484,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle' # <--- Enables massive caching for the Android Gradle Build
+          cache: 'gradle'
 
       - name: Accept Android SDK Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
@@ -563,30 +563,18 @@ jobs:
           architecture: x86-64
           run: |
             sudo env IGNORE_OSVERSION=yes pkg update -f
-            
-            # Added 'yasm' and 'diffutils' which are required for libvpx to compile on FreeBSD
             sudo env IGNORE_OSVERSION=yes pkg install -y ccache autoconf-archive automake autoconf bash cmake curl gmake gn libdrm libtool libxcb libxkbcommon libX11 libXrender libXi nasm yasm ninja patchelf pkgconf python3 qt6-base unzip zip rust git llvm19 perl5 diffutils
-            
-            # Prioritize /usr/local/bin so GNU tools (diff, etc) are found before BSD base tools
             export PATH="/usr/local/bin:$PATH"
-            
             export MAKEJOBS=2
             export CC=/usr/local/bin/clang19
             export CXX=/usr/local/bin/clang++19
-            
-            # Force vcpkg to use the tools we just installed via pkg
             export VCPKG_FORCE_SYSTEM_BINARIES=1
-            
-            # Setup ccache environment inside VM
             export CMAKE_C_COMPILER_LAUNCHER=ccache
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
             export CCACHE_DIR="${PWD}/.ccache"
             export CCACHE_BASEDIR="${PWD}"
             export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
-            
-            # Run build
             python3 Meta/ladybird.py build --cc "$CC" --cxx "$CXX"
-            
             mkdir -p ladybird-package/Ladybird
             cmake --install Build/release --prefix ladybird-package/Ladybird
             tar -czvf ladybird-freebsd-x64.tar.gz -C ladybird-package Ladybird
@@ -648,27 +636,20 @@ jobs:
             --volume "${PWD}/vcpkg_cache:${PWD}/vcpkg_cache"
           install: |
             apt-get update -y
-            # Added libcurl4-openssl-dev to solve the vcpkg bootstrap error
             apt-get install -y sudo nodejs npm autoconf autoconf-archive automake bison build-essential ccache cmake curl libcurl4-openssl-dev fonts-liberation2 git libdrm-dev libegl1-mesa-dev libgl1-mesa-dev libpulse-dev libssl-dev libtool libxkbcommon-dev nasm ninja-build pulseaudio qt6-base-dev qt6-tools-dev-tools tar unzip zip python3 python3-pip rustc cargo
-            
             useradd -m builder
           run: |
             chown -R builder:builder .
-            
             sudo -u builder bash -c '
               set -e 
-              
               export CMAKE_C_COMPILER_LAUNCHER=ccache
               export CMAKE_CXX_COMPILER_LAUNCHER=ccache
               export CCACHE_DIR="${PWD}/.ccache"
               export CCACHE_BASEDIR="${PWD}"
               export VCPKG_BINARY_SOURCES="clear;files,${PWD}/vcpkg_cache,readwrite"
-              
               export MAKEJOBS=2
               export VCPKG_FORCE_SYSTEM_BINARIES=1
-              
               python3 Meta/ladybird.py build
-              
               mkdir -p ladybird-package/Ladybird
               cmake --install Build/release --prefix ladybird-package/Ladybird
               tar -czvf /artifacts/ladybird-linux-riscv64.tar.gz -C ladybird-package Ladybird
@@ -688,7 +669,5 @@ jobs:
           arch: 'riscv64'
           ccache_path: '${{ github.workspace }}/.ccache'
           ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
-          vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
-          vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
           vcpkg_cache_path: '${{ github.workspace }}/vcpkg_cache'
           vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
