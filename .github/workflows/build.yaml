@@ -76,7 +76,7 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: python Meta/ladybird.py build --arch ${{ matrix.arch }}
+        run: python Meta/ladybird.py build
 
       - name: Package
         shell: pwsh
