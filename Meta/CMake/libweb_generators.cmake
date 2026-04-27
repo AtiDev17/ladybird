@@ -2,54 +2,54 @@ function (generate_css_implementation)
     set(LIBWEB_INPUT_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
 
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "DescriptorID.cpp"
-        Lagom::GenerateCSSDescriptors
+        "generate_libweb_css_descriptors.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Descriptors.json"
         "CSS/DescriptorID.h"
         "CSS/DescriptorID.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Descriptors.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "Enums.cpp"
-        Lagom::GenerateCSSEnums
+        "generate_libweb_css_enums.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
         "CSS/Enums.h"
         "CSS/Enums.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "EnvironmentVariable.cpp"
-        Lagom::GenerateCSSEnvironmentVariable
+        "generate_libweb_css_environment_variables.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
         "CSS/EnvironmentVariable.h"
         "CSS/EnvironmentVariable.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/EnvironmentVariables.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "MathFunctions.cpp"
-        Lagom::GenerateCSSMathFunctions
+        "generate_libweb_css_math_functions.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
         "CSS/MathFunctions.h"
         "CSS/MathFunctions.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MathFunctions.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "MediaFeatureID.cpp"
-        Lagom::GenerateCSSMediaFeatureID
+        "generate_libweb_css_media_feature_id.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
         "CSS/MediaFeatureID.h"
         "CSS/MediaFeatureID.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/MediaFeatures.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "PropertyID.cpp"
-        Lagom::GenerateCSSPropertyID
+        "generate_libweb_css_property_id.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
         "CSS/PropertyID.h"
         "CSS/PropertyID.cpp"
@@ -59,55 +59,55 @@ function (generate_css_implementation)
         dependencies "${LIBWEB_INPUT_FOLDER}/CSS/Enums.json" "${LIBWEB_INPUT_FOLDER}/CSS/LogicalPropertyGroups.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "PseudoClass.cpp"
-        Lagom::GenerateCSSPseudoClass
+        "generate_libweb_css_pseudo_class.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
         "CSS/PseudoClass.h"
         "CSS/PseudoClass.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoClasses.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "PseudoElement.cpp"
-        Lagom::GenerateCSSPseudoElement
+        "generate_libweb_css_pseudo_element.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/PseudoElements.json"
         "CSS/PseudoElement.h"
         "CSS/PseudoElement.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoElements.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "TransformFunctions.cpp"
-        Lagom::GenerateCSSTransformFunctions
+        "generate_libweb_css_transform_functions.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
         "CSS/TransformFunctions.h"
         "CSS/TransformFunctions.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "Units.cpp"
-        Lagom::GenerateCSSUnits
+        "generate_libweb_css_units.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
         "CSS/Units.h"
         "CSS/Units.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
     )
 
-    invoke_cpp_generator(
+    invoke_py_generator(
         "Keyword.cpp"
-        Lagom::GenerateCSSKeyword
+        "generate_libweb_css_keyword.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Keywords.json"
         "CSS/Keyword.h"
         "CSS/Keyword.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Keywords.json"
     )
 
-    invoke_idl_generator(
+    invoke_py_idl_generator(
         "GeneratedCSSNumericFactoryMethods.cpp"
         "GeneratedCSSNumericFactoryMethods.idl"
-        Lagom::GenerateCSSNumericFactoryMethods
+        "generate_libweb_css_numeric_factory_methods.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
         "CSS/GeneratedCSSNumericFactoryMethods.h"
         "CSS/GeneratedCSSNumericFactoryMethods.cpp"
@@ -115,10 +115,10 @@ function (generate_css_implementation)
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
     )
 
-    invoke_idl_generator(
+    invoke_py_idl_generator(
         "GeneratedCSSStyleProperties.cpp"
         "GeneratedCSSStyleProperties.idl"
-        Lagom::GenerateCSSStyleProperties
+        "generate_libweb_css_style_properties.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
         "CSS/GeneratedCSSStyleProperties.h"
         "CSS/GeneratedCSSStyleProperties.cpp"

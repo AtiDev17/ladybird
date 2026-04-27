@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    .plain {
+        color: rgb(0, 0, 0);
+    }
+</style>
+<div id="parent" class="plain"></div>
+<script>
+    function settleAndReset(triggerElement) {
+        getComputedStyle(triggerElement).color;
+        internals.resetStyleInvalidationCounters();
+    }
+
+    function report(label) {
+        const invalidations = internals.getStyleInvalidationCounters().styleInvalidations;
+        println(`${label}: ${invalidations} invalidations`);
+    }
+
+    test(() => {
+        const parent = document.getElementById("parent");
+
+        settleAndReset(parent);
+        const child = document.createElement("span");
+        parent.appendChild(child);
+        getComputedStyle(parent).color;
+        report("appending a child to a parent without observable child-state pseudos");
+
+        settleAndReset(parent);
+        parent.removeChild(child);
+        getComputedStyle(parent).color;
+        report("removing the only child from a parent without observable child-state pseudos");
+
+        settleAndReset(parent);
+        const fragment = document.createDocumentFragment();
+        fragment.appendChild(document.createElement("span"));
+        fragment.appendChild(document.createElement("span"));
+        parent.appendChild(fragment);
+        getComputedStyle(parent).color;
+        report("appending a fragment to a parent without observable child-state pseudos");
+    });
+</script>

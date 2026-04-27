@@ -11,6 +11,7 @@
 #include <AK/kmalloc.h>
 #include <LibGC/DeferGC.h>
 #include <LibJS/Bytecode/ClassBlueprint.h>
+#include <LibJS/Bytecode/Debug.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/IdentifierTable.h>
 #include <LibJS/Bytecode/PropertyKeyTable.h>
@@ -359,6 +360,11 @@ ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units,
     return rust_parse_program(utf16_data, length_in_code_units, static_cast<u8>(type), line_number_offset, g_dump_ast, g_dump_ast_use_color);
 }
 
+CompiledProgram* compile_parsed_program_off_thread(ParsedProgram* parsed, size_t length_in_code_units)
+{
+    return rust_compile_parsed_program_off_thread(parsed, length_in_code_units);
+}
+
 bool parsed_program_has_errors(ParsedProgram const* parsed)
 {
     return rust_parsed_program_has_errors(const_cast<ParsedProgram*>(parsed));
@@ -367,6 +373,11 @@ bool parsed_program_has_errors(ParsedProgram const* parsed)
 void free_parsed_program(ParsedProgram* parsed)
 {
     rust_free_parsed_program(parsed);
+}
+
+void free_compiled_program(CompiledProgram* compiled)
+{
+    rust_free_compiled_program(compiled);
 }
 
 Optional<Result<ScriptResult, Vector<ParserError>>> compile_parsed_script(ParsedProgram* parsed, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
@@ -387,6 +398,23 @@ Optional<Result<ScriptResult, Vector<ParserError>>> compile_parsed_script(Parsed
     ScriptGdiBuilder builder;
 
     void* exec_ptr = rust_compile_parsed_script(parsed, &realm.vm(), source_code.ptr(), &builder, length);
+
+    if (!exec_ptr)
+        return Vector<ParserError> {};
+
+    builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    return builder.result;
+}
+
+Optional<Result<ScriptResult, Vector<ParserError>>> materialize_compiled_script(CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!compiled)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    ScriptGdiBuilder builder;
+
+    void* exec_ptr = rust_materialize_compiled_script(compiled, &realm.vm(), source_code.ptr(), &builder);
 
     if (!exec_ptr)
         return Vector<ParserError> {};
@@ -477,6 +505,55 @@ Optional<Result<ModuleResult, Vector<ParserError>>> compile_parsed_module(Parsed
 
     void* exec_ptr = rust_compile_parsed_module(parsed, &realm.vm(), source_code.ptr(),
         &builder, &callbacks, &tla_executable, length);
+
+    if (!exec_ptr && !tla_executable)
+        return Vector<ParserError> {};
+
+    if (tla_executable) {
+        auto& vm = realm.vm();
+        auto* tla_exec = static_cast<Bytecode::Executable*>(tla_executable);
+
+        builder.result.tla_shared_data = vm.heap().allocate<SharedFunctionInstanceData>(
+            vm, FunctionKind::Async,
+            "module code with top-level await"_utf16_fly_string,
+            0, 0, true, false, true,
+            Vector<Utf16FlyString> {}, nullptr);
+        builder.result.tla_shared_data->m_is_module_wrapper = true;
+        builder.result.tla_shared_data->m_uses_this = true;
+        builder.result.tla_shared_data->m_function_environment_needed = true;
+        builder.result.tla_shared_data->update_asm_call_metadata();
+        builder.result.tla_shared_data->set_executable(tla_exec);
+    } else {
+        builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
+    }
+
+    return builder.result;
+}
+
+Optional<Result<ModuleResult, Vector<ParserError>>> materialize_compiled_module(CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
+    if (!compiled)
+        return {};
+
+    GC::DeferGC defer_gc(realm.vm().heap());
+    ModuleBuilder builder;
+    ModuleCallbacks callbacks {
+        .set_has_top_level_await = module_set_has_top_level_await,
+        .push_import_entry = module_push_import_entry,
+        .push_local_export = module_push_local_export,
+        .push_indirect_export = module_push_indirect_export,
+        .push_star_export = module_push_star_export,
+        .push_requested_module = module_push_requested_module,
+        .set_default_export_binding = module_set_default_export_binding,
+        .push_var_name = module_push_var_name,
+        .push_function = module_push_function,
+        .push_lexical_binding = module_push_lexical_binding,
+    };
+
+    void* tla_executable = nullptr;
+
+    void* exec_ptr = rust_materialize_compiled_module(compiled, &realm.vm(), source_code.ptr(),
+        &builder, &callbacks, &tla_executable);
 
     if (!exec_ptr && !tla_executable)
         return Vector<ParserError> {};
@@ -695,12 +772,35 @@ static JS::Value decode_constant(JS::VM& vm, uint8_t const*& cursor, uint8_t con
         }();
         return JS::BigInt::create(vm, move(integer));
     }
-    case ConstantTag::RawValue: {
-        VERIFY(cursor + 8 <= end);
-        JS::Value value;
-        memcpy(&value, cursor, 8);
-        cursor += 8;
-        return value;
+    case ConstantTag::WellKnownSymbol: {
+        VERIFY(cursor + 1 <= end);
+        auto symbol_id = static_cast<WellKnownSymbolKind>(*cursor++);
+        switch (symbol_id) {
+        case WellKnownSymbolKind::SymbolIterator:
+            return vm.well_known_symbol_iterator();
+        case WellKnownSymbolKind::SymbolAsyncIterator:
+            return vm.well_known_symbol_async_iterator();
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+    case ConstantTag::AbstractOperation: {
+        VERIFY(cursor + 1 <= end);
+        auto operation = static_cast<AbstractOperationKind>(*cursor++);
+        auto& intrinsics = vm.current_realm()->intrinsics();
+        switch (operation) {
+        case AbstractOperationKind::AsyncIteratorClose:
+            return JS::Value(intrinsics.async_iterator_close_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetMethod:
+            return JS::Value(intrinsics.get_method_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetIteratorDirect:
+            return JS::Value(intrinsics.get_iterator_direct_abstract_operation_function().ptr());
+        case AbstractOperationKind::GetIteratorFromMethod:
+            return JS::Value(intrinsics.get_iterator_from_method_abstract_operation_function().ptr());
+        case AbstractOperationKind::IteratorComplete:
+            return JS::Value(intrinsics.iterator_complete_abstract_operation_function().ptr());
+        }
+        VERIFY_NOT_REACHED();
     }
     default:
         VERIFY_NOT_REACHED();
@@ -922,6 +1022,30 @@ extern "C" void rust_sfd_set_class_field_initializer_name(
     }
 }
 
+extern "C" void rust_sfd_set_precompiled_executable(
+    void* sfd_ptr,
+    void* executable_ptr,
+    bool uses_this,
+    bool function_environment_needed,
+    size_t function_environment_bindings_count,
+    bool might_need_arguments_object,
+    bool contains_direct_call_to_eval)
+{
+    auto& shared = *static_cast<JS::SharedFunctionInstanceData*>(sfd_ptr);
+    auto& executable = *static_cast<JS::Bytecode::Executable*>(executable_ptr);
+
+    shared.m_uses_this = uses_this;
+    shared.m_function_environment_needed = function_environment_needed;
+    shared.m_function_environment_bindings_count = function_environment_bindings_count;
+    shared.m_might_need_arguments_object = might_need_arguments_object;
+    shared.m_contains_direct_call_to_eval = contains_direct_call_to_eval;
+    shared.set_executable(executable);
+    executable.name = shared.m_name;
+    if (Bytecode::g_dump_bytecode)
+        executable.dump();
+    shared.clear_compile_inputs();
+}
+
 extern "C" void* rust_create_class_blueprint(
     void* vm_ptr,
     void const* source_code_ptr,
@@ -1107,39 +1231,6 @@ extern "C" size_t rust_format_double(double value, uint8_t* buffer, size_t buffe
     auto len = min(bytes.size(), buffer_len);
     memcpy(buffer, bytes.data(), len);
     return len;
-}
-
-extern "C" uint64_t get_well_known_symbol(void* vm_ptr, WellKnownSymbolKind symbol_id)
-{
-    auto& vm = *static_cast<JS::VM*>(vm_ptr);
-    JS::Value value;
-    switch (symbol_id) {
-    case WellKnownSymbolKind::SymbolIterator:
-        value = vm.well_known_symbol_iterator();
-        break;
-    case WellKnownSymbolKind::SymbolAsyncIterator:
-        value = vm.well_known_symbol_async_iterator();
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-    return value.encoded();
-}
-
-extern "C" uint64_t get_abstract_operation_function(void* vm_ptr, uint16_t const* name, size_t name_len)
-{
-    auto& vm = *static_cast<JS::VM*>(vm_ptr);
-    auto& intrinsics = vm.current_realm()->intrinsics();
-    auto name_view = JS::RustIntegration::utf16_view_from_bytes(name, name_len);
-    auto name_str = MUST(name_view.to_utf8());
-
-#define __JS_ENUMERATE(snake_name, functionName, length) \
-    if (name_str == #functionName##sv)                   \
-        return JS::Value(intrinsics.snake_name##_abstract_operation_function().ptr()).encoded();
-    JS_ENUMERATE_NATIVE_JAVASCRIPT_BACKED_ABSTRACT_OPERATIONS
-#undef __JS_ENUMERATE
-
-    VERIFY_NOT_REACHED();
 }
 
 }

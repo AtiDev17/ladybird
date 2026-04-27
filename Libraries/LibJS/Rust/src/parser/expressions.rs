@@ -875,9 +875,9 @@ impl Parser<'_> {
                     if matches!(lhs.inner, ExpressionKind::Super) {
                         self.syntax_error("Cannot access private field or method via 'super'");
                     }
-                    // C++ uses rule_start (period position) for property identifiers.
-                    let id = self.parse_private_identifier(start);
-                    let property = self.expression(start, ExpressionKind::PrivateIdentifier(Box::new(id)));
+                    let property_start = self.position();
+                    let id = self.parse_private_identifier(property_start);
+                    let property = self.expression(property_start, ExpressionKind::PrivateIdentifier(Box::new(id)));
                     (
                         self.expression(
                             start,
@@ -890,10 +890,10 @@ impl Parser<'_> {
                         ForbiddenTokens::none(),
                     )
                 } else if self.match_identifier_name() {
+                    let property_start = self.position();
                     let token = self.consume();
-                    // C++ uses rule_start (period position) for property identifiers.
-                    let property_identifier = self.make_identifier(start, self.token_identifier_name(&token));
-                    let property = self.expression(start, ExpressionKind::Identifier(property_identifier));
+                    let property_identifier = self.make_identifier(property_start, self.token_identifier_name(&token));
+                    let property = self.expression(property_start, ExpressionKind::Identifier(property_identifier));
                     (
                         self.expression(
                             start,
@@ -1418,11 +1418,11 @@ impl Parser<'_> {
         let mut has_proto_setter = false;
         while !self.match_token(TokenType::CurlyClose) && !self.done() {
             if self.match_token(TokenType::TripleDot) {
+                let spread_start = self.position();
                 self.consume();
                 let expression = self.parse_assignment_expression();
-                // C++ uses object expression start position for all ObjectProperty nodes.
                 properties.push(ObjectProperty {
-                    range: self.range_from(start),
+                    range: self.range_from(spread_start),
                     property_type: ObjectPropertyType::Spread,
                     key: Box::new(expression),
                     is_computed: false,
@@ -1493,31 +1493,13 @@ impl Parser<'_> {
             self.consume();
         }
 
-        // In C++, identifiers matching match_identifier() are consumed directly in
-        // parse_object_expression and get the object's rule_start position. This applies
-        // even after consuming an `async` prefix. Only get/set prefix and generator `*`
-        // cause the key to go through parse_property_key with its own position.
-        // NB: C++ match_identifier() returns true for most EscapedKeyword tokens
-        // (like escaped reserved words "if", "while", etc.), only rejecting
-        // let/yield/await under specific conditions. Rust's match_identifier()
-        // is more restrictive, so we add explicit EscapedKeyword handling here.
-        let is_cpp_identifier = self.match_identifier()
-            || (self.current_token.token_type == TokenType::EscapedKeyword && {
-                let value = self.token_value(&self.current_token);
-                value != utf16!("let") && value != utf16!("yield") && value != utf16!("await")
-            });
-        let ident_override = if !is_getter && !is_setter && !is_generator && is_cpp_identifier {
-            Some(obj_start)
-        } else {
-            None
-        };
         let PropertyKey {
             expression: key,
             name: key_value,
             is_proto,
             is_computed,
             is_identifier,
-        } = self.parse_property_key(ident_override);
+        } = self.parse_property_key();
 
         // https://tc39.es/ecma262/#sec-object-initializer
         // Private names are not allowed in object literals, even inside class bodies.
@@ -1679,17 +1661,7 @@ impl Parser<'_> {
         ) || next.token_type.is_identifier_name()
     }
 
-    pub(crate) fn parse_property_key(&mut self, ident_pos_override: Option<Position>) -> PropertyKey {
-        // Suppress eval/arguments check for property key tokens (C++ uses
-        // regular `consume()` not `consume_and_allow_division()` here).
-        let saved_property_key_ctx = self.flags.in_property_key_context;
-        self.flags.in_property_key_context = true;
-        let result = self.parse_property_key_inner(ident_pos_override);
-        self.flags.in_property_key_context = saved_property_key_ctx;
-        result
-    }
-
-    fn parse_property_key_inner(&mut self, ident_pos_override: Option<Position>) -> PropertyKey {
+    pub(crate) fn parse_property_key(&mut self) -> PropertyKey {
         let proto_name = utf16!("__proto__");
         let start = self.position();
         match self.current_token_type() {
@@ -1706,7 +1678,7 @@ impl Parser<'_> {
                 }
             }
             TokenType::StringLiteral => {
-                let token = self.consume();
+                let token = self.consume_property_key_token();
                 // C++ calls consume() before push_start() for StringLiteral,
                 // so its position is the token AFTER the string.
                 let after_string = self.position();
@@ -1769,12 +1741,10 @@ impl Parser<'_> {
                 if value == utf16!("#constructor") {
                     self.syntax_error("Private property with name '#constructor' is not allowed");
                 }
-                // C++ uses the class start position for private identifiers in class elements.
-                let key_start = ident_pos_override.unwrap_or(start);
                 let expression = self.expression(
-                    key_start,
+                    start,
                     ExpressionKind::PrivateIdentifier(Box::new(PrivateIdentifier {
-                        range: self.range_from(key_start),
+                        range: self.range_from(start),
                         name: value.clone(),
                     })),
                 );
@@ -1792,12 +1762,10 @@ impl Parser<'_> {
                     // identifier names). This matters for shorthand properties: { await }
                     // is not valid in class static blocks since await is not an identifier there.
                     let is_ident = self.match_identifier();
-                    let token = self.consume();
+                    let token = self.consume_property_key_token();
                     let value = Utf16String::from(self.token_value(&token));
                     let is_proto = value == proto_name;
-                    // C++ uses the object expression start position for identifier-name keys.
-                    let key_start = ident_pos_override.unwrap_or(start);
-                    let expression = self.expression(key_start, ExpressionKind::StringLiteral(Box::new(value.clone())));
+                    let expression = self.expression(start, ExpressionKind::StringLiteral(Box::new(value.clone())));
                     PropertyKey {
                         expression,
                         name: Some(value),
@@ -1807,7 +1775,7 @@ impl Parser<'_> {
                     }
                 } else {
                     self.expected("property key");
-                    self.consume();
+                    self.consume_property_key_token();
                     let expression =
                         self.expression(start, ExpressionKind::StringLiteral(Box::new(Utf16String::new())));
                     PropertyKey {
@@ -1834,11 +1802,11 @@ impl Parser<'_> {
                 continue;
             }
             if self.match_token(TokenType::TripleDot) {
+                let spread_start = self.position();
                 self.consume();
                 let expression = self.parse_assignment_expression();
-                // C++ uses the array's rule_start ([ position) for SpreadExpression.
                 elements.push(Some(
-                    self.expression(start, ExpressionKind::Spread(Box::new(expression))),
+                    self.expression(spread_start, ExpressionKind::Spread(Box::new(expression))),
                 ));
             } else {
                 elements.push(Some(self.parse_assignment_expression()));
@@ -2224,6 +2192,7 @@ impl Parser<'_> {
         // load_state() rollback will undo this.
         self.scope_collector.open_function_scope(None);
         self.scope_collector.set_is_arrow_function();
+        self.push_function_context();
 
         // Set await_expression_is_valid during parameter parsing so that
         // 'await' is rejected as an identifier in async arrow parameters.
@@ -2334,7 +2303,8 @@ impl Parser<'_> {
             self.flags.await_expression_is_valid = saved_await_body;
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
-            let function_id = self.function_table.insert(FunctionData {
+            let nested_function_ids = self.pop_function_context();
+            let function_id = self.insert_function_data(FunctionData {
                 name: None,
                 source_text_start: src_start,
                 source_text_end: self.source_text_end_offset(),
@@ -2345,6 +2315,7 @@ impl Parser<'_> {
                 is_strict_mode: self.flags.strict_mode || has_use_strict,
                 is_arrow_function: true,
                 parsing_insights: insights,
+                nested_function_ids: Some(nested_function_ids),
             });
             Some(self.expression(start, ExpressionKind::Function(function_id)))
         } else {
@@ -2382,7 +2353,8 @@ impl Parser<'_> {
             self.flags.await_expression_is_valid = saved_await_body;
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
-            let function_id = self.function_table.insert(FunctionData {
+            let nested_function_ids = self.pop_function_context();
+            let function_id = self.insert_function_data(FunctionData {
                 name: None,
                 source_text_start: src_start,
                 source_text_end: self.source_text_end_offset(),
@@ -2393,6 +2365,7 @@ impl Parser<'_> {
                 is_strict_mode: self.flags.strict_mode,
                 is_arrow_function: true,
                 parsing_insights: insights,
+                nested_function_ids: Some(nested_function_ids),
             });
             Some(self.expression(start, ExpressionKind::Function(function_id)))
         }
@@ -2434,6 +2407,7 @@ impl Parser<'_> {
         // method body don't steal names from an outer binding context.
         let saved_pattern_bound_names = std::mem::take(&mut self.pattern_bound_names);
 
+        self.push_function_context();
         let parsed = self.parse_formal_parameters();
 
         self.register_function_parameters_with_scope(&parsed.parameters, &parsed.parameter_info);
@@ -2479,7 +2453,8 @@ impl Parser<'_> {
             insights.uses_this_from_environment = true;
         }
 
-        let function_id = self.function_table.insert(FunctionData {
+        let nested_function_ids = self.pop_function_context();
+        let function_id = self.insert_function_data(FunctionData {
             name: None,
             source_text_start: function_start.offset,
             source_text_end: self.source_text_end_offset(),
@@ -2490,6 +2465,7 @@ impl Parser<'_> {
             is_strict_mode: self.flags.strict_mode || has_use_strict,
             is_arrow_function: false,
             parsing_insights: insights,
+            nested_function_ids: Some(nested_function_ids),
         });
         self.expression(start, ExpressionKind::Function(function_id))
     }

@@ -264,6 +264,7 @@ set(SOURCES
     CSS/StyleValues/GridTemplateAreaStyleValue.cpp
     CSS/StyleValues/GridTrackPlacementStyleValue.cpp
     CSS/StyleValues/GridTrackSizeListStyleValue.cpp
+    CSS/StyleValues/ImageSetStyleValue.cpp
     CSS/StyleValues/ImageStyleValue.cpp
     CSS/StyleValues/IntegerStyleValue.cpp
     CSS/StyleValues/KeywordStyleValue.cpp
@@ -622,6 +623,8 @@ set(SOURCES
     HTML/Parser/HTMLToken.cpp
     HTML/Parser/HTMLTokenizer.cpp
     HTML/Parser/ListOfActiveFormattingElements.cpp
+    HTML/Parser/SpeculativeHTMLParser.cpp
+    HTML/Parser/SpeculativeMockElement.cpp
     HTML/Parser/StackOfOpenElements.cpp
     HTML/Path2D.cpp
     HTML/Plugin.cpp
@@ -630,6 +633,7 @@ set(SOURCES
     HTML/PopoverTargetAttributes.cpp
     HTML/PopStateEvent.cpp
     HTML/PotentialCORSRequest.cpp
+    HTML/PreloadEntry.cpp
     HTML/PromiseRejectionEvent.cpp
     HTML/RadioNodeList.cpp
     HTML/RenderingThread.cpp
@@ -666,6 +670,7 @@ set(SOURCES
     HTML/StorageEvent.cpp
     HTML/StructuredSerialize.cpp
     HTML/SubmitEvent.cpp
+    HTML/SupportedImageTypes.cpp
     HTML/SyntaxHighlighter/SyntaxHighlighter.cpp
     HTML/TagNames.cpp
     HTML/TextMetrics.cpp

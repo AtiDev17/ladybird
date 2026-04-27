@@ -42,6 +42,17 @@ Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_parsed(FFI::Par
     return realm.heap().allocate<Script>(realm, filename, move(rust_compilation->value()), host_defined);
 }
 
+Result<GC::Ref<Script>, Vector<ParserError>> Script::create_from_compiled(FFI::CompiledProgram* compiled, NonnullRefPtr<SourceCode const> source_code, Realm& realm, HostDefined* host_defined)
+{
+    auto filename = source_code->filename();
+    auto rust_compilation = RustIntegration::materialize_compiled_script(compiled, move(source_code), realm);
+    if (!rust_compilation.has_value())
+        return Vector<ParserError> {};
+    if (rust_compilation->is_error())
+        return rust_compilation->release_error();
+    return realm.heap().allocate<Script>(realm, filename, move(rust_compilation->value()), host_defined);
+}
+
 Script::Script(Realm& realm, StringView filename, RustIntegration::ScriptResult&& result, HostDefined* host_defined)
     : m_realm(realm)
     , m_executable(result.executable)
@@ -168,9 +179,7 @@ ThrowCompletionOr<void> Script::global_declaration_instantiation(VM& vm, GlobalE
     }
 
     // 16. For each Parse Node f of functionsToInitialize, do
-    // NB: We iterate in reverse order since we appended the functions
-    //     instead of prepending during pre-computation.
-    for (auto const& function_to_initialize : m_functions_to_initialize.in_reverse()) {
+    for (auto const& function_to_initialize : m_functions_to_initialize) {
         // a. Let fn be the sole element of the BoundNames of f.
         // b. Let fo be InstantiateFunctionObject of f with arguments env and privateEnv.
         auto function = ECMAScriptFunctionObject::create_from_function_data(

@@ -93,6 +93,9 @@ public:
 
     size_t script_nesting_level() const { return m_script_nesting_level; }
 
+    void schedule_resume_check();
+    void set_post_parse_action(Function<void()> action) { m_post_parse_action = move(action); }
+
 private:
     HTMLParser(DOM::Document&, ParserScriptingMode, StringView input, StringView encoding);
     HTMLParser(DOM::Document&, ParserScriptingMode);
@@ -128,6 +131,11 @@ private:
 
     void stop_parsing() { m_stop_parsing = true; }
 
+    // https://html.spec.whatwg.org/multipage/parsing.html#start-the-speculative-html-parser
+    void start_the_speculative_html_parser();
+    // https://html.spec.whatwg.org/multipage/parsing.html#stop-the-speculative-html-parser
+    void stop_the_speculative_html_parser();
+
     void generate_implied_end_tags(FlyString const& exception = {});
     void generate_all_implied_end_tags_thoroughly();
     GC::Ref<DOM::Element> create_element_for(HTMLToken const&, Optional<FlyString> const& namespace_, DOM::Node& intended_parent);
@@ -162,6 +170,9 @@ private:
     void increment_script_nesting_level();
     void decrement_script_nesting_level();
     void reset_the_insertion_mode_appropriately();
+
+    void resume_after_parser_blocking_script();
+    void invoke_post_parse_action();
 
     void handle_element_popped(DOM::Element&);
 
@@ -203,7 +214,10 @@ private:
     bool m_aborted { false };
     bool m_parser_pause_flag { false };
     bool m_stop_parsing { false };
+    bool m_resume_check_pending { false };
     size_t m_script_nesting_level { 0 };
+
+    Function<void()> m_post_parse_action;
 
     JS::Realm& realm();
 
@@ -211,6 +225,9 @@ private:
     GC::Ptr<HTMLHeadElement> m_head_element;
     GC::Ptr<HTMLFormElement> m_form_element;
     GC::Ptr<DOM::Element> m_context_element;
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#active-speculative-html-parser
+    GC::Ptr<SpeculativeHTMLParser> m_active_speculative_html_parser;
 
     Vector<HTMLToken> m_pending_table_character_tokens;
 

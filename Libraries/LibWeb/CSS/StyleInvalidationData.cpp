@@ -240,6 +240,18 @@ static void collect_properties_used_in_has(Selector::SimpleSelector const& selec
         }
         break;
     }
+    case Selector::SimpleSelector::Type::PseudoElement: {
+        // Pseudo-elements like ::slotted(.x:has(...)) carry a compound selector argument whose contents need the same
+        // recursive collection.
+        auto const& pseudo_element = selector.pseudo_element();
+        if (pseudo_element.type() == PseudoElement::Slotted) {
+            for (auto const& compound_selector : pseudo_element.compound_selector().compound_selectors()) {
+                for (auto const& simple_selector : compound_selector.simple_selectors)
+                    collect_properties_used_in_has(simple_selector, style_invalidation_data, metadata);
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -390,6 +402,18 @@ void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const&
                     has_only.set_needs_invalidate_pseudo_class(PseudoClass::Has);
                     add_invalidation_plan_for_properties(style_invalidation_data, has_only, *make_invalidate_whole_subtree_invalidation());
                 }
+            }
+        }
+        break;
+    }
+    case Selector::SimpleSelector::Type::PseudoElement: {
+        // Pseudo-elements like ::slotted(.x) and ::part(...) carry a compound selector argument whose simple
+        // selectors decide which property changes should trigger invalidation against this rule.
+        auto const& pseudo_element = selector.pseudo_element();
+        if (pseudo_element.type() == PseudoElement::Slotted) {
+            for (auto const& compound_selector : pseudo_element.compound_selector().compound_selectors()) {
+                for (auto const& nested_simple : compound_selector.simple_selectors)
+                    build_invalidation_sets_for_simple_selector(nested_simple, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_selector);
             }
         }
         break;

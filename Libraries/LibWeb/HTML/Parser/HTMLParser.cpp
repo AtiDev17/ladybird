@@ -41,6 +41,7 @@
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/HTMLToken.h>
+#include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Window.h>
@@ -194,6 +195,7 @@ void HTMLParser::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_head_element);
     visitor.visit(m_form_element);
     visitor.visit(m_context_element);
+    visitor.visit(m_active_speculative_html_parser);
     visitor.visit(m_character_insertion_node);
 
     m_stack_of_open_elements.visit_edges(visitor);
@@ -211,6 +213,9 @@ void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point
     m_stop_parsing = false;
 
     for (;;) {
+        if (m_parser_pause_flag)
+            break;
+
         auto optional_token = m_tokenizer.next_token(stop_at_insertion_point);
         if (!optional_token.has_value())
             break;
@@ -270,8 +275,10 @@ void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint st
 {
     m_document->set_url(url);
     m_document->set_source(m_tokenizer.source());
+    m_post_parse_action = [this] { the_end(*m_document, this); };
     run(stop_at_insertion_point);
-    the_end(*m_document, this);
+    if (!m_parser_pause_flag)
+        invoke_post_parse_action();
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#the-end
@@ -308,7 +315,11 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     if (parser && parser->m_parsing_fragment)
         return;
 
-    // FIXME: 1. If the active speculative HTML parser is not null, then stop the speculative HTML parser and return.
+    // 1. If the active speculative HTML parser is not null, then stop the speculative HTML parser and return.
+    if (parser && parser->m_active_speculative_html_parser) {
+        parser->stop_the_speculative_html_parser();
+        return;
+    }
 
     // 2. Set the insertion point to undefined.
     if (parser)
@@ -339,6 +350,22 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
 }
 
 static constexpr int THE_END_TIMEOUT_MS = 15000;
+
+// Perform a microtask checkpoint matching spin_until's pre-check semantics: pending microtasks (e.g. image load-event
+// delayer creation from update_the_image_data step 8) must be drained before checking parser progress. The empty-queue
+// fast path avoids the save/clear/restore of the execution context stack and notify_about_rejected_promises when there
+// is nothing to drain.
+static void perform_pre_progress_microtask_checkpoint()
+{
+    auto& event_loop = main_thread_event_loop();
+    if (event_loop.microtask_queue_empty())
+        return;
+    auto& vm = event_loop.vm();
+    vm.save_execution_context_stack();
+    vm.clear_execution_context_stack();
+    event_loop.perform_a_microtask_checkpoint();
+    vm.restore_execution_context_stack();
+}
 
 GC::Ref<HTMLParserEndState> HTMLParserEndState::create(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> parser)
 {
@@ -372,17 +399,7 @@ void HTMLParserEndState::schedule_progress_check()
         return;
     m_check_pending = true;
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this] {
-        // NOTE: Pending microtasks (e.g. image load event delayer creation from update_the_image_data
-        //       step 8) must be processed before we check conditions, matching spin_until's behavior.
-        //       Skip the checkpoint when the microtask queue is empty to avoid unnecessary work
-        //       (save/restore execution context stack, notify_about_rejected_promises, etc.).
-        if (!main_thread_event_loop().microtask_queue_empty()) {
-            auto& vm = main_thread_event_loop().vm();
-            vm.save_execution_context_stack();
-            vm.clear_execution_context_stack();
-            main_thread_event_loop().perform_a_microtask_checkpoint();
-            vm.restore_execution_context_stack();
-        }
+        perform_pre_progress_microtask_checkpoint();
         check_progress();
         m_check_pending = false;
     }));
@@ -879,8 +896,13 @@ HTMLParser::AdjustedInsertionLocation HTMLParser::find_appropriate_place_for_ins
 // https://html.spec.whatwg.org/multipage/parsing.html#create-an-element-for-the-token
 GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Optional<FlyString> const& namespace_, DOM::Node& intended_parent)
 {
-    // FIXME: 1. If the active speculative HTML parser is not null, then return the result of creating a speculative mock element given namespace, token's tag name, and token's attributes.
-    // FIXME: 2. Otherwise, optionally create a speculative mock element given namespace, token's tag name, and token's attributes.
+    // 1. If the active speculative HTML parser is not null, then return the result of creating a speculative mock element given namespace, token's tag name, and token's attributes.
+    // The active speculative HTML parser runs synchronously to completion, so it is null whenever the real
+    // parser invokes this algorithm. The speculative parser produces mock elements via its own path.
+
+    // 2. Otherwise, optionally create a speculative mock element given namespace, token's tag name, and token's attributes.
+    // We deliberately skip step 2 — the active speculative parser already issues these fetches, so doing it
+    // again here would be redundant.
 
     // 3. Let document be intendedParent's node document.
     GC::Ref<DOM::Document> document = intended_parent.document();
@@ -3411,6 +3433,111 @@ void HTMLParser::adjust_foreign_attributes(HTMLToken& token)
     }
 }
 
+void HTMLParser::schedule_resume_check()
+{
+    if (m_resume_check_pending)
+        return;
+    if (!m_parser_pause_flag)
+        return;
+    m_resume_check_pending = true;
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this] {
+        m_resume_check_pending = false;
+        perform_pre_progress_microtask_checkpoint();
+        resume_after_parser_blocking_script();
+    }));
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+// Async equivalent of "spin the event loop until ... ready to be parser-executed" from the per-iteration block of the
+// "text" insertion mode (steps 4-13). Driven by schedule_resume_check.
+void HTMLParser::resume_after_parser_blocking_script()
+{
+    if (!m_parser_pause_flag)
+        return;
+    if (m_aborted || m_stop_parsing)
+        return;
+
+    auto pending = document().pending_parsing_blocking_script();
+    auto pending_svg = document().pending_parsing_blocking_svg_script();
+    bool ready = false;
+    if (pending)
+        ready = pending->is_ready_to_be_parser_executed();
+    else if (pending_svg)
+        ready = pending_svg->is_ready_to_be_parser_executed();
+    else
+        return;
+
+    // 5. If the parser's Document has a style sheet that is blocking scripts or the script's ready to be
+    //    parser-executed is false: spin the event loop until the parser's Document has no style sheet that is blocking
+    //    scripts and the script's ready to be parser-executed becomes true.
+    // The async equivalent: return without taking the script; schedule_resume_check re-fires this method when the
+    // relevant state changes.
+    if (m_document->has_a_style_sheet_that_is_blocking_scripts())
+        return;
+    if (!ready)
+        return;
+
+    // 3. Start the speculative HTML parser for this instance of the HTML parser.
+    // (Done at the pause point in the corresponding insertion-mode handler, so that speculation runs during the wait.)
+
+    // 4. Block the tokenizer for this instance of the HTML parser, such that the event loop will not run tasks that
+    //    invoke the tokenizer.
+    // (No-op: pausing is expressed by returning from run() and m_parser_pause_flag, not a tokenizer-level block flag.)
+
+    // 6. If this parser has been aborted in the meantime, return.
+    if (m_aborted)
+        return;
+
+    // 7. Stop the speculative HTML parser for this instance of the HTML parser.
+    stop_the_speculative_html_parser();
+
+    // 8. Unblock the tokenizer for this instance of the HTML parser, such that tasks that invoke the tokenizer can
+    //    again be run. (No-op, see step 4.)
+
+    // 9. Let the insertion point be just before the next input character.
+    m_tokenizer.update_insertion_point();
+
+    // 10. Increment the parser's script nesting level by one (it should be zero before this step, so this sets it to
+    //     one).
+    VERIFY(script_nesting_level() == 0);
+    increment_script_nesting_level();
+
+    // 1. Let the script be the pending parsing-blocking script.
+    // 2. Set the pending parsing-blocking script to null.
+    // 11. Execute the script element the script.
+    if (pending)
+        document().take_pending_parsing_blocking_script({})->execute_script();
+    else
+        document().take_pending_parsing_blocking_svg_script({})->execute_pending_parser_blocking_script({});
+
+    // 12. Decrement the parser's script nesting level by one.
+    decrement_script_nesting_level();
+
+    // If the parser's script nesting level is zero (which it always should be at this point), then set the parser pause
+    // flag to false.
+    VERIFY(script_nesting_level() == 0);
+    m_parser_pause_flag = false;
+
+    // 13. Let the insertion point be undefined again.
+    m_tokenizer.undefine_insertion_point();
+
+    // The spec's "While the pending parsing-blocking script is not null" iteration is realized by run() pausing again
+    // on the next </script> end tag if the executed script set up a new pending blocking script (e.g. via
+    // document.write).
+    run();
+
+    if (m_parser_pause_flag)
+        return;
+
+    invoke_post_parse_action();
+}
+
+void HTMLParser::invoke_post_parse_action()
+{
+    if (auto action = exchange(m_post_parse_action, nullptr))
+        action();
+}
+
 void HTMLParser::increment_script_nesting_level()
 {
     ++m_script_nesting_level;
@@ -3452,13 +3579,11 @@ void HTMLParser::handle_text(HTMLToken& token)
 
     // -> An end tag whose tag name is "script"
     if (token.is_end_tag() && token.tag_name() == HTML::TagNames::script) {
-        // FIXME: If the active speculative HTML parser is null and the JavaScript execution context stack is empty, then perform a microtask checkpoint.
-
         // Non-standard: Make sure the <script> element has up-to-date text content before preparing the script.
         flush_character_insertions();
 
         // If the active speculative HTML parser is null and the JavaScript execution context stack is empty, then perform a microtask checkpoint.
-        // FIXME: If the active speculative HTML parser is null
+        // The active speculative HTML parser is null here — start/stop are paired around the spin_until below.
         auto& vm = main_thread_event_loop().vm();
         if (!vm.has_running_execution_context())
             perform_a_microtask_checkpoint();
@@ -3473,7 +3598,7 @@ void HTMLParser::handle_text(HTMLToken& token)
         m_insertion_mode = m_original_insertion_mode;
 
         // Let the old insertion point have the same value as the current insertion point.
-        m_tokenizer.store_insertion_point();
+        m_tokenizer.store_old_insertion_point();
 
         // Let the insertion point be just before the next input character.
         m_tokenizer.update_insertion_point();
@@ -3488,7 +3613,7 @@ void HTMLParser::handle_text(HTMLToken& token)
         // If the active speculative HTML parser is null, then prepare the script element script.
         // This might cause some script to execute, which might cause new characters to be inserted into the tokenizer,
         // and might cause the tokenizer to output more tokens, resulting in a reentrant invocation of the parser.
-        // FIXME: Check if active speculative HTML parser is null.
+        // The active speculative HTML parser is null here (see above).
         script->prepare_script(Badge<HTMLParser> {});
 
         // Decrement the parser's script nesting level by one.
@@ -3499,7 +3624,7 @@ void HTMLParser::handle_text(HTMLToken& token)
             m_parser_pause_flag = false;
 
         // Let the insertion point have the value of the old insertion point.
-        m_tokenizer.restore_insertion_point();
+        m_tokenizer.restore_old_insertion_point();
 
         // At this stage, if the pending parsing-blocking script is not null, then:
         if (document().pending_parsing_blocking_script()) {
@@ -3512,59 +3637,17 @@ void HTMLParser::handle_text(HTMLToken& token)
                 return;
             }
 
-            // Otherwise:
-            else {
-                // While the pending parsing-blocking script is not null:
-                while (document().pending_parsing_blocking_script()) {
-                    // 1. Let the script be the pending parsing-blocking script.
-                    // 2. Set the pending parsing-blocking script to null.
-                    auto the_script = document().take_pending_parsing_blocking_script({});
+            // -> Otherwise:
+            // The spec's "While the pending parsing-blocking script is not null" loop and the contained "spin the event
+            // loop" step are implemented asynchronously: pause the parser, schedule a resume check, and yield back to
+            // the caller. The remaining steps (4-13) run from resume_after_parser_blocking_script when the script is
+            // ready.
 
-                    // FIXME: 3. Start the speculative HTML parser for this instance of the HTML parser.
+            // 3. Start the speculative HTML parser for this instance of the HTML parser.
+            start_the_speculative_html_parser();
 
-                    // 4. Block the tokenizer for this instance of the HTML parser, such that the event loop will not run tasks that invoke the tokenizer.
-                    m_tokenizer.set_blocked(true);
-
-                    // 5. If the parser's Document has a style sheet that is blocking scripts
-                    //    or the script's ready to be parser-executed is false:
-                    if (m_document->has_a_style_sheet_that_is_blocking_scripts() || the_script->is_ready_to_be_parser_executed() == false) {
-                        // spin the event loop until the parser's Document has no style sheet that is blocking scripts
-                        // and the script's ready to be parser-executed becomes true.
-                        main_thread_event_loop().spin_until(GC::create_function(heap(), [&] {
-                            return !m_document->has_a_style_sheet_that_is_blocking_scripts() && the_script->is_ready_to_be_parser_executed();
-                        }));
-                    }
-
-                    // 6. If this parser has been aborted in the meantime, return.
-                    if (m_aborted)
-                        return;
-
-                    // FIXME: 7. Stop the speculative HTML parser for this instance of the HTML parser.
-
-                    // 8. Unblock the tokenizer for this instance of the HTML parser, such that tasks that invoke the tokenizer can again be run.
-                    m_tokenizer.set_blocked(false);
-
-                    // 9. Let the insertion point be just before the next input character.
-                    m_tokenizer.update_insertion_point();
-
-                    // 10. Increment the parser's script nesting level by one (it should be zero before this step, so this sets it to one).
-                    VERIFY(script_nesting_level() == 0);
-                    increment_script_nesting_level();
-
-                    // 11. Execute the script element the script.
-                    the_script->execute_script();
-
-                    // 12. Decrement the parser's script nesting level by one.
-                    decrement_script_nesting_level();
-
-                    // If the parser's script nesting level is zero (which it always should be at this point), then set the parser pause flag to false.
-                    VERIFY(script_nesting_level() == 0);
-                    m_parser_pause_flag = false;
-
-                    // 13. Let the insertion point be undefined again.
-                    m_tokenizer.undefine_insertion_point();
-                }
-            }
+            m_parser_pause_flag = true;
+            schedule_resume_check();
         }
 
         return;
@@ -4717,12 +4800,19 @@ void HTMLParser::process_using_the_rules_for_foreign_content(HTMLToken& token)
         adjust_foreign_attributes(token);
 
         // Insert a foreign element for the token, with the adjusted current node's namespace and false.
-        (void)insert_foreign_element(token, adjusted_current_node()->namespace_uri(), OnlyAddToElementStack::No);
-
-        // AD-HOC: we don't want to execute script elements just by adding data to it
-        if (token.tag_name() == SVG::TagNames::script && current_node()->namespace_uri() == Namespace::SVG) {
-            auto& script_element = as<SVG::SVGScriptElement>(*current_node());
-            script_element.set_parser_inserted({});
+        // AD-HOC: For SVG script elements, set the parser-inserted flag before the element is
+        //         inserted into the DOM. Otherwise inserted()/attribute_changed() would invoke
+        //         process_the_script_element() with the flag still unset and bypass the
+        //         parser-blocking fetch handling.
+        auto namespace_ = adjusted_current_node()->namespace_uri();
+        if (token.tag_name() == SVG::TagNames::script && namespace_ == Namespace::SVG) {
+            auto adjusted_insertion_location = find_appropriate_place_for_inserting_node();
+            auto element = create_element_for(token, namespace_, *adjusted_insertion_location.parent);
+            as<SVG::SVGScriptElement>(*element).set_parser_inserted({});
+            insert_an_element_at_the_adjusted_insertion_location(element);
+            m_stack_of_open_elements.push(element);
+        } else {
+            (void)insert_foreign_element(token, namespace_, OnlyAddToElementStack::No);
         }
 
         // If the token has its self-closing flag set, then run the appropriate steps from the following list:
@@ -4754,7 +4844,7 @@ void HTMLParser::process_using_the_rules_for_foreign_content(HTMLToken& token)
         // Pop the current node off the stack of open elements.
         auto& script_element = as<SVG::SVGScriptElement>(*m_stack_of_open_elements.pop());
         // Let the old insertion point have the same value as the current insertion point.
-        m_tokenizer.store_insertion_point();
+        m_tokenizer.store_old_insertion_point();
         // Let the insertion point be just before the next input character.
         m_tokenizer.update_insertion_point();
         // Increment the parser's script nesting level by one.
@@ -4766,7 +4856,7 @@ void HTMLParser::process_using_the_rules_for_foreign_content(HTMLToken& token)
         flush_character_insertions();
 
         // If the active speculative HTML parser is null and the user agent supports SVG, then Process the SVG script element according to the SVG rules. [SVG]
-        // FIXME: If the active speculative HTML parser is null
+        // The active speculative HTML parser is null here (see above).
         script_element.process_the_script_element();
 
         // Decrement the parser's script nesting level by one.
@@ -4776,7 +4866,15 @@ void HTMLParser::process_using_the_rules_for_foreign_content(HTMLToken& token)
             m_parser_pause_flag = false;
 
         // Let the insertion point have the value of the old insertion point.
-        m_tokenizer.restore_insertion_point();
+        m_tokenizer.restore_old_insertion_point();
+
+        // If the SVG script registered itself as a pending parsing-blocking script (external fetch in flight),
+        // pause the parser and schedule a resume check. The parser will resume from
+        // resume_after_parser_blocking_script when the fetch completes.
+        if (document().pending_parsing_blocking_svg_script()) {
+            m_parser_pause_flag = true;
+            schedule_resume_check();
+        }
         return;
     }
 
@@ -5657,13 +5755,55 @@ JS::Realm& HTMLParser::realm()
     return m_document->realm();
 }
 
+// https://html.spec.whatwg.org/multipage/parsing.html#start-the-speculative-html-parser
+void HTMLParser::start_the_speculative_html_parser()
+{
+    // 1. Optionally, return.
+    // NOTE: We do not opt out.
+
+    // 2. If parser's active speculative HTML parser is not null, then stop the speculative HTML parser for parser.
+    if (m_active_speculative_html_parser)
+        stop_the_speculative_html_parser();
+
+    // 3. Let speculativeParser be a new speculative HTML parser, with the same state as parser.
+    // 4. Let speculativeDoc be a new isomorphic representation of parser's Document, where all elements are instead
+    //    speculative mock elements. Let speculativeParser parse into speculativeDoc.
+    // NOTE: Speculative mock elements are produced on the fly during run(); we do not materialize a full speculativeDoc tree.
+    auto speculative_parser = SpeculativeHTMLParser::create(realm(), *m_document, m_tokenizer.unparsed_input(), m_document->base_url());
+
+    // 5. Set parser's active speculative HTML parser to speculativeParser.
+    m_active_speculative_html_parser = speculative_parser;
+
+    // 6. In parallel, run speculativeParser until it is stopped or until it reaches the end of its input stream.
+    speculative_parser->run();
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#stop-the-speculative-html-parser
+void HTMLParser::stop_the_speculative_html_parser()
+{
+    // 1. Let speculativeParser be parser's active speculative HTML parser.
+    auto speculative_parser = m_active_speculative_html_parser;
+
+    // 2. If speculativeParser is null, then return.
+    if (!speculative_parser)
+        return;
+
+    // 3. Throw away any pending content in speculativeParser's input stream, and discard any future content that would
+    //    have been added to it.
+    speculative_parser->stop();
+
+    // 4. Set parser's active speculative HTML parser to null.
+    m_active_speculative_html_parser = nullptr;
+}
+
 // https://html.spec.whatwg.org/multipage/parsing.html#abort-a-parser
 void HTMLParser::abort()
 {
     // 1. Throw away any pending content in the input stream, and discard any future content that would have been added to it.
     m_tokenizer.abort();
 
-    // FIXME: 2. Stop the speculative HTML parser for this HTML parser.
+    // 2. Stop the speculative HTML parser for this HTML parser.
+    stop_the_speculative_html_parser();
 
     // 3. Update the current document readiness to "interactive".
     m_document->update_readiness(DocumentReadyState::Interactive);

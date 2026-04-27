@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<div id="target">target</div>
+<script>
+    function settleAndReset(triggerElement) {
+        getComputedStyle(triggerElement).color;
+        internals.resetStyleInvalidationCounters();
+    }
+
+    function report(label) {
+        const invalidations = internals.getStyleInvalidationCounters().styleInvalidations;
+        println(`${label}: ${invalidations} invalidations`);
+    }
+
+    test(() => {
+        const target = document.getElementById("target");
+
+        target.setAttribute("style", "color: red");
+        settleAndReset(target);
+
+        target.setAttribute("style", "color: red");
+        getComputedStyle(target).color;
+        report("setting identical style text");
+
+        settleAndReset(target);
+        target.setAttribute("style", "color: green");
+        getComputedStyle(target).color;
+        report("setting changed style text");
+    });
+</script>

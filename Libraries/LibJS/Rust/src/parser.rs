@@ -37,8 +37,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ast::{
-    BindingPattern, Expression, ExpressionKind, FunctionParameter, FunctionTable, Identifier, PrivateIdentifier,
-    ProgramData, ScopeData, SharedUtf16String, SourceRange, Statement, StatementKind, Utf16String,
+    BindingPattern, Expression, ExpressionKind, FunctionData, FunctionId, FunctionParameter, FunctionTable, Identifier,
+    PrivateIdentifier, ProgramData, ScopeData, SharedUtf16String, SourceRange, Statement, StatementKind, Utf16String,
 };
 use crate::lexer::{Lexer, ch};
 use crate::scope_collector::{ScopeCollector, ScopeCollectorState};
@@ -199,10 +199,6 @@ pub(crate) struct ParserFlags {
     pub new_target_is_valid: bool,
     pub function_might_need_arguments_object: bool,
     pub previous_token_was_period: bool,
-    /// Set during property key parsing to suppress eval/arguments check.
-    /// C++ uses separate `consume()` and `consume_and_allow_division()` methods;
-    /// we emulate this by skipping the check in property key contexts.
-    pub in_property_key_context: bool,
 }
 
 /// Snapshot of parser state for speculative parsing (backtracking).
@@ -211,6 +207,7 @@ struct SavedState {
     errors_len: usize,
     flags: ParserFlags,
     scope_collector_state: ScopeCollectorState,
+    function_context_stack_lengths: Vec<usize>,
 }
 
 /// The main JavaScript parser.
@@ -259,11 +256,6 @@ pub struct Parser<'a> {
     /// Set during synthesize_binding_pattern to allow MemberExpressions as binding targets.
     allow_member_expressions: bool,
 
-    /// Position of the opening bracket/brace in binding patterns.
-    /// Used so all identifiers inside a binding pattern share the pattern's start position,
-    /// matching C++ parser behavior.
-    binding_pattern_start: Option<Position>,
-
     /// True while parsing a class body that has an `extends` clause.
     pub(crate) class_has_super_class: bool,
     /// Depth counter for class bodies — used to reject `#name` outside classes.
@@ -292,6 +284,13 @@ pub struct Parser<'a> {
 
     /// Side table owning all FunctionData produced during parsing.
     pub function_table: FunctionTable,
+
+    /// Stack of nested function ids discovered while parsing each active function.
+    ///
+    /// When the parser finishes a function, the top list becomes that
+    /// FunctionData's child list. This lets lazy-compile payload extraction move
+    /// a known function subtree instead of walking the function body again.
+    function_context_stack: Vec<Vec<FunctionId>>,
 
     /// Memoization: offsets where arrow function parsing has already failed.
     /// Prevents exponential re-processing of nested expressions like
@@ -329,7 +328,6 @@ impl<'a> Parser<'a> {
             last_class_name: Utf16String::default(),
             pattern_bound_names: Vec::new(),
             allow_member_expressions: false,
-            binding_pattern_start: None,
             class_has_super_class: false,
             class_scope_depth: 0,
             has_default_export_name: false,
@@ -341,6 +339,7 @@ impl<'a> Parser<'a> {
             scope_collector: ScopeCollector::new(),
             exported_names: HashSet::new(),
             function_table: FunctionTable::new(),
+            function_context_stack: Vec::new(),
             arrow_function_failed_positions: HashSet::new(),
         }
     }
@@ -360,6 +359,27 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn statement(&self, start: Position, statement: StatementKind) -> Statement {
         Statement::new(self.range_from(start), statement)
+    }
+
+    pub(crate) fn push_function_context(&mut self) {
+        self.function_context_stack.push(Vec::new());
+    }
+
+    pub(crate) fn pop_function_context(&mut self) -> Vec<FunctionId> {
+        self.function_context_stack
+            .pop()
+            .expect("Parser::pop_function_context: no active function context")
+    }
+
+    pub(crate) fn insert_function_data(&mut self, data: FunctionData) -> FunctionId {
+        let function_id = self.function_table.insert(data);
+        if let Some(context) = self.function_context_stack.last_mut() {
+            // The newly parsed function belongs to the innermost function
+            // context. Top-level functions have no parent and remain reachable
+            // through their AST node, as before.
+            context.push(function_id);
+        }
+        function_id
     }
 
     pub(crate) fn make_identifier(&self, start: Position, name: impl Into<SharedUtf16String>) -> Rc<Identifier> {
@@ -461,12 +481,16 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn consume(&mut self) -> Token {
         let old = std::mem::replace(&mut self.current_token, self.lexer.next());
-        // C++ checks for `arguments`/`eval` in `consume_and_allow_division()` which
-        // is used by `consume_identifier()`. We put the check here (in `consume()`)
-        // but skip it when parsing property keys, matching C++'s behavior.
-        if !self.flags.in_property_key_context {
-            self.check_arguments_or_eval(&old);
-        }
+        self.check_arguments_or_eval(&old);
+        self.flags.previous_token_was_period = old.token_type == TokenType::Period;
+        old
+    }
+
+    /// Like `consume()` but skips the `arguments`/`eval` reference check.
+    /// Use this when consuming a token that is syntactically a property key
+    /// rather than an identifier reference (e.g. `{ arguments: 1 }`).
+    pub(crate) fn consume_property_key_token(&mut self) -> Token {
+        let old = std::mem::replace(&mut self.current_token, self.lexer.next());
         self.flags.previous_token_was_period = old.token_type == TokenType::Period;
         old
     }
@@ -719,6 +743,7 @@ impl<'a> Parser<'a> {
             errors_len: self.errors.len(),
             flags: self.flags,
             scope_collector_state: self.scope_collector.save_state(),
+            function_context_stack_lengths: self.function_context_stack.iter().map(Vec::len).collect(),
         });
     }
 
@@ -728,6 +753,15 @@ impl<'a> Parser<'a> {
         self.errors.truncate(state.errors_len);
         self.flags = state.flags;
         self.scope_collector.load_state(state.scope_collector_state);
+        self.function_context_stack
+            .truncate(state.function_context_stack_lengths.len());
+        for (context, len) in self
+            .function_context_stack
+            .iter_mut()
+            .zip(state.function_context_stack_lengths)
+        {
+            context.truncate(len);
+        }
         self.lexer.load_state();
     }
 

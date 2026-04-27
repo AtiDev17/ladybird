@@ -12,6 +12,7 @@
 
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
@@ -35,6 +36,7 @@
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/NavigationType.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/VisibilityState.h>
@@ -447,6 +449,14 @@ public:
     HTML::HTMLScriptElement* pending_parsing_blocking_script() { return m_pending_parsing_blocking_script.ptr(); }
     GC::Ref<HTML::HTMLScriptElement> take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>);
 
+    void set_pending_parsing_blocking_svg_script(SVG::SVGScriptElement*);
+    SVG::SVGScriptElement* pending_parsing_blocking_svg_script() { return m_pending_parsing_blocking_svg_script.ptr(); }
+    GC::Ref<SVG::SVGScriptElement> take_pending_parsing_blocking_svg_script(Badge<HTML::HTMLParser>);
+    bool has_pending_parsing_blocking_script() const
+    {
+        return m_pending_parsing_blocking_script.ptr() || m_pending_parsing_blocking_svg_script.ptr();
+    }
+
     void add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLScriptElement>, HTML::HTMLScriptElement&);
     Vector<GC::Root<HTML::HTMLScriptElement>> take_scripts_to_execute_when_parsing_has_finished(Badge<HTML::HTMLParser>);
     Vector<GC::Ref<HTML::HTMLScriptElement>>& scripts_to_execute_when_parsing_has_finished() { return m_scripts_to_execute_when_parsing_has_finished; }
@@ -765,6 +775,14 @@ public:
     HTML::ListOfAvailableImages& list_of_available_images();
     HTML::ListOfAvailableImages const& list_of_available_images() const;
 
+    // https://html.spec.whatwg.org/multipage/links.html#map-of-preloaded-resources
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>>& map_of_preloaded_resources() { return m_map_of_preloaded_resources; }
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>> const& map_of_preloaded_resources() const { return m_map_of_preloaded_resources; }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#list-of-speculative-fetch-urls
+    bool has_speculative_fetch_url(URL::URL const& url) const { return m_list_of_speculative_fetch_urls.contains(url); }
+    void add_speculative_fetch_url(URL::URL url) { m_list_of_speculative_fetch_urls.set(move(url)); }
+
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserver&);
 
@@ -844,7 +862,7 @@ public:
 
     void set_needs_invalidation_of_elements_affected_by_has() { m_needs_invalidation_of_elements_affected_by_has = true; }
 
-    // Test-only counters for observing :has() invalidation work. See Internals.idl.
+    // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
     struct StyleInvalidationCounters {
         u64 has_ancestor_walk_invocations { 0 };
         u64 has_ancestor_walk_visits { 0 };
@@ -855,6 +873,11 @@ public:
         u64 has_result_cache_misses { 0 };
         u64 full_style_invalidations { 0 };
         u64 style_invalidations { 0 };
+        u64 element_style_recomputations { 0 };
+        u64 element_style_noop_recomputations { 0 };
+        u64 element_inherited_style_recomputations { 0 };
+        u64 element_inherited_style_noop_recomputations { 0 };
+        u64 previous_sibling_invalidation_walk_visits { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const { m_style_invalidation_counters = {}; }
@@ -1185,6 +1208,7 @@ private:
     String m_source;
 
     GC::Ptr<HTML::HTMLScriptElement> m_pending_parsing_blocking_script;
+    GC::Ptr<SVG::SVGScriptElement> m_pending_parsing_blocking_svg_script;
 
     Vector<GC::Ref<HTML::HTMLScriptElement>> m_scripts_to_execute_when_parsing_has_finished;
 
@@ -1360,6 +1384,13 @@ private:
 
     // https://html.spec.whatwg.org/multipage/images.html#list-of-available-images
     GC::Ptr<HTML::ListOfAvailableImages> m_list_of_available_images;
+
+    // https://html.spec.whatwg.org/multipage/links.html#map-of-preloaded-resources
+    // FIXME: Entries leak until document destruction if a <link rel=preload> is never consumed.
+    HashMap<HTML::PreloadKey, GC::Ref<HTML::PreloadEntry>> m_map_of_preloaded_resources;
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#list-of-speculative-fetch-urls
+    HashTable<URL::URL> m_list_of_speculative_fetch_urls;
 
     GC::Ptr<CSS::VisualViewport> m_visual_viewport;
 

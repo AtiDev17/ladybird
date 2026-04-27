@@ -2279,7 +2279,13 @@ void FlexFormattingContext::resolve_cross_axis_auto_margins()
 
             // If its outer cross size (treating those auto margins as zero) is less than the cross size of its flex line,
             // distribute the difference in those sizes equally to the auto margins.
-            auto outer_cross_size = item.cross_size.value() + item.padding.cross_before + item.padding.cross_after + item.borders.cross_before + item.borders.cross_after;
+            // NB: Auto cross-axis margins are stored as 0, so including them here treats them as zero while keeping
+            //     non-auto cross-axis margins in the outer cross size.
+            auto outer_cross_size = item.cross_size.value()
+                + item.padding.cross_before + item.padding.cross_after
+                + item.borders.cross_before + item.borders.cross_after
+                + item.margins.cross_before + item.margins.cross_after;
+
             if (outer_cross_size < line.cross_size) {
                 CSSPixels remainder = line.cross_size - outer_cross_size;
                 if (item.margins.cross_before_is_auto && item.margins.cross_after_is_auto) {

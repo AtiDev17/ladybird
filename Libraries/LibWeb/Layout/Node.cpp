@@ -586,8 +586,8 @@ void NodeWithStyle::visit_edges(Visitor& visitor)
     for (auto const& layer : computed_values().background_layers())
         layer.background_image->visit_edges(visitor);
 
-    if (m_list_style_image && m_list_style_image->is_image())
-        m_list_style_image->as_image().visit_edges(visitor);
+    if (m_list_style_image)
+        m_list_style_image->visit_edges(visitor);
 
     m_computed_values->visit_edges(visitor);
 }
@@ -622,7 +622,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     auto background_layers = computed_style.background_layers();
 
     for (auto const& layer : background_layers)
-        const_cast<CSS::AbstractImageStyleValue&>(*layer.background_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(*layer.background_image).load_any_resources(*this);
 
     computed_values.set_background_layers(move(background_layers));
 
@@ -719,7 +719,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     auto const& list_style_image = computed_style.property(CSS::PropertyID::ListStyleImage);
     if (list_style_image.is_abstract_image()) {
         m_list_style_image = list_style_image.as_abstract_image();
-        const_cast<CSS::AbstractImageStyleValue&>(*m_list_style_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(*m_list_style_image).load_any_resources(*this);
     }
 
     computed_values.set_text_decoration_color(computed_style.color(CSS::PropertyID::TextDecorationColor, color_resolution_context));
@@ -871,7 +871,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     } else if (mask_image.is_abstract_image()) {
         auto const& abstract_image = mask_image.as_abstract_image();
         computed_values.set_mask_image(abstract_image);
-        const_cast<CSS::AbstractImageStyleValue&>(abstract_image).load_any_resources(document());
+        const_cast<CSS::AbstractImageStyleValue&>(abstract_image).load_any_resources(*this);
     }
 
     computed_values.set_mask_type(computed_style.mask_type());
@@ -989,22 +989,11 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
 
 CSS::StyleScope const& NodeWithStyle::style_scope() const
 {
-    auto resolve_style_scope = [](DOM::Node const& dom_node) -> CSS::StyleScope const& {
-        auto const& root = dom_node.root();
-        if (root.is_shadow_root()) {
-            auto const& shadow_root = static_cast<DOM::ShadowRoot const&>(root);
-            if (shadow_root.uses_document_style_sheets())
-                return root.document().style_scope();
-            return shadow_root.style_scope();
-        }
-        return root.document().style_scope();
-    };
-
     if (auto const* dom_node = this->dom_node())
-        return resolve_style_scope(*dom_node);
+        return dom_node->style_scope();
 
     if (is_generated_for_pseudo_element())
-        return resolve_style_scope(*pseudo_element_generator());
+        return pseudo_element_generator()->style_scope();
 
     if (auto const* parent = this->parent())
         return parent->style_scope();

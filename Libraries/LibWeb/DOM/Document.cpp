@@ -190,6 +190,7 @@
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
+#include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
 #include <LibWeb/Selection/Selection.h>
@@ -605,6 +606,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_associated_inert_template_document);
     visitor.visit(m_appropriate_template_contents_owner_document);
     visitor.visit(m_pending_parsing_blocking_script);
+    visitor.visit(m_pending_parsing_blocking_svg_script);
     visitor.visit(m_history);
     visitor.visit(m_html_parser_end_state);
     visitor.visit(m_style_computer);
@@ -643,6 +645,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_associated_animation_timelines);
     visitor.visit(m_list_of_available_images);
+    for (auto& it : m_map_of_preloaded_resources)
+        visitor.visit(it.value);
 
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         visitor.visit(form_associated_element->form_associated_element_to_html_element());
@@ -782,7 +786,7 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Vector<TrustedT
     //     point at a time, processing resulting tokens as they are emitted, and stopping when the tokenizer reaches
     //     the insertion point or when the processing of the tokenizer is aborted by the tree construction stage (this
     //     can happen if a script end tag token is emitted by the tokenizer).
-    if (!pending_parsing_blocking_script())
+    if (!has_pending_parsing_blocking_script())
         m_parser->run(HTML::HTMLTokenizer::StopAtInsertionPoint::Yes);
 
     return {};
@@ -910,11 +914,19 @@ WebIDL::ExceptionOr<void> Document::close()
     m_parser->tokenizer().insert_eof();
 
     // 5. If there is a pending parsing-blocking script, then return.
-    if (pending_parsing_blocking_script())
+    if (has_pending_parsing_blocking_script()) {
+        m_parser->set_post_parse_action([this] { completely_finish_loading(); });
         return {};
+    }
 
     // 6. Run the tokenizer, processing resulting tokens as they are emitted, and stopping when the tokenizer reaches the explicit "EOF" character or spins the event loop.
     m_parser->run();
+
+    // run() may have paused on a blocking script (e.g. from document.write inside an inline script).
+    if (has_pending_parsing_blocking_script()) {
+        m_parser->set_post_parse_action([this] { completely_finish_loading(); });
+        return {};
+    }
 
     // AD-HOC: This ensures that a load event is fired if the node navigable's container is an iframe.
     completely_finish_loading();
@@ -2620,6 +2632,19 @@ GC::Ref<HTML::HTMLScriptElement> Document::take_pending_parsing_blocking_script(
     return *script;
 }
 
+void Document::set_pending_parsing_blocking_svg_script(SVG::SVGScriptElement* script)
+{
+    m_pending_parsing_blocking_svg_script = script;
+}
+
+GC::Ref<SVG::SVGScriptElement> Document::take_pending_parsing_blocking_svg_script(Badge<HTML::HTMLParser>)
+{
+    VERIFY(m_pending_parsing_blocking_svg_script);
+    auto script = m_pending_parsing_blocking_svg_script;
+    m_pending_parsing_blocking_svg_script = nullptr;
+    return *script;
+}
+
 void Document::add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLScriptElement>, HTML::HTMLScriptElement& script)
 {
     m_scripts_to_execute_when_parsing_has_finished.append(script);
@@ -3601,6 +3626,10 @@ void Document::completely_finish_loading()
             container->dispatch_event(DOM::Event::create(container->realm(), HTML::EventNames::load));
         });
     }
+
+    // AD-HOC: Script-created parsers (iframe document.open/write/close) don't reach set_ready_for_post_load_tasks, so
+    //         the parent's load-event-delay phase wouldn't otherwise be re-evaluated when this iframe finishes loading.
+    container->document().schedule_html_parser_end_check();
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-cookie
@@ -4213,6 +4242,8 @@ void Document::schedule_html_parser_end_check()
 {
     if (m_html_parser_end_state)
         m_html_parser_end_state->schedule_progress_check();
+    if (m_parser)
+        m_parser->schedule_resume_check();
 }
 
 void Document::set_ready_for_post_load_tasks(bool ready)
@@ -5008,8 +5039,9 @@ void Document::unload(GC::Ptr<Document>)
 
     // FIXME: 17. Set oldDocument's has been scrolled by the user to false.
 
-    // FIXME: 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other
+    // 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other
     //     applicable specifications.
+    run_unloading_cleanup_steps();
 
     // 19. If oldDocument's salvageable state is false, then destroy oldDocument.
     if (!m_salvageable)
