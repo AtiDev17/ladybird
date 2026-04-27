@@ -99,8 +99,12 @@ foreach(source IN LISTS AK_TEST_SOURCES)
 endforeach()
 
 if (WIN32)
-    # FIXME: Windows on ARM
-    target_link_libraries(TestUFixedBigInt PRIVATE clang_rt.builtins-x86_64.lib)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64")
+        set(CLANG_RT_BUILTINS_LIB "clang_rt.builtins-aarch64.lib")
+    else()
+        set(CLANG_RT_BUILTINS_LIB "clang_rt.builtins-x86_64.lib")
+    endif()
+    target_link_libraries(TestUFixedBigInt PRIVATE ${CLANG_RT_BUILTINS_LIB})
 endif()
 
 if (CXX_COMPILER_SUPPORTS_BLOCKS)

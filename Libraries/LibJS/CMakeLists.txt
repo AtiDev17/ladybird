@@ -280,8 +280,12 @@ if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "i.86.*")
 endif()
 
 if (WIN32)
-    # FIXME: Windows on ARM
-    target_link_libraries(LibJS PRIVATE clang_rt.builtins-x86_64.lib kernel32 ntdll Ws2_32 userenv)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64")
+        set(CLANG_RT_BUILTINS_LIB "clang_rt.builtins-aarch64.lib")
+    else()
+        set(CLANG_RT_BUILTINS_LIB "clang_rt.builtins-x86_64.lib")
+    endif()
+    target_link_libraries(LibJS PRIVATE ${CLANG_RT_BUILTINS_LIB} kernel32 ntdll Ws2_32 userenv)
 else()
     # This flag has no effect on Windows
     target_compile_options(LibJS PRIVATE -fno-omit-frame-pointer)
