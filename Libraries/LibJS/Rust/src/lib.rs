@@ -1888,24 +1888,30 @@ fn extract_gdi_common(
         }
     }
 
-    // Functions to initialize (reverse order, deduplicated by name).
-    let mut seen_names: HashSet<ast::Utf16String> = HashSet::new();
-    let mut functions_to_init: Vec<(ast::FunctionId, ast::Utf16String)> = Vec::new();
-    for child in scope.children.iter().rev() {
+    // Functions to initialize: keep the last declaration with each name
+    // (ECMAScript hoisting semantics), but emit them in source order. Two
+    // forward passes; SharedUtf16String keys keep the inserts cheap.
+    let mut last_position: std::collections::HashMap<ast::SharedUtf16String, usize> = std::collections::HashMap::new();
+    for (i, child) in scope.children.iter().enumerate() {
         if let StatementKind::FunctionDeclaration(ref fd) = child.inner
             && let Some(ref name_ident) = fd.name
-            && seen_names.insert(name_ident.name.to_utf16_string())
         {
-            functions_to_init.push((fd.function_id, name_ident.name.to_utf16_string()));
+            last_position.insert(name_ident.name.clone(), i);
         }
     }
-    for (function_id, name) in &functions_to_init {
-        let function_data = function_table.take(*function_id);
-        let subtable = function_table.extract_reachable(&function_data);
-        let sfd_ptr =
-            unsafe { bytecode::ffi::create_sfd_for_gdi(function_data, subtable, vm_ptr, source_code_ptr, is_strict) };
-        assert!(!sfd_ptr.is_null(), "create_sfd_for_gdi returned null");
-        push_function(sfd_ptr, name);
+    for (i, child) in scope.children.iter().enumerate() {
+        if let StatementKind::FunctionDeclaration(ref fd) = child.inner
+            && let Some(ref name_ident) = fd.name
+            && last_position.get(&name_ident.name).copied() == Some(i)
+        {
+            let function_data = function_table.take(fd.function_id);
+            let subtable = function_table.extract_reachable(&function_data);
+            let sfd_ptr = unsafe {
+                bytecode::ffi::create_sfd_for_gdi(function_data, subtable, vm_ptr, source_code_ptr, is_strict)
+            };
+            assert!(!sfd_ptr.is_null(), "create_sfd_for_gdi returned null");
+            push_function(sfd_ptr, name_ident.name.as_slice());
+        }
     }
 
     // Var-scoped names (var VariableDeclaration names, excluding function declarations)
@@ -2411,7 +2417,17 @@ fn compute_sfd_metadata(function_data: &ast::FunctionData) -> bytecode::generato
     }
 
     // §10.2.11 steps 15-18: determine if arguments object is needed.
-    let arguments_object_needed = bsi.might_need_arguments
+    // We trust either the parser's conservative "might need arguments" flag
+    // (set when we consume an `arguments` or `eval` Identifier as a free
+    // reference) OR scope analysis having allocated an ArgumentsObject local
+    // for `arguments`. The latter catches references created without going
+    // through consume(), e.g. shorthand `{ arguments }` in an object literal.
+    // Skip the local-driven path when a function named `arguments` shadows
+    // it; in that case the local belongs to the function declaration, not
+    // a real arguments-object reference.
+    let arguments_object_referenced =
+        bsi.might_need_arguments || (bsi.has_arguments_object_local && !bsi.has_function_named_arguments);
+    let arguments_object_needed = arguments_object_referenced
         && !is_arrow
         && !parameter_names.contains(utf16!("arguments"))
         && body_scope.is_some()

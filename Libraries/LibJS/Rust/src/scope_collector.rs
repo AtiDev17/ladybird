@@ -49,8 +49,9 @@
 //! - `IdentifierGroup` — a set of identifier references with the same
 //!   name within one scope (multiple `foo` refs are grouped together)
 
+use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{
@@ -189,8 +190,8 @@ struct ScopeRecord {
     scope_level: ScopeLevel,
     scope_data: Option<Rc<RefCell<ScopeData>>>,
 
-    variables: HashMap<Utf16String, ScopeVariable>,
-    identifier_groups: HashMap<SharedUtf16String, IdentifierGroup>,
+    variables: IndexMap<Utf16String, ScopeVariable>,
+    identifier_groups: IndexMap<SharedUtf16String, IdentifierGroup>,
     functions_to_hoist: Vec<HoistableFunction>,
 
     // Parameter tracking
@@ -221,8 +222,8 @@ impl ScopeRecord {
             scope_type,
             scope_level,
             scope_data,
-            variables: HashMap::new(),
-            identifier_groups: HashMap::new(),
+            variables: IndexMap::new(),
+            identifier_groups: IndexMap::new(),
             functions_to_hoist: Vec::new(),
             has_function_parameters: false,
             parameter_names: Vec::new(),
@@ -931,13 +932,11 @@ impl ScopeCollector {
     /// - It's NOT used inside a `with` statement
     /// - The scope chain is NOT poisoned by `eval()`
     fn resolve_identifiers(records: &mut [ScopeRecord], index: usize, initiated_by_eval: bool, suppress_globals: bool) {
+        // identifier_groups is an IndexMap, so iteration is in source order
+        // of first reference. Local variable indices follow that order.
         let groups = std::mem::take(&mut records[index].identifier_groups);
-        // Sort groups by name for deterministic local variable indices
-        // (HashMap iteration order is arbitrary).
-        let mut sorted_groups: Vec<_> = groups.into_iter().collect();
-        sorted_groups.sort_by(|a, b| a.0.cmp(&b.0));
         let mut propagate_to_parent: Vec<(SharedUtf16String, IdentifierGroup)> = Vec::new();
-        for (name, mut group) in sorted_groups {
+        for (name, mut group) in groups {
             // Annotate each Identifier AST node with its declaration kind,
             // so the bytecode generator knows how to handle TDZ checks, etc.
             if let Some(dk) = group.declaration_kind {
@@ -1192,15 +1191,26 @@ impl ScopeCollector {
         let mut non_local_var_count_for_parameter_expressions: usize = 0;
 
         // Build functions_to_initialize by scanning children for FunctionDeclarations.
-        // Walk in reverse order, deduplicating by name.
+        // ECMAScript hoisting keeps the LAST function declaration with a given name,
+        // but we want to emit the resulting list in SOURCE order. Two forward passes:
+        // record the last position for each name, then keep only the entries whose
+        // position matches. Keys are SharedUtf16String so each insert is a cheap
+        // Rc bump rather than a deep clone of the name.
         let mut functions_to_initialize: Vec<crate::ast::FunctionToInit> = Vec::new();
-        let mut seen_function_names: HashSet<Utf16String> = HashSet::new();
+        let mut last_position: HashMap<SharedUtf16String, usize> = HashMap::new();
         {
             let sd = scope_data.borrow();
-            for i in (0..sd.children.len()).rev() {
-                if let crate::ast::StatementKind::FunctionDeclaration(ref fd) = sd.children[i].inner
+            for (i, child) in sd.children.iter().enumerate() {
+                if let crate::ast::StatementKind::FunctionDeclaration(ref fd) = child.inner
                     && let Some(ref name_ident) = fd.name
-                    && seen_function_names.insert(name_ident.name.to_utf16_string())
+                {
+                    last_position.insert(name_ident.name.clone(), i);
+                }
+            }
+            for (i, child) in sd.children.iter().enumerate() {
+                if let crate::ast::StatementKind::FunctionDeclaration(ref fd) = child.inner
+                    && let Some(ref name_ident) = fd.name
+                    && last_position.get(&name_ident.name).copied() == Some(i)
                 {
                     functions_to_initialize.push(crate::ast::FunctionToInit { child_index: i });
                 }
@@ -1215,7 +1225,7 @@ impl ScopeCollector {
             var_names.push(name.clone());
 
             let is_parameter = var.flags.intersects(VarFlags::FORBIDDEN_LEXICAL);
-            let is_function_name = seen_function_names.contains(name);
+            let is_function_name = last_position.contains_key(name.as_slice());
 
             let local_info = if let Some(ref ident) = var.var_identifier {
                 if ident.is_local() {
@@ -1245,11 +1255,10 @@ impl ScopeCollector {
             });
         }
 
-        // Sort by name for deterministic output (HashMap iteration order is arbitrary).
-        vars_to_initialize.sort_by(|a, b| a.name.cmp(&b.name));
-        var_names.sort();
+        // vars_to_initialize and var_names follow source order via the
+        // insertion order of `record.variables`, which is now an IndexMap.
 
-        if seen_function_names.iter().any(|n| n == utf16!("arguments")) {
+        if last_position.contains_key(utf16!("arguments") as &[u16]) {
             has_function_named_arguments = true;
         }
 
