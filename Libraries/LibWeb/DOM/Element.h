@@ -349,6 +349,7 @@ public:
 
     [[nodiscard]] bool affected_by_pseudo_class(CSS::PseudoClass) const;
     bool includes_properties_from_invalidation_set(CSS::InvalidationSet const&) const;
+    void clear_removed_attributes_for_style_invalidation() { m_removed_attributes_for_style_invalidation.clear(); }
 
     void set_pseudo_element_node(Badge<Layout::TreeBuilder>, CSS::PseudoElement, GC::Ptr<Layout::NodeWithStyle>);
     GC::Ptr<Layout::NodeWithStyle> get_pseudo_element_node(CSS::PseudoElement) const;
@@ -541,6 +542,16 @@ public:
     bool affected_by_backward_positional_pseudo_class() const { return m_affected_by_backward_positional_pseudo_class; }
     void set_affected_by_backward_positional_pseudo_class(bool value);
 
+    // Write-once: this can be set while matching descendants, and recomputing this element's own style may not revisit
+    // those descendant selectors. Keeping it sticky is conservative and avoids stale descendant style after moves.
+    bool affected_by_structural_pseudo_class_in_non_subject_position() const { return m_affected_by_structural_pseudo_class_in_non_subject_position; }
+    void set_affected_by_structural_pseudo_class_in_non_subject_position() { m_affected_by_structural_pseudo_class_in_non_subject_position = true; }
+
+    // Write-once: this can be set while matching descendants, and recomputing this element's own style may not revisit
+    // those descendant selectors. Keeping it sticky is conservative and avoids stale descendant style after moves.
+    bool affected_by_sibling_combinator_in_non_subject_position() const { return m_affected_by_sibling_combinator_in_non_subject_position; }
+    void set_affected_by_sibling_combinator_in_non_subject_position() { m_affected_by_sibling_combinator_in_non_subject_position = true; }
+
     size_t sibling_invalidation_distance() const { return m_sibling_invalidation_distance; }
     void set_sibling_invalidation_distance(size_t value) { m_sibling_invalidation_distance = value; }
 
@@ -701,6 +712,7 @@ private:
     GC::Ptr<CSS::StylePropertyMapReadOnly> m_computed_style_map_cache;
 
     CSSPixelPoint m_scroll_offset;
+    Vector<FlyString, 1> m_removed_attributes_for_style_invalidation;
 
     bool m_is_being_activated : 1 { false };
     bool m_in_top_layer : 1 { false };
@@ -719,6 +731,8 @@ private:
     bool m_affected_by_last_child_pseudo_class : 1 { false };
     bool m_affected_by_forward_positional_pseudo_class : 1 { false };
     bool m_affected_by_backward_positional_pseudo_class : 1 { false };
+    bool m_affected_by_structural_pseudo_class_in_non_subject_position : 1 { false };
+    bool m_affected_by_sibling_combinator_in_non_subject_position : 1 { false };
     bool m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator : 1 { false };
     bool m_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator : 1 { false };
     bool m_in_has_scope : 1 { false };

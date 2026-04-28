@@ -1889,14 +1889,13 @@ bool Element::includes_properties_from_invalidation_set(CSS::InvalidationSet con
         case CSS::InvalidationSet::Property::Type::TagName:
             return local_name() == property.name();
         case CSS::InvalidationSet::Property::Type::Attribute: {
-            if (property.name() == HTML::AttributeNames::id || property.name() == HTML::AttributeNames::class_)
-                return true;
-            return has_attribute(property.name());
+            return has_attribute(property.name()) || m_removed_attributes_for_style_invalidation.contains_slow(property.name());
         }
         case CSS::InvalidationSet::Property::Type::PseudoClass: {
             switch (property.value.get<CSS::PseudoClass>()) {
             case CSS::PseudoClass::Has:
-                return true;
+                return affected_by_has_pseudo_class_in_subject_position()
+                    || affected_by_has_pseudo_class_in_non_subject_position();
             case CSS::PseudoClass::Enabled: {
                 return matches_enabled_pseudo_class();
             }
@@ -1911,6 +1910,21 @@ bool Element::includes_properties_from_invalidation_set(CSS::InvalidationSet con
             }
             case CSS::PseudoClass::PlaceholderShown: {
                 return matches_placeholder_shown_pseudo_class();
+            }
+            case CSS::PseudoClass::Empty: {
+                if (!has_children())
+                    return true;
+                if (first_child_of_type<DOM::Element>())
+                    return false;
+                bool has_nonempty_text_child = false;
+                for_each_child_of_type<DOM::Text>([&](auto const& text_child) {
+                    if (!text_child.data().is_empty()) {
+                        has_nonempty_text_child = true;
+                        return IterationDecision::Break;
+                    }
+                    return IterationDecision::Continue;
+                });
+                return !has_nonempty_text_child;
             }
             case CSS::PseudoClass::AnyLink:
             case CSS::PseudoClass::Link:
@@ -3097,6 +3111,9 @@ void Element::invalidate_style_after_attribute_change(FlyString const& attribute
         changed_properties.append({ .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Required });
         changed_properties.append({ .type = CSS::InvalidationSet::Property::Type::PseudoClass, .value = CSS::PseudoClass::Optional });
     }
+
+    if (!new_value.has_value() && !m_removed_attributes_for_style_invalidation.contains_slow(attribute_name))
+        m_removed_attributes_for_style_invalidation.append(attribute_name);
 
     changed_properties.append({ .type = CSS::InvalidationSet::Property::Type::Attribute, .value = attribute_name });
     invalidate_style(StyleInvalidationReason::ElementAttributeChange, changed_properties, style_invalidation_options);
