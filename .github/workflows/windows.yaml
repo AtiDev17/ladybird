@@ -84,6 +84,11 @@ jobs:
               Copy-Item "$vcpkgBin/*.dll" -Destination "$pkgDir/bin/" -Force
           }
 
+          $shareSource = "Build/release/share"
+          if (Test-Path $shareSource) {
+              Copy-Item -Path $shareSource -Destination "$pkgDir/" -Recurse -Force
+          }
+
           $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
           if (!$deployTool) {
               Write-Host "Error: windeployqt.exe not found! Cannot deploy Qt." -ForegroundColor Red
@@ -249,6 +254,7 @@ jobs:
         shell: pwsh
         run: |
           $binDir = "${{ github.workspace }}/ladybird-package/Ladybird/bin"
+          $pkgDir = "${{ github.workspace }}/ladybird-package/Ladybird"
           $env:PATH = "$binDir;" + $env:PATH
           
           Write-Host "Verifying Qt GUI deployment..."
@@ -258,6 +264,14 @@ jobs:
               exit 1
           }
           Write-Host "Qt platform plugin found." -ForegroundColor Green
+
+          Write-Host "Verifying Resources..."
+          $themeFile = Join-Path $pkgDir "share\Lagom\themes\Default.ini"
+          if (!(Test-Path $themeFile)) {
+              Write-Host "Build Failed: Theme file missing at $themeFile" -ForegroundColor Red
+              exit 1
+          }
+          Write-Host "Theme file found." -ForegroundColor Green
 
           Write-Host "Verifying headless execution via Ladybird.exe..."
           $tempDir = [System.IO.Path]::GetTempPath()
@@ -270,12 +284,13 @@ jobs:
           
           if (!$exited) {
               Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-              Write-Host "Build Failed: Ladybird hung or crashed on startup" -ForegroundColor Red
+              Write-Host "Build Failed: Ladybird hung on startup." -ForegroundColor Red
               exit 1
           }
           
           if ($proc.ExitCode -ne 0) {
-              Write-Host "Build Failed: Ladybird exited with code $($proc.ExitCode)" -ForegroundColor Red
+              Write-Host "Build Failed: Ladybird crashed with code $($proc.ExitCode)." -ForegroundColor Red
+              Write-Host "This usually indicates an ABI/Illegal Instruction (0xC000001D) or missing DLL (0xC0000135) issue in the experimental Windows build." -ForegroundColor Red
               exit 1
           }
           
