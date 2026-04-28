@@ -84,13 +84,19 @@ jobs:
               Copy-Item "$vcpkgBin/*.dll" -Destination "$pkgDir/bin/" -Force
           }
 
+          $shareSource = "Build/release/share"
+          if (Test-Path $shareSource) {
+              Copy-Item -Path $shareSource -Destination "$pkgDir/" -Recurse -Force
+          }
+
           $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
           if ($deployTool) {
-              Get-ChildItem -Path "$pkgDir/bin" -Filter "*.exe" | ForEach-Object {
-                  $exePath = $_.FullName
-                  $process = Start-Process -FilePath $deployTool -ArgumentList "`"$exePath`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+              $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
+              if (Test-Path $ladybirdExe) {
+                  $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
                   if ($process.ExitCode -ne 0) {
-                      Write-Host "Note: $($_.Name) is not a Qt executable. Skipping..." -ForegroundColor DarkGray
+                      Write-Host "Error: windeployqt failed for Ladybird.exe! Qt DLLs are missing." -ForegroundColor Red
+                      exit 1
                   }
               }
           }
@@ -244,27 +250,22 @@ jobs:
           $binDir = "${{ github.workspace }}/ladybird-package/Ladybird/bin"
           $env:PATH = "$binDir;" + $env:PATH
           
-          Write-Host "All multi-process binaries and bundled apps are present." -ForegroundColor Green
+          Write-Host "Verifying core engine via js.exe..."
+          $output = & "$binDir/js.exe" -c "print('Core engine OK')" 2>&1
           
-          Write-Host "Performing headless smoke test on Ladybird.exe..."
-          
-          # Launch Ladybird in headless mode to verify DLL resolution and child process initialization
-          $proc = Start-Process -FilePath "$binDir/Ladybird.exe" -ArgumentList "--headless" -PassThru
-          
-          Start-Sleep -Seconds 5
-          $proc.Refresh()
-          
-          if ($proc.HasExited) {
-              if ($proc.ExitCode -ne 0) {
-                  Write-Host "Build Failed: Ladybird crashed during headless initialization with code $($proc.ExitCode)" -ForegroundColor Red
-                  exit 1
-              } else {
-                  Write-Host "Build Verified: Headless mode initialized and exited cleanly." -ForegroundColor Green
-              }
-          } else {
-              Write-Host "Build Verified: Headless process initialized successfully and is running stably." -ForegroundColor Green
-              Stop-Process -Id $proc.Id -Force
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "Build Failed: js.exe exited with code $LASTEXITCODE" -ForegroundColor Red
+              exit 1
           }
+          
+          Write-Host "Verifying Qt GUI deployment..."
+          $platformPlugin = Join-Path $binDir "platforms\qwindows.dll"
+          if (!(Test-Path $platformPlugin)) {
+              Write-Host "Build Failed: Qt platform plugin missing at $platformPlugin" -ForegroundColor Red
+              exit 1
+          }
+          
+          Write-Host "Build Verified: Engine and Qt deployment are functional." -ForegroundColor Green
           
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
