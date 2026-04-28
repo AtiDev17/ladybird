@@ -95,14 +95,21 @@ jobs:
               exit 1
           }
 
-          # Add vcpkg bin to PATH so windeployqt natively finds the correct Qt/Vcpkg DLLs
-          $env:PATH = "$(Resolve-Path "Build/release/vcpkg_installed/x64-windows/bin");" + $env:PATH
-
-          $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
-
+          # 1. Define the executable path FIRST
           $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
           if (!(Test-Path $ladybirdExe)) {
               Write-Host "Error: Ladybird.exe not found in package directory!" -ForegroundColor Red
+              exit 1
+          }
+
+          # 2. Add vcpkg bin to PATH
+          $env:PATH = "$(Resolve-Path "Build/release/vcpkg_installed/x64-windows/bin");" + $env:PATH
+
+          # 3. NOW run windeployqt
+          $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+          
+          if ($process.ExitCode -ne 0) {
+              Write-Host "Error: windeployqt failed for Ladybird.exe! Qt DLLs are missing." -ForegroundColor Red
               exit 1
           }
 
