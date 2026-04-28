@@ -84,21 +84,22 @@ jobs:
               Copy-Item "$vcpkgBin/*.dll" -Destination "$pkgDir/bin/" -Force
           }
 
-          $shareSource = "Build/release/share"
-          if (Test-Path $shareSource) {
-              Copy-Item -Path $shareSource -Destination "$pkgDir/" -Recurse -Force
+          $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (!$deployTool) {
+              Write-Host "Error: windeployqt.exe not found! Cannot deploy Qt." -ForegroundColor Red
+              exit 1
           }
 
-          $deployTool = Get-ChildItem -Path "Build/release/vcpkg_installed" -Filter "windeployqt.exe" -Recurse | Select-Object -First 1 -ExpandProperty FullName
-          if ($deployTool) {
-              $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
-              if (Test-Path $ladybirdExe) {
-                  $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
-                  if ($process.ExitCode -ne 0) {
-                      Write-Host "Error: windeployqt failed for Ladybird.exe! Qt DLLs are missing." -ForegroundColor Red
-                      exit 1
-                  }
-              }
+          $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
+          if (!(Test-Path $ladybirdExe)) {
+              Write-Host "Error: Ladybird.exe not found in package directory!" -ForegroundColor Red
+              exit 1
+          }
+
+          $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
+          if ($process.ExitCode -ne 0) {
+              Write-Host "Error: windeployqt failed for Ladybird.exe! Qt DLLs are missing." -ForegroundColor Red
+              exit 1
           }
 
           Remove-Item -Path "$pkgDir/bin/vc_redist.x64.exe" -Force -ErrorAction SilentlyContinue
@@ -250,22 +251,35 @@ jobs:
           $binDir = "${{ github.workspace }}/ladybird-package/Ladybird/bin"
           $env:PATH = "$binDir;" + $env:PATH
           
-          Write-Host "Verifying core engine via js.exe..."
-          $output = & "$binDir/js.exe" -c "print('Core engine OK')" 2>&1
-          
-          if ($LASTEXITCODE -ne 0) {
-              Write-Host "Build Failed: js.exe exited with code $LASTEXITCODE" -ForegroundColor Red
-              exit 1
-          }
-          
           Write-Host "Verifying Qt GUI deployment..."
           $platformPlugin = Join-Path $binDir "platforms\qwindows.dll"
           if (!(Test-Path $platformPlugin)) {
               Write-Host "Build Failed: Qt platform plugin missing at $platformPlugin" -ForegroundColor Red
               exit 1
           }
+          Write-Host "Qt platform plugin found." -ForegroundColor Green
+
+          Write-Host "Verifying headless execution via Ladybird.exe..."
+          $tempDir = [System.IO.Path]::GetTempPath()
+          Get-ChildItem -Path $tempDir -Filter "Ladybird*.socket" -ErrorAction SilentlyContinue | Remove-Item -Force
+          Get-ChildItem -Path $tempDir -Filter "Ladybird*.pid" -ErrorAction SilentlyContinue | Remove-Item -Force
+
+          $proc = Start-Process -FilePath "$binDir/Ladybird.exe" -ArgumentList "--headless","about:blank" -PassThru
           
-          Write-Host "Build Verified: Engine and Qt deployment are functional." -ForegroundColor Green
+          $exited = $proc.WaitForExit(15000)
+          
+          if (!$exited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Write-Host "Build Failed: Ladybird hung or crashed on startup" -ForegroundColor Red
+              exit 1
+          }
+          
+          if ($proc.ExitCode -ne 0) {
+              Write-Host "Build Failed: Ladybird exited with code $($proc.ExitCode)" -ForegroundColor Red
+              exit 1
+          }
+          
+          Write-Host "Build Verified: Headless execution succeeded." -ForegroundColor Green
           
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
