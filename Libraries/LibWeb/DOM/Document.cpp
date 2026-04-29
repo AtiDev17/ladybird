@@ -908,7 +908,7 @@ WebIDL::ExceptionOr<void> Document::close()
         return WebIDL::InvalidStateError::create(realm(), "throw-on-dynamic-markup-insertion-counter greater than zero."_utf16);
 
     // 3. If there is no script-created parser associated with the document, then return.
-    if (!m_parser)
+    if (!m_parser || !m_parser->is_script_created())
         return {};
 
     // 4. Insert an explicit "EOF" character at the end of the parser's input stream.
@@ -7523,18 +7523,6 @@ void Document::set_navigable(GC::Ptr<HTML::Navigable> navigable)
         return;
     m_navigable = navigable.ptr();
     HTML::main_thread_event_loop().document_navigable_did_change({});
-}
-
-void Document::notify_css_background_image_loaded()
-{
-    // FIXME: Do less than a full repaint if possible?
-    if (auto* paintable = unsafe_paintable()) {
-        paintable->for_each_in_inclusive_subtree_of_type<Painting::PaintableBox>([](auto& paintable_box) {
-            paintable_box.invalidate_paint_cache();
-            return TraversalDecision::Continue;
-        });
-    }
-    set_needs_repaint();
 }
 
 void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)

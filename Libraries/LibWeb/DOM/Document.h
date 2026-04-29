@@ -633,6 +633,7 @@ public:
 
     void set_parser(Badge<HTML::HTMLParser>, HTML::HTMLParser&);
     void detach_parser();
+    GC::Ptr<HTML::HTMLParser> parser() const { return m_parser; }
 
     [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing == TemporaryDocumentForFragmentParsing::Yes; }
 
@@ -965,8 +966,6 @@ public:
     {
         set_needs_repaint(should_invalidate_display_list);
     }
-
-    void notify_css_background_image_loaded();
 
     RefPtr<Painting::DisplayList> cached_display_list() const;
     RefPtr<Painting::DisplayList> record_display_list(HTML::PaintConfig);

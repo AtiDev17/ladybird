@@ -10,6 +10,7 @@
 #include <AK/GenericShorthands.h>
 #include <AK/SourceLocation.h>
 #include <AK/Utf32View.h>
+#include <AK/Utf8View.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/HTML/Parser/Entities.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -196,22 +197,36 @@ static inline void log_parse_error(SourceLocation const& location = SourceLocati
 
 bool HTMLTokenizer::should_pause_before_next_input_character(StopAtInsertionPoint stop_at_insertion_point) const
 {
-    if (stop_at_insertion_point != StopAtInsertionPoint::Yes || !m_insertion_point.has_value())
-        return false;
+    if (stop_at_insertion_point == StopAtInsertionPoint::Yes && m_insertion_point.has_value()) {
+        if (m_current_offset >= *m_insertion_point)
+            return true;
 
-    if (m_current_offset >= *m_insertion_point)
-        return true;
-
-    if (m_current_offset < static_cast<ssize_t>(m_decoded_input.size())
-        && m_decoded_input[m_current_offset] == '\r'
-        && m_current_offset + 1 == *m_insertion_point) {
-        // Newline normalization needs one code point of lookahead for CRLF. If document.write()
-        // stops the tokenizer immediately after a CR, wait for more input before deciding whether
-        // it is a CRLF pair or a standalone CR.
-        return true;
+        if (m_current_offset < static_cast<ssize_t>(m_decoded_input.size())
+            && m_decoded_input[m_current_offset] == '\r'
+            && m_current_offset + 1 == *m_insertion_point) {
+            // Newline normalization needs one code point of lookahead for CRLF. If document.write()
+            // stops the tokenizer immediately after a CR, wait for more input before deciding whether
+            // it is a CRLF pair or a standalone CR.
+            return true;
+        }
     }
 
-    return false;
+    if (m_input_stream_closed)
+        return false;
+
+    if (m_current_offset >= static_cast<ssize_t>(m_decoded_input.size()))
+        return true;
+
+    // Newline normalization needs one code point of lookahead for CRLF. If a network chunk ends in
+    // CR, wait for either another code point or the input stream close before deciding whether it is
+    // a CRLF pair or a standalone CR.
+    return m_decoded_input[m_current_offset] == '\r' && m_current_offset + 1 >= static_cast<ssize_t>(m_decoded_input.size());
+}
+
+bool HTMLTokenizer::can_run_out_of_characters(StopAtInsertionPoint stop_at_insertion_point) const
+{
+    return (stop_at_insertion_point == StopAtInsertionPoint::Yes && m_insertion_point.has_value())
+        || !m_input_stream_closed;
 }
 
 Optional<u32> HTMLTokenizer::next_code_point(StopAtInsertionPoint stop_at_insertion_point)
@@ -1718,9 +1733,10 @@ _StartOfFunction:
             // 13.2.5.73 Named character reference state, https://html.spec.whatwg.org/multipage/parsing.html#named-character-reference-state
             BEGIN_STATE(NamedCharacterReference)
             {
-                if (stop_at_insertion_point == StopAtInsertionPoint::Yes && is_insertion_point_defined()) {
+                if (can_run_out_of_characters(stop_at_insertion_point)) {
                     // If there is an insertion point, match code-point-by-code-point to handle the possibility of
-                    // document.write being used to insert a named character reference one-code-point-at-a-time.
+                    // document.write being used to insert a named character reference one-code-point-at-a-time. Do
+                    // the same for an open input stream, since more network input can extend the reference later.
                     if (current_input_character.has_value()) {
                         if (m_named_character_reference_matcher.try_consume_code_point(current_input_character.value())) {
                             m_temporary_buffer.append(current_input_character.value());
@@ -2868,9 +2884,8 @@ HTMLTokenizer::ConsumeNextResult HTMLTokenizer::consume_next_if_match(StringView
     for (size_t i = 0; i < string.length(); ++i) {
         auto code_point = peek_code_point(i, stop_at_insertion_point);
         if (!code_point.has_value()) {
-            if (StopAtInsertionPoint::Yes == stop_at_insertion_point) {
+            if (can_run_out_of_characters(stop_at_insertion_point))
                 return ConsumeNextResult::RanOutOfCharacters;
-            }
             return ConsumeNextResult::NotConsumed;
         }
         // FIXME: This should be more Unicode-aware.
@@ -2915,6 +2930,7 @@ HTMLTokenizer::HTMLTokenizer(StringView input, ByteString const& encoding)
     m_current_offset = 0;
     m_prev_offset = 0;
     m_source_positions.empend(0u, 0u);
+    m_input_stream_closed = true;
 }
 
 void HTMLTokenizer::parser_did_run(Badge<HTMLParser>)
@@ -2938,6 +2954,17 @@ String HTMLTokenizer::unparsed_input() const
     StringBuilder builder;
     builder.append(Utf32View { m_decoded_input.span().slice(m_current_offset) });
     return MUST(builder.to_string());
+}
+
+void HTMLTokenizer::append_to_input_stream(StringView input)
+{
+    for (auto code_point : Utf8View(input))
+        m_decoded_input.append(code_point);
+}
+
+void HTMLTokenizer::close_input_stream()
+{
+    m_input_stream_closed = true;
 }
 
 void HTMLTokenizer::insert_input_at_insertion_point(StringView input)
@@ -2969,6 +2996,7 @@ void HTMLTokenizer::insert_input_at_insertion_point(StringView input)
 
 void HTMLTokenizer::insert_eof()
 {
+    close_input_stream();
     m_explicit_eof_inserted = true;
 }
 

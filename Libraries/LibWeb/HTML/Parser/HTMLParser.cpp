@@ -173,8 +173,9 @@ HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mo
     m_document->set_encoding(MUST(String::from_utf8(standardized_encoding.value())));
 }
 
-HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode)
+HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, ScriptCreatedParser script_created)
     : m_scripting_mode(scripting_mode)
+    , m_script_created(script_created == ScriptCreatedParser::Yes)
     , m_document(document)
 {
     m_document->set_parser({}, *this);
@@ -275,6 +276,11 @@ void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint st
 {
     m_document->set_url(url);
     m_document->set_source(m_tokenizer.source());
+    run_until_completion(stop_at_insertion_point);
+}
+
+void HTMLParser::run_until_completion(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point)
+{
     m_post_parse_action = [this] { the_end(*m_document, this); };
     run(stop_at_insertion_point);
     if (!m_parser_pause_flag)
@@ -5169,7 +5175,13 @@ WebIDL::ExceptionOr<Vector<GC::Root<DOM::Node>>> HTMLParser::parse_html_fragment
 GC::Ref<HTMLParser> HTMLParser::create_for_scripting(DOM::Document& document)
 {
     auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
-    return document.realm().create<HTMLParser>(document, scripting_mode);
+    return document.realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::Yes);
+}
+
+GC::Ref<HTMLParser> HTMLParser::create_with_open_input_stream(DOM::Document& document)
+{
+    auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
+    return document.realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::No);
 }
 
 GC::Ref<HTMLParser> HTMLParser::create_with_uncertain_encoding(DOM::Document& document, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type)
