@@ -95,17 +95,14 @@ jobs:
               exit 1
           }
 
-          # 1. Define the executable path FIRST
           $ladybirdExe = "$pkgDir/bin/Ladybird.exe"
           if (!(Test-Path $ladybirdExe)) {
               Write-Host "Error: Ladybird.exe not found in package directory!" -ForegroundColor Red
               exit 1
           }
 
-          # 2. Add vcpkg bin to PATH
           $env:PATH = "$(Resolve-Path "Build/release/vcpkg_installed/x64-windows/bin");" + $env:PATH
 
-          # 3. NOW run windeployqt
           $process = Start-Process -FilePath $deployTool -ArgumentList "`"$ladybirdExe`" --dir `"$pkgDir/bin`" --no-translations --compiler-runtime" -Wait -NoNewWindow -PassThru
           
           if ($process.ExitCode -ne 0) {
@@ -126,7 +123,7 @@ jobs:
           @echo off
           setlocal
           echo ============================================
-          echo      Ladybird Windows Update Tool
+          echo   Unofficial Ladybird Build Updater
           echo ============================================
           echo.
           echo Please ensure Ladybird is closed before updating.
@@ -306,9 +303,16 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: success() && github.ref == 'refs/heads/master'
         with:
-          tag_name: latest
-          name: "Latest Windows Build"
-          body: "Commit: ${{ github.sha }}" 
+          tag_name: latest-unofficial
+          name: "Unofficial Automated Build"
+          body: |
+            **UNOFFICIAL BUILD**
+            This is an automated, experimental build created from a personal fork. 
+            It is **NOT** affiliated with, endorsed by, or supported by the official Ladybird Web Browser Initiative. 
+            
+            Please **do not** report bugs or issues found in this build to the official Ladybird repository.
+            
+            Commit: ${{ github.sha }}
           files: |
             ladybird-windows-x64.zip
             ladybird-windows-x64.zip.sha256
