@@ -97,60 +97,20 @@ SourceHighlighterClient::SourceHighlighterClient(String const& source, Syntax::L
     }
 }
 
-Vector<Syntax::TextDocumentSpan> const& SourceHighlighterClient::spans() const
-{
-    return document().spans();
-}
-
-void SourceHighlighterClient::set_span_at_index(size_t index, Syntax::TextDocumentSpan span)
-{
-    document().set_span_at_index(index, span);
-}
-
-Vector<Syntax::TextDocumentFoldingRegion>& SourceHighlighterClient::folding_regions()
-{
-    return document().folding_regions();
-}
-
-Vector<Syntax::TextDocumentFoldingRegion> const& SourceHighlighterClient::folding_regions() const
-{
-    return document().folding_regions();
-}
-
-ByteString SourceHighlighterClient::highlighter_did_request_text() const
+StringView SourceHighlighterClient::highlighter_did_request_text() const
 {
     return document().text();
 }
 
-void SourceHighlighterClient::highlighter_did_request_update()
-{
-    // No-op
-}
-
-Syntax::Document& SourceHighlighterClient::highlighter_did_request_document()
-{
-    return document();
-}
-
-Syntax::TextPosition SourceHighlighterClient::highlighter_did_request_cursor() const
-{
-    return {};
-}
-
 void SourceHighlighterClient::highlighter_did_set_spans(Vector<Syntax::TextDocumentSpan> spans)
 {
-    document().set_spans(span_collection_index, move(spans));
+    document().set_spans(move(spans));
 }
 
-void SourceHighlighterClient::highlighter_did_set_folding_regions(Vector<Syntax::TextDocumentFoldingRegion> folding_regions)
-{
-    document().set_folding_regions(move(folding_regions));
-}
-
-String highlight_source(Optional<URL::URL> const& url, URL::URL const& base_url, String const& source, Syntax::Language language, HighlightOutputMode mode)
+String highlight_source(Optional<URL::URL> const& url, URL::URL const& base_url, String const& source, Syntax::Language language)
 {
     SourceHighlighterClient highlighter_client { source, language };
-    return highlighter_client.to_html_string(url, base_url, mode);
+    return highlighter_client.to_html_string(url, base_url);
 }
 
 StringView SourceHighlighterClient::class_for_token(u64 token_type) const
@@ -268,11 +228,11 @@ StringView SourceHighlighterClient::class_for_token(u64 token_type) const
     }
 }
 
-String SourceHighlighterClient::to_html_string(Optional<URL::URL> const& url, URL::URL const& base_url, HighlightOutputMode mode) const
+String SourceHighlighterClient::to_html_string(Optional<URL::URL> const& url, URL::URL const& base_url) const
 {
     StringBuilder builder;
 
-    auto append_escaped = [&](Utf32View text) {
+    auto append_escaped = [&](Utf8View const& text) {
         for (auto code_point : text) {
             if (code_point == '&') {
                 builder.append("&amp;"sv);
@@ -295,35 +255,33 @@ String SourceHighlighterClient::to_html_string(Optional<URL::URL> const& url, UR
         builder.append("</span>"sv);
     };
 
-    if (mode == HighlightOutputMode::FullDocument) {
-        builder.append(R"~~~(
+    builder.append(R"~~~(
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <meta name="color-scheme" content="dark light">)~~~"sv);
 
-        if (url.has_value())
-            builder.appendff("<title>View Source - {}</title>", escape_html_entities(url->serialize_for_display()));
-        else
-            builder.append("<title>View Source</title>"sv);
+    if (url.has_value())
+        builder.appendff("<title>View Source - {}</title>", escape_html_entities(url->serialize_for_display()));
+    else
+        builder.append("<title>View Source</title>"sv);
 
-        builder.appendff("<style type=\"text/css\">{}</style>", HTML_HIGHLIGHTER_STYLE);
-        builder.append(R"~~~(
+    builder.appendff("<style type=\"text/css\">{}</style>", HTML_HIGHLIGHTER_STYLE);
+    builder.append(R"~~~(
 </head>
-<body>)~~~"sv);
-    }
-    builder.append("<pre class=\"html\">"sv);
+<body>
+<pre class=\"html\">)~~~"sv);
 
-    static constexpr auto href = to_array<u32>({ 'h', 'r', 'e', 'f' });
-    static constexpr auto src = to_array<u32>({ 's', 'r', 'c' });
+    static constexpr auto href = "href"sv;
+    static constexpr auto src = "src"sv;
     bool linkify_attribute = false;
 
-    auto resolve_url_for_attribute = [&](Utf32View const& attribute_value) -> Optional<URL::URL> {
+    auto resolve_url_for_attribute = [&](Utf8View const& attribute_value) -> Optional<URL::URL> {
         if (!linkify_attribute)
             return {};
 
-        auto attribute_url = MUST(String::formatted("{}", attribute_value));
-        auto attribute_url_without_quotes = attribute_url.bytes_as_string_view().trim("\""sv);
+        auto attribute_url_without_quotes = attribute_value.as_string().trim("\""sv);
 
         return Web::DOMURL::parse(attribute_url_without_quotes, base_url);
     };
@@ -341,13 +299,13 @@ String SourceHighlighterClient::to_html_string(Optional<URL::URL> const& url, UR
             if (length == 0)
                 return;
 
-            auto text = line_view.substring_view(start, length);
+            auto text = line_view.unicode_substring_view(start, length);
 
             if (span.has_value()) {
                 bool append_anchor_close = false;
 
                 if (span->data == to_underlying(Web::HTML::AugmentedTokenKind::AttributeName)) {
-                    linkify_attribute = text == Utf32View { href } || text == Utf32View { src };
+                    linkify_attribute = text.as_string() == href || text.as_string() == src;
                 } else if (span->data == to_underlying(Web::HTML::AugmentedTokenKind::AttributeValue)) {
                     if (auto href = resolve_url_for_attribute(text); href.has_value()) {
                         builder.appendff("<a href=\"{}\">", *href);
@@ -409,13 +367,11 @@ String SourceHighlighterClient::to_html_string(Optional<URL::URL> const& url, UR
         builder.append("</div>"sv);
     }
 
-    builder.append("</pre>"sv);
-    if (mode == HighlightOutputMode::FullDocument) {
-        builder.append(R"~~~(
+    builder.append(R"~~~(
+</pre>
 </body>
 </html>
 )~~~"sv);
-    }
 
     return builder.to_string_without_validation();
 }
