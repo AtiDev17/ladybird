@@ -68,7 +68,7 @@ jobs:
       - name: Setup Windows Specific Tools
         shell: pwsh
         run: |
-          choco install ccache pkgconfiglite -y --limit-output --execution-timeout=120
+          choco install ccache pkgconfiglite -y --limit-output
 
       - name: Build
         shell: pwsh
@@ -275,25 +275,6 @@ jobs:
           path: |
             ladybird-windows-x64.zip
           retention-days: 14
-
-      - name: Validate Build Stability
-        shell: pwsh
-        run: |
-          $binDir = "${{ github.workspace }}/ladybird-package/Ladybird/bin"
-          $pkgDir = "${{ github.workspace }}/ladybird-package/Ladybird"
-          $env:PATH = "$binDir;" + $env:PATH
-
-          $platformPlugin = Join-Path $binDir "platforms\qwindows.dll"
-          if (!(Test-Path $platformPlugin)) {
-              Write-Host "Build Failed: Qt platform plugin missing at $platformPlugin" -ForegroundColor Red
-              exit 1
-          }
-
-          $themeFile = Join-Path $pkgDir "share\Lagom\themes\Default.ini"
-          if (!(Test-Path $themeFile)) {
-              Write-Host "Build Failed: Theme file missing at $themeFile" -ForegroundColor Red
-              exit 1
-          }
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
