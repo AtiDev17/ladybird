@@ -24,13 +24,6 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1.13.0
 
-      - name: Restore LLVM Cache
-        id: llvm-cache
-        uses: actions/cache@v5
-        with:
-          path: C:\Program Files\LLVM
-          key: llvm-${{ hashFiles('.github/actions/setup/action.yml') }}-x64
-
       - name: Setup Environment
         uses: ./.github/actions/setup
         with:
