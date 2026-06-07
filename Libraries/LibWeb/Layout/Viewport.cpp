@@ -16,8 +16,6 @@
 
 namespace Web::Layout {
 
-GC_DEFINE_ALLOCATOR(Viewport);
-
 Viewport::Viewport(DOM::Document& document, CSS::ComputedProperties const& style)
     : BlockContainer(document, &document, style)
 {
@@ -33,18 +31,6 @@ DOM::Document const& Viewport::dom_node() const
 RefPtr<Painting::Paintable> Viewport::create_paintable() const
 {
     return Painting::ViewportPaintable::create(*this);
-}
-
-void Viewport::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    if (!m_text_blocks.has_value())
-        return;
-
-    for (auto& text_block : *m_text_blocks) {
-        for (auto& text_position : text_block.positions)
-            visitor.visit(text_position.dom_node);
-    }
 }
 
 Vector<Viewport::TextBlock> const& Viewport::text_blocks()
@@ -102,7 +88,11 @@ void Viewport::update_text_blocks()
             // https://html.spec.whatwg.org/multipage/interaction.html#inert-subtrees
             // When a node is inert:
             // - The user agent should ignore the node for the purposes of find-in-page.
-            auto& dom_node = const_cast<DOM::Text&>(text_node->dom_node());
+            auto* dom_text = text_node->dom_text();
+            if (!dom_text)
+                return TraversalDecision::Continue;
+
+            auto& dom_node = const_cast<DOM::Text&>(*dom_text);
             if (dom_node.is_inert())
                 return TraversalDecision::Continue;
 
