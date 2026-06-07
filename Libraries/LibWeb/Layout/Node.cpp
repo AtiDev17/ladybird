@@ -600,7 +600,7 @@ bool Node::is_sticky_position() const
     return position == CSS::Positioning::Sticky;
 }
 
-NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, GC::Ref<CSS::ComputedProperties> computed_style)
+NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, CSS::ComputedProperties const& computed_style)
     : Node(document, node)
     , m_computed_values(make<CSS::ComputedValues>())
 {
@@ -615,6 +615,11 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, NonnullOw
 {
     m_has_style = true;
     m_is_body = node && node == document.body();
+}
+
+NodeWithStyleAndBoxModelMetrics::NodeWithStyleAndBoxModelMetrics(DOM::Document& document, DOM::Node* node, CSS::ComputedProperties const& style)
+    : NodeWithStyle(document, node, style)
+{
 }
 
 NodeWithStyle::ImageObserver::ImageObserver(NodeWithStyle& owner, NonnullRefPtr<CSS::ImageStyleValue const> image)
@@ -652,7 +657,7 @@ void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleV
 
 void NodeWithStyle::ImageObserver::visit_edges(JS::Cell::Visitor& visitor) const
 {
-    m_image->visit_edges(visitor);
+    (void)visitor;
 }
 
 void NodeWithStyle::finalize()
@@ -702,9 +707,6 @@ void NodeWithStyle::visit_edges(Visitor& visitor)
         m_list_style_image->visit_edges(visitor);
 
     m_computed_values->visit_edges(visitor);
-
-    for (auto const& image_observer : m_image_observers)
-        image_observer->visit_edges(visitor);
 }
 
 void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)

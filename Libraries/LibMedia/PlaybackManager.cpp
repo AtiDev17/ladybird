@@ -10,6 +10,7 @@
 #include <LibMedia/GenericTimeProvider.h>
 #include <LibMedia/PlaybackStates/StartingStateHandler.h>
 #include <LibMedia/Processors/AudioMixer.h>
+#include <LibMedia/Processors/AudioTimeStretchProcessor.h>
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibMedia/Producers/DecodedVideoProducer.h>
 #include <LibMedia/Sinks/AudioPlaybackSink.h>
@@ -116,13 +117,15 @@ DecoderErrorOr<void> PlaybackManager::prepare_playback_from_demuxer(WeakPlayback
 
         if (!self->m_audio_output_disabled && !self->m_audio_sink && !self->m_audio_tracks.is_empty()) {
             self->m_audio_mixer = MUST(AudioMixer::try_create());
+            self->m_audio_time_stretch_processor = MUST(AudioTimeStretchProcessor::try_create());
             self->m_audio_sink = MUST(AudioPlaybackSink::try_create(
                 [self](PipelineStatus status) {
                     if (!self)
                         return;
                     self->on_audio_sink_state_changed(status);
                 }));
-            MUST(self->m_audio_sink->connect_input(*self->m_audio_mixer));
+            MUST(self->m_audio_time_stretch_processor->connect_input(*self->m_audio_mixer));
+            MUST(self->m_audio_sink->connect_input(*self->m_audio_time_stretch_processor));
             self->set_time_provider(*self->m_audio_sink);
             self->m_audio_sink->on_audio_output_error = [self](Error&& error) {
                 if (!self)
@@ -301,6 +304,7 @@ void PlaybackManager::set_time_provider(NonnullRefPtr<MediaTimeProvider> const& 
             continue;
         track_data.display->set_time_provider(provider);
     }
+    provider->set_playback_rate(m_playback_rate);
     if (is_playing())
         provider->resume();
 }
@@ -309,6 +313,7 @@ void PlaybackManager::disable_audio()
 {
     m_audio_buffering = false;
     m_audio_mixer = nullptr;
+    m_audio_time_stretch_processor = nullptr;
     m_audio_sink = nullptr;
     set_time_provider(make_ref_counted<GenericTimeProvider>());
     on_audio_sink_state_changed(PipelineStatus::EndOfStream);
@@ -343,8 +348,10 @@ void PlaybackManager::enable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(!track_data.enabled);
-    if (m_audio_mixer)
+    if (m_audio_mixer) {
+        m_audio_mixer->seek(current_time());
         MUST(m_audio_mixer->connect_input(track_data.producer));
+    }
     track_data.enabled = true;
 }
 
@@ -352,8 +359,10 @@ void PlaybackManager::disable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(track_data.enabled);
-    if (m_audio_mixer)
+    if (m_audio_mixer) {
+        m_audio_mixer->seek(current_time());
         m_audio_mixer->disconnect_input(track_data.producer);
+    }
     track_data.enabled = false;
 }
 
@@ -430,6 +439,12 @@ void PlaybackManager::set_volume(double volume)
 {
     if (m_audio_sink)
         m_audio_sink->set_volume(volume);
+}
+
+void PlaybackManager::set_playback_rate(float rate)
+{
+    m_playback_rate = rate;
+    m_time_provider->set_playback_rate(rate);
 }
 
 }

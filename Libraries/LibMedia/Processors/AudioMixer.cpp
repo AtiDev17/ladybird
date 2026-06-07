@@ -37,7 +37,7 @@ ErrorOr<void> AudioMixer::connect_input(NonnullRefPtr<AudioProducer> const& inpu
         {
             Sync::MutexLocker locker { m_mutex };
             m_status = combined_input_status();
-            should_wake_downstream = m_downstream_needs_wake && !is_waiting_for_data(m_status);
+            should_wake_downstream = status_change_should_wake(m_last_returned_status, m_status);
             if (m_moved_position_pending)
                 m_status = PipelineStatus::MovedPosition;
         }
@@ -49,6 +49,7 @@ ErrorOr<void> AudioMixer::connect_input(NonnullRefPtr<AudioProducer> const& inpu
             disconnect_input_while_locked(input);
             return result.release_error();
         }
+        input->set_playback_rate(m_playback_rate);
         input->seek(mix_head_timestamp());
         if (m_started)
             input->start();
@@ -68,7 +69,7 @@ void AudioMixer::disconnect_input_while_locked(NonnullRefPtr<AudioProducer> cons
     input->set_wake_handler(nullptr);
     m_inputs.remove(input);
     m_status = combined_input_status();
-    if (m_downstream_needs_wake && !is_waiting_for_data(m_status)) {
+    if (status_change_should_wake(m_last_returned_status, m_status)) {
         Core::deferred_invoke([self = NonnullRefPtr(*this)] {
             self->dispatch_wake();
         });
@@ -118,6 +119,16 @@ Audio::SampleSpecification AudioMixer::sample_specification() const
     return m_sample_specification;
 }
 
+void AudioMixer::set_playback_rate(float rate)
+{
+    Sync::MutexLocker locker { m_mutex };
+    if (m_playback_rate == rate)
+        return;
+    for (auto& [input, input_data] : m_inputs)
+        input->set_playback_rate(rate);
+    m_playback_rate = rate;
+}
+
 AK::Duration AudioMixer::mix_head_timestamp() const
 {
     return AK::Duration::from_time_units(m_next_frame_to_write, 1, m_sample_specification.sample_rate());
@@ -140,7 +151,7 @@ void AudioMixer::seek(AK::Duration timestamp)
         }
 
         m_status = PipelineStatus::Pending;
-        m_downstream_needs_wake = true;
+        m_last_returned_status = PipelineStatus::Pending;
     }
 
     if (m_inputs.is_empty()) {
@@ -164,7 +175,7 @@ PipelineStatus AudioMixer::status() const
     m_status = combined_input_status();
     if (m_moved_position_pending)
         m_status = PipelineStatus::MovedPosition;
-    m_downstream_needs_wake = is_waiting_for_data(m_status);
+    m_last_returned_status = m_status;
     return m_status;
 }
 
@@ -177,8 +188,6 @@ void AudioMixer::dispatch_wake()
 {
     if (m_wake_handler)
         m_wake_handler();
-    Sync::MutexLocker locker { m_mutex };
-    m_downstream_needs_wake = false;
 }
 
 PipelineStatus AudioMixer::combined_input_status() const
@@ -187,12 +196,12 @@ PipelineStatus AudioMixer::combined_input_status() const
     for (auto& [input, input_data] : m_inputs) {
         if (!input_data.current_block.is_empty()
             && input_data.current_block.sample_specification() == m_sample_specification
-            && input_data.current_block.end_timestamp_in_frames() > m_next_frame_to_write) {
+            && input_data.current_block.end_frame_index() > m_next_frame_to_write) {
             status = select_combined_pipeline_status(status, PipelineStatus::HaveData);
             continue;
         }
 
-        if (!can_carry_data(input_data.last_status)) {
+        if (is_waiting_for_data(input_data.last_status) && !is_terminal(input_data.last_status)) {
             while ((input_data.last_status = input->status()) == PipelineStatus::MovedPosition) {
                 input->pull(input_data.current_block);
                 VERIFY(input_data.current_block.is_empty());
@@ -227,113 +236,122 @@ void AudioMixer::pull(AudioBlock& into)
 
     auto buffer_start_frame = m_next_frame_to_write;
     auto frames_end_cap = buffer_start_frame + static_cast<i64>(max_frame_count);
-    auto write_size = max_frame_count * channel_count;
 
     auto combined_status_after_mix = PipelineStatus::EndOfStream;
     i64 latest_mixed_frame = frames_end_cap;
+    i64 latest_frame_containing_data = buffer_start_frame;
 
     for (auto& [input, input_data] : m_inputs)
         input_data.next_frame = buffer_start_frame;
 
-    into.emplace(m_sample_specification, buffer_start_frame, [&](AudioBlock::Data& data) {
-        data.resize_and_keep_capacity(write_size);
-        for (size_t i = 0; i < write_size; i++)
-            data[i] = 0.0f;
+    into.initialize(m_sample_specification, buffer_start_frame, max_frame_count);
+    for (size_t channel = 0; channel < channel_count; ++channel)
+        into.channel_data(channel).fill(0.0f);
 
-        while (true) {
-            struct MixTarget {
-                AudioProducer& input;
-                InputMixingData& input_data;
-            };
-            auto mix_target = [&] {
-                Optional<MixTarget> result;
-                for (auto& [input, input_data] : m_inputs) {
-                    if (input_data.next_frame >= frames_end_cap)
-                        continue;
-                    if (!result.has_value() || input_data.next_frame < result->input_data.next_frame)
-                        result = { input, input_data };
-                }
-                return result;
-            }();
-            if (!mix_target.has_value())
-                break;
-            auto [input, input_data] = mix_target.release_value();
-
-            auto& current_block = input_data.current_block;
-            input_data.last_status = input.status();
-            while (input_data.last_status == PipelineStatus::MovedPosition) {
-                input.pull(current_block);
-                VERIFY(current_block.is_empty());
-                input_data.last_status = input.status();
-            }
-
-            auto current_block_is_usable = [&] {
-                if (current_block.is_empty())
-                    return false;
-                if (current_block.sample_specification() != m_sample_specification)
-                    return false;
-                if (current_block.end_timestamp_in_frames() <= input_data.next_frame)
-                    return false;
-                return true;
-            }();
-
-            if (!current_block_is_usable) {
-                current_block.clear();
-                if (input_data.last_status == PipelineStatus::EndOfStream) {
-                    input_data.next_frame = frames_end_cap;
+    while (true) {
+        struct MixTarget {
+            AudioProducer& input;
+            InputMixingData& input_data;
+        };
+        auto mix_target = [&] {
+            Optional<MixTarget> result;
+            for (auto& [input, input_data] : m_inputs) {
+                if (input_data.next_frame >= frames_end_cap)
                     continue;
-                }
-                if (input_data.last_status != PipelineStatus::HaveData)
-                    break;
-                input.pull(current_block);
-                VERIFY(!current_block.is_empty());
-                continue;
+                if (!result.has_value() || input_data.next_frame < result->input_data.next_frame)
+                    result = { input, input_data };
             }
+            return result;
+        }();
+        if (!mix_target.has_value())
+            break;
+        auto [input, input_data] = mix_target.release_value();
 
-            auto first_frame_offset = current_block.timestamp_in_frames();
-            if (first_frame_offset >= frames_end_cap) {
+        auto& current_block = input_data.current_block;
+        input_data.last_status = input.status();
+        while (input_data.last_status == PipelineStatus::MovedPosition) {
+            input.pull(current_block);
+            VERIFY(current_block.is_empty());
+            input_data.last_status = input.status();
+        }
+
+        auto current_block_is_usable = [&] {
+            if (current_block.is_empty())
+                return false;
+            if (current_block.sample_specification() != m_sample_specification)
+                return false;
+            if (current_block.end_frame_index() <= input_data.next_frame)
+                return false;
+            return true;
+        }();
+
+        if (!current_block_is_usable) {
+            current_block.clear();
+            if (input_data.last_status == PipelineStatus::EndOfStream) {
                 input_data.next_frame = frames_end_cap;
                 continue;
             }
-
-            auto next_frame = max(input_data.next_frame, first_frame_offset);
-
-            VERIFY(next_frame >= first_frame_offset);
-            auto index_in_block = static_cast<size_t>((next_frame - first_frame_offset) * channel_count);
-            VERIFY(index_in_block < current_block.sample_count());
-
-            VERIFY(next_frame >= buffer_start_frame);
-            auto index_in_buffer = static_cast<size_t>((next_frame - buffer_start_frame) * channel_count);
-            VERIFY(index_in_buffer < write_size);
-
-            VERIFY(current_block.sample_count() >= index_in_block);
-            auto write_count = current_block.sample_count() - index_in_block;
-            write_count = min(write_count, write_size - index_in_buffer);
-            VERIFY(write_count > 0);
-            VERIFY(index_in_buffer + write_count <= write_size);
-            VERIFY(write_count % channel_count == 0);
-
-            for (size_t i = 0; i < write_count; i++)
-                data[index_in_buffer + i] += current_block.data()[index_in_block + i];
-
-            input_data.next_frame = next_frame + static_cast<i64>(write_count / channel_count);
+            if (input_data.last_status != PipelineStatus::HaveData)
+                break;
+            input.pull(current_block);
+            VERIFY(!current_block.is_empty());
+            continue;
         }
 
-        for (auto& [input, input_data] : m_inputs) {
-            VERIFY(input_data.last_status != PipelineStatus::MovedPosition);
-            latest_mixed_frame = min(latest_mixed_frame, input_data.next_frame);
-            combined_status_after_mix = select_combined_pipeline_status(combined_status_after_mix, input_data.last_status);
+        auto first_frame_offset = current_block.first_frame_index();
+        if (first_frame_offset >= frames_end_cap) {
+            input_data.next_frame = frames_end_cap;
+            continue;
         }
-    });
+
+        auto next_frame = max(input_data.next_frame, first_frame_offset);
+
+        VERIFY(next_frame >= first_frame_offset);
+        auto frame_index_in_block = static_cast<size_t>(next_frame - first_frame_offset);
+        VERIFY(frame_index_in_block < current_block.frame_count());
+
+        VERIFY(next_frame >= buffer_start_frame);
+        auto frame_index_in_buffer = static_cast<size_t>(next_frame - buffer_start_frame);
+        VERIFY(frame_index_in_buffer < max_frame_count);
+
+        VERIFY(current_block.frame_count() >= frame_index_in_block);
+        auto frames_to_write = current_block.frame_count() - frame_index_in_block;
+        frames_to_write = min(frames_to_write, max_frame_count - frame_index_in_buffer);
+        VERIFY(frames_to_write > 0);
+        VERIFY(frame_index_in_buffer + frames_to_write <= max_frame_count);
+
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+            auto input_channel = current_block.channel_data(channel).slice(frame_index_in_block, frames_to_write);
+            auto output_channel = into.channel_data(channel).slice(frame_index_in_buffer, frames_to_write);
+            for (size_t frame = 0; frame < frames_to_write; ++frame)
+                output_channel[frame] += input_channel[frame];
+        }
+
+        input_data.next_frame = next_frame + static_cast<i64>(frames_to_write);
+        latest_frame_containing_data = max(latest_frame_containing_data, input_data.next_frame);
+    }
+
+    for (auto& [input, input_data] : m_inputs) {
+        VERIFY(input_data.last_status != PipelineStatus::MovedPosition);
+        latest_mixed_frame = min(latest_mixed_frame, input_data.next_frame);
+        combined_status_after_mix = select_combined_pipeline_status(combined_status_after_mix, input_data.last_status);
+    }
 
     VERIFY(latest_mixed_frame >= buffer_start_frame);
-    auto frame_count = static_cast<size_t>(latest_mixed_frame - buffer_start_frame);
-
     if (combined_status_after_mix == PipelineStatus::EndOfStream) {
-        m_next_frame_to_write = frames_end_cap;
+        if (latest_frame_containing_data > buffer_start_frame) {
+            auto frame_count = static_cast<size_t>(latest_frame_containing_data - buffer_start_frame);
+            into.trim(frame_count);
+            m_next_frame_to_write += static_cast<i64>(frame_count);
+            m_status = PipelineStatus::HaveData;
+            return;
+        }
+        into.clear();
         m_status = PipelineStatus::EndOfStream;
         return;
     }
+
+    auto frame_count = static_cast<size_t>(latest_mixed_frame - buffer_start_frame);
 
     if (frame_count == 0) {
         into.clear();

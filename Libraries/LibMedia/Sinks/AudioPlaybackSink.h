@@ -11,7 +11,6 @@
 #include <AK/RefPtr.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/Audio/Forward.h>
-#include <LibMedia/Audio/SampleSpecification.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaTimeProvider.h>
@@ -40,24 +39,35 @@ public:
     virtual void pause() override;
     virtual void seek(AK::Duration) override;
 
+    virtual void set_playback_rate(float) override;
+
     void set_volume(double);
 
     Function<void(Error&&)> on_audio_output_error;
 
 private:
+    enum class StreamState {
+        Suspended,
+        Playing,
+    };
+
     void create_playback_stream();
+    bool effectively_paused() const;
+    void update_playback_stream_state();
+    void resume_playback_stream();
+    void pause_playback_stream();
 
     Core::EventLoop& m_main_thread_event_loop;
 
-    Audio::SampleSpecification m_sample_specification;
-
     bool m_started_creating_playback_stream { false };
     bool m_playing { false };
+    StreamState m_stream_state { StreamState::Suspended };
     double m_volume { 1 };
 
-    AK::Duration m_last_stream_time;
-    AK::Duration m_last_media_time;
+    AK::Duration m_anchor_stream_time;
+    i64 m_anchor_output_frame_index { 0 };
     Optional<AK::Duration> m_temporary_time;
+    mutable AK::Duration m_minimum_media_time;
 
     NonnullRefPtr<OutputThreadData> m_output_thread_data;
 };

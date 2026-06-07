@@ -195,24 +195,26 @@ Optional<ByteString> Application::ask_user_for_download_path(StringView file) co
     }
     gtk_file_dialog_set_initial_name(GTK_FILE_DIALOG(dialog.ptr()), ByteString(file).characters());
 
-    Optional<ByteString> result;
-    Core::EventLoop nested_loop;
+    struct FileDialogSaveResult {
+        bool done { false };
+        Optional<ByteString> path;
+    } result;
 
     gtk_file_dialog_save(GTK_FILE_DIALOG(dialog.ptr()), m_active_window->gtk_window(), nullptr, +[](GObject* source, GAsyncResult* async_result, gpointer user_data) {
-        auto* result_ptr = static_cast<Optional<ByteString>*>(user_data);
+        auto* result_ptr = static_cast<FileDialogSaveResult*>(user_data);
         GError* error = nullptr;
         GObjectPtr file { gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source), async_result, &error) };
         if (file.ptr()) {
             g_autofree char* path = g_file_get_path(G_FILE(file.ptr()));
             if (path)
-                *result_ptr = ByteString(path);
+                result_ptr->path = ByteString(path);
         }
         if (error)
             g_error_free(error);
-        Core::EventLoop::current().quit(0); }, &result);
+        result_ptr->done = true; }, &result);
 
-    nested_loop.exec();
-    return result;
+    Core::EventLoop::current().spin_until([&] { return result.done; });
+    return result.path;
 }
 
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
@@ -232,23 +234,26 @@ void Application::display_error_dialog(StringView error_message) const
     Dialogs::show_error(m_active_window->gtk_window(), error_message);
 }
 
-// GDK4 only provides an async clipboard API. Spin a nested event loop to read synchronously.
+// GDK4 only provides an async clipboard API. Spin the event loop until we get a response.
 static Optional<ByteString> read_clipboard_text_sync()
 {
     auto* clipboard = gdk_display_get_clipboard(gdk_display_get_default());
 
-    Optional<ByteString> result;
-    Core::EventLoop nested_loop;
+    struct ClipboardReadTextResult {
+        bool done { false };
+        Optional<ByteString> text;
+    } result;
 
     gdk_clipboard_read_text_async(clipboard, nullptr, [](GObject* source, GAsyncResult* async_result, gpointer user_data) {
-        auto* result_ptr = static_cast<Optional<ByteString>*>(user_data);
+        auto* result_ptr = static_cast<ClipboardReadTextResult*>(user_data);
         g_autofree char* text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(source), async_result, nullptr);
         if (text)
-            *result_ptr = ByteString(text);
-        Core::EventLoop::current().quit(0); }, &result);
+            result_ptr->text = ByteString(text);
 
-    nested_loop.exec();
-    return result;
+        result_ptr->done = true; }, &result);
+
+    Core::EventLoop::current().spin_until([&] { return result.done; });
+    return result.text;
 }
 
 Utf16String Application::clipboard_text(ClipboardType) const
