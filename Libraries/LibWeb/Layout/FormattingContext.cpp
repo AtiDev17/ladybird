@@ -923,6 +923,15 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
             return width_of_containing_block - left - margin_left.to_px_or_zero(box) - border_left - padding_left - width.to_px_or_zero(box) - padding_right - border_right - margin_right.to_px_or_zero(box);
         };
 
+        auto calculate_shrink_to_fit_width = [&] {
+            auto available_width = solve_for_width().to_px(box);
+            auto preferred_width = calculate_max_content_width(box);
+            if (preferred_width <= available_width)
+                return preferred_width;
+            auto preferred_minimum_width = calculate_min_content_width(box);
+            return min(max(preferred_minimum_width, available_width), preferred_width);
+        };
+
         // If all three of 'left', 'width', and 'right' are 'auto':
         if (computed_left.is_auto() && width.is_auto() && computed_right.is_auto()) {
             // First set any 'auto' values for 'margin-left' and 'margin-right' to 0.
@@ -937,9 +946,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
             // NOTE: As with compute_height_for_absolutely_positioned_non_replaced_element, we actually apply these
             //       steps in the opposite order since the static position may depend on the width of the box.
 
-            auto result = calculate_shrink_to_fit_widths(box);
-            auto available_width = solve_for_width();
-            CSSPixels content_width = min(max(result.preferred_minimum_width, available_width.to_px(box)), result.preferred_width);
+            auto content_width = calculate_shrink_to_fit_width();
             width = CSS::Length::make_px(content_width);
             m_state.get_mutable(box).set_content_width(content_width);
 
@@ -988,9 +995,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
         // 1. 'left' and 'width' are 'auto' and 'right' is not 'auto',
         //    then the width is shrink-to-fit. Then solve for 'left'
         if (computed_left.is_auto() && width.is_auto() && !computed_right.is_auto()) {
-            auto result = calculate_shrink_to_fit_widths(box);
-            auto available_width = solve_for_width();
-            width = CSS::Length::make_px(min(max(result.preferred_minimum_width, available_width.to_px(box)), result.preferred_width));
+            width = CSS::Length::make_px(calculate_shrink_to_fit_width());
             left = solve_for_left();
         }
 
@@ -1009,9 +1014,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
         // 3. 'width' and 'right' are 'auto' and 'left' is not 'auto',
         //    then the width is shrink-to-fit. Then solve for 'right'
         else if (width.is_auto() && computed_right.is_auto() && !computed_left.is_auto()) {
-            auto result = calculate_shrink_to_fit_widths(box);
-            auto available_width = solve_for_width();
-            width = CSS::Length::make_px(min(max(result.preferred_minimum_width, available_width.to_px(box)), result.preferred_width));
+            width = CSS::Length::make_px(calculate_shrink_to_fit_width());
             right = solve_for_right();
         }
 
@@ -2042,9 +2045,11 @@ CSSPixels FormattingContext::calculate_fit_content_width(Layout::Box const& box,
     // If the available space in a given axis is definite, equal to clamp(min-content size, stretch-fit size,
     // max-content size) (i.e. max(min-content size, min(max-content size, stretch-fit size))).
     if (available_space.width.is_definite()) {
-        return max(calculate_min_content_width(box),
-            min(calculate_stretch_fit_width(box, available_space.width),
-                calculate_max_content_width(box)));
+        auto stretch_fit_width = calculate_stretch_fit_width(box, available_space.width);
+        auto max_content_width = calculate_max_content_width(box);
+        if (max_content_width <= stretch_fit_width)
+            return max_content_width;
+        return max(calculate_min_content_width(box), stretch_fit_width);
     }
 
     // When sizing under a min-content constraint, equal to the min-content size.
@@ -2062,9 +2067,12 @@ CSSPixels FormattingContext::calculate_fit_content_height(Layout::Box const& box
     // equal to clamp(min-content size, stretch-fit size, max-content size)
     // (i.e. max(min-content size, min(max-content size, stretch-fit size))).
     if (available_space.height.is_definite()) {
-        return max(calculate_min_content_height(box, available_space.width.to_px_or_zero()),
-            min(calculate_stretch_fit_height(box, available_space.height),
-                calculate_max_content_height(box, available_space.width.to_px_or_zero())));
+        auto width = available_space.width.to_px_or_zero();
+        auto stretch_fit_height = calculate_stretch_fit_height(box, available_space.height);
+        auto max_content_height = calculate_max_content_height(box, width);
+        if (max_content_height <= stretch_fit_height)
+            return max_content_height;
+        return max(calculate_min_content_height(box, width), stretch_fit_height);
     }
 
     // When sizing under a min-content constraint, equal to the min-content size.

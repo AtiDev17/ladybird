@@ -12,12 +12,24 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 
 namespace Web::CSS::Invalidation {
+
+static bool element_may_have_attribute_matching_selector(DOM::Element const& element, Selector::SimpleSelector::Attribute const& attribute)
+{
+    auto const& attribute_name = attribute.qualified_name.name.name;
+    if (element.has_attribute(attribute_name))
+        return true;
+
+    auto const& lowercase_attribute_name = attribute.qualified_name.name.lowercase_name;
+    return lowercase_attribute_name != attribute_name && element.has_attribute(lowercase_attribute_name);
+}
 
 static bool compound_may_match_element_impl(DOM::Element const& element, Selector::CompoundSelector const& compound_selector, Optional<PseudoClass> ignored_pseudo_class, bool in_selector_list_argument)
 {
@@ -47,7 +59,7 @@ static bool compound_may_match_element_impl(DOM::Element const& element, Selecto
                 return false;
             break;
         case Selector::SimpleSelector::Type::Attribute:
-            if (!element.has_attribute(simple_selector.attribute().qualified_name.name.lowercase_name))
+            if (!element_may_have_attribute_matching_selector(element, simple_selector.attribute()))
                 return false;
             break;
         case Selector::SimpleSelector::Type::PseudoClass: {
@@ -100,7 +112,7 @@ bool element_matches_any_invalidation_set_property(DOM::Element const& element, 
         case InvalidationSet::Property::Type::Id:
             return element.id() == property.name();
         case InvalidationSet::Property::Type::TagName:
-            return element.local_name() == property.name();
+            return element.lowercased_local_name() == property.name();
         case InvalidationSet::Property::Type::Attribute:
             return element.has_attribute(property.name()) || element.has_removed_attribute_for_style_invalidation(property.name());
         case InvalidationSet::Property::Type::PseudoClass: {
@@ -144,6 +156,17 @@ bool element_matches_any_invalidation_set_property(DOM::Element const& element, 
                 return element.is_shadow_host();
             case PseudoClass::Required:
             case PseudoClass::Optional:
+                return is<HTML::HTMLInputElement>(element)
+                    || is<HTML::HTMLSelectElement>(element)
+                    || is<HTML::HTMLTextAreaElement>(element);
+            case PseudoClass::Valid:
+            case PseudoClass::Invalid: {
+                auto const* html_element = as_if<HTML::HTMLElement>(element);
+                return (html_element && html_element->is_form_associated_element())
+                    || is<HTML::HTMLFormElement>(element);
+            }
+            case PseudoClass::UserValid:
+            case PseudoClass::UserInvalid:
                 return is<HTML::HTMLInputElement>(element)
                     || is<HTML::HTMLSelectElement>(element)
                     || is<HTML::HTMLTextAreaElement>(element);
