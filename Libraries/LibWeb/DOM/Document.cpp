@@ -5744,7 +5744,10 @@ void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_docum
                 auto increment_unloaded = GC::create_function(heap, [unload_state] { unload_state->did_process_child(); });
 
                 // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
-                child_navigable->active_document()->unload_a_document_and_its_descendants({}, increment_unloaded);
+                if (auto active_document = child_navigable->active_document())
+                    active_document->unload_a_document_and_its_descendants({}, increment_unloaded);
+                else
+                    increment_unloaded->function()();
             }));
     }
 
@@ -7930,6 +7933,17 @@ Vector<GC::Root<Range>> Document::find_matching_text(String const& query, CaseSe
             auto end_dom_node = match_end_position->dom_node.ptr();
             VERIFY(end_dom_node);
             auto end_position = match_index.value() + utf16_query.length_in_code_units() - match_end_position->start_offset + match_end_position->dom_offset_within_node;
+
+            if (&start_dom_node->root() != &end_dom_node->root()
+                || !start_dom_node->is_connected()
+                || !end_dom_node->is_connected()
+                || start_position > start_dom_node->length()
+                || end_position > end_dom_node->length()) {
+                offset = match_index.value() + utf16_query.length_in_code_units() + 1;
+                if (offset >= text_view.length_in_code_units())
+                    break;
+                continue;
+            }
 
             matches.append(Range::create(*start_dom_node, start_position, *end_dom_node, end_position));
             match_start_position = match_end_position;

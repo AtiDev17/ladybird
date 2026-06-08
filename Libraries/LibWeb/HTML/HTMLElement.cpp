@@ -224,7 +224,7 @@ WebIDL::ExceptionOr<void> HTMLElement::set_outer_text(Utf16View const& value)
         MUST(fragment->append_child(document().create_text_node({})));
 
     // 6. Replace this with fragment within this's parent.
-    MUST(parent()->replace_child(fragment, *this));
+    TRY(parent()->replace_child(fragment, *this));
 
     // 7. If next is non-null and next's previous sibling is a Text node, then merge with the next text node given next's previous sibling.
     if (next && is<DOM::Text>(next->previous_sibling()))
@@ -313,6 +313,8 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
     //    FIXME: - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for non-replaced block-level CSS boxes.
     auto* layout_node = node.layout_node();
     if (!layout_node)
+        return items;
+    if (!layout_node->has_style_or_parent_with_style())
         return items;
 
     auto const& computed_values = layout_node->computed_values();
