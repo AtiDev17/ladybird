@@ -274,7 +274,7 @@ jobs:
           name: ladybird-windows-x64
           path: |
             ladybird-windows-x64.zip
-          retention-days: 14
+          retention-days: 1
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
