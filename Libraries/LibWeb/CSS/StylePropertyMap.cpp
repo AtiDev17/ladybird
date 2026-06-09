@@ -131,6 +131,11 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
     if ((property->is_custom_property() || property_is_single_valued(property->id())) && values.size() > 1)
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Property '{}' only accepts a single value", property_name)) };
 
+    // FIXME: The spec doesn't say how to handle empty `values`, but other browsers throw a TypeError so let's do that
+    //        too - see https://github.com/w3c/css-houdini-drafts/issues/1176
+    if (values.is_empty())
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Property '{}' requires at least one value", property_name)) };
+
     // 4. If any of the items in values have a non-null [[associatedProperty]] internal slot, and that slot’s value is
     //    anything other than property, throw a TypeError.
     if (any_have_non_matching_associated_property(property->name(), values))
@@ -148,10 +153,6 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
     // 6. Let props be the value of this’s [[declarations]] internal slot.
     auto& props = declarations();
 
-    // 7. If props[property] exists, remove it.
-    // FIXME: Avoid converting to string and back.
-    TRY(props.remove_property(property->name()));
-
     // 8. Let values to set be an empty list.
     StyleValueVector values_to_set;
 
@@ -167,6 +168,12 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
 
         values_to_set.append(move(internal_representation));
     }
+
+    // 7. If props[property] exists, remove it.
+    // FIXME: Avoid converting to string and back.
+    // FIXME: We handle this after creating the internal representations (step 9) so that we maintain the original
+    //        value in the case that fails - see https://github.com/w3c/css-houdini-drafts/issues/1175
+    TRY(props.remove_property(property->name()));
 
     // AD-HOC: To match the behavior of our parser we should store values of list-valued longhands as lists even if
     //         there is only one value, except in some rare circumstances.

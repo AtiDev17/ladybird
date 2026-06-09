@@ -122,6 +122,8 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(u64
         arguments.append("--disable-async-scrolling"sv);
     if (web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
         arguments.append("--tuple-file-origins"sv);
+    if (browser_options.enable_sandbox == EnableSandbox::Yes)
+        arguments.append("--enable-sandbox"sv);
 
     if (auto const maybe_echo_server_port = web_content_options.echo_server_port; maybe_echo_server_port.has_value()) {
         arguments.append("--echo-server-port"sv);
@@ -146,7 +148,11 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(u64
 
 ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> launch_image_decoder_process()
 {
+    auto const& browser_options = WebView::Application::browser_options();
+
     Vector<ByteString> arguments;
+    if (browser_options.enable_sandbox == EnableSandbox::Yes)
+        arguments.append("--enable-sandbox"sv);
     if (auto server = mach_server_name(); server.has_value()) {
         arguments.append("--mach-server-name"sv);
         arguments.append(server.value());
@@ -157,9 +163,12 @@ ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> launch_image_decoder_process(
 
 ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
 {
+    auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
 
     Vector<ByteString> arguments;
+    if (browser_options.enable_sandbox == EnableSandbox::Yes)
+        arguments.append("--enable-sandbox"sv);
     if (web_content_options.force_cpu_painting == WebView::ForceCPUPainting::Yes)
         arguments.append("--force-cpu-painting"sv);
     if (web_content_options.force_fontconfig == WebView::ForceFontconfig::Yes)
@@ -176,10 +185,13 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
 
 ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings::AgentType type, Web::HTML::WorkerAgentId agent_id)
 {
+    auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
 
     Vector<ByteString> arguments;
 
+    if (browser_options.enable_sandbox == EnableSandbox::Yes)
+        arguments.append("--enable-sandbox"sv);
     if (web_content_options.expose_experimental_interfaces == WebView::ExposeExperimentalInterfaces::Yes)
         arguments.append("--expose-experimental-interfaces"sv);
     if (web_content_options.enable_http_memory_cache == WebView::EnableMemoryHTTPCache::Yes)
@@ -212,10 +224,13 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings:
 
 ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process()
 {
+    auto const& browser_options = Application::browser_options();
     auto const& request_server_options = Application::request_server_options();
 
     Vector<ByteString> arguments;
 
+    if (browser_options.enable_sandbox == EnableSandbox::Yes)
+        arguments.append("--enable-sandbox"sv);
     for (auto const& certificate : request_server_options.certificates)
         arguments.append(ByteString::formatted("--certificate={}", certificate));
 
