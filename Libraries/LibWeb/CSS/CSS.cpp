@@ -29,7 +29,7 @@ WebIDL::ExceptionOr<String> escape(JS::VM&, StringView identifier)
 }
 
 // https://www.w3.org/TR/css-conditional-3/#dom-css-supports
-bool supports(JS::VM&, FlyString const& property_name, StringView value)
+bool supports(JS::VM&, Utf16FlyString const& property_name, StringView value)
 {
     // 1. If property is an ASCII case-insensitive match for any defined CSS property that the UA supports, or is a
     //    custom property name string, and value successfully parses according to that property’s grammar, return true.
@@ -76,7 +76,8 @@ WebIDL::ExceptionOr<void> register_property(JS::VM& vm, Bindings::PropertyDefini
 
     // If property set already contains an entry with name as its property name (compared codepoint-wise),
     // throw an InvalidModificationError and exit this algorithm.
-    if (property_set.contains(definition.name))
+    auto property_name = Utf16FlyString::from_utf8(definition.name);
+    if (property_set.contains(property_name))
         return WebIDL::InvalidModificationError::create(realm, "Property already registered"_utf16);
 
     auto parsing_params = CSS::Parser::ParsingParams { document };
@@ -142,7 +143,7 @@ WebIDL::ExceptionOr<void> register_property(JS::VM& vm, Bindings::PropertyDefini
     // 6. Let registered property be a struct with a property name of name, a syntax of syntax definition,
     //    an initial value of parsed initial value, and an inherit flag of inherit flag.
     CustomPropertyRegistration registered_property {
-        .property_name = definition.name,
+        .property_name = property_name,
         .syntax = definition.syntax,
         .inherit = definition.inherits,
         .initial_value = initial_value_maybe,

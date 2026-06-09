@@ -38,7 +38,7 @@ String CSSDescriptors::item(size_t index) const
     if (index >= length())
         return {};
 
-    return m_descriptors[index].descriptor_name_and_id.name().to_string();
+    return m_descriptors[index].descriptor_name_and_id.name().to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
 }
 
 // https://drafts.csswg.org/cssom/#set-a-css-declaration
@@ -63,11 +63,14 @@ bool CSSDescriptors::set_a_css_declaration(DescriptorNameAndID const& descriptor
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty
-WebIDL::ExceptionOr<void> CSSDescriptors::set_property(FlyString const& property, StringView value, StringView priority)
+WebIDL::ExceptionOr<void> CSSDescriptors::set_property(Utf16FlyString const& property, StringView value, StringView priority)
 {
     // 1. If the readonly flag is set, then throw a NoModificationAllowedError exception.
     if (is_readonly())
         return WebIDL::NoModificationAllowedError::create(realm(), "Cannot modify properties of readonly CSSStyleDeclaration"_utf16);
+
+    if (!property.is_ascii())
+        return {};
 
     // 2. If property is not a custom property, follow these substeps:
     Optional<DescriptorNameAndID> descriptor_name_and_id;
@@ -129,11 +132,14 @@ WebIDL::ExceptionOr<void> CSSDescriptors::set_property(FlyString const& property
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-removeproperty
-WebIDL::ExceptionOr<String> CSSDescriptors::remove_property(FlyString const& property)
+WebIDL::ExceptionOr<String> CSSDescriptors::remove_property(Utf16FlyString const& property)
 {
     // 1. If the readonly flag is set, then throw a NoModificationAllowedError exception.
     if (is_readonly())
         return WebIDL::NoModificationAllowedError::create(realm(), "Cannot modify properties of readonly CSSStyleDeclaration"_utf16);
+
+    if (!property.is_ascii())
+        return String {};
 
     // 2. If property is not a custom property, let property be property converted to ASCII lowercase.
     // AD-HOC: We compare names case-insensitively instead.
@@ -170,8 +176,11 @@ WebIDL::ExceptionOr<String> CSSDescriptors::remove_property(FlyString const& pro
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-getpropertyvalue
-String CSSDescriptors::get_property_value(FlyString const& property) const
+String CSSDescriptors::get_property_value(Utf16FlyString const& property) const
 {
+    if (!property.is_ascii())
+        return {};
+
     // 1. If property is not a custom property, follow these substeps: ...
     // NB: These substeps only apply to shorthands, and descriptors cannot be shorthands.
 
@@ -189,7 +198,7 @@ String CSSDescriptors::get_property_value(FlyString const& property) const
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-getpropertypriority
-StringView CSSDescriptors::get_property_priority(FlyString const&) const
+StringView CSSDescriptors::get_property_priority(Utf16FlyString const&) const
 {
     // AD-HOC: It's not valid for descriptors to be !important.
     return {};
@@ -209,6 +218,7 @@ String CSSDescriptors::serialized() const
     for (auto const& descriptor : m_descriptors) {
         // 1. Let property be declaration’s property name.
         auto property = descriptor.descriptor_name_and_id.name();
+        auto property_string = property.to_utf16_string();
 
         // 2. If property is in already serialized, continue with the steps labeled declaration loop.
         // AD-HOC: Not needed as we don't have shorthands.
@@ -221,7 +231,7 @@ String CSSDescriptors::serialized() const
         auto value = descriptor.value->to_string(SerializationMode::Normal);
 
         // 6. Let serialized declaration be the result of invoking serialize a CSS declaration with property name property, value value, and the important flag set if declaration has its important flag set.
-        auto serialized_declaration = serialize_a_css_declaration(property, value, Important::No);
+        auto serialized_declaration = serialize_a_css_declaration(property_string.ascii_view(), value, Important::No);
 
         // 7. Append serialized declaration to list.
         list.append(serialized_declaration);

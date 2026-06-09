@@ -47,7 +47,7 @@ void StylePropertyMap::initialize(JS::Realm& realm)
     Base::initialize(realm);
 }
 
-static bool any_have_non_matching_associated_property(FlyString const& property, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
+static bool any_have_non_matching_associated_property(Utf16FlyString const& property, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
 {
     return any_of(values, [&property](Variant<GC::Ref<CSSStyleValue>, String> const& value) {
         if (auto* style_value = value.get_pointer<GC::Ref<CSSStyleValue>>()) {
@@ -116,7 +116,7 @@ static WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> normalize_overflow_c
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymap-set
-WebIDL::ExceptionOr<void> StylePropertyMap::set(FlyString property_name, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
+WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
 {
     // The set(property, ...values) method, when called on a StylePropertyMap this, must perform the following steps:
 
@@ -221,7 +221,7 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(FlyString property_name, Readonl
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymap-append
-WebIDL::ExceptionOr<void> StylePropertyMap::append(FlyString property_name, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
+WebIDL::ExceptionOr<void> StylePropertyMap::append(Utf16FlyString property_name, ReadonlySpan<Variant<GC::Ref<CSSStyleValue>, String>> values)
 {
     // The append(property, ...values) method, when called on a StylePropertyMap this, must perform the following steps:
 
@@ -289,7 +289,7 @@ WebIDL::ExceptionOr<void> StylePropertyMap::append(FlyString property_name, Read
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymap-delete
-WebIDL::ExceptionOr<void> StylePropertyMap::delete_(FlyString property)
+WebIDL::ExceptionOr<void> StylePropertyMap::delete_(Utf16FlyString property)
 {
     // The delete(property) method, when called on a StylePropertyMap this, must perform the following steps:
 

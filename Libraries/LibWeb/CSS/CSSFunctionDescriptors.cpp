@@ -26,13 +26,13 @@ void CSSFunctionDescriptors::initialize(JS::Realm& realm)
 // https://drafts.csswg.org/css-mixins-1/#dom-cssfunctiondescriptors-result
 String CSSFunctionDescriptors::result() const
 {
-    return get_property_value("result"_string);
+    return get_property_value("result"_utf16_fly_string);
 }
 
 // https://drafts.csswg.org/css-mixins-1/#dom-cssfunctiondescriptors-result
 WebIDL::ExceptionOr<void> CSSFunctionDescriptors::set_result(StringView value)
 {
-    return set_property("result"_string, value, ""sv);
+    return set_property("result"_utf16_fly_string, value, ""sv);
 }
 
 }
