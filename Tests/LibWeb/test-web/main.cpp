@@ -2,27 +2,27 @@
  * Copyright (c) 2022, Dex♪ <dexes.ttp@gmail.com>
  * Copyright (c) 2023-2025, Tim Flynn <trflynn89@ladybird.org>
  * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2023-2024, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2023-2026, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include "Application.h"
+#include "Collection.h"
 #include "Debug.h"
 #include "Display.h"
 #include "TestRunCapture.h"
 #include "TestWeb.h"
 #include "TestWebView.h"
+#include "Variants.h"
 
 #include <AK/ByteBuffer.h>
 #include <AK/Enumerate.h>
 #include <AK/Function.h>
-#include <AK/GenericLexer.h>
 #include <AK/LexicalPath.h>
 #include <AK/NumberFormat.h>
 #include <AK/Platform.h>
-#include <AK/QuickSort.h>
 #include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/Span.h>
@@ -33,7 +33,6 @@
 #include <LibCore/File.h>
 #include <LibCore/MappedFile.h>
 #include <LibCore/Process.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/Timer.h>
 #include <LibDiff/Format.h>
 #include <LibDiff/Generator.h>
@@ -78,12 +77,6 @@ static ErrorOr<ByteString> prepare_output_path(Test const& test)
     auto base_path = LexicalPath::join(app.results_directory, test.safe_relative_path);
     TRY(Core::Directory::create(base_path.dirname(), Core::Directory::CreateDirectories::Yes));
     return base_path.string();
-}
-
-static bool is_valid_test_name(StringView test_name)
-{
-    auto valid_test_file_suffixes = { ".htm"sv, ".html"sv, ".svg"sv, ".xhtml"sv, ".xht"sv, ".pdf"sv };
-    return AK::any_of(valid_test_file_suffixes, [&](auto suffix) { return test_name.ends_with(suffix); });
 }
 
 static ErrorOr<ByteString> real_path_for_test_input(ByteString const& path)
@@ -165,221 +158,6 @@ static ErrorOr<void> skip_async_scrolling_tests_unless_enabled(Application const
     return enumerate_test_files_recursively(path, s_skipped_tests);
 }
 
-static bool is_html_space(char ch)
-{
-    return ch == '\t' || ch == '\n' || ch == '\f' || ch == '\r' || ch == ' ';
-}
-
-static bool is_htmlish_text_test(Test const& test)
-{
-    if (test.mode != TestMode::Text)
-        return false;
-
-    auto lexical_path = LexicalPath(test.input_path);
-    auto extension = lexical_path.extension();
-    return extension == "htm"sv || extension == "html"sv || extension == "xht"sv || extension == "xhtml"sv;
-}
-
-static void skip_to_end_of_tag(GenericLexer& lexer)
-{
-    while (!lexer.is_eof()) {
-        auto ch = lexer.consume();
-        if (ch == '"' || ch == '\'') {
-            lexer.ignore_until(ch);
-            lexer.consume_specific(ch);
-            continue;
-        }
-
-        if (ch == '>')
-            return;
-    }
-}
-
-static void skip_until_case_insensitive(GenericLexer& lexer, StringView needle)
-{
-    while (!lexer.is_eof()) {
-        auto next = lexer.peek_string(needle.length());
-        if (next.has_value() && next->equals_ignoring_ascii_case(needle)) {
-            lexer.ignore(needle.length());
-            return;
-        }
-
-        lexer.ignore();
-    }
-}
-
-static StringView consume_html_attribute_value(GenericLexer& lexer)
-{
-    lexer.ignore_while(is_html_space);
-
-    if (lexer.next_is('"') || lexer.next_is('\'')) {
-        auto quote = lexer.consume();
-        auto value = lexer.consume_until(quote);
-        lexer.consume_specific(quote);
-        return value;
-    }
-
-    return lexer.consume_until([](auto ch) {
-        return is_html_space(ch) || ch == '>';
-    });
-}
-
-static ErrorOr<Vector<String>> read_static_test_variants(Test const& test)
-{
-    Vector<String> variants;
-    if (!is_htmlish_text_test(test))
-        return variants;
-
-    auto file = TRY(Core::File::open(test.input_path, Core::File::OpenMode::Read));
-    auto contents = TRY(file->read_until_eof());
-
-    GenericLexer lexer { StringView { contents } };
-    while (!lexer.is_eof()) {
-        lexer.ignore_until('<');
-        if (!lexer.consume_specific('<'))
-            break;
-
-        if (lexer.consume_specific("!--"sv)) {
-            skip_until_case_insensitive(lexer, "-->"sv);
-            continue;
-        }
-
-        lexer.ignore_while(is_html_space);
-
-        if (lexer.consume_specific('/') || lexer.consume_specific('!') || lexer.consume_specific('?')) {
-            skip_to_end_of_tag(lexer);
-            continue;
-        }
-
-        auto tag_name = lexer.consume_until([](auto ch) {
-            return is_html_space(ch) || ch == '/' || ch == '>';
-        });
-
-        if (tag_name.equals_ignoring_ascii_case("script"sv)) {
-            skip_to_end_of_tag(lexer);
-            skip_until_case_insensitive(lexer, "</script"sv);
-            skip_to_end_of_tag(lexer);
-            continue;
-        }
-
-        if (tag_name.equals_ignoring_ascii_case("style"sv)) {
-            skip_to_end_of_tag(lexer);
-            skip_until_case_insensitive(lexer, "</style"sv);
-            skip_to_end_of_tag(lexer);
-            continue;
-        }
-
-        if (!tag_name.equals_ignoring_ascii_case("meta"sv)) {
-            skip_to_end_of_tag(lexer);
-            continue;
-        }
-
-        Optional<StringView> name_attribute;
-        Optional<StringView> content_attribute;
-
-        while (!lexer.is_eof()) {
-            lexer.ignore_while(is_html_space);
-
-            if (lexer.consume_specific('>'))
-                break;
-            if (lexer.consume_specific('/'))
-                continue;
-
-            auto attribute_name = lexer.consume_until([](auto ch) {
-                return is_html_space(ch) || ch == '=' || ch == '/' || ch == '>';
-            });
-            if (attribute_name.is_empty()) {
-                lexer.ignore();
-                continue;
-            }
-
-            lexer.ignore_while(is_html_space);
-
-            StringView attribute_value = ""sv;
-            if (lexer.consume_specific('='))
-                attribute_value = consume_html_attribute_value(lexer);
-
-            if (attribute_name.equals_ignoring_ascii_case("name"sv))
-                name_attribute = attribute_value;
-            else if (attribute_name.equals_ignoring_ascii_case("content"sv))
-                content_attribute = attribute_value;
-        }
-
-        if (name_attribute.has_value() && name_attribute->equals_ignoring_ascii_case("variant"sv) && content_attribute.has_value())
-            variants.append(TRY(String::from_utf8(*content_attribute)));
-    }
-
-    return variants;
-}
-
-static ErrorOr<void> collect_dump_tests(Application const& app, Vector<Test>& tests, StringView path, StringView trail, TestMode mode)
-{
-    Core::DirIterator it(ByteString::formatted("{}/input/{}", path, trail), Core::DirIterator::Flags::SkipDots);
-
-    while (it.has_next()) {
-        auto name = it.next_path();
-        auto input_path = TRY(FileSystem::real_path(ByteString::formatted("{}/input/{}/{}", path, trail, name)));
-
-        if (FileSystem::is_directory(input_path)) {
-            TRY(collect_dump_tests(app, tests, path, ByteString::formatted("{}/{}", trail, name), mode));
-            continue;
-        }
-
-        if (!is_valid_test_name(name))
-            continue;
-
-        auto expectation_path = ByteString::formatted("{}/expected/{}/{}.txt", path, trail, LexicalPath::title(name));
-        auto relative_path = LexicalPath::relative_path(input_path, app.test_root_path).release_value();
-        tests.append({ mode, input_path, move(expectation_path), relative_path, relative_path });
-    }
-
-    return {};
-}
-
-static ErrorOr<void> collect_ref_tests(Application const& app, Vector<Test>& tests, StringView path, StringView trail)
-{
-    Core::DirIterator it(ByteString::formatted("{}/input/{}", path, trail), Core::DirIterator::Flags::SkipDots);
-    while (it.has_next()) {
-        auto name = it.next_path();
-        auto input_path = TRY(FileSystem::real_path(ByteString::formatted("{}/input/{}/{}", path, trail, name)));
-
-        if (FileSystem::is_directory(input_path)) {
-            TRY(collect_ref_tests(app, tests, path, ByteString::formatted("{}/{}", trail, name)));
-            continue;
-        }
-
-        if (!is_valid_test_name(name))
-            continue;
-
-        auto relative_path = LexicalPath::relative_path(input_path, app.test_root_path).release_value();
-        tests.append({ TestMode::Ref, input_path, {}, relative_path, relative_path });
-    }
-
-    return {};
-}
-
-static StringView screenshot_platform_name()
-{
-#if defined(AK_OS_MACOS)
-    return "macos"sv;
-#elif defined(AK_OS_LINUX)
-    return "linux"sv;
-#elif defined(AK_OS_WINDOWS)
-    return "windows"sv;
-#else
-#    error "Unhandled platform for screenshot expectations"
-#endif
-}
-
-static ByteString screenshot_expectation_path(StringView path, StringView trail, StringView name)
-{
-    auto title = LexicalPath::title(name);
-    auto platform_expectation_path = ByteString::formatted("{}/expected-{}/{}/{}.png", path, screenshot_platform_name(), trail, title);
-    if (FileSystem::exists(platform_expectation_path))
-        return platform_expectation_path;
-    return ByteString::formatted("{}/expected/{}/{}.png", path, trail, title);
-}
-
 static void log_active_test_views(StringView reason)
 {
     outln();
@@ -452,50 +230,6 @@ static void try_write_harness_status(StringView reason)
 {
     if (auto result = write_harness_status(reason); result.is_error())
         warnln("Failed to write test-web harness status: {}", result.error());
-}
-
-static ErrorOr<void> collect_screenshot_tests(Application const& app, Vector<Test>& tests, StringView path, StringView trail)
-{
-    Core::DirIterator it(ByteString::formatted("{}/input/{}", path, trail), Core::DirIterator::Flags::SkipDots);
-    while (it.has_next()) {
-        auto name = it.next_path();
-        auto input_path = TRY(FileSystem::real_path(ByteString::formatted("{}/input/{}/{}", path, trail, name)));
-
-        if (FileSystem::is_directory(input_path)) {
-            TRY(collect_screenshot_tests(app, tests, path, ByteString::formatted("{}/{}", trail, name)));
-            continue;
-        }
-
-        if (!is_valid_test_name(name))
-            continue;
-
-        auto expectation_path = screenshot_expectation_path(path, trail, name);
-        auto relative_path = LexicalPath::relative_path(input_path, app.test_root_path).release_value();
-        tests.append({ TestMode::Screenshot, input_path, move(expectation_path), relative_path, relative_path });
-    }
-
-    return {};
-}
-
-static ErrorOr<void> collect_crash_tests(Application const& app, Vector<Test>& tests, StringView path, StringView trail)
-{
-    Core::DirIterator it(ByteString::formatted("{}/{}", path, trail), Core::DirIterator::Flags::SkipDots);
-    while (it.has_next()) {
-        auto name = it.next_path();
-        auto input_path = TRY(FileSystem::real_path(ByteString::formatted("{}/{}/{}", path, trail, name)));
-
-        if (FileSystem::is_directory(input_path)) {
-            TRY(collect_crash_tests(app, tests, path, ByteString::formatted("{}/{}", trail, name)));
-            continue;
-        }
-        if (!is_valid_test_name(name))
-            continue;
-
-        auto relative_path = LexicalPath::relative_path(input_path, app.test_root_path).release_value();
-        tests.append({ TestMode::Crash, input_path, {}, relative_path, relative_path });
-    }
-
-    return {};
 }
 
 static String generate_wait_for_test_string(StringView wait_class, StringView on_finish_script = ""sv)
@@ -699,56 +433,6 @@ pre { margin: 0; padding: 16px; font-family: ui-monospace, monospace; font-size:
 
     TRY(html_file->write_until_depleted("</pre></body></html>"sv));
 
-    return {};
-}
-
-static void apply_variant_to_test(Test& test, String variant)
-{
-    VERIFY(variant.starts_with('?'));
-
-    test.variant = move(variant);
-
-    // relative_path uses '?' for display, safe_relative_path uses '@' for filesystem.
-    auto variant_suffix = test.variant->bytes_as_string_view().substring_view(1);
-    test.relative_path = ByteString::formatted("{}?{}", test.relative_path, variant_suffix);
-    test.safe_relative_path = ByteString::formatted("{}@{}", test.safe_relative_path, variant_suffix);
-
-    // Expected file: test@variant_suffix.txt
-    auto dir = LexicalPath::dirname(test.expectation_path);
-    auto title = LexicalPath::title(LexicalPath::basename(test.input_path));
-    if (dir.is_empty())
-        test.expectation_path = ByteString::formatted("{}@{}.txt", title, variant_suffix);
-    else
-        test.expectation_path = ByteString::formatted("{}/{}@{}.txt", dir, title, variant_suffix);
-}
-
-// https://web-platform-tests.org/writing-tests/testharness.html#variants
-static ErrorOr<void> expand_tests_with_static_variants(Vector<Test>& tests)
-{
-    Vector<Test> expanded_tests;
-    expanded_tests.ensure_capacity(tests.size());
-
-    for (auto& test : tests) {
-        if (test.variant.has_value() || s_skipped_tests.contains_slow(test.input_path)) {
-            expanded_tests.append(move(test));
-            continue;
-        }
-
-        auto variants = TRY(read_static_test_variants(test));
-        if (variants.is_empty()) {
-            expanded_tests.append(move(test));
-            continue;
-        }
-
-        expanded_tests.ensure_capacity(expanded_tests.size() + variants.size());
-        for (auto const& variant : variants) {
-            auto variant_test = test;
-            apply_variant_to_test(variant_test, variant);
-            expanded_tests.append(move(variant_test));
-        }
-    }
-
-    tests = move(expanded_tests);
     return {};
 }
 
@@ -1363,7 +1047,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
         }
     }
 
-    TRY(expand_tests_with_static_variants(tests));
+    TRY(expand_tests_with_static_variants(tests, s_skipped_tests));
 
     if (app.shuffle)
         shuffle(tests);
