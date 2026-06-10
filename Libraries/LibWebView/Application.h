@@ -77,14 +77,12 @@ public:
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
 
     static BookmarkStore& bookmark_store() { return the().m_bookmark_store; }
-    static HistoryStore& history_store() { return *the().m_history_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
-    void clear_history();
-
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id) { }
 
+    static HistoryStore& history_store() { return *the().m_history_store; }
     static CookieJar& cookie_jar() { return *the().m_cookie_jar; }
     static HSTSStore& hsts_store() { return *the().m_hsts_store; }
     static StorageJar& storage_jar() { return *the().m_storage_jar; }
@@ -189,6 +187,8 @@ public:
     Menu& bookmarks_bar_context_menu() { return *m_bookmarks_bar_context_menu; }
     Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
+
+    Menu& history_menu() { return *m_history_menu; }
 
     Menu& inspect_menu() { return *m_inspect_menu; }
     Action& view_source_action() { return *m_view_source_action; }
@@ -388,6 +388,8 @@ private:
     RefPtr<Menu> m_bookmarks_bar_context_menu;
     RefPtr<Menu> m_bookmark_context_menu;
     RefPtr<Menu> m_bookmark_folder_context_menu;
+
+    RefPtr<Menu> m_history_menu;
 
     RefPtr<Menu> m_inspect_menu;
     RefPtr<Action> m_view_source_action;

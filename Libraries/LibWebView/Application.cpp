@@ -22,6 +22,7 @@
 #include <LibDevTools/DevToolsServer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibImageDecoderClient/Client.h>
+#include <LibURL/InternalURLs.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -1244,14 +1245,6 @@ void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
         on_recently_closed_entries_changed();
 }
 
-void Application::clear_history()
-{
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Clearing browsing history");
-
-    m_history_store->clear();
-    on_recently_closed_entries_changed();
-}
-
 void Application::initialize_actions()
 {
     auto debug_request = [this](auto request) {
@@ -1516,6 +1509,11 @@ void Application::initialize_actions()
     m_bookmark_folder_context_menu->add_separator();
     m_bookmark_folder_context_menu->add_action(add_bookmark_action);
     m_bookmark_folder_context_menu->add_action(add_bookmark_folder_action);
+
+    m_history_menu = Menu::create("History"sv);
+    m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
+        open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
+    }));
 
     m_inspect_menu = Menu::create("Inspect"sv);
 
