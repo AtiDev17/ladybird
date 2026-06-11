@@ -26,6 +26,8 @@ public:
     virtual void on_enter() = 0;
     virtual void on_exit() = 0;
 
+    virtual AK::Duration current_time() const;
+
     virtual void start() { }
     virtual void play() = 0;
     virtual void pause() = 0;
@@ -35,11 +37,7 @@ public:
     virtual PlaybackState state() = 0;
     virtual AvailableData available_data() = 0;
 
-    virtual void enter_buffering() = 0;
-    virtual void exit_buffering() = 0;
-
-    virtual void on_audio_sink_state_changed(PipelineStatus) { }
-    virtual void on_video_sink_state_changed(Track const&, PipelineStatus) { }
+    virtual void on_pipeline_status_changed(PipelineStatus);
 
 protected:
     PlaybackManager& manager() const { return m_manager; }

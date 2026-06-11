@@ -6,6 +6,18 @@
         <link rel="stylesheet" type="text/css" href="resource://ladybird/ladybird.css" />
         <link rel="stylesheet" type="text/css" href="resource://ladybird/about-pages/webui.css" />
         <style>
+            @media (prefers-color-scheme: light) {
+                :root {
+                    --history-entry-hover-color: #e8e8e8;
+                }
+            }
+
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --history-entry-hover-color: #2d2d2d;
+                }
+            }
+
             .history-status {
                 color: var(--secondary-text-color);
                 font-size: 13px;
@@ -61,7 +73,7 @@
             }
 
             .history-entry:hover {
-                background-color: var(--item-hover-color);
+                background-color: var(--history-entry-hover-color);
             }
 
             .history-entry + .history-entry {
@@ -103,12 +115,19 @@
             .entry-text {
                 display: flex;
                 flex-direction: column;
+                flex: 1;
                 gap: 4px;
                 min-width: 0;
+                width: 100%;
             }
 
             .entry-title {
                 color: inherit;
+                display: block;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+
                 font-size: 14px;
                 font-weight: 600;
                 text-decoration: none;
@@ -171,11 +190,6 @@
 
                 .entry-meta {
                     text-align: left;
-                }
-
-                .entry-actions {
-                    width: 100%;
-                    justify-content: flex-end;
                 }
             }
         </style>
@@ -415,6 +429,7 @@
                                 className: "entry-title",
                                 href: entry.url,
                                 textContent: title,
+                                title,
                             }),
                             createElement("div", {
                                 className: "entry-url",

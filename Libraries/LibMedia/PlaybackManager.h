@@ -55,7 +55,7 @@ public:
 
     AK::Duration duration() const { return m_duration; }
     void set_duration(AK::Duration duration) { m_duration = duration; }
-    AK::Duration current_time() const { return min(m_time_provider->current_time(), duration()); }
+    AK::Duration current_time() const;
 
     Optional<AK::UnixDateTime> start_time_realtime() const { return m_start_time_realtime; }
 
@@ -106,6 +106,7 @@ private:
         Track track;
         NonnullRefPtr<DecodedVideoProducer> producer;
         RefPtr<DisplayingVideoSink> display;
+        PipelineStatus sink_status { PipelineStatus::HaveData };
     };
     using VideoTrackDatas = Vector<VideoTrackData, EXPECTED_VIDEO_TRACK_COUNT>;
 
@@ -126,7 +127,9 @@ private:
     void set_up_producers();
     void on_audio_sink_state_changed(PipelineStatus);
     void on_video_sink_state_changed(Track const&, PipelineStatus);
-    void update_buffering_state();
+    void update_pipeline_state();
+    void reset_pipeline_state();
+    PipelineStatus combined_pipeline_status() const;
     void check_for_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
 
@@ -182,9 +185,7 @@ private:
     AK::Duration m_duration;
     Optional<AK::UnixDateTime> m_start_time_realtime;
 
-    bool m_audio_buffering { false };
-    HashTable<Track> m_video_tracks_buffering;
-    bool m_was_buffering { false };
+    PipelineStatus m_audio_sink_status { PipelineStatus::HaveData };
 
     bool m_is_in_error_state { false };
 };
