@@ -37,6 +37,9 @@ public:
     Optional<HighResolutionTime::DOMHighResTimeStamp> const& pending_resource_start_time() const { return m_pending_resource_start_time; }
     void set_pending_resource_start_time(Optional<HighResolutionTime::DOMHighResTimeStamp> time) { m_pending_resource_start_time = time; }
 
+    Optional<URL::URL> const& pending_resource_timing_url() const { return m_pending_resource_timing_url; }
+    void set_pending_resource_timing_url(Optional<URL::URL> url) { m_pending_resource_timing_url = url; }
+
     GC::Ref<DOM::DOMTokenList> sandbox();
 
     SandboxingFlagSet iframe_sandboxing_flag_set() const { return m_iframe_sandboxing_flag_set; }
@@ -80,6 +83,9 @@ private:
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-start-time
     Optional<HighResolutionTime::DOMHighResTimeStamp> m_pending_resource_start_time = {};
 
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-url
+    Optional<URL::URL> m_pending_resource_timing_url {};
+
     GC::Ptr<DOM::DOMTokenList> m_sandbox;
 
     // https://html.spec.whatwg.org/multipage/browsers.html#iframe-sandboxing-flag-set
@@ -87,6 +93,8 @@ private:
 };
 
 void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
+
+ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder);
 
 }
 

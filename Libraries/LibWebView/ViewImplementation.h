@@ -44,6 +44,7 @@
 #include <LibWebView/Forward.h>
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/Settings.h>
+#include <LibWebView/StorageSetResult.h>
 #include <LibWebView/WebContentClient.h>
 
 namespace WebView {
@@ -105,9 +106,15 @@ public:
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
 
-    void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie>);
+    void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
+    void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
+    void stop_listening_for_host_cookie_changes();
     ErrorOr<Core::SharedVersionIndex> ensure_document_cookie_version_index(Badge<WebContentClient>, String const&);
     Optional<Core::SharedVersion> document_cookie_version(URL::URL const&) const;
+
+    void notify_storage_changed(DevTools::DevToolsDelegate::StorageChange);
+    u64 add_storage_change_listener(DevTools::DevToolsDelegate::OnStorageChange);
+    void remove_storage_change_listener(u64 listener_id);
 
     ByteString selected_text();
     ByteString cut_selected_text();
@@ -120,6 +127,10 @@ public:
     void get_source();
 
     void inspect_dom_tree();
+    void inspect_storage(Web::StorageAPI::StorageEndpointType, u64 request_id);
+    Optional<StorageSetResult> set_session_storage_item(String const& key, String const& value);
+    Optional<String> remove_session_storage_item(String const& key);
+    bool clear_session_storage();
     void inspect_accessibility_tree();
     void get_hovered_node_id();
     void start_node_picker(DevTools::DevToolsDelegate::OnNodePickerEvent);
@@ -256,6 +267,7 @@ public:
     Function<void()> on_request_dismiss_dialog;
     Function<void(JsonObject)> on_received_dom_tree;
     Function<void(DOMNodeProperties)> on_received_dom_node_properties;
+    HashMap<u64, Function<void(ErrorOr<Vector<DevTools::DevToolsDelegate::StorageItem>>)>> on_received_storage_items;
     Function<void(JsonArray)> on_received_grid_layouts;
     Function<void(Optional<JsonObject>)> on_received_current_grid;
     Function<void(Optional<JsonObject>)> on_received_current_flexbox;
@@ -458,6 +470,10 @@ protected:
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
     HashMap<String, Core::SharedVersionIndex> m_document_cookie_version_indices;
+    DevTools::DevToolsDelegate::OnHostCookieChange m_on_host_cookie_change;
+
+    HashMap<u64, DevTools::DevToolsDelegate::OnStorageChange> m_storage_change_listeners;
+    u64 m_next_storage_change_listener_id { 1 };
 
     // FIXME: Reconcile this ID with `page_id`. The latter is only unique per WebContent connection, whereas the view ID
     //        is required to be globally unique for Firefox DevTools.

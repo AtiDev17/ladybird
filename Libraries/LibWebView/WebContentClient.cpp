@@ -11,6 +11,7 @@
 #include <AK/WeakPtr.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/Timer.h>
+#include <LibDevTools/StorageHelpers.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibIPC/Transport.h>
 #include <LibIPC/TransportHandle.h>
@@ -680,6 +681,39 @@ void WebContentClient::did_inspect_dom_tree(u64 page_id, String dom_tree)
     }
 }
 
+static ErrorOr<Vector<DevTools::DevToolsDelegate::StorageItem>> parse_storage_items(String const& storage_items)
+{
+    auto parsed_items = JsonValue::from_string(storage_items);
+    if (parsed_items.is_error())
+        return Error::from_string_literal("Unable to parse storage items");
+
+    if (!parsed_items.value().is_array())
+        return Error::from_string_literal("Expected storage items to be an array");
+
+    Vector<DevTools::DevToolsDelegate::StorageItem> items;
+    parsed_items.value().as_array().for_each([&](auto const& item) {
+        if (!item.is_object())
+            return;
+
+        auto name = item.as_object().get_string("name"sv);
+        auto value = item.as_object().get_string("value"sv);
+        if (!name.has_value() || !value.has_value())
+            return;
+
+        items.append({ name.release_value(), value.release_value() });
+    });
+    return items;
+}
+
+void WebContentClient::did_inspect_storage(u64 page_id, u64 request_id, String storage_items)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        auto handler = view->on_received_storage_items.take(request_id);
+        if (handler.has_value())
+            (*handler)(parse_storage_items(storage_items));
+    }
+}
+
 void WebContentClient::did_inspect_dom_node(u64 page_id, DOMNodeProperties properties)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
@@ -935,7 +969,7 @@ Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_reque
 
 void WebContentClient::did_set_cookie(URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source)
 {
-    Application::cookie_jar().set_cookie(url, cookie, source);
+    (void)Application::cookie_jar().set_cookie(url, cookie, source);
 }
 
 void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
@@ -981,6 +1015,32 @@ Messages::WebContentClient::DidRequestStorageKeysResponse WebContentClient::did_
 void WebContentClient::did_clear_storage(Web::StorageAPI::StorageEndpointType storage_endpoint, String storage_key)
 {
     Application::storage_jar().clear_storage_key(storage_endpoint, storage_key);
+}
+
+void WebContentClient::did_change_storage_item(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, String url, Optional<String> key, Optional<String> old_value, Optional<String> new_value)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        auto host = DevTools::storage_host_for_url(url);
+        if (!host.has_value())
+            return;
+
+        DevTools::DevToolsDelegate::StorageChange::Type type;
+        if (!key.has_value())
+            type = DevTools::DevToolsDelegate::StorageChange::Type::Cleared;
+        else if (!old_value.has_value())
+            type = DevTools::DevToolsDelegate::StorageChange::Type::Added;
+        else if (!new_value.has_value())
+            type = DevTools::DevToolsDelegate::StorageChange::Type::Deleted;
+        else
+            type = DevTools::DevToolsDelegate::StorageChange::Type::Changed;
+
+        view->notify_storage_changed({
+            .storage_endpoint = storage_endpoint,
+            .host = host.release_value(),
+            .type = type,
+            .key = move(key),
+        });
+    }
 }
 
 void WebContentClient::did_post_broadcast_channel_message(u64, Web::HTML::BroadcastChannelMessage message)

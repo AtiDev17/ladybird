@@ -17,12 +17,14 @@
 #include <LibDevTools/Actors/PageStyleActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Forward.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Header.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/Forward.h>
 
@@ -37,6 +39,41 @@ public:
     virtual void navigate_tab(TabDescription const&, String const&) const { }
     virtual void reload_tab(TabDescription const&, bool bypass_cache) const { (void)bypass_cache; }
     virtual void traverse_the_history_by_delta(TabDescription const&, int) const { }
+    virtual Vector<HTTP::Cookie::Cookie> cookies(TabDescription const&) const { return {}; }
+    virtual ErrorOr<void> set_cookie(TabDescription const&, Optional<HTTP::Cookie::Cookie>, HTTP::Cookie::Cookie) const { return {}; }
+    virtual void delete_cookies(TabDescription const&, Vector<HTTP::Cookie::Cookie>) const { }
+    using OnHostCookieChange = Function<void(Vector<HTTP::Cookie::Cookie>)>;
+    virtual void listen_for_host_cookie_changes(TabDescription const&, OnHostCookieChange) const { }
+    virtual void stop_listening_for_host_cookie_changes(TabDescription const&) const { }
+
+    struct StorageItem {
+        String name;
+        String value;
+    };
+
+    using OnStorageItemsReceived = Function<void(ErrorOr<Vector<StorageItem>>)>;
+    virtual void inspect_storage(TabDescription const&, Web::StorageAPI::StorageEndpointType, OnStorageItemsReceived) const { }
+    virtual ErrorOr<Optional<String>> set_storage_item(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&, String const&, String const&) const { return Optional<String> {}; }
+    virtual ErrorOr<Optional<String>> remove_storage_item(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&, String const&) const { return Optional<String> {}; }
+    virtual ErrorOr<void> clear_storage(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&) const { return {}; }
+
+    struct StorageChange {
+        enum class Type : u8 {
+            Added,
+            Changed,
+            Deleted,
+            Cleared,
+        };
+
+        Web::StorageAPI::StorageEndpointType storage_endpoint;
+        String host;
+        Type type;
+        Optional<String> key;
+    };
+
+    using OnStorageChange = Function<void(StorageChange)>;
+    virtual u64 add_storage_change_listener(TabDescription const&, OnStorageChange) const { return 0; }
+    virtual void remove_storage_change_listener(TabDescription const&, u64) const { }
 
     using OnTabInspectionComplete = Function<void(ErrorOr<JsonValue>)>;
     virtual void inspect_tab(TabDescription const&, OnTabInspectionComplete) const { }

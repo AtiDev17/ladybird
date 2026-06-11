@@ -508,6 +508,17 @@ void ConnectionFromClient::debug_request(u64 page_id, ByteString request, ByteSt
         return;
     }
 
+    if (request == "dump-session-storage") {
+        if (auto* document = page->page().top_level_browsing_context().active_document()) {
+            auto storage_or_error = document->window()->session_storage();
+            if (storage_or_error.is_error())
+                dbgln("Failed to retrieve session storage: {}", storage_or_error.release_error());
+            else
+                storage_or_error.release_value()->dump();
+        }
+        return;
+    }
+
     if (request == "navigator-compatibility-mode") {
         Web::NavigatorCompatibilityMode compatibility_mode;
         if (argument == "chrome") {
@@ -545,6 +556,113 @@ void ConnectionFromClient::inspect_dom_tree(u64 page_id)
         if (auto* doc = page->page().top_level_browsing_context().active_document())
             async_did_inspect_dom_tree(page_id, doc->dump_dom_tree_as_json());
     }
+}
+
+void ConnectionFromClient::inspect_storage(u64 page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, u64 request_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        async_did_inspect_storage(page_id, request_id, "[]"_string);
+        return;
+    }
+
+    auto* document = page->page().top_level_browsing_context().active_document();
+    if (!document || !document->window()) {
+        async_did_inspect_storage(page_id, request_id, "[]"_string);
+        return;
+    }
+
+    Web::WebIDL::ExceptionOr<GC::Ref<Web::HTML::Storage>> storage_or_error = [&]() -> Web::WebIDL::ExceptionOr<GC::Ref<Web::HTML::Storage>> {
+        if (storage_endpoint == Web::StorageAPI::StorageEndpointType::LocalStorage)
+            return document->window()->local_storage();
+        VERIFY(storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage);
+        return document->window()->session_storage();
+    }();
+
+    if (storage_or_error.is_error()) {
+        async_did_inspect_storage(page_id, request_id, "[]"_string);
+        return;
+    }
+
+    auto storage = storage_or_error.release_value();
+    JsonArray storage_items;
+    for (auto i = 0uz; i < storage->length(); ++i) {
+        auto name = storage->key(i);
+        if (!name.has_value())
+            continue;
+
+        auto value = storage->get_item(*name);
+        if (!value.has_value())
+            continue;
+
+        JsonObject item;
+        item.set("name"sv, name.release_value());
+        item.set("value"sv, value.release_value());
+        storage_items.must_append(move(item));
+    }
+
+    async_did_inspect_storage(page_id, request_id, storage_items.serialized());
+}
+
+static Optional<GC::Ref<Web::HTML::Storage>> active_session_storage_for_page(PageClient& page)
+{
+    auto* document = page.page().top_level_browsing_context().active_document();
+    if (!document || !document->window())
+        return {};
+
+    auto storage_or_error = document->window()->session_storage();
+    if (storage_or_error.is_exception())
+        return {};
+
+    return storage_or_error.release_value();
+}
+
+Messages::WebContentServer::SetSessionStorageItemResponse ConnectionFromClient::set_session_storage_item(u64 page_id, String key, String value)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return Optional<WebView::StorageSetResult> {};
+
+    auto storage = active_session_storage_for_page(*page);
+    if (!storage.has_value())
+        return Optional<WebView::StorageSetResult> {};
+
+    auto old_value = (*storage)->get_item(key);
+    auto result = (*storage)->set_item(key, value);
+    if (result.is_exception())
+        return WebView::StorageSetResult { WebView::StorageOperationError::QuotaExceededError };
+
+    return WebView::StorageSetResult { move(old_value) };
+}
+
+Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClient::remove_session_storage_item(u64 page_id, String key)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return Optional<String> {};
+
+    auto storage = active_session_storage_for_page(*page);
+    if (!storage.has_value())
+        return Optional<String> {};
+
+    auto old_value = (*storage)->get_item(key);
+    if (old_value.has_value())
+        (*storage)->remove_item(key);
+    return old_value;
+}
+
+Messages::WebContentServer::ClearSessionStorageResponse ConnectionFromClient::clear_session_storage(u64 page_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return false;
+
+    auto storage = active_session_storage_for_page(*page);
+    if (!storage.has_value() || (*storage)->length() == 0)
+        return false;
+
+    (*storage)->clear();
+    return true;
 }
 
 void ConnectionFromClient::inspect_dom_node(u64 page_id, WebView::DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonValue options_value)

@@ -23,6 +23,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibImageDecoderClient/Client.h>
 #include <LibURL/InternalURLs.h>
+#include <LibURL/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -1546,6 +1547,7 @@ void Application::initialize_actions()
     m_debug_menu->add_action(Action::create("Dump CSS Errors"sv, ActionID::DumpCSSErrors, debug_request("dump-all-css-errors"sv)));
     m_debug_menu->add_action(Action::create("Dump Cookies"sv, ActionID::DumpCookies, [this]() { m_cookie_jar->dump_cookies(); }));
     m_debug_menu->add_action(Action::create("Dump Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
+    m_debug_menu->add_action(Action::create("Dump Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
     m_debug_menu->add_action(Action::create("Dump WASM Stats"sv, ActionID::DumpWasmStats, debug_request("dump-wasm-stats"sv)));
     m_debug_menu->add_action(Action::create("Dump GC graph"sv, ActionID::DumpGCGraph, [this]() {
         if (auto view = active_web_view(); view.has_value()) {
@@ -1817,6 +1819,149 @@ void Application::traverse_the_history_by_delta(DevTools::TabDescription const& 
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->traverse_the_history_by_delta(delta);
+}
+
+Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return {};
+
+    return Application::cookie_jar().get_all_cookies();
+}
+
+ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& description, Optional<HTTP::Cookie::Cookie> old_cookie, HTTP::Cookie::Cookie cookie) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    auto url = URL::Parser::basic_parse(description.url);
+    if (!url.has_value())
+        return Error::from_string_literal("Unable to parse tab URL");
+
+    Optional<CookieStorageKey> old_key;
+    if (old_cookie.has_value())
+        old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
+
+    TRY(Application::cookie_jar().set_cookie_from_devtools(*url, move(old_key), move(cookie)));
+    return {};
+}
+
+void Application::delete_cookies(DevTools::TabDescription const& description, Vector<HTTP::Cookie::Cookie> cookies) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return;
+
+    for (auto const& cookie : cookies)
+        Application::cookie_jar().delete_cookie({ cookie.name, cookie.domain, cookie.path });
+}
+
+void Application::listen_for_host_cookie_changes(DevTools::TabDescription const& description, OnHostCookieChange on_host_cookie_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->listen_for_host_cookie_changes(move(on_host_cookie_change));
+}
+
+void Application::stop_listening_for_host_cookie_changes(DevTools::TabDescription const& description) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->stop_listening_for_host_cookie_changes();
+}
+
+static ErrorOr<Optional<String>> storage_set_result_to_error_or_old_value(StorageSetResult result)
+{
+    if (result.has<StorageOperationError>())
+        return Error::from_string_literal("Unable to store more than the storage quota");
+
+    return result.get<Optional<String>>();
+}
+
+void Application::inspect_storage(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, OnStorageItemsReceived on_complete) const
+{
+    static u64 next_request_id = 0;
+
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value()) {
+        on_complete(Error::from_string_literal("Unable to locate tab"));
+        return;
+    }
+
+    auto request_id = next_request_id++;
+    view->on_received_storage_items.set(request_id, move(on_complete));
+    view->inspect_storage(storage_endpoint, request_id);
+}
+
+ErrorOr<Optional<String>> Application::set_storage_item(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key, String const& value) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage) {
+        auto result = view->set_session_storage_item(key, value);
+        if (!result.has_value())
+            return Error::from_string_literal("Unable to locate session storage");
+        return TRY(storage_set_result_to_error_or_old_value(result.release_value()));
+    }
+
+    auto old_value = TRY(storage_set_result_to_error_or_old_value(Application::storage_jar().set_item(storage_endpoint, storage_key, key, value)));
+    if (!old_value.has_value()) {
+        view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Added, key });
+    } else if (*old_value != value) {
+        view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Changed, key });
+    }
+
+    return old_value;
+}
+
+ErrorOr<Optional<String>> Application::remove_storage_item(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage)
+        return view->remove_session_storage_item(key);
+
+    auto old_value = Application::storage_jar().get_item(storage_endpoint, storage_key, key);
+    if (!old_value.has_value())
+        return Optional<String> {};
+
+    Application::storage_jar().remove_item(storage_endpoint, storage_key, key);
+    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Deleted, key });
+    return old_value;
+}
+
+ErrorOr<void> Application::clear_storage(DevTools::TabDescription const& description, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage) {
+        view->clear_session_storage();
+        return {};
+    }
+
+    auto keys = Application::storage_jar().get_all_keys(storage_endpoint, storage_key);
+    if (keys.is_empty())
+        return {};
+
+    Application::storage_jar().clear_storage_key(storage_endpoint, storage_key);
+    view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, {} });
+    return {};
+}
+
+u64 Application::add_storage_change_listener(DevTools::TabDescription const& description, OnStorageChange on_storage_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        return view->add_storage_change_listener(move(on_storage_change));
+    return 0;
+}
+
+void Application::remove_storage_change_listener(DevTools::TabDescription const& description, u64 listener_id) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->remove_storage_change_listener(listener_id);
 }
 
 void Application::inspect_tab(DevTools::TabDescription const& description, OnTabInspectionComplete on_complete) const
