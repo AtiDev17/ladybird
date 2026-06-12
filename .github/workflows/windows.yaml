@@ -176,20 +176,19 @@ jobs:
 
           $headers = @{ "User-Agent" = "Ladybird-Windows-Updater" }
 
-          $releases = try {
-              Invoke-RestMethod -Uri 'https://api.github.com/repos/${{ github.repository }}/releases' -Headers $headers
+          $latestRelease = try {
+              (Invoke-RestMethod -Uri 'https://api.github.com/repos/${{ github.repository }}/releases/latest' -Headers $headers)
           } catch {
               $null
           }
 
-          if (!$releases) {
-              Write-Host 'Error: Could not connect to GitHub API.' -ForegroundColor Red
+          if (!$latestRelease) {
+              Write-Host 'Error: Could not fetch the latest release from GitHub.' -ForegroundColor Red
               exit 1
           }
 
-          $release = $releases[0]
           $remoteCommit = 'unknown'
-          if ($release.body -match 'Commit: ([a-f0-9]+)') {
+          if ($latestRelease.body -match 'Commit: ([a-f0-9]+)') {
               $remoteCommit = $matches[1]
           }
 
@@ -200,8 +199,8 @@ jobs:
               exit 0
           }
 
-          $asset = $release.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
-          $hashAsset = $release.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip.sha256' }
+          $asset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
+          $hashAsset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip.sha256' }
 
           if ($asset) {
               if (!$hashAsset) {
@@ -276,12 +275,19 @@ jobs:
             ladybird-windows-x64.zip
           retention-days: 1
 
-      - name: Upload to GitHub Release
+      - name: Generate Unique Tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="unofficial-$(date +'%Y-%m-%d')-run${{ github.run_number }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Upload to GitHub Release (unique tag)
         uses: softprops/action-gh-release@v3
         if: success() && github.ref == 'refs/heads/master'
         with:
-          tag_name: latest-unofficial
-          name: "Unofficial Automated Build"
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Unofficial Automated Build ${{ steps.tag.outputs.tag }}"
           body: |
             **UNOFFICIAL BUILD**
             This is an automated, experimental build created from a personal fork.
