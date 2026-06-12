@@ -11,8 +11,6 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/Document.h>
@@ -89,26 +87,46 @@ static TransformData visual_viewport_transform_data(DOM::Document& document)
     return TransformData { matrix, { 0.f, 0.f } };
 }
 
+// https://drafts.csswg.org/css-transforms-2/#ctm
 static Optional<TransformData> compute_transform(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values, double pixel_ratio)
 {
     if (!paintable_box.has_css_transform())
         return {};
 
-    auto matrix = Gfx::FloatMatrix4x4::identity();
+    // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
+    // offset properties as follows:
+    auto reference_box = paintable_box.transform_reference_box();
+    auto const& css_transform_origin = computed_values.transform_origin();
+    auto origin_x = css_transform_origin.x.to_px(paintable_box.layout_node(), reference_box.width());
+    auto origin_y = css_transform_origin.y.to_px(paintable_box.layout_node(), reference_box.height());
+    auto origin_z = css_transform_origin.z.to_px(paintable_box.layout_node(), 0).to_float();
+
+    // 1. Start with the identity matrix.
+    // 2. Translate by the computed X, Y, and Z values of transform-origin.
+    auto matrix = Gfx::translation_matrix(Vector3 { 0.f, 0.f, origin_z });
+
+    // 3. Translate by the computed X, Y, and Z values of translate.
     if (auto const& translate = computed_values.translate())
         matrix = matrix * translate->to_matrix(paintable_box);
+
+    // 4. Rotate by the computed <angle> about the specified axis of rotate.
     if (auto const& rotate = computed_values.rotate())
         matrix = matrix * rotate->to_matrix(paintable_box);
+
+    // 5. Scale by the computed X, Y, and Z values of scale.
     if (auto const& scale = computed_values.scale())
         matrix = matrix * scale->to_matrix(paintable_box);
+
+    // FIXME: 6. Translate and rotate by the transform specified by offset.
+
+    // 7. Multiply by each of the transform functions in transform from left to right.
     for (auto const& transform : computed_values.transformations())
         matrix = matrix * transform->to_matrix(paintable_box);
-    auto const& css_transform_origin = computed_values.transform_origin();
-    auto reference_box = paintable_box.transform_reference_box();
-    CSSPixelPoint origin {
-        reference_box.left() + css_transform_origin.x.to_px(paintable_box.layout_node(), reference_box.width()),
-        reference_box.top() + css_transform_origin.y.to_px(paintable_box.layout_node(), reference_box.height()),
-    };
+
+    // 8. Translate by the negated computed X, Y and Z values of transform-origin.
+    matrix = matrix * Gfx::translation_matrix(Vector3 { 0.f, 0.f, -origin_z });
+
+    auto origin = reference_box.location() + CSSPixelPoint { origin_x, origin_y };
     auto scale = static_cast<float>(pixel_ratio);
     auto device_origin = origin.to_type<float>() * scale;
     return TransformData { scale_matrix_for_device_pixels(matrix, scale), device_origin };
@@ -135,13 +153,13 @@ static Optional<Gfx::FloatMatrix4x4> compute_perspective_matrix(PaintableBox con
 
     // 3. Multiply by the matrix that would be obtained from the 'perspective()' transform function, where the
     //    length is provided by the value of the perspective property
-    // NB: Length values less than 1px being clamped to 1px is handled by the perspective() function already.
-    // FIXME: Create the matrix directly.
-    perspective_matrix = perspective_matrix * CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Perspective, CSS::StyleValueVector { CSS::LengthStyleValue::create(CSS::Length::make_px(perspective.value())) })->to_matrix({});
+    // https://drafts.csswg.org/css-transforms-2/#funcdef-perspective
+    // If the depth value is less than '1px', it must be treated as '1px' for the purpose of rendering, [..]
+    auto distance = max(perspective->to_float(), 1.f);
+    perspective_matrix = perspective_matrix * Gfx::perspective_matrix(distance);
 
     // 4. Translate by the negated computed X and Y values of 'perspective-origin'
-    perspective_matrix = perspective_matrix * Gfx::translation_matrix(Vector3<float>(-computed_x, -computed_y, 0));
-    return perspective_matrix;
+    return perspective_matrix * Gfx::translation_matrix(Vector3 { -computed_x, -computed_y, 0.f });
 }
 
 static Optional<ClipData> compute_clip_data(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values, DevicePixelConverter const& converter)

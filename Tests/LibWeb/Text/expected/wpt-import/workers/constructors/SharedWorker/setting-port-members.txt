@@ -1,0 +1,12 @@
+Harness status: OK
+
+Found 7 tests
+
+7 Pass
+Pass	postMessage
+Pass	start
+Pass	close
+Pass	onmessage
+Pass	addEventListener
+Pass	removeEventListener
+Pass	despatchEvent
