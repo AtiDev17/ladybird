@@ -10,6 +10,8 @@ namespace Gfx {
 
 class Bitmap;
 class CMYKBitmap;
+class CanvasCommandList;
+class CanvasCommandPlayer;
 class ColorSpace;
 class DecodedImageFrame;
 class Color;
@@ -21,6 +23,7 @@ class ImageDecoder;
 struct FontPixelMetrics;
 
 class Painter;
+class PainterSkia;
 class PaintingSurface;
 class Palette;
 class YUVData;
