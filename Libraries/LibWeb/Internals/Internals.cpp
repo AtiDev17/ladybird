@@ -478,6 +478,16 @@ void Internals::expire_cookies_with_time_offset(WebIDL::LongLong seconds)
     page().client().page_did_expire_cookies_with_time_offset(AK::Duration::from_seconds(seconds));
 }
 
+GC::Ref<WebIDL::Promise> Internals::delete_all_cookies()
+{
+    auto& realm = this->realm();
+    auto promise = WebIDL::create_promise(realm);
+    auto const& document = as<HTML::Window>(HTML::relevant_global_object(*this)).associated_document();
+
+    page().client().page_did_delete_all_cookies(document.url(), promise);
+    return promise;
+}
+
 bool Internals::set_http_memory_cache_enabled(bool enabled)
 {
     auto was_enabled = Web::Fetch::Fetching::http_memory_cache_enabled();
@@ -741,6 +751,7 @@ JS::Object* Internals::get_style_invalidation_counters()
     object->define_direct_property("elementInheritedStyleNoopRecomputations"_utf16_fly_string, JS::Value(counters.element_inherited_style_noop_recomputations), JS::default_attributes);
     object->define_direct_property("previousSiblingInvalidationWalkVisits"_utf16_fly_string, JS::Value(counters.previous_sibling_invalidation_walk_visits), JS::default_attributes);
     object->define_direct_property("descendantSlotInvalidationSubtreeScans"_utf16_fly_string, JS::Value(counters.descendant_slot_invalidation_subtree_scans), JS::default_attributes);
+    object->define_direct_property("mediaRuleEvaluations"_utf16_fly_string, JS::Value(counters.media_rule_evaluations), JS::default_attributes);
     return object;
 }
 
