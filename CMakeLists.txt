@@ -83,7 +83,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang$")
 
     # Vanilla host builds only for building the clang plugins
     if (ENABLE_CLANG_PLUGINS AND NOT CROSS_COMPILING AND NOT ENABLE_FUZZERS AND NOT ENABLE_COMPILER_EXPLORER_BUILD)
-        add_subdirectory(Meta/Lagom/ClangPlugins)
+        add_subdirectory(Meta/ClangPlugins)
         depend_on_clang_plugin(JSClangPlugin LibJSGCClangPlugin)
         depend_on_clang_plugin(GenericClangPlugin LambdaCaptureClangPlugin)
     endif()
@@ -126,7 +126,7 @@ add_subdirectory(AK)
 add_subdirectory(Libraries)
 
 if (ENABLE_FUZZERS)
-    add_subdirectory(Meta/Lagom/Fuzzers)
+    add_subdirectory(Meta/Fuzzers)
 endif()
 
 # No utilities or tests in these configs
