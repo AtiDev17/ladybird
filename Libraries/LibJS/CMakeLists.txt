@@ -1,13 +1,11 @@
 include(libjs_generators)
 
 set(SOURCES
-    Bytecode/AsmInterpreter/AsmInterpreter.cpp
-    Bytecode/BasicBlock.cpp
+    Bytecode/AsmInterpreter/AsmSlowPaths.cpp
     Bytecode/Executable.cpp
     Bytecode/IdentifierTable.cpp
     Bytecode/Instruction.cpp
     Bytecode/Interpreter.cpp
-    Bytecode/Label.cpp
     Bytecode/PropertyNameIterator.cpp
     Bytecode/PropertyKeyTable.cpp
     Bytecode/RegexTable.cpp
@@ -328,6 +326,8 @@ if ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(x86_64|amd64|AMD64)$")
     set(ASMINT_ARCH "x86_64")
 elseif ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64|ARM64)$")
     set(ASMINT_ARCH "aarch64")
+else()
+    message(FATAL_ERROR "LibJS requires AsmInterpreter support for ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
 if (DEFINED ASMINT_ARCH)

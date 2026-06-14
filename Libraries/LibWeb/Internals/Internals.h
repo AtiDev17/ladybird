@@ -111,6 +111,8 @@ public:
     String dump_stacking_context_tree();
     String dump_gc_graph();
     String dump_session_history();
+    String dump_ui_process_session_history();
+    GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
 
     GC::Ptr<DOM::ShadowRoot> get_shadow_root(GC::Ref<DOM::Element>);
 

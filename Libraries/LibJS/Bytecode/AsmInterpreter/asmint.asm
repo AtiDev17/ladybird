@@ -1,6 +1,6 @@
 # AsmInterpreter DSL source
 # Each handler implements one bytecode instruction.
-# Instructions not listed here fall through to the C++ fallback handler.
+# Invalid dispatch table entries fall through to the C++ fallback handler.
 #
 # For the full DSL instruction reference, see AsmIntGen/src/main.rs.
 #
@@ -368,6 +368,74 @@ macro bitwise_op(op_insn, slow_path_func)
     call_slow_path slow_path_func
 end
 
+macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
+    temp value, tag, int_value, dst
+    ftemp result_dbl, one_dbl
+    load_operand value, m_dst
+    extract_tag tag, value
+    branch_ne tag, INT32_TAG, .slow
+    unbox_int32 int_value, value
+    op32_overflow int_value, 1, .overflow
+    box_int32_clean dst, int_value
+    store_operand m_dst, dst
+    dispatch_next
+.overflow:
+    unbox_int32 int_value, value
+    int_to_double result_dbl, int_value
+    mov dst, DOUBLE_ONE
+    fp_mov one_dbl, dst
+    fp_op result_dbl, one_dbl
+    fp_mov dst, result_dbl
+    store_operand m_dst, dst
+    dispatch_next
+.slow:
+    call_slow_path slow_path_func
+end
+
+macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
+    temp value, tag, int_value, dst
+    ftemp result_dbl, one_dbl
+    load_operand value, m_src
+    extract_tag tag, value
+    branch_ne tag, INT32_TAG, .slow
+    store_operand m_dst, value
+    unbox_int32 int_value, value
+    op32_overflow int_value, 1, .overflow_after_store
+    box_int32_clean dst, int_value
+    store_operand m_src, dst
+    dispatch_next
+.overflow_after_store:
+    unbox_int32 int_value, value
+    int_to_double result_dbl, int_value
+    mov dst, DOUBLE_ONE
+    fp_mov one_dbl, dst
+    fp_op result_dbl, one_dbl
+    fp_mov dst, result_dbl
+    store_operand m_src, dst
+    dispatch_next
+.slow:
+    call_slow_path slow_path_func
+end
+
+macro int32_shift_op(op_insn, slow_path_func)
+    temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, count, dst
+    load_operand lhs, m_lhs
+    load_operand rhs, m_rhs
+    extract_tag lhs_tag, lhs
+    branch_ne lhs_tag, INT32_TAG, .slow
+    extract_tag rhs_tag, rhs
+    branch_ne rhs_tag, INT32_TAG, .slow
+    unbox_int32 lhs_int, lhs
+    unbox_int32 count, rhs
+    and count, 31
+    op_insn lhs_int, count
+    box_int32 dst, lhs_int
+    store_operand m_dst, dst
+    dispatch_next
+.slow:
+    call_slow_path slow_path_func
+end
+
 # Validate that the callee still points at the expected builtin function.
 # Jumps to fail if the call target has been replaced or is not a function.
 macro validate_callee_builtin(expected_builtin, fail)
@@ -438,17 +506,18 @@ macro dispatch_current()
 end
 
 # Walk the environment chain using a statically computed EnvironmentCoordinate.
-# Input: m_cache_field is the offset of the EnvironmentCoordinate inside
-# the bytecode instruction.
+# Input: m_environment_field is the offset of the starting environment inside
+# ExecutionContext. m_cache_field is the offset of the EnvironmentCoordinate
+# inside the bytecode instruction.
 # Output: target_env points at the resolved environment, bind_index holds
 # the binding index within it.
 # On failure (the caller's binding operation fails): jumps to fail_label.
-macro walk_env_chain(m_cache_field, target_env, bind_index, fail_label)
+macro walk_env_chain(m_environment_field, m_cache_field, target_env, bind_index, fail_label)
     temp coord_addr, hops
     lea coord_addr, [pb, pc]
     add coord_addr, m_cache_field
     load_pair32 hops, bind_index, [coord_addr, ENVIRONMENT_COORDINATE_HOPS], [coord_addr, ENVIRONMENT_COORDINATE_INDEX]
-    load64 target_env, [exec_ctx, EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT]
+    load64 target_env, [exec_ctx, m_environment_field]
     assert_nonzero target_env
     branch_zero hops, .walk_done
 .walk_loop:
@@ -498,13 +567,13 @@ end
 # CallConstruct, so caller_is_construct is always false for asm-managed inline
 # frames.
 #
-# This mirrors VM::pop_inline_frame():
-#   1. Read the caller's destination register from the callee frame.
-#   2. Publish the caller's resume pc and returned value.
-#   3. Deallocate the callee by rewinding InterpreterStack::top to exec_ctx.
-#   4. Make the caller the running execution context again.
-#   5. Advance execution_generation so WeakRef and similar observers still see
-#      the same boundary they would have seen through the C++ helper.
+# This resumes the caller by:
+#   1. Reading the caller's destination register from the callee frame.
+#   2. Publishing the caller's resume pc and returned value.
+#   3. Deallocating the callee by rewinding InterpreterStack::top to exec_ctx.
+#   4. Making the caller the running execution context again.
+#   5. Advancing execution_generation so WeakRef and similar observers still see
+#      the expected execution boundary.
 #
 # The macro expects exec_ctx/pb/values/pc to still describe the callee frame.
 # Input:
@@ -694,6 +763,26 @@ handler Mul
     call_slow_path asm_slow_path_mul
 end
 
+handler Exp
+    call_slow_path asm_slow_path_exp
+end
+
+handler ConcatString
+    call_slow_path asm_slow_path_concat_string
+end
+
+handler CopyObjectExcludingProperties
+    call_slow_path asm_slow_path_copy_object_excluding_properties
+end
+
+handler ImportCall
+    call_slow_path asm_slow_path_import_call
+end
+
+handler NewClass
+    call_slow_path asm_slow_path_new_class
+end
+
 # ============================================================================
 # Control flow
 # ============================================================================
@@ -874,52 +963,12 @@ end
 # Fast path for ++x: int32 + 1 with overflow check.
 # On overflow, convert to double and add 1.0.
 handler Increment
-    temp value, tag, int_value, dst
-    ftemp result_dbl, one_dbl
-    load_operand value, m_dst
-    extract_tag tag, value
-    branch_ne tag, INT32_TAG, .slow
-    unbox_int32 int_value, value
-    add32_overflow int_value, 1, .overflow
-    box_int32_clean dst, int_value
-    store_operand m_dst, dst
-    dispatch_next
-.overflow:
-    unbox_int32 int_value, value
-    int_to_double result_dbl, int_value
-    mov dst, DOUBLE_ONE
-    fp_mov one_dbl, dst
-    fp_add result_dbl, one_dbl
-    fp_mov dst, result_dbl
-    store_operand m_dst, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_increment
+    prefix_inc_dec add32_overflow, fp_add, asm_slow_path_increment
 end
 
 # Fast path for --x: int32 - 1 with overflow check.
 handler Decrement
-    temp value, tag, int_value, dst
-    ftemp result_dbl, one_dbl
-    load_operand value, m_dst
-    extract_tag tag, value
-    branch_ne tag, INT32_TAG, .slow
-    unbox_int32 int_value, value
-    sub32_overflow int_value, 1, .overflow
-    box_int32_clean dst, int_value
-    store_operand m_dst, dst
-    dispatch_next
-.overflow:
-    unbox_int32 int_value, value
-    int_to_double result_dbl, int_value
-    mov dst, DOUBLE_ONE
-    fp_mov one_dbl, dst
-    fp_sub result_dbl, one_dbl
-    fp_mov dst, result_dbl
-    store_operand m_dst, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_decrement
+    prefix_inc_dec sub32_overflow, fp_sub, asm_slow_path_decrement
 end
 
 handler Not
@@ -956,9 +1005,33 @@ handler Not
     dispatch_next
 end
 
+handler ToBoolean
+    temp value, truthy, result
+    load_operand value, m_value
+    call_helper asm_helper_to_boolean, value, truthy
+    assert_lt_unsigned truthy, 2
+    branch_zero truthy, .store_false
+    mov result, BOOLEAN_TRUE
+    store_operand m_dst, result
+    dispatch_next
+.store_false:
+    mov result, BOOLEAN_FALSE
+    store_operand m_dst, result
+    dispatch_next
+end
+
 # ============================================================================
 # Return / function call
 # ============================================================================
+
+handler Catch
+    temp exception, empty
+    load64 exception, [values, EXCEPTION_REG_OFFSET]
+    store_operand m_dst, exception
+    mov empty, EMPTY_VALUE
+    store64 [values, EXCEPTION_REG_OFFSET], empty
+    dispatch_next
+end
 
 handler Return
     # Empty is the internal "no explicit value" marker. Returning it from
@@ -1011,14 +1084,31 @@ handler GetLexicalEnvironment
     temp env, tag
     load64 env, [exec_ctx, EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT]
     assert_nonzero env
-    mov tag, CELL_TAG_SHIFTED
+    mov tag, SHIFTED_IS_CELL_PATTERN
     or env, tag
     store_operand m_dst, env
     dispatch_next
 end
 
+handler GetImportMeta
+    call_slow_path asm_slow_path_get_import_meta
+end
+
+handler GetNewTarget
+    call_slow_path asm_slow_path_get_new_target
+end
+
+handler GetSuperConstructor
+    call_slow_path asm_slow_path_get_super_constructor
+end
+
 handler SetLexicalEnvironment
-    call_slow_path asm_slow_path_set_lexical_environment
+    temp env
+    load_operand env, m_environment
+    assert_tag env, IS_CELL_PATTERN
+    unbox_object env, env
+    store64 [exec_ctx, EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT], env
+    dispatch_next
 end
 
 # ============================================================================
@@ -1085,7 +1175,7 @@ end
 # Inline environment chain walk + binding value load with TDZ check.
 handler GetBinding
     temp env, idx, binding_values, value, empty
-    walk_env_chain m_cache, env, idx, .slow
+    walk_env_chain EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, m_cache, env, idx, .slow
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     store_operand m_dst, value
     dispatch_next
@@ -1106,7 +1196,7 @@ end
 # Inline environment chain walk + direct binding value load.
 handler GetInitializedBinding
     temp env, idx, binding_values, value
-    walk_env_chain m_cache, env, idx, .slow
+    walk_env_chain EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, m_cache, env, idx, .slow
     load_binding_value env, idx, binding_values, value
     store_operand m_dst, value
     dispatch_next
@@ -1127,12 +1217,22 @@ end
 # Inline environment chain walk + initialize binding.
 handler InitializeLexicalBinding
     temp env, idx, value, binding_values
-    walk_env_chain m_cache, env, idx, .slow
+    walk_env_chain EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, m_cache, env, idx, .slow
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
 .slow:
     call_slow_path asm_slow_path_initialize_lexical_binding
+end
+
+handler InitializeVariableBinding
+    temp env, idx, value, binding_values
+    walk_env_chain EXECUTION_CONTEXT_VARIABLE_ENVIRONMENT, m_cache, env, idx, .slow
+    load_operand value, m_src
+    store_binding_value env, idx, binding_values, value
+    dispatch_next
+.slow:
+    call_slow_path asm_slow_path_initialize_variable_binding
 end
 
 handler DynamicInitializeLexicalBinding
@@ -1158,7 +1258,7 @@ end
 # Inline environment chain walk + set mutable binding.
 handler SetLexicalBinding
     temp env, idx, flag, value, binding_values, flags, empty
-    walk_env_chain m_cache, env, idx, .slow
+    walk_env_chain EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, m_cache, env, idx, .slow
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     # Check mutable
     load_binding_flags env, idx, flags, flag
@@ -1169,6 +1269,21 @@ handler SetLexicalBinding
     dispatch_next
 .slow:
     call_slow_path asm_slow_path_set_lexical_binding
+end
+
+handler SetVariableBinding
+    temp env, idx, flag, value, binding_values, flags, empty
+    walk_env_chain EXECUTION_CONTEXT_VARIABLE_ENVIRONMENT, m_cache, env, idx, .slow
+    check_binding_initialized env, idx, binding_values, value, empty, .slow
+    # Check mutable
+    load_binding_flags env, idx, flags, flag
+    and flag, BINDING_FLAG_MUTABLE
+    branch_zero flag, .slow
+    load_operand value, m_src
+    store_binding_value env, idx, binding_values, value
+    dispatch_next
+.slow:
+    call_slow_path asm_slow_path_set_variable_binding
 end
 
 handler DynamicSetLexicalBinding
@@ -1201,32 +1316,53 @@ handler DynamicSetVariableBinding
     call_slow_path asm_slow_path_dynamic_set_variable_binding
 end
 
+handler ResolveBinding
+    call_slow_path asm_slow_path_resolve_binding
+end
+
+handler ResolveSuperBase
+    call_slow_path asm_slow_path_resolve_super_base
+end
+
+handler SetResolvedBinding
+    call_slow_path asm_slow_path_set_resolved_binding
+end
+
+handler TypeofBinding
+    call_slow_path asm_slow_path_typeof_binding
+end
+
+handler DynamicTypeofBinding
+    call_slow_path asm_slow_path_dynamic_typeof_binding
+end
+
+handler HasPrivateId
+    call_slow_path asm_slow_path_has_private_id
+end
+
+handler SetFunctionName
+    call_slow_path asm_slow_path_set_function_name
+end
+
+handler NewArrayWithLength
+    call_slow_path asm_slow_path_new_array_with_length
+end
+
+handler ArrayAppend
+    call_slow_path asm_slow_path_array_append
+end
+
+handler CreateVariable
+    call_slow_path asm_slow_path_create_variable
+end
+
+handler EnterObjectEnvironment
+    call_slow_path asm_slow_path_enter_object_environment
+end
+
 # x++: save original to dst first, then increment src in-place.
 handler PostfixIncrement
-    temp value, tag, int_value, dst
-    ftemp result_dbl, one_dbl
-    load_operand value, m_src
-    extract_tag tag, value
-    branch_ne tag, INT32_TAG, .slow
-    # Save original value to dst (the "postfix" part)
-    store_operand m_dst, value
-    # Increment in-place: src = src + 1
-    unbox_int32 int_value, value
-    add32_overflow int_value, 1, .overflow_after_store
-    box_int32_clean dst, int_value
-    store_operand m_src, dst
-    dispatch_next
-.overflow_after_store:
-    unbox_int32 int_value, value
-    int_to_double result_dbl, int_value
-    mov dst, DOUBLE_ONE
-    fp_mov one_dbl, dst
-    fp_add result_dbl, one_dbl
-    fp_mov dst, result_dbl
-    store_operand m_src, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_postfix_increment
+    postfix_inc_dec add32_overflow, fp_add, asm_slow_path_postfix_increment
 end
 
 # Division result is stored as int32 when representable (e.g. 6/3 = 2),
@@ -1374,6 +1510,42 @@ handler ThrowIfNullish
     call_slow_path asm_slow_path_throw_if_nullish
 end
 
+handler ThrowConstAssignment
+    call_slow_path asm_slow_path_throw_const_assignment
+end
+
+handler Throw
+    call_slow_path asm_slow_path_throw
+end
+
+handler Await
+    call_slow_path asm_slow_path_await
+end
+
+handler Yield
+    call_slow_path asm_slow_path_yield
+end
+
+handler YieldIteratorResult
+    call_slow_path asm_slow_path_yield_iterator_result
+end
+
+handler ToString
+    call_slow_path asm_slow_path_to_string
+end
+
+handler ToPrimitiveWithStringHint
+    call_slow_path asm_slow_path_to_primitive_with_string_hint
+end
+
+handler ToObject
+    call_slow_path asm_slow_path_to_object
+end
+
+handler ToLength
+    call_slow_path asm_slow_path_to_length
+end
+
 # Fast path for int32: ~value
 handler BitwiseNot
     temp value, tag, dst
@@ -1400,41 +1572,11 @@ end
 
 # Shift ops: int32-only fast path, shift count masked to 0-31 per spec.
 handler LeftShift
-    temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, count, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
-    extract_tag lhs_tag, lhs
-    branch_ne lhs_tag, INT32_TAG, .slow
-    extract_tag rhs_tag, rhs
-    branch_ne rhs_tag, INT32_TAG, .slow
-    unbox_int32 lhs_int, lhs
-    unbox_int32 count, rhs
-    and count, 31
-    shl lhs_int, count
-    box_int32 dst, lhs_int
-    store_operand m_dst, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_left_shift
+    int32_shift_op shl, asm_slow_path_left_shift
 end
 
 handler RightShift
-    temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, count, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
-    extract_tag lhs_tag, lhs
-    branch_ne lhs_tag, INT32_TAG, .slow
-    extract_tag rhs_tag, rhs
-    branch_ne rhs_tag, INT32_TAG, .slow
-    unbox_int32 lhs_int, lhs
-    unbox_int32 count, rhs
-    and count, 31
-    sar lhs_int, count
-    box_int32 dst, lhs_int
-    store_operand m_dst, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_right_shift
+    int32_shift_op sar, asm_slow_path_right_shift
 end
 
 # Unsigned right shift: result is always unsigned, so values > INT32_MAX
@@ -1518,7 +1660,7 @@ end
 # Inline environment chain walk + get callee and this.
 handler GetCalleeAndThisFromEnvironment
     temp env, idx, binding_values, value, empty
-    walk_env_chain m_cache, env, idx, .slow
+    walk_env_chain EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, m_cache, env, idx, .slow
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     store_operand m_callee, value
     # this = undefined (DeclarativeEnvironment.with_base_object() always returns nullptr)
@@ -1595,30 +1737,7 @@ end
 
 # x--: save original to dst first, then decrement src in-place.
 handler PostfixDecrement
-    temp value, tag, int_value, dst
-    ftemp result_dbl, one_dbl
-    load_operand value, m_src
-    extract_tag tag, value
-    branch_ne tag, INT32_TAG, .slow
-    # Save original value to dst (the "postfix" part)
-    store_operand m_dst, value
-    # Decrement in-place: src = src - 1
-    unbox_int32 int_value, value
-    sub32_overflow int_value, 1, .overflow_after_store
-    box_int32_clean dst, int_value
-    store_operand m_src, dst
-    dispatch_next
-.overflow_after_store:
-    unbox_int32 int_value, value
-    int_to_double result_dbl, int_value
-    mov dst, DOUBLE_ONE
-    fp_mov one_dbl, dst
-    fp_sub result_dbl, one_dbl
-    fp_mov dst, result_dbl
-    store_operand m_src, dst
-    dispatch_next
-.slow:
-    call_slow_path asm_slow_path_postfix_decrement
+    postfix_inc_dec sub32_overflow, fp_sub, asm_slow_path_postfix_decrement
 end
 
 handler ToInt32
@@ -1850,6 +1969,10 @@ handler GetById
     dispatch_next
 end
 
+handler GetByIdWithThis
+    call_slow_path asm_slow_path_get_by_id_with_this
+end
+
 # Inline cache fast path for own-property store (ChangeOwnProperty).
 handler PutById
     temp base, tag, obj, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, src, result
@@ -1885,6 +2008,10 @@ handler PutById
     call_slow_path asm_slow_path_put_by_id
 .done:
     dispatch_next
+end
+
+handler PutByIdWithThis
+    call_slow_path asm_slow_path_put_by_id_with_this
 end
 
 # Fast path for array[int32_index] with Packed/Holey indexed storage.
@@ -2023,6 +2150,18 @@ handler GetByValue
     call_slow_path asm_slow_path_get_by_value
 end
 
+handler GetByValueWithThis
+    call_slow_path asm_slow_path_get_by_value_with_this
+end
+
+handler PutByValueWithThis
+    call_slow_path asm_slow_path_put_by_value_with_this
+end
+
+handler PutBySpread
+    call_slow_path asm_slow_path_put_by_spread
+end
+
 # Fast path for Array.length (magical length property).
 # Also includes IC fast path for non-array objects (same as GetById).
 handler GetLength
@@ -2070,6 +2209,18 @@ handler GetLength
     dispatch_next
 .slow:
     call_slow_path asm_slow_path_get_length
+end
+
+handler GetLengthWithThis
+    call_slow_path asm_slow_path_get_length_with_this
+end
+
+handler GetMethod
+    call_slow_path asm_slow_path_get_method
+end
+
+handler GetIterator
+    call_slow_path asm_slow_path_get_iterator
 end
 
 # Inline cache fast path for global variable access via the global object.
@@ -2587,7 +2738,7 @@ handler Call
     # The native threw. Hand the thrown Value off to a C++ helper, which
     # unwinds the callee frame off the interpreter stack and calls through
     # to VM::handle_exception. Return value follows the standard asm
-    # slow-path convention (see AsmInterpreter.cpp:127):
+    # slow-path convention:
     #   >= 0 : an enclosing handler was found; the result is the new
     #          program counter to resume at inside the (post-unwind)
     #          running execution context.
@@ -2876,8 +3027,7 @@ end
 
 # Handlers below are pure slow-path delegations: no fast path is worthwhile
 # because the operation is inherently complex (object allocation, prototype
-# chain walks, etc). Having them here avoids the generic fallback handler's
-# overhead of saving/restoring all temporaries.
+# chain walks, etc).
 
 handler GetObjectPropertyIterator
     call_slow_path asm_slow_path_get_object_property_iterator
@@ -2980,12 +3130,52 @@ handler ObjectPropertyIteratorNext
     call_slow_path asm_slow_path_object_property_iterator_next
 end
 
+handler IteratorClose
+    call_slow_path asm_slow_path_iterator_close
+end
+
+handler IteratorNext
+    call_slow_path asm_slow_path_iterator_next
+end
+
+handler IteratorNextUnpack
+    call_slow_path asm_slow_path_iterator_next_unpack
+end
+
+handler IteratorToArray
+    call_slow_path asm_slow_path_iterator_to_array
+end
+
 handler CallConstruct
     call_slow_path asm_slow_path_call_construct
 end
 
+handler CallDirectEval
+    call_slow_path asm_slow_path_call_direct_eval
+end
+
+handler CallWithArgumentArray
+    call_slow_path asm_slow_path_call_with_argument_array
+end
+
+handler CallDirectEvalWithArgumentArray
+    call_slow_path asm_slow_path_call_direct_eval_with_argument_array
+end
+
+handler CallConstructWithArgumentArray
+    call_slow_path asm_slow_path_call_construct_with_argument_array
+end
+
+handler SuperCallWithArgumentArray
+    call_slow_path asm_slow_path_super_call_with_argument_array
+end
+
 handler NewObject
     call_slow_path asm_slow_path_new_object
+end
+
+handler NewObjectWithNoPrototype
+    call_slow_path asm_slow_path_new_object_with_no_prototype
 end
 
 handler CacheObjectShape
@@ -3000,8 +3190,130 @@ handler NewArray
     call_slow_path asm_slow_path_new_array
 end
 
+handler NewPrimitiveArray
+    call_slow_path asm_slow_path_new_primitive_array
+end
+
+handler NewRegExp
+    call_slow_path asm_slow_path_new_regexp
+end
+
+handler NewReferenceError
+    call_slow_path asm_slow_path_new_reference_error
+end
+
+handler NewTypeError
+    call_slow_path asm_slow_path_new_type_error
+end
+
 handler InstanceOf
     call_slow_path asm_slow_path_instance_of
+end
+
+handler In
+    call_slow_path asm_slow_path_in
+end
+
+handler IsCallable
+    temp value, tag, object, flags, result
+    load_operand value, m_value
+    extract_tag tag, value
+    branch_ne tag, OBJECT_TAG, .not_callable
+    unbox_object object, value
+    load8 flags, [object, OBJECT_FLAGS]
+    branch_bits_clear flags, OBJECT_FLAG_IS_FUNCTION, .not_callable
+    mov result, BOOLEAN_TRUE
+    store_operand m_dst, result
+    dispatch_next
+.not_callable:
+    mov result, BOOLEAN_FALSE
+    store_operand m_dst, result
+    dispatch_next
+end
+
+handler IsConstructor
+    call_slow_path asm_slow_path_is_constructor
+end
+
+handler AddPrivateName
+    call_slow_path asm_slow_path_add_private_name
+end
+
+handler CreateAsyncFromSyncIterator
+    call_slow_path asm_slow_path_create_async_from_sync_iterator
+end
+
+handler CreateDataPropertyOrThrow
+    call_slow_path asm_slow_path_create_data_property_or_throw
+end
+
+handler CreateImmutableBinding
+    call_slow_path asm_slow_path_create_immutable_binding
+end
+
+handler CreateMutableBinding
+    call_slow_path asm_slow_path_create_mutable_binding
+end
+
+handler CreateRestParams
+    call_slow_path asm_slow_path_create_rest_params
+end
+
+handler CreateArguments
+    call_slow_path asm_slow_path_create_arguments
+end
+
+handler CreateLexicalEnvironment
+    call_slow_path asm_slow_path_create_lexical_environment
+end
+
+handler CreatePrivateEnvironment
+    call_slow_path asm_slow_path_create_private_environment
+end
+
+handler CreateVariableEnvironment
+    call_slow_path asm_slow_path_create_variable_environment
+end
+
+handler DeleteById
+    call_slow_path asm_slow_path_delete_by_id
+end
+
+handler DeleteByValue
+    call_slow_path asm_slow_path_delete_by_value
+end
+
+handler DeleteVariable
+    call_slow_path asm_slow_path_delete_variable
+end
+
+handler GetCompletionFields
+    call_slow_path asm_slow_path_get_completion_fields
+end
+
+handler SetCompletionType
+    call_slow_path asm_slow_path_set_completion_type
+end
+
+handler GetTemplateObject
+    call_slow_path asm_slow_path_get_template_object
+end
+
+handler NewFunction
+    call_slow_path asm_slow_path_new_function
+end
+
+handler Typeof
+    call_slow_path asm_slow_path_typeof
+end
+
+handler LeavePrivateEnvironment
+    temp private_environment, outer_environment
+    load64 private_environment, [exec_ctx, EXECUTION_CONTEXT_PRIVATE_ENVIRONMENT]
+    assert_nonzero private_environment
+    load64 outer_environment, [private_environment, PRIVATE_ENVIRONMENT_OUTER]
+    store64 [exec_ctx, EXECUTION_CONTEXT_PRIVATE_ENVIRONMENT], outer_environment
+    dispatch_next
 end
 
 # Fast path: if this_value register is already cached (non-empty), skip the slow path.

@@ -383,9 +383,11 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
 fn generate_fallback_handler(out: &mut String, program: &Program, _pinned: &PinnedConstants) {
     emit_handler_alignment(out, program.object_format);
     w!(out, "asm_handler_fallback:");
-    // Set up args: x0=vm (x20), w1=pc (ip - pb)
+    // Set up args: x0=vm (x20), w1=pc (ip - pb), x2=instruction (ip)
     w!(out, "    mov x0, x20");
     w!(out, "    sub w1, w21, w26");
+    emit_sync_pc_to_execution_context(out, program);
+    w!(out, "    mov x2, x21");
     w!(out, "    bl CSYM(asm_fallback_handler)");
     // Check for exit (return < 0)
     w!(out, "    tbnz x0, #63, .Lexit");
@@ -427,6 +429,15 @@ fn emit_state_reload(out: &mut String, program: &Program) {
     emit_ldr64(out, "x9", "x28", exec_executable);
     emit_ldr64(out, "x26", "x9", exec_bytecode);
     emit_add_imm(out, "x27", "x28", sizeof_execctx);
+}
+
+fn emit_sync_pc_to_execution_context(out: &mut String, program: &Program) {
+    let program_counter = program
+        .constants
+        .get("EXECUTION_CONTEXT_PROGRAM_COUNTER")
+        .copied()
+        .expect("EXECUTION_CONTEXT_PROGRAM_COUNTER constant required");
+    emit_str32(out, "w1", "x28", program_counter);
 }
 
 /// Emit a dispatch sequence: recompute x21 from w25 + x26, then dispatch.
@@ -1250,7 +1261,12 @@ fn emit_instruction(
                 let cc = if m == "assert_tag" { "b.eq" } else { "b.ne" };
                 w!(out, "    lsr x9, {value}, #48");
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    emit_cmp_imm(out, "x9", val, pinned);
+                    if (val as u64) <= 4095 || pinned.get(val).is_some() || is_cmn_candidate(val) {
+                        emit_cmp_imm(out, "x9", val, pinned);
+                    } else {
+                        emit_mov_imm(out, "x10", val);
+                        w!(out, "    cmp x9, x10");
+                    }
                 } else {
                     let tag = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    cmp x9, {tag}");
@@ -1341,6 +1357,8 @@ fn emit_instruction(
             if let Some(Operand::Register(func_name)) = insn.operands.first() {
                 w!(out, "    mov x0, x20"); // vm
                 w!(out, "    sub w1, w21, w26"); // pc = ip - pb
+                emit_sync_pc_to_execution_context(out, program);
+                w!(out, "    mov x2, x21"); // instruction
                 w!(out, "    bl CSYM({func_name})");
                 w!(out, "    tbnz x0, #63, .Lexit");
                 emit_state_reload(out, program);
@@ -1369,11 +1387,12 @@ fn emit_instruction(
             }
         }
 
-        // call_interp: NON-TERMINAL call with (VM*, u32 pc)
+        // call_interp: NON-TERMINAL call with (VM*, u32 pc, Op::Foo const* instruction)
         "call_interp" => {
             if let Some(Operand::Register(func_name)) = insn.operands.first() {
                 w!(out, "    mov x0, x20");
                 w!(out, "    sub w1, w21, w26"); // pc = ip - pb
+                w!(out, "    mov x2, x21"); // instruction
                 w!(out, "    bl CSYM({func_name})");
                 // Result in x0 (= t0)
             }

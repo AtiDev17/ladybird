@@ -671,12 +671,60 @@ String Internals::dump_session_history()
         auto step = entry->step();
         auto const& url = entry->url();
         auto filename = url.basename();
-        auto display = url.fragment().has_value() ? MUST(String::formatted("{}#{}", filename, *url.fragment())) : MUST(String::from_byte_string(filename));
+        StringBuilder display_builder;
+        display_builder.append(filename);
+        if (url.query().has_value())
+            display_builder.appendff("?{}", *url.query());
+        if (url.fragment().has_value())
+            display_builder.appendff("#{}", *url.fragment());
+        auto display = display_builder.to_string_without_validation();
         auto is_current = step.has<int>() && step.get<int>() == current_step;
         auto relative_step = step.has<int>() && min_step.has_value() ? String::number(step.get<int>() - *min_step) : "pending"_string;
         builder.appendff("  step {} {}{}\n", relative_step, display, is_current ? " (current)"sv : ""sv);
     }
     return builder.to_string_without_validation();
+}
+
+String Internals::dump_ui_process_session_history()
+{
+    auto& document = window().associated_document();
+    if (auto navigable = document.navigable()) {
+        if (auto traversable = navigable->traversable_navigable();
+            traversable && document.page().client().should_report_session_history_updates()) {
+            auto session_history_snapshot = traversable->create_session_history_snapshot();
+            document.page().client().page_did_update_session_history(
+                session_history_snapshot.top_level_session_history_entries,
+                session_history_snapshot.used_session_history_steps,
+                session_history_snapshot.current_used_step_index);
+        }
+    }
+
+    return document.page().client().page_did_request_ui_process_session_history_for_testing();
+}
+
+GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
+{
+    auto& realm = this->realm();
+    auto promise = WebIDL::create_promise(realm);
+    auto& document = window().associated_document();
+    auto navigable = document.navigable();
+    if (!navigable) {
+        WebIDL::resolve_promise(realm, promise);
+        return promise;
+    }
+
+    auto traversable = navigable->traversable_navigable();
+    if (!traversable) {
+        WebIDL::resolve_promise(realm, promise);
+        return promise;
+    }
+
+    traversable->append_session_history_traversal_steps(GC::create_function(heap(), [&realm, promise](NonnullRefPtr<Core::Promise<Empty>> signal) {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(realm, promise);
+        signal->resolve({});
+    }));
+    return promise;
 }
 
 GC::Ptr<DOM::ShadowRoot> Internals::get_shadow_root(GC::Ref<DOM::Element> element)
