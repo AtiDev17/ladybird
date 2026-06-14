@@ -302,7 +302,7 @@ jobs:
         id: tag
         shell: bash
         run: |
-          TAG="unofficial-$(date +'%Y-%m-%d')-run${{ github.run_number }}"
+          TAG="unofficial-$(date +'%Y-%m-%d')"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Release (unique tag)
