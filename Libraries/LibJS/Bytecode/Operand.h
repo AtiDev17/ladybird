@@ -13,19 +13,7 @@ namespace JS::Bytecode {
 
 class Operand {
 public:
-    enum class Type {
-        Register,
-        Local,
-        Constant,
-        Argument,
-    };
-
     [[nodiscard]] bool operator==(Operand const&) const = default;
-
-    explicit Operand(Type type, u32 index)
-        : m_raw(to_underlying(type) << 29 | index)
-    {
-    }
 
     enum class ShouldMakeInvalid { Indeed };
     explicit Operand(ShouldMakeInvalid)
@@ -33,27 +21,12 @@ public:
     {
     }
 
-    explicit Operand(Register);
-
     [[nodiscard]] bool is_invalid() const { return m_raw == 0xffffffffu; }
-    [[nodiscard]] bool is_register() const { return type() == Type::Register; }
-    [[nodiscard]] bool is_local() const { return type() == Type::Local; }
-    [[nodiscard]] bool is_constant() const { return type() == Type::Constant; }
-
-    [[nodiscard]] Type type() const { return static_cast<Type>((m_raw & 0xe0000000u) >> 29); }
-    [[nodiscard]] u32 index() const { return m_raw & 0x1fffffff; }
-
     [[nodiscard]] u32 raw() const { return m_raw; }
 
-    [[nodiscard]] Register as_register() const;
-
-    void offset_index_by(u32 offset)
-    {
-        m_raw &= 0x1fffffff;
-        m_raw += offset;
-    }
-
 private:
+    Operand() = default;
+
     u32 m_raw { 0 };
 };
 

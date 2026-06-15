@@ -7,10 +7,14 @@
 #pragma once
 
 #include <AK/Forward.h>
-#include <AK/Function.h>
-#include <LibJS/Bytecode/Executable.h>
+#include <LibJS/Bytecode/IdentifierTable.h>
+#include <LibJS/Bytecode/Label.h>
 #include <LibJS/Bytecode/OpCodes.h>
+#include <LibJS/Bytecode/Operand.h>
+#include <LibJS/Bytecode/PropertyKeyTable.h>
+#include <LibJS/Bytecode/StringTable.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Runtime/EnvironmentCoordinate.h>
 
 namespace JS::Bytecode::Op {
 
@@ -80,9 +84,6 @@ public:
 
     Type type() const { return m_type; }
     size_t length() const;
-    ByteString to_byte_string(Bytecode::Executable const&) const;
-    void visit_labels(Function<void(Label&)> visitor);
-    void visit_operands(Function<void(Operand&)> visitor);
 
     Strict strict() const { return m_strict; }
     void set_strict(Strict strict) { m_strict = strict; }
@@ -93,43 +94,9 @@ protected:
     {
     }
 
-    void visit_labels_impl(Function<void(Label&)>) { }
-    void visit_operands_impl(Function<void(Operand&)>) { }
-
 private:
     Type m_type {};
     Strict m_strict {};
-};
-
-class InstructionStreamIterator {
-public:
-    InstructionStreamIterator(ReadonlyBytes bytes, Executable const* executable = nullptr, size_t offset = 0)
-        : m_begin(bytes.data())
-        , m_end(bytes.data() + bytes.size())
-        , m_ptr(bytes.data() + offset)
-        , m_executable(executable)
-    {
-    }
-
-    size_t offset() const { return m_ptr - m_begin; }
-    bool at_end() const { return m_ptr >= m_end; }
-
-    Instruction const& operator*() const { return dereference(); }
-
-    ALWAYS_INLINE void operator++()
-    {
-        m_ptr += dereference().length();
-    }
-
-    Executable const* executable() const { return m_executable; }
-
-private:
-    Instruction const& dereference() const { return *reinterpret_cast<Instruction const*>(m_ptr); }
-
-    u8 const* m_begin { nullptr };
-    u8 const* m_end { nullptr };
-    u8 const* m_ptr { nullptr };
-    GC::Ptr<Executable const> m_executable;
 };
 
 }

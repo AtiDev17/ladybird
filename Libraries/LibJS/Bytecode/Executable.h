@@ -28,7 +28,6 @@
 #include <LibJS/Export.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
-#include <LibJS/LocalVariable.h>
 #include <LibJS/Runtime/EnvironmentCoordinate.h>
 #include <LibJS/SourceRange.h>
 
@@ -330,7 +329,7 @@ public:
 
     Vector<SourceMapEntry> source_map;
 
-    Vector<LocalVariable> local_variable_names;
+    Vector<Utf16FlyString> local_variable_names;
     u32 local_index_base { 0 };
     u32 argument_index_base { 0 };
 
@@ -347,7 +346,6 @@ public:
         return get_identifier(*index);
     }
 
-    [[nodiscard]] COLD Optional<size_t> basic_block_index_for_offset(size_t offset) const;
     void copy_runtime_caches_from(Executable const&);
     [[nodiscard]] COLD Optional<ExceptionHandlers const&> exception_handlers_for_offset(size_t offset) const;
 
@@ -356,7 +354,6 @@ public:
     [[nodiscard]] SourceRange const& get_source_range(u32 program_counter);
 
     void dump() const;
-    [[nodiscard]] Operand original_operand_from_raw(u32) const;
 
     virtual Cell const& owner_cell(Badge<GC::Heap>) const override { return *this; }
     virtual void remove_dead_cells(Badge<GC::Heap>) override;
