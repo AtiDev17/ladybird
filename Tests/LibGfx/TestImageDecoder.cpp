@@ -92,6 +92,21 @@ TEST_CASE(test_bmp_v4)
     EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
 }
 
+TEST_CASE(test_bmp_negative_int_min_height)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("bmp/negative-height-int-min.bmp"sv)));
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(file->bytes()));
+    EXPECT(plugin_decoder->frame(0).is_error());
+}
+
+TEST_CASE(test_bmp_v5_icc_profile_out_of_bounds)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("bmp/v5-icc-profile-out-of-bounds.bmp"sv)));
+    EXPECT(Gfx::BMPImageDecoderPlugin::sniff(file->bytes()));
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(file->bytes()));
+    EXPECT(plugin_decoder->icc_data().is_error());
+}
+
 TEST_CASE(test_bmp_os2_3bit)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("bmp/os2_3bpc.bmp"sv)));
@@ -544,6 +559,22 @@ TEST_CASE(test_exif)
 
     EXPECT_EQ(frame.image->get_pixel(65, 70), Gfx::Color(0, 255, 0));
     EXPECT_EQ(frame.image->get_pixel(190, 10), Gfx::Color(255, 0, 0));
+}
+
+TEST_CASE(test_exif_orientation_transpose_non_square)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("png/exif-orientation-5.png"sv)));
+    EXPECT(Gfx::PNGImageDecoderPlugin::sniff(file->bytes()));
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::PNGImageDecoderPlugin::create(file->bytes()));
+
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 1, 3 }));
+    EXPECT(plugin_decoder->metadata().has_value());
+    auto const& exif_metadata = static_cast<Gfx::ExifMetadata const&>(plugin_decoder->metadata().value());
+    EXPECT_EQ(*exif_metadata.orientation(), Gfx::TIFF::Orientation::Rotate90ClockwiseThenFlipHorizontally);
+
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(255, 0, 0));
+    EXPECT_EQ(frame.image->get_pixel(0, 1), Gfx::Color(0, 255, 0));
+    EXPECT_EQ(frame.image->get_pixel(0, 2), Gfx::Color(0, 0, 255));
 }
 
 TEST_CASE(test_png_malformed_frame)

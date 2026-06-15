@@ -1297,8 +1297,9 @@ static ErrorOr<void> decode_bmp_pixel_data(BMPLoadingContext& context)
         return Error::from_string_literal("BMP has invalid bpp");
     }
 
-    u32 const width = abs(context.dib.core.width);
-    u32 const height = !context.is_included_in_ico ? abs(context.dib.core.height) : (abs(context.dib.core.height) / 2);
+    u32 const width = static_cast<u32>(abs(static_cast<i64>(context.dib.core.width)));
+    u32 const absolute_height = static_cast<u32>(abs(static_cast<i64>(context.dib.core.height)));
+    u32 const height = !context.is_included_in_ico ? absolute_height : (absolute_height / 2);
 
     context.bitmap = TRY(Bitmap::create(format, Gfx::AlphaType::Unpremultiplied, { static_cast<int>(width), static_cast<int>(height) }));
 
@@ -1570,7 +1571,7 @@ ErrorOr<Optional<ReadonlyBytes>> BMPImageDecoderPlugin::icc_data()
     // FIXME: Do something with v5.intent (which has a GamutMappingIntent value).
 
     u8 header_size = m_context->is_included_in_ico ? 0 : bmp_header_size;
-    if (v5.profile_data + header_size + v5.profile_size > m_context->file_size)
+    if (static_cast<u64>(v5.profile_data) + header_size + v5.profile_size > m_context->file_size)
         return Error::from_string_literal("BMPImageDecoderPlugin: ICC profile data out of bounds");
 
     return ReadonlyBytes { m_context->file_bytes + header_size + v5.profile_data, v5.profile_size };
