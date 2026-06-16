@@ -6,12 +6,15 @@
 
 #pragma once
 
+#include <AK/HashMap.h>
+#include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/DocumentState.h>
@@ -84,7 +87,7 @@ struct SessionHistoryNestedHistoryDescriptor {
 };
 
 // https://html.spec.whatwg.org/multipage/history.html#session-history-entry
-class SessionHistoryEntry final : public RefCounted<SessionHistoryEntry> {
+class WEB_API SessionHistoryEntry final : public RefCounted<SessionHistoryEntry> {
 public:
     static NonnullRefPtr<SessionHistoryEntry> create();
 
@@ -97,6 +100,12 @@ public:
 
     [[nodiscard]] Variant<int, Pending> step() const { return m_step; }
     void set_step(Variant<int, Pending> step) { m_step = step; }
+    [[nodiscard]] Optional<int> step_value() const
+    {
+        if (auto const* step = m_step.get_pointer<int>())
+            return *step;
+        return {};
+    }
 
     [[nodiscard]] URL::URL const& url() const { return m_url; }
     void set_url(URL::URL url) { m_url = move(url); }
@@ -162,6 +171,20 @@ private:
     // FIXME: persisted user state, which is implementation-defined, initially null
     // NOTE: This is where we could remember the state of form controls, for example.
 };
+
+struct SessionHistoryEntryDescriptorCreationState {
+    HashMap<DocumentState const*, u64> document_state_ids;
+    u64 next_document_state_id { 1 };
+};
+
+WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&, SessionHistoryEntryDescriptorCreationState&);
+WEB_API bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&);
+enum class MatchNestedHistories {
+    Yes,
+    No,
+};
+WEB_API bool session_history_entry_descriptors_match_ignoring_document_state_id(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
+WEB_API bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
 
 }
 

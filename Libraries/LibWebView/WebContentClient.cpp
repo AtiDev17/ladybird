@@ -312,6 +312,17 @@ bool WebContentClient::handle_mouse_event_in_compositor(u64 page_id, Web::MouseE
     return handled;
 }
 
+bool WebContentClient::handle_pinch_event_in_compositor(u64 page_id, Web::PinchEvent const& event)
+{
+    auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
+
+    auto handled = Application::the().handle_pinch_event_in_compositor(compositor_context_id_for_page(page_id), event);
+
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC pinch_event page {} returned {} in {} us",
+        page_id, handled, timer.elapsed_time().to_microseconds());
+    return handled;
+}
+
 void WebContentClient::dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const& event)
 {
     auto context_id = compositor_context_id_for_page(page_id);
@@ -1438,6 +1449,16 @@ Messages::WebContentClient::DidRequestUiProcessSessionHistoryForTestingResponse 
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
         return { view->ui_process_session_history_for_testing({}) };
+
+    return { "{}"_string };
+}
+
+Messages::WebContentClient::DidUpdateSessionHistoryAndRequestUiProcessSessionHistoryForTestingResponse WebContentClient::did_update_session_history_and_request_ui_process_session_history_for_testing(u64 page_id, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        view->did_update_session_history_for_testing({}, move(entries), move(used_steps), current_used_step_index);
+        return { view->ui_process_session_history_for_testing({}) };
+    }
 
     return { "{}"_string };
 }
