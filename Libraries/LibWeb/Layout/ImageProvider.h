@@ -19,28 +19,23 @@ class ImageProvider {
 public:
     virtual ~ImageProvider() { }
 
-    virtual bool is_image_available() const = 0;
+    bool is_image_available() const { return decoded_image_data() != nullptr; }
 
     virtual size_t current_frame_index() const = 0;
 
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const = 0;
 
-    virtual Optional<CSSPixels> intrinsic_width() const = 0;
-    virtual Optional<CSSPixels> intrinsic_height() const = 0;
+    Optional<CSSPixels> intrinsic_width() const;
+    Optional<CSSPixels> intrinsic_height() const;
     Optional<CSSPixelSize> intrinsic_size() const;
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const = 0;
+    Optional<CSSPixelFraction> intrinsic_aspect_ratio() const;
 
-    virtual Optional<Gfx::DecodedImageFrame> current_image_frame() const;
-    virtual Optional<Gfx::DecodedImageFrame> current_image_frame_sized(Gfx::IntSize) const = 0;
+    Optional<Gfx::DecodedImageFrame> current_image_frame(Optional<Gfx::IntSize> size = {}) const;
+    Optional<Gfx::DecodedImageFrame> default_image_frame(Optional<Gfx::IntSize> size = {}) const;
 
-    virtual Optional<Gfx::DecodedImageFrame> default_image_frame() const;
-    virtual Optional<Gfx::DecodedImageFrame> default_image_frame_sized(Gfx::IntSize) const;
-
-    virtual void set_visible_in_viewport(bool) = 0;
     virtual void layout_node_was_detached() const { }
 
 protected:
-    virtual GC::Ptr<DOM::Element const> to_html_element() const = 0;
     static void did_update_alt_text(ImageBox&);
 };
 

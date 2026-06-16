@@ -1388,7 +1388,7 @@ void force_the_value(GC::Ref<DOM::Node> node, FlyString const& command, Optional
             { node },
             [&](GC::Ref<DOM::Node> sibling) {
                 return is_simple_modifiable_element(sibling)
-                    && specified_command_value(static_cast<DOM::Element&>(*sibling), command) == new_value
+                    && values_are_equivalent(command, specified_command_value(as<DOM::Element>(*sibling), command), new_value)
                     && values_are_loosely_equivalent(command, effective_command_value(sibling, command), new_value);
             },
             [] -> GC::Ptr<DOM::Node> { return {}; });
@@ -3720,7 +3720,7 @@ void set_the_selections_value(DOM::Document& document, FlyString const& command,
         }
 
         // 5. Otherwise, if command is "createLink" or it has a value specified, set the value override to new value.
-        else if (command == CommandNames::createLink || !MUST(document.query_command_value(CommandNames::createLink)).is_empty()) {
+        else if (command == CommandNames::createLink || command_definition->value) {
             document.set_command_value_override(command, *new_value);
         }
 
@@ -4040,10 +4040,55 @@ void split_the_parent_of_nodes(Vector<GC::Ref<DOM::Node>> const& node_list)
         remove_extraneous_line_breaks_at_the_end_of_node(*last_node->parent());
 }
 
-enum class ToggleListMode : u8 {
-    Enable,
-    Disable,
-};
+// https://w3c.github.io/editing/docs/execCommand/#standard-inline-value-command
+bool standard_inline_indeterminate(DOM::Document const& document, FlyString const& command)
+{
+    // If a command is a standard inline value command, it is indeterminate if among formattable nodes that are
+    // effectively contained in the active range, there are two that have distinct effective command values.
+    Optional<Utf16String> first_node_value;
+    bool has_distinct_values = false;
+    for_each_node_effectively_contained_in_range(active_range(document), [&](GC::Ref<DOM::Node> node) {
+        if (!is_formattable_node(node))
+            return TraversalDecision::Continue;
+
+        auto node_value = effective_command_value(node, command);
+        if (!node_value.has_value())
+            return TraversalDecision::Continue;
+
+        if (!first_node_value.has_value()) {
+            first_node_value = node_value.value();
+        } else if (first_node_value.value() != node_value.value()) {
+            has_distinct_values = true;
+            return TraversalDecision::Break;
+        }
+
+        return TraversalDecision::Continue;
+    });
+    return has_distinct_values;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#standard-inline-value-command
+Utf16String standard_inline_value(DOM::Document const& document, FlyString const& command)
+{
+    // Its value is the effective command value of the first formattable node that is effectively contained in the
+    // active range;
+    auto range = active_range(document);
+    Optional<Utf16String> value;
+    for_each_node_effectively_contained_in_range(range, [&](GC::Ref<DOM::Node> node) {
+        if (!is_formattable_node(node))
+            return TraversalDecision::Continue;
+
+        value = effective_command_value(node, command);
+        return TraversalDecision::Break;
+    });
+
+    // or if there is no such node, the effective command value of the active range's start node;
+    if (!value.has_value() && range)
+        value = effective_command_value(range->start_container(), command);
+
+    // or if that is null, the empty string.
+    return value.value_or({});
+}
 
 // https://w3c.github.io/editing/docs/execCommand/#toggle-lists
 void toggle_lists(DOM::Document& document, FlyString const& tag_name)
@@ -4051,6 +4096,10 @@ void toggle_lists(DOM::Document& document, FlyString const& tag_name)
     VERIFY(first_is_one_of(tag_name, HTML::TagNames::ol, HTML::TagNames::ul));
 
     // 1. Let mode be "disable" if the selection's list state is tag name, and "enable" otherwise.
+    enum class ToggleListMode : u8 {
+        Enable,
+        Disable,
+    };
     auto mode = ToggleListMode::Enable;
     auto list_state = selections_list_state(document);
     if ((list_state == SelectionsListState::Ol && tag_name == HTML::TagNames::ol)
@@ -4630,8 +4679,13 @@ void for_each_node_effectively_contained_in_range(GC::Ptr<DOM::Range> range, Fun
         return;
 
     // A node can still be "effectively contained" in range even if it's not actually contained within the range; so we
-    // need to do an inclusive subtree traversal since the common ancestor could be matched as well.
-    range->common_ancestor_container()->for_each_in_inclusive_subtree([&](GC::Ref<DOM::Node> descendant) {
+    // need to traverse the highest effectively contained ancestor of the common ancestor container.
+    // See: https://w3c.github.io/editing/docs/execCommand/#effectively-contained
+    GC::Ref<DOM::Node> traversal_root = range->common_ancestor_container();
+    while (traversal_root->parent() && is_effectively_contained_in_range(*traversal_root->parent(), *range))
+        traversal_root = *traversal_root->parent();
+
+    traversal_root->for_each_in_inclusive_subtree([&](GC::Ref<DOM::Node> descendant) {
         if (!is_effectively_contained_in_range(descendant, *range)) {
             // NOTE: We cannot skip children here since if a descendant is not effectively contained within a range, its
             //       children might still be.
