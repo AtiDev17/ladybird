@@ -68,6 +68,11 @@ jobs:
           restore-keys: |
             ccache | Windows | x86_64 | ClangCL | NORMAL
 
+      - name: Patch CPU baseline for i7-2600 compatibility
+        shell: pwsh
+        run: |
+          (Get-Content Meta/CMake/compile_options.cmake) -replace 'x86-64-v3', 'x86-64-v2' | Set-Content Meta/CMake/compile_options.cmake
+
       - name: Configure ccache
         shell: pwsh
         run: |
