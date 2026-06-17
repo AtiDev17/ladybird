@@ -70,7 +70,7 @@ void CompositorState::create_context(Web::Compositor::CompositorContextId contex
         VERIFY(context_id == Web::Compositor::compositor_context_id_for_page(*page_id));
 
     auto& context = *m_contexts.ensure(context_id, [&] {
-        return make<ContextState>(page_id, web_content_client, m_async_scrolling_enabled);
+        return make<ContextState>(page_id, web_content_client, m_canvas_surface_registry, m_async_scrolling_enabled);
     });
     resize_backing_stores_if_needed(context_id, context);
 }
@@ -154,23 +154,6 @@ void CompositorState::clear_video_frame(Web::Compositor::CompositorContextId con
     auto* context = context_if_present(context_id);
     VERIFY(context);
     context->clear_video_frame(frame_id);
-    present_current_frame(context_id, *context);
-}
-
-void CompositorState::update_compositor_surface(Web::Compositor::CompositorContextId context_id, Web::Painting::CompositorSurfaceId surface_id, Gfx::SharedImage&& shared_image)
-{
-    auto* context = context_if_present(context_id);
-    VERIFY(context);
-    context->update_compositor_surface(surface_id, move(shared_image));
-    present_current_frame(context_id, *context);
-}
-
-void CompositorState::clear_compositor_surface(Web::Compositor::CompositorContextId context_id, Web::Painting::CompositorSurfaceId surface_id)
-{
-    auto* context = context_if_present(context_id);
-    VERIFY(context);
-    context->clear_compositor_surface(surface_id);
-    remove_child_surface(*context, context_id, surface_id);
     present_current_frame(context_id, *context);
 }
 
@@ -514,17 +497,6 @@ void CompositorState::detach_from_parent_surface(Web::Compositor::CompositorCont
     VERIFY(*removed_child_context_id == context_id);
     parent_context->clear_compositor_surface(published_surface->surface_id);
     present_current_frame(published_surface->parent_context_id, *parent_context);
-}
-
-void CompositorState::remove_child_surface(ContextState& context, Web::Compositor::CompositorContextId parent_context_id, Web::Painting::CompositorSurfaceId surface_id)
-{
-    auto child_context_id = context.take_child_context_for_surface(surface_id);
-    if (!child_context_id.has_value())
-        return;
-
-    auto* child_context = context_if_present(*child_context_id);
-    VERIFY(child_context);
-    child_context->did_detach_from_parent_surface(parent_context_id, surface_id);
 }
 
 void CompositorState::resize_backing_stores_if_needed(Web::Compositor::CompositorContextId context_id, ContextState& context)

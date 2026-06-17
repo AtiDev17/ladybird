@@ -8,21 +8,18 @@
 
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
-#include <LibWeb/Export.h>
 #include <LibWeb/WebGL/GLFunctions.h>
 
-namespace Web::WebGL {
+namespace Compositor {
 
-class WEB_API OpenGLContext : public GLFunctions {
+class OpenGLContext : public Web::WebGL::GLFunctions {
 public:
-    enum class WebGLVersion {
-        WebGL1,
-        WebGL2,
-    };
+    using WebGLVersion = Web::WebGL::WebGLVersion;
 
     struct DrawingBufferOptions {
         bool depth;
@@ -53,9 +50,6 @@ public:
     u32 default_renderbuffer() const;
 
     Vector<String> get_supported_opengl_extensions();
-    void request_extension(char const* extension_name);
-
-    WebGLVersion webgl_version() const { return m_webgl_version; }
 
 private:
     NonnullRefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;

@@ -41,11 +41,19 @@ AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(i64, UniqueNodeID, Comparison, Increment, Ca
 
 }
 
+namespace Web::Compositor {
+
+class CompositorContextHandle;
+class CompositorHost;
+
+}
+
 namespace Web::Painting {
 
 class AccumulatedVisualContextTree;
 class BackingStore;
 class ChromeWidget;
+class CanvasSurfaceRegistry;
 class DevicePixelConverter;
 class DisplayList;
 class DisplayListPlayerSkia;
@@ -691,6 +699,7 @@ class BroadcastChannel;
 class BrowsingContext;
 class BrowsingContextGroup;
 class CanvasRenderingContext2D;
+class RemoteCanvas2DTransport;
 class ClassicScript;
 class CloseEvent;
 class CloseWatcher;
@@ -1302,7 +1311,8 @@ enum class AudioContextState;
 
 namespace Web::WebGL {
 
-class OpenGLContext;
+class RemoteWebGLTransport;
+class WebGLContextProxy;
 class WebGL2RenderingContext;
 class WebGLActiveInfo;
 class WebGLBuffer;

@@ -28,14 +28,16 @@ extern "C" {
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <LibGfx/VulkanImage.h>
 #endif
-#include <LibWeb/WebGL/OpenGLContext.h>
+#include <Compositor/OpenGLContext.h>
 
 // Enable WebGL if we're on MacOS and can use Metal or if we can use shareable Vulkan images
 #if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
 #    define ENABLE_WEBGL 1
 #endif
 
-namespace Web::WebGL {
+namespace Compositor {
+
+using namespace Web::WebGL;
 
 struct OpenGLContext::Impl {
     EGLDisplay display { EGL_NO_DISPLAY };
@@ -522,16 +524,6 @@ Vector<String> OpenGLContext::get_supported_opengl_extensions()
 #else
     (void)m_webgl_version;
     return {};
-#endif
-}
-
-void OpenGLContext::request_extension(char const* extension_name)
-{
-#ifdef ENABLE_WEBGL
-    make_current();
-    glRequestExtensionANGLE(extension_name);
-#else
-    (void)extension_name;
 #endif
 }
 

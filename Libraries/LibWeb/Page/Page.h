@@ -233,8 +233,9 @@ public:
     void register_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
     void unregister_canvas_element(Badge<HTML::HTMLCanvasElement>, UniqueNodeID canvas_id);
 
-    void present_all_canvas_element_surfaces();
-    void republish_all_canvas_element_surfaces();
+    void prepare_canvas_contexts_for_compositing();
+    void notify_all_canvas_elements_of_lost_backing_storage();
+    void notify_all_webgl_contexts_lost();
 
     struct MediaContextMenu {
         URL::URL media_url;

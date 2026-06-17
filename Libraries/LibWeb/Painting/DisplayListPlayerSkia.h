@@ -7,7 +7,10 @@
 #pragma once
 
 #include <AK/Function.h>
-#include <LibGfx/DecodedImageFrameSkiaImageCache.h>
+#include <AK/HashMap.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/RefPtr.h>
+#include <LibGfx/Forward.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
@@ -19,9 +22,21 @@ namespace Web::Painting {
 
 class WEB_API DisplayListPlayerSkia final : public DisplayListPlayer {
 public:
+    using CompositorSurfaceMap = HashMap<CompositorSurfaceId, NonnullRefPtr<Gfx::PaintingSurface>>;
+
     DisplayListPlayerSkia();
     explicit DisplayListPlayerSkia(RefPtr<Gfx::SkiaBackendContext>);
     ~DisplayListPlayerSkia();
+
+    using DisplayListPlayer::execute;
+    void execute(
+        DisplayList const&,
+        AccumulatedVisualContextTree const&,
+        DisplayListResourceStorage const&,
+        ScrollStateSnapshot const&,
+        RefPtr<Gfx::PaintingSurface>,
+        CanvasSurfaceRegistry const*,
+        CompositorSurfaceMap const*);
 
     void flush(Gfx::PaintingSurface&) override;
     void flush_async(Gfx::PaintingSurface&, Function<void()>&&);
@@ -45,7 +60,7 @@ private:
     ReadonlySpan<float> gradient_positions(DisplayListGradientColorStops) const;
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
-    Gfx::DecodedImageFrameSkiaImageCache m_image_cache;
+    CompositorSurfaceMap const* m_compositor_surfaces { nullptr };
 };
 
 }

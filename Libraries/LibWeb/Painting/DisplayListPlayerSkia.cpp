@@ -7,6 +7,7 @@
 
 #define SK_SUPPORT_UNSPANNED_APIS
 
+#include <AK/TemporaryChange.h>
 #include <core/SkBitmap.h>
 #include <core/SkBlurTypes.h>
 #include <core/SkCanvas.h>
@@ -38,6 +39,7 @@
 #include <LibGfx/SkiaUtils.h>
 #include <LibGfx/YUVData.h>
 #include <LibMedia/VideoFrame.h>
+#include <LibWeb/Painting/CanvasSurfaceRegistry.h>
 #include <LibWeb/Painting/DisplayListPlayerSkia.h>
 
 namespace Web::Painting {
@@ -49,12 +51,30 @@ DisplayListPlayerSkia::DisplayListPlayerSkia()
 
 DisplayListPlayerSkia::DisplayListPlayerSkia(RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
     : m_skia_backend_context(move(skia_backend_context))
-    , m_image_cache(m_skia_backend_context)
 {
 }
 
 DisplayListPlayerSkia::~DisplayListPlayerSkia()
 {
+}
+
+void DisplayListPlayerSkia::execute(
+    DisplayList const& display_list,
+    AccumulatedVisualContextTree const& visual_context_tree,
+    DisplayListResourceStorage const& resource_storage,
+    ScrollStateSnapshot const& scroll_state_snapshot,
+    RefPtr<Gfx::PaintingSurface> surface,
+    CanvasSurfaceRegistry const* canvas_surface_registry,
+    CompositorSurfaceMap const* compositor_surfaces)
+{
+    TemporaryChange compositor_surfaces_change { m_compositor_surfaces, compositor_surfaces };
+    DisplayListPlayer::execute(
+        display_list,
+        visual_context_tree,
+        resource_storage,
+        scroll_state_snapshot,
+        move(surface),
+        canvas_surface_registry);
 }
 
 static SkRRect to_skia_rrect(auto const& rect, Gfx::CornerRadii const& corner_radii)
@@ -106,7 +126,6 @@ static SkM44 to_skia_matrix4x4(Gfx::FloatMatrix4x4 const& matrix)
 
 void DisplayListPlayerSkia::flush(Gfx::PaintingSurface& surface)
 {
-    m_image_cache.prune();
     if (auto context = surface.skia_backend_context())
         context->flush_and_submit(&surface.sk_surface());
     surface.flush();
@@ -114,7 +133,6 @@ void DisplayListPlayerSkia::flush(Gfx::PaintingSurface& surface)
 
 void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<void()>&& callback)
 {
-    m_image_cache.prune();
     if (auto context = surface.skia_backend_context())
         context->flush_and_submit_async(&surface.sk_surface(), move(callback));
     else
@@ -209,11 +227,36 @@ void DisplayListPlayerSkia::play_command(FillRect const& command)
 
 void DisplayListPlayerSkia::play_command(DrawCompositorSurface const& command)
 {
-    auto frame = resource_storage().compositor_surface(command.surface_id);
-    if (!frame.has_value())
+    if (!m_compositor_surfaces)
         return;
 
-    auto image = m_image_cache.image_for_frame(frame.value());
+    auto compositor_surface = m_compositor_surfaces->get(command.surface_id);
+    if (!compositor_surface.has_value())
+        return;
+
+    auto image = compositor_surface.value()->sk_image_snapshot<sk_sp<SkImage>>();
+    if (!image)
+        return;
+
+    auto dst_rect = to_skia_rect(command.dst_rect);
+    SkRect src_rect = SkRect::MakeIWH(image->width(), image->height());
+    auto& canvas = surface().canvas();
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    canvas.drawImageRect(image.get(), src_rect, dst_rect, to_skia_sampling_options(command.scaling_mode), &paint, SkCanvas::kStrict_SrcRectConstraint);
+}
+
+void DisplayListPlayerSkia::play_command(DrawCanvas const& command)
+{
+    auto const* registry = canvas_surface_registry();
+    if (!registry)
+        return;
+
+    auto* canvas_surface = registry->canvas_surface(command.canvas_id);
+    if (!canvas_surface)
+        return;
+
+    auto image = canvas_surface->sk_image_snapshot<sk_sp<SkImage>>();
     if (!image)
         return;
 
@@ -270,8 +313,7 @@ void DisplayListPlayerSkia::play_command(DrawVideoFrame const& command)
 
 void DisplayListPlayerSkia::play_command(DrawScaledDecodedImageFrame const& command)
 {
-    auto const& frame = resource_storage().image_frame(command.frame_id);
-    auto image = m_image_cache.image_for_frame(frame);
+    auto image = resource_storage().skia_image_for_image_frame(command.frame_id, m_skia_backend_context);
     if (!image)
         return;
 
@@ -288,7 +330,7 @@ void DisplayListPlayerSkia::play_command(DrawScaledDecodedImageFrame const& comm
 void DisplayListPlayerSkia::play_command(DrawRepeatedDecodedImageFrame const& command)
 {
     auto const& frame = resource_storage().image_frame(command.frame_id);
-    auto image = m_image_cache.image_for_frame(frame);
+    auto image = resource_storage().skia_image_for_image_frame(command.frame_id, m_skia_backend_context);
     if (!image)
         return;
 

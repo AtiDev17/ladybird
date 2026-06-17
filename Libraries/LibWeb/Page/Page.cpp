@@ -716,17 +716,24 @@ void Page::for_each_canvas_element(Callback&& callback)
     }
 }
 
-void Page::present_all_canvas_element_surfaces()
+void Page::prepare_canvas_contexts_for_compositing()
 {
     for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.present();
+        canvas_element.prepare_for_compositing();
     });
 }
 
-void Page::republish_all_canvas_element_surfaces()
+void Page::notify_all_canvas_elements_of_lost_backing_storage()
 {
     for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.republish_compositor_surface();
+        canvas_element.notify_compositor_backing_storage_lost();
+    });
+}
+
+void Page::notify_all_webgl_contexts_lost()
+{
+    for_each_canvas_element([](auto& canvas_element) {
+        canvas_element.notify_compositor_connection_lost();
     });
 }
 
