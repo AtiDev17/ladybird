@@ -3,7 +3,7 @@ name: Windows Build
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 */14 * *'
+    - cron: '0 0 */7 * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -307,7 +307,7 @@ jobs:
         id: tag
         shell: bash
         run: |
-          TAG="unofficial-$(date +'%Y-%m-%d')"
+          TAG="$(date +'%Y-%m-%d')"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Release (unique tag)
@@ -315,7 +315,7 @@ jobs:
         if: success() && github.ref == 'refs/heads/master'
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: "Unofficial Automated Build ${{ steps.tag.outputs.tag }}"
+          name: "Windows Build ${{ steps.tag.outputs.tag }}"
           body: |
             **UNOFFICIAL BUILD**
             This is an automated, experimental build created from a personal fork.
