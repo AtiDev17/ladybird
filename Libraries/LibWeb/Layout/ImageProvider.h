@@ -15,13 +15,12 @@
 
 namespace Web::Layout {
 
+// FIXME: Update all ImageProviders to be DecodedImageData::Clients (i.e. support animated images)
 class ImageProvider {
 public:
     virtual ~ImageProvider() { }
 
     bool is_image_available() const { return decoded_image_data() != nullptr; }
-
-    virtual size_t current_frame_index() const = 0;
 
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const = 0;
 

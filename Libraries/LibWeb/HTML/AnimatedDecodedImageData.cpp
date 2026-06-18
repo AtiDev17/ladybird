@@ -1,252 +1,84 @@
 /*
- * Copyright (c) 2026, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2026, Callum Law <callumlaw1709@outlook.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
-#include <LibGC/Heap.h>
-#include <LibGfx/Bitmap.h>
-#include <LibJS/Runtime/ExternalMemory.h>
-#include <LibJS/Runtime/Realm.h>
-#include <LibWeb/HTML/AnimatedDecodedImageData.h>
-#include <LibWeb/Painting/DisplayListRecorder.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
-#include <LibWeb/Platform/ImageCodecPlugin.h>
+#include "AnimatedDecodedImageData.h"
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/DocumentObserver.h>
 
 namespace Web::HTML {
 
-GC_DEFINE_ALLOCATOR(AnimatedDecodedImageData);
-
-HashMap<i64, GC::RawPtr<AnimatedDecodedImageData>>& AnimatedDecodedImageData::session_registry()
+void AnimatedDecodedImageData::visit_edges(Cell::Visitor& visitor)
 {
-    static NeverDestroyed<HashMap<i64, GC::RawPtr<AnimatedDecodedImageData>>> registry;
-    return *registry;
+    Base::visit_edges(visitor);
+    visitor.visit(m_document_observer);
 }
 
-void AnimatedDecodedImageData::install_frame_delivery_callback()
+AnimatedDecodedImageData::AnimatedDecodedImageData(GC::Ref<DOM::DocumentObserver> document_observer)
+    : m_document_observer(document_observer)
 {
-    static bool s_installed = false;
-    if (s_installed)
-        return;
-    s_installed = true;
+    auto weak_this = GC::Weak { *this };
 
-    Platform::ImageCodecPlugin::the().on_animation_frames_decoded = [](i64 session_id, Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps) {
-        deliver_frames_for_session(session_id, move(bitmaps));
-    };
-    Platform::ImageCodecPlugin::the().on_animation_decode_failed = [](i64 session_id) {
-        auto it = session_registry().find(session_id);
-        if (it != session_registry().end()) {
-            if (auto data = it->value)
-                data->m_request_in_flight = false;
+    // OPTIMIZATION: To avoid CPU churn in background tabs we cancel the animation when the document is inactive or
+    //               hidden. Other browsers disagree on what should happen when the document becomes active again,
+    //               Blink continues the animation from where it would be if it had been running the whole time, and
+    //               Gecko restarts the animation. For now we restart the animation since that's simpler.
+    m_document_observer->set_document_became_inactive([weak_this] {
+        if (auto self = weak_this.ptr())
+            self->stop_animation();
+    });
+
+    m_document_observer->set_document_became_active([weak_this] {
+        if (auto self = weak_this.ptr()) {
+            if (!self->has_clients())
+                self->m_should_start_animation_on_client_registration = true;
+
+            self->restart_animation();
         }
-    };
+    });
+
+    m_document_observer->set_document_visibility_state_observer([weak_this](HTML::VisibilityState visibility_state) {
+        if (auto self = weak_this.ptr()) {
+            switch (visibility_state) {
+            case HTML::VisibilityState::Hidden:
+                self->stop_animation();
+                break;
+            case HTML::VisibilityState::Visible:
+                if (!self->has_clients())
+                    self->m_should_start_animation_on_client_registration = true;
+                self->restart_animation();
+                break;
+            }
+        }
+    });
 }
 
-void AnimatedDecodedImageData::deliver_frames_for_session(i64 session_id, Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps)
+void AnimatedDecodedImageData::restart_animation()
 {
-    auto it = session_registry().find(session_id);
-    if (it == session_registry().end())
-        return;
-    if (auto data = it->value)
-        data->receive_frames(move(bitmaps), data->m_last_requested_start_frame);
+    stop_animation();
+    reset_animation();
+    start_animation_if_needed();
 }
 
-GC::Ref<AnimatedDecodedImageData> AnimatedDecodedImageData::create(
-    JS::Realm& realm,
-    i64 session_id,
-    u32 frame_count,
-    u32 loop_count,
-    Gfx::IntSize size,
-    Gfx::ColorSpace color_space,
-    Vector<u32> durations,
-    Vector<NonnullRefPtr<Gfx::Bitmap>> initial_bitmaps)
+void AnimatedDecodedImageData::on_client_registered()
 {
-    auto data = realm.create<AnimatedDecodedImageData>(
-        session_id, frame_count, loop_count, size, move(color_space), move(durations));
-
-    // Place initial bitmaps into the buffer pool.
-    for (u32 i = 0; i < initial_bitmaps.size(); ++i) {
-        auto& slot = data->m_buffer_slots[i % BUFFER_POOL_SIZE];
-        slot.frame_index = i;
-        slot.frame = Gfx::DecodedImageFrame { *initial_bitmaps[i], data->m_color_space };
-        slot.generation = ++data->m_write_generation;
-    }
-
-    data->m_highest_requested_frame = initial_bitmaps.size();
-
-    if (!initial_bitmaps.is_empty())
-        data->m_last_displayed_frame = data->m_buffer_slots[0].frame;
-
-    install_frame_delivery_callback();
-    session_registry().set(session_id, data.ptr());
-
-    return data;
-}
-
-AnimatedDecodedImageData::AnimatedDecodedImageData(
-    i64 session_id,
-    u32 frame_count,
-    u32 loop_count,
-    Gfx::IntSize size,
-    Gfx::ColorSpace color_space,
-    Vector<u32> durations)
-    : m_session_id(session_id)
-    , m_frame_count(frame_count)
-    , m_loop_count(loop_count)
-    , m_size(size)
-    , m_color_space(move(color_space))
-    , m_durations(move(durations))
-{
-}
-
-AnimatedDecodedImageData::~AnimatedDecodedImageData() = default;
-
-size_t AnimatedDecodedImageData::external_memory_size() const
-{
-    size_t size = JS::vector_external_memory_size(m_durations);
-    for (auto const& slot : m_buffer_slots) {
-        if (slot.frame.has_value())
-            size = JS::saturating_add_external_memory_size(size, slot.frame->bitmap().data_size());
-    }
-    return size;
-}
-
-void AnimatedDecodedImageData::finalize()
-{
-    Base::finalize();
-    session_registry().remove(m_session_id);
-    Platform::ImageCodecPlugin::the().stop_animation_decode(m_session_id);
-}
-
-AnimatedDecodedImageData::BufferSlot const* AnimatedDecodedImageData::find_slot(u32 frame_index) const
-{
-    for (auto const& slot : m_buffer_slots) {
-        if (slot.frame_index == frame_index && slot.frame.has_value())
-            return &slot;
-    }
-    return nullptr;
-}
-
-AnimatedDecodedImageData::BufferSlot& AnimatedDecodedImageData::evict_oldest_slot()
-{
-    BufferSlot* oldest = &m_buffer_slots[0];
-    for (auto& slot : m_buffer_slots) {
-        if (slot.generation < oldest->generation)
-            oldest = &slot;
-    }
-    return *oldest;
-}
-
-Optional<Gfx::DecodedImageFrame> AnimatedDecodedImageData::frame(size_t frame_index, Gfx::IntSize) const
-{
-    if (frame_index >= m_frame_count)
-        return m_last_displayed_frame;
-
-    if (auto const* slot = find_slot(frame_index)) {
-        m_last_displayed_frame = slot->frame;
-        return slot->frame;
-    }
-
-    // Frame not in pool; return last displayed frame as fallback.
-    return m_last_displayed_frame;
-}
-
-int AnimatedDecodedImageData::frame_duration(size_t frame_index) const
-{
-    if (frame_index >= m_durations.size())
-        return 0;
-    return m_durations[frame_index];
-}
-
-Optional<CSSPixels> AnimatedDecodedImageData::intrinsic_width() const
-{
-    return m_size.width();
-}
-
-Optional<CSSPixels> AnimatedDecodedImageData::intrinsic_height() const
-{
-    return m_size.height();
-}
-
-Optional<CSSPixelFraction> AnimatedDecodedImageData::intrinsic_aspect_ratio() const
-{
-    return CSSPixels(m_size.width()) / CSSPixels(m_size.height());
-}
-
-Optional<Gfx::IntRect> AnimatedDecodedImageData::frame_rect(size_t) const
-{
-    return Gfx::IntRect { {}, m_size };
-}
-
-void AnimatedDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode scaling_mode) const
-{
-    auto decoded_frame = frame(frame_index);
-    if (!decoded_frame.has_value())
-        return;
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, *decoded_frame, scaling_mode);
-}
-
-void AnimatedDecodedImageData::receive_frames(Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps, u32 start_frame_index)
-{
-    m_request_in_flight = false;
-
-    for (u32 i = 0; i < bitmaps.size(); ++i) {
-        u32 frame_index = start_frame_index + i;
-        if (frame_index >= m_frame_count)
-            break;
-
-        // Check if this frame is already in the pool.
-        if (find_slot(frame_index))
-            continue;
-
-        auto& slot = evict_oldest_slot();
-        slot.frame_index = frame_index;
-        slot.frame = Gfx::DecodedImageFrame { *bitmaps[i], m_color_space };
-        slot.generation = ++m_write_generation;
-    }
-}
-
-size_t AnimatedDecodedImageData::notify_frame_advanced(size_t caller_frame_index)
-{
-    // We own the frame progression. Only advance when a caller reports
-    // the expected next frame (this deduplicates multiple callers per tick).
-    size_t expected_next = (m_current_frame_index + 1) % m_frame_count;
-    if (caller_frame_index == expected_next) {
-        m_current_frame_index = expected_next;
-        maybe_request_more_frames(m_current_frame_index);
-    }
-    return m_current_frame_index;
-}
-
-void AnimatedDecodedImageData::maybe_request_more_frames(size_t current_frame_index)
-{
-    if (m_request_in_flight)
+    if (!m_should_start_animation_on_client_registration)
         return;
 
-    // Count how many frames ahead of current are in the pool.
-    u32 frames_ahead = 0;
-    for (u32 offset = 1; offset <= BUFFER_POOL_SIZE; ++offset) {
-        u32 future_index = (current_frame_index + offset) % m_frame_count;
-        if (find_slot(future_index))
-            ++frames_ahead;
-        else
-            break;
-    }
+    m_should_start_animation_on_client_registration = false;
 
-    // Request more when buffer is less than half full, giving the decoder
-    // time to respond while we still have frames to display.
-    if (frames_ahead >= REQUEST_BATCH_SIZE)
+    start_animation_if_needed();
+}
+
+void AnimatedDecodedImageData::start_animation_if_needed()
+{
+    // NB: Animations should start when the first client is registered while the document is active and visible.
+    if (!has_clients() || !m_document_observer->document()->is_fully_active() || m_document_observer->document()->hidden())
         return;
 
-    // Determine which frame to request from.
-    u32 request_start = (current_frame_index + frames_ahead + 1) % m_frame_count;
-    u32 request_count = REQUEST_BATCH_SIZE;
-
-    m_request_in_flight = true;
-    m_last_requested_start_frame = request_start;
-    m_highest_requested_frame = max(m_highest_requested_frame, request_start + request_count);
-    Platform::ImageCodecPlugin::the().request_animation_frames(m_session_id, request_start, request_count);
+    start_animation();
 }
 
 }

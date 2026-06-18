@@ -829,10 +829,8 @@ public:
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
     CSS::ImageStyleValueResource* css_image_resource(URL::URL const&);
     CSS::ImageStyleValueResource const* css_image_resource(URL::URL const&) const;
-    CSS::ImageStyleValueResource& ensure_css_image_resource(URL::URL const&);
+    CSS::ImageStyleValueResource& create_css_image_resource(GC::Ref<HTML::SharedResourceRequest>);
     void remove_css_image_resource_if_unused(URL::URL const&);
-    void animate_css_image_resource(URL::URL const&);
-    u64 active_css_image_animation_timer_count() const;
     void prune_image_resource_caches();
 
     void restore_the_history_object_state(NonnullRefPtr<HTML::SessionHistoryEntry> entry);
@@ -920,7 +918,7 @@ public:
     void record_full_style_invalidation() const;
     static void set_style_invalidation_counter_dump_interval(Optional<u64>);
 
-    void set_needs_accumulated_visual_contexts_update(bool value) { m_needs_accumulated_visual_contexts_update = value; }
+    void set_needs_accumulated_visual_contexts_update(bool);
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
 
     virtual JS::Value named_item_value(FlyString const& name) const override;

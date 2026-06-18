@@ -19,46 +19,33 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/URL.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 
 namespace Web::CSS {
 
 class ImageStyleValue;
 
-class ImageStyleValueResource {
+class ImageStyleValueResource final : public HTML::DecodedImageData::Client {
 public:
-    explicit ImageStyleValueResource(::URL::URL);
+    explicit ImageStyleValueResource(GC::Ref<HTML::SharedResourceRequest>, GC::Ref<DOM::Document> const&);
     ~ImageStyleValueResource();
 
     void visit_edges(JS::Cell::Visitor&);
 
-    void set_resource_request(DOM::Document&, GC::Ref<HTML::SharedResourceRequest>);
-    void register_image_style_value(DOM::Document&, ImageStyleValue const&);
+    void register_image_style_value(ImageStyleValue const&);
     void unregister_image_style_value(ImageStyleValue const&);
     bool can_be_removed() const { return m_image_style_values.is_empty(); }
 
-    [[nodiscard]] GC::Ptr<HTML::DecodedImageData> image_data() const;
-    [[nodiscard]] Optional<Gfx::DecodedImageFrame> frame(size_t frame_index, Gfx::IntSize = {}) const;
-    [[nodiscard]] size_t current_frame_index() const { return m_current_frame_index; }
-    [[nodiscard]] bool has_active_animation_timer() const;
-
-    void animate(DOM::Document&);
+    [[nodiscard]] virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override;
 
 private:
-    void add_callbacks_if_needed(DOM::Document&);
-    void notify_image_style_values_did_update(DOM::Document&);
-    void start_animation_timer_if_needed(DOM::Document&);
-    void stop_animation_timer();
-    bool is_animatable() const;
-    bool animation_has_completed() const;
-    int current_frame_duration() const;
+    virtual void decoded_image_data_did_update() override { notify_image_style_values_did_update(); }
 
-    ::URL::URL m_url;
-    GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
-    GC::Ptr<Platform::Timer> m_timer;
+    void on_decoded_image_data_loaded();
+    void notify_image_style_values_did_update();
+
+    GC::Ref<HTML::SharedResourceRequest> m_resource_request;
     HashTable<ImageStyleValue const*> m_image_style_values;
-    size_t m_current_frame_index { 0 };
-    size_t m_loops_completed { 0 };
-    bool m_has_resource_request_callbacks { false };
 };
 
 class ImageStyleValue final
@@ -89,7 +76,6 @@ public:
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(URL const&, Optional<::URL::URL> style_resource_base_url);
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(::URL::URL const&);
     virtual ~ImageStyleValue() override;
-    static u64 active_animation_timer_count(DOM::Document const&);
 
     virtual void serialize(StringBuilder&, SerializationMode) const override;
     virtual bool equals(StyleValue const& other) const override;
@@ -106,10 +92,7 @@ public:
     void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering) const override;
 
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
-    Optional<Gfx::DecodedImageFrame> current_frame(DOM::Document const&, DevicePixelRect const& dest_rect) const;
-    size_t current_frame_index(DOM::Document const&) const;
-
-    mutable Function<void()> on_animate;
+    Optional<Gfx::DecodedImageFrame> current_frame(DOM::Document const&, DevicePixelRect const& dest_rect = {}) const;
 
     GC::Ptr<HTML::DecodedImageData> image_data(DOM::Document const&) const;
 
@@ -122,15 +105,14 @@ private:
     void register_client(Client&) const;
     void unregister_client(Client&) const;
     void notify_clients_did_update() const;
-    void notify_did_animate() const;
     void update_style_sheet_resource_context(CSSStyleSheet const&);
+    GC::Ptr<HTML::SharedResourceRequest> fetch_image(DOM::Document&) const;
     Optional<::URL::URL> resolved_url(DOM::Document const&) const;
     ::URL::URL style_resource_base_url(DOM::Document const&) const;
 
     virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
 
     virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    Optional<Gfx::DecodedImageFrame> frame(DOM::Document const&, size_t frame_index, Gfx::IntSize = {}) const;
 
     URL m_url;
     Optional<::URL::URL> m_style_resource_base_url;

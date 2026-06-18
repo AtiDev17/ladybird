@@ -1,0 +1,31 @@
+<!doctype html>
+<html class="reftest-wait">
+    <style>
+        body {
+            margin: 0;
+        }
+
+        #target {
+            width: 100px;
+            height: 50px;
+            /* red-then-green.gif is 100x50: frame 0 is solid red for 500ms, frame 1 is solid green for 100s, it does not loop */
+            background: url("../data/red-then-green.gif") no-repeat;
+        }
+    </style>
+    <div id="target"></div>
+    <script src="../../Text/input/include.js"></script>
+    <script>
+        (async () => {
+            const imageURL = "../data/red-then-green.gif";
+
+            // Wait for the animation to start
+            await waitForImageAnimationState(imageURL, state => state.timerActive);
+
+            // Wait until the next frame
+            await waitForImageAnimationState(imageURL, state => state.frameIndex > 0);
+
+            // Take a screenshot - the image should have been invalidated and repainted.
+            document.documentElement.classList.remove("reftest-wait");
+        })();
+    </script>
+</html>

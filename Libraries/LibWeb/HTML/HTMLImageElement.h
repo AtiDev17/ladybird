@@ -14,6 +14,7 @@
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ViewportClient.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/LazyLoadingElement.h>
 #include <LibWeb/HTML/SourceSet.h>
@@ -25,7 +26,8 @@ class HTMLImageElement final
     : public HTMLElement
     , public LazyLoadingElement<HTMLImageElement>
     , public Layout::ImageProvider
-    , public DOM::ViewportClient {
+    , public DOM::ViewportClient
+    , public DecodedImageData::Client {
     WEB_PLATFORM_OBJECT(HTMLImageElement, HTMLElement);
     GC_DECLARE_ALLOCATOR(HTMLImageElement);
     LAZY_LOADING_ELEMENT(HTMLImageElement);
@@ -96,8 +98,6 @@ public:
     ImageRequest& current_request() { return *m_current_request; }
     ImageRequest const& current_request() const { return *m_current_request; }
 
-    virtual size_t current_frame_index() const override { return m_current_frame_index; }
-
     // https://html.spec.whatwg.org/multipage/images.html#upgrade-the-pending-request-to-the-current-request
     void upgrade_pending_request_to_current_request();
 
@@ -136,14 +136,7 @@ private:
     void handle_failed_fetch();
     void add_callbacks_to_image_request(GC::Ref<ImageRequest>, bool maybe_omit_events, String const& url_string, String const& previous_url, u64 update_the_image_data_count);
 
-    bool current_request_has_running_animation() const;
-    void start_animation_timer_if_visible();
-    void animate();
-
-    RefPtr<Core::Timer> m_animation_timer;
-    size_t m_current_frame_index { 0 };
-    size_t m_loops_completed { 0 };
-    bool m_animation_paused_by_visibility { false };
+    virtual void decoded_image_data_did_update() override { set_needs_repaint(); }
 
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 

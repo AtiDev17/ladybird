@@ -6777,14 +6777,14 @@ CSS::ImageStyleValueResource const* Document::css_image_resource(URL::URL const&
     return it->value.ptr();
 }
 
-CSS::ImageStyleValueResource& Document::ensure_css_image_resource(URL::URL const& url)
+CSS::ImageStyleValueResource& Document::create_css_image_resource(GC::Ref<HTML::SharedResourceRequest> request)
 {
-    if (auto* resource = css_image_resource(url))
-        return *resource;
+    // NB: The caller should guard against creating already existing resources.
+    VERIFY(!m_css_image_resources.contains(request->url()));
 
-    auto resource = make<CSS::ImageStyleValueResource>(url);
+    auto resource = make<CSS::ImageStyleValueResource>(request, *this);
     auto& resource_ref = *resource;
-    m_css_image_resources.set(url, move(resource));
+    m_css_image_resources.set(request->url(), move(resource));
     return resource_ref;
 }
 
@@ -6798,22 +6798,6 @@ void Document::remove_css_image_resource_if_unused(URL::URL const& url)
     m_css_image_resources.remove(it);
 }
 
-void Document::animate_css_image_resource(URL::URL const& url)
-{
-    if (auto* resource = css_image_resource(url))
-        resource->animate(*this);
-}
-
-u64 Document::active_css_image_animation_timer_count() const
-{
-    u64 count = 0;
-    for (auto const& it : m_css_image_resources) {
-        if (it.value->has_active_animation_timer())
-            ++count;
-    }
-    return count;
-}
-
 void Document::prune_image_resource_caches()
 {
     static constexpr size_t decoded_image_resource_cache_limit = 8 * MiB;
@@ -6821,7 +6805,7 @@ void Document::prune_image_resource_caches()
 
     auto is_used_by_css_image_resource = [&](URL::URL const& url, HTML::SharedResourceRequest const& request) {
         auto* css_image_resource = this->css_image_resource(url);
-        return css_image_resource && css_image_resource->image_data() == request.image_data();
+        return css_image_resource && css_image_resource->decoded_image_data() == request.image_data();
     };
 
     struct CacheSize {
@@ -8564,6 +8548,13 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
     if (auto container = navigable->container()) {
         container->document().set_needs_repaint(InvalidateDisplayList::No);
     }
+}
+
+void Document::set_needs_accumulated_visual_contexts_update(bool value)
+{
+    m_needs_accumulated_visual_contexts_update = value;
+    if (value)
+        set_needs_repaint(InvalidateDisplayList::No);
 }
 
 void Document::set_needs_to_record_display_list()

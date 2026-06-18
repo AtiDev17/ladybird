@@ -377,6 +377,8 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
         auto mask_rect_in_device_pixels = context.enclosing_device_rect(absolute_mask_rect);
         auto mask_rect = CSSPixelRect { {}, absolute_mask_rect.size() };
         auto resolved_mask = resolve_background_layers(mask_layers, paintable_box(), Color::Transparent, CSS::BackgroundBox::BorderBox, mask_rect, {});
+
+        // FIXME: Respect `image-rendering` here.
         paint_background(mask_painting_context, paintable_box(), CSS::ImageRendering::Auto, resolved_mask, {});
         masks.append({ { *mask_display_list, move(visual_context_tree) }, mask_rect_in_device_pixels.to_type<int>(), Gfx::MaskKind::Alpha });
     }
@@ -412,7 +414,7 @@ void StackingContext::dump(StringBuilder& builder, int indent) const
     for (int i = 0; i < indent; ++i)
         builder.append(' ');
     CSSPixelRect rect = paintable_box().absolute_rect();
-    builder.appendff("SC for {} {} [children: {}] (z-index: ", paintable_box().layout_node().debug_description(), rect, m_children.size());
+    builder.appendff("SC for {} {} (z-index: ", paintable_box().layout_node().debug_description(), rect);
 
     if (paintable_box().effective_z_index().has_value())
         builder.appendff("{}", paintable_box().effective_z_index().value());
@@ -424,7 +426,7 @@ void StackingContext::dump(StringBuilder& builder, int indent) const
         builder.append(", has_transform"sv);
 
     builder.append('\n');
-    for (auto& child : m_children)
+    for (auto const& child : m_children)
         child->dump(builder, indent + 1);
 }
 
