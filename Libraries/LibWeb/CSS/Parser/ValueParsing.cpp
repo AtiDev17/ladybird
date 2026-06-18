@@ -684,6 +684,28 @@ RefPtr<StyleValue const> Parser::parse_anchor(TokenStream<ComponentValue>& token
     if (!function_token.is_function("anchor"sv))
         return {};
 
+    // It is only allowed in the inset properties (and is otherwise invalid).
+    static Array allowed_property_ids = {
+        PropertyID::Inset,
+        PropertyID::Top,
+        PropertyID::Right,
+        PropertyID::Bottom,
+        PropertyID::Left,
+        PropertyID::InsetBlock,
+        PropertyID::InsetBlockStart,
+        PropertyID::InsetBlockEnd,
+        PropertyID::InsetInline,
+        PropertyID::InsetInlineStart,
+        PropertyID::InsetInlineEnd,
+    };
+
+    auto property_context = m_value_context.last_matching([](ValueParsingContext const& it) {
+        return it.has<PropertyID>();
+    });
+    bool valid_property_context = property_context.has_value() && allowed_property_ids.contains_slow(property_context->get<PropertyID>());
+    if (!valid_property_context)
+        return {};
+
     auto argument_tokens = TokenStream { function_token.function().value };
     auto context_guard = push_temporary_value_parsing_context(FunctionContext { function_token.function().name });
     Optional<FlyString> anchor_name;
@@ -799,16 +821,10 @@ RefPtr<StyleValue const> Parser::parse_anchor_size(TokenStream<ComponentValue>& 
         // FIXME: position-anchor
         // FIXME: position-area
     };
-    bool valid_property_context = false;
-    for (auto& value_context : m_value_context) {
-        if (!value_context.has<PropertyID>())
-            continue;
-        if (!allowed_property_ids.contains_slow(value_context.get<PropertyID>())) {
-            valid_property_context = false;
-            break;
-        }
-        valid_property_context = true;
-    }
+    auto property_context = m_value_context.last_matching([](ValueParsingContext const& it) {
+        return it.has<PropertyID>();
+    });
+    bool valid_property_context = property_context.has_value() && allowed_property_ids.contains_slow(property_context->get<PropertyID>());
     if (!valid_property_context)
         return {};
 
@@ -5131,6 +5147,10 @@ RefPtr<CalculationNode const> Parser::convert_to_calculation_node(CalcParsing::N
             auto tree_counting_function_tokens = TokenStream<ComponentValue>::of_single_token(component_value);
             if (auto tree_counting_function = parse_tree_counting_function(tree_counting_function_tokens, TreeCountingFunctionStyleValue::ComputedType::Number))
                 return NonMathFunctionCalculationNode::create(tree_counting_function.release_nonnull(), NumericType {});
+
+            auto anchor_function_tokens = TokenStream<ComponentValue>::of_single_token(component_value);
+            if (auto anchor_function = parse_anchor(anchor_function_tokens))
+                return NonMathFunctionCalculationNode::create(anchor_function->as_anchor(), NumericType { NumericType::BaseType::Length, 1 });
 
             // NOTE: If we get here, then we have a ComponentValue that didn't get replaced with something else,
             //       so the calc() is invalid.

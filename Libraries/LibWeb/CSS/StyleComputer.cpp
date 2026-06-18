@@ -184,16 +184,16 @@ Optional<String> StyleComputer::user_agent_style_sheet_source(StringView name)
 RuleCache const* StyleComputer::rule_cache_for_cascade_origin(CascadeOrigin cascade_origin, Optional<FlyString const> qualified_layer_name, GC::Ptr<DOM::ShadowRoot const> shadow_root) const
 {
     auto& style_scope = shadow_root ? shadow_root->style_scope() : document().style_scope();
-    style_scope.build_rule_cache_if_needed();
+    auto const& rule_cache = style_scope.rule_cache();
 
     auto const* rule_caches_by_layer = [&]() -> RuleCaches const* {
         switch (cascade_origin) {
         case CascadeOrigin::Author:
-            return &style_scope.m_rule_cache->author_rule_cache;
+            return &rule_cache.author_rule_cache;
         case CascadeOrigin::User:
-            return &style_scope.m_rule_cache->user_rule_cache;
+            return &rule_cache.user_rule_cache;
         case CascadeOrigin::UserAgent:
-            return &style_scope.m_rule_cache->user_agent_rule_cache;
+            return &rule_cache.user_agent_rule_cache;
         default:
             VERIFY_NOT_REACHED();
         }
@@ -216,9 +216,10 @@ RuleCache const* StyleComputer::rule_cache_for_cascade_origin(CascadeOrigin casc
 NonnullRefPtr<InvalidationPlan> StyleComputer::invalidation_plan_for_properties(Vector<InvalidationSet::Property> const& properties, StyleScope const& style_scope) const
 {
     auto result = InvalidationPlan::create();
-    if (!style_scope.m_rule_cache)
+    if (properties.is_empty())
         return result;
-    auto const& invalidation_plans = style_scope.m_rule_cache->style_invalidation_data.invalidation_plans;
+
+    auto const& invalidation_plans = style_scope.style_invalidation_data().invalidation_plans;
     for (auto const& property : properties) {
         if (auto it = invalidation_plans.find(property); it != invalidation_plans.end()) {
             result->include_all_from(*it->value);
@@ -231,8 +232,7 @@ NonnullRefPtr<InvalidationPlan> StyleComputer::invalidation_plan_for_properties(
 
 Vector<HasInvalidationMetadata> const* StyleComputer::has_invalidation_metadata_for_property(InvalidationSet::Property const& property, StyleScope const& style_scope) const
 {
-    if (!style_scope.m_rule_cache)
-        return nullptr;
+    auto const& style_invalidation_data = style_scope.style_invalidation_data();
 
     auto return_bucket_if_present = [](auto const& map, auto const& key) -> Vector<HasInvalidationMetadata> const* {
         auto bucket = map.get(key);
@@ -243,15 +243,15 @@ Vector<HasInvalidationMetadata> const* StyleComputer::has_invalidation_metadata_
 
     switch (property.type) {
     case InvalidationSet::Property::Type::Id:
-        return return_bucket_if_present(style_scope.m_rule_cache->style_invalidation_data.ids_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.ids_used_in_has_selectors, property.name());
     case InvalidationSet::Property::Type::Class:
-        return return_bucket_if_present(style_scope.m_rule_cache->style_invalidation_data.class_names_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.class_names_used_in_has_selectors, property.name());
     case InvalidationSet::Property::Type::Attribute:
-        return return_bucket_if_present(style_scope.m_rule_cache->style_invalidation_data.attribute_names_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.attribute_names_used_in_has_selectors, property.name());
     case InvalidationSet::Property::Type::TagName:
-        return return_bucket_if_present(style_scope.m_rule_cache->style_invalidation_data.tag_names_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.tag_names_used_in_has_selectors, property.name());
     case InvalidationSet::Property::Type::PseudoClass:
-        return return_bucket_if_present(style_scope.m_rule_cache->style_invalidation_data.pseudo_classes_used_in_has_selectors, property.value.get<PseudoClass>());
+        return return_bucket_if_present(style_invalidation_data.pseudo_classes_used_in_has_selectors, property.value.get<PseudoClass>());
     default:
         break;
     }
@@ -375,7 +375,13 @@ static Optional<ResolvedScope> resolve_scope(DOM::AbstractElement abstract_eleme
     return resolve_scope_chain(abstract_element, rule, shadow_host, rule_root, *rule.scope_rule);
 }
 
-Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_from_context(DOM::AbstractElement abstract_element, CascadeOrigin cascade_origin, GC::Ptr<DOM::ShadowRoot const> context_shadow_root, Optional<FlyString const> qualified_layer_name) const
+static u64 pseudo_element_style_bit(PseudoElement pseudo_element)
+{
+    VERIFY(to_underlying(pseudo_element) < to_underlying(PseudoElement::KnownPseudoElementCount));
+    return 1ull << to_underlying(pseudo_element);
+}
+
+Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_from_context(DOM::AbstractElement abstract_element, CascadeOrigin cascade_origin, GC::Ptr<DOM::ShadowRoot const> context_shadow_root, Optional<FlyString const> qualified_layer_name, u64* matching_pseudo_element_styles) const
 {
     auto const& root_node = abstract_element.element().root();
     auto shadow_root = as_if<DOM::ShadowRoot>(root_node);
@@ -450,7 +456,14 @@ Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_
             }
         } else {
             for (auto const& rule : rules) {
-                if ((rule.slotted || rule.contains_part_pseudo_element || !rule.contains_pseudo_element) && filter_namespace_rule(element_namespace_uri, rule))
+                if (!filter_namespace_rule(element_namespace_uri, rule))
+                    continue;
+                if (rule.selector.target_pseudo_element().has_value()) {
+                    if (matching_pseudo_element_styles)
+                        add_rule_to_run(rule, rule_root);
+                    continue;
+                }
+                if (rule.slotted || rule.contains_part_pseudo_element || !rule.contains_pseudo_element)
                     add_rule_to_run(rule, rule_root);
             }
         }
@@ -461,6 +474,10 @@ Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_
             add_rules_to_run(matching_rules, rule_root);
             return IterationDecision::Continue;
         });
+        if (!abstract_element.pseudo_element().has_value() && matching_pseudo_element_styles) {
+            for (auto const& matching_rules : rule_cache.rules_by_pseudo_element)
+                add_rules_to_run(matching_rules, rule_root);
+        }
     };
 
     if (auto const* rule_cache = rule_cache_for_cascade_origin(cascade_origin, qualified_layer_name, context_shadow_root))
@@ -539,6 +556,20 @@ Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_
             .collect_per_element_selector_involvement_metadata = true,
             .has_result_cache = m_has_result_cache.ptr(),
         };
+        if (!abstract_element.pseudo_element().has_value() && matching_pseudo_element_styles) {
+            if (auto pseudo_element = selector.target_pseudo_element(); pseudo_element.has_value()) {
+                if (is_synthetic_pseudo_element(*pseudo_element)) {
+                    auto pseudo_element_bit = pseudo_element_style_bit(*pseudo_element);
+                    if (*matching_pseudo_element_styles & pseudo_element_bit)
+                        continue;
+                    if (selector.contains_pseudo_class(PseudoClass::Has)
+                        || SelectorEngine::matches_originating_element_for_pseudo_element(selector, *pseudo_element, abstract_element, shadow_host_to_use, context, resolved_scope->root)) {
+                        *matching_pseudo_element_styles |= pseudo_element_bit;
+                    }
+                }
+                continue;
+            }
+        }
         if (!SelectorEngine::matches(selector, abstract_element, shadow_host_to_use, context, resolved_scope->root))
             continue;
         if (rule.container_rule && rule.container_rule->contains_size_feature()) {
@@ -1414,6 +1445,11 @@ void StyleComputer::start_needed_transitions(ComputedProperties const& previous_
 
 StyleComputer::MatchingRuleSet StyleComputer::build_matching_rule_set(DOM::AbstractElement abstract_element, bool& did_match_any_pseudo_element_rules, ComputeStyleMode mode) const
 {
+    MatchingRuleSet matching_rule_set;
+    u64* matching_pseudo_element_styles = nullptr;
+    if (mode == ComputeStyleMode::Normal && !abstract_element.pseudo_element().has_value())
+        matching_pseudo_element_styles = &matching_rule_set.matching_pseudo_element_styles;
+
     auto collect_author_contexts = [&] {
         Vector<GC::Ptr<DOM::ShadowRoot const>, 4> context_shadow_roots;
         auto append_context = [&](GC::Ptr<DOM::ShadowRoot const> shadow_root) {
@@ -1456,20 +1492,20 @@ StyleComputer::MatchingRuleSet StyleComputer::build_matching_rule_set(DOM::Abstr
 
         for (auto shadow_root : context_shadow_roots) {
             auto& context_style_scope = shadow_root ? shadow_root->style_scope() : document().style_scope();
-            context_style_scope.build_rule_cache_if_needed();
+            auto const& context_rule_cache = context_style_scope.rule_cache();
 
             ContextMatchingRules context {
                 .shadow_root = shadow_root,
                 .author_rules = {},
             };
 
-            for (auto const& layer_name : context_style_scope.m_rule_cache->qualified_layer_names_in_order) {
-                auto layer_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::Author, shadow_root, layer_name);
+            for (auto const& layer_name : context_rule_cache.qualified_layer_names_in_order) {
+                auto layer_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::Author, shadow_root, layer_name, matching_pseudo_element_styles);
                 sort_matching_rules(layer_rules);
                 context.author_rules.append({ layer_name, layer_rules });
             }
 
-            auto unlayered_author_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::Author, shadow_root);
+            auto unlayered_author_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::Author, shadow_root, {}, matching_pseudo_element_styles);
             sort_matching_rules(unlayered_author_rules);
             context.author_rules.append({ {}, unlayered_author_rules });
 
@@ -1480,10 +1516,9 @@ StyleComputer::MatchingRuleSet StyleComputer::build_matching_rule_set(DOM::Abstr
     };
 
     // First, we collect all the CSS rules whose selectors match `element`:
-    MatchingRuleSet matching_rule_set;
-    matching_rule_set.user_agent_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::UserAgent, nullptr);
+    matching_rule_set.user_agent_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::UserAgent, nullptr, {}, matching_pseudo_element_styles);
     sort_matching_rules(matching_rule_set.user_agent_rules);
-    matching_rule_set.user_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::User, nullptr);
+    matching_rule_set.user_rules = collect_matching_rules_from_context(abstract_element, CascadeOrigin::User, nullptr, {}, matching_pseudo_element_styles);
     sort_matching_rules(matching_rule_set.user_rules);
     matching_rule_set.author_contexts = collect_author_contexts();
 
@@ -2636,6 +2671,7 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
     }
 
     auto computed_properties = compute_properties(abstract_element, cascaded_properties);
+    computed_properties->set_has_pseudo_element_styles(matching_rule_set.matching_pseudo_element_styles);
 
     if (did_change_custom_properties.has_value()) {
         auto new_custom_property_data = abstract_element.custom_property_data();
