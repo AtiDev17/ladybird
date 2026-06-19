@@ -32,6 +32,17 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     m_context.types.extend(module.type_section().types());
     m_context.data_count = module.data_count_section().count();
 
+    // https://webassembly.github.io/spec/core/valid/modules.html#types
+    // Intern the type section's recursive groups as defined types ("the defined type sequence
+    // dt* is of the form roll*_x(rectype)") before anything else can refer to them; the rest of
+    // the sub type validation rule runs in validate(TypeSection const&) below.
+    {
+        auto canonical_types = TRY(canonicalize_module_types(module.type_section()));
+        m_context.canonical_types.extend(canonical_types);
+        module.set_canonical_types(move(canonical_types));
+    }
+    TRY(validate(module.type_section()));
+
     for (auto& import_ : module.import_section().imports()) {
         TRY(import_.description().visit(
             [&](TypeIndex const& index) -> ErrorOr<void, ValidationError> {
@@ -136,6 +147,8 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     }
     for (auto& segment : module.global_section().entries())
         scan_expression_for_function_indices(segment.expression());
+    for (auto& table : module.table_section().tables())
+        scan_expression_for_function_indices(table.initializer());
 
     TRY(validate(module.import_section()));
     TRY(validate(module.export_section()));
@@ -147,7 +160,6 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     TRY(validate(module.table_section()));
     TRY(validate(module.code_section()));
     TRY(validate(module.tag_section()));
-    TRY(validate(module.type_section()));
 
     for (auto& entry : module.code_section().functions())
         module.set_minimum_call_record_allocation_size(max(entry.func().body().compiled_instructions.max_call_rec_size, module.minimum_call_record_allocation_size()));
@@ -318,13 +330,17 @@ ErrorOr<void, ValidationError> Validator::validate(DataSection const& section)
 ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section)
 {
     for (auto& segment : section.segments()) {
+        // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
+        // - The reference type elemtype is valid.
+        TRY(validate(segment.type));
         TRY(segment.mode.visit(
             [](ElementSection::Declarative const&) -> ErrorOr<void, ValidationError> { return {}; },
             [](ElementSection::Passive const&) -> ErrorOr<void, ValidationError> { return {}; },
             [&](ElementSection::Active const& active) -> ErrorOr<void, ValidationError> {
+                // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
                 TRY(validate(active.index));
                 auto table = m_context.tables[active.index.value()];
-                if (table.element_type() != segment.type)
+                if (!matches_reference_type(segment.type, table.element_type(), m_context.type_context()))
                     return Errors::invalid("active element reference type"sv);
                 auto at = table.limits().address_value_type();
                 auto expression_result = TRY(validate(active.expression, { at }));
@@ -338,9 +354,12 @@ ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section
         for (auto& expression : segment.init) {
             if (expression.instructions().is_empty())
                 continue;
+            // https://webassembly.github.io/spec/core/valid/modules.html#element-segments
             auto result = TRY(validate(expression, { segment.type }));
             if (!result.is_constant)
                 return Errors::invalid("element initializer"sv);
+            if (result.result_types.size() != 1)
+                return Errors::invalid("element initializer type"sv, segment.type, result.result_types);
         }
     }
     return {};
@@ -348,14 +367,19 @@ ErrorOr<void, ValidationError> Validator::validate(ElementSection const& section
 
 ErrorOr<void, ValidationError> Validator::validate(GlobalSection const& section)
 {
+    // https://webassembly.github.io/spec/core/valid/modules.html#modules
+    auto section_validator = fork();
+    section_validator.m_context.globals = m_globals_without_internal_globals;
+
     for (auto& entry : section.entries()) {
         auto& type = entry.type();
-        TRY(validate(type));
-        auto expression_result = TRY(validate(entry.expression(), { type.type() }));
+        TRY(section_validator.validate(type));
+        auto expression_result = TRY(section_validator.validate(entry.expression(), { type.type() }));
         if (!expression_result.is_constant)
             return Errors::invalid("global variable initializer"sv);
-        if (expression_result.result_types.size() != 1 || !expression_result.result_types.first().is_of_kind(type.type().kind()))
+        if (expression_result.result_types.size() != 1)
             return Errors::invalid("global variable initializer type"sv, ValueType(ValueType::I32), expression_result.result_types);
+        section_validator.m_context.globals.append(type);
     }
 
     return {};
@@ -368,10 +392,20 @@ ErrorOr<void, ValidationError> Validator::validate(MemorySection const& section)
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/modules.html#tables
 ErrorOr<void, ValidationError> Validator::validate(TableSection const& section)
 {
-    for (auto& entry : section.tables())
-        TRY(validate(entry.type()));
+    auto section_validator = fork();
+    section_validator.m_context.globals = m_globals_without_internal_globals;
+
+    for (auto& entry : section.tables()) {
+        TRY(section_validator.validate(entry.type()));
+        auto expression_result = TRY(section_validator.validate(entry.initializer(), { entry.type().element_type() }));
+        if (!expression_result.is_constant)
+            return Errors::invalid("table initializer"sv);
+        if (expression_result.result_types.size() != 1)
+            return Errors::invalid("table initializer type"sv, entry.type().element_type(), expression_result.result_types);
+    }
     return {};
 }
 
@@ -390,12 +424,26 @@ ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
         function_validator.m_context.locals.extend(function_type.parameters());
         function_validator.m_context.current_function_parameter_count = function_type.parameters().size();
         for (auto& local : function.locals()) {
+            // https://webassembly.github.io/spec/core/valid/modules.html#functions
+            // The locals' value types must be valid (in particular, type uses must exist).
+            TRY(function_validator.validate(local.type()));
             for (size_t i = 0; i < local.n(); ++i)
                 function_validator.m_context.locals.append(local.type());
         }
 
-        function_validator.m_frames.empend(function_type, FrameKind::Function, (size_t)0);
-        function_validator.m_max_frame_size = max(function_validator.m_max_frame_size, function_validator.m_frames.size());
+        // https://webassembly.github.io/spec/core/valid/modules.html#functions
+        function_validator.m_local_initialized.clear_with_capacity();
+        function_validator.m_local_init_log.clear_with_capacity();
+        for (auto& parameter : function_type.parameters()) {
+            (void)parameter;
+            function_validator.m_local_initialized.append(true);
+        }
+        for (auto& local : function.locals()) {
+            for (size_t i = 0; i < local.n(); ++i)
+                function_validator.m_local_initialized.append(local.type().is_defaultable());
+        }
+
+        function_validator.push_frame(Frame { function_type, FrameKind::Function, (size_t)0 });
 
         auto results = TRY(function_validator.validate(function.body(), function_type.results()));
         if (results.result_types.size() != function_type.results().size())
@@ -425,11 +473,11 @@ ErrorOr<void, ValidationError> Validator::validate(TagSection const& section)
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/types.html#recursive-types
 ErrorOr<void, ValidationError> Validator::validate(TypeSection const& section)
 {
-    for (auto& type : section.types()) {
-        TRY(validate(type));
-    }
+    for (size_t type_index = 0; type_index < section.types().size(); ++type_index)
+        TRY(validate(section.types()[type_index], type_index));
 
     return {};
 }
@@ -472,8 +520,34 @@ ErrorOr<void, ValidationError> Validator::validate(ValueType const& type)
     return {};
 }
 
-ErrorOr<void, ValidationError> Validator::validate(TypeSection::Type const& type)
+// https://webassembly.github.io/spec/core/valid/types.html#recursive-types
+ErrorOr<void, ValidationError> Validator::validate(TypeSection::Type const& type, size_t this_type_index)
 {
+    // - The length of x* is less than or equal to 1.
+    if (type.supertypes().size() > 1)
+        return Errors::invalid("supertype count, only a single supertype is allowed"sv);
+
+    // - For all x in x*:
+    for (auto supertype_index : type.supertypes()) {
+        // - The index x is less than x0.
+        if (supertype_index.value() >= this_type_index)
+            return Errors::invalid("supertype index, must precede the subtype"sv);
+
+        // - The type C.types[x] exists.
+        TRY(validate(supertype_index));
+
+        // - The sub type unroll(C.types[x]) is of the form (sub y* comptype').
+        auto const& supertype = m_context.types[supertype_index.value()];
+        if (supertype.is_final())
+            return Errors::invalid("supertype, must not be final"sv);
+
+        // - The composite type comptype matches the composite type comptype'.
+        auto const* defined_type = m_context.canonical_types[this_type_index];
+        auto const* defined_supertype = m_context.canonical_types[supertype_index.value()];
+        if (!matches_composite_type(defined_type->expansion(), defined_supertype->expansion(), TypeContext {}))
+            return Errors::invalid("subtype, composite type must match its declared supertype"sv);
+    }
+
     return type.description().visit(
         [&](FunctionType const& function) { return validate(function); },
         [&](StructType const& struct_) { return validate(struct_); },
@@ -1563,43 +1637,52 @@ VALIDATE_INSTRUCTION(select_typed)
     if (required_types.size() != 1)
         return Errors::invalid("select types"sv, "exactly one type"sv, required_types);
 
+    // https://webassembly.github.io/spec/core/valid/instructions.html#parametric-instructions
+    // select t: valid with [t t i32] -> [t] if the value type t is valid; both operands must match the annotated type.
+    TRY(validate(required_types.first()));
     TRY(stack.take<ValueType::I32>());
-    auto arg0_type = TRY(stack.take_last());
-    auto arg1_type = TRY(stack.take_last());
+    TRY(stack.take(required_types.first()));
+    TRY(stack.take(required_types.first()));
 
-    if (arg0_type != arg1_type || arg0_type != required_types.first())
-        return Errors::invalid("select argument types"sv, Vector { required_types.first(), required_types.first() }, Vector { arg0_type, arg1_type });
-
-    stack.append(arg0_type.is_known ? arg0_type : arg1_type);
+    stack.append(required_types.first());
 
     return {};
 }
 
 // https://webassembly.github.io/spec/core/bikeshed/#variable-instructions%E2%91%A2
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
 VALIDATE_INSTRUCTION(local_get)
 {
     auto index = TRY(validate(instruction.local_index()));
+    if (!m_local_initialized[index.value()])
+        return Errors::invalid("local.get of an uninitialized non-defaultable local"sv);
 
     stack.append(m_context.locals[index.value()]);
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
 VALIDATE_INSTRUCTION(local_set)
 {
     auto index = TRY(validate(instruction.local_index()));
 
     auto& value_type = m_context.locals[index.value()];
     TRY(stack.take(value_type));
+    mark_local_initialized(index.value());
 
     return {};
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#variable-instructions
+// local.tee x is valid with the instruction type t ->_x t; afterwards the local counts as
+// initialized (the init set x).
 VALIDATE_INSTRUCTION(local_tee)
 {
     auto index = TRY(validate(instruction.local_index()));
 
     auto& value_type = m_context.locals[index.value()];
     TRY(stack.take(value_type));
+    mark_local_initialized(index.value());
     stack.append(value_type);
 
     return {};
@@ -1697,11 +1780,8 @@ VALIDATE_INSTRUCTION(table_copy)
     auto lhs_table = TRY(validate(args.lhs));
     auto rhs_table = TRY(validate(args.rhs));
 
-    if (lhs_table.element_type() != rhs_table.element_type())
+    if (!matches_reference_type(rhs_table.element_type(), lhs_table.element_type(), m_context.type_context()))
         return Errors::non_conforming_types("table.copy"sv, lhs_table.element_type(), rhs_table.element_type());
-
-    if (!lhs_table.element_type().is_reference())
-        return Errors::invalid("table.copy element type"sv, "a reference type"sv, lhs_table.element_type());
 
     auto const lhs_at = lhs_table.limits().address_value_type();
     auto const rhs_at = rhs_table.limits().address_value_type();
@@ -1723,7 +1803,7 @@ VALIDATE_INSTRUCTION(table_init)
 
     auto& element_type = m_context.elements[args.element_index.value()];
 
-    if (table.element_type() != element_type)
+    if (!matches_reference_type(element_type, table.element_type(), m_context.type_context()))
         return Errors::non_conforming_types("table.init"sv, table.element_type(), element_type);
 
     TRY((stack.take<ValueType::I32, ValueType::I32>()));
@@ -2257,6 +2337,10 @@ VALIDATE_INSTRUCTION(structured_end)
 
     for (auto& result : results)
         stack.append(result);
+
+    // Locals initialized within the block become uninitialized again when it exits.
+    // https://webassembly.github.io/spec/core/appendix/algorithm.html
+    roll_back_local_initializations(last_frame.local_init_log_height);
     m_frames.take_last();
 
     return {};
@@ -2283,6 +2367,10 @@ VALIDATE_INSTRUCTION(structured_else)
 
     frame.kind = FrameKind::Else;
     frame.unreachable = false;
+
+    // https://webassembly.github.io/spec/core/appendix/algorithm.html
+    roll_back_local_initializations(frame.local_init_log_height);
+
     for (auto& parameter : block_type.parameters())
         stack.append(parameter);
 
@@ -2298,8 +2386,7 @@ VALIDATE_INSTRUCTION(block)
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::Block, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::Block, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
 
@@ -2323,8 +2410,7 @@ VALIDATE_INSTRUCTION(loop)
 
     auto const tier_up_eligible = parameters.is_empty() && stack.size() == 0;
 
-    m_frames.empend(block_type, FrameKind::Loop, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::Loop, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
 
@@ -2350,8 +2436,7 @@ VALIDATE_INSTRUCTION(if_)
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
 
-    m_frames.empend(block_type, FrameKind::If, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::If, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
 
@@ -2410,6 +2495,46 @@ VALIDATE_INSTRUCTION(try_table)
     auto& args = instruction.arguments().get<Instruction::TryTableArgs>();
     auto block_type = TRY(validate(args.block_type));
 
+    // https://webassembly.github.io/spec/core/valid/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-try-table-xref-syntax-types-syntax-blocktype-mathit-blocktype-xref-syntax-instructions-syntax-catch-mathit-catch-ast-xref-syntax-instructions-syntax-instr-mathit-instr-ast
+    // try_table bt catch* instr* is valid with [t1*] -> [t2*] if:
+    //  - The block type bt is valid as some instruction type [t1*] -> [t2*].
+    //  - For all catch in catch*: the catch clause catch is valid.
+    //    Note: the catch clauses are validated under C, without the try_table's own label.
+    for (auto& catch_ : args.catches()) {
+        // - The label C.labels[l] exists.
+        auto label = catch_.target_label();
+        TRY(validate(label));
+        auto& target_label_type = m_frames[(m_frames.size() - 1) - label.value()].labels();
+
+        Vector<ValueType> expected_label_types;
+        if (auto tag = catch_.matching_tag_index(); tag.has_value()) {
+            // - The tag C.tags[x] exists.
+            TRY(validate(tag.value()));
+            auto tag_type = m_context.tags[tag->value()];
+            TRY(validate(tag_type.type()));
+            auto& type = m_context.types[tag_type.type().value()];
+
+            // - The expansion of C.tags[x] is (func t* -> ε).
+            if (!type.is_function())
+                return Errors::invalid("catch tag type"sv, "a function type"sv, type);
+            auto& func = type.function();
+            if (!func.results().is_empty())
+                return Errors::invalid("catch tag type"sv, "no results"sv, func.results());
+
+            expected_label_types.extend(func.parameters());
+        }
+
+        // catch x l:         the result type t* matches the label C.labels[l].
+        // catch_ref x l:     the result type t* (ref exn) matches the label C.labels[l].
+        // catch_all l:       the result type ε matches the label C.labels[l].
+        // catch_all_ref l:   the result type (ref exn) matches the label C.labels[l].
+        if (catch_.is_ref())
+            expected_label_types.append(ValueType(ValueType::ExceptionReference, false));
+
+        if (!matches_result_types(expected_label_types.span(), target_label_type.span(), m_context.type_context()))
+            return Errors::non_conforming_types("catch"sv, expected_label_types.span(), target_label_type.span());
+    }
+
     auto& parameters = block_type.parameters();
     for (size_t i = 1; i <= parameters.size(); ++i)
         TRY(stack.take(parameters[parameters.size() - i]));
@@ -2420,56 +2545,10 @@ VALIDATE_INSTRUCTION(try_table)
         .tier_up_eligible = false,
     };
 
-    m_frames.empend(block_type, FrameKind::TryTable, stack.size());
-    m_max_frame_size = max(m_max_frame_size, m_frames.size());
+    push_frame(Frame { block_type, FrameKind::TryTable, stack.size() });
     for (auto& parameter : parameters)
         stack.append(parameter);
 
-    for (auto& catch_ : args.catches()) {
-        auto label = catch_.target_label();
-        TRY(validate(label));
-        auto& target_label_type = m_frames[(m_frames.size() - 1) - label.value()].labels();
-
-        if (auto tag = catch_.matching_tag_index(); tag.has_value()) {
-            TRY(validate(tag.value()));
-            auto tag_type = m_context.tags[tag->value()];
-            TRY(validate(tag_type.type()));
-            auto& type = m_context.types[tag_type.type().value()];
-
-            if (!type.is_function())
-                return Errors::invalid("catch type"sv, "a function type"sv, type);
-
-            auto& func = type.function();
-
-            if (!func.results().is_empty())
-                return Errors::invalid("catch type"sv, "empty"sv, func.results());
-
-            Span<ValueType const> parameters_to_check = func.parameters().span();
-            if (catch_.is_ref()) {
-                // catch_ref x l
-                auto& parameters = func.parameters();
-                if (parameters.is_empty() || parameters.last().kind() != ValueType::ExceptionReference)
-                    return Errors::invalid("catch_ref type"sv, "[..., exnref]"sv, parameters);
-                parameters_to_check = parameters_to_check.slice(0, parameters.size() - 1);
-            } else {
-                // catch x l
-                // (noop here)
-            }
-
-            if (parameters_to_check != target_label_type.span())
-                return Errors::non_conforming_types("catch"sv, parameters_to_check, target_label_type.span());
-        } else {
-            if (catch_.is_ref()) {
-                // catch_all_ref l
-                if (target_label_type.size() != 1 || target_label_type[0].kind() != ValueType::ExceptionReference)
-                    return Errors::invalid("catch_all_ref type"sv, "[exnref]"sv, target_label_type);
-            } else {
-                // catch_all l
-                if (!target_label_type.is_empty())
-                    return Errors::invalid("catch_all type"sv, "empty"sv, target_label_type);
-            }
-        }
-    }
     return {};
 }
 
@@ -2588,7 +2667,7 @@ VALIDATE_INSTRUCTION(call_indirect)
     auto table = TRY(validate(args.table));
     TRY(validate(args.type));
 
-    if (table.element_type().kind() != ValueType::FunctionReference)
+    if (!matches_reference_type(table.element_type(), ValueType(ValueType::FunctionReference), m_context.type_context()))
         return Errors::invalid("table element type for call.indirect"sv, "a function reference"sv, table.element_type());
 
     auto& type = m_context.types[args.type.value()];
@@ -2634,7 +2713,7 @@ VALIDATE_INSTRUCTION(return_call_indirect)
     TRY(validate(args.type));
 
     auto& table = m_context.tables[args.table.value()];
-    if (table.element_type().kind() != ValueType::FunctionReference)
+    if (!matches_reference_type(table.element_type(), ValueType(ValueType::FunctionReference), m_context.type_context()))
         return Errors::invalid("table element type for call.indirect"sv, "a function reference"sv, table.element_type());
 
     auto& type = m_context.types[args.type.value()];
@@ -4461,6 +4540,527 @@ VALIDATE_INSTRUCTION(i32x4_relaxed_dot_i8x16_i7x16_add_s)
     return stack.take_and_put<ValueType::V128, ValueType::V128, ValueType::V128>(ValueType::V128);
 }
 
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_eq)
+{
+    TRY(stack.take(ValueType(ValueType::EqReference)));
+    TRY(stack.take(ValueType(ValueType::EqReference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_as_non_null)
+{
+    auto entry = TRY(stack.take_last());
+    if (entry.is_known && !entry.concrete_type.is_reference())
+        return Errors::invalid_stack_state(stack, Tuple { "reference" });
+
+    if (entry.is_known) {
+        auto type = entry.concrete_type;
+        type.set_nullable(false);
+        stack.append(type);
+    } else {
+        stack.append(entry);
+    }
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+VALIDATE_INSTRUCTION(br_on_null)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
+
+    auto entry = TRY(stack.take_last());
+    if (entry.is_known && !entry.concrete_type.is_reference())
+        return Errors::invalid_stack_state(stack, Tuple { "reference" });
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+    auto& type = target.labels();
+
+    for (size_t i = 0; i < type.size(); ++i)
+        TRY(stack.take(type[type.size() - i - 1]));
+    for (auto& label_type : type)
+        stack.append(label_type);
+
+    if (entry.is_known) {
+        auto result = entry.concrete_type;
+        result.set_nullable(false);
+        stack.append(result);
+    } else {
+        stack.append(entry);
+    }
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+VALIDATE_INSTRUCTION(br_on_non_null)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchArgs>();
+    TRY(validate(args.label));
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.label.value()];
+    auto& type = target.labels();
+    if (type.is_empty() || !type.last().is_reference())
+        return Errors::invalid("br_on_non_null label type"sv, "t* (ref null? ht)"sv, type);
+
+    auto expected = type.last();
+    expected.set_nullable(true);
+    TRY(stack.take(expected));
+
+    for (size_t i = 0; i + 1 < type.size(); ++i)
+        TRY(stack.take(type[type.size() - i - 2]));
+    for (size_t i = 0; i + 1 < type.size(); ++i)
+        stack.append(type[i]);
+
+    args.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_new)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.new type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    for (size_t i = 0; i < fields.size(); ++i)
+        TRY(stack.take(fields[fields.size() - i - 1].type().unpacked()));
+
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_new_default)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.new_default type"sv, "a struct type"sv, type);
+
+    for (auto& field : type.struct_().fields()) {
+        if (!field.type().is_defaultable())
+            return Errors::invalid("struct.new_default field type, must be defaultable"sv);
+    }
+
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_struct_get(Stack& stack, Instruction const& instruction, bool requires_packed)
+{
+    auto& args = instruction.arguments().get<Instruction::StructFieldArgs>();
+    TRY(validate(args.type_index));
+    auto const& type = m_context.types[args.type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.get type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    if (args.field_index >= fields.size())
+        return Errors::invalid("struct.get field index"sv);
+    auto field_type = fields[args.field_index].type();
+    if (field_type.is_packed() != requires_packed)
+        return Errors::invalid("struct.get signedness, present iff the field type is packed"sv);
+
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    stack.append(field_type.unpacked());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(struct_get)
+{
+    return validate_struct_get(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(struct_get_s)
+{
+    return validate_struct_get(stack, instruction, true);
+}
+
+VALIDATE_INSTRUCTION(struct_get_u)
+{
+    return validate_struct_get(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(struct_set)
+{
+    auto& args = instruction.arguments().get<Instruction::StructFieldArgs>();
+    TRY(validate(args.type_index));
+    auto const& type = m_context.types[args.type_index.value()];
+    if (!type.is_struct())
+        return Errors::invalid("struct.set type"sv, "a struct type"sv, type);
+
+    auto& fields = type.struct_().fields();
+    if (args.field_index >= fields.size())
+        return Errors::invalid("struct.set field index"sv);
+    auto& field = fields[args.field_index];
+    if (!field.is_mutable())
+        return Errors::invalid("struct.set field, must be mutable"sv);
+
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+ErrorOr<FieldType, ValidationError> Validator::array_field_type(TypeIndex type_index, StringView instruction_name, bool requires_mutable)
+{
+    TRY(validate(type_index));
+    auto const& type = m_context.types[type_index.value()];
+    if (!type.is_array())
+        return Errors::invalid(instruction_name, "an array type"sv, type);
+    if (requires_mutable && !type.array().type().is_mutable())
+        return Errors::invalid(instruction_name, "a mutable array type"sv, type);
+    return type.array().type();
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.new type"sv, false));
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(field.type().unpacked()));
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_default)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.new_default type"sv, false));
+    if (!field.type().is_defaultable())
+        return Errors::invalid("array.new_default element type, must be defaultable"sv);
+
+    TRY(stack.take<ValueType::I32>());
+    stack.append(ValueType(ValueType::TypeUseReference, type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_fixed)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayNewFixedArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_fixed type"sv, false));
+
+    for (size_t i = 0; i < args.count; ++i)
+        TRY(stack.take(field.type().unpacked()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_data)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayDataArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_data type"sv, false));
+    if (field.type().is_reference())
+        return Errors::invalid("array.new_data element type"sv, "a numeric or vector type"sv, field.type());
+
+    if (!m_context.data_count.has_value())
+        return Errors::invalid("array.new_data, requires data count section"sv);
+    TRY(validate(args.data_index));
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_new_elem)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayElemArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.new_elem type"sv, false));
+    if (!field.type().is_reference())
+        return Errors::invalid("array.new_elem element type"sv, "a reference type"sv, field.type());
+
+    TRY(validate(args.element_index));
+    auto segment_type = m_context.elements[args.element_index.value()];
+    if (!matches_reference_type(segment_type, field.type(), m_context.type_context()))
+        return Errors::invalid("array.new_elem element segment type"sv, field.type(), segment_type);
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    stack.append(ValueType(ValueType::TypeUseReference, args.type_index, false));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_array_get(Stack& stack, Instruction const& instruction, bool requires_packed)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.get type"sv, false));
+    if (field.type().is_packed() != requires_packed)
+        return Errors::invalid("array.get signedness, present iff the element type is packed"sv);
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    stack.append(field.type().unpacked());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(array_get)
+{
+    return validate_array_get(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(array_get_s)
+{
+    return validate_array_get(stack, instruction, true);
+}
+
+VALIDATE_INSTRUCTION(array_get_u)
+{
+    return validate_array_get(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_set)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.set type"sv, true));
+
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_len)
+{
+    TRY(stack.take(ValueType(ValueType::ArrayReference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_fill)
+{
+    auto type_index = instruction.arguments().get<TypeIndex>();
+    auto field = TRY(array_field_type(type_index, "array.fill type"sv, true));
+
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(field.type().unpacked()));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_copy)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayCopyArgs>();
+    auto destination_field = TRY(array_field_type(args.destination_type_index, "array.copy destination type"sv, true));
+    auto source_field = TRY(array_field_type(args.source_type_index, "array.copy source type"sv, false));
+
+    if (!matches_field_type(FieldType { false, source_field.type() }, FieldType { false, destination_field.type() }, m_context.type_context()))
+        return Errors::invalid("array.copy source element type"sv, destination_field.type(), source_field.type());
+
+    TRY((stack.take<ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.source_type_index)));
+    TRY(stack.take<ValueType::I32>());
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.destination_type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_init_data)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayDataArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.init_data type"sv, true));
+    if (field.type().is_reference())
+        return Errors::invalid("array.init_data element type"sv, "a numeric or vector type"sv, field.type());
+
+    if (!m_context.data_count.has_value())
+        return Errors::invalid("array.init_data, requires data count section"sv);
+    TRY(validate(args.data_index));
+
+    TRY((stack.take<ValueType::I32, ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#aggregate-reference-instructions
+VALIDATE_INSTRUCTION(array_init_elem)
+{
+    auto& args = instruction.arguments().get<Instruction::ArrayElemArgs>();
+    auto field = TRY(array_field_type(args.type_index, "array.init_elem type"sv, true));
+    if (!field.type().is_reference())
+        return Errors::invalid("array.init_elem element type"sv, "a reference type"sv, field.type());
+
+    TRY(validate(args.element_index));
+    auto segment_type = m_context.elements[args.element_index.value()];
+    if (!matches_reference_type(segment_type, field.type(), m_context.type_context()))
+        return Errors::invalid("array.init_elem element segment type"sv, field.type(), segment_type);
+
+    TRY((stack.take<ValueType::I32, ValueType::I32, ValueType::I32>()));
+    TRY(stack.take(ValueType(ValueType::TypeUseReference, args.type_index)));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+ErrorOr<void, ValidationError> Validator::validate_ref_test_or_cast(Stack& stack, Instruction const& instruction)
+{
+    auto type = instruction.arguments().get<ValueType>();
+    TRY(validate(type));
+
+    auto top = ValueType(top_of_heap_type(type, m_context.type_context()));
+    TRY(stack.take(top));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_test)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_test_null)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#reference-instructions
+VALIDATE_INSTRUCTION(ref_cast)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(instruction.arguments().get<ValueType>());
+    return {};
+}
+
+VALIDATE_INSTRUCTION(ref_cast_null)
+{
+    TRY(validate_ref_test_or_cast(stack, instruction));
+    stack.append(instruction.arguments().get<ValueType>());
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#control-instructions
+ErrorOr<void, ValidationError> Validator::validate_br_on_cast(Stack& stack, Instruction const& instruction, bool branch_on_failure)
+{
+    auto& args = instruction.arguments().get<Instruction::BranchOnCastArgs>();
+    TRY(validate(args.branch.label));
+    TRY(validate(args.source_type));
+    TRY(validate(args.target_type));
+
+    if (!matches_reference_type(args.target_type, args.source_type, m_context.type_context()))
+        return Errors::invalid("br_on_cast target type"sv, args.source_type, args.target_type);
+
+    auto& target = m_frames[(m_frames.size() - 1) - args.branch.label.value()];
+    auto& label_types = target.labels();
+    if (label_types.is_empty() || !label_types.last().is_reference())
+        return Errors::invalid("br_on_cast label type"sv, "t* rt"sv, label_types);
+    auto& label_reference_type = label_types.last();
+
+    // https://webassembly.github.io/spec/core/valid/conventions.html#conventions
+    // rt1 \ rt2 = (ref ht1)        if rt2 = (ref null ht2)
+    //           = (ref null1? ht1) otherwise
+    auto difference = args.source_type;
+    if (args.target_type.is_nullable())
+        difference.set_nullable(false);
+
+    auto& branched_type = branch_on_failure ? difference : args.target_type;
+    if (!matches_reference_type(branched_type, label_reference_type, m_context.type_context()))
+        return Errors::invalid("br_on_cast label type"sv, label_reference_type, branched_type);
+
+    TRY(stack.take(args.source_type));
+    for (size_t i = 0; i + 1 < label_types.size(); ++i)
+        TRY(stack.take(label_types[label_types.size() - i - 2]));
+    for (size_t i = 0; i + 1 < label_types.size(); ++i)
+        stack.append(label_types[i]);
+
+    stack.append(branch_on_failure ? args.target_type : difference);
+    args.branch.has_stack_adjustment = target.initial_size != stack.size();
+    return {};
+}
+
+VALIDATE_INSTRUCTION(br_on_cast)
+{
+    return validate_br_on_cast(stack, instruction, false);
+}
+
+VALIDATE_INSTRUCTION(br_on_cast_fail)
+{
+    return validate_br_on_cast(stack, instruction, true);
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#external-reference-instructions
+VALIDATE_INSTRUCTION(any_convert_extern)
+{
+    auto entry = TRY(stack.take_last());
+    bool nullable = true;
+    if (entry.is_known) {
+        if (!matches_value_type(entry.concrete_type, ValueType(ValueType::ExternReference), m_context.type_context()))
+            return Errors::invalid("any.convert_extern operand"sv, ValueType(ValueType::ExternReference), entry);
+        nullable = entry.concrete_type.is_nullable();
+    } else {
+        nullable = false;
+    }
+    stack.append(ValueType(ValueType::AnyReference, nullable));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#external-reference-instructions
+VALIDATE_INSTRUCTION(extern_convert_any)
+{
+    auto entry = TRY(stack.take_last());
+    bool nullable = true;
+    if (entry.is_known) {
+        if (!matches_value_type(entry.concrete_type, ValueType(ValueType::AnyReference), m_context.type_context()))
+            return Errors::invalid("extern.convert_any operand"sv, ValueType(ValueType::AnyReference), entry);
+        nullable = entry.concrete_type.is_nullable();
+    } else {
+        nullable = false;
+    }
+    stack.append(ValueType(ValueType::ExternReference, nullable));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#scalar-reference-instructions
+VALIDATE_INSTRUCTION(ref_i31)
+{
+    TRY(stack.take<ValueType::I32>());
+    stack.append(ValueType(ValueType::I31Reference, false));
+    is_constant = true;
+    return {};
+}
+
+// https://webassembly.github.io/spec/core/valid/instructions.html#scalar-reference-instructions
+VALIDATE_INSTRUCTION(i31_get_s)
+{
+    TRY(stack.take(ValueType(ValueType::I31Reference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
+VALIDATE_INSTRUCTION(i31_get_u)
+{
+    TRY(stack.take(ValueType(ValueType::I31Reference)));
+    stack.append(ValueType(ValueType::I32));
+    return {};
+}
+
 VALIDATE_INSTRUCTION(synthetic_end_expression)
 {
     is_constant = true;
@@ -4488,7 +5088,7 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
 {
     if (m_frames.is_empty())
         m_frames.empend(FunctionType { {}, result_types }, FrameKind::Function, (size_t)0);
-    auto stack = Stack(m_frames);
+    auto stack = Stack(m_frames, m_context.type_context());
     bool is_constant_expression = true;
 
     for (auto& instruction : expression.instructions()) {

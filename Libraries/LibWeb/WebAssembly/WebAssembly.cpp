@@ -55,15 +55,17 @@ static GC::Ref<WebIDL::Promise> compile_potential_webassembly_response(JS::VM&, 
 
 namespace Detail {
 
-static GC::WeakHashMap<JS::Object, WebAssemblyCache>& caches()
+// The caches hold AbstractMachines whose gc-roots providers keep pointers into them, so they
+// live behind OwnPtrs and never move on rehash.
+static GC::WeakHashMap<JS::Object, NonnullOwnPtr<WebAssemblyCache>>& caches()
 {
-    static NeverDestroyed<GC::WeakHashMap<JS::Object, WebAssemblyCache>> caches;
+    static NeverDestroyed<GC::WeakHashMap<JS::Object, NonnullOwnPtr<WebAssemblyCache>>> caches;
     return *caches;
 }
 
 WebAssemblyCache& get_cache(JS::Realm& realm)
 {
-    return caches().ensure(realm.global_object());
+    return *caches().ensure(realm.global_object(), [] { return make<WebAssemblyCache>(); });
 }
 
 }
@@ -72,7 +74,7 @@ void visit_edges(JS::Object& object, JS::Cell::Visitor& visitor)
 {
     auto& global_object = HTML::relevant_global_object(object);
     if (auto maybe_cache = Detail::caches().get(global_object); maybe_cache.has_value()) {
-        auto& cache = maybe_cache.value();
+        auto& cache = *maybe_cache.value();
         visitor.visit(cache.function_instances());
         visitor.visit(cache.imported_objects());
         visitor.visit(cache.extern_values());
@@ -702,7 +704,7 @@ JS::NativeFunction* create_native_function(JS::VM& vm, Wasm::FunctionAddress add
             if (result.is_trap()) {
                 if (auto ptr = result.trap().data.get_pointer<Wasm::ExternallyManagedTrap>())
                     return ptr->unsafe_external_object_as<JS::Completion>();
-                auto& trap = result.trap().data.get<ByteString>();
+                auto trap = result.trap().format();
                 // https://webassembly.github.io/spec/js-api/#stack-overflow
                 // 6.1. Whenever a stack overflow occurs in WebAssembly code, the same class of exception is thrown as for a stack overflow in JavaScript.
                 if (trap.ends_with(Wasm::Constants::stack_exhaustion_message))
@@ -788,8 +790,21 @@ JS::ThrowCompletionOr<Wasm::Value> to_webassembly_value(JS::VM& vm, JS::Value va
         return Wasm::Value(Wasm::ValueType { Wasm::ValueType::Kind::ExceptionReference });
     case Wasm::ValueType::V128:
         return vm.throw_completion<JS::TypeError>("Cannot convert a vector value to a javascript value"sv);
+    case Wasm::ValueType::I8:
+    case Wasm::ValueType::I16:
+        return vm.throw_completion<JS::TypeError>("Cannot convert a packed value to a javascript value"sv);
+    case Wasm::ValueType::NoFunctionReference:
+    case Wasm::ValueType::NoExternReference:
+    case Wasm::ValueType::AnyReference:
+    case Wasm::ValueType::EqReference:
+    case Wasm::ValueType::I31Reference:
+    case Wasm::ValueType::StructReference:
+    case Wasm::ValueType::ArrayReference:
+    case Wasm::ValueType::NoneReference:
+    case Wasm::ValueType::NoExceptionReference:
     case Wasm::ValueType::TypeUseReference:
-    case Wasm::ValueType::UnsupportedHeapReference:
+        // FIXME: Implement the conversions for the wasm-gc reference hierarchy
+        //        (https://webassembly.github.io/spec/js-api/#tojsvalue).
         return vm.throw_completion<JS::TypeError>("Unsupported heap reference"sv);
     }
 
@@ -810,9 +825,18 @@ Wasm::Value default_webassembly_value(JS::VM& vm, Wasm::ValueType type)
         return MUST(to_webassembly_value(vm, JS::js_undefined(), type));
     case Wasm::ValueType::ExceptionReference:
         return Wasm::Value(type);
+    case Wasm::ValueType::I8:
+    case Wasm::ValueType::I16:
+    case Wasm::ValueType::NoFunctionReference:
+    case Wasm::ValueType::NoExternReference:
+    case Wasm::ValueType::AnyReference:
+    case Wasm::ValueType::EqReference:
+    case Wasm::ValueType::I31Reference:
+    case Wasm::ValueType::StructReference:
+    case Wasm::ValueType::ArrayReference:
+    case Wasm::ValueType::NoneReference:
+    case Wasm::ValueType::NoExceptionReference:
     case Wasm::ValueType::TypeUseReference:
-        return Wasm::Value(type);
-    case Wasm::ValueType::UnsupportedHeapReference:
         return Wasm::Value(type);
     }
     VERIFY_NOT_REACHED();
@@ -858,9 +882,19 @@ JS::Value to_js_value(JS::VM& vm, Wasm::Value& wasm_value, Wasm::ValueType type)
         return value.release_value();
     }
     case Wasm::ValueType::V128:
+    case Wasm::ValueType::I8:
+    case Wasm::ValueType::I16:
     case Wasm::ValueType::ExceptionReference:
+    case Wasm::ValueType::NoFunctionReference:
+    case Wasm::ValueType::NoExternReference:
+    case Wasm::ValueType::AnyReference:
+    case Wasm::ValueType::EqReference:
+    case Wasm::ValueType::I31Reference:
+    case Wasm::ValueType::StructReference:
+    case Wasm::ValueType::ArrayReference:
+    case Wasm::ValueType::NoneReference:
+    case Wasm::ValueType::NoExceptionReference:
     case Wasm::ValueType::TypeUseReference:
-    case Wasm::ValueType::UnsupportedHeapReference:
         VERIFY_NOT_REACHED();
     }
     VERIFY_NOT_REACHED();

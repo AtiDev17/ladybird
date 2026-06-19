@@ -31,6 +31,7 @@
 
 namespace Wasm {
 
+class DefinedType;
 class Module;
 
 template<size_t M>
@@ -190,7 +191,15 @@ private:
     Vector<u8, 8> m_buffer;
 };
 
-// https://webassembly.github.io/spec/core/bikeshed/#value-types%E2%91%A2
+// https://webassembly.github.io/spec/core/syntax/types.html#value-types
+// valtype ::= numtype | vectype | reftype
+// https://webassembly.github.io/spec/core/syntax/types.html#reference-types
+// reftype  ::= ref null? heaptype
+// https://webassembly.github.io/spec/core/syntax/types.html#heap-types
+// heaptype ::= absheaptype | typeidx
+// absheaptype ::= func | nofunc | extern | noextern | any | eq | i31 | struct | array | none | exn | noexn
+// https://webassembly.github.io/spec/core/syntax/types.html#composite-types
+// packtype ::= i8 | i16
 class ValueType {
 public:
     enum Kind : u8 {
@@ -199,11 +208,21 @@ public:
         F32,
         F64,
         V128,
+        I8,  // as packtype
+        I16, // as packtype
         FunctionReference,
+        NoFunctionReference,
         ExternReference,
+        NoExternReference,
+        AnyReference,
+        EqReference,
+        I31Reference,
+        StructReference,
+        ArrayReference,
+        NoneReference,
         ExceptionReference,
+        NoExceptionReference,
         TypeUseReference,
-        UnsupportedHeapReference, // Stub for wasm-gc proposal's reference types.
     };
 
     explicit ValueType(Kind kind)
@@ -211,8 +230,15 @@ public:
     {
     }
 
-    explicit ValueType(Kind kind, TypeIndex type_index)
+    explicit ValueType(Kind kind, bool nullable)
         : m_kind(kind)
+        , m_nullable(nullable)
+    {
+    }
+
+    explicit ValueType(Kind kind, TypeIndex type_index, bool nullable = true)
+        : m_kind(kind)
+        , m_nullable(nullable)
         , m_type_index(type_index)
     {
         VERIFY(kind == TypeUseReference);
@@ -223,11 +249,30 @@ public:
     bool is_nullable() const { return m_nullable; }
     void set_nullable(bool nullable) { m_nullable = nullable; }
 
-    auto is_reference() const { return m_kind == ExternReference || m_kind == FunctionReference || m_kind == TypeUseReference || m_kind == UnsupportedHeapReference; }
+    auto is_reference() const { return m_kind >= FunctionReference; }
     auto is_vector() const { return m_kind == V128; }
-    auto is_numeric() const { return !is_reference() && !is_vector(); }
+    auto is_packed() const { return m_kind == I8 || m_kind == I16; }
+    auto is_numeric() const { return !is_reference() && !is_vector() && !is_packed(); }
     auto is_typeuse() const { return m_kind == TypeUseReference; }
     auto kind() const { return m_kind; }
+
+    // https://webassembly.github.io/spec/core/syntax/types.html#aux-unpack
+    // unpack(valtype)  = valtype
+    // unpack(packtype) = i32
+    ValueType unpacked() const
+    {
+        if (is_packed())
+            return ValueType(I32);
+        return *this;
+    }
+
+    // https://webassembly.github.io/spec/core/valid/types.html#defaultable-types
+    bool is_defaultable() const
+    {
+        if (is_reference())
+            return m_nullable;
+        return true;
+    }
 
     auto unsafe_typeindex() const
     {
@@ -250,16 +295,36 @@ public:
             return "f64";
         case V128:
             return "v128";
+        case I8:
+            return "i8";
+        case I16:
+            return "i16";
         case FunctionReference:
-            return m_nullable ? "funcref" : "ref func";
+            return m_nullable ? "funcref" : "(ref func)";
+        case NoFunctionReference:
+            return m_nullable ? "nullfuncref" : "(ref nofunc)";
         case ExternReference:
-            return m_nullable ? "externref" : "ref extern";
+            return m_nullable ? "externref" : "(ref extern)";
+        case NoExternReference:
+            return m_nullable ? "nullexternref" : "(ref noextern)";
+        case AnyReference:
+            return m_nullable ? "anyref" : "(ref any)";
+        case EqReference:
+            return m_nullable ? "eqref" : "(ref eq)";
+        case I31Reference:
+            return m_nullable ? "i31ref" : "(ref i31)";
+        case StructReference:
+            return m_nullable ? "structref" : "(ref struct)";
+        case ArrayReference:
+            return m_nullable ? "arrayref" : "(ref array)";
+        case NoneReference:
+            return m_nullable ? "nullref" : "(ref none)";
         case ExceptionReference:
-            return "exnref";
+            return m_nullable ? "exnref" : "(ref exn)";
+        case NoExceptionReference:
+            return m_nullable ? "nullexnref" : "(ref noexn)";
         case TypeUseReference:
-            return ByteString::formatted("ref {} {}", m_nullable ? "null" : "", unsafe_typeindex().value());
-        case UnsupportedHeapReference:
-            return "todo.heapref";
+            return ByteString::formatted("(ref {}{})", m_nullable ? "null " : "", unsafe_typeindex().value());
         }
         VERIFY_NOT_REACHED();
     }
@@ -652,6 +717,38 @@ public:
         MemoryIndex memory_index;
     };
 
+    // Proposal "gc"
+    struct StructFieldArgs {
+        TypeIndex type_index;
+        u32 field_index;
+    };
+
+    struct ArrayNewFixedArgs {
+        TypeIndex type_index;
+        u32 count;
+    };
+
+    struct ArrayDataArgs {
+        TypeIndex type_index;
+        DataIndex data_index;
+    };
+
+    struct ArrayElemArgs {
+        TypeIndex type_index;
+        ElementIndex element_index;
+    };
+
+    struct ArrayCopyArgs {
+        TypeIndex destination_type_index;
+        TypeIndex source_type_index;
+    };
+
+    struct BranchOnCastArgs {
+        BranchArgs branch;
+        ValueType source_type; // Nullability carries the castop null_1? flag.
+        ValueType target_type; // Nullability carries the castop null_2? flag.
+    };
+
     // Proposal "exception-handling"
     struct TryTableArgs : StructuredInstructionArgsBase<OwnPtr<FixedArray<Catch>>> {
         using Base = StructuredInstructionArgsBase<OwnPtr<FixedArray<Catch>>>;
@@ -753,8 +850,13 @@ private:
     LocalIndex m_local_index;
 
     Variant<
+        ArrayCopyArgs,
+        ArrayDataArgs,
+        ArrayElemArgs,
+        ArrayNewFixedArgs,
         BlockType,
         BranchArgs,
+        BranchOnCastArgs,
         DataIndex,
         ElementIndex,
         FunctionIndex,
@@ -769,6 +871,7 @@ private:
         MemoryCopyArgs,
         MemoryIndexArgument,
         MemoryInitArgs,
+        StructFieldArgs,
         StructuredInstructionArgs,
         ShuffleArgument,
         TableBranchArgs,
@@ -1014,13 +1117,21 @@ private:
 
 class TypeSection {
 public:
+    // https://webassembly.github.io/spec/core/syntax/types.html#recursive-types
+    // https://webassembly.github.io/spec/core/syntax/types.html#composite-types
     class Type {
-    private:
-        using TypeDesc = Variant<FunctionType, StructType, ArrayType>;
-
     public:
-        Type(TypeDesc type)
-            : m_description(type)
+        using CompositeType = Variant<FunctionType, StructType, ArrayType>;
+
+        struct RecGroupSpan {
+            u32 first_type_index { 0 };
+            u32 size { 1 };
+        };
+
+        Type(CompositeType type, Vector<TypeIndex> supertypes = {}, bool is_final = true)
+            : m_description(move(type))
+            , m_supertypes(move(supertypes))
+            , m_is_final(is_final)
         {
         }
 
@@ -1033,6 +1144,16 @@ public:
         auto& struct_() const { return m_description.get<StructType>(); }
         bool is_struct() const { return m_description.has<StructType>(); }
 
+        auto& array() const { return m_description.get<ArrayType>(); }
+        bool is_array() const { return m_description.has<ArrayType>(); }
+
+        // sub final? x* ct
+        auto& supertypes() const { return m_supertypes; }
+        bool is_final() const { return m_is_final; }
+
+        auto& rec_group() const { return m_rec_group; }
+        void set_rec_group(RecGroupSpan span) { m_rec_group = span; }
+
         ByteString name() const
         {
             return m_description.visit(
@@ -1041,10 +1162,13 @@ public:
                 [](ArrayType const&) -> ByteString { return "array type"; });
         }
 
-        static ParseResult<Type> parse(ConstrainedStream& stream);
+        static ParseResult<Type> parse(ConstrainedStream& stream, Optional<u8> leading_tag = {});
 
     private:
-        TypeDesc m_description;
+        CompositeType m_description;
+        Vector<TypeIndex> m_supertypes;
+        bool m_is_final { true };
+        RecGroupSpan m_rec_group;
     };
 
     TypeSection() = default;
@@ -1126,21 +1250,48 @@ private:
     Vector<TypeIndex> m_types;
 };
 
+class Expression {
+public:
+    explicit Expression(Vector<Instruction> instructions)
+        : m_instructions(move(instructions))
+    {
+    }
+
+    auto& instructions() const { return m_instructions; }
+
+    static ParseResult<Expression> parse(ConstrainedStream& stream, Optional<size_t> size_hint = {});
+
+    void set_stack_usage_hint(size_t value) const { m_stack_usage_hint = value; }
+    auto stack_usage_hint() const { return m_stack_usage_hint; }
+    void set_frame_usage_hint(size_t value) const { m_frame_usage_hint = value; }
+    auto frame_usage_hint() const { return m_frame_usage_hint; }
+
+    mutable CompiledInstructions compiled_instructions;
+
+private:
+    Vector<Instruction> m_instructions;
+    mutable Optional<size_t> m_stack_usage_hint;
+    mutable Optional<size_t> m_frame_usage_hint;
+};
+
 class TableSection {
 public:
     class Table {
     public:
-        explicit Table(TableType type)
+        explicit Table(TableType type, Expression initializer)
             : m_type(move(type))
+            , m_initializer(move(initializer))
         {
         }
 
         auto& type() const { return m_type; }
+        auto& initializer() const { return m_initializer; }
 
         static ParseResult<Table> parse(ConstrainedStream& stream);
 
     private:
         TableType m_type;
+        Expression m_initializer;
     };
 
 public:
@@ -1190,30 +1341,6 @@ public:
 
 private:
     Vector<Memory> m_memories;
-};
-
-class Expression {
-public:
-    explicit Expression(Vector<Instruction> instructions)
-        : m_instructions(move(instructions))
-    {
-    }
-
-    auto& instructions() const { return m_instructions; }
-
-    static ParseResult<Expression> parse(ConstrainedStream& stream, Optional<size_t> size_hint = {});
-
-    void set_stack_usage_hint(size_t value) const { m_stack_usage_hint = value; }
-    auto stack_usage_hint() const { return m_stack_usage_hint; }
-    void set_frame_usage_hint(size_t value) const { m_frame_usage_hint = value; }
-    auto frame_usage_hint() const { return m_frame_usage_hint; }
-
-    mutable CompiledInstructions compiled_instructions;
-
-private:
-    Vector<Instruction> m_instructions;
-    mutable Optional<size_t> m_stack_usage_hint;
-    mutable Optional<size_t> m_frame_usage_hint;
 };
 
 class GlobalSection {
@@ -1623,6 +1750,11 @@ public:
     size_t minimum_call_record_allocation_size() const { return m_minimum_call_record_allocation_size; }
     void set_minimum_call_record_allocation_size(size_t size) { m_minimum_call_record_allocation_size = size; }
 
+    // The defined type of each (flattened) type-section entry; filled in during validation.
+    // https://webassembly.github.io/spec/core/valid/conventions.html#defined-types
+    auto& canonical_types() const { return m_canonical_types; }
+    void set_canonical_types(Vector<DefinedType const*> types) { m_canonical_types = move(types); }
+
 private:
     void set_validation_status(ValidationStatus status) { m_validation_status = status; }
     void preprocess();
@@ -1649,6 +1781,8 @@ private:
     mutable Sync::ConditionVariable m_cranelift_compilation_state_changed { m_cranelift_compilation_mutex };
     Optional<CompileCacheConfig> m_cranelift_cache_config;
     Optional<ModuleStats> m_compile_stats;
+
+    Vector<DefinedType const*> m_canonical_types;
 
     size_t m_minimum_call_record_allocation_size { 0 };
 };

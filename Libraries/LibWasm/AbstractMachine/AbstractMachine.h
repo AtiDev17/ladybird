@@ -14,7 +14,12 @@
 #include <AK/StackInfo.h>
 #include <AK/UFixedBigInt.h>
 #include <AK/Weakable.h>
+#include <LibGC/Cell.h>
+#include <LibGC/CellAllocator.h>
+#include <LibGC/ConservativeRangeProvider.h>
+#include <LibGC/Heap.h>
 #include <LibWasm/Export.h>
+#include <LibWasm/TypeSystem.h>
 #include <LibWasm/Types.h>
 
 namespace Wasm {
@@ -61,8 +66,17 @@ public:
     struct Exception {
         ExceptionAddress address;
     };
+    // https://webassembly.github.io/spec/core/exec/runtime.html#values
+    // ref.i31 i31: an unboxed 31-bit scalar reference.
+    struct I31 {
+        u32 value; // using only low 31 bits
+    };
+    // A reference to a structure or array instance (a GC::Cell, see StructInstance and ArrayInstance below).
+    struct GcObject {
+        GC::Ptr<GC::Cell> ptr;
+    };
 
-    using RefType = Variant<Null, Func, Extern, Exception>;
+    using RefType = Variant<Null, Func, Extern, Exception, I31, GcObject>;
     explicit Reference(RefType ref)
         : m_ref(move(ref))
     {
@@ -91,23 +105,32 @@ public:
         case ValueType::F32:
         case ValueType::F64:
         case ValueType::V128:
+        case ValueType::I8:
+        case ValueType::I16:
             break;
         case ValueType::FunctionReference:
-            // ref.null funcref
+        case ValueType::NoFunctionReference:
+            // ref.null func | ref.null nofunc
             m_value = u128(0, 2);
             break;
         case ValueType::ExternReference:
-            // ref.null externref
+        case ValueType::NoExternReference:
+            // ref.null extern | ref.null noextern
             m_value = u128(0, 3);
             break;
         case ValueType::ExceptionReference:
-            // ref.null exnref
+        case ValueType::NoExceptionReference:
+            // ref.null exn | ref.null noexn
             m_value = u128(0, 4);
             break;
+        case ValueType::AnyReference:
+        case ValueType::EqReference:
+        case ValueType::I31Reference:
+        case ValueType::StructReference:
+        case ValueType::ArrayReference:
+        case ValueType::NoneReference:
         case ValueType::TypeUseReference:
-        case ValueType::UnsupportedHeapReference:
-            // ref.null (todo)
-            m_value = u128(0, 5);
+            m_value = u128(0, 8);
             break;
         }
     }
@@ -148,21 +171,55 @@ public:
     {
     }
 
-    explicit Value(Reference ref)
+    explicit Value(Reference const& ref)
     {
         // Reference variant is encoded in the high storage of the u128:
-        // 0: funcref
         // 1: externref
         // 2: null funcref
         // 3: null externref
         // 4: null exnref
         // 5: exnref
+        // 6: a gc object
+        // 7: an i31 reference
+        // 8: a null reference in the any hierarchy
+        // 9 | (tag << 8): an "externalized" internal reference (extern.convert_any)
+        // 10: a host externref viewed as a value in the any hierarchy (any.convert_extern)
+        // anything else: funcref, where high is the defining Module* (null for host functions)
         ref.ref().visit(
             [&](Reference::Func const& func) { m_value = u128(bit_cast<u64>(func.address), bit_cast<u64>(func.source_module.ptr())); },
             [&](Reference::Extern const& func) { m_value = u128(bit_cast<u64>(func.address), 1); },
-            [&](Reference::Null const& null) { m_value = u128(0, null.type.kind() == ValueType::Kind::FunctionReference ? 2 : null.type.kind() == ValueType::Kind::ExceptionReference ? 4
-                                                                                                                                                                                      : 3); },
-            [&](Reference::Exception const& exn) { m_value = u128(bit_cast<u64>(exn.address), 5); });
+            [&](Reference::Null const& null) {
+                switch (null.type.kind()) {
+                case ValueType::Kind::FunctionReference:
+                case ValueType::Kind::NoFunctionReference:
+                    m_value = u128(0, 2);
+                    break;
+                case ValueType::Kind::ExternReference:
+                case ValueType::Kind::NoExternReference:
+                    m_value = u128(0, 3);
+                    break;
+                case ValueType::Kind::ExceptionReference:
+                case ValueType::Kind::NoExceptionReference:
+                    m_value = u128(0, 4);
+                    break;
+                default:
+                    m_value = u128(0, 8);
+                    break;
+                }
+            },
+            [&](Reference::Exception const& exn) { m_value = u128(bit_cast<u64>(exn.address), 5); },
+            [&](Reference::I31 const& i31) { m_value = u128(static_cast<u64>(i31.value & 0x7fffffff), 7); },
+            [&](Reference::GcObject const& object) { m_value = u128(bit_cast<u64>(object.ptr.ptr()), 6); });
+    }
+
+    // The gc cell behind this value if it holds a gc object reference, otherwise null.
+    GC::Cell* gc_cell() const
+    {
+        // A gc object, either plain (tag 6) or externalized by extern.convert_any (tag 9
+        // wrapping tag 6).
+        if (m_value.high() == 6 || m_value.high() == (9 | (6 << 8)))
+            return bit_cast<GC::Cell*>(m_value.low());
+        return nullptr;
     }
 
     template<SameAs<u128> T>
@@ -209,6 +266,21 @@ public:
                 return Reference { Reference::Null { ValueType(ValueType::Kind::ExceptionReference) } };
             case 5:
                 return Reference { Reference::Exception { bit_cast<ExceptionAddress>(m_value.low()) } };
+            case 6:
+                return Reference { Reference::GcObject { bit_cast<GC::Cell*>(m_value.low()) } };
+            case 7:
+                return Reference { Reference::I31 { static_cast<u32>(m_value.low()) } };
+            case 8:
+                return Reference { Reference::Null { ValueType(ValueType::Kind::AnyReference) } };
+            case 9 | (6 << 8):
+                // An externalized gc object; boxing drops the extern.convert_any wrapper.
+                return Reference { Reference::GcObject { bit_cast<GC::Cell*>(m_value.low()) } };
+            case 9 | (7 << 8):
+                // An externalized i31; boxing drops the extern.convert_any wrapper.
+                return Reference { Reference::I31 { static_cast<u32>(m_value.low()) } };
+            case 10:
+                // A host externref internalized by any.convert_extern; boxing drops the wrapper.
+                return Reference { Reference::Extern { bit_cast<ExternAddress>(m_value.low()) } };
             default:
                 return Reference { Reference::Func { bit_cast<FunctionAddress>(m_value.low()), bit_cast<Wasm::Module*>(m_value.high()) } };
             }
@@ -235,13 +307,20 @@ struct ExternallyManagedTrap {
     }
 };
 
+// https://webassembly.github.io/spec/core/exec/runtime.html#results
+struct UncaughtException {
+    ExceptionAddress address;
+};
+
 struct Trap {
-    Variant<ByteString, ExternallyManagedTrap> data;
+    Variant<ByteString, ExternallyManagedTrap, UncaughtException> data;
 
     ByteString format() const
     {
         if (auto const* ptr = data.get_pointer<ByteString>())
             return *ptr;
+        if (data.has<UncaughtException>())
+            return "uncaught exception";
         return "<Externally managed Trap Data>";
     }
 
@@ -355,6 +434,8 @@ public:
     ModuleInstance() = default;
 
     auto& types() const { return m_types; }
+    auto& canonical_types() const { return m_canonical_types; }
+    auto& canonical_types() { return m_canonical_types; }
     auto& functions() const { return m_functions; }
     auto& tables() const { return m_tables; }
     auto& memories() const { return m_memories; }
@@ -382,6 +463,7 @@ public:
 
 private:
     Vector<TypeSection::Type> m_types;
+    Vector<DefinedType const*> m_canonical_types;
     Vector<TagType> m_tag_types;
     Vector<FunctionAddress> m_functions;
     Vector<TableAddress> m_tables;
@@ -398,8 +480,9 @@ private:
 
 class WasmFunction {
 public:
-    explicit WasmFunction(FunctionType const& type, ModuleInstance const& instance, Module const& module, CodeSection::Code const& code)
+    explicit WasmFunction(FunctionType const& type, DefinedType const* defined_type, ModuleInstance const& instance, Module const& module, CodeSection::Code const& code)
         : m_type(type)
+        , m_defined_type(defined_type)
         , m_module(module.make_weak_ptr())
         , m_module_instance(instance.make_weak_ptr<ModuleInstance const>())
         , m_code(&code)
@@ -407,7 +490,8 @@ public:
     }
 
     auto& type() const { return m_type; }
-    // Callers must have already verified the module is alive (e.g., via Store::get() returning non-null).
+    // https://webassembly.github.io/spec/core/exec/runtime.html#function-instances
+    DefinedType const* defined_type() const { return m_defined_type; }
     ModuleInstance const& module() const { return *m_module_instance.strong_ref(); }
     RefPtr<ModuleInstance const> try_module() const { return m_module_instance.strong_ref(); }
     auto& code() const { return *m_code; }
@@ -415,6 +499,7 @@ public:
 
 private:
     FunctionType m_type;
+    DefinedType const* m_defined_type { nullptr };
     WeakPtr<Module const> m_module;
     WeakPtr<ModuleInstance const> m_module_instance;
     CodeSection::Code const* m_code;
@@ -433,9 +518,14 @@ public:
     auto& type() const { return m_type; }
     auto& name() const { return m_name; }
 
+    // Interned on the store.
+    DefinedType const* defined_type() const { return m_defined_type; }
+    void set_defined_type(DefinedType const* defined_type) { m_defined_type = defined_type; }
+
 private:
     AK::Function<Result(Configuration&, Span<Value>)> m_function;
     FunctionType m_type;
+    DefinedType const* m_defined_type { nullptr };
     ByteString m_name;
 };
 
@@ -632,34 +722,84 @@ private:
 
 class TagInstance {
 public:
-    TagInstance(FunctionType const& type, TagType::Flags flags)
+    TagInstance(FunctionType const& type, DefinedType const* defined_type, TagType::Flags flags)
         : m_type(type)
+        , m_defined_type(defined_type)
         , m_flags(flags)
     {
     }
 
     auto& type() const { return m_type; }
+    // https://webassembly.github.io/spec/core/exec/runtime.html#tag-instances
+    DefinedType const* defined_type() const { return m_defined_type; }
     auto flags() const { return m_flags; }
 
 private:
     FunctionType m_type;
+    DefinedType const* m_defined_type { nullptr };
     TagType::Flags m_flags;
 };
 
+// https://webassembly.github.io/spec/core/exec/runtime.html#exception-instances
 class ExceptionInstance {
 public:
-    explicit ExceptionInstance(TagInstance const& type, Vector<Value> params)
-        : m_type(type)
+    explicit ExceptionInstance(TagAddress tag, Vector<Value> params)
+        : m_tag(tag)
         , m_params(move(params))
     {
     }
 
-    auto& type() const { return m_type; }
+    auto tag() const { return m_tag; }
     auto& params() const { return m_params; }
 
 private:
-    TagInstance m_type;
+    TagAddress m_tag;
     Vector<Value> m_params;
+};
+
+// https://webassembly.github.io/spec/core/exec/runtime.html#aggregate-instances
+class WASM_API StructInstance final : public GC::Cell {
+    GC_CELL(StructInstance, GC::Cell);
+    GC_DECLARE_ALLOCATOR(StructInstance);
+
+public:
+    DefinedType const& type() const { return *m_type; }
+    ReadonlySpan<Value> fields() const { return m_fields; }
+    Span<Value> fields() { return m_fields; }
+
+private:
+    StructInstance(DefinedType const& type, Vector<Value> fields)
+        : m_type(&type)
+        , m_fields(move(fields))
+    {
+    }
+
+    virtual void visit_edges(Visitor&) override;
+
+    DefinedType const* m_type { nullptr };
+    Vector<Value> m_fields;
+};
+
+class WASM_API ArrayInstance final : public GC::Cell {
+    GC_CELL(ArrayInstance, GC::Cell);
+    GC_DECLARE_ALLOCATOR(ArrayInstance);
+
+public:
+    DefinedType const& type() const { return *m_type; }
+    ReadonlySpan<Value> elements() const { return m_elements; }
+    Span<Value> elements() { return m_elements; }
+
+private:
+    ArrayInstance(DefinedType const& type, Vector<Value> elements)
+        : m_type(&type)
+        , m_elements(move(elements))
+    {
+    }
+
+    virtual void visit_edges(Visitor&) override;
+
+    DefinedType const* m_type { nullptr };
+    Vector<Value> m_elements;
 };
 
 class WASM_API Store {
@@ -673,8 +813,8 @@ public:
     Optional<DataAddress> allocate_data(Vector<u8>);
     Optional<GlobalAddress> allocate(GlobalType const&, Value);
     Optional<ElementAddress> allocate(ValueType const&, Vector<Reference>);
-    Optional<TagAddress> allocate(FunctionType const&, TagType::Flags);
-    Optional<ExceptionAddress> allocate(TagInstance const&, Vector<Value>);
+    Optional<TagAddress> allocate(FunctionType const&, DefinedType const*, TagType::Flags);
+    Optional<ExceptionAddress> allocate(TagAddress, Vector<Value>);
 
     Module const* get_module_for(FunctionAddress);
     RefPtr<ModuleInstance const> get_module_instance_for(FunctionAddress); // Obtains strong ref for module.
@@ -690,6 +830,18 @@ public:
     ALWAYS_INLINE FunctionInstance* unsafe_get(FunctionAddress address) { return &m_functions.data()[address.value()]; }
     ALWAYS_INLINE MemoryInstance* unsafe_get(MemoryAddress address) { return m_memories.data()[address.value()].ptr(); }
 
+    GC::Heap& heap() { return *m_heap; }
+    void set_heap(GC::Heap& heap) { m_heap = &heap; }
+
+    void register_configuration(Badge<Configuration>, Configuration& configuration) { m_active_configurations.set(&configuration); }
+    void unregister_configuration(Badge<Configuration>, Configuration& configuration) { m_active_configurations.remove(&configuration); }
+    auto& active_configurations() const { return m_active_configurations; }
+
+    auto& tables() const { return m_tables; }
+    auto& globals() const { return m_globals; }
+    auto& elements() const { return m_elements; }
+    auto& exceptions() const { return m_exceptions; }
+
 private:
     Vector<FunctionInstance> m_functions;
     Vector<TableInstance> m_tables;
@@ -699,25 +851,32 @@ private:
     Vector<DataInstance> m_datas;
     Vector<TagInstance> m_tags;
     Vector<ExceptionInstance> m_exceptions;
+
+    GC::Heap* m_heap { nullptr };
+    HashTable<Configuration*> m_active_configurations;
 };
 
 class Label {
 public:
-    explicit Label(size_t arity, InstructionPointer continuation, size_t stack_height)
+    explicit Label(size_t arity, InstructionPointer continuation, size_t stack_height, Instruction const* try_table_instruction = nullptr)
         : m_arity(arity)
         , m_stack_height(stack_height)
         , m_continuation(continuation)
+        , m_try_table_instruction(try_table_instruction)
     {
     }
 
     auto continuation() const { return m_continuation; }
     auto arity() const { return m_arity; }
     auto stack_height() const { return m_stack_height; }
+    // https://webassembly.github.io/spec/core/exec/instructions.html#exec-try-table
+    Instruction const* try_table_instruction() const { return m_try_table_instruction; }
 
 private:
     size_t m_arity { 0 };
     size_t m_stack_height { 0 };
     InstructionPointer m_continuation { 0 };
+    Instruction const* m_try_table_instruction { nullptr };
 };
 
 class Frame {
@@ -790,7 +949,23 @@ struct HostVisitOps {
 
 class WASM_API AbstractMachine {
 public:
-    explicit AbstractMachine() = default;
+    explicit AbstractMachine(GC::Heap* heap = nullptr)
+    {
+        if (heap)
+            adopt_heap(*heap);
+    }
+
+    GC::Heap& heap()
+    {
+        if (!m_heap) [[unlikely]]
+            create_own_heap();
+        return *m_heap;
+    }
+
+    // For embedders that decide on a (shared) heap after constructing the machine. Must
+    // happen before any code runs.
+    bool has_heap() const { return m_heap != nullptr; }
+    void adopt_heap(GC::Heap&);
 
     // Validate a module; permanently sets the module's validity status.
     ErrorOr<void, ValidationError> validate(Module&, Optional<CompileCacheConfig> cache_config = {}, CompileToNative = CompileToNative::Yes);
@@ -831,9 +1006,29 @@ private:
         return InterpreterHandle(*this, interpreter);
     }
 
-    Optional<InstantiationError> allocate_all_initial_phase(Module const&, ModuleInstance&, Vector<ExternValue>&, Vector<Value>& global_values, Vector<FunctionAddress>& own_functions);
+    Optional<InstantiationError> allocate_all_initial_phase(Module const&, ModuleInstance&, Vector<ExternValue>&, Vector<Value>& global_values, Vector<Value>& table_initial_values, Vector<FunctionAddress>& own_functions);
     Optional<InstantiationError> allocate_all_final_phase(Module const&, ModuleInstance&, Vector<Vector<Reference>>& elements);
+
+    void create_own_heap();
+
+    class RootsProvider final : public GC::ConservativeRangeProvider {
+    public:
+        RootsProvider(GC::Heap& heap, Store& store)
+            : GC::ConservativeRangeProvider(heap)
+            , m_store(store)
+        {
+        }
+
+    private:
+        virtual void for_each_conservative_range(AK::Function<void(ReadonlySpan<FlatPtr>)> const&) const override;
+
+        Store& m_store;
+    };
+
     Store m_store;
+    OwnPtr<GC::Heap> m_owned_heap;
+    GC::Heap* m_heap { nullptr };
+    OwnPtr<RootsProvider> m_roots_provider;
     StackInfo m_stack_info;
     HashTable<Interpreter*> m_active_interpreters;
     bool m_should_limit_instruction_count { false };

@@ -8,6 +8,7 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/SaturatingMath.h>
 #include <LibCore/System.h>
+#include <LibGC/Heap.h>
 #include <LibSync/MutexProtected.h>
 #include <LibWasm/AbstractMachine/AbstractMachine.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
@@ -90,6 +91,78 @@ void dump_module_stats()
             total_tier_up_checkpoints,
             total_hits);
     });
+}
+
+GC_DEFINE_ALLOCATOR(StructInstance);
+GC_DEFINE_ALLOCATOR(ArrayInstance);
+
+void StructInstance::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    for (auto& field : m_fields) {
+        if (auto* cell = field.gc_cell())
+            visitor.visit(cell);
+    }
+}
+
+void ArrayInstance::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    for (auto& element : m_elements) {
+        if (auto* cell = element.gc_cell())
+            visitor.visit(cell);
+    }
+}
+
+void AbstractMachine::adopt_heap(GC::Heap& heap)
+{
+    VERIFY(!m_heap);
+    m_heap = &heap;
+    m_store.set_heap(heap);
+    m_roots_provider = make<RootsProvider>(heap, m_store);
+}
+
+void AbstractMachine::create_own_heap()
+{
+    m_owned_heap = make<GC::Heap>([](auto&) { }, GC::Heap::BecomeProcessDefault::No);
+    adopt_heap(*m_owned_heap);
+}
+
+void AbstractMachine::RootsProvider::for_each_conservative_range(AK::Function<void(ReadonlySpan<FlatPtr>)> const& callback) const
+{
+    static_assert(sizeof(Value) % sizeof(FlatPtr) == 0);
+    auto report_values = [&](Value const* data, size_t count) {
+        if (count == 0)
+            return;
+        callback({ reinterpret_cast<FlatPtr const*>(data), count * (sizeof(Value) / sizeof(FlatPtr)) });
+    };
+    auto report_references = [&](ReadonlySpan<Reference> references) {
+        if (references.is_empty())
+            return;
+        callback({ reinterpret_cast<FlatPtr const*>(references.data()), references.size() * (sizeof(Reference) / sizeof(FlatPtr)) });
+    };
+
+    for (auto* configuration : m_store.active_configurations()) {
+        // Scan up to capacity, not just size.
+        report_values(configuration->value_stack().data(), configuration->value_stack().capacity());
+        report_values(configuration->regs.data(), configuration->regs.size());
+        report_values(configuration->m_current_call_record.data(), configuration->m_current_call_record.size());
+        for (auto& arguments : configuration->m_call_argument_freelist)
+            report_values(arguments.data(), arguments.capacity());
+        for (auto& frame : configuration->m_frame_stack) {
+            if (frame.owns_locals())
+                report_values(frame.locals_data(), frame.owned_locals().size());
+        }
+    }
+
+    for (auto& table : m_store.tables())
+        report_references(table.elements().span());
+    for (auto& element : m_store.elements())
+        report_references(element.references().span());
+    for (auto& global : m_store.globals())
+        report_values(&global.value(), 1);
+    for (auto& exception : m_store.exceptions())
+        report_values(exception.params().data(), exception.params().size());
 }
 
 MemoryBuffer::~MemoryBuffer()
@@ -288,13 +361,16 @@ Optional<FunctionAddress> Store::allocate(ModuleInstance& instance, Module const
         return {};
 
     auto& type = instance.types()[type_index.value()].function();
-    m_functions.empend(WasmFunction { type, instance, module, code });
+    auto const* defined_type = instance.canonical_types()[type_index.value()];
+    m_functions.empend(WasmFunction { type, defined_type, instance, module, code });
     return address;
 }
 
 Optional<FunctionAddress> Store::allocate(HostFunction&& function)
 {
     FunctionAddress address { m_functions.size() };
+    if (!function.defined_type())
+        function.set_defined_type(canonicalize_type(TypeSection::Type { FunctionType { function.type() } }, TypeContext {}));
     m_functions.empend(HostFunction { move(function) });
     return address;
 }
@@ -346,17 +422,17 @@ Optional<ElementAddress> Store::allocate(ValueType const& type, Vector<Reference
     return address;
 }
 
-Optional<TagAddress> Store::allocate(FunctionType const& type, TagType::Flags flags)
+Optional<TagAddress> Store::allocate(FunctionType const& type, DefinedType const* defined_type, TagType::Flags flags)
 {
     TagAddress address { m_tags.size() };
-    m_tags.append({ type, flags });
+    m_tags.append({ type, defined_type, flags });
     return address;
 }
 
-Optional<ExceptionAddress> Store::allocate(TagInstance const& tag_instance, Vector<Value> params)
+Optional<ExceptionAddress> Store::allocate(TagAddress tag_address, Vector<Value> params)
 {
     ExceptionAddress address { m_exceptions.size() };
-    m_exceptions.append(ExceptionInstance { tag_instance, move(params) });
+    m_exceptions.append(ExceptionInstance { tag_address, move(params) });
     return address;
 }
 
@@ -472,6 +548,9 @@ ErrorOr<void, ValidationError> AbstractMachine::validate(Module& module, Optiona
 }
 InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<ExternValue> externs)
 {
+    // FIXME: Only create a heap if we actually have GC used in the module.
+    heap();
+
     if (auto result = validate(const_cast<Module&>(module)); result.is_error())
         return InstantiationError { ByteString::formatted("Validation failed: {}", result.error()) };
 
@@ -480,6 +559,7 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
     auto& main_module_instance = *main_module_instance_pointer;
 
     main_module_instance.types() = module.type_section().types();
+    main_module_instance.canonical_types() = module.canonical_types();
 
     Vector<Value> global_values;
     Vector<Vector<Reference>> elements;
@@ -487,7 +567,12 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
     auto& auxiliary_instance = *auxiliary_instance_ptr;
 
     auxiliary_instance.cached_minimum_call_record_allocation_size = module.minimum_call_record_allocation_size();
+    auxiliary_instance.types() = module.type_section().types();
+    auxiliary_instance.canonical_types() = module.canonical_types();
 
+    // https://webassembly.github.io/spec/core/exec/modules.html#instantiation
+    // https://webassembly.github.io/spec/core/valid/matching.html#external-types
+    TypeContext const import_type_context { module.canonical_types().span() };
     for (auto [i, import_] : enumerate(module.import_section().imports())) {
         auto extern_ = externs.at(i);
         auto invalid = import_.description().visit(
@@ -495,7 +580,7 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
                 if (!extern_.has<MemoryAddress>())
                     return "Expected memory import"sv;
                 auto other_mem_type = m_store.get(extern_.get<MemoryAddress>())->type();
-                if (other_mem_type.limits().is_subset_of(mem_type.limits()))
+                if (matches_memory_type(other_mem_type, mem_type))
                     return {};
                 return ByteString::formatted("Memory import and extern do not match: {}-{} vs {}-{}", mem_type.limits().min(), mem_type.limits().max(), other_mem_type.limits().min(), other_mem_type.limits().max());
             },
@@ -503,8 +588,7 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
                 if (!extern_.has<TableAddress>())
                     return "Expected table import"sv;
                 auto other_table_type = m_store.get(extern_.get<TableAddress>())->type();
-                if (table_type.element_type() == other_table_type.element_type()
-                    && other_table_type.limits().is_subset_of(table_type.limits()))
+                if (matches_table_type(other_table_type, table_type, TypeContext {}, import_type_context))
                     return {};
 
                 return ByteString::formatted("Table import and extern do not match: {}-{} vs {}-{}", table_type.limits().min(), table_type.limits().max(), other_table_type.limits().min(), other_table_type.limits().max());
@@ -513,8 +597,7 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
                 if (!extern_.has<GlobalAddress>())
                     return "Expected global import"sv;
                 auto other_global_type = m_store.get(extern_.get<GlobalAddress>())->type();
-                if (global_type.type() == other_global_type.type()
-                    && global_type.is_mutable() == other_global_type.is_mutable())
+                if (matches_global_type(other_global_type, global_type, TypeContext {}, import_type_context))
                     return {};
                 return "Global import and extern do not match"sv;
             },
@@ -535,8 +618,14 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
                 if (other_tag_instance->flags() != type.flags())
                     return "Tag import and extern do not match"sv;
 
-                auto& this_type = module.type_section().types()[type.type().value()];
+                auto const* defined_type = module.canonical_types()[type.type().value()];
+                if (other_tag_instance->defined_type() && defined_type) {
+                    if (!matches_tag_type(*other_tag_instance->defined_type(), *defined_type))
+                        return "Tag import and extern do not match"sv;
+                    return {};
+                }
 
+                auto& this_type = module.type_section().types()[type.type().value()];
                 if (other_tag_instance->type().parameters() != this_type.function().parameters())
                     return "Tag import and extern do not match"sv;
                 return {};
@@ -544,12 +633,11 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
             [&](TypeIndex type_index) -> Optional<ByteString> {
                 if (!extern_.has<FunctionAddress>())
                     return "Expected function import"sv;
-                auto other_type = m_store.get(extern_.get<FunctionAddress>())->visit([&](WasmFunction const& wasm_func) { return wasm_func.type(); }, [&](HostFunction const& host_func) { return host_func.type(); });
-                auto& type = module.type_section().types()[type_index.value()].function();
-                if (type.results() != other_type.results())
-                    return ByteString::formatted("Function import and extern do not match, results: {} vs {}", type.results(), other_type.results());
-                if (type.parameters() != other_type.parameters())
-                    return ByteString::formatted("Function import and extern do not match, parameters: {} vs {}", type.parameters(), other_type.parameters());
+                auto const* other_defined_type = m_store.get(extern_.get<FunctionAddress>())->visit([&](WasmFunction const& wasm_func) { return wasm_func.defined_type(); }, [&](HostFunction const& host_func) { return host_func.defined_type(); });
+                auto const* defined_type = module.canonical_types()[type_index.value()];
+                VERIFY(other_defined_type && defined_type);
+                if (!matches_defined_type(*other_defined_type, *defined_type))
+                    return ByteString::formatted("Function import and extern do not match: {} vs {}", module.type_section().types()[type_index.value()].name(), other_defined_type->sub_type().name());
                 return {};
             });
         if (invalid.has_value())
@@ -596,7 +684,23 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
         auxiliary_instance.globals().append(addr);
     }
 
-    if (auto result = allocate_all_initial_phase(module, main_module_instance, externs, global_values, module_functions); result.has_value())
+    Vector<Value> table_initial_values;
+    for (auto& table : module.table_section().tables()) {
+        Configuration config { m_store };
+        if (m_should_limit_instruction_count)
+            config.enable_instruction_count_limit();
+        config.set_frame(IsTailcall::No,
+            auxiliary_instance,
+            Vector<Value, ArgumentsStaticSize> {},
+            table.initializer(),
+            1uz);
+        auto result = config.execute(interpreter);
+        if (result.is_trap())
+            return InstantiationError { "Table initializer trapped", move(result.trap()) };
+        table_initial_values.append(result.values().first());
+    }
+
+    if (auto result = allocate_all_initial_phase(module, main_module_instance, externs, global_values, table_initial_values, module_functions); result.has_value())
         return result.release_value();
 
     for (auto& segment : module.element_section().segments()) {
@@ -605,11 +709,12 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
             Configuration config { m_store };
             if (m_should_limit_instruction_count)
                 config.enable_instruction_count_limit();
+            // https://webassembly.github.io/spec/core/exec/modules.html#instantiation
             config.set_frame(IsTailcall::No,
                 main_module_instance,
                 Vector<Value, ArgumentsStaticSize> {},
                 entry,
-                entry.instructions().size() - 1);
+                1uz);
             auto result = config.execute(interpreter);
             if (result.is_trap())
                 return InstantiationError { "Element section initialisation trapped", move(result.trap()) };
@@ -743,7 +848,7 @@ InstantiationResult AbstractMachine::instantiate(Module const& module, Vector<Ex
     return InstantiationResult { move(main_module_instance_pointer) };
 }
 
-Optional<InstantiationError> AbstractMachine::allocate_all_initial_phase(Module const& module, ModuleInstance& module_instance, Vector<ExternValue>& externs, Vector<Value>& global_values, Vector<FunctionAddress>& own_functions)
+Optional<InstantiationError> AbstractMachine::allocate_all_initial_phase(Module const& module, ModuleInstance& module_instance, Vector<ExternValue>& externs, Vector<Value>& global_values, Vector<Value>& table_initial_values, Vector<FunctionAddress>& own_functions)
 {
     Optional<InstantiationError> result;
 
@@ -758,11 +863,24 @@ Optional<InstantiationError> AbstractMachine::allocate_all_initial_phase(Module 
 
     module_instance.functions().extend(own_functions);
 
-    for (auto& table : module.table_section().tables()) {
-        auto table_address = m_store.allocate(table.type());
+    // https://webassembly.github.io/spec/core/valid/conventions.html#aux-clostype
+    TypeContext const module_type_context { module.canonical_types().span() };
+
+    for (auto [table_index, table] : enumerate(module.table_section().tables())) {
+        auto table_address = m_store.allocate(TableType { canonicalized(table.type().element_type(), module_type_context), table.type().limits() });
         if (!table_address.has_value())
             return InstantiationError { "Failed to allocate a table instance" };
         module_instance.tables().append(*table_address);
+
+        auto reference = table_initial_values[table_index].to<Reference>();
+        if (!reference.ref().has<Reference::Null>()) {
+            auto* table_instance = m_store.get(*table_address);
+            RefPtr<ModuleInstance const> anchor;
+            if (reference.ref().has<Reference::Func>())
+                anchor = &module_instance;
+            for (size_t i = 0; i < table_instance->elements().size(); ++i)
+                table_instance->set_element(i, reference, anchor);
+        }
     }
 
     for (auto& memory : module.memory_section().memories()) {
@@ -774,7 +892,7 @@ Optional<InstantiationError> AbstractMachine::allocate_all_initial_phase(Module 
 
     size_t index = 0;
     for (auto& entry : module.global_section().entries()) {
-        auto address = m_store.allocate(entry.type(), move(global_values[index]));
+        auto address = m_store.allocate(GlobalType { canonicalized(entry.type().type(), module_type_context), entry.type().is_mutable() }, move(global_values[index]));
         VERIFY(address.has_value());
         module_instance.globals().append(*address);
         index++;
@@ -782,7 +900,8 @@ Optional<InstantiationError> AbstractMachine::allocate_all_initial_phase(Module 
 
     for (auto& entry : module.tag_section().tags()) {
         auto& type = module.type_section().types()[entry.type().value()];
-        auto address = m_store.allocate(type.function(), entry.flags());
+        auto const* defined_type = module.canonical_types()[entry.type().value()];
+        auto address = m_store.allocate(type.function(), defined_type, entry.flags());
         VERIFY(address.has_value());
         module_instance.tags().append(*address);
     }

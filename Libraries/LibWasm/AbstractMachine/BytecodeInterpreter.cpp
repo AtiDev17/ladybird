@@ -18,6 +18,7 @@
 #include <AK/SaturatingMath.h>
 #include <AK/ScopedValueRollback.h>
 #include <AK/Time.h>
+#include <AK/TypeCasts.h>
 #include <LibCore/File.h>
 #include <LibWasm/AbstractMachine/AbstractMachine.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
@@ -2011,9 +2012,16 @@ HANDLE_INSTRUCTION(synthetic_call_00)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_00(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_01)
@@ -2023,9 +2031,16 @@ HANDLE_INSTRUCTION(synthetic_call_01)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_01(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_10)
@@ -2035,9 +2050,16 @@ HANDLE_INSTRUCTION(synthetic_call_10)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_10(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_11)
@@ -2047,9 +2069,16 @@ HANDLE_INSTRUCTION(synthetic_call_11)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_11(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_20)
@@ -2059,9 +2088,16 @@ HANDLE_INSTRUCTION(synthetic_call_20)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_20(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_21)
@@ -2071,9 +2107,16 @@ HANDLE_INSTRUCTION(synthetic_call_21)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_21(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_30)
@@ -2083,9 +2126,16 @@ HANDLE_INSTRUCTION(synthetic_call_30)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_30(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_31)
@@ -2095,9 +2145,16 @@ HANDLE_INSTRUCTION(synthetic_call_31)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "[{}] call_31(#{} -> {})", short_ip.current_ip_value, index.value(), address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingRegisters)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(unreachable)
@@ -2336,9 +2393,16 @@ HANDLE_INSTRUCTION(call)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "call({})", address.value());
-    if (interpreter.call_address(configuration, address, addresses) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_with_record_0)
@@ -2348,9 +2412,16 @@ HANDLE_INSTRUCTION(synthetic_call_with_record_0)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "call.with_record.0({})", address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingCallRecord) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingCallRecord)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(synthetic_call_with_record_1)
@@ -2360,9 +2431,16 @@ HANDLE_INSTRUCTION(synthetic_call_with_record_1)
     auto index = instruction->arguments().get<FunctionIndex>();
     auto address = configuration.frame().module().functions()[index.value()];
     dbgln_if(WASM_TRACE_DEBUG, "call.with_record.1({})", address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingCallRecord) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::DirectCall, BytecodeInterpreter::CallType::UsingCallRecord)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(return_call)
@@ -2403,15 +2481,22 @@ HANDLE_INSTRUCTION(call_indirect)
     auto& element = table_instance->elements()[index];
     TRAP_IN_LOOP_IF_NOT(element.ref().template has<Reference::Func>());
     auto address = element.ref().template get<Reference::Func>().address;
-    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
-    auto const& type_expected = configuration.frame().module().types()[args.type.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+    // https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-call-indirect-x-y
+    auto const* type_actual = configuration.store().get(address)->visit([](auto& f) { return f.defined_type(); });
+    auto const* type_expected = configuration.frame().module().canonical_types()[args.type.value()];
+    TRAP_IN_LOOP_IF_NOT(type_actual && matches_defined_type(*type_actual, *type_expected));
 
     dbgln_if(WASM_TRACE_DEBUG, "call_indirect({} -> {})", index, address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectCall) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectCall)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(return_call_indirect)
@@ -2428,10 +2513,10 @@ HANDLE_INSTRUCTION(return_call_indirect)
     auto& element = table_instance->elements()[index];
     TRAP_IN_LOOP_IF_NOT(element.ref().template has<Reference::Func>());
     auto address = element.ref().template get<Reference::Func>().address;
-    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
-    auto const& type_expected = configuration.frame().module().types()[args.type.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+    // https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-call-indirect-x-y
+    auto const* type_actual = configuration.store().get(address)->visit([](auto& f) { return f.defined_type(); });
+    auto const* type_expected = configuration.frame().module().canonical_types()[args.type.value()];
+    TRAP_IN_LOOP_IF_NOT(type_actual && matches_defined_type(*type_actual, *type_expected));
 
     configuration.label_stack().shrink(configuration.frame().label_index(), true);
     dbgln_if(WASM_TRACE_DEBUG, "tail call_indirect({} -> {})", index, address.value());
@@ -2462,15 +2547,22 @@ HANDLE_INSTRUCTION(call_ref)
         TRAP_IN_LOOP_IF_NOT(!reference.ref().template has<Reference::Null>());
         address = reference.ref().template get<Reference::Func>().address;
     }
-    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
-    auto const& type_expected = configuration.frame().module().types()[type_index.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+    // https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-call-ref-x
+    auto const* type_actual = configuration.store().get(address)->visit([](auto& f) { return f.defined_type(); });
+    auto const* type_expected = configuration.frame().module().canonical_types()[type_index.value()];
+    TRAP_IN_LOOP_IF_NOT(type_actual && matches_defined_type(*type_actual, *type_expected));
 
     dbgln_if(WASM_TRACE_DEBUG, "call_ref({})", address.value());
-    if (interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectCall) == Outcome::Return)
+    switch (auto const outcome = interpreter.call_address(configuration, address, addresses, BytecodeInterpreter::CallAddressSource::IndirectCall)) {
+    case Outcome::Return:
         return Outcome::Return;
-    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    default:
+        // A callee's thrown exception was caught by a try_table in this frame; continue at the catch's branch target.
+        short_ip.current_ip_value = to_underlying(outcome) - 1;
+        [[fallthrough]];
+    case Outcome::Continue:
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
 }
 
 HANDLE_INSTRUCTION(return_call_ref)
@@ -2485,10 +2577,9 @@ HANDLE_INSTRUCTION(return_call_ref)
         TRAP_IN_LOOP_IF_NOT(!reference.ref().template has<Reference::Null>());
         address = reference.ref().template get<Reference::Func>().address;
     }
-    auto const& type_actual = configuration.store().get(address)->visit([](auto& f) -> decltype(auto) { return f.type(); });
-    auto const& type_expected = configuration.frame().module().types()[type_index.value()].unsafe_function();
-    TRAP_IN_LOOP_IF_NOT(type_actual.parameters() == type_expected.parameters());
-    TRAP_IN_LOOP_IF_NOT(type_actual.results() == type_expected.results());
+    auto const* type_actual = configuration.store().get(address)->visit([](auto& f) { return f.defined_type(); });
+    auto const* type_expected = configuration.frame().module().canonical_types()[type_index.value()];
+    TRAP_IN_LOOP_IF_NOT(type_actual && matches_defined_type(*type_actual, *type_expected));
 
     configuration.label_stack().shrink(configuration.frame().label_index(), true);
     dbgln_if(WASM_TRACE_DEBUG, "tail call_ref({})", address.value());
@@ -5483,13 +5574,28 @@ HANDLE_INSTRUCTION(i32x4_relaxed_dot_i8x16_i7x16_add_s)
     TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
 }
 
+// https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-ref
 HANDLE_INSTRUCTION(throw_ref)
 {
     LOG_INSN;
-    interpreter.set_trap("Not Implemented: Proposal 'Exception-handling'"sv);
+    LOAD_ADDRESSES();
+    auto const value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    // 4. If val' is ref.null, then trap. (See the encoding table in Value(Reference const&): 4 is a null exnref.)
+    if (value.value().high() == 4) [[unlikely]] {
+        interpreter.set_trap("null exception reference"sv);
+        return Outcome::Return;
+    }
+    auto const exception_address = bit_cast<ExceptionAddress>(value.value().low());
+    if (auto continuation = interpreter.unwind_to_throw_handler(configuration, exception_address); continuation.has_value()) {
+        short_ip.current_ip_value = continuation->value() - 1;
+        TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+    }
+    // 5.5.2. "...the first non-value entry of the stack is not a handler: Throw the exception val' as a result."
+    interpreter.set_trap(Trap { UncaughtException { exception_address } });
     return Outcome::Return;
 }
 
+// https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-x
 HANDLE_INSTRUCTION(throw_)
 {
     LOG_INSN;
@@ -5499,7 +5605,7 @@ HANDLE_INSTRUCTION(throw_)
         auto& type = tag_instance.type();
         auto values = Vector<Value>(configuration.value_stack().span().slice_from_end(type.parameters().size()));
         configuration.value_stack().shrink(configuration.value_stack().size() - type.parameters().size());
-        auto exception_address = configuration.store().allocate(tag_instance, move(values));
+        auto exception_address = configuration.store().allocate(tag_address, move(values));
         if (!exception_address.has_value()) {
             interpreter.set_trap("Out of memory"sv);
             return Outcome::Return;
@@ -5509,12 +5615,744 @@ HANDLE_INSTRUCTION(throw_)
     TAILCALL return InstructionHandler<Instructions::throw_ref.value()>::operator()<HasDynamicInsnLimit, Continue, SourceAddressMix::Any>(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
 }
 
+// https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-try-table-xref-syntax-instructions-syntax-blocktype-mathit-blocktype-xref-syntax-instructions-syntax-catch-mathit-catch-ast-xref-syntax-instructions-syntax-instr-mathit-instr-ast
 HANDLE_INSTRUCTION(try_table)
 {
     LOG_INSN;
-    interpreter.set_trap("Not Implemented: Proposal 'Exception-handling'"sv);
-    return Outcome::Return;
+    auto& args = instruction->arguments().unsafe_get<Instruction::TryTableArgs>();
+    auto& meta = args.meta;
+    auto label = Label(meta.arity, args.end_ip, configuration.value_stack().size() - meta.parameter_count, instruction);
+    configuration.label_stack().unchecked_append(move(label));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
 }
+
+// Proposal "gc".
+
+#define GC_TRAP_IF(condition, message)         \
+    do {                                       \
+        if (condition) [[unlikely]] {          \
+            interpreter.set_trap(message##sv); \
+            return Outcome::Return;            \
+        }                                      \
+    } while (false)
+
+static ALWAYS_INLINE bool is_null_gc_reference(Value const& value)
+{
+    auto const tag = value.value().high();
+    return tag == 2 || tag == 3 || tag == 4 || tag == 8;
+}
+
+// https://webassembly.github.io/spec/core/exec/runtime.html#aggregate-instances
+static Value pack_into_field(ValueType const& storage_type, Value const& value)
+{
+    switch (storage_type.kind()) {
+    case ValueType::I8:
+        return Value(static_cast<u32>(value.to<u32>() & 0xff));
+    case ValueType::I16:
+        return Value(static_cast<u32>(value.to<u32>() & 0xffff));
+    default:
+        return value;
+    }
+}
+
+// https://webassembly.github.io/spec/core/exec/runtime.html#aggregate-instances
+// unpack^sx?_zt(val) = val                     if zt is a valtype
+//                    = extend^sx_|zt|,32(val)  if zt is a packtype
+static Value unpack_from_field(ValueType const& storage_type, Value const& value, bool sign_extend)
+{
+    switch (storage_type.kind()) {
+    case ValueType::I8:
+        return sign_extend
+            ? Value(static_cast<i32>(static_cast<i8>(value.to<u32>() & 0xff)))
+            : Value(static_cast<u32>(value.to<u32>() & 0xff));
+    case ValueType::I16:
+        return sign_extend
+            ? Value(static_cast<i32>(static_cast<i16>(value.to<u32>() & 0xffff)))
+            : Value(static_cast<u32>(value.to<u32>() & 0xffff));
+    default:
+        return value;
+    }
+}
+
+static size_t storage_type_byte_width(ValueType const& storage_type)
+{
+    switch (storage_type.kind()) {
+    case ValueType::I8:
+        return 1;
+    case ValueType::I16:
+        return 2;
+    case ValueType::I32:
+    case ValueType::F32:
+        return 4;
+    case ValueType::I64:
+    case ValueType::F64:
+        return 8;
+    case ValueType::V128:
+        return 16;
+    default:
+        // References cannot be read out of a data segment (checked by the validator).
+        VERIFY_NOT_REACHED();
+    }
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+static Value value_from_segment_bytes(ValueType const& storage_type, ReadonlyBytes bytes)
+{
+    auto read_le = []<typename T>(ReadonlyBytes data) {
+        T value {};
+        __builtin_memcpy(&value, data.data(), sizeof(T));
+        return AK::convert_between_host_and_little_endian(value);
+    };
+    switch (storage_type.kind()) {
+    case ValueType::I8:
+        // Packed fields are stored pre-truncated; reads sign- or zero-extend, see unpack_from_field() above.
+        return Value(static_cast<u32>(bytes[0]));
+    case ValueType::I16:
+        return Value(static_cast<u32>(read_le.operator()<u16>(bytes)));
+    case ValueType::I32:
+        return Value(static_cast<i32>(read_le.operator()<u32>(bytes)));
+    case ValueType::I64:
+        return Value(static_cast<i64>(read_le.operator()<u64>(bytes)));
+    case ValueType::F32:
+        return Value(bit_cast<f32>(read_le.operator()<u32>(bytes)));
+    case ValueType::F64:
+        return Value(bit_cast<f64>(read_le.operator()<u64>(bytes)));
+    case ValueType::V128: {
+        u128 value {};
+        __builtin_memcpy(&value, bytes.data(), sizeof(u128));
+        return Value(value);
+    }
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+static bool reference_matches_type(Value const& value, ValueType const& target, Configuration& configuration)
+{
+    // See the encoding table in Value(Reference const&).
+    switch (value.value().high()) {
+    case 2: // null funcref / nofuncref
+    case 3: // null externref / noexternref
+    case 4: // null exnref / noexnref
+    case 8: // null in the any hierarchy
+        // "ref.null matches (ref null ht)": null only matches nullable targets. Validation
+        // keeps the hierarchies apart, so the target heap type always agrees with the null;
+        // in particular this is the only way to match the bottom (none/nofunc/...) types.
+        return target.is_nullable();
+    case 1: // a host externref
+        // Matches extern; also any, for an internalized host reference (tag 10) that lost its
+        // wrapper crossing a Reference boundary (e.g. an anyref table), see Value::to<Reference>().
+        return target.kind() == ValueType::ExternReference || target.kind() == ValueType::AnyReference;
+    case 5: // an exception
+        return target.kind() == ValueType::ExceptionReference;
+    case 6: { // a struct or array instance
+        auto& cell = *bit_cast<GC::Cell*>(value.value().low());
+        switch (target.kind()) {
+        case ValueType::AnyReference:
+        case ValueType::EqReference:
+            return true;
+        case ValueType::ExternReference:
+            // An externalized aggregate (tag 9) that lost its wrapper crossing a Reference boundary (e.g. an externref table); it is still in the extern hierarchy.
+            return true;
+        case ValueType::StructReference:
+            return is<StructInstance>(cell);
+        case ValueType::ArrayReference:
+            return is<ArrayInstance>(cell);
+        case ValueType::TypeUseReference: {
+            DefinedType const* actual = nullptr;
+            if (auto* struct_instance = as_if<StructInstance>(cell))
+                actual = &struct_instance->type();
+            else if (auto* array_instance = as_if<ArrayInstance>(cell))
+                actual = &array_instance->type();
+            return actual && matches_defined_type(*actual, *configuration.frame().module().canonical_types()[target.unsafe_typeindex().value()]);
+        }
+        default:
+            return false;
+        }
+    }
+    case 7: // an i31
+        // ExternReference covers an externalized i31 (tag 9) that lost its wrapper crossing a Reference boundary, as for tag 6 above.
+        return first_is_one_of(target.kind(), ValueType::I31Reference, ValueType::EqReference, ValueType::AnyReference, ValueType::ExternReference);
+    case 9 | (6 << 8): // an externalized struct or array instance
+    case 9 | (7 << 8): // an externalized i31
+        return target.kind() == ValueType::ExternReference;
+    case 10: // a host externref internalized into the any hierarchy
+        return target.kind() == ValueType::AnyReference;
+    default: { // a funcref; high is the defining Module* (null for host functions)
+        if (target.kind() == ValueType::FunctionReference)
+            return true;
+        if (target.kind() != ValueType::TypeUseReference)
+            return false;
+        auto* function = configuration.store().get(FunctionAddress { value.value().low() });
+        auto const* actual = function ? function->visit([](auto& f) { return f.defined_type(); }) : nullptr;
+        return actual && matches_defined_type(*actual, *configuration.frame().module().canonical_types()[target.unsafe_typeindex().value()]);
+    }
+    }
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(ref_eq)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    // bounds checked by verifier.
+    auto rhs = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto& lhs_slot = configuration.source_value<source_address_mix>(1, addresses.sources);
+    // Both operands are in the eq hierarchy: nulls are uniformly tag 8, i31s carry their payload and aggregates their cell pointer, so reference equality is bit equality.
+    auto const equal = lhs_slot.value() == rhs.value();
+    lhs_slot = Value(static_cast<i32>(equal ? 1 : 0));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(ref_as_non_null)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    GC_TRAP_IF(is_null_gc_reference(slot), "null reference");
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions
+HANDLE_INSTRUCTION(br_on_null)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto const is_null = is_null_gc_reference(value);
+    // The branched-to label's arity does not include the reference; it is only put back when falling through.
+    if (!is_null)
+        configuration.value_stack().append(value);
+    short_ip.current_ip_value = interpreter.branch_to_label<true>(configuration, instruction->arguments().unsafe_get<Instruction::BranchArgs>().label, short_ip.current_ip_value, is_null).value();
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions
+HANDLE_INSTRUCTION(br_on_non_null)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto const is_null = is_null_gc_reference(value);
+    if (!is_null)
+        configuration.value_stack().append(value);
+    short_ip.current_ip_value = interpreter.branch_to_label<true>(configuration, instruction->arguments().unsafe_get<Instruction::BranchArgs>().label, short_ip.current_ip_value, !is_null).value();
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(struct_new)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto const& type = *configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()];
+        auto const& field_types = type.expansion().get<StructType>().fields();
+        auto const field_count = field_types.size();
+        auto operands = configuration.value_stack().span().slice_from_end(field_count);
+        Vector<Value> fields;
+        fields.ensure_capacity(field_count);
+        for (size_t i = 0; i < field_count; ++i)
+            fields.unchecked_append(pack_into_field(field_types[i].type(), operands[i]));
+        auto instance = configuration.store().heap().allocate<StructInstance>(type, move(fields));
+        configuration.value_stack().shrink(configuration.value_stack().size() - field_count);
+        configuration.push_to_destination<source_address_mix>(Value(Reference { Reference::GcObject { instance.ptr() } }), addresses.destination);
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(struct_new_default)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto const& type = *configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()];
+        auto const& field_types = type.expansion().get<StructType>().fields();
+        Vector<Value> fields;
+        fields.ensure_capacity(field_types.size());
+        for (auto const& field_type : field_types)
+            fields.unchecked_append(Value(field_type.type().unpacked()));
+        auto instance = configuration.store().heap().allocate<StructInstance>(type, move(fields));
+        configuration.push_to_destination<source_address_mix>(Value(Reference { Reference::GcObject { instance.ptr() } }), addresses.destination);
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+template<SourceAddressMix mix>
+static bool struct_get_impl(BytecodeInterpreter& interpreter, Configuration& configuration, Instruction const* instruction, SourcesAndDestination const& addresses, bool sign_extend)
+{
+    auto& args = instruction->arguments().get<Instruction::StructFieldArgs>();
+    auto& slot = configuration.source_value<mix>(0, addresses.sources); // bounds checked by verifier.
+    if (is_null_gc_reference(slot)) [[unlikely]]
+        return interpreter.set_trap("null structure reference"sv);
+    auto& instance = *static_cast<StructInstance*>(bit_cast<GC::Cell*>(slot.value().low()));
+    auto const& field_types = configuration.frame().module().canonical_types()[args.type_index.value()]->expansion().get<StructType>().fields();
+    slot = unpack_from_field(field_types[args.field_index].type(), instance.fields()[args.field_index], sign_extend);
+    return false;
+}
+
+HANDLE_INSTRUCTION(struct_get)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (struct_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, false))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(struct_get_s)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (struct_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, true))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(struct_get_u)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (struct_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, false))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(struct_set)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& args = instruction->arguments().get<Instruction::StructFieldArgs>();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto reference = configuration.take_source<source_address_mix>(1, addresses.sources);
+    GC_TRAP_IF(is_null_gc_reference(reference), "null structure reference");
+    auto& instance = *static_cast<StructInstance*>(bit_cast<GC::Cell*>(reference.value().low()));
+    auto const& field_types = configuration.frame().module().canonical_types()[args.type_index.value()]->expansion().get<StructType>().fields();
+    instance.fields()[args.field_index] = pack_into_field(field_types[args.field_index].type(), value);
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_new)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto const& type = *configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()];
+        auto const& field_type = type.expansion().get<ArrayType>().type();
+        // bounds checked by verifier.
+        auto count = configuration.take_source<source_address_mix>(0, addresses.sources).template to<u32>();
+        auto& slot = configuration.source_value<source_address_mix>(1, addresses.sources);
+        Vector<Value> elements;
+        GC_TRAP_IF(elements.try_ensure_capacity(count).is_error(), "Out of memory");
+        // The initializer stays live in `slot` (a scanned location) if the allocation below triggers a collection.
+        auto const element = pack_into_field(field_type.type(), slot);
+        for (u32 i = 0; i < count; ++i)
+            elements.unchecked_append(element);
+        auto instance = configuration.store().heap().allocate<ArrayInstance>(type, move(elements));
+        slot = Value(Reference { Reference::GcObject { instance.ptr() } });
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_new_default)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto const& type = *configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()];
+        auto const& field_type = type.expansion().get<ArrayType>().type();
+        auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+        auto count = slot.template to<u32>();
+        Vector<Value> elements;
+        GC_TRAP_IF(elements.try_ensure_capacity(count).is_error(), "Out of memory");
+        auto const element = Value(field_type.type().unpacked());
+        for (u32 i = 0; i < count; ++i)
+            elements.unchecked_append(element);
+        auto instance = configuration.store().heap().allocate<ArrayInstance>(type, move(elements));
+        slot = Value(Reference { Reference::GcObject { instance.ptr() } });
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_new_fixed)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto& args = instruction->arguments().get<Instruction::ArrayNewFixedArgs>();
+        auto const& type = *configuration.frame().module().canonical_types()[args.type_index.value()];
+        auto const& field_type = type.expansion().get<ArrayType>().type();
+        auto operands = configuration.value_stack().span().slice_from_end(args.count);
+        Vector<Value> elements;
+        elements.ensure_capacity(args.count);
+        for (auto const& operand : operands)
+            elements.unchecked_append(pack_into_field(field_type.type(), operand));
+        auto instance = configuration.store().heap().allocate<ArrayInstance>(type, move(elements));
+        configuration.value_stack().shrink(configuration.value_stack().size() - args.count);
+        configuration.push_to_destination<source_address_mix>(Value(Reference { Reference::GcObject { instance.ptr() } }), addresses.destination);
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_new_data)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto& args = instruction->arguments().get<Instruction::ArrayDataArgs>();
+        auto const& type = *configuration.frame().module().canonical_types()[args.type_index.value()];
+        auto const& field_type = type.expansion().get<ArrayType>().type();
+        auto const element_size = storage_type_byte_width(field_type.type());
+        // bounds checked by verifier.
+        auto count = configuration.take_source<source_address_mix>(0, addresses.sources).template to<u32>();
+        auto& slot = configuration.source_value<source_address_mix>(1, addresses.sources);
+        auto offset = slot.template to<u32>();
+        auto const& data = *configuration.store().get(configuration.frame().module().datas()[args.data_index.value()]);
+        GC_TRAP_IF(static_cast<u64>(offset) + static_cast<u64>(count) * element_size > data.size(), "out of bounds memory access");
+        Vector<Value> elements;
+        GC_TRAP_IF(elements.try_ensure_capacity(count).is_error(), "Out of memory");
+        auto bytes = data.data().span();
+        for (u32 i = 0; i < count; ++i)
+            elements.unchecked_append(value_from_segment_bytes(field_type.type(), bytes.slice(offset + static_cast<size_t>(i) * element_size, element_size)));
+        auto instance = configuration.store().heap().allocate<ArrayInstance>(type, move(elements));
+        slot = Value(Reference { Reference::GcObject { instance.ptr() } });
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_new_elem)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    {
+        auto& args = instruction->arguments().get<Instruction::ArrayElemArgs>();
+        auto const& type = *configuration.frame().module().canonical_types()[args.type_index.value()];
+        // bounds checked by verifier.
+        auto count = configuration.take_source<source_address_mix>(0, addresses.sources).template to<u32>();
+        auto& slot = configuration.source_value<source_address_mix>(1, addresses.sources);
+        auto offset = slot.template to<u32>();
+        auto const& references = configuration.store().get(configuration.frame().module().elements()[args.element_index.value()])->references();
+        GC_TRAP_IF(static_cast<u64>(offset) + count > references.size(), "out of bounds table access");
+        Vector<Value> elements;
+        GC_TRAP_IF(elements.try_ensure_capacity(count).is_error(), "Out of memory");
+        for (u32 i = 0; i < count; ++i)
+            elements.unchecked_append(Value(references[offset + i]));
+        auto instance = configuration.store().heap().allocate<ArrayInstance>(type, move(elements));
+        slot = Value(Reference { Reference::GcObject { instance.ptr() } });
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+template<SourceAddressMix mix>
+static bool array_get_impl(BytecodeInterpreter& interpreter, Configuration& configuration, Instruction const* instruction, SourcesAndDestination const& addresses, bool sign_extend)
+{
+    // bounds checked by verifier.
+    auto index = configuration.take_source<mix>(0, addresses.sources).template to<u32>();
+    auto& slot = configuration.source_value<mix>(1, addresses.sources);
+    if (is_null_gc_reference(slot)) [[unlikely]]
+        return interpreter.set_trap("null array reference"sv);
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(slot.value().low()));
+    if (index >= instance.elements().size()) [[unlikely]]
+        return interpreter.set_trap("out of bounds array access"sv);
+    auto const& field_type = configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()]->expansion().get<ArrayType>().type();
+    slot = unpack_from_field(field_type.type(), instance.elements()[index], sign_extend);
+    return false;
+}
+
+HANDLE_INSTRUCTION(array_get)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (array_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, false))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(array_get_s)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (array_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, true))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(array_get_u)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    if (array_get_impl<source_address_mix>(interpreter, configuration, instruction, addresses, false))
+        return Outcome::Return;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_set)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto index = configuration.take_source<source_address_mix>(1, addresses.sources).template to<u32>();
+    auto reference = configuration.take_source<source_address_mix>(2, addresses.sources);
+    GC_TRAP_IF(is_null_gc_reference(reference), "null array reference");
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(reference.value().low()));
+    GC_TRAP_IF(index >= instance.elements().size(), "out of bounds array access");
+    auto const& field_type = configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()]->expansion().get<ArrayType>().type();
+    instance.elements()[index] = pack_into_field(field_type.type(), value);
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_len)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    GC_TRAP_IF(is_null_gc_reference(slot), "null array reference");
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(slot.value().low()));
+    slot = Value(static_cast<i32>(instance.elements().size()));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_fill)
+{
+    LOG_INSN;
+    auto& value_stack = configuration.value_stack();
+    auto count = value_stack.take_last().to<u32>();
+    auto value = value_stack.take_last();
+    auto offset = value_stack.take_last().to<u32>();
+    auto reference = value_stack.take_last();
+    GC_TRAP_IF(is_null_gc_reference(reference), "null array reference");
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(reference.value().low()));
+    GC_TRAP_IF(static_cast<u64>(offset) + count > instance.elements().size(), "out of bounds array access");
+    auto const& field_type = configuration.frame().module().canonical_types()[instruction->arguments().get<TypeIndex>().value()]->expansion().get<ArrayType>().type();
+    auto const element = pack_into_field(field_type.type(), value);
+    for (u32 i = 0; i < count; ++i)
+        instance.elements()[offset + i] = element;
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_copy)
+{
+    LOG_INSN;
+    auto& value_stack = configuration.value_stack();
+    auto count = value_stack.take_last().to<u32>();
+    auto source_offset = value_stack.take_last().to<u32>();
+    auto source_reference = value_stack.take_last();
+    auto destination_offset = value_stack.take_last().to<u32>();
+    auto destination_reference = value_stack.take_last();
+    GC_TRAP_IF(is_null_gc_reference(destination_reference), "null array reference");
+    GC_TRAP_IF(is_null_gc_reference(source_reference), "null array reference");
+    auto& destination = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(destination_reference.value().low()));
+    auto& source = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(source_reference.value().low()));
+    GC_TRAP_IF(static_cast<u64>(destination_offset) + count > destination.elements().size(), "out of bounds array access");
+    GC_TRAP_IF(static_cast<u64>(source_offset) + count > source.elements().size(), "out of bounds array access");
+    if (destination_offset <= source_offset) {
+        for (u32 i = 0; i < count; ++i)
+            destination.elements()[destination_offset + i] = source.elements()[source_offset + i];
+    } else {
+        for (u32 i = count; i > 0; --i)
+            destination.elements()[destination_offset + i - 1] = source.elements()[source_offset + i - 1];
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_init_data)
+{
+    LOG_INSN;
+    auto& args = instruction->arguments().get<Instruction::ArrayDataArgs>();
+    auto& value_stack = configuration.value_stack();
+    auto count = value_stack.take_last().to<u32>();
+    auto source_offset = value_stack.take_last().to<u32>();
+    auto destination_offset = value_stack.take_last().to<u32>();
+    auto reference = value_stack.take_last();
+    GC_TRAP_IF(is_null_gc_reference(reference), "null array reference");
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(reference.value().low()));
+    GC_TRAP_IF(static_cast<u64>(destination_offset) + count > instance.elements().size(), "out of bounds array access");
+    auto const& field_type = configuration.frame().module().canonical_types()[args.type_index.value()]->expansion().get<ArrayType>().type();
+    auto const element_size = storage_type_byte_width(field_type.type());
+    auto const& data = *configuration.store().get(configuration.frame().module().datas()[args.data_index.value()]);
+    GC_TRAP_IF(static_cast<u64>(source_offset) + static_cast<u64>(count) * element_size > data.size(), "out of bounds memory access");
+    auto bytes = data.data().span();
+    for (u32 i = 0; i < count; ++i)
+        instance.elements()[destination_offset + i] = value_from_segment_bytes(field_type.type(), bytes.slice(source_offset + static_cast<size_t>(i) * element_size, element_size));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(array_init_elem)
+{
+    LOG_INSN;
+    auto& args = instruction->arguments().get<Instruction::ArrayElemArgs>();
+    auto& value_stack = configuration.value_stack();
+    auto count = value_stack.take_last().to<u32>();
+    auto source_offset = value_stack.take_last().to<u32>();
+    auto destination_offset = value_stack.take_last().to<u32>();
+    auto reference = value_stack.take_last();
+    GC_TRAP_IF(is_null_gc_reference(reference), "null array reference");
+    auto& instance = *static_cast<ArrayInstance*>(bit_cast<GC::Cell*>(reference.value().low()));
+    GC_TRAP_IF(static_cast<u64>(destination_offset) + count > instance.elements().size(), "out of bounds array access");
+    auto const& references = configuration.store().get(configuration.frame().module().elements()[args.element_index.value()])->references();
+    GC_TRAP_IF(static_cast<u64>(source_offset) + count > references.size(), "out of bounds table access");
+    for (u32 i = 0; i < count; ++i)
+        instance.elements()[destination_offset + i] = Value(references[source_offset + i]);
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(ref_test)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    slot = Value(static_cast<i32>(reference_matches_type(slot, instruction->arguments().get<ValueType>(), configuration) ? 1 : 0));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+ALIAS_INSTRUCTION(ref_test_null, ref_test)
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(ref_cast)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto const& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    GC_TRAP_IF(!reference_matches_type(slot, instruction->arguments().get<ValueType>(), configuration), "cast failure");
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+ALIAS_INSTRUCTION(ref_cast_null, ref_cast)
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions
+HANDLE_INSTRUCTION(br_on_cast)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& args = instruction->arguments().get<Instruction::BranchOnCastArgs>();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto const matches = reference_matches_type(value, args.target_type, configuration);
+    configuration.value_stack().append(value);
+    short_ip.current_ip_value = interpreter.branch_to_label<true>(configuration, args.branch.label, short_ip.current_ip_value, matches).value();
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions
+HANDLE_INSTRUCTION(br_on_cast_fail)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& args = instruction->arguments().get<Instruction::BranchOnCastArgs>();
+    // bounds checked by verifier.
+    auto value = configuration.take_source<source_address_mix>(0, addresses.sources);
+    auto const matches = reference_matches_type(value, args.target_type, configuration);
+    configuration.value_stack().append(value);
+    short_ip.current_ip_value = interpreter.branch_to_label<true>(configuration, args.branch.label, short_ip.current_ip_value, !matches).value();
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(any_convert_extern)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    auto const low = slot.value().low();
+    switch (slot.value().high()) {
+    case 3:
+        slot = Value(u128(0, 8));
+        break;
+    case 1:
+        slot = Value(u128(low, 10));
+        break;
+    case 9 | (6 << 8):
+        slot = Value(u128(low, 6));
+        break;
+    case 9 | (7 << 8):
+        slot = Value(u128(low, 7));
+        break;
+    default:
+        break;
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(extern_convert_any)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    auto const low = slot.value().low();
+    switch (slot.value().high()) {
+    case 8:
+        slot = Value(u128(0, 3));
+        break;
+    case 6:
+        slot = Value(u128(low, 9 | (6 << 8)));
+        break;
+    case 7:
+        slot = Value(u128(low, 9 | (7 << 8)));
+        break;
+    case 10:
+        slot = Value(u128(low, 1));
+        break;
+    default:
+        break;
+    }
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(ref_i31)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    slot = Value(u128(static_cast<u64>(slot.template to<u32>() & 0x7fffffff), 7));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#reference-instructions
+HANDLE_INSTRUCTION(i31_get_s)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    GC_TRAP_IF(is_null_gc_reference(slot), "null i31 reference");
+    auto const payload = static_cast<u32>(slot.value().low() & 0x7fffffff);
+    slot = Value(static_cast<i32>(payload << 1) >> 1);
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+HANDLE_INSTRUCTION(i31_get_u)
+{
+    LOG_INSN;
+    LOAD_ADDRESSES();
+    auto& slot = configuration.source_value<source_address_mix>(0, addresses.sources); // bounds checked by verifier.
+    GC_TRAP_IF(is_null_gc_reference(slot), "null i31 reference");
+    slot = Value(static_cast<u32>(slot.value().low() & 0x7fffffff));
+    TAILCALL return continue_(HANDLER_PARAMS(DECOMPOSE_PARAMS_NAME_ONLY));
+}
+
+#undef GC_TRAP_IF
 
 bool BytecodeInterpreter::trap_if_insufficient_native_stack_space(size_t minimum_native_stack_space_to_keep_free)
 {
@@ -5607,6 +6445,50 @@ InstructionPointer BytecodeInterpreter::branch_to_label(Configuration& configura
             configuration.value_stack().remove(label.stack_height(), configuration.value_stack().size() - label.stack_height() - label.arity());
     }
     return actually_branching ? label.continuation().value() - 1 : current_ip;
+}
+
+// https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-ref
+Optional<InstructionPointer> BytecodeInterpreter::unwind_to_throw_handler(Configuration& configuration, ExceptionAddress exception_address)
+{
+    auto& exception = *configuration.store().get(exception_address);
+    auto& label_stack = configuration.label_stack();
+    auto& frame = configuration.frame();
+    auto const frame_label_index = frame.label_index();
+    for (size_t label_index = label_stack.size(); label_index > frame_label_index + 1;) {
+        --label_index;
+        auto const& label = label_stack.data()[label_index];
+        auto const* try_table_instruction = label.try_table_instruction();
+        if (!try_table_instruction)
+            continue;
+        auto& args = try_table_instruction->arguments().unsafe_get<Instruction::TryTableArgs>();
+        for (auto& catch_ : args.catches()) {
+            // catch x l / catch_ref x l match if exns[a].tag = z.module.tags[x];
+            // catch_all l / catch_all_ref l match any exception.
+            if (auto tag_index = catch_.matching_tag_index(); tag_index.has_value()) {
+                if (frame.module().tags()[tag_index->value()] != exception.tag())
+                    continue;
+            }
+            // Matched: the handler and its label should be removed, and the exception's fields (plus the exnref for the _ref forms) replace them...
+            auto& value_stack = configuration.value_stack();
+            value_stack.shrink(label.stack_height(), true);
+            if (catch_.matching_tag_index().has_value()) {
+                value_stack.ensure_capacity(value_stack.size() + exception.params().size());
+                for (auto& field : exception.params())
+                    value_stack.unchecked_append(field);
+            }
+            if (catch_.is_ref())
+                value_stack.append(Value(Reference { Reference::Exception { exception_address } }));
+            label_stack.unsafe_shrink(label_index);
+            // ...followed by (br l), with l relative to the context outside the try_table.
+            label_stack.unsafe_shrink(label_stack.size() - catch_.target_label().value());
+            auto const& target = label_stack.unsafe_last();
+            value_stack.remove(target.stack_height(), value_stack.size() - target.stack_height() - target.arity());
+            return target.continuation();
+        }
+    }
+    // No handler in this frame matched; drop its labels (the frame is being unwound) so that a re-dispatch in the calling frame only ever sees that frame's own (still active) handlers.
+    label_stack.shrink(frame_label_index, true);
+    return {};
 }
 
 template<typename ReadType, typename PushType, SourceAddressMix mix>
@@ -5862,6 +6744,14 @@ Outcome BytecodeInterpreter::call_address(Configuration& configuration, Function
         }
 
         if (result.is_trap()) {
+            // https://webassembly.github.io/spec/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-ref
+            if (auto const* uncaught_exception = result.trap().data.get_pointer<UncaughtException>(); uncaught_exception && final_outcome == Outcome::Continue) {
+                if (auto continuation = unwind_to_throw_handler(configuration, uncaught_exception->address); continuation.has_value()) {
+                    // The callee's interpret() left the exception in m_trap; it's handled now.
+                    m_trap = Empty {};
+                    return static_cast<Outcome>(continuation->value());
+                }
+            }
             m_trap = move(result.trap());
             return Outcome::Return;
         }
@@ -6467,21 +7357,27 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
         }
 
         auto& args = result.dispatches[i].instruction->arguments();
+        auto offset_to = [&](InstructionPointer ip) {
+            size_t offset = 0;
+            auto it = nops_to_remove_it;
+            while (it != nops_to_remove.end() && it.key() < ip.value()) {
+                ++offset;
+                ++it;
+            }
+            return offset;
+        };
         if (auto ptr = args.get_pointer<Instruction::StructuredInstructionArgs>()) {
-            auto offset_to = [&](InstructionPointer ip) {
-                size_t offset = 0;
-                auto it = nops_to_remove_it;
-                while (it != nops_to_remove.end() && it.key() < ip.value()) {
-                    ++offset;
-                    ++it;
-                }
-                return offset;
-            };
-
             InstructionPointer end_ip = ptr->end_ip.value() - offset_accumulated - offset_to(ptr->end_ip - ptr->else_ip().has_value());
             auto else_ip = ptr->else_ip().map([&](InstructionPointer const& ip) -> InstructionPointer { return ip.value() - offset_accumulated - offset_to(ip - 1); });
             auto instruction = *result.dispatches[i].instruction;
             instruction.arguments() = Instruction::StructuredInstructionArgs { ptr->block_type, end_ip, else_ip, ptr->meta };
+            auto& extra_instruction = append_extra_instruction(move(instruction));
+            result.dispatches[i].instruction = &extra_instruction;
+            result.dispatches[i].instruction_opcode = result.dispatches[i].instruction->opcode();
+        } else if (auto try_table_ptr = args.get_pointer<Instruction::TryTableArgs>()) {
+            InstructionPointer end_ip = try_table_ptr->end_ip.value() - offset_accumulated - offset_to(try_table_ptr->end_ip);
+            auto instruction = *result.dispatches[i].instruction;
+            instruction.arguments() = Instruction::TryTableArgs { try_table_ptr->block_type, end_ip, try_table_ptr->catches(), try_table_ptr->meta };
             auto& extra_instruction = append_extra_instruction(move(instruction));
             result.dispatches[i].instruction = &extra_instruction;
             result.dispatches[i].instruction_opcode = result.dispatches[i].instruction->opcode();
@@ -6537,16 +7433,22 @@ CompiledInstructions try_compile_instructions(Expression const& expression, Span
 
             // Re-point absolute IPs in structured args (end_ip / else_ip) past the inserted ops.
             for (size_t i = 0; i < new_dispatches.size(); ++i) {
-                auto* sa = new_dispatches[i].instruction->arguments().get_pointer<Instruction::StructuredInstructionArgs>();
-                if (!sa)
-                    continue;
-                InstructionPointer new_end_ip = sa->end_ip.value() + shift_before(sa->end_ip.value());
-                auto new_else_ip = sa->else_ip().map([&](InstructionPointer ip) -> InstructionPointer { return ip.value() + shift_before(ip.value()); });
-                auto rebuilt = *new_dispatches[i].instruction;
-                rebuilt.arguments() = Instruction::StructuredInstructionArgs { sa->block_type, new_end_ip, new_else_ip, sa->meta };
-                auto& extra_instruction = append_extra_instruction(move(rebuilt));
-                new_dispatches[i].instruction = &extra_instruction;
-                new_dispatches[i].instruction_opcode = extra_instruction.opcode();
+                if (auto* sa = new_dispatches[i].instruction->arguments().get_pointer<Instruction::StructuredInstructionArgs>()) {
+                    InstructionPointer new_end_ip = sa->end_ip.value() + shift_before(sa->end_ip.value());
+                    auto new_else_ip = sa->else_ip().map([&](InstructionPointer ip) -> InstructionPointer { return ip.value() + shift_before(ip.value()); });
+                    auto rebuilt = *new_dispatches[i].instruction;
+                    rebuilt.arguments() = Instruction::StructuredInstructionArgs { sa->block_type, new_end_ip, new_else_ip, sa->meta };
+                    auto& extra_instruction = append_extra_instruction(move(rebuilt));
+                    new_dispatches[i].instruction = &extra_instruction;
+                    new_dispatches[i].instruction_opcode = extra_instruction.opcode();
+                } else if (auto* tta = new_dispatches[i].instruction->arguments().get_pointer<Instruction::TryTableArgs>()) {
+                    InstructionPointer new_end_ip = tta->end_ip.value() + shift_before(tta->end_ip.value());
+                    auto rebuilt = *new_dispatches[i].instruction;
+                    rebuilt.arguments() = Instruction::TryTableArgs { tta->block_type, new_end_ip, tta->catches(), tta->meta };
+                    auto& extra_instruction = append_extra_instruction(move(rebuilt));
+                    new_dispatches[i].instruction = &extra_instruction;
+                    new_dispatches[i].instruction_opcode = extra_instruction.opcode();
+                }
             }
 
             result.dispatches = move(new_dispatches);
