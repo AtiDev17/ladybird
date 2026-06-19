@@ -33,6 +33,7 @@ ErrorOr<void> apply_sandbox()
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/drirc.d"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/vulkan"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dri"sv, Sandbox::LandlockPath::Access::ReadWrite));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/udmabuf"sv, Sandbox::LandlockPath::Access::ReadWrite));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/sys"sv, Sandbox::LandlockPath::Access::ReadOnly));
     if (auto library_path = Core::Environment::get("LD_LIBRARY_PATH"sv); library_path.has_value()) {
         for (auto path : library_path->split_view(':'))
@@ -70,6 +71,9 @@ ErrorOr<void> apply_sandbox()
     policy.allow_gpu_device_operations();
     policy.allow_common_runtime();
     policy.allow_executable_memory_mappings();
+    // Some GPU drivers allocate writable executable code heaps lazily after
+    // context creation, including while handling WebGL commands.
+    policy.allow_writable_executable_memory_mappings();
     TRY(policy.install());
 
     return {};
