@@ -37,13 +37,6 @@ jobs:
         shell: pwsh
         run: echo "version=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
 
-      - name: Restore LLVM Cache
-        id: llvm-cache
-        uses: actions/cache@v5
-        with:
-          path: C:\Program Files\LLVM
-          key: llvm-${{ hashFiles('.github/actions/setup/action.yml') }}-x64
-
       - name: Setup Environment
         uses: ./.github/actions/setup
         with:
@@ -51,13 +44,6 @@ jobs:
           arch: 'x86_64'
           toolchain: 'ClangCL'
           type: 'build'
-
-      - name: Save LLVM Cache
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: C:\Program Files\LLVM
-          key: llvm-${{ hashFiles('.github/actions/setup/action.yml') }}-x64
 
       - name: Restore ccache
         id: ccache-restore
@@ -86,12 +72,20 @@ jobs:
           ccache -s
           ccache -z
 
+      - name: Compute vcpkg cache key
+        id: vcpkg-key
+        shell: bash
+        run: |
+          echo "key=vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+
       - name: Restore vcpkg cache
         id: vcpkg-restore
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/vcpkg_cache
-          key: vcpkg | Windows | x86_64 | ClangCL | NORMAL | ${{ hashFiles('vcpkg.json') }} | ${{ steps.msvc.outputs.version }}
+          key: ${{ steps.vcpkg-key.outputs.key }}
+          restore-keys: |
+            vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}-
 
       - name: Setup Windows Specific Tools
         shell: pwsh
@@ -348,4 +342,4 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/vcpkg_cache
-          key: ${{ steps.vcpkg-restore.outputs.cache-primary-key }}
+          key: ${{ steps.vcpkg-key.outputs.key }}
