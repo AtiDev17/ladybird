@@ -777,6 +777,12 @@ void WebContentClient::did_inspect_current_flexbox(u64 page_id, String flexbox_l
     }
 }
 
+void WebContentClient::did_inspect_indexed_database(u64 page_id, u64 request_id, String result)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_indexed_database_inspection(request_id, parse_json(result, "IndexedDB inspection result"sv));
+}
+
 void WebContentClient::did_inspect_accessibility_tree(u64 page_id, String accessibility_tree)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
@@ -1078,6 +1084,12 @@ void WebContentClient::did_change_storage_item(u64 page_id, Web::StorageAPI::Sto
             .key = move(key),
         });
     }
+}
+
+void WebContentClient::did_update_indexed_database(u64 page_id, String update)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->notify_indexed_database_changed(parse_json(update, "IndexedDB update"sv));
 }
 
 void WebContentClient::did_post_broadcast_channel_message(u64, Web::HTML::BroadcastChannelMessage message)

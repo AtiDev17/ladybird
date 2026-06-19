@@ -718,6 +718,24 @@ void ViewImplementation::remove_storage_change_listener(u64 listener_id)
     m_storage_change_listeners.remove(listener_id);
 }
 
+void ViewImplementation::notify_indexed_database_changed(JsonObject update)
+{
+    for (auto& listener : m_indexed_database_change_listeners)
+        listener.value(update);
+}
+
+u64 ViewImplementation::add_indexed_database_change_listener(DevTools::DevToolsDelegate::OnIndexedDatabaseChange on_indexed_database_change)
+{
+    auto listener_id = m_next_indexed_database_change_listener_id++;
+    m_indexed_database_change_listeners.set(listener_id, move(on_indexed_database_change));
+    return listener_id;
+}
+
+void ViewImplementation::remove_indexed_database_change_listener(u64 listener_id)
+{
+    m_indexed_database_change_listeners.remove(listener_id);
+}
+
 ErrorOr<Core::SharedVersionIndex> ViewImplementation::ensure_document_cookie_version_index(Badge<WebContentClient>, String const& domain)
 {
     return m_document_cookie_version_indices.try_ensure(domain, [&]() -> ErrorOr<Core::SharedVersionIndex> {
@@ -945,6 +963,58 @@ void ViewImplementation::inspect_current_grid(Web::UniqueNodeID node_id)
 void ViewImplementation::inspect_current_flexbox(Web::UniqueNodeID node_id, bool only_look_at_parents)
 {
     client().async_inspect_current_flexbox(page_id(), node_id, only_look_at_parents);
+}
+
+void ViewImplementation::inspect_indexed_database_storage(DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete on_complete)
+{
+    auto request_id = m_next_indexed_database_inspection_request_id++;
+    m_pending_indexed_database_inspection_requests.set(request_id, move(on_complete));
+    client().async_inspect_indexed_database_storage(page_id(), request_id);
+}
+
+void ViewImplementation::inspect_indexed_database_objects(String const& host, Optional<JsonArray> names, JsonObject options, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete on_complete)
+{
+    auto request_id = m_next_indexed_database_inspection_request_id++;
+    m_pending_indexed_database_inspection_requests.set(request_id, move(on_complete));
+    if (names.has_value())
+        client().async_inspect_indexed_database_objects(page_id(), request_id, host, JsonValue { names.release_value() }, JsonValue { move(options) });
+    else
+        client().async_inspect_indexed_database_objects(page_id(), request_id, host, JsonValue {}, JsonValue { move(options) });
+}
+
+void ViewImplementation::delete_indexed_database(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete on_complete)
+{
+    auto request_id = m_next_indexed_database_inspection_request_id++;
+    m_pending_indexed_database_inspection_requests.set(request_id, move(on_complete));
+    client().async_delete_indexed_database(page_id(), request_id, host, name);
+}
+
+void ViewImplementation::clear_indexed_database_object_store(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete on_complete)
+{
+    auto request_id = m_next_indexed_database_inspection_request_id++;
+    m_pending_indexed_database_inspection_requests.set(request_id, move(on_complete));
+    client().async_clear_indexed_database_object_store(page_id(), request_id, host, name);
+}
+
+void ViewImplementation::delete_indexed_database_record(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete on_complete)
+{
+    auto request_id = m_next_indexed_database_inspection_request_id++;
+    m_pending_indexed_database_inspection_requests.set(request_id, move(on_complete));
+    client().async_delete_indexed_database_record(page_id(), request_id, host, name);
+}
+
+void ViewImplementation::did_receive_indexed_database_inspection(u64 request_id, JsonObject result)
+{
+    auto callback = m_pending_indexed_database_inspection_requests.take(request_id);
+    if (!callback.has_value())
+        return;
+
+    if (result.has_string("error"sv)) {
+        (*callback)(Error::from_string_literal("IndexedDB operation failed"));
+        return;
+    }
+
+    (*callback)(move(result));
 }
 
 void ViewImplementation::clear_inspected_dom_node()

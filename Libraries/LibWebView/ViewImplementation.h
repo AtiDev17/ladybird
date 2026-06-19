@@ -140,12 +140,21 @@ public:
     void notify_cookies_changed(HashTable<String> const& changed_domains, ReadonlySpan<HTTP::Cookie::Cookie> page_cookies, ReadonlySpan<HTTP::Cookie::Cookie> host_cookies);
     void listen_for_host_cookie_changes(DevTools::DevToolsDelegate::OnHostCookieChange);
     void stop_listening_for_host_cookie_changes();
+    void notify_indexed_database_changed(JsonObject);
+    u64 add_indexed_database_change_listener(DevTools::DevToolsDelegate::OnIndexedDatabaseChange);
+    void remove_indexed_database_change_listener(u64 listener_id);
     ErrorOr<Core::SharedVersionIndex> ensure_document_cookie_version_index(Badge<WebContentClient>, String const&);
     Optional<Core::SharedVersion> document_cookie_version(URL::URL const&) const;
 
     void notify_storage_changed(DevTools::DevToolsDelegate::StorageChange);
     u64 add_storage_change_listener(DevTools::DevToolsDelegate::OnStorageChange);
     void remove_storage_change_listener(u64 listener_id);
+
+    void inspect_indexed_database_storage(DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete);
+    void inspect_indexed_database_objects(String const& host, Optional<JsonArray> names, JsonObject options, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete);
+    void delete_indexed_database(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete);
+    void clear_indexed_database_object_store(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete);
+    void delete_indexed_database_record(String const& host, String const& name, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete);
 
     ByteString selected_text();
     ByteString cut_selected_text();
@@ -601,9 +610,14 @@ protected:
     Core::AnonymousBuffer m_document_cookie_version_buffer;
     HashMap<String, Core::SharedVersionIndex> m_document_cookie_version_indices;
     DevTools::DevToolsDelegate::OnHostCookieChange m_on_host_cookie_change;
+    HashMap<u64, DevTools::DevToolsDelegate::OnIndexedDatabaseChange> m_indexed_database_change_listeners;
+    u64 m_next_indexed_database_change_listener_id { 1 };
 
     HashMap<u64, DevTools::DevToolsDelegate::OnStorageChange> m_storage_change_listeners;
     u64 m_next_storage_change_listener_id { 1 };
+
+    HashMap<u64, DevTools::DevToolsDelegate::OnIndexedDBInspectionComplete> m_pending_indexed_database_inspection_requests;
+    u64 m_next_indexed_database_inspection_request_id { 1 };
 
     // FIXME: Reconcile this ID with `page_id`. The latter is only unique per WebContent connection, whereas the view ID
     //        is required to be globally unique for Firefox DevTools.
@@ -619,6 +633,7 @@ protected:
     };
     void request_node_picker_hit_test(NodePickerRequestType, Web::DevicePixelPoint);
     void did_receive_node_picker_hit_test(u64 request_id, Web::UniqueNodeID);
+    void did_receive_indexed_database_inspection(u64 request_id, JsonObject);
 
     bool m_node_picker_active { false };
     Optional<Web::UniqueNodeID> m_node_picker_hovered_node_id;

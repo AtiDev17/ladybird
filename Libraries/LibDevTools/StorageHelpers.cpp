@@ -11,25 +11,44 @@
 
 namespace DevTools {
 
+JsonObject define_storage_field(StringView name, StorageFieldType state)
+{
+    JsonObject field;
+    field.set("name"sv, name);
+    field.set("editable"sv, state == StorageFieldType::Mutable);
+
+    if (state == StorageFieldType::Hidden)
+        field.set("hidden"sv, true);
+    else if (state == StorageFieldType::Private)
+        field.set("private"sv, true);
+
+    return field;
+}
+
 Optional<String> storage_host_for_url(String const& url_string)
 {
     auto url = URL::Parser::basic_parse(url_string);
     if (!url.has_value())
         return {};
 
-    auto const& scheme = url->scheme();
+    return storage_host_for_url(url.value());
+}
+
+Optional<String> storage_host_for_url(URL::URL const& url)
+{
+    auto const& scheme = url.scheme();
     if (scheme == "http"sv || scheme == "https"sv) {
         StringBuilder builder;
         builder.append(scheme);
         builder.append("://"sv);
-        builder.append(url->serialized_host());
-        if (auto port = url->port(); port.has_value())
+        builder.append(url.serialized_host());
+        if (auto port = url.port(); port.has_value())
             builder.appendff(":{}", *port);
         return builder.to_string_without_validation();
     }
 
     if (scheme == "about"sv || scheme == "file"sv || scheme == "javascript"sv || scheme == "resource"sv)
-        return url->serialize();
+        return url.serialize();
 
     return {};
 }

@@ -25,6 +25,7 @@ struct LandlockPath {
 
     ByteString path;
     Access access { Access::ReadOnly };
+    bool is_directory { false };
 };
 #endif
 
@@ -52,8 +53,7 @@ enum class NetworkAccess {
 
 #if defined(AK_OS_LINUX)
 [[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
-[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath>);
-[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<StringView> readable_paths = {});
+[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> = {});
 #endif
 
 #if defined(AK_OS_MACOS)
