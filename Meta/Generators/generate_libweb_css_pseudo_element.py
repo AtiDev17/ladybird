@@ -29,6 +29,7 @@ PROPERTY_GROUPS = {
         # https://drafts.csswg.org/css-backgrounds/#property-index
         "background",
         "background-attachment",
+        "background-blend-mode",
         "background-clip",
         "background-color",
         "background-image",
@@ -96,9 +97,9 @@ PROPERTY_GROUPS = {
         "font",
         "font-family",
         "font-feature-settings",
-        # FIXME: font-kerning
+        "font-kerning",
         "font-language-override",
-        # FIXME: font-optical-sizing
+        "font-optical-sizing",
         # FIXME: font-palette
         "font-size",
         # FIXME: font-size-adjust
@@ -136,39 +137,15 @@ PROPERTY_GROUPS = {
     "#inline-typesetting-properties": [
         # https://drafts.csswg.org/css-text-4/#property-index
         # FIXME: hanging-punctuation
-        # FIXME: hyphenate-character
-        # FIXME: hyphenate-limit-chars
-        # FIXME: hyphenate-limit-last
-        # FIXME: hyphenate-limit-lines
-        # FIXME: hyphenate-limit-zone
-        # FIXME: hyphens
         "letter-spacing",
-        # FIXME: line-break
         # FIXME: line-padding
-        "overflow-wrap",
-        "tab-size",
-        "text-align",
-        # FIXME: text-align-all
-        # FIXME: text-align-last
         # FIXME: text-autospace
-        # FIXME: text-group-align
-        "text-indent",
         "text-justify",
         # FIXME: text-spacing
         # FIXME: text-spacing-trim
         "text-transform",
-        "text-wrap",
-        "text-wrap-mode",
-        "text-wrap-style",
-        "white-space",
-        "white-space-collapse",
-        "white-space-trim",
-        "word-break",
         # FIXME: word-space-transform
         "word-spacing",
-        # FIXME: wrap-after
-        # FIXME: wrap-before
-        # FIXME: wrap-inside
     ],
     "#margin-properties": [
         "margin",
@@ -200,8 +177,12 @@ PROPERTY_GROUPS = {
         "text-decoration",
         "text-decoration-color",
         "text-decoration-line",
+        "text-decoration-skip-ink",
         "text-decoration-style",
         "text-decoration-thickness",
+        "text-shadow",
+        "text-underline-offset",
+        "text-underline-position",
     ],
 }
 
