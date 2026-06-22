@@ -6,6 +6,7 @@
 
 #include <UI/Qt/MacWindow.h>
 
+#include <LibGfx/Color.h>
 #include <QAbstractNativeEventFilter>
 #include <QColor>
 #include <QCoreApplication>
@@ -66,6 +67,24 @@ namespace Ladybird {
 
 static NSEvent* s_latest_window_drag_event;
 
+static Gfx::Color ns_color_to_gfx_color(NSColor* color)
+{
+    auto* rgb_color = [color colorUsingColorSpace:NSColorSpace.genericRGBColorSpace];
+    if (rgb_color != nil)
+        return {
+            static_cast<u8>([rgb_color redComponent] * 255),
+            static_cast<u8>([rgb_color greenComponent] * 255),
+            static_cast<u8>([rgb_color blueComponent] * 255),
+            static_cast<u8>([rgb_color alphaComponent] * 255)
+        };
+    return {};
+}
+
+static bool is_window_drag_on_gesture_enabled()
+{
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"NSWindowShouldDragOnGesture"];
+}
+
 static bool is_appkit_event_type(QByteArray const& event_type)
 {
     return event_type == QByteArrayLiteral("NSEvent")
@@ -86,6 +105,25 @@ static bool is_window_drag_event(NSEvent* event)
     }
 }
 
+static bool should_start_window_drag_for_gesture(NSEvent* event)
+{
+    if (!event || event.type != NSEventTypeLeftMouseDown)
+        return false;
+
+    if (!is_window_drag_on_gesture_enabled())
+        return false;
+
+    auto modifier_flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if ((modifier_flags & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != (NSEventModifierFlagCommand | NSEventModifierFlagControl))
+        return false;
+
+    auto* window = event.window;
+    if (!window || !window.isMovable || (window.styleMask & NSWindowStyleMaskFullScreen))
+        return false;
+
+    return true;
+}
+
 class LadybirdAppKitEventCaptureFilter final : public QAbstractNativeEventFilter {
 public:
     virtual bool nativeEventFilter(QByteArray const& event_type, void* message, qintptr*) override
@@ -94,6 +132,11 @@ public:
             return false;
 
         auto* event = static_cast<NSEvent*>(message);
+        if (should_start_window_drag_for_gesture(event)) {
+            [event.window performWindowDragWithEvent:event];
+            return true;
+        }
+
         if (!is_window_drag_event(event))
             return false;
 
@@ -142,6 +185,22 @@ void set_rounded_window_corners(QWidget& widget, bool enabled, double radius, QC
     content_view.layer.backgroundColor = cg_color_from_qcolor(background_color);
 }
 
+void set_appkit_window_resizable(QWidget& widget, bool enabled)
+{
+    auto* view = reinterpret_cast<NSView*>(widget.winId());
+    if (!view)
+        return;
+
+    auto* window = view.window;
+    if (!window)
+        return;
+
+    if (enabled)
+        window.styleMask |= NSWindowStyleMaskResizable;
+    else
+        window.styleMask &= ~NSWindowStyleMaskResizable;
+}
+
 void install_always_active_window_control_hover_tracking(QWidget& widget, void (*hover_changed)(QWidget*))
 {
     static char tracker_key;
@@ -176,6 +235,23 @@ void install_always_active_window_control_hover_tracking(QWidget& widget, void (
 #endif
 }
 
+void make_appkit_window_first_responder(QWidget& widget)
+{
+    auto* window_widget = widget.window();
+    if (!window_widget)
+        return;
+
+    auto* view = reinterpret_cast<NSView*>(window_widget->winId());
+    if (!view)
+        return;
+
+    auto* window = view.window;
+    if (!window)
+        return;
+
+    [window makeFirstResponder:view];
+}
+
 bool start_appkit_window_drag(QWidget& widget)
 {
     auto* window_widget = widget.window();
@@ -200,6 +276,16 @@ bool start_appkit_window_drag(QWidget& widget)
 
     [window performWindowDragWithEvent:event];
     return true;
+}
+
+Gfx::Color appkit_web_inactive_selection_color()
+{
+    return ns_color_to_gfx_color([NSColor unemphasizedSelectedTextBackgroundColor]);
+}
+
+Gfx::Color appkit_web_inactive_selection_text_color()
+{
+    return ns_color_to_gfx_color([NSColor unemphasizedSelectedTextColor]);
 }
 
 }
