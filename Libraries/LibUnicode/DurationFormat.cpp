@@ -22,11 +22,11 @@ static constexpr bool is_not_ascii_digit(u32 code_point)
     return !is_ascii_digit(code_point);
 }
 
-DigitalFormat digital_format(StringView locale)
+DigitalFormat digital_format(Utf16View locale)
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale);
+    auto locale_data = LocaleData::for_locale(locale.bytes());
     if (!locale_data.has_value())
         return {};
 

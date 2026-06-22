@@ -5,6 +5,7 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteString.h>
 #include <LibUnicode/DisplayNames.h>
 #include <LibUnicode/ICU.h>
 
@@ -16,7 +17,7 @@
 
 namespace Unicode {
 
-LanguageDisplay language_display_from_string(StringView language_display)
+LanguageDisplay language_display_from_string(Utf16View language_display)
 {
     if (language_display == "standard"sv)
         return LanguageDisplay::Standard;
@@ -25,13 +26,13 @@ LanguageDisplay language_display_from_string(StringView language_display)
     VERIFY_NOT_REACHED();
 }
 
-StringView language_display_to_string(LanguageDisplay language_display)
+Utf16String language_display_to_string(LanguageDisplay language_display)
 {
     switch (language_display) {
     case LanguageDisplay::Standard:
-        return "standard"sv;
+        return "standard"_utf16;
     case LanguageDisplay::Dialect:
-        return "dialect"sv;
+        return "dialect"_utf16;
     default:
         VERIFY_NOT_REACHED();
     }
@@ -224,27 +225,6 @@ Optional<Utf16String> currency_display_name(StringView locale, StringView curren
 
     i32 length = 0;
     UChar const* result = ucurr_getName(icu_currency.data(), locale_data->locale().getName(), icu_currency_style(style), nullptr, &length, &status);
-
-    if (icu_failure(status))
-        return {};
-    if ((status == U_USING_DEFAULT_WARNING) && (result == icu_currency.data()))
-        return {};
-
-    return icu_string_to_utf16_string(result, length);
-}
-
-Optional<Utf16String> currency_numeric_display_name(StringView locale, StringView currency)
-{
-    UErrorCode status = U_ZERO_ERROR;
-
-    auto locale_data = LocaleData::for_locale(locale);
-    if (!locale_data.has_value())
-        return {};
-
-    auto icu_currency = icu_currency_code(currency);
-
-    i32 length = 0;
-    UChar const* result = ucurr_getPluralName(icu_currency.data(), locale_data->locale().getName(), nullptr, "other", &length, &status);
 
     if (icu_failure(status))
         return {};

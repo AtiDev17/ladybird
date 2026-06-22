@@ -11,6 +11,7 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <LibUnicode/Forward.h>
 
@@ -28,24 +29,26 @@ enum class TimeUnit {
     Year,
 };
 Optional<TimeUnit> time_unit_from_string(StringView);
-StringView time_unit_to_string(TimeUnit);
+Optional<TimeUnit> time_unit_from_string(Utf16View);
+Utf16String time_unit_to_string(TimeUnit);
 
 enum class NumericDisplay {
     Always,
     Auto,
 };
 NumericDisplay numeric_display_from_string(StringView);
-StringView numeric_display_to_string(NumericDisplay);
+NumericDisplay numeric_display_from_string(Utf16View);
+Utf16String numeric_display_to_string(NumericDisplay);
 
 class RelativeTimeFormat {
 public:
-    static NonnullOwnPtr<RelativeTimeFormat> create(StringView locale, Style style);
+    static NonnullOwnPtr<RelativeTimeFormat> create(Utf16View locale, Style style);
     virtual ~RelativeTimeFormat() = default;
 
     struct Partition {
-        StringView type;
+        Utf16String type;
         Utf16String value;
-        StringView unit;
+        Utf16String unit;
     };
 
     virtual Utf16String format(double, TimeUnit, NumericDisplay) const = 0;

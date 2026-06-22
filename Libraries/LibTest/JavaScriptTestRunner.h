@@ -125,7 +125,7 @@ extern HashMap<bool*, Tuple<ByteString, ByteString, char>> g_extra_args;
 
 struct ParserError {
     JS::ParserError error;
-    ByteString hint;
+    Utf16String hint;
 };
 
 struct JSFileResult {
@@ -208,7 +208,7 @@ inline JS_DEFINE_NATIVE_FUNCTION(TestRunnerGlobalObject::report_test)
         return JS::js_undefined();
 
     auto test_name_value = vm.argument(0);
-    auto test_name = TRY(test_name_value.to_string(vm));
+    auto test_name = TRY(test_name_value.to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
     auto state_value = vm.argument(1);
     self.on_test_reported(test_name, state_value);
     return JS::js_undefined();
@@ -235,11 +235,13 @@ inline ByteBuffer load_entire_file(StringView path)
 inline AK::Result<GC::Ref<JS::Script>, ParserError> parse_script(StringView path, JS::Realm& realm)
 {
     auto contents = load_entire_file(path);
-    auto script_or_errors = JS::Script::parse(contents, realm, path);
+    auto source_text = Utf16String::from_utf8(StringView { contents.bytes() });
+    auto display_filename = Utf16String::from_utf8(path);
+    auto script_or_errors = JS::Script::parse(source_text.utf16_view(), realm, path, display_filename.utf16_view());
 
     if (script_or_errors.is_error()) {
         auto errors = script_or_errors.release_error();
-        return ParserError { errors[0], errors[0].source_location_hint(Utf16String::from_utf8(contents)) };
+        return ParserError { errors[0], errors[0].source_location_hint(source_text) };
     }
 
     return script_or_errors.release_value();
@@ -248,11 +250,13 @@ inline AK::Result<GC::Ref<JS::Script>, ParserError> parse_script(StringView path
 inline AK::Result<GC::Ref<JS::SourceTextModule>, ParserError> parse_module(StringView path, JS::Realm& realm)
 {
     auto contents = load_entire_file(path);
-    auto script_or_errors = JS::SourceTextModule::parse(contents, realm, path);
+    auto source_text = Utf16String::from_utf8(StringView { contents.bytes() });
+    auto display_filename = Utf16String::from_utf8(path);
+    auto script_or_errors = JS::SourceTextModule::parse(source_text.utf16_view(), realm, path, display_filename.utf16_view());
 
     if (script_or_errors.is_error()) {
         auto errors = script_or_errors.release_error();
-        return ParserError { errors[0], errors[0].source_location_hint(Utf16String::from_utf8(contents)) };
+        return ParserError { errors[0], errors[0].source_location_hint(source_text) };
     }
 
     return script_or_errors.release_value();
@@ -263,7 +267,7 @@ inline ErrorOr<JsonValue> get_test_results(JS::Realm& realm)
     auto results = MUST(realm.global_object().get("__TestResults__"_utf16_fly_string));
     auto maybe_json_string = MUST(JS::JSONObject::stringify_impl(*g_vm, results, JS::js_undefined(), JS::js_undefined()));
     if (maybe_json_string.has_value())
-        return JsonValue::from_string(*maybe_json_string);
+        return JsonValue::from_string(MUST(maybe_json_string->utf16_view().to_utf8()));
     return JsonValue();
 }
 
@@ -293,7 +297,7 @@ inline Vector<ByteString> TestRunner::get_test_paths() const
 inline void print_test_timings(String test_name, JS::Value state_value)
 {
     if (state_value.is_string()) {
-        auto state_string = state_value.as_string().utf8_string();
+        auto state_string = state_value.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16();
         if (state_string == "pass"sv) {
             print_modifiers({ FG_BOLD });
             out("Finished: ");
@@ -382,7 +386,7 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
     auto result = parse_script(m_common_path, *realm);
     if (result.is_error()) {
         warnln("Unable to parse test-common.js");
-        warnln("{}", result.error().error.to_byte_string());
+        warnln("{}", result.error().error.to_utf16_string().to_byte_string());
         warnln("{}", result.error().hint);
         cleanup_and_exit();
     }
@@ -419,7 +423,7 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
     auto& arr = user_output.as_array_exotic_object();
     for (u32 i = 0; i < arr.indexed_array_like_size(); ++i) {
         auto message = MUST(arr.get(i));
-        file_result.logged_messages.append(message.to_string_without_side_effects().to_byte_string());
+        file_result.logged_messages.append(message.to_utf16_string_without_side_effects().to_utf8().to_byte_string());
     }
 
     test_json.value().as_object().for_each_member([&](String const& suite_name, JsonValue const& suite_value) {
@@ -492,11 +496,14 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
             auto message = error_object.get_without_side_effects(g_vm->names.message);
 
             if (name.is_accessor() || message.is_accessor()) {
-                detail_builder.append(error.to_string_without_side_effects());
+                auto error_string = error.to_utf16_string_without_side_effects();
+                detail_builder.append(error_string.utf16_view());
             } else {
-                detail_builder.append(name.to_string_without_side_effects());
+                auto name_string = name.to_utf16_string_without_side_effects();
+                detail_builder.append(name_string.utf16_view());
                 detail_builder.append(": "sv);
-                detail_builder.append(message.to_string_without_side_effects());
+                auto message_string = message.to_utf16_string_without_side_effects();
+                detail_builder.append(message_string.utf16_view());
             }
 
             if (is<JS::Error>(error_object)) {
@@ -507,7 +514,7 @@ inline JSFileResult TestRunner::run_file_test(ByteString const& test_path)
 
             test_case.details = MUST(detail_builder.to_string());
         } else {
-            test_case.details = error.to_string_without_side_effects();
+            test_case.details = error.to_utf16_string_without_side_effects().to_utf8();
         }
 
         suite.tests.append(move(test_case));
@@ -571,11 +578,11 @@ inline void TestRunner::print_file_result(JSFileResult const& file_result) const
         outln("    ❌ The file failed to parse");
         outln();
         print_modifiers({ FG_GRAY });
-        for (auto& message : test_error.hint.split('\n', SplitBehavior::KeepEmpty)) {
+        for (auto& message : test_error.hint.split_view('\n', SplitBehavior::KeepEmpty)) {
             outln("         {}", message);
         }
         print_modifiers({ FG_RED });
-        outln("         {}", test_error.error.to_byte_string());
+        outln("         {}", test_error.error.to_utf16_string().to_byte_string());
         outln();
         return;
     }

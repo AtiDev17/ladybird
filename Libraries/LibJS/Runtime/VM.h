@@ -163,11 +163,6 @@ public:
     JS_ENUMERATE_WELL_KNOWN_SYMBOLS
 #undef __JS_ENUMERATE
 
-    HashMap<String, GC::Ptr<PrimitiveString>>& string_cache()
-    {
-        return m_string_cache;
-    }
-
     HashMap<Utf16String, GC::Ptr<PrimitiveString>>& utf16_string_cache()
     {
         return m_utf16_string_cache;
@@ -368,7 +363,11 @@ public:
     template<typename T>
     COLD Completion throw_completion(ErrorType const& type)
     {
-        return throw_completion<T>(type.message());
+        auto& realm = *current_realm();
+        if constexpr (requires { T::create(realm, type.message()); })
+            return throw_completion<T>(type.message());
+        else
+            return throw_completion<T>(Utf16String::from_utf16(type.message()));
     }
 
     template<typename T, typename... Args>
@@ -440,11 +439,11 @@ public:
     Function<void(GC::Ref<GC::Function<ThrowCompletionOr<Value>()>>, Realm*)> host_enqueue_promise_job;
     Function<GC::Ref<JobCallback>(FunctionObject&)> host_make_job_callback;
     Function<GC::Ptr<PrimitiveString>(Object const&)> host_get_code_for_eval;
-    Function<ThrowCompletionOr<void>(Realm&, ReadonlySpan<String>, StringView, StringView, CompilationType, ReadonlySpan<Value>, Value)> host_ensure_can_compile_strings;
+    Function<ThrowCompletionOr<void>(Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value)> host_ensure_can_compile_strings;
     Function<ThrowCompletionOr<void>(Object&)> host_ensure_can_add_private_element;
     Function<ThrowCompletionOr<HandledByHost>(ArrayBuffer&, size_t)> host_resize_array_buffer;
     Function<ThrowCompletionOr<HandledByHost>(ArrayBuffer&, size_t)> host_grow_shared_array_buffer;
-    Function<void(StringView)> host_unrecognized_date_string;
+    Function<void(Utf16View)> host_unrecognized_date_string;
     Function<Crypto::SignedBigInteger(Object const& global)> host_system_utc_epoch_nanoseconds;
     Function<bool()> host_promise_job_queue_is_empty;
 
@@ -516,7 +515,6 @@ private:
 
     static VM* s_the;
 
-    HashMap<String, GC::Ptr<PrimitiveString>> m_string_cache;
     HashMap<Utf16String, GC::Ptr<PrimitiveString>> m_utf16_string_cache;
 
     static constexpr size_t numeric_string_cache_size = 1000;

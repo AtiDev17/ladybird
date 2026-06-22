@@ -96,7 +96,7 @@ void {interface.name}Properties::initialize(JS::Realm& realm)
     auto& vm = realm.vm();
 
     // The class string of a named properties object is the concatenation of the interface's identifier and the string "Properties".
-    define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name}Properties"_string), JS::Attribute::Configurable);
+    define_direct_property(vm.well_known_symbol_to_string_tag(), JS::PrimitiveString::create(vm, "{interface.name}Properties"_utf16), JS::Attribute::Configurable);
 
     // 1. Let proto be null.
     // 2. If interface is declared to inherit from another interface, then set proto to the interface prototype object in realm for the inherited interface.
@@ -119,7 +119,7 @@ JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> {interface.name}Properti
 
     // 4. If the result of running the named property visibility algorithm with property name P and object object is true, then:
     if (TRY(object.is_named_property_exposed_on_object(property_name))) {{
-        auto property_name_string = property_name.to_string().to_utf8_but_should_be_ported_to_utf16();
+        auto property_name_string = property_name.to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
 
         // 1. Let operation be the operation used to declare the named property getter.
         // 2. Let value be an uninitialized variable.

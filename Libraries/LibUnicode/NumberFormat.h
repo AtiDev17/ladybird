@@ -10,6 +10,7 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibUnicode/Forward.h>
@@ -24,7 +25,8 @@ enum class NumberFormatStyle {
     Unit,
 };
 NumberFormatStyle number_format_style_from_string(StringView);
-StringView number_format_style_to_string(NumberFormatStyle);
+NumberFormatStyle number_format_style_from_string(Utf16View);
+Utf16String number_format_style_to_string(NumberFormatStyle);
 
 enum class SignDisplay {
     Auto,
@@ -34,7 +36,8 @@ enum class SignDisplay {
     Negative,
 };
 SignDisplay sign_display_from_string(StringView);
-StringView sign_display_to_string(SignDisplay);
+SignDisplay sign_display_from_string(Utf16View);
+Utf16String sign_display_to_string(SignDisplay);
 
 enum class Notation {
     Standard,
@@ -43,14 +46,16 @@ enum class Notation {
     Compact,
 };
 Notation notation_from_string(StringView);
-StringView notation_to_string(Notation);
+Notation notation_from_string(Utf16View);
+Utf16String notation_to_string(Notation);
 
 enum class CompactDisplay {
     Short,
     Long,
 };
 CompactDisplay compact_display_from_string(StringView);
-StringView compact_display_to_string(CompactDisplay);
+CompactDisplay compact_display_from_string(Utf16View);
+Utf16String compact_display_to_string(CompactDisplay);
 
 enum class Grouping {
     Always,
@@ -59,7 +64,7 @@ enum class Grouping {
     False,
 };
 Grouping grouping_from_string(StringView);
-StringView grouping_to_string(Grouping);
+Utf16String grouping_to_string(Grouping);
 
 enum class CurrencyDisplay {
     Code,
@@ -68,14 +73,16 @@ enum class CurrencyDisplay {
     Name,
 };
 CurrencyDisplay currency_display_from_string(StringView);
-StringView currency_display_to_string(CurrencyDisplay);
+CurrencyDisplay currency_display_from_string(Utf16View);
+Utf16String currency_display_to_string(CurrencyDisplay);
 
 enum class CurrencySign {
     Standard,
     Accounting,
 };
 CurrencySign currency_sign_from_string(StringView);
-StringView currency_sign_to_string(CurrencySign);
+CurrencySign currency_sign_from_string(Utf16View);
+Utf16String currency_sign_to_string(CurrencySign);
 
 struct DisplayOptions {
     NumberFormatStyle style { NumberFormatStyle::Decimal };
@@ -86,11 +93,11 @@ struct DisplayOptions {
 
     Grouping grouping { Grouping::Always };
 
-    Optional<String> currency;
+    Optional<Utf16String> currency;
     Optional<CurrencyDisplay> currency_display;
     Optional<CurrencySign> currency_sign;
 
-    Optional<String> unit;
+    Optional<Utf16String> unit;
     Optional<Style> unit_display;
 };
 
@@ -101,7 +108,7 @@ enum class RoundingType {
     LessPrecision,
 };
 RoundingType rounding_type_from_string(StringView);
-StringView rounding_type_to_string(RoundingType);
+Utf16String rounding_type_to_string(RoundingType);
 
 enum class RoundingMode {
     Ceil,
@@ -115,14 +122,16 @@ enum class RoundingMode {
     Trunc,
 };
 RoundingMode rounding_mode_from_string(StringView);
-StringView rounding_mode_to_string(RoundingMode);
+RoundingMode rounding_mode_from_string(Utf16View);
+Utf16String rounding_mode_to_string(RoundingMode);
 
 enum class TrailingZeroDisplay {
     Auto,
     StripIfInteger,
 };
 TrailingZeroDisplay trailing_zero_display_from_string(StringView);
-StringView trailing_zero_display_to_string(TrailingZeroDisplay);
+TrailingZeroDisplay trailing_zero_display_from_string(Utf16View);
+Utf16String trailing_zero_display_to_string(TrailingZeroDisplay);
 
 struct RoundingOptions {
     RoundingType type { RoundingType::MorePrecision };
@@ -142,19 +151,19 @@ struct RoundingOptions {
 class NumberFormat {
 public:
     static NonnullOwnPtr<NumberFormat> create(
-        StringView locale,
+        Utf16View locale,
         DisplayOptions const&,
         RoundingOptions const&);
 
     virtual ~NumberFormat() = default;
 
     struct Partition {
-        StringView type;
+        Utf16String type;
         Utf16String value;
-        StringView source;
+        Utf16String source;
     };
 
-    using Value = Variant<double, String>;
+    using Value = Variant<double, Utf16String>;
 
     virtual Utf16String format(Value const&) const = 0;
     virtual Vector<Partition> format_to_parts(Value const&) const = 0;

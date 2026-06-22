@@ -6,7 +6,6 @@
 
 #include <AK/CharacterTypes.h>
 #include <AK/QuickSort.h>
-#include <AK/Utf8View.h>
 #include <LibUnicode/ICU.h>
 #include <LibUnicode/Locale.h>
 #include <LibUnicode/NumberFormat.h>
@@ -32,17 +31,30 @@ NumberFormatStyle number_format_style_from_string(StringView number_format_style
     VERIFY_NOT_REACHED();
 }
 
-StringView number_format_style_to_string(NumberFormatStyle number_format_style)
+NumberFormatStyle number_format_style_from_string(Utf16View number_format_style)
+{
+    if (number_format_style == "decimal"sv)
+        return NumberFormatStyle::Decimal;
+    if (number_format_style == "percent"sv)
+        return NumberFormatStyle::Percent;
+    if (number_format_style == "currency"sv)
+        return NumberFormatStyle::Currency;
+    if (number_format_style == "unit"sv)
+        return NumberFormatStyle::Unit;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String number_format_style_to_string(NumberFormatStyle number_format_style)
 {
     switch (number_format_style) {
     case NumberFormatStyle::Decimal:
-        return "decimal"sv;
+        return "decimal"_utf16;
     case NumberFormatStyle::Percent:
-        return "percent"sv;
+        return "percent"_utf16;
     case NumberFormatStyle::Currency:
-        return "currency"sv;
+        return "currency"_utf16;
     case NumberFormatStyle::Unit:
-        return "unit"sv;
+        return "unit"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -62,19 +74,34 @@ SignDisplay sign_display_from_string(StringView sign_display)
     VERIFY_NOT_REACHED();
 }
 
-StringView sign_display_to_string(SignDisplay sign_display)
+SignDisplay sign_display_from_string(Utf16View sign_display)
+{
+    if (sign_display == "auto"sv)
+        return SignDisplay::Auto;
+    if (sign_display == "never"sv)
+        return SignDisplay::Never;
+    if (sign_display == "always"sv)
+        return SignDisplay::Always;
+    if (sign_display == "exceptZero"sv)
+        return SignDisplay::ExceptZero;
+    if (sign_display == "negative"sv)
+        return SignDisplay::Negative;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String sign_display_to_string(SignDisplay sign_display)
 {
     switch (sign_display) {
     case SignDisplay::Auto:
-        return "auto"sv;
+        return "auto"_utf16;
     case SignDisplay::Never:
-        return "never"sv;
+        return "never"_utf16;
     case SignDisplay::Always:
-        return "always"sv;
+        return "always"_utf16;
     case SignDisplay::ExceptZero:
-        return "exceptZero"sv;
+        return "exceptZero"_utf16;
     case SignDisplay::Negative:
-        return "negative"sv;
+        return "negative"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -109,17 +136,30 @@ Notation notation_from_string(StringView notation)
     VERIFY_NOT_REACHED();
 }
 
-StringView notation_to_string(Notation notation)
+Notation notation_from_string(Utf16View notation)
+{
+    if (notation == "standard"sv)
+        return Notation::Standard;
+    if (notation == "scientific"sv)
+        return Notation::Scientific;
+    if (notation == "engineering"sv)
+        return Notation::Engineering;
+    if (notation == "compact"sv)
+        return Notation::Compact;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String notation_to_string(Notation notation)
 {
     switch (notation) {
     case Notation::Standard:
-        return "standard"sv;
+        return "standard"_utf16;
     case Notation::Scientific:
-        return "scientific"sv;
+        return "scientific"_utf16;
     case Notation::Engineering:
-        return "engineering"sv;
+        return "engineering"_utf16;
     case Notation::Compact:
-        return "compact"sv;
+        return "compact"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -153,13 +193,22 @@ CompactDisplay compact_display_from_string(StringView compact_display)
     VERIFY_NOT_REACHED();
 }
 
-StringView compact_display_to_string(CompactDisplay compact_display)
+CompactDisplay compact_display_from_string(Utf16View compact_display)
+{
+    if (compact_display == "short"sv)
+        return CompactDisplay::Short;
+    if (compact_display == "long"sv)
+        return CompactDisplay::Long;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String compact_display_to_string(CompactDisplay compact_display)
 {
     switch (compact_display) {
     case CompactDisplay::Short:
-        return "short"sv;
+        return "short"_utf16;
     case CompactDisplay::Long:
-        return "long"sv;
+        return "long"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -177,17 +226,17 @@ Grouping grouping_from_string(StringView grouping)
     VERIFY_NOT_REACHED();
 }
 
-StringView grouping_to_string(Grouping grouping)
+Utf16String grouping_to_string(Grouping grouping)
 {
     switch (grouping) {
     case Grouping::Always:
-        return "always"sv;
+        return "always"_utf16;
     case Grouping::Auto:
-        return "auto"sv;
+        return "auto"_utf16;
     case Grouping::Min2:
-        return "min2"sv;
+        return "min2"_utf16;
     case Grouping::False:
-        return "false"sv;
+        return "false"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -220,17 +269,30 @@ CurrencyDisplay currency_display_from_string(StringView currency_display)
     VERIFY_NOT_REACHED();
 }
 
-StringView currency_display_to_string(CurrencyDisplay currency_display)
+CurrencyDisplay currency_display_from_string(Utf16View currency_display)
+{
+    if (currency_display == "code"sv)
+        return CurrencyDisplay::Code;
+    if (currency_display == "symbol"sv)
+        return CurrencyDisplay::Symbol;
+    if (currency_display == "narrowSymbol"sv)
+        return CurrencyDisplay::NarrowSymbol;
+    if (currency_display == "name"sv)
+        return CurrencyDisplay::Name;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String currency_display_to_string(CurrencyDisplay currency_display)
 {
     switch (currency_display) {
     case CurrencyDisplay::Code:
-        return "code"sv;
+        return "code"_utf16;
     case CurrencyDisplay::Symbol:
-        return "symbol"sv;
+        return "symbol"_utf16;
     case CurrencyDisplay::NarrowSymbol:
-        return "narrowSymbol"sv;
+        return "narrowSymbol"_utf16;
     case CurrencyDisplay::Name:
-        return "name"sv;
+        return "name"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -259,13 +321,22 @@ CurrencySign currency_sign_from_string(StringView currency_sign)
     VERIFY_NOT_REACHED();
 }
 
-StringView currency_sign_to_string(CurrencySign currency_sign)
+CurrencySign currency_sign_from_string(Utf16View currency_sign)
+{
+    if (currency_sign == "standard"sv)
+        return CurrencySign::Standard;
+    if (currency_sign == "accounting"sv)
+        return CurrencySign::Accounting;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String currency_sign_to_string(CurrencySign currency_sign)
 {
     switch (currency_sign) {
     case CurrencySign::Standard:
-        return "standard"sv;
+        return "standard"_utf16;
     case CurrencySign::Accounting:
-        return "accounting"sv;
+        return "accounting"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -283,17 +354,17 @@ RoundingType rounding_type_from_string(StringView rounding_type)
     VERIFY_NOT_REACHED();
 }
 
-StringView rounding_type_to_string(RoundingType rounding_type)
+Utf16String rounding_type_to_string(RoundingType rounding_type)
 {
     switch (rounding_type) {
     case RoundingType::SignificantDigits:
-        return "significantDigits"sv;
+        return "significantDigits"_utf16;
     case RoundingType::FractionDigits:
-        return "fractionDigits"sv;
+        return "fractionDigits"_utf16;
     case RoundingType::MorePrecision:
-        return "morePrecision"sv;
+        return "morePrecision"_utf16;
     case RoundingType::LessPrecision:
-        return "lessPrecision"sv;
+        return "lessPrecision"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -321,27 +392,50 @@ RoundingMode rounding_mode_from_string(StringView rounding_mode)
     VERIFY_NOT_REACHED();
 }
 
-StringView rounding_mode_to_string(RoundingMode rounding_mode)
+RoundingMode rounding_mode_from_string(Utf16View rounding_mode)
+{
+    if (rounding_mode == "ceil"sv)
+        return RoundingMode::Ceil;
+    if (rounding_mode == "expand"sv)
+        return RoundingMode::Expand;
+    if (rounding_mode == "floor"sv)
+        return RoundingMode::Floor;
+    if (rounding_mode == "halfCeil"sv)
+        return RoundingMode::HalfCeil;
+    if (rounding_mode == "halfEven"sv)
+        return RoundingMode::HalfEven;
+    if (rounding_mode == "halfExpand"sv)
+        return RoundingMode::HalfExpand;
+    if (rounding_mode == "halfFloor"sv)
+        return RoundingMode::HalfFloor;
+    if (rounding_mode == "halfTrunc"sv)
+        return RoundingMode::HalfTrunc;
+    if (rounding_mode == "trunc"sv)
+        return RoundingMode::Trunc;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String rounding_mode_to_string(RoundingMode rounding_mode)
 {
     switch (rounding_mode) {
     case RoundingMode::Ceil:
-        return "ceil"sv;
+        return "ceil"_utf16;
     case RoundingMode::Expand:
-        return "expand"sv;
+        return "expand"_utf16;
     case RoundingMode::Floor:
-        return "floor"sv;
+        return "floor"_utf16;
     case RoundingMode::HalfCeil:
-        return "halfCeil"sv;
+        return "halfCeil"_utf16;
     case RoundingMode::HalfEven:
-        return "halfEven"sv;
+        return "halfEven"_utf16;
     case RoundingMode::HalfExpand:
-        return "halfExpand"sv;
+        return "halfExpand"_utf16;
     case RoundingMode::HalfFloor:
-        return "halfFloor"sv;
+        return "halfFloor"_utf16;
     case RoundingMode::HalfTrunc:
-        return "halfTrunc"sv;
+        return "halfTrunc"_utf16;
     case RoundingMode::Trunc:
-        return "trunc"sv;
+        return "trunc"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -380,13 +474,22 @@ TrailingZeroDisplay trailing_zero_display_from_string(StringView trailing_zero_d
     VERIFY_NOT_REACHED();
 }
 
-StringView trailing_zero_display_to_string(TrailingZeroDisplay trailing_zero_display)
+TrailingZeroDisplay trailing_zero_display_from_string(Utf16View trailing_zero_display)
+{
+    if (trailing_zero_display == "auto"sv)
+        return TrailingZeroDisplay::Auto;
+    if (trailing_zero_display == "stripIfInteger"sv)
+        return TrailingZeroDisplay::StripIfInteger;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String trailing_zero_display_to_string(TrailingZeroDisplay trailing_zero_display)
 {
     switch (trailing_zero_display) {
     case TrailingZeroDisplay::Auto:
-        return "auto"sv;
+        return "auto"_utf16;
     case TrailingZeroDisplay::StripIfInteger:
-        return "stripIfInteger"sv;
+        return "stripIfInteger"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -438,14 +541,23 @@ static void apply_display_options(icu::number::LocalizedNumberFormatter& formatt
         formatter = formatter.unit(icu::MeasureUnit::getPercent()).scale(icu::number::Scale::byDouble(100));
         break;
 
-    case NumberFormatStyle::Currency:
-        formatter = formatter.unit(icu::CurrencyUnit(icu_string_piece(*display_options.currency), status));
+    case NumberFormatStyle::Currency: {
+        VERIFY(display_options.currency->length_in_code_units() == 3);
+        UChar currency_code[4] {
+            display_options.currency->code_unit_at(0),
+            display_options.currency->code_unit_at(1),
+            display_options.currency->code_unit_at(2),
+            0,
+        };
+        formatter = formatter.unit(icu::CurrencyUnit(currency_code, status));
         formatter = formatter.unitWidth(icu_currency_display(*display_options.currency_display));
         verify_icu_success(status);
         break;
+    }
 
     case NumberFormatStyle::Unit:
-        formatter = formatter.unit(icu::MeasureUnit::forIdentifier(icu_string_piece(*display_options.unit), status));
+        auto unit = display_options.unit->to_utf8();
+        formatter = formatter.unit(icu::MeasureUnit::forIdentifier(icu_string_piece(unit.bytes_as_string_view()), status));
         formatter = formatter.unitWidth(icu_unit_width(*display_options.unit_display));
         verify_icu_success(status);
         break;
@@ -490,47 +602,47 @@ static void apply_rounding_options(icu::number::LocalizedNumberFormatter& format
     formatter = formatter.roundingMode(icu_rounding_mode(rounding_options.mode));
 }
 
-static constexpr StringView icu_number_format_field_to_string(i32 field, NumberFormat::Value const& value, bool is_unit)
+static Utf16String icu_number_format_field_to_string(i32 field, NumberFormat::Value const& value, bool is_unit)
 {
     switch (field) {
     case PartitionRange::LITERAL_FIELD:
-        return "literal"sv;
+        return "literal"_utf16;
     case UNUM_INTEGER_FIELD:
         if (auto const* number = value.get_pointer<double>()) {
             if (isnan(*number))
-                return "nan"sv;
+                return "nan"_utf16;
             if (isinf(*number))
-                return "infinity"sv;
+                return "infinity"_utf16;
         }
-        return "integer"sv;
+        return "integer"_utf16;
     case UNUM_FRACTION_FIELD:
-        return "fraction"sv;
+        return "fraction"_utf16;
     case UNUM_DECIMAL_SEPARATOR_FIELD:
-        return "decimal"sv;
+        return "decimal"_utf16;
     case UNUM_EXPONENT_SYMBOL_FIELD:
-        return "exponentSeparator"sv;
+        return "exponentSeparator"_utf16;
     case UNUM_EXPONENT_SIGN_FIELD:
-        return "exponentMinusSign"sv;
+        return "exponentMinusSign"_utf16;
     case UNUM_EXPONENT_FIELD:
-        return "exponentInteger"sv;
+        return "exponentInteger"_utf16;
     case UNUM_GROUPING_SEPARATOR_FIELD:
-        return "group"sv;
+        return "group"_utf16;
     case UNUM_CURRENCY_FIELD:
-        return "currency"sv;
+        return "currency"_utf16;
     case UNUM_PERCENT_FIELD:
-        return is_unit ? "unit"sv : "percentSign"sv;
+        return is_unit ? "unit"_utf16 : "percentSign"_utf16;
     case UNUM_SIGN_FIELD: {
         auto is_negative = value.visit(
             [&](double number) { return signbit(number); },
-            [&](String const& number) { return number.starts_with('-'); });
-        return is_negative ? "minusSign"sv : "plusSign"sv;
+            [&](Utf16String const& number) { return number.starts_with('-'); });
+        return is_negative ? "minusSign"_utf16 : "plusSign"_utf16;
     }
     case UNUM_MEASURE_UNIT_FIELD:
-        return "unit"sv;
+        return "unit"_utf16;
     case UNUM_COMPACT_FIELD:
-        return "compact"sv;
+        return "compact"_utf16;
     case UNUM_APPROXIMATELY_SIGN_FIELD:
-        return "approximatelySign"sv;
+        return "approximatelySign"_utf16;
     }
 
     VERIFY_NOT_REACHED();
@@ -723,13 +835,36 @@ public:
     }
 
 private:
+    struct DecimalStringPiece {
+        String utf8_storage;
+        icu::StringPiece string_piece;
+    };
+
+    static DecimalStringPiece decimal_string_piece(Utf16String const& number)
+    {
+        auto number_view = number.utf16_view();
+
+        if (number_view.has_ascii_storage()) {
+            auto bytes = number_view.bytes();
+            return { {}, { reinterpret_cast<char const*>(bytes.data()), static_cast<i32>(bytes.size()) } };
+        }
+
+        DecimalStringPiece result;
+        result.utf8_storage = MUST(number_view.to_utf8());
+        result.string_piece = icu_string_piece(result.utf8_storage);
+        return result;
+    }
+
     static icu::Formattable value_to_formattable(Value const& value)
     {
         UErrorCode status = U_ZERO_ERROR;
 
         auto formattable = value.visit(
             [&](double number) { return icu::Formattable { number }; },
-            [&](String const& number) { return icu::Formattable(icu_string_piece(number), status); });
+            [&](Utf16String const& number) {
+                auto decimal_number = decimal_string_piece(number);
+                return icu::Formattable(decimal_number.string_piece, status);
+            });
         verify_icu_success(status);
 
         return formattable;
@@ -743,8 +878,9 @@ private:
             [&](double number) {
                 return m_formatter.formatDouble(number, status);
             },
-            [&](String const& number) {
-                return m_formatter.formatDecimal(icu_string_piece(number), status);
+            [&](Utf16String const& number) {
+                auto decimal_number = decimal_string_piece(number);
+                return m_formatter.formatDecimal(decimal_number.string_piece, status);
             });
 
         if (icu_failure(status))
@@ -809,18 +945,18 @@ private:
         auto apply_to_partition = [&](Partition& partition, auto field, auto index) {
             if (start_range.has_value() && start_range->contains(index)) {
                 partition.type = icu_number_format_field_to_string(field, start, m_is_unit);
-                partition.source = "startRange"sv;
+                partition.source = "startRange"_utf16;
                 return;
             }
 
             if (end_range.has_value() && end_range->contains(index)) {
                 partition.type = icu_number_format_field_to_string(field, end, m_is_unit);
-                partition.source = "endRange"sv;
+                partition.source = "endRange"_utf16;
                 return;
             }
 
             partition.type = icu_number_format_field_to_string(field, end, m_is_unit);
-            partition.source = "shared"sv;
+            partition.source = "shared"_utf16;
         };
 
         Vector<Partition> result;
@@ -850,11 +986,11 @@ private:
 };
 
 NonnullOwnPtr<NumberFormat> NumberFormat::create(
-    StringView locale,
+    Utf16View locale,
     DisplayOptions const& display_options,
     RoundingOptions const& rounding_options)
 {
-    auto locale_data = LocaleData::for_locale(locale);
+    auto locale_data = LocaleData::for_locale(locale.bytes());
     VERIFY(locale_data.has_value());
 
     auto formatter = icu::number::NumberFormatter::withLocale(locale_data->locale());

@@ -61,10 +61,10 @@ ThrowCompletionOr<GC::Ref<Object>> DisplayNamesConstructor::construct(FunctionOb
     auto [options, result, _] = TRY(resolve_options(vm, display_names, locales_value, options_value, SpecialBehaviors::RequireOptions));
 
     // 6. Let style be ? GetOption(options, "style", string, « "narrow", "short", "long" », "long").
-    auto style = TRY(get_option(vm, *options, vm.names.style, OptionType::String, { "narrow"sv, "short"sv, "long"sv }, "long"sv));
+    auto style = TRY(get_option(vm, *options, vm.names.style, OptionType::String, { "narrow"sv, "short"sv, "long"sv }, u"long"sv));
 
     // 7. Set displayNames.[[Style]] to style.
-    display_names->set_style(style.as_string().utf8_string_view());
+    display_names->set_style(style.as_string().utf16_string_view());
 
     // 8. Let type be ? GetOption(options, "type", string, « "language", "region", "script", "currency", "calendar", "dateTimeField" », undefined).
     auto type = TRY(get_option(vm, *options, vm.names.type, OptionType::String, { "language"sv, "region"sv, "script"sv, "currency"sv, "calendar"sv, "dateTimeField"sv }, Empty {}));
@@ -74,23 +74,24 @@ ThrowCompletionOr<GC::Ref<Object>> DisplayNamesConstructor::construct(FunctionOb
         return vm.throw_completion<TypeError>(ErrorType::IsUndefined, "options.type"sv);
 
     // 10. Set displayNames.[[Type]] to type.
-    display_names->set_type(type.as_string().utf8_string_view());
+    display_names->set_type(type.as_string().utf16_string_view());
 
     // 11. Let fallback be ? GetOption(options, "fallback", string, « "code", "none" », "code").
-    auto fallback = TRY(get_option(vm, *options, vm.names.fallback, OptionType::String, { "code"sv, "none"sv }, "code"sv));
+    auto fallback = TRY(get_option(vm, *options, vm.names.fallback, OptionType::String, { "code"sv, "none"sv }, u"code"sv));
 
     // 12. Set displayNames.[[Fallback]] to fallback.
-    display_names->set_fallback(fallback.as_string().utf8_string_view());
+    display_names->set_fallback(fallback.as_string().utf16_string_view());
 
     // 13. Set displayNames.[[Locale]] to r.[[Locale]].
     display_names->set_locale(move(result.locale));
+    display_names->set_icu_locale(move(result.icu_locale));
 
     // 14. Let resolvedLocaleData be r.[[LocaleData]].
     // 15. Let types be resolvedLocaleData.[[types]].
     // 16. Assert: types is a Record (see 12.2.3).
 
     // 17. Let languageDisplay be ? GetOption(options, "languageDisplay", string, « "dialect", "standard" », "dialect").
-    auto language_display = TRY(get_option(vm, *options, vm.names.languageDisplay, OptionType::String, { "dialect"sv, "standard"sv }, "dialect"sv));
+    auto language_display = TRY(get_option(vm, *options, vm.names.languageDisplay, OptionType::String, { "dialect"sv, "standard"sv }, u"dialect"sv));
 
     // 18. Let typeFields be types.[[<type>]].
     // 19. Assert: typeFields is a Record (see 12.2.3).
@@ -98,7 +99,7 @@ ThrowCompletionOr<GC::Ref<Object>> DisplayNamesConstructor::construct(FunctionOb
     // 20. If type is "language", then
     if (display_names->type() == DisplayNames::Type::Language) {
         // a. Set displayNames.[[LanguageDisplay]] to languageDisplay.
-        display_names->set_language_display(language_display.as_string().utf8_string_view());
+        display_names->set_language_display(language_display.as_string().utf16_string_view());
 
         // b. Set typeFields to typeFields.[[<languageDisplay>]].
         // c. Assert: typeFields is a Record (see 12.2.3).

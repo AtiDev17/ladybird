@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16String.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/TypedArray.h>
@@ -117,7 +118,7 @@ WebIDL::ExceptionOr<void> pack_and_post_message(JS::Realm& realm, HTML::MessageP
     auto message = JS::Object::create(realm, nullptr);
 
     // 2. Perform ! CreateDataProperty(message, "type", type).
-    MUST(message->create_data_property(vm.names.type, JS::PrimitiveString::create(vm, type)));
+    MUST(message->create_data_property(vm.names.type, JS::PrimitiveString::create(vm, Utf16String::from_ascii_without_validation(type.bytes()))));
 
     // 3. Perform ! CreateDataProperty(message, "value", value).
     MUST(message->create_data_property(vm.names.value, value));
@@ -175,7 +176,7 @@ void set_up_cross_realm_transform_readable(JS::Realm& realm, ReadableStream& str
             auto value = MUST(data.get(vm, vm.names.value));
 
             // 5. Assert: type is a String.
-            auto type_string = type.as_string().utf8_string_view();
+            auto type_string = type.as_string().utf16_string_view();
 
             // 6. If type is "chunk",
             if (type_string == "chunk"sv) {
@@ -286,7 +287,7 @@ void set_up_cross_realm_transform_writable(JS::Realm& realm, WritableStream& str
             auto value = MUST(data.get(vm, vm.names.value));
 
             // 5. Assert: type is a String.
-            auto type_string = type.as_string().utf8_string_view();
+            auto type_string = type.as_string().utf16_string_view();
 
             // 6. If type is "pull",
             if (type_string == "pull"sv) {

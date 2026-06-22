@@ -6,8 +6,11 @@
  */
 
 #include <AK/CharacterTypes.h>
+#include <AK/Checked.h>
 #include <AK/Function.h>
+#include <AK/NumericLimits.h>
 #include <AK/Optional.h>
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <LibJS/Bytecode/Debug.h>
 #include <LibJS/ModuleLoading.h>
@@ -43,6 +46,29 @@
 #include <LibJS/SourceCode.h>
 
 namespace JS {
+
+size_t max_js_string_length()
+{
+    return NumericLimits<u32>::max();
+}
+
+ThrowCompletionOr<size_t> checked_js_string_length_sum(VM& vm, size_t addend_a, size_t addend_b, ErrorType const& error_type)
+{
+    Checked<size_t> sum = addend_a;
+    sum += addend_b;
+    if (sum.has_overflow() || sum.value() > max_js_string_length())
+        return vm.throw_completion<RangeError>(error_type);
+    return sum.value();
+}
+
+ThrowCompletionOr<size_t> checked_js_string_length_product(VM& vm, size_t factor_a, size_t factor_b, ErrorType const& error_type)
+{
+    Checked<size_t> product = factor_a;
+    product *= factor_b;
+    if (product.has_overflow() || product.value() > max_js_string_length())
+        return vm.throw_completion<RangeError>(error_type);
+    return product.value();
+}
 
 // 7.2.1 RequireObjectCoercible ( argument ), https://tc39.es/ecma262/#sec-requireobjectcoercible
 ThrowCompletionOr<Value> require_object_coercible(VM& vm, Value value)
@@ -620,7 +646,8 @@ ThrowCompletionOr<Value> perform_eval(VM& vm, Value x, CallerMode strict_caller,
 
     // 6. NOTE: In the case of a direct eval, evalRealm is the realm of both the caller of eval and of the eval function itself.
     // 7. Perform ? HostEnsureCanCompileStrings(evalRealm, « », xStr, xStr, direct, « », x).
-    TRY(vm.host_ensure_can_compile_strings(eval_realm, {}, code_string->utf8_string_view(), code_string->utf8_string_view(), direct == EvalMode::Direct ? CompilationType::DirectEval : CompilationType::IndirectEval, {}, x));
+    auto code_string_view = code_string->utf16_string_view();
+    TRY(vm.host_ensure_can_compile_strings(eval_realm, {}, code_string_view, code_string_view, direct == EvalMode::Direct ? CompilationType::DirectEval : CompilationType::IndirectEval, {}, x));
 
     // 8. Let inFunction be false.
     bool in_function = false;
@@ -675,7 +702,7 @@ ThrowCompletionOr<Value> perform_eval(VM& vm, Value x, CallerMode strict_caller,
 
     auto rust_compilation = RustIntegration::compile_eval(*code_string, vm, strict_caller, in_function, in_method, in_derived_constructor, in_class_field_initializer);
     if (!rust_compilation.has_value())
-        return vm.throw_completion<SyntaxError>("Failed to compile eval code"_string);
+        return vm.throw_completion<SyntaxError>("Failed to compile eval code"_utf16);
     if (rust_compilation->is_error())
         return vm.throw_completion<SyntaxError>(rust_compilation->release_error());
     auto& eval_result = rust_compilation->value();
@@ -1250,7 +1277,7 @@ CanonicalIndex canonical_numeric_index_string(PropertyKey const& property_key, C
 
     // FIXME: We return 0 instead of n but it might not observable?
     // 3. If SameValue(! ToString(n), argument) is true, return n.
-    if (number_to_string(*maybe_double) == argument)
+    if (number_to_utf16_string(*maybe_double) == argument)
         return CanonicalIndex(CanonicalIndex::Type::Numeric, 0);
 
     // 4. Return undefined.
@@ -1258,7 +1285,7 @@ CanonicalIndex canonical_numeric_index_string(PropertyKey const& property_key, C
 }
 
 // 22.1.3.19.1 GetSubstitution ( matched, str, position, captures, namedCaptures, replacementTemplate ), https://tc39.es/ecma262/#sec-getsubstitution
-ThrowCompletionOr<String> get_substitution(VM& vm, Utf16View const& matched, Utf16View const& str, size_t position, Span<Value> captures, Value named_captures, Value replacement_template)
+ThrowCompletionOr<Utf16String> get_substitution(VM& vm, Utf16View const& matched, Utf16View const& str, size_t position, Span<Value> captures, Value named_captures, Utf16View const& replacement_template)
 {
     // 1. Let stringLength be the length of str.
     auto string_length = str.length_in_code_units();
@@ -1267,11 +1294,10 @@ ThrowCompletionOr<String> get_substitution(VM& vm, Utf16View const& matched, Utf
     VERIFY(position <= string_length);
 
     // 3. Let result be the empty String.
-    StringBuilder result(StringBuilder::Mode::UTF16);
+    Utf16StringBuilder result;
 
     // 4. Let templateRemainder be replacementTemplate.
-    auto replace_template_string = TRY(replacement_template.to_utf16_string(vm));
-    Utf16View template_remainder { replace_template_string };
+    auto template_remainder = replacement_template;
 
     // 5. Repeat, while templateRemainder is not the empty String,
     while (!template_remainder.is_empty()) {
@@ -1333,8 +1359,7 @@ ThrowCompletionOr<String> get_substitution(VM& vm, Utf16View const& matched, Utf
             auto digits = template_remainder.substring_view(1, digit_count);
 
             // iii. Let index be ℝ(StringToNumber(digits)).
-            auto utf8_digits = MUST(digits.to_utf8());
-            auto index = static_cast<size_t>(string_to_number(utf8_digits));
+            auto index = static_cast<size_t>(string_to_number(digits));
 
             // iv. Assert: 0 ≤ index ≤ 99.
             VERIFY(index <= 99);
@@ -1353,8 +1378,7 @@ ThrowCompletionOr<String> get_substitution(VM& vm, Utf16View const& matched, Utf
                 digits = digits.substring_view(0, 1);
 
                 // 4. Set index to ℝ(StringToNumber(digits)).
-                utf8_digits = MUST(digits.to_utf8());
-                index = static_cast<size_t>(string_to_number(utf8_digits));
+                index = static_cast<size_t>(string_to_number(digits));
             }
 
             // vii. Let ref be the substring of templateRemainder from 0 to 1 + digitCount.
@@ -1446,7 +1470,7 @@ ThrowCompletionOr<String> get_substitution(VM& vm, Utf16View const& matched, Utf
     }
 
     // 6. Return result.
-    return MUST(result.utf16_string_view().to_utf8());
+    return result.to_string();
 }
 
 void DisposeCapability::visit_edges(GC::Cell::Visitor& visitor) const
@@ -1909,7 +1933,7 @@ ThrowCompletionOr<Value> get_option(VM& vm, Object const& options, PropertyKey c
             [](Empty) -> Value { return js_undefined(); },
             [](bool default_) -> Value { return Value { default_ }; },
             [](double default_) -> Value { return Value { default_ }; },
-            [&](StringView default_) -> Value { return PrimitiveString::create(vm, default_); });
+            [&](Utf16View default_) -> Value { return PrimitiveString::create(vm, default_); });
     }
 
     // 3. If type is BOOLEAN, then
@@ -1923,16 +1947,17 @@ ThrowCompletionOr<Value> get_option(VM& vm, Object const& options, PropertyKey c
         VERIFY(type == OptionType::String);
 
         // b. Set value to ? ToString(value).
-        value = TRY(value.to_primitive_string(vm));
-    }
+        auto value_string = TRY(value.to_utf16_string(vm));
 
-    // 5. If values is not EMPTY and values does not contain value, throw a RangeError exception.
-    if (!values.is_empty()) {
-        // NOTE: Every location in the spec that invokes GetOption with type=boolean also has values=undefined.
-        VERIFY(value.is_string());
+        // 5. If values is not EMPTY and values does not contain value, throw a RangeError exception.
+        if (!values.is_empty()) {
+            auto value_string_view = value_string.utf16_view();
+            auto it = find_if(values.begin(), values.end(), [&](auto allowed_value) { return value_string_view == allowed_value; });
+            if (it == values.end())
+                return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, value_string_view, property.as_string());
+        }
 
-        if (auto value_string = value.as_string().utf8_string(); !values.contains_slow(value_string))
-            return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, value_string, property.as_string());
+        value = PrimitiveString::create(vm, value_string);
     }
 
     // 6. Return value.
@@ -1946,13 +1971,23 @@ ThrowCompletionOr<RoundingMode> get_rounding_mode_option(VM& vm, Object const& o
     static constexpr auto allowed_strings = to_array({ "ceil"sv, "floor"sv, "expand"sv, "trunc"sv, "halfCeil"sv, "halfFloor"sv, "halfExpand"sv, "halfTrunc"sv, "halfEven"sv });
 
     // 2. Let stringFallback be the value from the "String Identifier" column of the row with fallback in its "Rounding Mode" column.
-    auto string_fallback = allowed_strings[to_underlying(fallback)];
+    static constexpr auto utf16_allowed_strings = to_array({ u"ceil"sv, u"floor"sv, u"expand"sv, u"trunc"sv, u"halfCeil"sv, u"halfFloor"sv, u"halfExpand"sv, u"halfTrunc"sv, u"halfEven"sv });
+    auto string_fallback = utf16_allowed_strings[to_underlying(fallback)];
 
     // 3. Let stringValue be ? GetOption(options, "roundingMode", STRING, allowedStrings, stringFallback).
     auto string_value = TRY(get_option(vm, options, vm.names.roundingMode, OptionType::String, allowed_strings, string_fallback));
 
     // 4. Return the value from the "Rounding Mode" column of the row with stringValue in its "String Identifier" column.
-    return static_cast<RoundingMode>(allowed_strings.first_index_of(string_value.as_string().utf8_string_view()).value());
+    auto string = string_value.as_string().utf16_string_view();
+    Optional<size_t> index;
+    for (size_t i = 0; i < allowed_strings.size(); ++i) {
+        if (string == allowed_strings[i]) {
+            index = i;
+            break;
+        }
+    }
+    VERIFY(index.has_value());
+    return static_cast<RoundingMode>(*index);
 }
 
 // 14.5.2.4 GetRoundingIncrementOption ( options ), https://tc39.es/proposal-temporal/#sec-temporal-getroundingincrementoption

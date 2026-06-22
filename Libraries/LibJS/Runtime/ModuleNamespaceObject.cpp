@@ -30,7 +30,7 @@ void ModuleNamespaceObject::initialize(Realm& realm)
     Base::initialize(realm);
 
     // 28.3.1 @@toStringTag, https://tc39.es/ecma262/#sec-@@tostringtag
-    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Module"_string), 0);
+    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Module"_utf16_fly_string), 0);
 }
 
 size_t ModuleNamespaceObject::external_memory_size() const
@@ -75,7 +75,7 @@ ThrowCompletionOr<Optional<PropertyDescriptor>> ModuleNamespaceObject::internal_
 
     // 2. Let exports be O.[[Exports]].
     // 3. If P is not an element of exports, return undefined.
-    auto export_element = m_exports.find(property_key.to_string());
+    auto export_element = m_exports.find(property_key.to_utf16_string());
     if (export_element.is_end())
         return Optional<PropertyDescriptor> {};
 
@@ -133,7 +133,7 @@ ThrowCompletionOr<bool> ModuleNamespaceObject::internal_has_property(PropertyKey
 
     // 2. Let exports be O.[[Exports]].
     // 3. If P is an element of exports, return true.
-    auto export_element = m_exports.find(property_key.to_string());
+    auto export_element = m_exports.find(property_key.to_utf16_string());
     if (!export_element.is_end())
         return true;
 
@@ -154,13 +154,13 @@ ThrowCompletionOr<Value> ModuleNamespaceObject::internal_get(PropertyKey const& 
 
     // 2. Let exports be O.[[Exports]].
     // 3. If P is not an element of exports, return undefined.
-    auto export_element = m_exports.find(property_key.to_string());
+    auto export_element = m_exports.find(property_key.to_utf16_string());
     if (export_element.is_end())
         return js_undefined();
 
     // 4. Let m be O.[[Module]].
     // 5. Let binding be m.ResolveExport(P).
-    auto binding = m_module->resolve_export(vm, property_key.to_string());
+    auto binding = m_module->resolve_export(vm, property_key.to_utf16_string());
 
     // 6. Assert: binding is a ResolvedBinding Record.
     VERIFY(binding.is_valid());
@@ -206,7 +206,7 @@ ThrowCompletionOr<bool> ModuleNamespaceObject::internal_delete(PropertyKey const
 
     // 2. Let exports be O.[[Exports]].
     // 3. If P is an element of exports, return false.
-    auto export_element = m_exports.find(property_key.to_string());
+    auto export_element = m_exports.find(property_key.to_utf16_string());
     if (!export_element.is_end())
         return false;
 

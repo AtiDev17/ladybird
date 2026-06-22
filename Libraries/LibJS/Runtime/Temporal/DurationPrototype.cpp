@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Intl/DurationFormat.h>
 #include <LibJS/Runtime/Intl/DurationFormatConstructor.h>
@@ -33,7 +34,7 @@ void DurationPrototype::initialize(Realm& realm)
     auto& vm = this->vm();
 
     // 7.3.2 Temporal.Duration.prototype[ %Symbol.toStringTag% ], https://tc39.es/proposal-temporal/#sec-temporal.duration.prototype-%symbol.tostringtag%
-    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Temporal.Duration"_string), Attribute::Configurable);
+    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Temporal.Duration"_utf16_fly_string), Attribute::Configurable);
 
 #define __JS_ENUMERATE(unit) \
     define_native_accessor(realm, vm.names.unit, unit##_getter, {}, Attribute::Configurable);
@@ -653,16 +654,16 @@ JS_DEFINE_NATIVE_FUNCTION(DurationPrototype::to_locale_string)
     auto parts = partition_duration_format_pattern(vm, formatter, duration);
 
     // 5. Let result be the empty String.
-    StringBuilder result;
+    Utf16StringBuilder result;
 
     // 6. For each Record { [[Type]], [[Value]], [[Unit]] } part in parts, do
     for (auto const& part : parts) {
         // a. Set result to the string-concatenation of result and part.[[Value]].
-        result.append(part.value);
+        result.append(part.value.utf16_view());
     }
 
     // 7. Return result.
-    return PrimitiveString::create(vm, MUST(result.to_string()));
+    return PrimitiveString::create(vm, result.to_string());
 }
 
 // 7.3.25 Temporal.Duration.prototype.valueOf ( ), https://tc39.es/proposal-temporal/#sec-temporal.duration.prototype.valueof

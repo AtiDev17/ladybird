@@ -21,10 +21,10 @@ RelativeTimeFormat::RelativeTimeFormat(Object& prototype)
 }
 
 // 18.2.3 Internal slots, https://tc39.es/ecma402/#sec-Intl.RelativeTimeFormat-internal-slots
-ReadonlySpan<StringView> RelativeTimeFormat::relevant_extension_keys() const
+ReadonlySpan<Utf16View> RelativeTimeFormat::relevant_extension_keys() const
 {
     // The value of the [[RelevantExtensionKeys]] internal slot is « "nu" ».
-    static constexpr AK::Array keys { "nu"sv };
+    static constexpr AK::Array<Utf16View, 1> keys { "nu"sv };
     return keys;
 }
 
@@ -43,7 +43,7 @@ ReadonlySpan<ResolutionOptionDescriptor> RelativeTimeFormat::resolution_option_d
 }
 
 // 18.5.1 SingularRelativeTimeUnit ( unit ), https://tc39.es/ecma402/#sec-singularrelativetimeunit
-ThrowCompletionOr<Unicode::TimeUnit> singular_relative_time_unit(VM& vm, StringView unit)
+ThrowCompletionOr<Unicode::TimeUnit> singular_relative_time_unit(VM& vm, Utf16View unit)
 {
     // 1. If unit is "seconds", return "second".
     if (unit == "seconds"sv)
@@ -78,7 +78,7 @@ ThrowCompletionOr<Unicode::TimeUnit> singular_relative_time_unit(VM& vm, StringV
 }
 
 // 18.5.2 PartitionRelativeTimePattern ( relativeTimeFormat, value, unit ), https://tc39.es/ecma402/#sec-PartitionRelativeTimePattern
-ThrowCompletionOr<Vector<Unicode::RelativeTimeFormat::Partition>> partition_relative_time_pattern(VM& vm, RelativeTimeFormat& relative_time_format, double value, StringView unit)
+ThrowCompletionOr<Vector<Unicode::RelativeTimeFormat::Partition>> partition_relative_time_pattern(VM& vm, RelativeTimeFormat& relative_time_format, double value, Utf16View unit)
 {
     // 1. If value is NaN, +∞𝔽, or -∞𝔽, throw a RangeError exception.
     if (!Value(value).is_finite_number())
@@ -91,7 +91,7 @@ ThrowCompletionOr<Vector<Unicode::RelativeTimeFormat::Partition>> partition_rela
 }
 
 // 18.5.4 FormatRelativeTime ( relativeTimeFormat, value, unit ), https://tc39.es/ecma402/#sec-FormatRelativeTime
-ThrowCompletionOr<Utf16String> format_relative_time(VM& vm, RelativeTimeFormat& relative_time_format, double value, StringView unit)
+ThrowCompletionOr<Utf16String> format_relative_time(VM& vm, RelativeTimeFormat& relative_time_format, double value, Utf16View unit)
 {
     // 1. Let parts be ? PartitionRelativeTimePattern(relativeTimeFormat, value, unit).
     auto time_unit = TRY([&]() -> ThrowCompletionOr<Unicode::TimeUnit> {
@@ -114,7 +114,7 @@ ThrowCompletionOr<Utf16String> format_relative_time(VM& vm, RelativeTimeFormat& 
 }
 
 // 18.5.5 FormatRelativeTimeToParts ( relativeTimeFormat, value, unit ), https://tc39.es/ecma402/#sec-FormatRelativeTimeToParts
-ThrowCompletionOr<GC::Ref<Array>> format_relative_time_to_parts(VM& vm, RelativeTimeFormat& relative_time_format, double value, StringView unit)
+ThrowCompletionOr<GC::Ref<Array>> format_relative_time_to_parts(VM& vm, RelativeTimeFormat& relative_time_format, double value, Utf16View unit)
 {
     auto& realm = *vm.current_realm();
 
@@ -131,7 +131,7 @@ ThrowCompletionOr<GC::Ref<Array>> format_relative_time_to_parts(VM& vm, Relative
         auto object = Object::create(realm, realm.intrinsics().object_prototype());
 
         // b. Perform ! CreateDataPropertyOrThrow(O, "type", part.[[Type]]).
-        MUST(object->create_data_property_or_throw(vm.names.type, PrimitiveString::create(vm, part.type)));
+        MUST(object->create_data_property_or_throw(vm.names.type, PrimitiveString::create(vm, move(part.type))));
 
         // c. Perform ! CreateDataPropertyOrThrow(O, "value", part.[[Value]]).
         MUST(object->create_data_property_or_throw(vm.names.value, PrimitiveString::create(vm, move(part.value))));
@@ -139,7 +139,7 @@ ThrowCompletionOr<GC::Ref<Array>> format_relative_time_to_parts(VM& vm, Relative
         // d. If part.[[Unit]] is not empty, then
         if (!part.unit.is_empty()) {
             // i. Perform ! CreateDataPropertyOrThrow(O, "unit", part.[[Unit]]).
-            MUST(object->create_data_property_or_throw(vm.names.unit, PrimitiveString::create(vm, part.unit)));
+            MUST(object->create_data_property_or_throw(vm.names.unit, PrimitiveString::create(vm, move(part.unit))));
         }
 
         // e. Perform ! CreateDataPropertyOrThrow(result, ! ToString(n), O).

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <LibUnicode/Locale.h>
 
@@ -18,15 +19,16 @@ enum class ListFormatType {
     Unit,
 };
 ListFormatType list_format_type_from_string(StringView);
-StringView list_format_type_to_string(ListFormatType);
+ListFormatType list_format_type_from_string(Utf16View);
+Utf16String list_format_type_to_string(ListFormatType);
 
 class ListFormat {
 public:
-    static NonnullOwnPtr<ListFormat> create(StringView locale, ListFormatType, Style);
+    static NonnullOwnPtr<ListFormat> create(Utf16View locale, ListFormatType, Style);
     virtual ~ListFormat() = default;
 
     struct Partition {
-        StringView type;
+        Utf16String type;
         Utf16String value;
     };
 

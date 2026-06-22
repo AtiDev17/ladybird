@@ -11,6 +11,8 @@
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/StringView.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 
 namespace Unicode {
 
@@ -21,12 +23,13 @@ enum class SegmenterGranularity {
     Word,
 };
 SegmenterGranularity segmenter_granularity_from_string(StringView);
-StringView segmenter_granularity_to_string(SegmenterGranularity);
+SegmenterGranularity segmenter_granularity_from_string(Utf16View);
+Utf16String segmenter_granularity_to_string(SegmenterGranularity);
 
 class Segmenter {
 public:
     static NonnullOwnPtr<Segmenter> create(SegmenterGranularity segmenter_granularity);
-    static NonnullOwnPtr<Segmenter> create(StringView locale, SegmenterGranularity segmenter_granularity);
+    static NonnullOwnPtr<Segmenter> create(Utf16View locale, SegmenterGranularity segmenter_granularity);
     static NonnullOwnPtr<Segmenter> create_for_ascii_grapheme(size_t length);
     static OwnPtr<Segmenter> try_create_for_ascii_line(Utf16View const&);
     virtual ~Segmenter() = default;

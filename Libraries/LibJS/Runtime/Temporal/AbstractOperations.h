@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <AK/Utf16View.h>
 #include <AK/Variant.h>
 #include <LibCrypto/BigInt/SignedBigInteger.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
@@ -99,7 +100,7 @@ enum class Unit {
     Microsecond,
     Nanosecond,
 };
-StringView temporal_unit_to_string(Unit);
+Utf16View temporal_unit_to_string(Unit);
 
 // https://tc39.es/proposal-temporal/#sec-temporal-units
 enum class UnitCategory {
@@ -183,20 +184,20 @@ UnitCategory temporal_unit_category(Unit);
 RoundingIncrement maximum_temporal_duration_rounding_increment(Unit);
 Crypto::UnsignedBigInteger const& temporal_unit_length_in_nanoseconds(Unit);
 ThrowCompletionOr<bool> is_partial_temporal_object(VM&, Value);
-String format_fractional_seconds(u64, Precision);
-String format_time_string(u8 hour, u8 minute, u8 second, u64 sub_second_nanoseconds, SecondsStringPrecision::Precision, Optional<TimeStyle> = {});
+Utf16String format_fractional_seconds(u64, Precision);
+Utf16String format_time_string(u8 hour, u8 minute, u8 second, u64 sub_second_nanoseconds, SecondsStringPrecision::Precision, Optional<TimeStyle> = {});
 UnsignedRoundingMode get_unsigned_rounding_mode(RoundingMode, Sign);
 double apply_unsigned_rounding_mode(double, double r1, double r2, UnsignedRoundingMode);
 Crypto::SignedBigInteger apply_unsigned_rounding_mode(Crypto::SignedDivisionResult const&, Crypto::SignedBigInteger r1, Crypto::SignedBigInteger r2, UnsignedRoundingMode, Crypto::UnsignedBigInteger const& increment);
 double round_number_to_increment(double, u64 increment, RoundingMode);
 Crypto::SignedBigInteger round_number_to_increment(Crypto::SignedBigInteger const&, Crypto::UnsignedBigInteger const& increment, RoundingMode);
 Crypto::SignedBigInteger round_number_to_increment_as_if_positive(Crypto::SignedBigInteger const&, Crypto::UnsignedBigInteger const& increment, RoundingMode);
-ThrowCompletionOr<ParsedISODateTime> parse_iso_date_time(VM&, StringView iso_string, ReadonlySpan<Production> allowed_formats);
-ThrowCompletionOr<String> parse_temporal_calendar_string(VM&, String const&);
-ThrowCompletionOr<GC::Ref<Duration>> parse_temporal_duration_string(VM&, StringView iso_string);
-ThrowCompletionOr<ParsedTimeZoneIdentifier> parse_temporal_time_zone_string(VM&, StringView time_zone_string);
-ThrowCompletionOr<String> to_offset_string(VM&, Value argument);
-CalendarFields iso_date_to_fields(String const& calendar, ISODate, DateType);
+ThrowCompletionOr<ParsedISODateTime> parse_iso_date_time(VM&, Utf16View iso_string, ReadonlySpan<Production> allowed_formats);
+ThrowCompletionOr<Utf16String> parse_temporal_calendar_string(VM&, Utf16View);
+ThrowCompletionOr<GC::Ref<Duration>> parse_temporal_duration_string(VM&, Utf16View iso_string);
+ThrowCompletionOr<ParsedTimeZoneIdentifier> parse_temporal_time_zone_string(VM&, Utf16View time_zone_string);
+ThrowCompletionOr<Utf16String> to_offset_string(VM&, Value argument);
+CalendarFields iso_date_to_fields(Utf16View calendar, ISODate, DateType);
 ThrowCompletionOr<DifferenceSettings> get_difference_settings(VM&, DurationOperation, Object const& options, UnitGroup, ReadonlySpan<Unit> disallowed_units, Unit fallback_smallest_unit, Unit smallest_largest_default_unit);
 
 // 13.40 ToIntegerWithTruncation ( argument ), https://tc39.es/proposal-temporal/#sec-tointegerwithtruncation
@@ -215,10 +216,10 @@ ThrowCompletionOr<double> to_integer_with_truncation(VM& vm, Value argument, Err
 }
 
 // 13.40 ToIntegerWithTruncation ( argument ), https://tc39.es/proposal-temporal/#sec-tointegerwithtruncation
-// AD-HOC: We often need to use this AO when we have a parsed StringView. This overload allows callers to avoid creating
+// AD-HOC: We often need to use this AO when we have a parsed Utf16View. This overload allows callers to avoid creating
 //         a PrimitiveString for the primary definition.
 template<typename... Args>
-ThrowCompletionOr<double> to_integer_with_truncation(VM& vm, StringView argument, ErrorType const& error_type, Args&&... args)
+ThrowCompletionOr<double> to_integer_with_truncation(VM& vm, Utf16View argument, ErrorType const& error_type, Args&&... args)
 {
     // 1. Let number be ? ToNumber(argument).
     auto number = string_to_number(argument);

@@ -35,14 +35,14 @@ WebIDL::ExceptionOr<GC::Ref<Memory>> Memory::construct_impl(JS::Realm& realm, Bi
     // https://webassembly.github.io/threads/js-api/index.html#dom-memory-memory
     // 3. If maximum is not empty and maximum < initial, throw a RangeError exception.
     if (descriptor.maximum.has_value() && descriptor.maximum.value() < descriptor.initial) {
-        return vm.throw_completion<JS::RangeError>("Initial is larger than maximum."sv);
+        return vm.throw_completion<JS::RangeError>("Initial is larger than maximum."_utf16);
     }
 
     // 4. Let share be shared if descriptor["shared"] is true and unshared otherwise.
     // 5. If share is shared and maximum is empty, throw a TypeError exception.
     auto shared = descriptor.shared;
     if (shared && !descriptor.maximum.has_value())
-        return vm.throw_completion<JS::TypeError>("Maximum has to be specified for shared memory."sv);
+        return vm.throw_completion<JS::TypeError>("Maximum has to be specified for shared memory."_utf16);
 
     Wasm::Limits limits { Wasm::AddressType::I32, descriptor.initial, descriptor.maximum.map([](auto x) -> u64 { return x; }) };
     Wasm::MemoryType memory_type { move(limits) };
@@ -50,7 +50,7 @@ WebIDL::ExceptionOr<GC::Ref<Memory>> Memory::construct_impl(JS::Realm& realm, Bi
     auto& cache = Detail::get_cache(realm);
     auto address = cache.abstract_machine().store().allocate(memory_type);
     if (!address.has_value())
-        return vm.throw_completion<JS::TypeError>("Wasm Memory allocation failed"sv);
+        return vm.throw_completion<JS::TypeError>("Wasm Memory allocation failed"_utf16);
 
     auto memory_object = realm.create<Memory>(realm, *address, shared ? Shared::Yes : Shared::No);
 
@@ -114,7 +114,7 @@ JS::ThrowCompletionOr<u32> Memory::grow(u32 delta)
 
     auto previous_size = memory->size() / Wasm::Constants::page_size;
     if (!memory->grow(delta * Wasm::Constants::page_size, Wasm::MemoryInstance::GrowType::No, Wasm::MemoryInstance::InhibitGrowCallback::Yes))
-        return vm.throw_completion<JS::RangeError>("Memory.grow() grows past the stated limit of the memory instance"sv);
+        return vm.throw_completion<JS::RangeError>("Memory.grow() grows past the stated limit of the memory instance"_utf16);
 
     refresh_the_memory_buffer(vm, realm(), m_address);
 
@@ -139,7 +139,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::ArrayBuffer>> Memory::to_fixed_length_buffer()
         auto fixed_buffer = create_a_fixed_length_memory_buffer(vm, realm(), m_address, m_shared, *this);
 
         // 2. Perform ! DetachArrayBuffer(buffer, "WebAssembly.Memory").
-        MUST(JS::detach_array_buffer(vm, *m_buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string)));
+        MUST(JS::detach_array_buffer(vm, *m_buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string)));
 
         // 3. Set this.[[BufferObject]] to fixedBuffer.
         m_buffer = fixed_buffer;
@@ -197,7 +197,7 @@ WebIDL::ExceptionOr<GC::Ref<JS::ArrayBuffer>> Memory::to_resizable_buffer()
     // 5. If IsSharedArrayBuffer(buffer) is false,
     // 9. Perform ! DetachArrayBuffer(buffer, "WebAssembly.Memory").
     if (!m_buffer->is_shared_array_buffer())
-        MUST(JS::detach_array_buffer(vm, *m_buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string)));
+        MUST(JS::detach_array_buffer(vm, *m_buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string)));
 
     // 10. Set this.[[BufferObject]] to resizableBuffer.
     m_buffer = resizable_buffer;
@@ -225,7 +225,7 @@ void Memory::refresh_the_memory_buffer(JS::VM& vm, JS::Realm& realm, Wasm::Memor
         // 1. If IsSharedArrayBuffer(buffer) is false,
         if (!buffer->is_shared_array_buffer()) {
             // 1. Perform ! DetachArrayBuffer(buffer, "WebAssembly.Memory").
-            MUST(JS::detach_array_buffer(vm, *buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string)));
+            MUST(JS::detach_array_buffer(vm, *buffer, JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string)));
         }
 
         // 2. Let newBuffer be the result of creating a fixed length memory buffer from memaddr.
@@ -301,7 +301,7 @@ GC::Ref<JS::ArrayBuffer> Memory::create_a_fixed_length_memory_buffer(JS::VM& vm,
     // 4. Otherwise,
     else {
         array_buffer = JS::ArrayBuffer::create(realm, JS::DataBlock::UnownedExternalBuffer(owner, &memory->data(), wasm_memory_buffer_data, wasm_memory_buffer_size));
-        array_buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string));
+        array_buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string));
     }
 
     return GC::Ref(*array_buffer);
@@ -318,7 +318,7 @@ JS::ThrowCompletionOr<GC::Ref<JS::ArrayBuffer>> Memory::create_a_resizable_memor
     // 3. If maxsize > (65536 × 65536),
     if (max_size > (65536 * Wasm::Constants::page_size)) {
         // 1. Throw a RangeError exception.
-        return vm.throw_completion<JS::RangeError>("Maximum memory length exceeds 65536 * 65536 bytes"sv);
+        return vm.throw_completion<JS::RangeError>("Maximum memory length exceeds 65536 * 65536 bytes"_utf16);
     }
 
     // https://webassembly.github.io/threads/js-api/index.html#create-a-resizable-memory-buffer
@@ -344,7 +344,7 @@ JS::ThrowCompletionOr<GC::Ref<JS::ArrayBuffer>> Memory::create_a_resizable_memor
         // AD-HOC: Set buffer.[[ArrayBufferDetachKey]] to "WebAssembly.Memory".
         //         SharedArrayBuffers can't be detached, but this allows us to bail early from HostGrowSharedArrayBuffer
         //         for SharedArrayBuffers not associated with a WebAssembly memory.
-        buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string));
+        buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string));
 
         // 7. Return buffer.
         return buffer;
@@ -364,7 +364,7 @@ JS::ThrowCompletionOr<GC::Ref<JS::ArrayBuffer>> Memory::create_a_resizable_memor
         buffer->set_max_byte_length(max_size);
 
         // 8. Set buffer.[[ArrayBufferDetachKey]] to "WebAssembly.Memory".
-        buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_string));
+        buffer->set_detach_key(JS::PrimitiveString::create(vm, "WebAssembly.Memory"_utf16_fly_string));
 
         // 9. Return buffer.
         return buffer;

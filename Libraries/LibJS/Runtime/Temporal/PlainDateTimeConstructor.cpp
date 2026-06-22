@@ -94,14 +94,14 @@ ThrowCompletionOr<GC::Ref<Object>> PlainDateTimeConstructor::construct(FunctionO
 
     // 11. If calendar is undefined, set calendar to "iso8601".
     if (calendar_value.is_undefined())
-        calendar_value = PrimitiveString::create(vm, "iso8601"_string);
+        calendar_value = PrimitiveString::create(vm, "iso8601"_utf16_fly_string);
 
     // 12. If calendar is not a String, throw a TypeError exception.
     if (!calendar_value.is_string())
         return vm.throw_completion<TypeError>(ErrorType::NotAString, "calendar"sv);
 
     // 13. Set calendar to ? CanonicalizeCalendar(calendar).
-    auto calendar = TRY(canonicalize_calendar(vm, calendar_value.as_string().utf8_string_view()));
+    auto calendar = TRY(canonicalize_calendar(vm, calendar_value.as_string().utf16_string_view()));
 
     // 14. If IsValidISODate(isoYear, isoMonth, isoDay) is false, throw a RangeError exception.
     if (!is_valid_iso_date(iso_year, iso_month, iso_day))

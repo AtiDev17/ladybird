@@ -31,7 +31,7 @@ void OptionConstructor::initialize(JS::Realm& realm)
     Base::initialize(realm);
 
     define_direct_property(vm.names.length, JS::Value(0), JS::Attribute::Configurable);
-    define_direct_property(vm.names.name, JS::PrimitiveString::create(vm, "Option"_string), JS::Attribute::Configurable);
+    define_direct_property(vm.names.name, JS::PrimitiveString::create(vm, "Option"_utf16_fly_string), JS::Attribute::Configurable);
     define_direct_property(vm.names.prototype, &ensure_web_prototype<Bindings::HTMLOptionElementPrototype>(realm, "HTMLOptionElement"_fly_string), 0);
 }
 
@@ -72,7 +72,7 @@ JS::ThrowCompletionOr<GC::Ref<JS::Object>> OptionConstructor::construct(Function
 
     // 4. If value is given, then set an attribute value for option using "value" and value.
     if (!vm.argument(1).is_undefined()) {
-        auto value = TRY(vm.argument(1).to_string(vm));
+        auto value = TRY(vm.argument(1).to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
         option_element->set_attribute_value(HTML::AttributeNames::value, value);
     }
 

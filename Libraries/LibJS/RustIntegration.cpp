@@ -85,21 +85,21 @@ struct BytecodeDumpBuilder {
 // --- Error collection callbacks ---
 
 // Collects parse errors as a Vector<ParserError> (for Script/Module compilation).
-static void collect_parse_errors(void* ctx, uint8_t const* message, size_t message_len, uint32_t line, uint32_t column)
+static void collect_parse_errors(void* ctx, uint16_t const* message, size_t message_len, uint32_t line, uint32_t column)
 {
     auto& errors = *static_cast<Vector<ParserError>*>(ctx);
     errors.append({
-        MUST(String::from_utf8({ message, message_len })),
+        Utf16String::from_utf16(utf16_view_from_bytes(message, message_len)),
         Position { line, column },
     });
 }
 
-// Collects a single parse error as a formatted String (for eval/dynamic function compilation).
-static void collect_single_parse_error(void* ctx, uint8_t const* message, size_t message_len, uint32_t line, uint32_t column)
+// Collects a single parse error as a formatted Utf16String (for eval/dynamic function compilation).
+static void collect_single_parse_error(void* ctx, uint16_t const* message, size_t message_len, uint32_t line, uint32_t column)
 {
-    auto& error_message = *static_cast<String*>(ctx);
+    auto& error_message = *static_cast<Utf16String*>(ctx);
     if (error_message.is_empty())
-        error_message = MUST(String::formatted("{} (line: {}, column: {})", MUST(String::from_utf8({ message, message_len })), line, column));
+        error_message = Utf16String::formatted("{} (line: {}, column: {})", utf16_view_from_bytes(message, message_len), line, column);
 }
 
 // --- Script GDI builder and callbacks ---
@@ -169,14 +169,14 @@ static void bytecode_dump_append_value_string(void* ctx, uint64_t encoded)
 {
     auto& builder = *static_cast<JS::RustIntegration::BytecodeDumpBuilder*>(ctx);
     auto value = bit_cast<Value>(encoded);
-    builder.output.append(value.as_string().utf8_string_view());
+    builder.output.append(value.as_string().utf16_string_view());
 }
 
 static void bytecode_dump_append_value_bigint(void* ctx, uint64_t encoded)
 {
     auto& builder = *static_cast<JS::RustIntegration::BytecodeDumpBuilder*>(ctx);
     auto value = bit_cast<Value>(encoded);
-    builder.output.append(MUST(value.as_bigint().to_string()));
+    builder.output.append(value.as_bigint().to_utf16_string());
 }
 
 static void bytecode_dump_append_value_fallback(void* ctx, uint64_t encoded)
@@ -697,18 +697,18 @@ Optional<Result<ScriptResult, Vector<ParserError>>> materialize_bytecode_cache_s
     void* exec_ptr = rust_materialize_bytecode_cache_script(blob, &realm.vm(), source_code.ptr(), source_code->length_in_code_units(), &builder.shared_function_data, &builder);
 
     if (!exec_ptr)
-        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_string, {} } };
+        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_utf16, {} } };
 
     builder.collect_shared_function_data();
     builder.result.executable = static_cast<Bytecode::Executable*>(exec_ptr);
     return builder.result;
 }
 
-Optional<Result<ScriptResult, Vector<ParserError>>> compile_script(StringView source_text, Realm& realm, StringView filename, size_t line_number_offset)
+Optional<Result<ScriptResult, Vector<ParserError>>> compile_script(Utf16View source_text, Realm& realm, Utf16View display_filename, size_t line_number_offset)
 {
     auto source_code = SourceCode::create(
-        String::from_utf8(filename).release_value_but_fixme_should_propagate_errors(),
-        Utf16String::from_utf8(source_text));
+        Utf16String::from_utf16(display_filename),
+        Utf16String::from_utf16(source_text));
 
     auto const* source_ptr = source_code->utf16_data();
     auto length = source_code->length_in_code_units();
@@ -718,7 +718,7 @@ Optional<Result<ScriptResult, Vector<ParserError>>> compile_script(StringView so
     return compile_parsed_script(parsed, source_code, realm);
 }
 
-Optional<Result<EvalResult, String>> compile_eval(
+Optional<Result<EvalResult, Utf16String>> compile_eval(
     PrimitiveString& code_string, VM& vm,
     CallerMode strict_caller, bool in_function, bool in_method,
     bool in_derived_constructor, bool in_class_field_initializer)
@@ -729,7 +729,7 @@ Optional<Result<EvalResult, String>> compile_eval(
 
     GC::DeferGC defer_gc(vm.heap());
     EvalGdiBuilder builder;
-    String parse_error;
+    Utf16String parse_error;
 
     auto const* source_ptr = source_code->utf16_data();
 
@@ -889,7 +889,7 @@ Optional<Result<ModuleResult, Vector<ParserError>>> materialize_bytecode_cache_m
         &builder, &callbacks, &tla_executable);
 
     if (!exec_ptr && !tla_executable)
-        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_string, {} } };
+        return Vector<ParserError> { ParserError { "Failed to materialize bytecode cache"_utf16, {} } };
 
     builder.collect_shared_function_data();
     if (tla_executable) {
@@ -989,10 +989,17 @@ ModuleBytecodeCacheInstallResult install_generated_bytecode_cache_module(Decoded
     return result.release_value();
 }
 
-Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(StringView source_text, Realm& realm, StringView filename)
+Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(Utf16View source_text, Realm& realm, Utf16View display_filename)
 {
-    auto source_code = SourceCode::create(String::from_utf8(filename).release_value_but_fixme_should_propagate_errors(), Utf16String::from_utf8(source_text));
+    auto source_code = SourceCode::create(
+        Utf16String::from_utf16(display_filename),
+        Utf16String::from_utf16(source_text));
 
+    return compile_module(move(source_code), realm);
+}
+
+Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(NonnullRefPtr<SourceCode const> source_code, Realm& realm)
+{
     auto const* source_ptr = source_code->utf16_data();
     auto length = source_code->length_in_code_units();
     auto* parsed = rust_parse_program(source_ptr, length, static_cast<u8>(ProgramType::Module), 0, g_dump_ast, g_dump_ast_use_color);
@@ -1000,16 +1007,13 @@ Optional<Result<ModuleResult, Vector<ParserError>>> compile_module(StringView so
     return compile_parsed_module(parsed, source_code, realm);
 }
 
-Optional<Result<GC::Ref<SharedFunctionInstanceData>, String>> compile_dynamic_function(
-    VM& vm, StringView source_text, StringView parameters_string, StringView body_parse_string,
+Optional<Result<GC::Ref<SharedFunctionInstanceData>, Utf16String>> compile_dynamic_function(
+    VM& vm, Utf16View source_text, Utf16View parameters_string, Utf16View body_parse_string,
     FunctionKind kind)
 {
-    auto source_code = SourceCode::create({}, Utf16String::from_utf8(source_text));
+    auto source_code = SourceCode::create({}, Utf16String::from_utf16(source_text));
     auto const& code_view = source_code->code_view();
     auto full_length = code_view.length_in_code_units();
-
-    auto params_utf16 = Utf16String::from_utf8(parameters_string);
-    auto body_utf16 = Utf16String::from_utf8(body_parse_string);
 
     auto prepare_utf16 = [](Utf16View const& view, Vector<u16>& buf) -> u16 const* {
         if (view.has_ascii_storage()) {
@@ -1024,16 +1028,16 @@ Optional<Result<GC::Ref<SharedFunctionInstanceData>, String>> compile_dynamic_fu
 
     Vector<u16> full_buf, params_buf, body_buf;
     auto const* full_data = prepare_utf16(code_view, full_buf);
-    auto const* params_data = prepare_utf16(params_utf16.utf16_view(), params_buf);
-    auto const* body_data = prepare_utf16(body_utf16.utf16_view(), body_buf);
+    auto const* params_data = prepare_utf16(parameters_string, params_buf);
+    auto const* body_data = prepare_utf16(body_parse_string, body_buf);
 
     GC::DeferGC defer_gc(vm.heap());
-    String parse_error;
+    Utf16String parse_error;
 
     void* sfd_ptr = rust_compile_dynamic_function(
         full_data, full_length,
-        params_data, params_utf16.utf16_view().length_in_code_units(),
-        body_data, body_utf16.utf16_view().length_in_code_units(),
+        params_data, parameters_string.length_in_code_units(),
+        body_data, body_parse_string.length_in_code_units(),
         &vm, source_code.ptr(),
         static_cast<u8>(kind),
         &parse_error, collect_single_parse_error,
@@ -1043,16 +1047,15 @@ Optional<Result<GC::Ref<SharedFunctionInstanceData>, String>> compile_dynamic_fu
         return parse_error;
 
     auto& function_data = *static_cast<SharedFunctionInstanceData*>(sfd_ptr);
-    function_data.m_source_text_owner = Utf16String::from_utf8(source_text);
+    function_data.m_source_text_owner = Utf16String::from_utf16(source_text);
 
     return GC::Ref<SharedFunctionInstanceData> { function_data };
 }
 
 Optional<Vector<GC::Root<SharedFunctionInstanceData>>> compile_builtin_file(
-    unsigned char const* script_text, VM& vm)
+    Utf16View script_text, VM& vm)
 {
-    auto script_text_as_utf16 = Utf16String::from_utf8_without_validation({ script_text, strlen(reinterpret_cast<char const*>(script_text)) });
-    auto code = SourceCode::create("BuiltinFile"_string, move(script_text_as_utf16));
+    auto code = SourceCode::create("BuiltinFile"_utf16, Utf16String::from_utf16(script_text));
 
     auto const& code_view = code->code_view();
     auto length = code_view.length_in_code_units();
@@ -1160,7 +1163,7 @@ void free_function_ast(void* ast)
 namespace JS::FFI {
 
 struct RustCompiledRegex {
-    String parsed_pattern;
+    Utf16String parsed_pattern;
 };
 
 static Utf16View view_from_ffi(FFIUtf16Slice slice)
@@ -1827,11 +1830,21 @@ extern "C" void module_sfd_set_name(
 extern "C" void* rust_compile_regex(
     uint16_t const* pattern_data, size_t pattern_len,
     uint16_t const* flags_data, size_t flags_len,
-    char const** error_out)
+    uint16_t const** error_out, size_t* error_len_out)
 {
     *error_out = nullptr;
+    *error_len_out = 0;
     auto pattern = JS::RustIntegration::utf16_view_from_bytes(pattern_data, pattern_len);
     auto flags_view = JS::RustIntegration::utf16_view_from_bytes(flags_data, flags_len);
+
+    auto set_error = [&](Utf16String message) {
+        auto view = message.utf16_view();
+        auto* buffer = static_cast<uint16_t*>(kmalloc(view.length_in_code_units() * sizeof(uint16_t)));
+        for (size_t i = 0; i < view.length_in_code_units(); ++i)
+            buffer[i] = view.code_unit_at(i);
+        *error_out = buffer;
+        *error_len_out = view.length_in_code_units();
+    };
 
     // Extract unicode/unicode_sets from flags for parse_regex_pattern.
     bool is_unicode = false;
@@ -1846,11 +1859,7 @@ extern "C" void* rust_compile_regex(
 
     auto parsed_pattern = JS::parse_regex_pattern(pattern, is_unicode, is_unicode_sets);
     if (parsed_pattern.is_error()) {
-        auto msg = MUST(String::formatted("RegExp compile error: {}", parsed_pattern.release_error().error));
-        auto* buf = static_cast<char*>(kmalloc(msg.byte_count() + 1));
-        memcpy(buf, msg.bytes().data(), msg.byte_count());
-        buf[msg.byte_count()] = '\0';
-        *error_out = buf;
+        set_error(Utf16String::formatted("RegExp compile error: {}", parsed_pattern.release_error().error));
         return nullptr;
     }
     auto pattern_str = parsed_pattern.release_value();
@@ -1889,13 +1898,10 @@ extern "C" void* rust_compile_regex(
         }
     }
 
-    auto compiled = regex::ECMAScriptRegex::compile(pattern_str.bytes_as_string_view(), compile_flags);
+    auto compiled = regex::ECMAScriptRegex::compile(pattern_str.utf16_view(), compile_flags);
     if (compiled.is_error()) {
-        auto msg = MUST(String::formatted("RegExp compile error: {}", compiled.release_error()));
-        auto* buf = static_cast<char*>(kmalloc(msg.byte_count() + 1));
-        memcpy(buf, msg.bytes().data(), msg.byte_count());
-        buf[msg.byte_count()] = '\0';
-        *error_out = buf;
+        auto error = compiled.release_error();
+        set_error(Utf16String::formatted("RegExp compile error: {}", Utf16String::from_utf8(error)));
         return nullptr;
     }
 
@@ -1907,9 +1913,9 @@ extern "C" void rust_free_compiled_regex(void* ptr)
     delete static_cast<RustCompiledRegex*>(ptr);
 }
 
-extern "C" void rust_free_error_string(char const* str)
+extern "C" void rust_free_error_string(uint16_t const* str)
 {
-    kfree(const_cast<char*>(str));
+    kfree(const_cast<uint16_t*>(str));
 }
 
 extern "C" size_t rust_number_to_utf16(double value, uint16_t* buffer, size_t buffer_len)
@@ -1919,19 +1925,6 @@ extern "C" size_t rust_number_to_utf16(double value, uint16_t* buffer, size_t bu
     auto len = min(view.length_in_code_units(), buffer_len);
     for (size_t i = 0; i < len; ++i)
         buffer[i] = view.code_unit_at(i);
-    return len;
-}
-
-// FIXME: This FFI workaround exists only to match C++ float-to-string
-//        formatting in the Rust AST dump. Once the C++ pipeline is
-//        removed, this can be deleted and the Rust side can use its own
-//        formatting without needing to match C++.
-extern "C" size_t rust_format_double(double value, uint8_t* buffer, size_t buffer_len)
-{
-    auto str = MUST(String::formatted("{}", value));
-    auto bytes = str.bytes();
-    auto len = min(bytes.size(), buffer_len);
-    memcpy(buffer, bytes.data(), len);
     return len;
 }
 

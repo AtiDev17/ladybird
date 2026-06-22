@@ -69,14 +69,14 @@ ThrowCompletionOr<GC::Ref<Object>> PlainMonthDayConstructor::construct(FunctionO
 
     // 5. If calendar is undefined, set calendar to "iso8601".
     if (calendar_value.is_undefined())
-        calendar_value = PrimitiveString::create(vm, "iso8601"_string);
+        calendar_value = PrimitiveString::create(vm, "iso8601"_utf16_fly_string);
 
     // 6. If calendar is not a String, throw a TypeError exception.
     if (!calendar_value.is_string())
         return vm.throw_completion<TypeError>(ErrorType::NotAString, calendar_value);
 
     // 7. Set calendar to ? CanonicalizeCalendar(calendar).
-    auto calendar = TRY(canonicalize_calendar(vm, calendar_value.as_string().utf8_string_view()));
+    auto calendar = TRY(canonicalize_calendar(vm, calendar_value.as_string().utf16_string_view()));
 
     // 8. Let y be ? ToIntegerWithTruncation(referenceISOYear).
     auto year = TRY(to_integer_with_truncation(vm, reference_iso_year, ErrorType::TemporalInvalidPlainMonthDay));

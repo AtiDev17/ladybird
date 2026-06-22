@@ -28,7 +28,7 @@ void AudioConstructor::initialize(JS::Realm& realm)
     Base::initialize(realm);
 
     define_direct_property(vm.names.length, JS::Value(0), JS::Attribute::Configurable);
-    define_direct_property(vm.names.name, JS::PrimitiveString::create(vm, "Audio"_string), JS::Attribute::Configurable);
+    define_direct_property(vm.names.name, JS::PrimitiveString::create(vm, "Audio"_utf16_fly_string), JS::Attribute::Configurable);
     define_direct_property(vm.names.prototype, &ensure_web_prototype<Bindings::HTMLAudioElementPrototype>(realm, "HTMLAudioElement"_fly_string), 0);
 }
 
@@ -61,7 +61,7 @@ JS::ThrowCompletionOr<GC::Ref<JS::Object>> AudioConstructor::construct(FunctionO
     // 4. If src is given, then set an attribute value for audio using "src" and src.
     //    (This will cause the user agent to invoke the object's resource selection algorithm before returning.)
     if (!src_value.is_undefined()) {
-        auto src = TRY(src_value.to_string(vm));
+        auto src = TRY(src_value.to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
         audio->set_attribute_value(HTML::AttributeNames::src, move(src));
     }
 

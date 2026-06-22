@@ -19,7 +19,7 @@ DisplayNames::DisplayNames(Object& prototype)
 }
 
 // 12.2.3 Internal slots, https://tc39.es/ecma402/#sec-Intl.DisplayNames-internal-slots
-ReadonlySpan<StringView> DisplayNames::relevant_extension_keys() const
+ReadonlySpan<Utf16View> DisplayNames::relevant_extension_keys() const
 {
     // The value of the [[RelevantExtensionKeys]] internal slot is « ».
     return {};
@@ -32,7 +32,7 @@ ReadonlySpan<ResolutionOptionDescriptor> DisplayNames::resolution_option_descrip
     return {};
 }
 
-void DisplayNames::set_type(StringView type)
+void DisplayNames::set_type(Utf16View type)
 {
     if (type == "language"sv)
         m_type = Type::Language;
@@ -50,27 +50,27 @@ void DisplayNames::set_type(StringView type)
         VERIFY_NOT_REACHED();
 }
 
-StringView DisplayNames::type_string() const
+Utf16String DisplayNames::type_string() const
 {
     switch (m_type) {
     case Type::Language:
-        return "language"sv;
+        return "language"_utf16;
     case Type::Region:
-        return "region"sv;
+        return "region"_utf16;
     case Type::Script:
-        return "script"sv;
+        return "script"_utf16;
     case Type::Currency:
-        return "currency"sv;
+        return "currency"_utf16;
     case Type::Calendar:
-        return "calendar"sv;
+        return "calendar"_utf16;
     case Type::DateTimeField:
-        return "dateTimeField"sv;
+        return "dateTimeField"_utf16;
     default:
         VERIFY_NOT_REACHED();
     }
 }
 
-void DisplayNames::set_fallback(StringView fallback)
+void DisplayNames::set_fallback(Utf16View fallback)
 {
     if (fallback == "none"sv)
         m_fallback = Fallback::None;
@@ -80,20 +80,20 @@ void DisplayNames::set_fallback(StringView fallback)
         VERIFY_NOT_REACHED();
 }
 
-StringView DisplayNames::fallback_string() const
+Utf16String DisplayNames::fallback_string() const
 {
     switch (m_fallback) {
     case Fallback::None:
-        return "none"sv;
+        return "none"_utf16;
     case Fallback::Code:
-        return "code"sv;
+        return "code"_utf16;
     default:
         VERIFY_NOT_REACHED();
     }
 }
 
 // 12.5.1 CanonicalCodeForDisplayNames ( type, code ), https://tc39.es/ecma402/#sec-canonicalcodefordisplaynames
-ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::Type type, StringView code)
+ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::Type type, Utf16View code)
 {
     // 1. If type is "language", then
     if (type == DisplayNames::Type::Language) {
@@ -107,7 +107,7 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
 
         // c. Return ! CanonicalizeUnicodeLocaleId(code).
         auto canonicalized_tag = canonicalize_unicode_locale_id(code);
-        return PrimitiveString::create(vm, move(canonicalized_tag));
+        return PrimitiveString::create(vm, canonicalized_tag);
     }
 
     // 2. If type is "region", then
@@ -117,7 +117,7 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
             return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "region"sv);
 
         // b. Return the ASCII-uppercase of code.
-        return PrimitiveString::create(vm, code.to_ascii_uppercase_string());
+        return PrimitiveString::create(vm, code.to_ascii_uppercase());
     }
 
     // 3. If type is "script", then
@@ -127,13 +127,13 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
             return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "script"sv);
 
         // Assert: The length of code is 4, and every code unit of code represents an ASCII letter (0x0041 through 0x005A and 0x0061 through 0x007A, both inclusive).
-        VERIFY(code.length() == 4);
+        VERIFY(code.length_in_code_units() == 4);
         VERIFY(all_of(code, is_ascii_alpha));
 
         // c. Let first be the ASCII-uppercase of the substring of code from 0 to 1.
         // d. Let rest be the ASCII-lowercase of the substring of code from 1.
         // e. Return the string-concatenation of first and rest.
-        return PrimitiveString::create(vm, code.to_ascii_titlecase_string());
+        return PrimitiveString::create(vm, code.to_ascii_titlecase());
     }
 
     // 4. If type is "calendar", then
@@ -143,11 +143,11 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
             return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "calendar"sv);
 
         // b. If code uses any of the backwards compatibility syntax described in Unicode Technical Standard #35 LDML § 3.3 BCP 47 Conformance, throw a RangeError exception.
-        if (code.contains('_'))
+        if (code.contains(u"_"sv))
             return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "calendar"sv);
 
         // c. Return the ASCII-lowercase of code.
-        return PrimitiveString::create(vm, code.to_ascii_lowercase_string());
+        return PrimitiveString::create(vm, code.to_ascii_lowercase());
     }
 
     // 5. If type is "dateTimeField", then
@@ -157,7 +157,7 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
             return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "dateTimeField"sv);
 
         // b. Return code.
-        return PrimitiveString::create(vm, code);
+        return PrimitiveString::create(vm, Utf16String::from_utf16(code));
     }
 
     // 6. Assert: type is "currency".
@@ -168,11 +168,11 @@ ThrowCompletionOr<Value> canonical_code_for_display_names(VM& vm, DisplayNames::
         return vm.throw_completion<RangeError>(ErrorType::OptionIsNotValidValue, code, "currency"sv);
 
     // 8. Return the ASCII-uppercase of code.
-    return PrimitiveString::create(vm, code.to_ascii_uppercase_string());
+    return PrimitiveString::create(vm, code.to_ascii_uppercase());
 }
 
 // 12.5.2 IsValidDateTimeFieldCode ( field ), https://tc39.es/ecma402/#sec-isvaliddatetimefieldcode
-bool is_valid_date_time_field_code(StringView field)
+bool is_valid_date_time_field_code(Utf16View field)
 {
     // 1. If field is listed in the Code column of Table 19, return true.
     // 2. Return false.

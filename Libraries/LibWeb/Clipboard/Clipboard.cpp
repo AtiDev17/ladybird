@@ -89,7 +89,7 @@ static String os_specific_well_known_format(StringView mime_type_string)
 }
 
 // https://w3c.github.io/clipboard-apis/#write-blobs-and-option-to-the-clipboard
-static void write_blobs_and_option_to_clipboard(JS::Realm& realm, ReadonlySpan<GC::Ref<FileAPI::Blob>> items, StringView presentation_style)
+static void write_blobs_and_option_to_clipboard(JS::Realm& realm, ReadonlySpan<GC::Ref<FileAPI::Blob>> items, Utf16String const& presentation_style)
 {
     auto& window = as<HTML::Window>(realm.global_object());
 
@@ -118,7 +118,7 @@ static void write_blobs_and_option_to_clipboard(JS::Realm& realm, ReadonlySpan<G
         auto payload = MUST(TextCodec::convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, item->raw_bytes()));
 
         // 4. Insert payload and presentationStyle into the system clipboard using formatString as the native clipboard format.
-        window.page().client().page_did_insert_clipboard_entry({ payload.to_byte_string(), move(format_string) }, presentation_style);
+        window.page().client().page_did_insert_clipboard_entry({ payload.to_byte_string(), move(format_string) }, presentation_style.to_byte_string());
     }
 
     // FIXME: 3. Write web custom formats given webCustomFormats.
@@ -234,7 +234,7 @@ GC::Ref<WebIDL::Promise> Clipboard::read(Bindings::ClipboardUnsanitizedFormats f
                         .mime_type = move(mime_type),
 
                         // 7. Resolve representation’s data with systemClipboardRepresentation’s data.
-                        .data = WebIDL::create_resolved_promise(realm, JS::PrimitiveString::create(realm.vm(), move(string))),
+                        .data = WebIDL::create_resolved_promise(realm, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(string))),
                     };
 
                     // 5. Let isUnsanitized be false.
@@ -381,7 +381,7 @@ GC::Ref<WebIDL::Promise> Clipboard::read_text()
                             auto decoder = TextCodec::decoder_for("UTF-8"sv);
                             auto string = MUST(TextCodec::convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, system_clipboard_representation.data));
 
-                            WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), move(string)));
+                            WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(string)));
                             return;
                         }
                     }
@@ -456,7 +456,7 @@ GC::Ref<WebIDL::Promise> Clipboard::write(GC::RootVector<GC::Ref<ClipboardItem>>
                             // 1. If v is a DOMString, then follow the below steps:
                             if (value.is_string()) {
                                 // 1. Let dataAsBytes be the result of UTF-8 encoding v.
-                                auto const& data_as_bytes = value.as_string().utf8_string();
+                                auto const& data_as_bytes = value.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16();
 
                                 // 2. Let blobData be a Blob created using dataAsBytes with its type set to representation’s MIME type.
                                 auto blob_data = FileAPI::Blob::create(realm, MUST(ByteBuffer::copy(data_as_bytes.bytes())), move(mime_type));
@@ -578,7 +578,7 @@ GC::Ref<WebIDL::Promise> Clipboard::write_text(String data)
             item_list.append(text_blob);
 
             // 4. Let option be set to "unspecified".
-            static constexpr auto option = "unspecified"sv;
+            auto option = "unspecified"_utf16;
 
             // 5. Write blobs and option to the clipboard with itemList and option.
             write_blobs_and_option_to_clipboard(realm, item_list, option);

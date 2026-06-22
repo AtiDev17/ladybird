@@ -58,7 +58,7 @@ static JsonValue serialize_js_value(JS::Realm& realm, JS::Value value)
         return value.as_bool();
 
     if (value.is_string())
-        return value.as_string().utf8_string();
+        return value.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16();
 
     if (value.is_number()) {
         if (value.is_nan())
@@ -86,7 +86,7 @@ static JsonValue serialize_js_value(JS::Realm& realm, JS::Value value)
         Web::HTML::TemporaryExecutionContext execution_context { realm };
         AllocatingMemoryStream stream;
 
-        JS::PrintContext context { vm, stream, true };
+        JS::PrintContext context { .vm = vm, .stream = &stream, .strip_ansi = true };
         MUST(JS::print(value, context));
 
         return MUST(String::from_stream(stream, stream.used_buffer_size()));
@@ -113,7 +113,7 @@ void DevToolsConsoleClient::report_exception(String const& name, String const& m
             stack_frame.function = frame.function_name.to_utf8();
 
         if (!source_range.filename().is_empty() || source_range.start.line != 0 || source_range.start.column != 0) {
-            stack_frame.file = String::from_utf8_with_replacement_character(source_range.filename());
+            stack_frame.file = source_range.filename().to_utf8();
             stack_frame.line = source_range.start.line;
             stack_frame.column = source_range.start.column;
         }
@@ -150,9 +150,13 @@ JS::ThrowCompletionOr<JS::Value> DevToolsConsoleClient::printer(JS::Console::Log
         stack_frames.ensure_capacity(trace.stack.size());
 
         for (auto const& frame : trace.stack) {
+            Optional<String> source_file;
+            if (frame.source_file.has_value())
+                source_file = frame.source_file->to_utf8();
+
             stack_frames.unchecked_append(WebView::StackFrame {
-                .function = frame.function_name,
-                .file = frame.source_file,
+                .function = frame.function_name.to_utf8(),
+                .file = move(source_file),
                 .line = frame.line,
                 .column = frame.column,
             });
@@ -161,7 +165,7 @@ JS::ThrowCompletionOr<JS::Value> DevToolsConsoleClient::printer(JS::Console::Log
         send_console_output({
             .timestamp = UnixDateTime::now(),
             .output = WebView::ConsoleTrace {
-                .label = trace.label,
+                .label = trace.label.to_utf8(),
                 .stack = move(stack_frames),
             },
         });

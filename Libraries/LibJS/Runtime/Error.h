@@ -26,7 +26,7 @@ class JS_API Error
 public:
     static GC::Ref<Error> create(Realm&);
     static GC::Ref<Error> create(Realm&, Utf16String message);
-    static GC::Ref<Error> create(Realm&, StringView message);
+    static GC::Ref<Error> create(Realm&, Utf16View message);
 
     virtual ~Error() override = default;
 
@@ -35,6 +35,7 @@ public:
     ThrowCompletionOr<void> install_error_cause(Value options);
 
     void set_message(Utf16String);
+    void set_message(Utf16View);
 
 protected:
     explicit Error(Object& prototype);
@@ -62,7 +63,7 @@ inline bool Object::fast_is<Error>() const { return is_error_object(); }
     public:                                                                         \
         static GC::Ref<ClassName> create(Realm&);                                   \
         static GC::Ref<ClassName> create(Realm&, Utf16String message);              \
-        static GC::Ref<ClassName> create(Realm&, StringView message);               \
+        static GC::Ref<ClassName> create(Realm&, Utf16View message);                \
                                                                                     \
         explicit ClassName(Object& prototype);                                      \
         virtual ~ClassName() override = default;                                    \

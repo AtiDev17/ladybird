@@ -26,7 +26,7 @@ void RelativeTimeFormatPrototype::initialize(Realm& realm)
     auto& vm = this->vm();
 
     // 18.3.5 Intl.RelativeTimeFormat.prototype [ %Symbol.toStringTag% ], https://tc39.es/ecma402/#sec-Intl.RelativeTimeFormat.prototype-toStringTag
-    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Intl.RelativeTimeFormat"_string), Attribute::Configurable);
+    define_direct_property(vm.well_known_symbol_to_string_tag(), PrimitiveString::create(vm, "Intl.RelativeTimeFormat"_utf16_fly_string), Attribute::Configurable);
 
     u8 attr = Attribute::Writable | Attribute::Configurable;
     define_native_function(realm, vm.names.resolvedOptions, resolved_options, 0, attr);
@@ -71,10 +71,10 @@ JS_DEFINE_NATIVE_FUNCTION(RelativeTimeFormatPrototype::format)
     auto value = TRY(vm.argument(0).to_number(vm));
 
     // 4. Let unit be ? ToString(unit).
-    auto unit = TRY(vm.argument(1).to_string(vm));
+    auto unit = TRY(vm.argument(1).to_utf16_string(vm));
 
     // 5. Return ? FormatRelativeTime(relativeTimeFormat, value, unit).
-    auto formatted = TRY(format_relative_time(vm, relative_time_format, value.as_double(), unit.bytes_as_string_view()));
+    auto formatted = TRY(format_relative_time(vm, relative_time_format, value.as_double(), unit.utf16_view()));
     return PrimitiveString::create(vm, move(formatted));
 }
 
@@ -89,10 +89,10 @@ JS_DEFINE_NATIVE_FUNCTION(RelativeTimeFormatPrototype::format_to_parts)
     auto value = TRY(vm.argument(0).to_number(vm));
 
     // 4. Let unit be ? ToString(unit).
-    auto unit = TRY(vm.argument(1).to_string(vm));
+    auto unit = TRY(vm.argument(1).to_utf16_string(vm));
 
     // 5. Return ? FormatRelativeTimeToParts(relativeTimeFormat, value, unit).
-    return TRY(format_relative_time_to_parts(vm, relative_time_format, value.as_double(), unit.bytes_as_string_view()));
+    return TRY(format_relative_time_to_parts(vm, relative_time_format, value.as_double(), unit.utf16_view()));
 }
 
 }

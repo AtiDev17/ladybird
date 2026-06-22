@@ -9,10 +9,10 @@
 #include <AK/IterationDecision.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
-#include <AK/StringView.h>
 #include <AK/Time.h>
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <LibUnicode/Forward.h>
 
@@ -24,8 +24,8 @@ enum class DateTimeStyle {
     Medium,
     Short,
 };
-DateTimeStyle date_time_style_from_string(StringView);
-StringView date_time_style_to_string(DateTimeStyle);
+DateTimeStyle date_time_style_from_string(Utf16View);
+Utf16String date_time_style_to_string(DateTimeStyle);
 
 enum class Weekday {
     Sunday,
@@ -43,9 +43,9 @@ enum class HourCycle {
     H23,
     H24,
 };
-HourCycle hour_cycle_from_string(StringView hour_cycle);
-StringView hour_cycle_to_string(HourCycle hour_cycle);
-Optional<HourCycle> default_hour_cycle(StringView locale);
+HourCycle hour_cycle_from_string(Utf16View hour_cycle);
+Utf16String hour_cycle_to_string(HourCycle hour_cycle);
+Optional<HourCycle> default_hour_cycle(Utf16View locale);
 
 enum class CalendarPatternStyle {
     Narrow,
@@ -58,8 +58,8 @@ enum class CalendarPatternStyle {
     ShortGeneric,
     LongGeneric,
 };
-CalendarPatternStyle calendar_pattern_style_from_string(StringView style);
-StringView calendar_pattern_style_to_string(CalendarPatternStyle style);
+CalendarPatternStyle calendar_pattern_style_from_string(Utf16View style);
+Utf16String calendar_pattern_style_to_string(CalendarPatternStyle style);
 
 struct CalendarPattern {
     enum class Field {
@@ -138,24 +138,24 @@ struct CalendarPattern {
 class DateTimeFormat {
 public:
     static NonnullOwnPtr<DateTimeFormat> create_for_date_and_time_style(
-        StringView locale,
-        StringView time_zone_identifier,
+        Utf16View locale,
+        Utf16View time_zone_identifier,
         Optional<HourCycle> const& hour_cycle,
         Optional<bool> const& hour12,
         Optional<DateTimeStyle> const& date_style,
         Optional<DateTimeStyle> const& time_style);
 
     static NonnullOwnPtr<DateTimeFormat> create_for_pattern_options(
-        StringView locale,
-        StringView time_zone_identifier,
+        Utf16View locale,
+        Utf16View time_zone_identifier,
         CalendarPattern const&);
 
     virtual ~DateTimeFormat() = default;
 
     struct Partition {
-        StringView type;
+        Utf16String type;
         Utf16String value;
-        StringView source;
+        Utf16String source;
     };
 
     virtual CalendarPattern const& chosen_pattern() const = 0;
@@ -175,6 +175,6 @@ struct WeekInfo {
     Optional<Weekday> first_day_of_week;
     Vector<Weekday> weekend_days;
 };
-WeekInfo week_info_of_locale(StringView locale);
+WeekInfo week_info_of_locale(Utf16View locale);
 
 }

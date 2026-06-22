@@ -159,7 +159,7 @@ ThrowCompletionOr<GC::Ref<PlainTime>> to_temporal_time(VM& vm, Value item, Value
             return vm.throw_completion<TypeError>(ErrorType::TemporalInvalidPlainTime);
 
         // b. Let parseResult be ? ParseISODateTime(item, « TemporalTimeString »).
-        auto parse_result = TRY(parse_iso_date_time(vm, item.as_string().utf8_string_view(), { { Production::TemporalTimeString } }));
+        auto parse_result = TRY(parse_iso_date_time(vm, item.as_string().utf16_string_view(), { { Production::TemporalTimeString } }));
 
         // c. Assert: parseResult.[[Time]] is not START-OF-DAY.
         VERIFY(!parse_result.time.has<ParsedISODateTime::StartOfDay>());
@@ -445,7 +445,7 @@ ThrowCompletionOr<TemporalTimeLike> to_temporal_time_record(VM& vm, Object const
 }
 
 // 4.5.13 TimeRecordToString ( time, precision ), https://tc39.es/proposal-temporal/#sec-temporal-timerecordtostring
-String time_record_to_string(Time const& time, SecondsStringPrecision::Precision precision)
+Utf16String time_record_to_string(Time const& time, SecondsStringPrecision::Precision precision)
 {
     // 1. Let subSecondNanoseconds be time.[[Millisecond]] × 10**6 + time.[[Microsecond]] × 10**3 + time.[[Nanosecond]].
     auto sub_second_nanoseconds = (static_cast<u64>(time.millisecond) * 1'000'000) + (static_cast<u64>(time.microsecond) * 1000) + static_cast<u64>(time.nanosecond);

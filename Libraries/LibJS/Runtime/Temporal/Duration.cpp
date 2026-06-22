@@ -10,6 +10,7 @@
 #include <AK/GenericShorthands.h>
 #include <AK/Math.h>
 #include <AK/NumericLimits.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/Intrinsics.h>
@@ -360,7 +361,7 @@ ThrowCompletionOr<GC::Ref<Duration>> to_temporal_duration(VM& vm, Value item)
             return vm.throw_completion<TypeError>(ErrorType::NotAString, item);
 
         // b. Return ? ParseTemporalDurationString(item).
-        return TRY(parse_temporal_duration_string(vm, item.as_string().utf8_string_view()));
+        return TRY(parse_temporal_duration_string(vm, item.as_string().utf16_string_view()));
     }
 
     // 3. Let result be a new Partial Duration Record with each field set to 0.
@@ -845,7 +846,7 @@ Crypto::BigFraction total_time_duration(TimeDuration const& time_duration, Unit 
 }
 
 // 7.5.33 ComputeNudgeWindow ( sign, duration, originEpochNs, isoDateTime, timeZone, calendar, increment, unit, additionalShift ), https://tc39.es/proposal-temporal/#sec-temporal-computenudgewindow
-ThrowCompletionOr<NudgeWindow> compute_nudge_window(VM& vm, i8 sign, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, ISODateTime const& iso_date_time, Optional<String const&> time_zone, String const& calendar, u64 increment, Unit unit, bool additional_shift)
+ThrowCompletionOr<NudgeWindow> compute_nudge_window(VM& vm, i8 sign, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, ISODateTime const& iso_date_time, Optional<Utf16View> time_zone, Utf16View calendar, u64 increment, Unit unit, bool additional_shift)
 {
     DateDuration start_date_duration;
     DateDuration end_date_duration;
@@ -1008,7 +1009,7 @@ ThrowCompletionOr<NudgeWindow> compute_nudge_window(VM& vm, i8 sign, InternalDur
 }
 
 // 7.5.34 NudgeToCalendarUnit ( sign, duration, originEpochNs, destEpochNs, isoDateTime, timeZone, calendar, increment, unit, roundingMode ), https://tc39.es/proposal-temporal/#sec-temporal-nudgetocalendarunit
-ThrowCompletionOr<CalendarNudgeResult> nudge_to_calendar_unit(VM& vm, i8 sign, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<String const&> time_zone, String const& calendar, u64 increment, Unit unit, RoundingMode rounding_mode)
+ThrowCompletionOr<CalendarNudgeResult> nudge_to_calendar_unit(VM& vm, i8 sign, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<Utf16View> time_zone, Utf16View calendar, u64 increment, Unit unit, RoundingMode rounding_mode)
 {
     // 1. Let didExpandCalendarUnit be false.
     auto did_expand_calendar_unit = false;
@@ -1156,7 +1157,7 @@ ThrowCompletionOr<CalendarNudgeResult> nudge_to_calendar_unit(VM& vm, i8 sign, I
 }
 
 // 7.5.35 NudgeToZonedTime ( sign, duration, isoDateTime, timeZone, calendar, increment, unit, roundingMode ), https://tc39.es/proposal-temporal/#sec-temporal-nudgetozonedtime
-ThrowCompletionOr<DurationNudgeResult> nudge_to_zoned_time(VM& vm, i8 sign, InternalDuration const& duration, ISODateTime const& iso_date_time, String const& time_zone, String const& calendar, u64 increment, Unit unit, RoundingMode rounding_mode)
+ThrowCompletionOr<DurationNudgeResult> nudge_to_zoned_time(VM& vm, i8 sign, InternalDuration const& duration, ISODateTime const& iso_date_time, Utf16View time_zone, Utf16View calendar, u64 increment, Unit unit, RoundingMode rounding_mode)
 {
     // 1. Let start be ? CalendarDateAdd(calendar, isoDateTime.[[ISODate]], duration.[[Date]], CONSTRAIN).
     auto start = TRY(calendar_date_add(vm, calendar, iso_date_time.iso_date, duration.date, Overflow::Constrain));
@@ -1297,7 +1298,7 @@ ThrowCompletionOr<DurationNudgeResult> nudge_to_day_or_time(VM& vm, InternalDura
 }
 
 // 7.5.37 BubbleRelativeDuration ( sign, duration, nudgedEpochNs, isoDateTime, timeZone, calendar, largestUnit, smallestUnit ), https://tc39.es/proposal-temporal/#sec-temporal-bubblerelativeduration
-ThrowCompletionOr<InternalDuration> bubble_relative_duration(VM& vm, i8 sign, InternalDuration duration, Crypto::SignedBigInteger const& nudged_epoch_ns, ISODateTime const& iso_date_time, Optional<String const&> time_zone, String const& calendar, Unit largest_unit, Unit smallest_unit)
+ThrowCompletionOr<InternalDuration> bubble_relative_duration(VM& vm, i8 sign, InternalDuration duration, Crypto::SignedBigInteger const& nudged_epoch_ns, ISODateTime const& iso_date_time, Optional<Utf16View> time_zone, Utf16View calendar, Unit largest_unit, Unit smallest_unit)
 {
     // 1. If smallestUnit is largestUnit, return duration.
     if (smallest_unit == largest_unit)
@@ -1398,7 +1399,7 @@ ThrowCompletionOr<InternalDuration> bubble_relative_duration(VM& vm, i8 sign, In
 }
 
 // 7.5.38 RoundRelativeDuration ( duration, originEpochNs, destEpochNs, isoDateTime, timeZone, calendar, largestUnit, increment, smallestUnit, roundingMode ), https://tc39.es/proposal-temporal/#sec-temporal-roundrelativeduration
-ThrowCompletionOr<InternalDuration> round_relative_duration(VM& vm, InternalDuration duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<String const&> time_zone, String const& calendar, Unit largest_unit, u64 increment, Unit smallest_unit, RoundingMode rounding_mode)
+ThrowCompletionOr<InternalDuration> round_relative_duration(VM& vm, InternalDuration duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<Utf16View> time_zone, Utf16View calendar, Unit largest_unit, u64 increment, Unit smallest_unit, RoundingMode rounding_mode)
 {
     // 1. Let irregularLengthUnit be false.
     auto irregular_length_unit = false;
@@ -1452,7 +1453,7 @@ ThrowCompletionOr<InternalDuration> round_relative_duration(VM& vm, InternalDura
 }
 
 // 7.5.39 TotalRelativeDuration ( duration, originEpochNs, destEpochNs, isoDateTime, timeZone, calendar, unit ), https://tc39.es/proposal-temporal/#sec-temporal-totalrelativeduration
-ThrowCompletionOr<Crypto::BigFraction> total_relative_duration(VM& vm, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<String const&> time_zone, String const& calendar, Unit unit)
+ThrowCompletionOr<Crypto::BigFraction> total_relative_duration(VM& vm, InternalDuration const& duration, Crypto::SignedBigInteger const& origin_epoch_ns, Crypto::SignedBigInteger const& dest_epoch_ns, ISODateTime const& iso_date_time, Optional<Utf16View> time_zone, Utf16View calendar, Unit unit)
 {
     // 1. If IsCalendarUnit(unit) is true, or timeZone is not UNSET and unit is DAY, then
     if (is_calendar_unit(unit) || (time_zone.has_value() && unit == Unit::Day)) {
@@ -1474,13 +1475,13 @@ ThrowCompletionOr<Crypto::BigFraction> total_relative_duration(VM& vm, InternalD
 }
 
 // 7.5.40 TemporalDurationToString ( duration, precision ), https://tc39.es/proposal-temporal/#sec-temporal-temporaldurationtostring
-String temporal_duration_to_string(Duration const& duration, Precision precision)
+Utf16String temporal_duration_to_string(Duration const& duration, Precision precision)
 {
     // 1. Let sign be DurationSign(duration).
     auto sign = duration_sign(duration);
 
     // 2. Let datePart be the empty String.
-    StringBuilder date_part;
+    Utf16StringBuilder date_part;
 
     // 3. If duration.[[Years]] ≠ 0, then
     if (duration.years() != 0) {
@@ -1508,7 +1509,7 @@ String temporal_duration_to_string(Duration const& duration, Precision precision
     }
 
     // 7. Let timePart be the empty String.
-    StringBuilder time_part;
+    Utf16StringBuilder time_part;
 
     // 8. If duration.[[Hours]] ≠ 0, then
     if (duration.hours() != 0) {
@@ -1538,7 +1539,7 @@ String temporal_duration_to_string(Duration const& duration, Precision precision
         auto division_result = seconds_duration.divided_by(NANOSECONDS_PER_SECOND);
 
         // a. Let secondsPart be abs(truncate(secondsDuration / 10**9)) formatted as a decimal number.
-        auto seconds_part = MUST(division_result.quotient.unsigned_value().to_base(10));
+        auto seconds_part = MUST(division_result.quotient.unsigned_value().to_base_utf16(10));
 
         // b. Let subSecondsPart be FormatFractionalSeconds(abs(remainder(secondsDuration, 10**9)), precision).
         auto sub_seconds_part = format_fractional_seconds(division_result.remainder.unsigned_value().to_u64(), precision);
@@ -1552,17 +1553,20 @@ String temporal_duration_to_string(Duration const& duration, Precision precision
     auto sign_part = sign < 0 ? "-"sv : ""sv;
 
     // 15. Let result be the string concatenation of signPart, the code unit 0x0050 (LATIN CAPITAL LETTER P) and datePart.
-    StringBuilder result;
-    result.appendff("{}P{}", sign_part, date_part.string_view());
+    Utf16StringBuilder result;
+    result.append_ascii(sign_part);
+    result.append_ascii('P');
+    result.append(date_part.view());
 
     // 16. If timePart is not the empty String, then
     if (!time_part.is_empty()) {
         // a. Set result to the string concatenation of result, the code unit 0x0054 (LATIN CAPITAL LETTER T), and timePart.
-        result.appendff("T{}", time_part.string_view());
+        result.append_ascii('T');
+        result.append(time_part.view());
     }
 
     // 17. Return result.
-    return MUST(result.to_string());
+    return result.to_string();
 }
 
 // 7.5.41 AddDurations ( operation, duration, other ), https://tc39.es/proposal-temporal/#sec-temporal-adddurations

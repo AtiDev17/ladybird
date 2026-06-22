@@ -105,7 +105,7 @@ static JS::Value json_value_to_js_value(JS::VM& vm, JsonValue const& value)
     if (auto double_value = value.get_double_with_precision_loss(); double_value.has_value())
         return JS::Value(double_value.value());
     if (value.is_string())
-        return JS::PrimitiveString::create(vm, value.as_string());
+        return JS::PrimitiveString::create(vm, Utf16String::from_utf8(value.as_string()));
     if (value.is_bool())
         return JS::Value(value.as_bool());
     VERIFY_NOT_REACHED();
@@ -179,7 +179,7 @@ static ErrorOr<ResultType, WebDriver::Error> clone_an_object(HTML::BrowsingConte
                 if (result.is_array() && name.is_number())
                     result.as_array().set(name.as_number(), cloned_property_result.value());
                 else if (result.is_object())
-                    result.as_object().set(name.to_string().to_utf8(), cloned_property_result.value());
+                    result.as_object().set(name.to_utf16_string().to_utf8(), cloned_property_result.value());
             } else {
                 (void)result->set(name, cloned_property_result.value(), JS::Object::ShouldThrowExceptions::No);
             }
@@ -227,7 +227,7 @@ static Response internal_json_clone(HTML::BrowsingContext const& browsing_contex
     if (value.is_number())
         return JsonValue { value.as_double() };
     if (value.is_string())
-        return JsonValue { value.as_string().utf8_string() };
+        return JsonValue { value.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16() };
 
     // AD-HOC: BigInt and Symbol not mentioned anywhere in the WebDriver spec, as it references ES5.
     //         It assumes that all primitives are handled above, and the value is an object for the remaining steps.
@@ -301,7 +301,7 @@ static Response internal_json_clone(HTML::BrowsingContext const& browsing_contex
         if (!to_json_result.is_string())
             return WebDriver::Error::from_code(ErrorCode::JavascriptError, "toJSON did not return a String"sv);
 
-        return JsonValue { to_json_result.as_string().utf8_string() };
+        return JsonValue { to_json_result.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16() };
     }
 
     // -> Otherwise

@@ -8,6 +8,16 @@
 
 namespace JS::Intl {
 
+MathematicalValue::MathematicalValue(Value value)
+{
+    if (value.is_number()) {
+        m_value = value_from_number(value.as_double());
+        return;
+    }
+
+    m_value = MUST(value.as_bigint().big_integer().to_base_utf16(10));
+}
+
 bool MathematicalValue::is_number() const
 {
     return m_value.has<double>();
@@ -21,13 +31,13 @@ double MathematicalValue::as_number() const
 
 bool MathematicalValue::is_string() const
 {
-    return m_value.has<String>();
+    return m_value.has<Utf16String>();
 }
 
-String const& MathematicalValue::as_string() const
+Utf16String const& MathematicalValue::as_string() const
 {
     VERIFY(is_string());
-    return m_value.get<String>();
+    return m_value.get<Utf16String>();
 }
 
 bool MathematicalValue::is_mathematical_value() const
@@ -69,7 +79,7 @@ Unicode::NumberFormat::Value MathematicalValue::to_value() const
         [](double value) -> Unicode::NumberFormat::Value {
             return value;
         },
-        [](String const& value) -> Unicode::NumberFormat::Value {
+        [](Utf16String const& value) -> Unicode::NumberFormat::Value {
             return value;
         },
         [](auto symbol) -> Unicode::NumberFormat::Value {

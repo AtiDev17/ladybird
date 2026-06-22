@@ -32,17 +32,30 @@ SegmenterGranularity segmenter_granularity_from_string(StringView segmenter_gran
     VERIFY_NOT_REACHED();
 }
 
-StringView segmenter_granularity_to_string(SegmenterGranularity segmenter_granularity)
+SegmenterGranularity segmenter_granularity_from_string(Utf16View segmenter_granularity)
+{
+    if (segmenter_granularity == "grapheme"sv)
+        return SegmenterGranularity::Grapheme;
+    if (segmenter_granularity == "line"sv)
+        return SegmenterGranularity::Line;
+    if (segmenter_granularity == "sentence"sv)
+        return SegmenterGranularity::Sentence;
+    if (segmenter_granularity == "word"sv)
+        return SegmenterGranularity::Word;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String segmenter_granularity_to_string(SegmenterGranularity segmenter_granularity)
 {
     switch (segmenter_granularity) {
     case SegmenterGranularity::Grapheme:
-        return "grapheme"sv;
+        return "grapheme"_utf16;
     case SegmenterGranularity::Line:
-        return "line"sv;
+        return "line"_utf16;
     case SegmenterGranularity::Sentence:
-        return "sentence"sv;
+        return "sentence"_utf16;
     case SegmenterGranularity::Word:
-        return "word"sv;
+        return "word"_utf16;
     }
     VERIFY_NOT_REACHED();
 }
@@ -678,11 +691,11 @@ NonnullOwnPtr<Segmenter> Segmenter::create(SegmenterGranularity segmenter_granul
     return Segmenter::create(default_locale(), segmenter_granularity);
 }
 
-NonnullOwnPtr<Segmenter> Segmenter::create(StringView locale, SegmenterGranularity segmenter_granularity)
+NonnullOwnPtr<Segmenter> Segmenter::create(Utf16View locale, SegmenterGranularity segmenter_granularity)
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale);
+    auto locale_data = LocaleData::for_locale(locale.bytes());
     VERIFY(locale_data.has_value());
 
     auto segmenter = adopt_own_if_nonnull([&]() {

@@ -17,13 +17,22 @@ PluralForm plural_form_from_string(StringView plural_form)
     VERIFY_NOT_REACHED();
 }
 
-StringView plural_form_to_string(PluralForm plural_form)
+PluralForm plural_form_from_string(Utf16View plural_form)
+{
+    if (plural_form == "cardinal"sv)
+        return PluralForm::Cardinal;
+    if (plural_form == "ordinal"sv)
+        return PluralForm::Ordinal;
+    VERIFY_NOT_REACHED();
+}
+
+Utf16String plural_form_to_string(PluralForm plural_form)
 {
     switch (plural_form) {
     case PluralForm::Cardinal:
-        return "cardinal"sv;
+        return "cardinal"_utf16;
     case PluralForm::Ordinal:
-        return "ordinal"sv;
+        return "ordinal"_utf16;
     }
     VERIFY_NOT_REACHED();
 }

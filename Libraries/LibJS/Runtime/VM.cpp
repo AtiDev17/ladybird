@@ -7,12 +7,14 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteBuffer.h>
 #include <AK/Debug.h>
 #include <AK/LexicalPath.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
+#include <LibCore/ImmutableBytes.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Bytecode/Executable.h>
@@ -33,8 +35,10 @@
 #include <LibJS/Runtime/Symbol.h>
 #include <LibJS/Runtime/Temporal/Instant.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibJS/SourceCode.h>
 #include <LibJS/SourceTextModule.h>
 #include <LibJS/SyntheticModule.h>
+#include <LibTextCodec/Decoder.h>
 
 namespace JS {
 
@@ -50,7 +54,7 @@ NonnullRefPtr<VM> VM::create()
     ++s_vm_count;
 
     ErrorMessages error_messages {};
-    error_messages[to_underlying(ErrorMessage::OutOfMemory)] = ErrorType::OutOfMemory.message();
+    error_messages[to_underlying(ErrorMessage::OutOfMemory)] = Utf16String::from_utf16(ErrorType::OutOfMemory.message());
 
     auto vm = adopt_ref(*new VM(move(error_messages)));
 
@@ -84,18 +88,18 @@ VM::VM(ErrorMessages error_messages)
         Bytecode::StaticPropertyLookupCache::sweep_all();
     });
 
-    m_empty_string = m_heap.allocate<PrimitiveString>(String {});
+    m_empty_string = m_heap.allocate<PrimitiveString>(Utf16String {});
 
     cached_strings = {
-        .number = m_heap.allocate<PrimitiveString>("number"_string),
-        .undefined = m_heap.allocate<PrimitiveString>("undefined"_string),
-        .object = m_heap.allocate<PrimitiveString>("object"_string),
-        .string = m_heap.allocate<PrimitiveString>("string"_string),
-        .symbol = m_heap.allocate<PrimitiveString>("symbol"_string),
-        .boolean = m_heap.allocate<PrimitiveString>("boolean"_string),
-        .bigint = m_heap.allocate<PrimitiveString>("bigint"_string),
-        .function = m_heap.allocate<PrimitiveString>("function"_string),
-        .object_Object = m_heap.allocate<PrimitiveString>("[object Object]"_string),
+        .number = m_heap.allocate<PrimitiveString>("number"_utf16),
+        .undefined = m_heap.allocate<PrimitiveString>("undefined"_utf16),
+        .object = m_heap.allocate<PrimitiveString>("object"_utf16),
+        .string = m_heap.allocate<PrimitiveString>("string"_utf16),
+        .symbol = m_heap.allocate<PrimitiveString>("symbol"_utf16),
+        .boolean = m_heap.allocate<PrimitiveString>("boolean"_utf16),
+        .bigint = m_heap.allocate<PrimitiveString>("bigint"_utf16),
+        .function = m_heap.allocate<PrimitiveString>("function"_utf16),
+        .object_Object = m_heap.allocate<PrimitiveString>("[object Object]"_utf16),
     };
 
     for (size_t i = 0; i < single_ascii_character_strings.size(); ++i)
@@ -154,7 +158,7 @@ VM::VM(ErrorMessages error_messages)
     };
 
     // 2 HostEnsureCanCompileStrings ( calleeRealm, parameterStrings, bodyString, codeString, compilationType, parameterArgs, bodyArg ), https://tc39.es/proposal-dynamic-code-brand-checks/#sec-hostensurecancompilestrings
-    host_ensure_can_compile_strings = [](Realm&, ReadonlySpan<String>, StringView, StringView, CompilationType, ReadonlySpan<Value>, Value) -> ThrowCompletionOr<void> {
+    host_ensure_can_compile_strings = [](Realm&, ReadonlySpan<Utf16String>, Utf16View, Utf16View, CompilationType, ReadonlySpan<Value>, Value) -> ThrowCompletionOr<void> {
         // The host-defined abstract operation HostEnsureCanCompileStrings takes arguments calleeRealm (a Realm Record),
         // parameterStrings (a List of Strings), bodyString (a String), and direct (a Boolean) and returns either a normal
         // completion containing unused or a throw completion.
@@ -230,7 +234,7 @@ VM::VM(ErrorMessages error_messages)
     };
 
     // AD-HOC: Inform the host that we received a date string we were unable to parse.
-    host_unrecognized_date_string = [](StringView) {
+    host_unrecognized_date_string = [](Utf16View) {
     };
 }
 
@@ -627,6 +631,17 @@ VM::StoredModule* VM::get_stored_module(ImportedModuleReferrer const&, ByteStrin
 
 static ByteString resolve_module_filename(StringView filename, Utf16View const& module_type);
 
+static StringView utf8_path_view(Utf16View path, Optional<ByteBuffer>& utf8_storage)
+{
+    if (path.has_ascii_storage())
+        return { path.bytes() };
+
+    StringBuilder builder;
+    builder.append(path);
+    utf8_storage = MUST(builder.to_byte_buffer());
+    return { utf8_storage->bytes() };
+}
+
 ThrowCompletionOr<void> VM::link_and_eval_module(SourceTextModule& module)
 {
     return link_and_eval_module(static_cast<CyclicModule&>(module));
@@ -759,7 +774,9 @@ void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest con
         });
 
     LexicalPath base_path { base_filename };
-    auto filename = LexicalPath::absolute_path(base_path.dirname(), MUST(module_request.module_specifier.view().to_byte_string()));
+    Optional<ByteBuffer> module_specifier_utf8_storage;
+    auto module_specifier_path = utf8_path_view(module_request.module_specifier.view(), module_specifier_utf8_storage);
+    auto filename = LexicalPath::absolute_path(base_path.dirname(), module_specifier_path);
 
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] base path: '{}'", base_path);
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] initial filename: '{}'", filename);
@@ -769,18 +786,17 @@ void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest con
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] resolved filename: '{}'", filename);
 
 #if JS_MODULE_DEBUG
-    ByteString referencing_module_string = referrer.visit(
+    referrer.visit(
         [&](GC::Ref<Script> const& script) {
-            return ByteString::formatted("Script @ {}", script.ptr());
+            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Script @ {}, {})", script.ptr(), filename);
         },
         [&](GC::Ref<CyclicModule> const& module) {
-            return ByteString::formatted("Module @ {}", module.ptr());
+            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Module @ {}, {})", module.ptr(), filename);
         },
         [&](GC::Ref<Realm> const& realm) {
-            return ByteString::formatted("Realm @ {}", realm.ptr());
+            dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module(Realm @ {}, {})", realm.ptr(), filename);
         });
 
-    dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] load_imported_module({}, {})", referencing_module_string, filename);
     dbgln_if(JS_MODULE_DEBUG, "[JS MODULE]     resolved {} + {} -> {}", base_path, module_request.module_specifier, filename);
 #endif
 
@@ -811,24 +827,29 @@ void VM::load_imported_module(ImportedModuleReferrer referrer, ModuleRequest con
         return;
     }
 
-    StringView const content_view { file_content_or_error.value().bytes() };
+    auto source_bytes = Core::ImmutableBytes::adopt(file_content_or_error.release_value());
+    auto decoder = TextCodec::decoder_for("UTF-8"sv);
+    VERIFY(decoder.has_value());
+    auto source_length = TextCodec::convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, StringView { source_bytes.bytes() }).release_value_but_fixme_should_propagate_errors();
+    auto display_filename = Utf16String::from_utf8(filename);
+    auto source_code = SourceCode::create(move(display_filename), source_length, "UTF-8"sv, move(source_bytes));
 
-    auto module = [&, content = file_content_or_error.release_value()]() -> ThrowCompletionOr<GC::Ref<Module>> {
+    auto module = [&, source_code = move(source_code)]() mutable -> ThrowCompletionOr<GC::Ref<Module>> {
         // If moduleRequest.[[Attributes]] has an entry entry such that entry.[[Key]] is "type" and entry.[[Value]] is "json",
         // when the host environment performs FinishLoadingImportedModule(referrer, moduleRequest, payload, result), result
         // must either be the Completion Record returned by an invocation of ParseJSONModule or a throw completion.
         if (module_type == "json"sv) {
             dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing JSON module {}", filename);
-            return TRY(parse_json_module(*current_realm(), content_view, filename));
+            return TRY(parse_json_module(*current_realm(), source_code->code_view(), filename));
         }
 
         dbgln_if(JS_MODULE_DEBUG, "[JS MODULE] reading and parsing as SourceTextModule module {}", filename);
         // Note: We treat all files as module, so if a script does not have exports it just runs it.
-        auto module_or_errors = SourceTextModule::parse(content_view, *current_realm(), filename);
+        auto module_or_errors = SourceTextModule::parse(move(source_code), *current_realm(), filename);
 
         if (module_or_errors.is_error()) {
             VERIFY(module_or_errors.error().size() > 0);
-            return throw_completion<SyntaxError>(module_or_errors.error().first().to_byte_string());
+            return throw_completion<SyntaxError>(module_or_errors.error().first().to_utf16_string());
         }
 
         return module_or_errors.release_value();

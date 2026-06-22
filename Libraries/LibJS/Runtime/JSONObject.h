@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
+#include <AK/Utf16StringBuilder.h>
+#include <AK/Utf16View.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/Object.h>
 
@@ -21,7 +24,7 @@ struct JSONParseRecord {
     // NB: In place of the spec's [[ParseNode]] field, we capture the source text
     //     matched by the parse node up front. It is present only when [[Value]] is
     //     a primitive, since the reviver context only exposes "source" for those.
-    Optional<String> source;
+    Optional<Utf16String> source;
     // [[Elements]]: if [[Value]] is an Array, the records for its elements; else empty.
     Vector<JSONParseRecord> elements;
     // [[Entries]]: if [[Value]] is a non-Array Object, the records for its entries; else empty.
@@ -38,9 +41,9 @@ public:
 
     // The base implementation of stringify is exposed because it is used by
     // test-js to communicate between the JS tests and the C++ test runner.
-    static ThrowCompletionOr<Optional<String>> stringify_impl(VM&, Value value, Value replacer, Value space);
+    static ThrowCompletionOr<Optional<Utf16String>> stringify_impl(VM&, Value value, Value replacer, Value space);
 
-    static ThrowCompletionOr<Value> parse_json(VM&, StringView text, JSONParseRecord* root_record = nullptr);
+    static ThrowCompletionOr<Value> parse_json(VM&, Utf16View text, JSONParseRecord* root_record = nullptr);
 
 private:
     explicit JSONObject(Realm&);
@@ -49,16 +52,16 @@ private:
         GC::Ptr<FunctionObject> replacer_function;
         HashTable<GC::Ptr<Object>> seen_objects;
         size_t indent_depth { 0 };
-        String gap;
+        Utf16String gap;
         Optional<Vector<Utf16String>> property_list;
-        StringBuilder builder;
+        Utf16StringBuilder builder;
     };
 
     // Stringify helpers
     static ThrowCompletionOr<bool> serialize_json_property(VM&, StringifyState&, PropertyKey const& key, Object* holder);
     static ThrowCompletionOr<void> serialize_json_object(VM&, StringifyState&, Object&);
     static ThrowCompletionOr<void> serialize_json_array(VM&, StringifyState&, Object&);
-    static void quote_json_string(StringBuilder&, Utf16View const&);
+    static void quote_json_string(Utf16StringBuilder&, Utf16View const&);
 
     // Parse helpers
     static ThrowCompletionOr<Value> internalize_json_property(VM&, Object* holder, PropertyKey const& name, FunctionObject& reviver, JSONParseRecord const* parse_record);

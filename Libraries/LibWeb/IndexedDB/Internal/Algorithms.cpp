@@ -293,7 +293,7 @@ WebIDL::ExceptionOr<GC::Ref<Key>> convert_a_value_to_a_key(JS::Realm& realm, JS:
     if (input.is_string()) {
 
         // 1. Return a new key with type string and value input.
-        return Key::create_string(realm, input.as_string().utf8_string());
+        return Key::create_string(realm, input.as_string().utf16_string_view().to_utf8_but_should_be_ported_to_utf16());
     }
 
     // - If input is a buffer source type
@@ -738,7 +738,7 @@ JS::Value convert_a_key_to_a_value(JS::Realm& realm, GC::Ref<Key> key)
 
     case Key::KeyType::String: {
         // Return an ECMAScript String value equal to value
-        return JS::PrimitiveString::create(realm.vm(), key->value_as_string());
+        return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(key->value_as_string()));
     }
 
     case Key::KeyType::Date: {
@@ -1062,13 +1062,13 @@ WebIDL::ExceptionOr<ErrorOr<JS::Value>> evaluate_key_path_on_a_value(JS::Realm& 
         // If value is a Blob and identifier is "type"
         else if (value.is_object() && is<FileAPI::Blob>(value.as_object()) && identifier == "type") {
             // Let value be a String equal to value’s type.
-            value = JS::PrimitiveString::create(realm.vm(), static_cast<FileAPI::Blob&>(value.as_object()).type());
+            value = JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(static_cast<FileAPI::Blob&>(value.as_object()).type()));
         }
 
         // If value is a File and identifier is "name"
         else if (value.is_object() && is<FileAPI::File>(value.as_object()) && identifier == "name") {
             // Let value be a String equal to value’s name.
-            value = JS::PrimitiveString::create(realm.vm(), static_cast<FileAPI::File&>(value.as_object()).name());
+            value = JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(static_cast<FileAPI::File&>(value.as_object()).name()));
         }
 
         // If value is a File and identifier is "lastModified"
@@ -2496,14 +2496,14 @@ WebIDL::ExceptionOr<GC::Ref<IDBRequest>> create_a_request_to_retrieve_multiple_i
         count = TRY(TRY(query_or_options.get(vm, "count"_utf16)).to_u32(vm));
 
         // 3. Set direction to query_or_options["direction"].
-        auto direction_value = TRY(TRY(query_or_options.get(vm, "direction"_utf16)).to_string(vm));
-        if (direction_value == "next")
+        auto direction_value = TRY(TRY(query_or_options.get(vm, "direction"_utf16)).to_utf16_string(vm));
+        if (direction_value == "next"sv)
             direction = Bindings::IDBCursorDirection::Next;
-        else if (direction_value == "nextunique")
+        else if (direction_value == "nextunique"sv)
             direction = Bindings::IDBCursorDirection::Nextunique;
-        else if (direction_value == "prev")
+        else if (direction_value == "prev"sv)
             direction = Bindings::IDBCursorDirection::Prev;
-        else if (direction_value == "prevunique")
+        else if (direction_value == "prevunique"sv)
             direction = Bindings::IDBCursorDirection::Prevunique;
     }
 

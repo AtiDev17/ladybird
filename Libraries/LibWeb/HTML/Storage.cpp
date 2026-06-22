@@ -281,7 +281,7 @@ JS::Value Storage::named_item_value(FlyString const& name) const
         // AD-HOC: Spec leaves open to a description at: https://html.spec.whatwg.org/multipage/webstorage.html#the-storage-interface
         // However correct behavior expected here: https://github.com/whatwg/html/issues/8684
         return JS::js_undefined();
-    return JS::PrimitiveString::create(vm(), value.release_value());
+    return JS::PrimitiveString::create(vm(), Utf16String::from_utf8(value.release_value()));
 }
 
 WebIDL::ExceptionOr<Bindings::PlatformObject::DidDeletionFail> Storage::delete_value(String const& name)
@@ -294,7 +294,7 @@ WebIDL::ExceptionOr<void> Storage::set_value_of_named_property(String const& key
 {
     // NOTE: Since PlatformObject does not know the type of value, we must convert it ourselves.
     //       The type of `value` is `DOMString`.
-    auto value = TRY(unconverted_value.to_string(vm()));
+    auto value = TRY(unconverted_value.to_utf16_string(vm())).to_utf8_but_should_be_ported_to_utf16();
     return set_item(key, value);
 }
 

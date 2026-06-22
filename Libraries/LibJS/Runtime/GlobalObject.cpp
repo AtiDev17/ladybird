@@ -10,6 +10,7 @@
 #include <AK/Hex.h>
 #include <AK/StringConversions.h>
 #include <AK/UnicodeUtils.h>
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
 #include <LibGC/DeferGC.h>
@@ -237,7 +238,7 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_float)
     }
 
     // 1. Let inputString be ? ToString(string).
-    auto input_string = TRY(string.to_string(vm));
+    auto input_string = TRY(string.to_utf16_string(vm));
 
     // 2. Let trimmedString be ! TrimString(inputString, start).
     auto trimmed_string = MUST(trim_string(vm, PrimitiveString::create(vm, move(input_string)), TrimMode::Left));
@@ -249,17 +250,17 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_float)
     // 5. Let parsedNumber be ParseText(StringToCodePoints(numberString), StrDecimalLiteral).
     // 6. Assert: parsedNumber is a Parse Node.
     // 7. Return StringNumericValue of parsedNumber.
-    auto trimmed_string_view = trimmed_string.bytes_as_string_view();
+    auto trimmed_string_view = trimmed_string.utf16_view();
 
     auto parsed_number = AK::parse_first_number<double>(trimmed_string_view, TrimWhitespace::No);
     if (parsed_number.has_value())
         return parsed_number->value;
 
-    auto first_code_point = *trimmed_string.code_points().begin();
+    auto first_code_point = *trimmed_string.begin();
     if (first_code_point == '-' || first_code_point == '+')
         trimmed_string_view = trimmed_string_view.substring_view(1);
 
-    if (trimmed_string_view.starts_with("Infinity"sv, AK::CaseSensitivity::CaseSensitive)) {
+    if (trimmed_string_view.starts_with("Infinity"sv)) {
         // Only an immediate - means we should return negative infinity
         return first_code_point == '-' ? js_negative_infinity() : js_infinity();
     }
@@ -273,12 +274,12 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
     auto string = vm.argument(0);
 
     // 1. Let inputString be ? ToString(string).
-    auto input_string = TRY(string.to_string(vm));
+    auto input_string = TRY(string.to_utf16_string(vm));
 
     // 2. Let S be ! TrimString(inputString, start).
-    String trimmed_string;
+    Utf16String trimmed_string;
     // OPTIMIZATION: We can skip the trimming step when the value already starts with an alphanumeric ASCII character.
-    if (input_string.is_empty() || is_ascii_alphanumeric(input_string.bytes_as_string_view()[0])) {
+    if (input_string.is_empty() || is_ascii_alphanumeric(input_string.code_unit_at(0))) {
         trimmed_string = input_string;
     } else {
         trimmed_string = MUST(trim_string(vm, PrimitiveString::create(vm, move(input_string)), TrimMode::Left));
@@ -288,12 +289,12 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
     auto sign = 1;
 
     // 4. If S is not empty and the first code unit of S is the code unit 0x002D (HYPHEN-MINUS), set sign to -1.
-    auto first_code_point = trimmed_string.is_empty() ? OptionalNone {} : Optional<u32> { *trimmed_string.code_points().begin() };
+    auto first_code_point = trimmed_string.is_empty() ? OptionalNone {} : Optional<u32> { *trimmed_string.begin() };
     if (first_code_point == 0x2Du)
         sign = -1;
 
     // 5. If S is not empty and the first code unit of S is the code unit 0x002B (PLUS SIGN) or the code unit 0x002D (HYPHEN-MINUS), remove the first code unit from S.
-    auto trimmed_view = trimmed_string.bytes_as_string_view();
+    auto trimmed_view = trimmed_string.utf16_view();
     if (first_code_point == 0x2Bu || first_code_point == 0x2Du)
         trimmed_view = trimmed_view.substring_view(1);
 
@@ -322,7 +323,7 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
     // 10. If stripPrefix is true, then
     if (strip_prefix) {
         // a. If the length of S is at least 2 and the first two code units of S are either "0x" or "0X", then
-        if (trimmed_view.length() >= 2 && trimmed_view.substring_view(0, 2).equals_ignoring_ascii_case("0x"sv)) {
+        if (trimmed_view.length_in_code_units() >= 2 && trimmed_view.substring_view(0, 2).equals_ignoring_ascii_case("0x"sv)) {
             // i. Remove the first two code units from S.
             trimmed_view = trimmed_view.substring_view(2);
 
@@ -346,7 +347,7 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
 
     bool had_digits = false;
     double number = 0;
-    for (auto code_point : Utf8View(trimmed_view)) {
+    for (auto code_point : trimmed_view) {
         auto digit = parse_digit(code_point);
         if (!digit.has_value())
             break;
@@ -366,15 +367,13 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
 }
 
 // 19.2.6.5 Encode ( string, extraUnescaped ), https://tc39.es/ecma262/#sec-encode
-static ThrowCompletionOr<ByteString> encode(VM& vm, ByteString const& string, StringView unescaped_set)
+static ThrowCompletionOr<Utf16String> encode(VM& vm, Utf16View const& string, StringView unescaped_set)
 {
-    auto utf16_string = Utf16String::from_utf8(string);
-
     // 1. Let strLen be the length of string.
-    auto string_length = utf16_string.length_in_code_units();
+    auto string_length = string.length_in_code_units();
 
     // 2. Let R be the empty String.
-    StringBuilder encoded_builder;
+    Utf16StringBuilder encoded_builder;
 
     // 3. Let alwaysUnescaped be the string-concatenation of the ASCII word characters and "-.!~*'()".
     // 4. Let unescapedSet be the string-concatenation of alwaysUnescaped and extraUnescaped.
@@ -389,7 +388,7 @@ static ThrowCompletionOr<ByteString> encode(VM& vm, ByteString const& string, St
         // Handled below
 
         // b. Let C be the code unit at index k within string.
-        auto code_unit = utf16_string.code_unit_at(k);
+        auto code_unit = string.code_unit_at(k);
         // c. If C is in unescapedSet, then
         // NOTE: We assume the unescaped set only contains ascii characters as unescaped_set is a StringView.
         if (code_unit < 0x80 && unescaped_set.contains(static_cast<char>(code_unit))) {
@@ -397,12 +396,12 @@ static ThrowCompletionOr<ByteString> encode(VM& vm, ByteString const& string, St
             k++;
 
             // ii. Set R to the string-concatenation of R and C.
-            encoded_builder.append(code_unit);
+            encoded_builder.append_code_unit(code_unit);
         }
         // d. Else,
         else {
             // i. Let cp be CodePointAt(string, k).
-            auto code_point = code_point_at(utf16_string, k);
+            auto code_point = code_point_at(string, k);
             // ii. If cp.[[IsUnpairedSurrogate]] is true, throw a URIError exception.
             if (code_point.is_unpaired_surrogate)
                 return vm.throw_completion<URIError>(ErrorType::URIMalformed);
@@ -420,78 +419,79 @@ static ThrowCompletionOr<ByteString> encode(VM& vm, ByteString const& string, St
             VERIFY(nwritten > 0);
         }
     }
-    return encoded_builder.to_byte_string();
+    return encoded_builder.to_string();
+}
+
+static ThrowCompletionOr<u8> decode_percent_encoded_byte(VM& vm, Utf16View const& string, size_t percent_index)
+{
+    if (percent_index + 2 >= string.length_in_code_units())
+        return vm.throw_completion<URIError>(ErrorType::URIMalformed);
+
+    auto first_digit = string.code_unit_at(percent_index + 1);
+    if (!is_ascii_hex_digit(first_digit))
+        return vm.throw_completion<URIError>(ErrorType::URIMalformed);
+
+    auto second_digit = string.code_unit_at(percent_index + 2);
+    if (!is_ascii_hex_digit(second_digit))
+        return vm.throw_completion<URIError>(ErrorType::URIMalformed);
+
+    return (parse_ascii_hex_digit(first_digit) << 4) | parse_ascii_hex_digit(second_digit);
 }
 
 // 19.2.6.6 Decode ( string, preserveEscapeSet ), https://tc39.es/ecma262/#sec-decode
 // FIXME: Add spec comments to this implementation. It deviates a lot, so that's a bit tricky.
-static ThrowCompletionOr<ByteString> decode(VM& vm, ByteString const& string, StringView reserved_set)
+static ThrowCompletionOr<Utf16String> decode(VM& vm, Utf16View const& string, StringView reserved_set)
 {
-    StringBuilder decoded_builder;
-    auto code_point_start_offset = 0u;
-    auto expected_continuation_bytes = 0;
-    for (size_t k = 0; k < string.length(); k++) {
-        auto code_unit = string[k];
+    Utf16StringBuilder decoded_builder;
+    for (size_t k = 0; k < string.length_in_code_units(); ++k) {
+        auto code_unit = string.code_unit_at(k);
         if (code_unit != '%') {
-            if (expected_continuation_bytes > 0)
-                return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-
-            decoded_builder.append(code_unit);
+            decoded_builder.append_code_unit(code_unit);
             continue;
         }
 
-        if (k + 2 >= string.length())
-            return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-
-        auto first_digit = decode_hex_digit(string[k + 1]);
-        if (first_digit >= 16)
-            return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-
-        auto second_digit = decode_hex_digit(string[k + 2]);
-        if (second_digit >= 16)
-            return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-
-        u8 decoded_code_unit = (first_digit << 4) | second_digit;
+        auto decoded_code_unit = TRY(decode_percent_encoded_byte(vm, string, k));
         k += 2;
-        if (expected_continuation_bytes > 0) {
-            decoded_builder.append(decoded_code_unit);
-            expected_continuation_bytes--;
-            if (expected_continuation_bytes == 0 && !Utf8View(decoded_builder.string_view().substring_view(code_point_start_offset)).validate(AllowLonelySurrogates::No))
-                return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-            continue;
-        }
 
         if (decoded_code_unit < 0x80) {
             if (reserved_set.contains(static_cast<char>(decoded_code_unit)))
                 decoded_builder.append(string.substring_view(k - 2, 3));
             else
-                decoded_builder.append(decoded_code_unit);
+                decoded_builder.append_code_unit(decoded_code_unit);
             continue;
         }
 
-        auto leading_ones = count_leading_zeroes_safe(static_cast<u8>(~decoded_code_unit));
+        auto leading_ones = static_cast<size_t>(count_leading_zeroes_safe(static_cast<u8>(~decoded_code_unit)));
         if (leading_ones == 1 || leading_ones > 4)
             return vm.throw_completion<URIError>(ErrorType::URIMalformed);
 
-        code_point_start_offset = decoded_builder.length();
-        decoded_builder.append(decoded_code_unit);
-        expected_continuation_bytes = leading_ones - 1;
+        u8 utf8_bytes[4] { decoded_code_unit };
+        for (auto byte_index = 1u; byte_index < leading_ones; ++byte_index) {
+            if (k + 3 >= string.length_in_code_units() || string.code_unit_at(k + 1) != '%')
+                return vm.throw_completion<URIError>(ErrorType::URIMalformed);
+            utf8_bytes[byte_index] = TRY(decode_percent_encoded_byte(vm, string, k + 1));
+            k += 3;
+        }
+
+        auto utf8_view = Utf8View { StringView { reinterpret_cast<char const*>(utf8_bytes), leading_ones } };
+        if (!utf8_view.validate(AllowLonelySurrogates::No))
+            return vm.throw_completion<URIError>(ErrorType::URIMalformed);
+        for (auto decoded_code_point : utf8_view)
+            decoded_builder.append_code_point(decoded_code_point);
     }
-    if (expected_continuation_bytes > 0)
-        return vm.throw_completion<URIError>(ErrorType::URIMalformed);
-    return decoded_builder.to_byte_string();
+    return decoded_builder.to_string();
 }
 
 // 19.2.6.1 decodeURI ( encodedURI ), https://tc39.es/ecma262/#sec-decodeuri-encodeduri
 JS_DEFINE_NATIVE_FUNCTION(GlobalObject::decode_uri)
 {
     // 1. Let uriString be ? ToString(encodedURI).
-    auto uri_string = TRY(vm.argument(0).to_byte_string(vm));
+    auto uri_string = TRY(vm.argument(0).to_utf16_string(vm));
 
     // 2. Let preserveEscapeSet be ";/?:@&=+$,#".
     // 3. Return ? Decode(uriString, preserveEscapeSet).
-    auto decoded = TRY(decode(vm, uri_string, ";/?:@&=+$,#"sv));
-    return PrimitiveString::create(vm, move(decoded));
+    auto decoded = TRY(decode(vm, uri_string.utf16_view(), ";/?:@&=+$,#"sv));
+    return PrimitiveString::create(vm, decoded);
 }
 
 // 19.2.6.2 decodeURIComponent ( encodedURIComponent ), https://tc39.es/ecma262/#sec-decodeuricomponent-encodeduricomponent
@@ -500,12 +500,12 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::decode_uri_component)
     auto encoded_uri_component = vm.argument(0);
 
     // 1. Let componentString be ? ToString(encodedURIComponent).
-    auto uri_string = TRY(encoded_uri_component.to_byte_string(vm));
+    auto uri_string = TRY(encoded_uri_component.to_utf16_string(vm));
 
     // 2. Let preserveEscapeSet be the empty String.
     // 3. Return ? Decode(componentString, preserveEscapeSet).
-    auto decoded = TRY(decode(vm, uri_string, ""sv));
-    return PrimitiveString::create(vm, move(decoded));
+    auto decoded = TRY(decode(vm, uri_string.utf16_view(), ""sv));
+    return PrimitiveString::create(vm, decoded);
 }
 
 // 19.2.6.3 encodeURI ( uri ), https://tc39.es/ecma262/#sec-encodeuri-uri
@@ -514,11 +514,11 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::encode_uri)
     auto uri = vm.argument(0);
 
     // 1. Let uriString be ? ToString(uri).
-    auto uri_string = TRY(uri.to_byte_string(vm));
+    auto uri_string = TRY(uri.to_utf16_string(vm));
 
     // 2. Let extraUnescaped be ";/?:@&=+$,#".
     // 3. Return ? Encode(uriString, extraUnescaped).
-    auto encoded = TRY(encode(vm, uri_string, ";/?:@&=+$,abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()#"sv));
+    auto encoded = TRY(encode(vm, uri_string.utf16_view(), ";/?:@&=+$,abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()#"sv));
     return PrimitiveString::create(vm, move(encoded));
 }
 
@@ -528,11 +528,11 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::encode_uri_component)
     auto uri_component = vm.argument(0);
 
     // 1. Let componentString be ? ToString(uriComponent).
-    auto uri_string = TRY(uri_component.to_byte_string(vm));
+    auto uri_string = TRY(uri_component.to_utf16_string(vm));
 
     // 2. Let extraUnescaped be the empty String.
     // 3. Return ? Encode(componentString, extraUnescaped).
-    auto encoded = TRY(encode(vm, uri_string, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()"sv));
+    auto encoded = TRY(encode(vm, uri_string.utf16_view(), "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()"sv));
     return PrimitiveString::create(vm, move(encoded));
 }
 
@@ -543,7 +543,7 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::escape)
     auto string = TRY(vm.argument(0).to_utf16_string(vm));
 
     // 3. Let R be the empty String.
-    StringBuilder escaped;
+    Utf16StringBuilder escaped;
 
     // 4. Let unescapedSet be the string-concatenation of the ASCII word characters and "@*+-./".
     auto unescaped_set = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./"sv;
@@ -559,7 +559,7 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::escape)
         // NOTE: We know unescapedSet is ASCII-only, so ensure we have an ASCII codepoint before casting to char.
         if (is_ascii(code_unit) && unescaped_set.contains(static_cast<char>(code_unit))) {
             // i. Let S be the String value containing the single code unit char.
-            escaped.append(static_cast<char>(code_unit));
+            escaped.append_ascii(static_cast<char>(code_unit));
         }
         // c. Else,
         // i. Let n be the numeric value of char.
@@ -581,43 +581,50 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::escape)
     }
 
     // 7. Return R.
-    return PrimitiveString::create(vm, escaped.to_byte_string());
+    return PrimitiveString::create(vm, escaped.to_string());
 }
 
 // B.2.1.2 unescape ( string ), https://tc39.es/ecma262/#sec-unescape-string
 JS_DEFINE_NATIVE_FUNCTION(GlobalObject::unescape)
 {
     // 1. Set string to ? ToString(string).
-    auto string = TRY(vm.argument(0).to_byte_string(vm));
+    auto string = TRY(vm.argument(0).to_utf16_string(vm));
 
     // 2. Let length be the length of string.
-    ssize_t length = string.length();
+    size_t length = string.length_in_code_units();
 
     // 3. Let R be the empty String.
-    StringBuilder unescaped(length);
+    Utf16StringBuilder unescaped(length);
 
     // 4. Let k be 0.
     // 5. Repeat, while k ≠ length,
-    for (auto k = 0; k < length; ++k) {
+    for (size_t k = 0; k < length; ++k) {
         // a. Let c be the code unit at index k within string.
-        u32 code_point = string[k];
+        u16 code_unit = string.code_unit_at(k);
 
         // b. If c is the code unit 0x0025 (PERCENT SIGN), then
-        if (code_point == '%') {
+        if (code_unit == '%') {
             // i. Let hexEscape be the empty String.
             // ii. Let skip be 0.
             // iii. If k ≤ length - 6 and the code unit at index k + 1 within string is the code unit 0x0075 (LATIN SMALL LETTER U), then
-            if (k <= length - 6 && string[k + 1] == 'u' && is_ascii_hex_digit(string[k + 2]) && is_ascii_hex_digit(string[k + 3]) && is_ascii_hex_digit(string[k + 4]) && is_ascii_hex_digit(string[k + 5])) {
+            if (k + 5 < length
+                && string.code_unit_at(k + 1) == 'u'
+                && is_ascii_hex_digit(string.code_unit_at(k + 2))
+                && is_ascii_hex_digit(string.code_unit_at(k + 3))
+                && is_ascii_hex_digit(string.code_unit_at(k + 4))
+                && is_ascii_hex_digit(string.code_unit_at(k + 5))) {
                 // 1. Set hexEscape to the substring of string from k + 2 to k + 6.
-                code_point = (parse_ascii_hex_digit(string[k + 2]) << 12) | (parse_ascii_hex_digit(string[k + 3]) << 8) | (parse_ascii_hex_digit(string[k + 4]) << 4) | parse_ascii_hex_digit(string[k + 5]);
+                code_unit = (parse_ascii_hex_digit(string.code_unit_at(k + 2)) << 12) | (parse_ascii_hex_digit(string.code_unit_at(k + 3)) << 8) | (parse_ascii_hex_digit(string.code_unit_at(k + 4)) << 4) | parse_ascii_hex_digit(string.code_unit_at(k + 5));
 
                 // 2. Set skip to 5.
                 k += 5;
             }
             // iv. Else if k ≤ length - 3, then
-            else if (k <= length - 3 && is_ascii_hex_digit(string[k + 1]) && is_ascii_hex_digit(string[k + 2])) {
+            else if (k + 2 < length
+                && is_ascii_hex_digit(string.code_unit_at(k + 1))
+                && is_ascii_hex_digit(string.code_unit_at(k + 2))) {
                 // 1. Set hexEscape to the substring of string from k + 1 to k + 3.
-                code_point = (parse_ascii_hex_digit(string[k + 1]) << 4) | parse_ascii_hex_digit(string[k + 2]);
+                code_unit = (parse_ascii_hex_digit(string.code_unit_at(k + 1)) << 4) | parse_ascii_hex_digit(string.code_unit_at(k + 2));
 
                 // 2. Set skip to 2.
                 k += 2;
@@ -632,13 +639,13 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::unescape)
         }
 
         // c. Set R to the string-concatenation of R and c.
-        unescaped.append_code_point(code_point);
+        unescaped.append_code_unit(code_unit);
 
         // d. Set k to k + 1.
     }
 
     // 6. Return R.
-    return PrimitiveString::create(vm, unescaped.to_byte_string());
+    return PrimitiveString::create(vm, unescaped.to_string());
 }
 
 }

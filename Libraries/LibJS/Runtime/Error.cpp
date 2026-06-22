@@ -25,9 +25,11 @@ GC::Ref<Error> Error::create(Realm& realm, Utf16String message)
     return error;
 }
 
-GC::Ref<Error> Error::create(Realm& realm, StringView message)
+GC::Ref<Error> Error::create(Realm& realm, Utf16View message)
 {
-    return create(realm, Utf16String::from_utf8(message));
+    auto error = Error::create(realm);
+    error->set_message(message);
+    return error;
 }
 
 Utf16String Error::stack_string(CompactTraceback compact) const
@@ -78,6 +80,14 @@ void Error::set_message(Utf16String message)
     define_direct_property(vm.names.message, PrimitiveString::create(vm, move(message)), attr);
 }
 
+void Error::set_message(Utf16View message)
+{
+    auto& vm = this->vm();
+
+    u8 attr = Attribute::Writable | Attribute::Configurable;
+    define_direct_property(vm.names.message, PrimitiveString::create(vm, message), attr);
+}
+
 #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
     GC_DEFINE_ALLOCATOR(ClassName);                                                      \
     GC::Ref<ClassName> ClassName::create(Realm& realm)                                   \
@@ -92,9 +102,11 @@ void Error::set_message(Utf16String message)
         return error;                                                                    \
     }                                                                                    \
                                                                                          \
-    GC::Ref<ClassName> ClassName::create(Realm& realm, StringView message)               \
+    GC::Ref<ClassName> ClassName::create(Realm& realm, Utf16View message)                \
     {                                                                                    \
-        return create(realm, Utf16String::from_utf8(message));                           \
+        auto error = ClassName::create(realm);                                           \
+        error->set_message(message);                                                     \
+        return error;                                                                    \
     }                                                                                    \
                                                                                          \
     ClassName::ClassName(Object& prototype)                                              \

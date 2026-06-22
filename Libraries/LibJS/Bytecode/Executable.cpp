@@ -358,12 +358,16 @@ static void dump_header(StringBuilder& output, Executable const& executable)
 
     // Show source location if available.
     if (first_source_map_entry) {
-        auto filename = executable.source_code->filename();
+        auto filename = executable.source_code->filename().utf16_view();
         if (!filename.is_empty()) {
             // Show just the basename to keep output portable across machines.
-            auto last_slash = filename.bytes_as_string_view().find_last('/');
+            Optional<size_t> last_slash;
+            for (size_t i = 0; i < filename.length_in_code_units(); ++i) {
+                if (filename.code_unit_at(i) == '/')
+                    last_slash = i;
+            }
             if (last_slash.has_value())
-                filename = MUST(filename.substring_from_byte_offset(last_slash.value() + 1));
+                filename = filename.substring_view(last_slash.value() + 1);
             output.appendff(" {}:{}:{}", filename, first_source_map_entry->line, first_source_map_entry->column);
         } else {
             output.appendff(" line {}, column {}", first_source_map_entry->line, first_source_map_entry->column);
@@ -409,9 +413,9 @@ static void dump_metadata(StringBuilder& output, Executable const& executable)
             else if (value.is_double())
                 output.appendff("Double({})", value.as_double());
             else if (value.is_bigint())
-                output.appendff("BigInt({})", MUST(value.as_bigint().to_string()));
+                output.appendff("BigInt({})", value.as_bigint().to_utf16_string());
             else if (value.is_string())
-                output.appendff("String(\"{}\")", value.as_string().utf8_string_view());
+                output.appendff("String(\"{}\")", value.as_string().utf16_string_view());
             else if (value.is_undefined())
                 output.append("Undefined"sv);
             else if (value.is_null())

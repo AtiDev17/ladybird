@@ -9,6 +9,8 @@
 
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 
 namespace Unicode {
 
@@ -19,8 +21,9 @@ enum class NormalizationForm {
     NFKC
 };
 NormalizationForm normalization_form_from_string(StringView);
-StringView normalization_form_to_string(NormalizationForm);
+NormalizationForm normalization_form_from_string(Utf16View);
 
 String normalize(StringView string, NormalizationForm form);
+Utf16String normalize(Utf16View string, NormalizationForm form);
 
 }
