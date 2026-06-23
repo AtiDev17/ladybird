@@ -11,6 +11,7 @@
 #include <linux/audit.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
+#include <linux/sockios.h>
 #include <signal.h>
 #include <stddef.h>
 #include <sys/ioctl.h>
@@ -564,6 +565,9 @@ static char const* syscall_name(long syscall_number)
 #ifdef __NR_ioctl
         CASE_SYSCALL_NAME(ioctl);
 #endif
+#ifdef __NR_kcmp
+        CASE_SYSCALL_NAME(kcmp);
+#endif
 #ifdef __NR_link
         CASE_SYSCALL_NAME(link);
 #endif
@@ -993,6 +997,14 @@ void SeccompPolicy::allow_network()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept4);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, shutdown);
+
+    // Required by glibc's if_nametoindex() when resolving IPv6 link-local nameserver scopes.
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIOCGIFINDEX, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 }
 
 void SeccompPolicy::allow_memory_without_executable_mappings()
@@ -1137,6 +1149,11 @@ void SeccompPolicy::allow_gpu_device_operations()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_ctl);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_wait);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_pwait);
+
+#ifdef __NR_kcmp
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_kcmp, 0, 1));
+    append(SECCOMP_ERRNO(ENOSYS));
+#endif
 }
 
 void SeccompPolicy::allow_process_metadata()
