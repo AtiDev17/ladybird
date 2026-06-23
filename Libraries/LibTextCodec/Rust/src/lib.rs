@@ -93,6 +93,7 @@ pub unsafe extern "C" fn textcodec_rust_decode_to_utf8(
     input: *const u8,
     input_len: usize,
     remove_bom: bool,
+    fatal: bool,
     ctx: *mut c_void,
     on_bytes: FfiBytesFn,
 ) -> bool {
@@ -108,56 +109,16 @@ pub unsafe extern "C" fn textcodec_rust_decode_to_utf8(
                 return false;
             };
 
-            let (output, _) = if remove_bom {
+            let (output, had_errors) = if remove_bom {
                 encoding.decode_with_bom_removal(input)
             } else {
                 encoding.decode_without_bom_handling(input)
             };
+            if fatal && had_errors {
+                return false;
+            }
             on_bytes(ctx, output.as_bytes().as_ptr(), output.len());
             true
-        })
-    }
-}
-
-/// # Safety
-/// - `encoding_label`/`encoding_label_len` and `input`/`input_len` must be valid byte slices.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn textcodec_rust_validate(
-    encoding_label: *const u8,
-    encoding_label_len: usize,
-    input: *const u8,
-    input_len: usize,
-    remove_bom: bool,
-) -> bool {
-    unsafe {
-        abort_on_panic(|| {
-            let Some(label) = bytes_from_raw(encoding_label, encoding_label_len) else {
-                return false;
-            };
-            let Some(input) = bytes_from_raw(input, input_len) else {
-                return false;
-            };
-            let Some(encoding) = Encoding::for_label(label) else {
-                return false;
-            };
-
-            let input = if remove_bom {
-                if encoding == encoding_rs::UTF_8 && input.starts_with(b"\xEF\xBB\xBF") {
-                    &input[3..]
-                } else if (encoding == encoding_rs::UTF_16LE && input.starts_with(b"\xFF\xFE"))
-                    || (encoding == encoding_rs::UTF_16BE && input.starts_with(b"\xFE\xFF"))
-                {
-                    &input[2..]
-                } else {
-                    input
-                }
-            } else {
-                input
-            };
-
-            encoding
-                .decode_without_bom_handling_and_without_replacement(input)
-                .is_some()
         })
     }
 }
@@ -212,6 +173,7 @@ pub unsafe extern "C" fn textcodec_rust_streaming_decoder_decode_to_utf8(
     input: *const u8,
     input_len: usize,
     last: bool,
+    fatal: bool,
     ctx: *mut c_void,
     on_bytes: FfiBytesFn,
 ) -> bool {
@@ -230,7 +192,10 @@ pub unsafe extern "C" fn textcodec_rust_streaming_decoder_decode_to_utf8(
             };
             let mut output = String::with_capacity(output_capacity);
 
-            let (result, _, _) = decoder.decoder.decode_to_string(input, &mut output, last);
+            let (result, _, had_errors) = decoder.decoder.decode_to_string(input, &mut output, last);
+            if fatal && had_errors {
+                return false;
+            }
             if !output.is_empty() {
                 on_bytes(ctx, output.as_ptr(), output.len());
             }

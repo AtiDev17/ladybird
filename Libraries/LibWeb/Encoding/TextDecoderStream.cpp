@@ -15,6 +15,7 @@
 #include <LibWeb/Bindings/TextDecoder.h>
 #include <LibWeb/Bindings/TextDecoderStream.h>
 #include <LibWeb/Encoding/TextDecoderStream.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Streams/TransformStream.h>
 #include <LibWeb/Streams/TransformStreamOperations.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -38,7 +39,7 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     auto lowercase_encoding_name = encoding.value().to_ascii_lowercase_string();
 
     // 4. If options["fatal"] is true, then set this’s error mode to "fatal".
-    auto error_mode = options.fatal ? ErrorMode::Fatal : ErrorMode::Replacement;
+    auto error_mode = options.fatal ? TextCodec::ErrorMode::Fatal : TextCodec::ErrorMode::Replacement;
 
     // 5. Set this’s ignore BOM to options["ignoreBOM"].
     auto ignore_bom = options.ignore_bom;
@@ -59,6 +60,7 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     //    algorithm with this and chunk.
     auto transform_algorithm = GC::create_function(realm.heap(), [stream](JS::Value chunk) -> GC::Ref<WebIDL::Promise> {
         auto& realm = stream->realm();
+        HTML::TemporaryExecutionContext execution_context { realm };
         if (auto result = stream->decode_and_enqueue_chunk(chunk); result.is_error())
             return WebIDL::create_rejected_promise_from_exception(realm, result.release_error());
         return WebIDL::create_resolved_promise(realm, JS::js_undefined());
@@ -67,6 +69,7 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     // 8. Let flushAlgorithm be an algorithm which takes no arguments and runs the flush and enqueue algorithm with this.
     auto flush_algorithm = GC::create_function(realm.heap(), [stream]() -> GC::Ref<WebIDL::Promise> {
         auto& realm = stream->realm();
+        HTML::TemporaryExecutionContext execution_context { realm };
         if (auto result = stream->flush_and_enqueue(); result.is_error())
             return WebIDL::create_rejected_promise_from_exception(realm, result.release_error());
         return WebIDL::create_resolved_promise(realm, JS::js_undefined());
@@ -81,11 +84,14 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     return stream;
 }
 
-TextDecoderStream::TextDecoderStream(JS::Realm& realm, GC::Ref<Streams::TransformStream> transform, TextCodec::Decoder& decoder, FlyString encoding, ErrorMode error_mode, bool ignore_bom)
+TextDecoderStream::TextDecoderStream(JS::Realm& realm, GC::Ref<Streams::TransformStream> transform, TextCodec::Decoder& decoder, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
     : Bindings::PlatformObject(realm)
     , Streams::GenericTransformStreamMixin(transform)
     , TextDecoderCommonMixin(decoder, move(encoding), error_mode, ignore_bom)
-    , m_streaming_decoder(make<TextCodec::StreamingDecoder>(m_encoding))
+    , m_streaming_decoder(make<TextCodec::StreamingDecoder>(
+          m_encoding,
+          m_ignore_bom ? TextCodec::IgnoreBOM::Yes : TextCodec::IgnoreBOM::No,
+          m_error_mode))
 {
 }
 
@@ -119,7 +125,10 @@ WebIDL::ExceptionOr<void> TextDecoderStream::decode_and_enqueue_chunk(JS::Value 
         return WebIDL::OperationError::create(realm, "Failed to copy bytes from BufferSource"_utf16);
     auto buffer = buffer_or_error.release_value();
 
-    auto decoded = TRY_OR_THROW_OOM(vm, m_streaming_decoder->to_utf8(buffer.bytes()));
+    auto decoded_or_error = m_streaming_decoder->to_utf8(buffer.bytes());
+    if (decoded_or_error.is_error() && decoded_or_error.error().code() != ENOMEM)
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
+    auto decoded = TRY_OR_THROW_OOM(vm, move(decoded_or_error));
 
     // 3-4. Run "processing an item" until the input is exhausted, accumulating the output, then enqueue any non-empty
     //      result. If processing returns error, throw a TypeError.
@@ -130,7 +139,10 @@ WebIDL::ExceptionOr<void> TextDecoderStream::decode_and_enqueue_chunk(JS::Value 
 WebIDL::ExceptionOr<void> TextDecoderStream::flush_and_enqueue()
 {
     // 1-3. Drain decoder's I/O queue and run "processing an item" to completion.
-    auto decoded = TRY_OR_THROW_OOM(vm(), m_streaming_decoder->finish());
+    auto decoded_or_error = m_streaming_decoder->finish();
+    if (decoded_or_error.is_error() && decoded_or_error.error().code() != ENOMEM)
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
+    auto decoded = TRY_OR_THROW_OOM(vm(), move(decoded_or_error));
     return enqueue_decoded_output(decoded);
 }
 
@@ -139,21 +151,8 @@ WebIDL::ExceptionOr<void> TextDecoderStream::enqueue_decoded_output(String const
     auto& realm = this->realm();
     auto& vm = realm.vm();
 
-    // https://encoding.spec.whatwg.org/#concept-td-serialize
-    // FIXME: The underlying TextCodec decoders currently strip leading BOMs unconditionally for UTF-8 and UTF-16BE/LE,
-    //        so the "ignore BOM" flag is effectively ignored here. Once the decoders accept a "preserve BOM" mode,
-    //        plumb m_ignore_bom through and strip the BOM from `decoded` only when m_ignore_bom is false.
-    if (!m_bom_seen && !decoded.is_empty())
-        m_bom_seen = true;
-
     if (decoded.is_empty())
         return {};
-
-    // If decoder's error mode is "fatal" and processing produced any error, throw a TypeError.
-    // NB: We can only detect this approximately by looking for U+FFFD in the decoded output, which the underlying
-    //     decoder substitutes for invalid sequences. This matches the existing TextDecoder.decode() behavior.
-    if (fatal() && decoded.contains(0xFFFD))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
 
     auto js_string = JS::PrimitiveString::create(vm, Utf16String::from_utf8(decoded));
     return Streams::transform_stream_default_controller_enqueue(*m_transform->controller(), js_string);

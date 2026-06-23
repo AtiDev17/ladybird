@@ -12,6 +12,7 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/TextEncoderStream.h>
 #include <LibWeb/Encoding/TextEncoderStream.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Streams/TransformStream.h>
 #include <LibWeb/Streams/TransformStreamOperations.h>
 #include <LibWeb/WebIDL/Promise.h>
@@ -21,7 +22,7 @@ namespace Web::Encoding {
 GC_DEFINE_ALLOCATOR(TextEncoderStream);
 
 // https://encoding.spec.whatwg.org/#dom-textencoderstream
-WebIDL::ExceptionOr<GC::Ref<TextEncoderStream>> TextEncoderStream::construct_impl(JS::Realm& realm)
+GC::Ref<TextEncoderStream> TextEncoderStream::construct_impl(JS::Realm& realm)
 {
     // 1. Set this’s encoder to an instance of the UTF-8 encoder.
     // NOTE: No-op, as AK::String is already in UTF-8 format.
@@ -38,6 +39,7 @@ WebIDL::ExceptionOr<GC::Ref<TextEncoderStream>> TextEncoderStream::construct_imp
     auto transform_algorithm = GC::create_function(realm.heap(), [stream](JS::Value chunk) -> GC::Ref<WebIDL::Promise> {
         auto& realm = stream->realm();
         auto& vm = realm.vm();
+        HTML::TemporaryExecutionContext execution_context { realm };
 
         if (auto result = stream->encode_and_enqueue_chunk(chunk); result.is_error()) {
             auto throw_completion = Bindings::exception_to_throw_completion(vm, result.exception());
@@ -51,6 +53,7 @@ WebIDL::ExceptionOr<GC::Ref<TextEncoderStream>> TextEncoderStream::construct_imp
     auto flush_algorithm = GC::create_function(realm.heap(), [stream]() -> GC::Ref<WebIDL::Promise> {
         auto& realm = stream->realm();
         auto& vm = realm.vm();
+        HTML::TemporaryExecutionContext execution_context { realm };
 
         if (auto result = stream->encode_and_flush(); result.is_error()) {
             auto throw_completion = Bindings::exception_to_throw_completion(vm, result.exception());
