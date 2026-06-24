@@ -41,6 +41,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
+#include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Dump.h>
@@ -1531,6 +1532,53 @@ void ConnectionFromClient::request_style_sheet_source(u64 page_id, Web::CSS::Sty
         if (auto stylesheet = document->get_style_sheet_source(identifier); stylesheet.has_value())
             async_did_get_style_sheet_source(page_id, identifier, document->base_url(), stylesheet.value());
     }
+}
+
+void ConnectionFromClient::list_devtools_sources(u64 page_id, u64 request_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+
+    async_did_list_devtools_sources(page_id, request_id, page->list_devtools_sources());
+}
+
+void ConnectionFromClient::request_devtools_source(u64 page_id, Web::HTML::ScriptRegistry::Identifier source_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+
+    async_did_get_devtools_source(page_id, source_id, page->devtools_source_content(source_id));
+}
+
+void ConnectionFromClient::resolve_dom_node_url(u64 page_id, u64 request_id, Optional<Web::UniqueNodeID> node_id, String url)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        async_did_resolve_dom_node_url(page_id, request_id, move(url));
+        return;
+    }
+
+    auto* document = [&]() -> Web::DOM::Document* {
+        if (node_id.has_value()) {
+            if (auto* node = Web::DOM::Node::from_unique_id(*node_id))
+                return &node->document();
+            return nullptr;
+        }
+
+        return page->page().top_level_browsing_context().active_document();
+    }();
+
+    auto resolved_url = document
+        ? document->encoding_parse_url(url)
+              .map([](auto const& parsed_url) {
+                  return parsed_url.serialize();
+              })
+              .value_or(url)
+        : url;
+
+    async_did_resolve_dom_node_url(page_id, request_id, move(resolved_url));
 }
 
 void ConnectionFromClient::set_listen_for_dom_mutations(u64 page_id, bool listen_for_dom_mutations)

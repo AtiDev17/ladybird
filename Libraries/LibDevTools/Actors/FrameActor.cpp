@@ -24,6 +24,34 @@
 
 namespace DevTools {
 
+static JsonArray serialize_frame_list(WeakPtr<TabActor> const& tab_actor)
+{
+    JsonArray frames;
+
+    if (auto tab = tab_actor.strong_ref()) {
+        JsonObject frame;
+        frame.set("id"sv, tab->description().id);
+        frame.set("title"sv, tab->description().title);
+        frame.set("url"sv, tab->description().url);
+        frames.must_append(move(frame));
+    }
+
+    return frames;
+}
+
+static void set_resources_available_message(JsonObject& message, StringView resource_type, JsonArray resources)
+{
+    JsonArray resource;
+    resource.must_append(resource_type);
+    resource.must_append(move(resources));
+
+    JsonArray array;
+    array.must_append(move(resource));
+
+    message.set("type"sv, "resources-available-array"sv);
+    message.set("array"sv, move(array));
+}
+
 NonnullRefPtr<FrameActor> FrameActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<WatcherActor> watcher, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
 {
     return adopt_ref(*new FrameActor(devtools, move(name), move(tab), move(watcher), move(css_properties), move(console), move(inspector), move(style_sheets), move(thread), move(accessibility)));
@@ -150,8 +178,17 @@ void FrameActor::handle_message(Message const& message)
     }
 
     if (message.type == "listFrames"sv) {
+        response.set("frames"sv, serialize_frame_list(m_tab));
         send_response(message, move(response));
         send_pending_navigation_document_events_after_target_switch();
+        return;
+    }
+
+    if (message.type == "listWorkers"sv) {
+        // FIXME: Return dedicated, shared, and service worker targets once
+        //        Ladybird exposes worker targets to DevTools.
+        response.set("workers"sv, JsonArray {});
+        send_response(message, move(response));
         return;
     }
 
@@ -160,19 +197,9 @@ void FrameActor::handle_message(Message const& message)
 
 void FrameActor::send_frame_update_message()
 {
-    JsonArray frames;
-
-    if (auto tab_actor = m_tab.strong_ref()) {
-        JsonObject frame;
-        frame.set("id"sv, tab_actor->description().id);
-        frame.set("title"sv, tab_actor->description().title);
-        frame.set("url"sv, tab_actor->description().url);
-        frames.must_append(move(frame));
-    }
-
     JsonObject message;
     message.set("type"sv, "frameUpdate"sv);
-    message.set("frames"sv, move(frames));
+    message.set("frames"sv, serialize_frame_list(m_tab));
     send_message(move(message));
 }
 
@@ -306,6 +333,36 @@ void FrameActor::style_sheets_available(JsonObject& response, Vector<Web::CSS::S
     response.set("array"sv, move(array));
 
     style_sheets_actor->set_style_sheets(move(style_sheets));
+}
+
+void FrameActor::send_source_resource_available_message()
+{
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    devtools().delegate().retrieve_sources(tab->description(),
+        async_handler<FrameActor>({}, [](auto& self, auto sources, auto& response) {
+            auto thread = self.m_thread.strong_ref();
+            if (!thread)
+                return;
+
+            set_resources_available_message(response, "source"sv, thread->serialize_sources(sources));
+        }));
+}
+
+void FrameActor::send_source_resource_available_message(Web::HTML::ScriptRegistry::Description const& source)
+{
+    auto thread = m_thread.strong_ref();
+    if (!thread)
+        return;
+
+    JsonArray serialized_sources;
+    serialized_sources.must_append(thread->serialize_source(source));
+
+    JsonObject message;
+    set_resources_available_message(message, "source"sv, move(serialized_sources));
+    send_message(move(message));
 }
 
 void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
