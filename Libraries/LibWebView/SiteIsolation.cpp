@@ -11,16 +11,43 @@
 
 namespace WebView {
 
-static bool s_site_isolation_enabled = true;
+static SiteIsolationMode s_site_isolation_mode = SiteIsolationMode::TopLevel;
 
-void disable_site_isolation()
+Optional<SiteIsolationMode> site_isolation_mode_from_string(StringView mode)
 {
-    s_site_isolation_enabled = false;
+    if (mode.equals_ignoring_ascii_case("disable"sv) || mode.equals_ignoring_ascii_case("disabled"sv))
+        return SiteIsolationMode::Disabled;
+    if (mode.equals_ignoring_ascii_case("top-level"sv))
+        return SiteIsolationMode::TopLevel;
+    if (mode.equals_ignoring_ascii_case("iframe"sv) || mode.equals_ignoring_ascii_case("iframes"sv))
+        return SiteIsolationMode::IFrame;
+    return {};
 }
 
-bool is_url_suitable_for_same_process_navigation(URL::URL const& current_url, URL::URL const& target_url)
+StringView site_isolation_mode_to_string(SiteIsolationMode mode)
 {
-    if (!s_site_isolation_enabled)
+    switch (mode) {
+    case SiteIsolationMode::Disabled:
+        return "disable"sv;
+    case SiteIsolationMode::TopLevel:
+        return "top-level"sv;
+    case SiteIsolationMode::IFrame:
+        return "iframe"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void set_site_isolation_mode(SiteIsolationMode mode)
+{
+    s_site_isolation_mode = mode;
+}
+
+bool is_url_suitable_for_same_process_navigation(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target)
+{
+    if (s_site_isolation_mode == SiteIsolationMode::Disabled)
+        return true;
+
+    if (target == Web::NavigationTarget::IFrame && s_site_isolation_mode != SiteIsolationMode::IFrame)
         return true;
 
     // Allow navigating from about:blank to any site.

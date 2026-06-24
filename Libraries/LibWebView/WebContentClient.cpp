@@ -23,6 +23,7 @@
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
+#include <LibWebView/SiteIsolationManager.h>
 #include <LibWebView/SourceHighlighter.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
@@ -160,6 +161,8 @@ void WebContentClient::register_view(u64 page_id, ViewImplementation& view)
 void WebContentClient::unregister_view(u64 page_id)
 {
     forget_compositor_context(Web::Compositor::compositor_context_id_for_page(page_id));
+    SiteIsolationManager::the().close_remote_child_frames_for_page(*this, page_id);
+    SiteIsolationManager::the().remove_page(page_id);
 
     // A page that still needs a beforeunload check is not a detached
     // background close. It is being closed without waiting for WebContent,
@@ -186,9 +189,23 @@ void WebContentClient::request_close(u64 page_id)
     async_request_close(page_id);
 }
 
+void WebContentClient::register_embedded_page(u64 page_id)
+{
+    m_embedded_pages.set(page_id);
+    Application::process_manager().cancel_forced_exit(pid());
+}
+
+void WebContentClient::unregister_embedded_page(u64 page_id)
+{
+    m_embedded_pages.remove(page_id);
+    close_server_if_unused();
+}
+
 void WebContentClient::close_server_if_unused()
 {
     if (!m_views.is_empty())
+        return;
+    if (!m_embedded_pages.is_empty())
         return;
 
     if (m_detached_pages_pending_close.is_empty()) {
@@ -269,6 +286,7 @@ void WebContentClient::notify_compositor_process_reconnected(Badge<Application>)
 void WebContentClient::notify_all_views_of_crash()
 {
     destroy_all_compositor_contexts();
+    SiteIsolationManager::the().remove_all_pages_for_client(*this);
 
     // Collect view IDs first, then use deferred_invoke to handle crashes safely
     // (avoids signal handler deadlock and allows views to be looked up by ID
@@ -303,6 +321,13 @@ bool WebContentClient::send_async_scroll_to_compositor(u64 page_id, Gfx::FloatPo
 
 bool WebContentClient::handle_mouse_event_in_compositor(u64 page_id, Web::MouseEvent const& event)
 {
+    if (auto target = SiteIsolationManager::the().remote_child_frame_input_target_at(page_id, event.position); target.has_value()) {
+        auto translated_event = event.clone_without_browser_data();
+        translated_event.position.set_x(event.position.x() - target->viewport_rect.x());
+        translated_event.position.set_y(event.position.y() - target->viewport_rect.y());
+        return target->remote_client->handle_mouse_event_in_compositor(target->remote_page_id, translated_event);
+    }
+
     auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
 
     auto handled = Application::the().handle_mouse_event_in_compositor(compositor_context_id_for_page(page_id), event);
@@ -325,6 +350,14 @@ bool WebContentClient::handle_pinch_event_in_compositor(u64 page_id, Web::PinchE
 
 void WebContentClient::dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const& event)
 {
+    if (auto target = SiteIsolationManager::the().remote_child_frame_input_target_at(page_id, event.position); target.has_value()) {
+        auto translated_event = event.clone_without_browser_data();
+        translated_event.position.set_x(event.position.x() - target->viewport_rect.x());
+        translated_event.position.set_y(event.position.y() - target->viewport_rect.y());
+        target->remote_client->dispatch_mouse_event_to_web_content(target->remote_page_id, translated_event);
+        return;
+    }
+
     auto context_id = compositor_context_id_for_page(page_id);
     if (Application::the().dispatch_mouse_event_to_web_content(context_id, event))
         return;
@@ -358,6 +391,71 @@ void WebContentClient::did_request_new_process_for_navigation(u64 page_id, URL::
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
         view->create_new_process_for_cross_site_navigation(url, move(document_resource), history_handling);
+}
+
+Messages::WebContentClient::DecideNavigationProcessResponse WebContentClient::decide_navigation_process(u64 page_id, Optional<String> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target)
+{
+    return SiteIsolationManager::the().decide_navigation_process(*this, page_id, move(frame_id), move(current_url), move(target_url), target);
+}
+
+void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 page_id, String frame_id, URL::URL url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+{
+    auto& site_isolation_manager = SiteIsolationManager::the();
+    auto child_frame = site_isolation_manager.child_frame(page_id, frame_id);
+    if (!child_frame.has_value())
+        return;
+    if (!site_isolation_manager.has_matching_pending_child_frame_navigation(page_id, frame_id, url, ChildFrameOwner::Remote))
+        return;
+
+    auto remote_process_or_error = Application::the().launch_child_frame_web_content_process();
+    if (remote_process_or_error.is_error()) {
+        warnln("Unable to create WebContent process for child frame navigation: {}", remote_process_or_error.error());
+        site_isolation_manager.clear_pending_child_frame_navigation(page_id, frame_id);
+        return;
+    }
+
+    auto remote_process = remote_process_or_error.release_value();
+    auto remote_page_id = remote_process.page_id;
+    auto remote_client = move(remote_process.client);
+    site_isolation_manager.record_pending_child_frame_navigation(page_id, frame_id, url, ChildFrameOwner::Remote, remote_page_id);
+    remote_client->register_embedded_page(remote_page_id);
+    remote_client->async_set_page_parent_context(remote_page_id, Web::Compositor::compositor_context_id_for_page(page_id));
+    if (child_frame->viewport_rect.has_value()) {
+        remote_client->async_set_viewport(
+            remote_page_id,
+            child_frame->viewport_rect->size(),
+            child_frame->device_pixel_ratio,
+            Web::ViewportIsFullscreen::No);
+    }
+    remote_client->async_set_system_visibility_state(remote_page_id, Web::HTML::VisibilityState::Visible);
+    remote_client->async_load_url_with_document_resource(remote_page_id, url, move(document_resource), history_handling);
+
+    site_isolation_manager.transition_child_frame_to_remote(*this, page_id, frame_id, move(remote_client), remote_page_id);
+}
+
+void WebContentClient::did_create_child_frame(u64 page_id, String parent_frame_id, String frame_id)
+{
+    SiteIsolationManager::the().did_create_child_frame(page_id, move(parent_frame_id), move(frame_id));
+}
+
+void WebContentClient::did_update_child_frame_viewport(u64 page_id, String frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio)
+{
+    SiteIsolationManager::the().did_update_child_frame_viewport(page_id, move(frame_id), viewport_rect, device_pixel_ratio);
+}
+
+void WebContentClient::did_commit_child_frame_navigation(u64 page_id, String frame_id, URL::URL url)
+{
+    SiteIsolationManager::the().did_commit_child_frame_navigation(*this, page_id, frame_id, url);
+}
+
+void WebContentClient::did_destroy_child_frame(u64 page_id, String frame_id)
+{
+    SiteIsolationManager::the().did_destroy_child_frame(*this, page_id, frame_id);
+}
+
+Optional<WebContentClient::ChildFrameHost const&> WebContentClient::child_frame(u64 page_id, StringView frame_id) const
+{
+    return SiteIsolationManager::the().child_frame(page_id, frame_id);
 }
 
 void WebContentClient::did_start_webdriver_navigation(u64 page_id, URL::URL url)
@@ -459,6 +557,8 @@ void WebContentClient::did_finish_loading(u64 page_id, URL::URL url)
             if (listener.on_load_finish)
                 listener.on_load_finish(client_url);
         }
+    } else {
+        SiteIsolationManager::the().remote_child_frame_did_commit_navigation(*this, page_id, url);
     }
 }
 
@@ -555,6 +655,8 @@ void WebContentClient::did_change_url(u64 page_id, URL::URL url)
 
         if (view->on_url_change)
             view->on_url_change(url);
+    } else {
+        SiteIsolationManager::the().remote_child_frame_did_finish_loading(*this, page_id, url);
     }
 }
 
@@ -1160,7 +1262,10 @@ void WebContentClient::did_request_activate_tab(u64 page_id)
 
 void WebContentClient::did_close_browsing_context(u64 page_id)
 {
+    unregister_embedded_page(page_id);
     m_detached_pages_pending_close.remove(page_id);
+    SiteIsolationManager::the().close_remote_child_frames_for_page(*this, page_id);
+    SiteIsolationManager::the().remove_page(page_id);
 
     if (auto view = m_views.get(page_id); view.has_value()) {
         if ((*view)->on_close)
@@ -1417,8 +1522,12 @@ void WebContentClient::did_request_select_dropdown(u64 page_id, Gfx::IntPoint co
 
 void WebContentClient::did_finish_handling_input_event(u64 page_id, Web::EventResult event_result)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value())
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
         view->did_finish_handling_input_event({}, event_result);
+        return;
+    }
+
+    SiteIsolationManager::the().remote_child_frame_did_finish_handling_input_event(*this, page_id, event_result);
 }
 
 void WebContentClient::did_update_input_caret_rect(u64 page_id, Optional<Web::DevicePixelRect> rect)
@@ -1498,6 +1607,11 @@ Messages::WebContentClient::DidRequestUiProcessSessionHistoryForTestingResponse 
         return { view->ui_process_session_history_for_testing({}) };
 
     return { "{}"_string };
+}
+
+Messages::WebContentClient::DidRequestSiteIsolationProcessTreeForTestingResponse WebContentClient::did_request_site_isolation_process_tree_for_testing(u64 page_id)
+{
+    return { SiteIsolationManager::the().dump_process_tree(*this, page_id) };
 }
 
 Messages::WebContentClient::DidUpdateSessionHistoryAndRequestUiProcessSessionHistoryForTestingResponse WebContentClient::did_update_session_history_and_request_ui_process_session_history_for_testing(u64 page_id, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index)
