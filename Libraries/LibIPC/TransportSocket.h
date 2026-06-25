@@ -96,6 +96,17 @@ public:
 
     ErrorOr<TransportHandle> release_for_transfer();
 
+    // Test seam: When set to a non-zero value, the IO thread wakes the consumer and then pauses for the given duration
+    // on EOF — before the messages it has just read are parsed and appended. That forces a consumer drain into the
+    // narrow window between observing EOF and the final message becoming available — which is otherwise hit only under
+    // rare timing. No-op in production.
+    static void set_eof_drain_window_for_test(u32 milliseconds);
+
+    // Test seam: When set, the IO thread skips its in-loop read on POLLIN — modelling a stop path that ends the loop
+    // without having read a message already buffered on the socket (e.g. SocketClosed from a failed send). Exercises
+    // the loop-exit drain. No-op in production.
+    static void set_skip_inloop_read_for_test(bool);
+
 private:
     enum class TransferState {
         Continue,
@@ -134,6 +145,12 @@ private:
     Sync::Mutex m_incoming_mutex;
     Sync::ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // Consumer-visible EOF, guarded by m_incoming_mutex. Distinct from m_peer_eof. This is set only after the final
+    // batch of messages have been parsed and appended to m_incoming_messages under the same lock.
+    bool m_incoming_eof { false };
+
+    static Atomic<u32> s_eof_drain_window_for_test_ms;
+    static Atomic<bool> s_skip_inloop_read_for_test;
 
     RefPtr<AutoCloseFileDescriptor> m_wakeup_io_thread_read_fd;
     RefPtr<AutoCloseFileDescriptor> m_wakeup_io_thread_write_fd;

@@ -1,0 +1,18 @@
+Harness status: OK
+
+Found 12 tests
+
+8 Pass
+4 Fail
+Pass	rect1
+Fail	rect2
+Pass	circle
+Fail	ellipse1
+Fail	ellipse2
+Pass	ellipse3
+Pass	ellipse4
+Pass	image3
+Pass	image4
+Pass	foreign1
+Pass	foreign2
+Fail	SVGGraphicsElement.prototype.getBBox for elements with negative sizes
