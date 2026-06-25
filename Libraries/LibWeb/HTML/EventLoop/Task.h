@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/DistinctNumeric.h>
+#include <AK/RefCounted.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
@@ -89,6 +90,9 @@ public:
 
         // https://www.w3.org/TR/webcrypto-2/#dfn-crypto-task-source
         Crypto,
+
+        // https://w3c.github.io/web-locks/#web-locks-tasks-source
+        WebLocks,
 
         // !!! IMPORTANT: Keep this field last!
         // This serves as the base value of all unique task sources.
