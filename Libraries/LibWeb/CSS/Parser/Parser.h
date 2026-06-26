@@ -100,6 +100,7 @@ struct WEB_API ParsingParams {
     GC::Ptr<DOM::Document const> document;
     ParsingMode mode { ParsingMode::Normal };
     IsUAStyleSheet is_ua_style_sheet { IsUAStyleSheet::No };
+    ComputedProperties const* computed_style_for_custom_property_resolution { nullptr };
 
     Vector<ValueParsingContext> value_context;
     Vector<RuleContext> rule_context;
@@ -301,7 +302,7 @@ private:
     struct FunctionPrelude {
         FlyString name;
         Vector<FunctionParameterInternal> parameters;
-        NonnullOwnPtr<SyntaxNode> return_type;
+        NonnullRefPtr<SyntaxNode> return_type;
     };
     Optional<FunctionPrelude> parse_function_prelude(TokenStream<ComponentValue>&);
 
@@ -648,6 +649,7 @@ private:
     GC::Ptr<JS::Realm> m_realm;
     ParsingMode m_parsing_mode { ParsingMode::Normal };
     IsUAStyleSheet m_is_ua_style_sheet { IsUAStyleSheet::No };
+    ComputedProperties const* m_computed_style_for_custom_property_resolution { nullptr };
 
     Vector<Token> m_tokens;
     TokenStream<Token> m_token_stream;

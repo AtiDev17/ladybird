@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2021, the SerenityOS developers.
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
@@ -41,11 +41,13 @@
 #include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/InvalidationSet.h>
 #include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/SelectorEngine.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -1806,9 +1808,9 @@ static JsonArray serialize_devtools_style_declarations(DOM::Document const& docu
 {
     JsonArray declarations;
 
-    auto serialize_property = [&](String name, StyleProperty const& property, IsCustomProperty is_custom_property, Inherits inherits) {
+    auto serialize_property = [&](Utf16FlyString const& name, StyleProperty const& property, IsCustomProperty is_custom_property, Inherits inherits) {
         declarations.must_append(serialize_devtools_style_declaration(
-            move(name),
+            name.to_utf16_string().to_utf8_but_should_be_ported_to_utf16(),
             property.value->to_string(SerializationMode::Normal),
             property.important,
             is_custom_property,
@@ -1819,7 +1821,7 @@ static JsonArray serialize_devtools_style_declarations(DOM::Document const& docu
 
     for (auto const& property : declaration.properties()) {
         serialize_property(
-            string_from_property_id(property.property_id).to_string(),
+            string_from_property_id(property.property_id),
             property,
             IsCustomProperty::No,
             is_inherited_property(property.property_id) ? Inherits::Yes : Inherits::No);
@@ -1827,7 +1829,7 @@ static JsonArray serialize_devtools_style_declarations(DOM::Document const& docu
 
     for (auto const& custom_property : declaration.custom_properties())
         serialize_property(
-            custom_property.key.to_utf16_string().to_utf8_but_should_be_ported_to_utf16(),
+            custom_property.key,
             custom_property.value,
             IsCustomProperty::Yes,
             custom_property_inherits(document, custom_property.key) ? Inherits::Yes : Inherits::No);
@@ -2405,7 +2407,7 @@ void StyleComputer::compute_property_values(ComputedProperties::Builder& builder
     }
 }
 
-ComputationContext const& StyleComputer::get_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
+ComputationContext StyleComputer::make_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
 {
     auto subject_inline_axis_is_horizontal = [&]() {
         if (!abstract_element.has_value())
@@ -2440,76 +2442,101 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
     case PropertyID::FontWidth:
     case PropertyID::MathDepth:
     case PropertyID::TextRendering: {
-        if (!m_cached_font_computation_context.has_value()) {
-            auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
-            auto length_resolution_context = inheritance_parent.has_value()
-                ? Length::ResolutionContext::for_element(inheritance_parent.value())
-                : Length::ResolutionContext::for_document(m_document);
-            length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
-            length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
+        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+        auto length_resolution_context = inheritance_parent.has_value()
+            ? Length::ResolutionContext::for_element(inheritance_parent.value())
+            : Length::ResolutionContext::for_document(m_document);
+        length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
+        length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
 
-            m_cached_font_computation_context = {
-                .length_resolution_context = length_resolution_context,
-                .abstract_element = abstract_element
-            };
-        }
-
-        return m_cached_font_computation_context.value();
+        return {
+            .length_resolution_context = length_resolution_context,
+            .abstract_element = abstract_element
+        };
     }
     case PropertyID::LineHeight: {
-        if (!m_cached_line_height_computation_context.has_value()) {
-            auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
 
-            auto line_height_font_metrics = Length::FontMetrics {
-                style.font_size(),
-                style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-                inheritance_parent.has_value() ? inheritance_parent->computed_properties()->line_height() : InitialValues::line_height()
-            };
+        auto line_height_font_metrics = Length::FontMetrics {
+            style.font_size(),
+            style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+            inheritance_parent.has_value() ? inheritance_parent->computed_properties()->line_height() : InitialValues::line_height()
+        };
 
-            m_cached_line_height_computation_context = {
-                .length_resolution_context = {
-                    .viewport_rect = viewport_rect(),
-                    .font_metrics = line_height_font_metrics,
-                    .root_font_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
-                        ? line_height_font_metrics
-                        : m_root_element_font_metrics,
-                    .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                    .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
-                        ? style.font_metrics_depend_on_viewport_metrics()
-                        : m_root_element_font_metrics_depend_on_viewport_metrics,
-                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-                },
-                .abstract_element = abstract_element
-            };
-        }
-
-        return m_cached_line_height_computation_context.value();
+        return {
+            .length_resolution_context = {
+                .viewport_rect = viewport_rect(),
+                .font_metrics = line_height_font_metrics,
+                .root_font_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                    ? line_height_font_metrics
+                    : m_root_element_font_metrics,
+                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
+                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                    ? style.font_metrics_depend_on_viewport_metrics()
+                    : m_root_element_font_metrics_depend_on_viewport_metrics,
+                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
+            },
+            .abstract_element = abstract_element
+        };
     }
     default: {
-        if (!m_cached_generic_computation_context.has_value()) {
-            m_cached_generic_computation_context = {
-                .length_resolution_context = {
-                    .viewport_rect = viewport_rect(),
-                    .font_metrics = {
-                        style.font_size(),
-                        style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-                        style.line_height() },
-                    .root_font_metrics = m_root_element_font_metrics,
-                    .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                    .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
-                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-                },
-                .abstract_element = abstract_element,
-                .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
-            };
-        }
-        return m_cached_generic_computation_context.value();
+        return {
+            .length_resolution_context = {
+                .viewport_rect = viewport_rect(),
+                .font_metrics = {
+                    style.font_size(),
+                    style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+                    style.line_height() },
+                .root_font_metrics = m_root_element_font_metrics,
+                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
+                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
+                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
+            },
+            .abstract_element = abstract_element,
+            .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
+        };
     }
     }
 
     VERIFY_NOT_REACHED();
+}
+
+ComputationContext const& StyleComputer::get_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
+{
+    switch (property_id) {
+    case PropertyID::ColorScheme:
+    case PropertyID::FontFamily:
+    case PropertyID::FontFeatureSettings:
+    case PropertyID::FontKerning:
+    case PropertyID::FontOpticalSizing:
+    case PropertyID::FontSize:
+    case PropertyID::FontStyle:
+    case PropertyID::FontVariantAlternates:
+    case PropertyID::FontVariantCaps:
+    case PropertyID::FontVariantEastAsian:
+    case PropertyID::FontVariantEmoji:
+    case PropertyID::FontVariantLigatures:
+    case PropertyID::FontVariantNumeric:
+    case PropertyID::FontVariantPosition:
+    case PropertyID::FontVariationSettings:
+    case PropertyID::FontWeight:
+    case PropertyID::FontWidth:
+    case PropertyID::MathDepth:
+    case PropertyID::TextRendering:
+        if (!m_cached_font_computation_context.has_value())
+            m_cached_font_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_font_computation_context.value();
+    case PropertyID::LineHeight:
+        if (!m_cached_line_height_computation_context.has_value())
+            m_cached_line_height_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_line_height_computation_context.value();
+    default:
+        if (!m_cached_generic_computation_context.has_value())
+            m_cached_generic_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_generic_computation_context.value();
+    }
 }
 
 void StyleComputer::resolve_effective_overflow_values(ComputedProperties::Builder& builder) const
@@ -3525,44 +3552,140 @@ static bool matches_subject_pseudo_class_bucket(PseudoClass pseudo_class, DOM::E
     }
 }
 
-NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+static NonnullRefPtr<StyleValue const> compute_inherited_custom_property_value(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+{
+    auto element_to_inherit_style_from = abstract_element.element_to_inherit_style_from();
+    if (!element_to_inherit_style_from.has_value())
+        return abstract_element.document().custom_property_initial_value(name);
+    auto parent_data = inheritable_custom_property_data(element_to_inherit_style_from.value());
+    if (parent_data) {
+        auto const* parent_property = parent_data->get(name);
+        if (parent_property)
+            return parent_property->value;
+    }
+    return StyleComputer::compute_value_of_custom_property(element_to_inherit_style_from.value(), name, guarded_contexts);
+}
+
+template<typename ComputeRegisteredValue>
+static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts, ComputedProperties const* computed_style_for_custom_property_resolution, ComputeRegisteredValue compute_registered_value)
 {
     // https://drafts.csswg.org/css-variables/#propdef-
     // The computed value of a custom property is its specified value with any arbitrary-substitution functions replaced.
     // FIXME: These should probably be part of ComputedProperties.
     auto& document = abstract_element.document();
+    auto registration = document.get_registered_custom_property(name);
 
     auto value = abstract_element.get_custom_property(name);
     if (!value || value->is_initial())
         return document.custom_property_initial_value(name);
 
-    // Unset is the same as inherit for inherited properties, and by default all custom properties are inherited.
-    // FIXME: Support non-inherited registered custom properties.
-    if (value->is_inherit() || value->is_unset()) {
-        auto element_to_inherit_style_from = abstract_element.element_to_inherit_style_from();
-        if (!element_to_inherit_style_from.has_value())
-            return document.custom_property_initial_value(name);
-        auto inherited_value = element_to_inherit_style_from->get_custom_property(name);
-        if (!inherited_value)
-            return document.custom_property_initial_value(name);
-        return inherited_value.release_nonnull();
-    }
+    if (value->is_inherit())
+        return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+
+    // Unset is the same as inherit for inherited properties, and by default all unregistered custom properties inherit.
+    if (value->is_unset())
+        return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
 
     if (value->is_revert()) {
         // FIXME: Implement reverting custom properties.
+        return value.release_nonnull();
     }
     if (value->is_revert_layer()) {
         // FIXME: Implement reverting custom properties.
+        return value.release_nonnull();
     }
 
-    if (!value->is_unresolved() || !value->as_unresolved().contains_arbitrary_substitution_function())
-        return value.release_nonnull();
+    NonnullRefPtr<StyleValue const> resolved_value = value.release_nonnull();
 
-    auto& unresolved = value->as_unresolved();
-    return Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams {}, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+    if (resolved_value->is_unresolved() && resolved_value->as_unresolved().contains_arbitrary_substitution_function()) {
+        auto& unresolved = resolved_value->as_unresolved();
+        auto parsing_params = Parser::ParsingParams { document };
+        parsing_params.computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution;
+        resolved_value = Parser::Parser::resolve_unresolved_style_value(parsing_params, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+    }
+
+    auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
+        // https://drafts.csswg.org/css-values-5/#invalid-substitution
+        // When property replacement results in a property’s value containing the guaranteed-invalid value, this makes
+        // the declaration invalid at computed-value time. When this happens, the computed value is one of the
+        // following depending on the property’s type:
+
+        // -> The property is a non-registered custom property
+        // -> The property is a registered custom property with universal syntax
+        if (!registration.has_value() || registration->syntax->type() == Parser::SyntaxNode::NodeType::Universal) {
+            // The computed value is the guaranteed-invalid value.
+            return invalid_value;
+        }
+
+        // -> Otherwise
+        {
+            // Either the property’s inherited value or its initial value depending on whether the property is
+            // inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
+            if (registration->inherit)
+                return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+            return abstract_element.document().custom_property_initial_value(name);
+        }
+    };
+
+    if (resolved_value->is_guaranteed_invalid())
+        return invalid_custom_property_fallback_value(move(resolved_value));
+
+    if (!registration.has_value() || registration->syntax->type() == Parser::SyntaxNode::NodeType::Universal)
+        return resolved_value;
+
+    auto resolved_value_contains_attr_tainted_values = resolved_value->is_unresolved() && resolved_value->as_unresolved().contains_attr_tainted_values();
+    auto parsing_params = Parser::ParsingParams { document };
+    parsing_params.value_context.append(PropertyID::Custom);
+    auto parsed_value = Parser::parse_with_a_syntax(parsing_params, resolved_value->tokenize(), registration->syntax);
+    if (parsed_value->is_guaranteed_invalid())
+        return invalid_custom_property_fallback_value(move(parsed_value));
+
+    auto computed_value = compute_registered_value(*registration, move(parsed_value));
+    if (resolved_value_contains_attr_tainted_values)
+        return UnresolvedStyleValue::create(computed_value->tokenize(), {}, {}, UnresolvedStyleValue::SourceTextMode::Trim, true);
+    return computed_value;
 }
 
-void StyleComputer::compute_custom_properties(ComputedProperties&, DOM::AbstractElement abstract_element) const
+ComputationContext StyleComputer::fallback_computation_context_for_custom_property(DOM::AbstractElement const& abstract_element) const
+{
+    if (auto const* style = abstract_element.computed_properties())
+        return make_computation_context_for_property(PropertyID::Color, *style, abstract_element);
+
+    if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value() && parent->computed_properties())
+        return make_computation_context_for_property(PropertyID::Color, *parent->computed_properties(), abstract_element);
+
+    auto length_resolution_context = Length::ResolutionContext::for_document(document());
+    length_resolution_context.subject_element = &abstract_element.element();
+    return {
+        .length_resolution_context = length_resolution_context,
+        .abstract_element = abstract_element,
+    };
+}
+
+NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+{
+    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, nullptr, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
+        // In the fallback path we may be resolving var() before this element's new ComputedProperties have been
+        // installed. Avoid freezing relative values against stale metrics; the consuming property can still compute
+        // them with its own context.
+        if (!parsed_value->is_computationally_independent())
+            return parsed_value;
+
+        auto const& style_computer = abstract_element.document().style_computer();
+        auto computation_context = style_computer.fallback_computation_context_for_custom_property(abstract_element);
+        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
+    });
+}
+
+NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(ComputedProperties const& computed_style, DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts) const
+{
+    auto const& computation_context = get_computation_context_for_property(PropertyID::Color, computed_style, abstract_element);
+    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, &computed_style, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
+        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
+    });
+}
+
+void StyleComputer::compute_custom_properties(ComputedProperties& computed_style, DOM::AbstractElement abstract_element) const
 {
     // https://drafts.csswg.org/css-variables/#propdef-
     // The computed value of a custom property is its specified value with any arbitrary-substitution functions replaced.
@@ -3589,7 +3712,7 @@ void StyleComputer::compute_custom_properties(ComputedProperties&, DOM::Abstract
 
     OrderedHashMap<Utf16FlyString, StyleProperty> resolved_own;
     for (auto const& [name, style_property] : data->own_values()) {
-        auto resolved_value = compute_value_of_custom_property(abstract_element, name);
+        auto resolved_value = compute_value_of_custom_property(computed_style, abstract_element, name);
         if (parent_data) {
             auto const* parent_property = parent_data->get(name);
             if (parent_property && resolved_value->equals(*parent_property->value))
