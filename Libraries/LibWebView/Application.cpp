@@ -782,10 +782,57 @@ ErrorOr<void> Application::launch_services()
         if (auto history_database_path = m_history_database->database_path(); history_database_path.has_value())
             dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is enabled, using {}", history_database_path->string());
 
-        m_cookie_jar = TRY(CookieJar::create(*m_database));
-        m_history_store = TRY(HistoryStore::create(*m_history_database));
-        m_hsts_store = TRY(HSTSStore::create(*m_database));
-        m_storage_jar = TRY(StorageJar::create(*m_database));
+        // The browsing database is shared by several stores, so the decision to fall back is
+        // made for the file as a whole: if any store's schema is too new, none of them may
+        // modify the file. The check-only preflight never writes, so the file is untouched
+        // if any store then has to veto.
+        auto cookies_outcome = TRY(CookieJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+        auto hsts_outcome = TRY(HSTSStore::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+        auto storage_outcome = TRY(StorageJar::migrate_schema(*m_database, Database::MigrationMode::CheckOnly));
+
+        if (cookies_outcome == Database::MigrationOutcome::Success && hsts_outcome == Database::MigrationOutcome::Success && storage_outcome == Database::MigrationOutcome::Success) {
+            // Apply in order, stopping at the first store that finds the database too new
+            // (a concurrent process may have migrated it since the preflight).
+            cookies_outcome = TRY(CookieJar::migrate_schema(*m_database));
+            hsts_outcome = cookies_outcome == Database::MigrationOutcome::Success
+                ? TRY(HSTSStore::migrate_schema(*m_database))
+                : Database::MigrationOutcome::DatabaseTooNew;
+            storage_outcome = hsts_outcome == Database::MigrationOutcome::Success
+                ? TRY(StorageJar::migrate_schema(*m_database))
+                : Database::MigrationOutcome::DatabaseTooNew;
+        }
+
+        // If any store finds the shared file too new, including a concurrent process migrating it
+        // between the preflight and an apply above, none of them may persist this session, even if
+        // an earlier store already migrated. Otherwise, we would keep writing to a vetoed database.
+        if (cookies_outcome != Database::MigrationOutcome::Success || hsts_outcome != Database::MigrationOutcome::Success || storage_outcome != Database::MigrationOutcome::Success) {
+            warnln("Browsing database was created by a newer Ladybird version; cookies, web storage and HSTS policies will not be persisted this session");
+            cookies_outcome = Database::MigrationOutcome::DatabaseTooNew;
+            hsts_outcome = Database::MigrationOutcome::DatabaseTooNew;
+            storage_outcome = Database::MigrationOutcome::DatabaseTooNew;
+        }
+
+        if (cookies_outcome == Database::MigrationOutcome::Success)
+            m_cookie_jar = TRY(CookieJar::create(*m_database));
+        else
+            m_cookie_jar = CookieJar::create();
+
+        if (hsts_outcome == Database::MigrationOutcome::Success)
+            m_hsts_store = TRY(HSTSStore::create(*m_database));
+        else
+            m_hsts_store = HSTSStore::create();
+
+        if (storage_outcome == Database::MigrationOutcome::Success)
+            m_storage_jar = TRY(StorageJar::create(*m_database));
+        else
+            m_storage_jar = StorageJar::create();
+
+        if (TRY(HistoryStore::migrate_schema(*m_history_database)) == Database::MigrationOutcome::Success) {
+            m_history_store = TRY(HistoryStore::create(*m_history_database));
+        } else {
+            dbgln("History database was created by a newer Ladybird version; history will not be persisted this session");
+            m_history_store = HistoryStore::create();
+        }
     } else {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
 

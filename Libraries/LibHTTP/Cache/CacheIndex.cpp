@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/Debug.h>
+#include <AK/StdLibExtras.h>
 #include <AK/StringBuilder.h>
 #include <LibCore/Directory.h>
 #include <LibFileSystem/FileSystem.h>
@@ -14,7 +16,7 @@
 
 namespace HTTP {
 
-static constexpr u32 CACHE_METADATA_KEY = 12389u;
+static constexpr u32 INDEX_SCHEMA_BASELINE_VERSION = 1u;
 
 static ByteString serialize_headers(HeaderList const& headers)
 {
@@ -98,64 +100,43 @@ static void log_orphaned_disk_cache_entries(Database::Database& database)
 
 #endif
 
+// The index schema version is independent of CACHE_VERSION: index-only schema changes append
+// a migration here without invalidating the cache entries on disk. Entry files embed
+// CACHE_VERSION in their headers and are validated when read, so an entry format break must
+// append a migration that deletes the index rows referencing the now-unreadable entries.
+static_assert(CACHE_VERSION == 7, "Bumping CACHE_VERSION requires appending a CacheIndex migration that deletes the index rows referencing the old entry format");
+
+ErrorOr<Database::MigrationOutcome> CacheIndex::migrate_schema(Database::Database& database, Database::MigrationMode mode)
+{
+    Array<Database::Migration, 1> migrations { {
+        { .version = INDEX_SCHEMA_BASELINE_VERSION, .sql = R"#(
+            CREATE TABLE IF NOT EXISTS CacheIndex (
+                cache_key INTEGER,
+                vary_key INTEGER,
+                url TEXT,
+                request_headers BLOB,
+                response_headers BLOB,
+                data_size INTEGER,
+                associated_data_size INTEGER,
+                request_time INTEGER,
+                response_time INTEGER,
+                last_access_time INTEGER,
+                PRIMARY KEY(cache_key, vary_key)
+            );
+        )#"sv },
+    } };
+
+    return database.migrate("CacheIndex"sv, migrations, mode);
+}
+
 ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath const& cache_directory)
 {
-    auto create_cache_metadata_table = TRY(database.prepare_statement(R"#(
-        CREATE TABLE IF NOT EXISTS CacheMetadata (
-            metadata_key INTEGER,
-            version INTEGER,
-            PRIMARY KEY(metadata_key)
-        );
-    )#"sv));
-    database.execute_statement(create_cache_metadata_table, {});
-
-    auto read_cache_version = TRY(database.prepare_statement("SELECT version FROM CacheMetadata WHERE metadata_key = ?;"sv));
-    auto cache_version = 0u;
-
-    database.execute_statement(
-        read_cache_version,
-        [&](auto statement_id) { cache_version = database.result_column<u32>(statement_id, 0); },
-        CACHE_METADATA_KEY);
-
-    if (cache_version != CACHE_VERSION) {
-        if (cache_version != 0)
-            dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1mDisk cache version mismatch:\033[0m stored version = {}, new version = {}", cache_version, CACHE_VERSION);
-
-        // FIXME: We should more elegantly handle minor changes, i.e. use ALTER TABLE to add fields to CacheIndex.
-        auto delete_cache_index_table = TRY(database.prepare_statement("DROP TABLE IF EXISTS CacheIndex;"sv));
-        database.execute_statement(delete_cache_index_table, {});
-
-        auto set_cache_version = TRY(database.prepare_statement("INSERT OR REPLACE INTO CacheMetadata VALUES (?, ?);"sv));
-        database.execute_statement(set_cache_version, {}, CACHE_METADATA_KEY, CACHE_VERSION);
-
-        for_each_cache_entry_file(database, [&](LexicalPath const& cache_entry) {
-            (void)FileSystem::remove(cache_entry.string(), FileSystem::RecursionMode::Disallowed);
-        });
-    }
-
-    auto create_cache_index_table = TRY(database.prepare_statement(R"#(
-        CREATE TABLE IF NOT EXISTS CacheIndex (
-            cache_key INTEGER,
-            vary_key INTEGER,
-            url TEXT,
-            request_headers BLOB,
-            response_headers BLOB,
-            data_size INTEGER,
-            associated_data_size INTEGER,
-            request_time INTEGER,
-            response_time INTEGER,
-            last_access_time INTEGER,
-            PRIMARY KEY(cache_key, vary_key)
-        );
-    )#"sv));
-    database.execute_statement(create_cache_index_table, {});
-
 #if HTTP_DISK_CACHE_DEBUG
     log_orphaned_disk_cache_entries(database);
 #endif
 
     Statements statements {};
-    statements.insert_entry = TRY(database.prepare_statement("INSERT OR REPLACE INTO CacheIndex VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"sv));
+    statements.insert_entry = TRY(database.prepare_statement("INSERT OR REPLACE INTO CacheIndex (cache_key, vary_key, url, request_headers, response_headers, data_size, associated_data_size, request_time, response_time, last_access_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"sv));
     statements.remove_entry = TRY(database.prepare_statement(R"#(
         DELETE FROM CacheIndex
         WHERE cache_key = ? AND vary_key = ?
@@ -166,7 +147,7 @@ ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath
         WHERE last_access_time >= ?
         RETURNING cache_key, vary_key, data_size + associated_data_size + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
     )#"sv));
-    statements.select_entries = TRY(database.prepare_statement("SELECT * FROM CacheIndex WHERE cache_key = ?;"sv));
+    statements.select_entries = TRY(database.prepare_statement("SELECT vary_key, url, request_headers, response_headers, data_size, associated_data_size, request_time, response_time, last_access_time FROM CacheIndex WHERE cache_key = ?;"sv));
     statements.update_response_headers = TRY(database.prepare_statement("UPDATE CacheIndex SET response_headers = ? WHERE cache_key = ? AND vary_key = ?;"sv));
     statements.update_associated_data_size = TRY(database.prepare_statement("UPDATE CacheIndex SET associated_data_size = ? WHERE cache_key = ? AND vary_key = ?;"sv));
     statements.update_last_access_time = TRY(database.prepare_statement("UPDATE CacheIndex SET last_access_time = ? WHERE cache_key = ? AND vary_key = ?;"sv));
@@ -387,7 +368,7 @@ Optional<CacheIndex::Entry const&> CacheIndex::find_entry(u64 cache_key, HeaderL
         m_database->execute_statement(
             m_statements.select_entries,
             [&](auto statement_id) {
-                int column = 1; // Skip the cache_key column.
+                int column = 0;
 
                 auto vary_key = m_database->result_column<u64>(statement_id, column++);
                 auto url = m_database->result_column<String>(statement_id, column++);
