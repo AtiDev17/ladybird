@@ -152,10 +152,10 @@
 #include <LibWeb/HTML/HashChangeEvent.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Location.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
-#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/NavigationParams.h>
@@ -5202,10 +5202,10 @@ GC::Ref<HTML::SourceSnapshotParams> Document::snapshot_source_snapshot_params() 
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#descendant-navigables
-Vector<GC::Root<HTML::Navigable>> Document::descendant_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::descendant_navigables()
 {
     // 1. Let navigables be new list.
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
 
     // 2. Let navigableContainers be a list of all shadow-including descendants of document that are navigable containers, in shadow-including tree order.
     // 3. For each navigableContainer of navigableContainers:
@@ -5230,13 +5230,13 @@ Vector<GC::Root<HTML::Navigable>> Document::descendant_navigables()
     return navigables;
 }
 
-Vector<GC::Root<HTML::Navigable>> const Document::descendant_navigables() const
+Vector<GC::Root<HTML::LocalNavigable>> const Document::descendant_navigables() const
 {
     return const_cast<Document&>(*this).descendant_navigables();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-descendant-navigables
-Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_descendant_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5247,7 +5247,7 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
         return {};
 
     // 1. Let navigables be « document's node navigable ».
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
     navigables.append(*document_node_navigable);
 
     // 2. Extend navigables with document's descendant navigables.
@@ -5258,7 +5258,7 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_descendant_navigables()
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#ancestor-navigables
-Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5272,7 +5272,7 @@ Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
     auto navigable = document_node_navigable->parent();
 
     // 2. Let ancestors be an empty list.
-    Vector<GC::Root<HTML::Navigable>> ancestors;
+    Vector<GC::Root<HTML::LocalNavigable>> ancestors;
 
     // 3. While navigable is not null:
     while (navigable) {
@@ -5287,13 +5287,13 @@ Vector<GC::Root<HTML::Navigable>> Document::ancestor_navigables()
     return ancestors;
 }
 
-Vector<GC::Root<HTML::Navigable>> const Document::ancestor_navigables() const
+Vector<GC::Root<HTML::LocalNavigable>> const Document::ancestor_navigables() const
 {
     return const_cast<Document&>(*this).ancestor_navigables();
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-ancestor-navigables
-Vector<GC::Root<HTML::Navigable>> Document::inclusive_ancestor_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
@@ -5314,21 +5314,21 @@ Vector<GC::Root<HTML::Navigable>> Document::inclusive_ancestor_navigables()
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigables
-Vector<GC::Root<HTML::Navigable>> Document::document_tree_child_navigables()
+Vector<GC::Root<HTML::LocalNavigable>> Document::document_tree_child_navigables()
 {
     // 1. If document's node navigable is null, then return the empty list.
     if (!navigable())
         return {};
 
     // 2. Let navigables be new list.
-    Vector<GC::Root<HTML::Navigable>> navigables;
+    Vector<GC::Root<HTML::LocalNavigable>> navigables;
 
     // 3. Let navigableContainers be a list of all descendants of document that are navigable containers, in tree order.
     // 4. For each navigableContainer of navigableContainers:
     //     1. If navigableContainer's content navigable is null, then continue.
     //     2. Append navigableContainer's content navigable to navigables.
     // OPTIMIZATION: Iterate all registered navigables to avoid a full tree traversal.
-    for (auto const& navigable : HTML::all_navigables()) {
+    for (auto const& navigable : HTML::all_local_navigables()) {
         auto container = navigable->container();
         if (!container || !is_ancestor_of(*container))
             continue;
@@ -5435,7 +5435,7 @@ void Document::destroy()
         if (&navigable_container->document() == this && navigable_container->content_navigable()) {
             auto& child_navigable = *navigable_container->content_navigable();
             child_navigable.set_has_been_destroyed();
-            child_navigable.remove_from_all_navigables();
+            child_navigable.remove_from_all_local_navigables();
         }
     }
 
@@ -5547,13 +5547,16 @@ void Document::destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void(
     // 4. For each childNavigable of childNavigables, queue a global task on the navigation and traversal task source
     //    given childNavigable's active window to perform the following steps:
     for (auto& child_navigable : child_navigables) {
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
-            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
+        HTML::queue_a_task(HTML::Task::Source::NavigationAndTraversal, nullptr, nullptr,
+            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable = child_navigable.ptr()] {
                 // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
                 auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->did_process_child(); });
 
                 // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
-                child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
+                if (auto active_document = child_navigable->active_document())
+                    active_document->destroy_a_document_and_its_descendants(increment_destroyed);
+                else
+                    increment_destroyed->function()();
             }));
     }
 
@@ -8494,12 +8497,12 @@ GC::Ptr<DOM::Document> Document::container_document() const
     return node_navigable->container_document();
 }
 
-GC::Ptr<HTML::Navigable> Document::navigable() const
+GC::Ptr<HTML::LocalNavigable> Document::navigable() const
 {
     return m_navigable.ptr();
 }
 
-void Document::set_navigable(GC::Ptr<HTML::Navigable> navigable)
+void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 {
     if (m_navigable == navigable)
         return;
