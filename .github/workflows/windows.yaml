@@ -317,7 +317,7 @@ jobs:
 
             Please **do not** report bugs or issues found in this build to the official Ladybird repository.
 
-            Commit: ${{ github.sha }}
+            Commit: https://github.com/${{ github.repository }}/commits/${{ github.sha }}
           files: |
             ladybird-windows-x64.zip
             ladybird-windows-x64.zip.sha256
