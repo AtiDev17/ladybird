@@ -98,24 +98,6 @@ void platform_init(Optional<ByteString> ladybird_binary_path)
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_byte_string(s_ladybird_resource_root))));
 }
 
-void copy_default_config_files(StringView config_path)
-{
-    MUST(Core::Directory::create(config_path, Core::Directory::CreateDirectories::Yes));
-
-    auto config_resources = MUST(Core::Resource::load_from_uri("resource://ladybird/default-config"sv));
-
-    config_resources->for_each_descendant_file([config_path](Core::Resource const& resource) -> IterationDecision {
-        auto file_path = ByteString::formatted("{}/{}", config_path, resource.filename());
-
-        if (Core::System::stat(file_path).is_error()) {
-            auto file = MUST(Core::File::open(file_path, Core::File::OpenMode::Write));
-            MUST(file->write_until_depleted(resource.data()));
-        }
-
-        return IterationDecision::Continue;
-    });
-}
-
 ErrorOr<Vector<ByteString>> get_paths_for_helper_process(StringView process_name)
 {
     auto application_path = TRY(application_directory());

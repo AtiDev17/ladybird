@@ -16,9 +16,7 @@
 #include <LibMedia/Audio/Loader.h>
 #include <LibRequests/RequestClient.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -39,10 +37,6 @@ static ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> bind_image_decoder_ser
 {
     return bind_service<ImageDecoderClient::Client>(&bind_image_decoder_java);
 }
-
-static ErrorOr<void> load_content_blockers();
-
-static ErrorOr<void> load_autoplay_allowlist();
 
 ErrorOr<int> service_main(int ipc_socket)
 {
@@ -68,14 +62,6 @@ ErrorOr<int> service_main(int ipc_socket)
     // in order to make it work. For now, it's better to just disable it.
     WebView::set_site_isolation_mode(WebView::SiteIsolationMode::Disabled);
 
-    auto maybe_content_blocker_error = load_content_blockers();
-    if (maybe_content_blocker_error.is_error())
-        dbgln("Failed to load content blockers: {}", maybe_content_blocker_error.error());
-
-    auto maybe_autoplay_allowlist_error = load_autoplay_allowlist();
-    if (maybe_autoplay_allowlist_error.is_error())
-        dbgln("Failed to load autoplay allowlist: {}", maybe_autoplay_allowlist_error.error());
-
     auto webcontent_socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
     auto webcontent_client = TRY(WebContent::ConnectionFromClient::try_create(make<IPC::Transport>(move(webcontent_socket))));
 
@@ -100,57 +86,4 @@ ErrorOr<NonnullRefPtr<Client>> bind_service(void (*bind_method)(int))
     auto new_client = TRY(try_make_ref_counted<Client>(make<IPC::Transport>(move(socket))));
 
     return new_client;
-}
-
-static ErrorOr<void> load_content_blockers()
-{
-    auto file_or_error = Core::File::open(ByteString::formatted("{}/res/ladybird/default-config/BrowserContentBlockers.txt", WebView::s_ladybird_resource_root), Core::File::OpenMode::Read);
-    if (file_or_error.is_error())
-        return file_or_error.release_error();
-
-    auto file = file_or_error.release_value();
-    auto content_blocker_list = TRY(Core::InputBufferedFile::create(move(file)));
-    auto buffer = TRY(ByteBuffer::create_uninitialized(4096));
-
-    Vector<String> patterns;
-
-    while (TRY(content_blocker_list->can_read_line())) {
-        auto line = TRY(content_blocker_list->read_line(buffer));
-        if (line.is_empty())
-            continue;
-
-        auto pattern = TRY(String::from_utf8(line));
-        patterns.append(move(pattern));
-    }
-
-    auto& content_blocker = Web::ContentBlocker::the();
-    TRY(content_blocker.set_patterns(patterns));
-
-    return {};
-}
-
-static ErrorOr<void> load_autoplay_allowlist()
-{
-    auto file_or_error = Core::File::open(TRY(String::formatted("{}/res/ladybird/default-config/BrowserAutoplayAllowlist.txt", WebView::s_ladybird_resource_root)), Core::File::OpenMode::Read);
-    if (file_or_error.is_error())
-        return file_or_error.release_error();
-
-    auto file = file_or_error.release_value();
-    auto allowlist = TRY(Core::InputBufferedFile::create(move(file)));
-    auto buffer = TRY(ByteBuffer::create_uninitialized(4096));
-
-    Vector<String> origins;
-
-    while (TRY(allowlist->can_read_line())) {
-        auto line = TRY(allowlist->read_line(buffer));
-        if (line.is_empty())
-            continue;
-
-        auto domain = TRY(String::from_utf8(line));
-        TRY(origins.try_append(move(domain)));
-    }
-
-    Web::HTML::AutoplaySettings::the().set_policy(Web::HTML::AutoplayPolicy::BlockAudio, origins);
-
-    return {};
 }

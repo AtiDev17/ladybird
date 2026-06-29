@@ -26,7 +26,6 @@
 #include <LibWeb/HTML/UniversalGlobalScope.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Internals/Internals.h>
-#include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Painting/PaintableBox.h>
@@ -101,8 +100,6 @@ static void install_crash_signal_handlers()
 }
 #endif
 
-static ErrorOr<void> load_content_blockers(StringView config_path);
-
 static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
 static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
@@ -133,7 +130,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    auto config_path = ByteString::formatted("{}/ladybird/default-config", WebView::s_ladybird_resource_root);
+    auto config_path = WebView::s_ladybird_resource_root;
     StringView mach_server_name {};
     Vector<ByteString> certificates;
     bool enable_test_mode = false;
@@ -259,10 +256,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         Web::WebIDL::set_enable_idl_tracing(true);
     }
 
-    auto maybe_content_blocker_error = load_content_blockers(config_path);
-    if (maybe_content_blocker_error.is_error())
-        dbgln("Failed to load content blockers: {}", maybe_content_blocker_error.error());
-
     if (!disable_sandbox)
         TRY(RendererSandbox::apply_sandbox(config_path));
 
@@ -286,30 +279,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     };
 
     return event_loop.exec();
-}
-
-static ErrorOr<void> load_content_blockers(StringView config_path)
-{
-    auto buffer = TRY(ByteBuffer::create_uninitialized(4096));
-
-    auto file = TRY(Core::File::open(ByteString::formatted("{}/BrowserContentBlockers.txt", config_path), Core::File::OpenMode::Read));
-    auto content_blocker_list = TRY(Core::InputBufferedFile::create(move(file)));
-
-    Vector<String> patterns;
-
-    while (TRY(content_blocker_list->can_read_line())) {
-        auto line = TRY(content_blocker_list->read_line(buffer));
-        if (line.is_empty())
-            continue;
-
-        auto pattern = TRY(String::from_utf8(line));
-        patterns.append(move(pattern));
-    }
-
-    auto& content_blocker = Web::ContentBlocker::the();
-    TRY(content_blocker.set_patterns(patterns));
-
-    return {};
 }
 
 ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)

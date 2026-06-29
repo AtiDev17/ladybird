@@ -1761,106 +1761,153 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inframeset
     fn handle_in_frameset(&mut self, token: Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
         if token.is_parser_whitespace() {
+            // Insert the character.
             self.insert_character(token.code_point);
             return;
         }
 
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment.
             self.insert_comment(token.comment_data());
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
         if token.token_type == TokenType::Doctype {
             // Parse error. Ignore the token.
             self.parse_error("DOCTYPE token in in frameset insertion mode");
             return;
         }
 
+        // -> A start tag whose tag name is "html"
         if token.is_start_tag_named("html") {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> A start tag whose tag name is "frameset"
         if token.is_start_tag_named("frameset") {
+            // Insert an HTML element for the token.
             self.insert_html_element_for(&token, self.current_insertion_parent_handle());
             return;
         }
 
+        // -> An end tag whose tag name is "frameset"
         if token.is_end_tag_named("frameset") {
+            // If the current node is the root html element, then this is a parse error; ignore the token. (fragment case)
             if self.stack_of_open_elements.len() == 1 {
-                // Parse error. Ignore the token.
                 self.parse_error("frameset end tag with only root element on stack");
                 return;
             }
+
+            // Otherwise, pop the current node from the stack of open elements.
             self.pop_current_node();
+
+            // If the parser was not created as part of the HTML fragment parsing algorithm (fragment case), and the
+            // current node is no longer a frameset element, then switch the insertion mode to "after frameset".
             if !self.parsing_fragment && !self.current_node_named("frameset") {
                 self.insertion_mode = InsertionMode::AfterFrameset;
             }
             return;
         }
 
+        // -> A start tag whose tag name is "frame"
         if token.is_start_tag_named("frame") {
+            // Insert an HTML element for the token. Immediately pop the current node off the stack of open elements.
             self.insert_html_element_for(&token, self.current_insertion_parent_handle());
             self.pop_current_node();
+
+            // FIXME: Acknowledge the token's self-closing flag, if it is set.
             return;
         }
 
+        // -> A start tag whose tag name is "noframes"
         if token.is_start_tag_named("noframes") {
+            // Process the token using the rules for the "in head" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InHead, token);
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // If the current node is not the root html element, then this is a parse error.
+            // NOTE: The current node can only be the root html element in the fragment case.
             if !self.current_node_named("html") {
                 self.parse_error("end of file in in frameset insertion mode with non-root current node");
             }
+
+            // Stop parsing.
             self.stop_parsing();
             return;
         }
 
+        // -> Anything else
         // Parse error. Ignore the token.
         self.parse_error("unexpected token in in frameset insertion mode");
     }
 
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-afterframeset
     fn handle_after_frameset(&mut self, token: Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
         if token.is_parser_whitespace() {
+            // Insert the character.
             self.insert_character(token.code_point);
             return;
         }
 
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment.
             self.insert_comment(token.comment_data());
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
         if token.token_type == TokenType::Doctype {
             // Parse error. Ignore the token.
             self.parse_error("DOCTYPE token in after frameset insertion mode");
             return;
         }
 
+        // -> A start tag whose tag name is "html"
         if token.is_start_tag_named("html") {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // An end tag whose tag name is "html"
         if token.is_end_tag_named("html") {
+            // Switch the insertion mode to "after after frameset".
             self.insertion_mode = InsertionMode::AfterAfterFrameset;
             return;
         }
 
+        // -> A start tag whose tag name is "noframes"
         if token.is_start_tag_named("noframes") {
+            // Process the token using the rules for the "in head" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InHead, token);
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // Stop parsing.
             self.stop_parsing();
             return;
         }
 
+        // -> Anything else
         // Parse error. Ignore the token.
         self.parse_error("unexpected token in after frameset insertion mode");
     }
@@ -2218,110 +2265,168 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intr
     fn handle_in_row(&mut self, token: Token) {
+        // -> A start tag whose tag name is one of: "th", "td"
         if token.is_start_tag_one_of(&["td", "th"]) {
+            // Clear the stack back to a table row context. (See below.)
             self.clear_the_stack_back_to_a_table_row_context();
+
+            // Insert an HTML element for the token, then switch the insertion mode to "in cell".
             self.insert_html_element_for(&token, self.current_insertion_parent_handle());
             self.insertion_mode = InsertionMode::InCell;
+
+            // Insert a marker at the end of the list of active formatting elements.
             self.insert_marker_at_the_end_of_the_list_of_active_formatting_elements();
             return;
         }
 
+        // -> An end tag whose tag name is "tr"
         if token.is_end_tag_named("tr") {
+            // If the stack of open elements does not have a tr element in table scope, this is a parse error; ignore the token.
             if !self.has_in_table_scope("tr") {
                 // Parse error. Ignore the token.
                 self.parse_error("tr end tag without tr element in table scope");
                 return;
             }
+            // Otherwise:
+            // 1. Clear the stack back to a table row context. (See below.)
             self.clear_the_stack_back_to_a_table_row_context();
+
+            // 2. Pop the current node (which will be a tr element) from the stack of open elements.
+            //    Switch the insertion mode to "in table body".
             self.pop_until_tag_name_has_been_popped("tr");
             self.insertion_mode = InsertionMode::InTableBody;
             return;
         }
 
+        // -> A start tag whose tag name is one of: "caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"
+        // -> An end tag whose tag name is "table"
         if token.is_start_tag_one_of(&["caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"])
             || token.is_end_tag_named("table")
         {
+            // If the stack of open elements does not have a tr element in table scope, this is a parse error; ignore the token.
             if !self.has_in_table_scope("tr") {
-                // Parse error. Ignore the token.
                 self.parse_error("table token in row insertion mode without tr element in table scope");
                 return;
             }
+
+            // Otherwise:
+            // 1. Clear the stack back to a table row context. (See below.)
+            // 2. Pop the current node (which will be a tr element) from the stack of open elements.
+            //    Switch the insertion mode to "in table body".
+            // 3. Reprocess the token.
             self.process_using_the_rules_for(InsertionMode::InRow, Token::synthetic_end_tag("tr"));
             self.process_using_the_rules_for(InsertionMode::InTableBody, token);
             return;
         }
 
+        // -> An end tag whose tag name is one of: "tbody", "tfoot", "thead"
         if token.is_end_tag_one_of(&["tbody", "tfoot", "thead"]) {
+            // If the stack of open elements does not have an element in table scope that is an HTML element with the same
+            // tag name as the token, this is a parse error; ignore the token.
             if !self.has_in_table_scope(token.tag_name()) {
-                // Parse error. Ignore the token.
                 self.parse_error("table body end tag in row insertion mode without matching element in table scope");
                 return;
             }
+
+            // If the stack of open elements does not have a tr element in table scope, ignore the token.
             if !self.has_in_table_scope("tr") {
                 return;
             }
+
+            // Otherwise:
+            // 1. Clear the stack back to a table row context. (See below.)
+            // 2. Pop the current node (which will be a tr element) from the stack of open elements.
+            //    Switch the insertion mode to "in table body".
+            // 3. Reprocess the token.
             self.process_using_the_rules_for(InsertionMode::InRow, Token::synthetic_end_tag("tr"));
             self.process_using_the_rules_for(InsertionMode::InTableBody, token);
             return;
         }
 
+        // -> An end tag whose tag name is one of: "body", "caption", "col", "colgroup", "html", "td", "th"
         if token.is_end_tag_one_of(&["body", "caption", "col", "colgroup", "html", "td", "th"]) {
             // Parse error. Ignore the token.
             self.parse_error("unexpected end tag in in row insertion mode");
             return;
         }
 
+        // -> Anything else
+        // Process the token using the rules for the "in table" insertion mode.
         self.process_using_the_rules_for(InsertionMode::InTable, token);
     }
 
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intd
     fn handle_in_cell(&mut self, token: Token) {
+        // -> An end tag whose tag name is one of: "td", "th"
         if token.is_end_tag_one_of(&["td", "th"]) {
+            // If the stack of open elements does not have an element in table scope that is an HTML element with th
+            // same tag name as that of the token, then this is a parse error; ignore the token.
             if !self.has_in_table_scope(token.tag_name()) {
-                // Parse error. Ignore the token.
                 self.parse_error("cell end tag without matching element in table scope");
                 return;
             }
+
+            // Otherwise:
+            // 1. Generate implied end tags.
             self.generate_implied_end_tags();
+
+            // 2. Now, if the current node is not an HTML element with the same tag name as the token, then this is a parse error.
             if !self.current_node_named(token.tag_name()) {
                 self.parse_error("current node does not match cell end tag");
             }
+
+            // 3. Pop elements from the stack of open elements until an HTML element with the same tag name as the token
+            // has been popped from the stack.
             self.pop_until_tag_name_has_been_popped(token.tag_name());
+
+            // 4. Clear the list of active formatting elements up to the last marker.
             self.clear_the_list_of_active_formatting_elements_up_to_the_last_marker();
+
+            // 5. Switch the insertion mode to "in row".
             self.insertion_mode = InsertionMode::InRow;
             return;
         }
 
+        // -> A start tag whose tag name is one of: "caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"
         if token.is_start_tag_one_of(&[
             "caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr",
         ]) {
+            // FIXME: Assert: the stack of open elements has a td or th element in table scope.
             if !self.has_in_table_scope("td") && !self.has_in_table_scope("th") {
-                // Parse error. Ignore the token.
                 self.parse_error("table token in cell insertion mode without cell element in table scope");
                 return;
             }
+
+            // Close the cell (see below) and reprocess the token.
             self.close_the_cell();
             self.process_using_the_rules_for(self.insertion_mode, token);
             return;
         }
 
+        // -> An end tag whose tag name is one of: "body", "caption", "col", "colgroup", "html"
         if token.is_end_tag_one_of(&["body", "caption", "col", "colgroup", "html"]) {
             // Parse error. Ignore the token.
             self.parse_error("unexpected end tag in in cell insertion mode");
             return;
         }
 
+        // -> An end tag whose tag name is one of: "table", "tbody", "tfoot", "thead", "tr"
         if token.is_end_tag_one_of(&["table", "tbody", "tfoot", "thead", "tr"]) {
+            // If the stack of open elements does not have an element in table scope that is an HTML element with the same
+            // tag name as that of the token, then this is a parse error; ignore the token.
             if !self.has_in_table_scope(token.tag_name()) {
-                // Parse error. Ignore the token.
                 self.parse_error("table end tag in cell insertion mode without matching element in table scope");
                 return;
             }
+
+            // Otherwise, close the cell (see below) and reprocess the token.
             self.close_the_cell();
             self.process_using_the_rules_for(self.insertion_mode, token);
             return;
         }
 
+        // -> Anything else
+        // Process the token using the rules for the "in body" insertion mode.
         self.process_using_the_rules_for(InsertionMode::InBody, token);
     }
 
@@ -2367,22 +2472,30 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intemplate
     fn handle_in_template(&mut self, token: Token) {
+        // -> A character token
+        // -> A comment token
+        // -> A DOCTYPE token
         if token.token_type == TokenType::Character
             || token.token_type == TokenType::Comment
             || token.token_type == TokenType::Doctype
         {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> A start tag whose tag name is one of: "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template", "title"
+        // -> An end tag whose tag name is "template"
         if token.is_start_tag_one_of(&[
             "base", "basefont", "bgsound", "link", "meta", "noframes", "script", "style", "template", "title",
         ]) || token.is_end_tag_named("template")
         {
+            // Process the token using the rules for the "in head" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InHead, token);
             return;
         }
 
+        // -> A start tag whose tag name is one of: "caption", "colgroup", "tbody", "tfoot", "thead"
         if token.is_start_tag_one_of(&["caption", "colgroup", "tbody", "tfoot", "thead"]) {
             // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
@@ -2394,6 +2507,7 @@ impl TreeBuilder {
             return;
         }
 
+        // -> A start tag whose tag name is "col"
         if token.is_start_tag_named("col") {
             // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
@@ -2406,6 +2520,7 @@ impl TreeBuilder {
             return;
         }
 
+        // -> A start tag whose tag name is "tr"
         if token.is_start_tag_named("tr") {
             // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
@@ -2417,6 +2532,7 @@ impl TreeBuilder {
             return;
         }
 
+        // -> A start tag whose tag name is one of: "td", "th"
         if token.is_start_tag_one_of(&["td", "th"]) {
             // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
@@ -2428,6 +2544,7 @@ impl TreeBuilder {
             return;
         }
 
+        // -> Any other start tag
         if token.is_start_tag() {
             // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
@@ -2439,69 +2556,100 @@ impl TreeBuilder {
             return;
         }
 
+        // -> Any other end tag
         if token.is_end_tag() {
             // Parse error. Ignore the token.
             self.parse_error("unexpected end tag in in template insertion mode");
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // If there is no template element on the stack of open elements, then stop parsing. (fragment case)
             if !self.has_template_element_on_stack_of_open_elements() {
                 self.stop_parsing();
                 return;
             }
 
-            // Parse error.
+            // Otherwise, this is a parse error.
             self.parse_error("end of file in in template insertion mode");
+
+            // Pop elements from the stack of open elements until a template element has been popped from the stack.
             self.pop_until_tag_name_has_been_popped("template");
+
+            // Clear the list of active formatting elements up to the last marker.
             self.clear_the_list_of_active_formatting_elements_up_to_the_last_marker();
+
+            // Pop the current template insertion mode off the stack of template insertion modes.
             self.stack_of_template_insertion_modes.pop();
+
+            // Reset the insertion mode appropriately.
             self.reset_the_insertion_mode_appropriately();
+
+            // Reprocess the token.
             self.process_using_the_rules_for(self.insertion_mode, token);
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/parsing.html#the-after-body-insertion-mode
+    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-afterbody
     fn handle_after_body(&mut self, token: Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
         if token.is_parser_whitespace() {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment as the last child of the first element in the stack of open elements (the html element).
             if let Some(html) = self.stack_of_open_elements.first() {
                 self.append_comment_to_node(html.handle, token.comment_data());
             }
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
         if token.token_type == TokenType::Doctype {
             // Parse error. Ignore the token.
             self.parse_error("DOCTYPE token in after body insertion mode");
             return;
         }
 
+        // -> A start tag whose tag name is "html"
         if token.is_start_tag_named("html") {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> An end tag whose tag name is "html"
         if token.is_end_tag_named("html") {
+            // If the parser was created as part of the HTML fragment parsing algorithm, this is a parse error;
+            // ignore the token. (fragment case)
             if self.parsing_fragment {
                 // Parse error. Ignore the token.
                 self.parse_error("html end tag in after body insertion mode for fragment");
-            } else {
+            }
+            // Otherwise, switch the insertion mode to "after after body".
+            else {
                 self.insertion_mode = InsertionMode::AfterAfterBody;
             }
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // Process the token using the rules for the "in body" insertion mode.
             self.stop_parsing();
             return;
         }
 
-        // Parse error.
+        // -> Anything else
+        // Parse error. Switch the insertion mode to "in body" and reprocess the token.
         self.parse_error("unexpected token in after body insertion mode");
         self.insertion_mode = InsertionMode::InBody;
         self.process_using_the_rules_for(InsertionMode::InBody, token);
@@ -2509,18 +2657,29 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#the-after-after-body-insertion-mode
     fn handle_after_after_body(&mut self, token: Token) {
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment as the last child of the Document object.
             let document = self.document_node();
             self.append_comment_to_node(document, token.comment_data());
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        // -> A start tag whose tag name is "html"
         if token.token_type == TokenType::Doctype || token.is_parser_whitespace() || token.is_start_tag_named("html") {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // Stop parsing.
             self.stop_parsing();
             return;
         }
@@ -2533,27 +2692,41 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#the-after-after-frameset-insertion-mode
     fn handle_after_after_frameset(&mut self, token: Token) {
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment as the last child of the Document object.
             let document = self.document_node();
             self.append_comment_to_node(document, token.comment_data());
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        // -> A start tag whose tag name is "html"
         if token.token_type == TokenType::Doctype || token.is_parser_whitespace() || token.is_start_tag_named("html") {
+            // Process the token using the rules for the "in body" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InBody, token);
             return;
         }
 
+        // -> An end-of-file token
         if token.token_type == TokenType::EndOfFile {
+            // Stop parsing.
             self.stop_parsing();
             return;
         }
 
+        // -> A start tag whose tag name is "noframes"
         if token.is_start_tag_named("noframes") {
+            // Process the token using the rules for the "in head" insertion mode.
             self.process_using_the_rules_for(InsertionMode::InHead, token);
             return;
         }
 
+        // -> Anything else
         // Parse error. Ignore the token.
         self.parse_error("unexpected token in after after frameset insertion mode");
     }
@@ -2561,12 +2734,20 @@ impl TreeBuilder {
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign
     fn process_using_the_rules_for_foreign_content(&mut self, token: Token) {
         if token.token_type == TokenType::Character {
+            // -> A character token that is U+0000 NULL
             if token.code_point == 0 {
                 // Parse error. Insert a U+FFFD REPLACEMENT CHARACTER character.
                 self.parse_error("U+0000 character token in foreign content");
                 self.insert_character(0xfffd);
                 return;
             }
+
+            // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+            //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+            //        Insert the token's character.
+            // -> Any other character token
+            //        Insert the token's character.
+            //        Set the frameset-ok flag to "not ok".
             self.insert_character(token.code_point);
             if !token.is_parser_whitespace() {
                 self.frameset_ok = false;
@@ -2574,20 +2755,32 @@ impl TreeBuilder {
             return;
         }
 
+        // -> A comment token
         if token.token_type == TokenType::Comment {
+            // Insert a comment.
             self.insert_comment(token.comment_data());
             return;
         }
 
+        // FIXME: -> A processing instruction token
+
+        // -> A DOCTYPE token
         if token.token_type == TokenType::Doctype {
             // Parse error. Ignore the token.
             self.parse_error("DOCTYPE token in foreign content");
             return;
         }
 
+        // -> A start tag whose tag name is one of: "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div",
+        //    "dl", "dt", "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing",
+        //    "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup",
+        //    "table", "tt", "u", "ul", "var".
         if is_foreign_content_breakout_token(&token) {
             // Parse error.
             self.parse_error("HTML breakout token in foreign content");
+
+            // While the current node is not a MathML text integration point, an HTML integration point, or an element in
+            // the HTML namespace, pop elements from the stack of open elements.
             while self.stack_of_open_elements.last().is_some_and(|node| {
                 node.namespace_ != RustFfiHtmlNamespace::Html
                     && !is_mathml_text_integration_point(node)
@@ -2595,17 +2788,46 @@ impl TreeBuilder {
             }) {
                 self.pop_current_node();
             }
+            // Reprocess the token according to the rules given in the section corresponding to the current insertion
+            // mode in HTML content.
             self.process_using_the_rules_for(self.insertion_mode, token);
             return;
         }
 
+        // FIXME: -> A start tag whose tag name is "font", if the token has any attributes named "color", "face", or "size"
+        // FIXME: -> An end tag whose tag name is "br", "p"
+
+        // -> Any other start tag
         if token.is_start_tag() {
+            // FIXME: If the adjusted current node is an element in the MathML namespace, adjust MathML attributes for the token.
+            // (This fixes the case of MathML attributes that are not all lowercase.)
+
+            // FIXME: If the adjusted current node is an element in the SVG namespace, and the token's tag name is one of
+            // the ones in the first column of the following table, change the tag name to the name given in the
+            // corresponding cell in the second column. (This fixes the case of SVG elements that are not all lowercase.)
+
+            // FIXME: If the adjusted current node is an element in the SVG namespace, adjust SVG attributes for the token.
+            // (This fixes the case of SVG attributes that are not all lowercase.)
+
+            // FIXME: Adjust foreign attributes for the token. (This fixes the use of namespaced attributes, in particular
+            // XLink in SVG.)
             let namespace_ = self
                 .adjusted_current_node()
                 .map(|node| node.namespace_)
                 .unwrap_or(RustFfiHtmlNamespace::Html);
+
+            // Insert a foreign element for the token, with the adjusted current node's namespace and false.
+            // FIXME: And false.
             let element = self.insert_foreign_element_for(&token, namespace_);
+
+            // If the token has its self-closing flag set, then run the appropriate steps from the following list:
             if token.is_self_closing() {
+                // -> If the token's tag name is "script", and the new current node is in the SVG namespace
+                //        Acknowledge the token's self-closing flag, and then act as described in the steps for a
+                //        "script" end tag below.
+                // -> Otherwise
+                //        Pop the current node off the stack of open elements and acknowledge the token's self-closing flag.
+                // FIXME: This is not equivalent to acting as described as steps for "script" end tag below.
                 self.pop_current_node();
                 if namespace_ == RustFfiHtmlNamespace::Svg && token.tag_name() == "script" {
                     self.process_svg_script(element);
@@ -2614,6 +2836,7 @@ impl TreeBuilder {
             return;
         }
 
+        // -> An end tag whose tag name is "script", if the current node is an SVG script element
         if token.is_end_tag_named("script")
             && self
                 .stack_of_open_elements
@@ -2622,22 +2845,29 @@ impl TreeBuilder {
         {
             self.flush_character_insertions();
             let script = self.current_node_handle();
+
+            // Pop the current node off the stack of open elements.
             self.pop_current_node();
             self.process_svg_script(script);
             return;
         }
 
+        // -> Any other end tag
         if token.is_end_tag() {
-            if self.stack_of_open_elements.is_empty() {
-                return;
-            }
-
+            // 1. Initialize node to be the current node (the bottommost node of the stack).
+            assert!(!self.stack_of_open_elements.is_empty());
             let mut index = self.stack_of_open_elements.len() - 1;
+
+            // FIXME: 2. If node's tag name, converted to ASCII lowercase, is not the same as the tag name of the token, then this is a parse error.
+
+            // 3. Loop: If node is the topmost element in the stack of open elements, then return. (fragment case)
             loop {
                 if index == 0 {
                     return;
                 }
 
+                // 4. If node's tag name, converted to ASCII lowercase, is the same as the tag name of the token, pop
+                //    elements from the stack of open elements until node has been popped from the stack, and then return.
                 if self.stack_of_open_elements[index]
                     .local_name
                     .eq_ignore_ascii_case(token.tag_name())
@@ -2649,11 +2879,16 @@ impl TreeBuilder {
                     return;
                 }
 
+                // 5. Set node to the previous entry in the stack of open elements.
                 index -= 1;
+
+                // 6. If node is not an element in the HTML namespace, return to the step labeled loop.
                 if self.stack_of_open_elements[index].namespace_ != RustFfiHtmlNamespace::Html {
                     continue;
                 }
 
+                // 7. Otherwise, process the token according to the rules given in the section corresponding to the
+                //    current insertion mode in HTML content.
                 self.process_using_the_rules_for(self.insertion_mode, token);
                 return;
             }
@@ -2766,6 +3001,9 @@ impl TreeBuilder {
 
     // https://html.spec.whatwg.org/multipage/parsing.html#adjusted-current-node
     fn adjusted_current_node(&self) -> Option<&StackNode> {
+        // The adjusted current node is the context element if the parser was created as part of the HTML fragment parsing
+        // algorithm and the stack of open elements has only one element in it (fragment case); otherwise, the adjusted
+        // current node is the current node.
         if self.parsing_fragment && self.stack_of_open_elements.len() == 1 {
             return self.context_element.as_ref();
         }
@@ -3564,62 +3802,99 @@ impl TreeBuilder {
         self.insertion_mode = InsertionMode::InRow;
     }
 
-    fn foster_parenting_location(&self) -> (usize, usize) {
-        if let Some(table_index) = self
-            .stack_of_open_elements
-            .iter()
-            .rposition(|node| node.local_name == "table" && node.namespace_ == RustFfiHtmlNamespace::Html)
-            && table_index > 0
-        {
-            let table = self.stack_of_open_elements[table_index].handle;
-            let parent = self.parent_node(table);
-            if parent != 0 {
-                return (parent, table);
-            }
-
-            let parent_node = &self.stack_of_open_elements[table_index - 1];
-            let parent = parent_node.template_content.unwrap_or(parent_node.handle);
-            return (parent, 0);
-        }
-        (
-            self.stack_of_open_elements.first().map(|node| node.handle).unwrap_or(0),
-            0,
-        )
-    }
-
     // https://html.spec.whatwg.org/multipage/parsing.html#appropriate-place-for-inserting-a-node
     fn appropriate_place_for_inserting_node(&self, target: usize) -> (usize, usize) {
+        // 1. If there was an override target specified, then let target be the override target.
+        //    Otherwise, let target be the current node.
         let Some(target_node) = self.stack_of_open_elements.iter().find(|node| node.handle == target) else {
             return (target, 0);
         };
 
-        if !self.foster_parenting_enabled
-            || target_node.namespace_ != RustFfiHtmlNamespace::Html
-            || !matches!(
+        // 2. Determine the adjusted insertion location using the first matching steps from the following list:
+        let mut adjusted_insertion_location;
+
+        //   -> If foster parenting is enabled and target is a table, tbody, tfoot, thead, or tr element
+        //  NOTE: Foster parenting happens when content is misnested in tables.
+        if self.foster_parenting_enabled
+            && target_node.namespace_ == RustFfiHtmlNamespace::Html
+            && matches!(
                 target_node.local_name.as_str(),
                 "table" | "tbody" | "tfoot" | "thead" | "tr"
             )
         {
-            return (target_node.template_content.unwrap_or(target_node.handle), 0);
+            // 1. Let last template be the last template element in the stack of open elements, if any.
+            let last_template_index = self
+                .stack_of_open_elements
+                .iter()
+                .rposition(|node| node.local_name == "template" && node.namespace_ == RustFfiHtmlNamespace::Html);
+
+            // 2. Let last table be the last table element in the stack of open elements, if any.
+            let last_table_index = self
+                .stack_of_open_elements
+                .iter()
+                .rposition(|node| node.local_name == "table" && node.namespace_ == RustFfiHtmlNamespace::Html);
+
+            // 3. If there is a last template and either there is no last table, or there is one, but last template is
+            //    lower (more recently added) than last table in the stack of open elements, then let adjusted insertion
+            //    location be inside last template's template contents, after its last child (if any), and abort these steps.
+            if let Some(template_index) = last_template_index
+                && last_table_index.is_none_or(|table_index| template_index > table_index)
+            {
+                let template = &self.stack_of_open_elements[template_index];
+                adjusted_insertion_location = (template.handle, 0);
+            } else {
+                match last_table_index {
+                    // 4. If there is no last table, then let adjusted insertion location be inside the first element in
+                    //    the stack of open elements (the html element), after its last child (if any), and abort these
+                    //    steps. (fragment case)
+                    None => {
+                        adjusted_insertion_location = (
+                            self.stack_of_open_elements.first().map(|node| node.handle).unwrap_or(0),
+                            0,
+                        );
+                    }
+                    Some(table_index) => {
+                        let table = self.stack_of_open_elements[table_index].handle;
+                        let parent = self.parent_node(table);
+                        // 5. If last table has a parent node, then let adjusted insertion location be inside last table's
+                        //    parent node, immediately before last table, and abort these steps.
+                        if parent != 0 {
+                            adjusted_insertion_location = (parent, table);
+                        } else {
+                            // 6. Let previous element be the element immediately above last table in the stack of open
+                            //    elements.
+                            let previous_element = &self.stack_of_open_elements[table_index - 1];
+
+                            // 7. Let adjusted insertion location be inside previous element, after its last child (if any).
+                            adjusted_insertion_location = (previous_element.handle, 0);
+                        }
+                    }
+                }
+            }
+
+            // NOTE: These steps are involved in part because it's possible for elements, the table element in this case
+            //       in particular, to have been moved by a script around in the DOM, or indeed removed from the DOM entirely,
+            //       after the element was inserted by the parser.
+        }
+        //   -> Otherwise
+        else {
+            // Let adjusted insertion location be inside target, after its last child (if any).
+            adjusted_insertion_location = (target_node.handle, 0);
         }
 
-        let last_template_index = self
+        // 3. If the adjusted insertion location is inside a template element, let it instead be inside the template
+        //    element's template contents, after its last child (if any).
+        if let Some(node) = self
             .stack_of_open_elements
             .iter()
-            .rposition(|node| node.local_name == "template" && node.namespace_ == RustFfiHtmlNamespace::Html);
-        let last_table_index = self
-            .stack_of_open_elements
-            .iter()
-            .rposition(|node| node.local_name == "table" && node.namespace_ == RustFfiHtmlNamespace::Html);
-
-        if let Some(template_index) = last_template_index
-            && last_table_index.is_none_or(|table_index| template_index > table_index)
+            .find(|node: &&StackNode| node.handle == adjusted_insertion_location.0)
+            && let Some(template_content) = node.template_content
         {
-            let template = &self.stack_of_open_elements[template_index];
-            return (template.template_content.unwrap_or(template.handle), 0);
+            adjusted_insertion_location.0 = template_content;
         }
 
-        self.foster_parenting_location()
+        // 4. Return the adjusted insertion location.
+        adjusted_insertion_location
     }
 
     fn insert_marker_at_the_end_of_the_list_of_active_formatting_elements(&mut self) {

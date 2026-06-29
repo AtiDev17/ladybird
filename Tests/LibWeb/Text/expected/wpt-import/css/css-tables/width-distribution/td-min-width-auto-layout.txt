@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	Cell with min-width larger than width is expanded
+Pass	Cell with min-width smaller than width is not affected
+Pass	Cell with min-width equal to width is not affected
+Pass	Cell with min-width larger than max-width uses min-width

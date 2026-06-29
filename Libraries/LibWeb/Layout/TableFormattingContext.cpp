@@ -164,19 +164,37 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
         CSSPixels border_left = use_collapsing_borders_model ? round(cell_state.border_left / 2) : computed_values.border_left().width;
         CSSPixels border_right = use_collapsing_borders_model ? round(cell_state.border_right / 2) : computed_values.border_right().width;
 
-        auto min_content_width = calculate_min_content_width(cell.box);
-        auto max_content_width = calculate_max_content_width(cell.box);
+        auto cell_intrinsic_width_offsets = padding_left + padding_right + border_left + border_right;
+
+        auto min_width = computed_values.min_width().to_px(containing_block_width);
+        auto width = computed_values.width().is_length() ? computed_values.width().to_px(containing_block_width) : 0;
+        auto max_width = computed_values.max_width().is_length() ? computed_values.max_width().to_px(containing_block_width) : CSSPixels::max();
+
+        if (computed_values.box_sizing() == CSS::BoxSizing::BorderBox) {
+            min_width -= cell_intrinsic_width_offsets;
+            width -= cell_intrinsic_width_offsets;
+            max_width -= cell_intrinsic_width_offsets;
+        }
+
+        CSSPixels min_content_width;
+        CSSPixels max_content_width;
+
+        // https://drafts.csswg.org/css-tables-3/#computing-column-measures
+        // For the purpose of measuring a column when laid out in fixed mode [...] the min-content and max-content width
+        // of cells is considered zero unless they are directly specified as a length-percentage, in which case they are
+        // resolved based on the table width (if it is definite, otherwise use 0).
+        if (use_fixed_mode_layout()) {
+            if (computed_values.width().is_length_percentage()) {
+                min_content_width = width;
+                max_content_width = width;
+            }
+        } else {
+            min_content_width = calculate_min_content_width(cell.box);
+            max_content_width = calculate_max_content_width(cell.box);
+        }
 
         // The outer min-content width of a table-cell is max(min-width, min-content width) adjusted by the cell intrinsic offsets.
-        auto min_width = computed_values.min_width().to_px(containing_block_width);
-        auto cell_intrinsic_width_offsets = padding_left + padding_right + border_left + border_right;
-        // For fixed mode, according to https://www.w3.org/TR/css-tables-3/#computing-column-measures:
-        // The min-content and max-content width of cells is considered zero unless they are directly specified as a length-percentage,
-        // in which case they are resolved based on the table width (if it is definite, otherwise use 0).
-        auto width_is_specified_length_or_percentage = computed_values.width().is_length() || computed_values.width().is_percentage();
-        if (!use_fixed_mode_layout() || width_is_specified_length_or_percentage) {
-            cell.outer_min_width = max(min_width, min_content_width) + cell_intrinsic_width_offsets;
-        }
+        cell.outer_min_width = max(min_width, min_content_width) + cell_intrinsic_width_offsets;
 
         if (row_measurement == RowMeasurement::Include) {
             auto min_content_height = calculate_min_content_height(cell.box, max_content_width);
@@ -205,16 +223,14 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
         }
 
         // See the explanation for height and max_height above.
-        auto width = computed_values.width().is_length() ? computed_values.width().to_px(containing_block_width) : 0;
-        auto max_width = computed_values.max_width().is_length() ? computed_values.max_width().to_px(containing_block_width) : CSSPixels::max();
-        if (use_fixed_mode_layout() && !width_is_specified_length_or_percentage) {
-            continue;
-        }
         if (m_columns[cell.column_index].is_constrained) {
             // The outer max-content width of a table-cell in a constrained column is
             // max(min-width, width, min-content width, min(max-width, width)) adjusted by the cell intrinsic offsets.
-            // NB: min(max-width, width) doesn't have any effect here, we can simplify the expression to max(min-width, width, min-content width).
-            cell.outer_max_width = max(min_width, max(width, min_content_width)) + cell_intrinsic_width_offsets;
+
+            // AD-HOC: The formula defined by the spec doesn't respect max-width. We use a different formula that
+            //         matches the behavior that is expected by WPT and is implemented by other browsers.
+            // FIXME: Open a spec issue about this.
+            cell.outer_max_width = max(min_width, min(max_width, max(width, min_content_width))) + cell_intrinsic_width_offsets;
         } else {
             // The outer max-content width of a table-cell in a non-constrained column is
             // max(min-width, width, min-content width, min(max-width, max-content width)) adjusted by the cell intrinsic offsets.
@@ -1860,6 +1876,9 @@ void TableFormattingContext::run(AvailableSpace const& available_space)
 
     position_row_boxes();
     position_cell_boxes();
+
+    for (auto& cell : m_cells)
+        layout_absolutely_positioned_children(cell.box);
 
     m_state.get_mutable(table_box()).set_content_height(m_table_height);
 
