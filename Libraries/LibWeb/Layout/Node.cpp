@@ -10,6 +10,7 @@
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/BorderRadiusStyleValue.h>
+#include <LibWeb/CSS/StyleValues/CursorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
@@ -689,6 +690,10 @@ void NodeWithStyle::rebuild_image_observers()
     add_observer_for(m_list_style_image.ptr(), new_observers);
     for (auto const& layer : computed_values().mask_layers())
         add_observer_for(layer.background_image.ptr(), new_observers);
+    for (auto const& cursor : computed_values().cursor()) {
+        if (auto const* cursor_style_value = cursor.get_pointer<NonnullRefPtr<CSS::CursorStyleValue const>>())
+            add_observer_for(&(*cursor_style_value)->image(), new_observers);
+    }
     // TODO: Observe border-image and other <image> accepting properties once we support them.
 
     m_image_observers = move(new_observers);
@@ -817,7 +822,12 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_overflow_x(computed_style.overflow_x());
     computed_values.set_overflow_y(computed_style.overflow_y());
     computed_values.set_content_visibility(computed_style.content_visibility());
-    computed_values.set_cursor(computed_style.cursor());
+    auto cursor = computed_style.cursor();
+    for (auto const& cursor_data : cursor) {
+        if (auto const* cursor_style_value = cursor_data.get_pointer<NonnullRefPtr<CSS::CursorStyleValue const>>())
+            const_cast<CSS::AbstractImageStyleValue&>((*cursor_style_value)->image()).load_any_resources(*this);
+    }
+    computed_values.set_cursor(move(cursor));
     computed_values.set_image_rendering(computed_style.image_rendering());
     computed_values.set_pointer_events(computed_style.pointer_events());
     computed_values.set_text_decoration_line(computed_style.text_decoration_line());
