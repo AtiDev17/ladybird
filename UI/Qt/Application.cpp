@@ -163,6 +163,8 @@ public:
             Application::the().open_file();
         });
 
+        file_menu->addAction(create_application_action(*file_menu, application.open_downloads_page_action(), IncludeActionIcon::No));
+
         auto* open_location_action = add_application_menu_action(*file_menu, "Open &Location", { QKeySequence("Ctrl+L"), QKeySequence("Alt+D") });
         QObject::connect(open_location_action, &QAction::triggered, this, [] {
             Application::the().focus_location_editor();
@@ -356,6 +358,9 @@ void Application::open_file()
 
 void Application::quit()
 {
+    if (!confirm_cancel_active_downloads(active_window_if_any()))
+        return;
+
     QApplication::closeAllWindows();
 
     for (auto* widget : QApplication::topLevelWidgets()) {
@@ -364,6 +369,29 @@ void Application::quit()
     }
 
     QApplication::quit();
+}
+
+bool Application::confirm_cancel_active_downloads(QWidget* parent)
+{
+    auto& downloader = file_downloader();
+    if (!downloader.has_active_downloads())
+        return true;
+
+    QMessageBox dialog(parent ? parent : active_window_if_any());
+    dialog.setWindowTitle("Ladybird");
+    dialog.setIcon(QMessageBox::Warning);
+    dialog.setText("Downloads are still in progress.");
+    dialog.setInformativeText("Quitting will cancel active downloads.");
+    auto* quit_button = dialog.addButton("Quit and Cancel Downloads", QMessageBox::DestructiveRole);
+    dialog.addButton(QMessageBox::Cancel);
+    dialog.setDefaultButton(QMessageBox::Cancel);
+    dialog.exec();
+
+    if (dialog.clickedButton() != quit_button)
+        return false;
+
+    downloader.cancel_active_downloads();
+    return true;
 }
 
 void Application::initialize_macos_application_menu()
@@ -425,14 +453,14 @@ void Application::open_url_in_new_window(URL::URL const& url)
     this->new_window({ url });
 }
 
-Optional<ByteString> Application::ask_user_for_download_path(StringView file) const
+Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
 {
     auto default_path = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
 
     if (default_path.isNull() || default_path.isEmpty())
-        default_path = qstring_from_ak_string(file);
+        default_path = qstring_from_ak_string(file.view());
     else
-        default_path = QDir { default_path }.filePath(qstring_from_ak_string(file));
+        default_path = QDir { default_path }.filePath(qstring_from_ak_string(file.view()));
 
     auto path = QFileDialog::getSaveFileName(nullptr, "Select save location", default_path);
     if (path.isNull())
@@ -461,6 +489,28 @@ void Application::display_download_confirmation_dialog(StringView download_name,
 void Application::display_error_dialog(StringView error_message) const
 {
     QMessageBox::warning(active_tab(), "Ladybird", qstring_from_ak_string(error_message));
+}
+
+void Application::open_download(WebView::FileDownloader::Download const& download) const
+{
+    auto path = download_file_path_for_frontend_action(download);
+    if (path.is_error()) {
+        display_error_dialog("Unable to open downloaded file: path cannot be represented by this frontend"sv);
+        return;
+    }
+
+    QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path.release_value())));
+}
+
+void Application::show_download_in_folder(WebView::FileDownloader::Download const& download) const
+{
+    auto path = download_directory_path_for_frontend_action(download);
+    if (path.is_error()) {
+        display_error_dialog("Unable to show downloaded file: path cannot be represented by this frontend"sv);
+        return;
+    }
+
+    QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path.release_value())));
 }
 
 static QClipboard::Mode clipboard_mode(QClipboard const& clipboard, Application::ClipboardType type)

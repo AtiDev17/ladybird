@@ -10,6 +10,7 @@
 #include <AK/JsonObject.h>
 #include <AK/Math.h>
 #include <AK/ScopeGuard.h>
+#include <AK/StringBuilder.h>
 #include <AK/Time.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/ArgsParser.h>
@@ -126,6 +127,9 @@ Application::~Application()
     m_bookmark_store_observer.clear();
     if (m_compositor_client)
         m_compositor_client->on_death = nullptr;
+
+    m_spare_web_content_process = nullptr;
+    m_process_manager = nullptr;
 
     s_the = nullptr;
 }
@@ -1209,20 +1213,74 @@ void Application::process_did_exit(Process&& process, Optional<int> exit_status)
     }
 }
 
-ErrorOr<LexicalPath> Application::path_for_downloaded_file(StringView file) const
+static bool download_path_is_available(LexicalPath const& path)
 {
-    if (browser_options().headless_mode.has_value()) {
-        auto downloads_directory = Core::StandardPaths::downloads_directory();
+    if (FileSystem::exists(path.string()))
+        return false;
 
-        if (!FileSystem::is_directory(downloads_directory)) {
-            dbgln("Unable to ask user for download folder in headless mode, please ensure {} is a directory or use the XDG_DOWNLOAD_DIR environment variable to set a new download directory", downloads_directory);
-            return Error::from_errno(ENOENT);
-        }
-
-        return LexicalPath::join(downloads_directory, file);
+    for (auto const& download : Application::the().file_downloader().downloads()) {
+        if (download.status == FileDownloader::DownloadStatus::InProgress && download.destination.string() == path.string())
+            return false;
     }
 
-    auto download_path = ask_user_for_download_path(file);
+    return true;
+}
+
+static LexicalPath unique_download_path(ByteString const& downloads_directory, ByteString const& file)
+{
+    auto destination = LexicalPath::join(downloads_directory, file.view());
+    if (download_path_is_available(destination))
+        return destination;
+
+    auto lexical_file = LexicalPath { file };
+    auto title = lexical_file.title();
+    auto extension = lexical_file.extension();
+    for (u64 index = 1;; ++index) {
+        auto candidate_filename = extension.is_empty()
+            ? ByteString::formatted("{} ({})", title, index)
+            : ByteString::formatted("{} ({}).{}", title, index, extension);
+        auto candidate = LexicalPath::join(downloads_directory, candidate_filename.view());
+        if (download_path_is_available(candidate))
+            return candidate;
+    }
+}
+
+static ByteString sanitize_suggested_download_filename(ByteString filename)
+{
+    filename = LexicalPath::basename(move(filename));
+
+    StringBuilder builder;
+    for (auto byte : filename.bytes()) {
+        if (byte == '\0' || byte == '/' || byte == '\\')
+            builder.append('_');
+        else
+            builder.append(static_cast<char>(byte));
+    }
+
+    auto sanitized = builder.to_byte_string();
+    if (sanitized.is_empty() || sanitized == "."sv || sanitized == ".."sv)
+        return "download";
+    return sanitized;
+}
+
+ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString const& file) const
+{
+    auto downloads_directory = Core::StandardPaths::downloads_directory();
+
+    if (!FileSystem::is_directory(downloads_directory)) {
+        dbgln("Unable to find download folder, please ensure {} is a directory or use the XDG_DOWNLOAD_DIR environment variable to set a new download directory", downloads_directory);
+        return Error::from_errno(ENOENT);
+    }
+
+    return unique_download_path(downloads_directory, sanitize_suggested_download_filename(file));
+}
+
+ErrorOr<LexicalPath> Application::path_for_downloaded_file(ByteString const& file) const
+{
+    if (browser_options().headless_mode.has_value())
+        return default_path_for_downloaded_file(file);
+
+    auto download_path = ask_user_for_download_path(sanitize_suggested_download_filename(file));
     if (!download_path.has_value())
         return Error::from_errno(ECANCELED);
 
@@ -1237,6 +1295,31 @@ void Application::display_download_confirmation_dialog(StringView download_name,
 void Application::display_error_dialog(StringView error_message) const
 {
     warnln("{}", error_message);
+}
+
+static ErrorOr<String> download_path_for_frontend_action(LexicalPath const& path)
+{
+    return String::from_utf8(path.string().view());
+}
+
+ErrorOr<String> Application::download_file_path_for_frontend_action(FileDownloader::Download const& download) const
+{
+    return download_path_for_frontend_action(download.destination);
+}
+
+ErrorOr<String> Application::download_directory_path_for_frontend_action(FileDownloader::Download const& download) const
+{
+    return download_path_for_frontend_action(LexicalPath { download.destination.dirname() });
+}
+
+void Application::open_download(FileDownloader::Download const& download) const
+{
+    outln("Open downloaded file: {}", download.destination);
+}
+
+void Application::show_download_in_folder(FileDownloader::Download const& download) const
+{
+    outln("Show downloaded file in folder: {}", download.destination);
 }
 
 bool Application::supports_clipboard_type(ClipboardType type) const
@@ -1391,6 +1474,10 @@ void Application::initialize_actions()
 
     m_open_about_page_action = Action::create("About Ladybird"sv, ActionID::OpenAboutPage, [this]() {
         open_url_in_new_tab(URL::about_version(), Web::HTML::ActivateTab::Yes);
+    });
+    m_open_downloads_page_action = Action::create("Downloads"sv, ActionID::ViewDownloads, [this]() {
+        if (!activate_tab_with_url(URL::about_downloads()))
+            open_url_in_new_tab(URL::about_downloads(), Web::HTML::ActivateTab::Yes);
     });
     m_open_settings_page_action = Action::create("Settings"sv, ActionID::OpenSettingsPage, [this]() {
         open_url_in_new_tab(URL::about_settings(), Web::HTML::ActivateTab::Yes);

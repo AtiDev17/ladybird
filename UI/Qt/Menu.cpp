@@ -164,6 +164,11 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
             qaction.setIcon(create_chrome_icon(ChromeIcon::Reload, palette));
         qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_R), QKeySequence(Qt::Key_F5) });
         break;
+    case WebView::ActionID::ViewDownloads:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Download, palette));
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_J));
+        break;
 
     case WebView::ActionID::CopySelection:
         qaction.setShortcut(QKeySequence::StandardKey::Copy);

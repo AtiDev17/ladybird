@@ -490,7 +490,7 @@ public:
                 copied_list.ensure_capacity(map->map_size() * 2);
 
                 // 2. For each Record { [[Key]], [[Value]] } entry of value.[[MapData]]:
-                for (auto const& entry : *map) {
+                for (auto entry : *map) {
                     // 1. Let copiedEntry be a new Record { [[Key]]: entry.[[Key]], [[Value]]: entry.[[Value]] }.
                     // 2. If copiedEntry.[[Key]] is not the special value empty, append copiedEntry to copiedList.
                     copied_list.append(entry.key);
@@ -517,9 +517,9 @@ public:
                 copied_list.ensure_capacity(set->set_size());
 
                 // 2. For each entry of value.[[SetData]]:
-                for (auto const& entry : *set) {
+                for (auto entry : *set) {
                     // 1. If entry is not the special value empty, append entry to copiedList.
-                    copied_list.append(entry.key);
+                    copied_list.append(entry);
                 }
 
                 serialized.encode(set->set_size());

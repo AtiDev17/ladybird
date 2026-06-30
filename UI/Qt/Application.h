@@ -14,6 +14,7 @@
 #include <QApplication>
 
 class QMenu;
+class QWidget;
 
 namespace Ladybird {
 
@@ -39,6 +40,7 @@ public:
     void reopen_recently_closed_tab();
     void open_file();
     void quit();
+    bool confirm_cancel_active_downloads(QWidget* parent = nullptr);
     void initialize_macos_application_menu();
     QMenu* qt_bookmarks_menu() const;
 
@@ -61,9 +63,11 @@ private:
     virtual bool activate_tab_with_url(URL::URL const&) const override;
     virtual void open_url_in_new_window(URL::URL const& url) override;
 
-    virtual Optional<ByteString> ask_user_for_download_path(StringView file) const override;
+    virtual Optional<ByteString> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
     virtual void display_error_dialog(StringView error_message) const override;
+    virtual void open_download(WebView::FileDownloader::Download const&) const override;
+    virtual void show_download_in_folder(WebView::FileDownloader::Download const&) const override;
 
     virtual bool supports_clipboard_type(ClipboardType) const override;
     virtual Utf16String clipboard_text(ClipboardType) const override;

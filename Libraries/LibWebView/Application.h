@@ -132,10 +132,15 @@ public:
 
     virtual bool should_capture_web_content_output() const { return false; }
 
-    ErrorOr<LexicalPath> path_for_downloaded_file(StringView file) const;
+    ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const;
+    ErrorOr<LexicalPath> path_for_downloaded_file(ByteString const& file) const;
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
+    ErrorOr<String> download_file_path_for_frontend_action(FileDownloader::Download const&) const;
+    ErrorOr<String> download_directory_path_for_frontend_action(FileDownloader::Download const&) const;
+    virtual void open_download(FileDownloader::Download const&) const;
+    virtual void show_download_in_folder(FileDownloader::Download const&) const;
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -178,6 +183,7 @@ public:
     Action& select_all_action() { return *m_select_all_action; }
 
     Action& open_about_page_action() { return *m_open_about_page_action; }
+    Action& open_downloads_page_action() { return *m_open_downloads_page_action; }
     Action& open_settings_page_action() { return *m_open_settings_page_action; }
 
     Menu& zoom_menu() { return *m_zoom_menu; }
@@ -223,7 +229,7 @@ protected:
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions&) { }
     virtual Core::EventLoop& create_platform_event_loop();
 
-    virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] StringView file) const { return {}; }
+    virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
 
     virtual void update_tabs_display() const { }
 
@@ -393,6 +399,7 @@ private:
     RefPtr<Action> m_select_all_action;
 
     RefPtr<Action> m_open_about_page_action;
+    RefPtr<Action> m_open_downloads_page_action;
     RefPtr<Action> m_open_settings_page_action;
 
     RefPtr<Menu> m_zoom_menu;

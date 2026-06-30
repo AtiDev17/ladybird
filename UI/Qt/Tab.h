@@ -8,6 +8,7 @@
 #pragma once
 
 #include <LibWeb/HTML/AudioPlayState.h>
+#include <LibWebView/FileDownloader.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/BookmarksBar.h>
 #include <UI/Qt/FindInPageWidget.h>
@@ -22,10 +23,11 @@
 #include <QWidget>
 
 class QTimer;
-
 namespace Ladybird {
 
 class BrowserWindow;
+enum class ChromeIcon;
+class DownloadsPopover;
 class WindowControlButton;
 
 class HyperlinkLabel final : public QLabel {
@@ -49,6 +51,7 @@ signals:
 
 class Tab final
     : public QWidget
+    , public WebView::FileDownloaderObserver
     , public WebView::SettingsObserver {
     Q_OBJECT
 
@@ -115,9 +118,17 @@ private:
     void update_hamburger_menu();
     void update_chrome_style();
     void update_tab_title();
+    void update_downloads_button();
+    void update_downloads_popover();
+    void show_downloads_popover();
+    void position_downloads_popover();
     void set_loading(bool);
     void update_tab_icon();
     int tab_index();
+
+    virtual void download_added(WebView::FileDownloader::Download const&) override;
+    virtual void download_updated(WebView::FileDownloader::Download const&) override;
+    virtual void download_removed(u64) override;
 
     QWidget* m_toolbar_container { nullptr };
     QWidget* m_toolbar { nullptr };
@@ -132,6 +143,8 @@ private:
     WindowControlButton* m_close_window_button { nullptr };
     BookmarksBar* m_bookmarks_bar { nullptr };
     QToolButton* m_hamburger_button { nullptr };
+    QToolButton* m_downloads_button { nullptr };
+    QPointer<DownloadsPopover> m_downloads_popover;
     LocationEdit* m_location_edit { nullptr };
     WebContentView* m_view { nullptr };
     FindInPageWidget* m_find_in_page { nullptr };
@@ -157,6 +170,9 @@ private:
     QAction* m_navigate_back_action { nullptr };
     QAction* m_navigate_forward_action { nullptr };
     QAction* m_reload_action { nullptr };
+    QAction* m_open_downloads_page_action { nullptr };
+    Optional<ChromeIcon> m_downloads_button_icon;
+    QString m_downloads_button_tooltip;
 
     QPointer<QDialog> m_dialog;
 
