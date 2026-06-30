@@ -9,6 +9,7 @@
 #include <AK/OwnPtr.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/AvailableSpace.h>
+#include <LibWeb/Layout/LayoutInput.h>
 #include <LibWeb/Layout/LayoutState.h>
 
 namespace Web::Layout {
@@ -111,7 +112,7 @@ public:
         Last,
     };
 
-    virtual void run(AvailableSpace const&) = 0;
+    virtual void run(LayoutInput const&) = 0;
 
     // These functions return the automatic content dimensions of the context's root box.
     virtual CSSPixels automatic_content_width() const = 0;
@@ -156,7 +157,6 @@ public:
 
     virtual CSSPixels greatest_child_width(Box const&) const;
 
-    [[nodiscard]] CSSPixelRect absolute_content_rect(Box const&) const;
     [[nodiscard]] CSSPixelRect margin_box_rect_in_ancestor_coordinate_space(Box const&, Box const& ancestor_box) const;
     [[nodiscard]] CSSPixelRect margin_box_rect_in_ancestor_coordinate_space(LayoutState::UsedValues const&, Box const& ancestor_box) const;
     [[nodiscard]] CSSPixelRect content_box_rect(Box const&) const;
@@ -186,7 +186,7 @@ protected:
 
     [[nodiscard]] bool box_is_sized_as_replaced_element(Box const&, AvailableSpace const&) const;
 
-    OwnPtr<FormattingContext> layout_inside(Box const&, LayoutMode, AvailableSpace const&);
+    OwnPtr<FormattingContext> layout_inside(Box const&, LayoutMode, LayoutInput const&);
 
     struct SpaceUsedByFloats {
         CSSPixels left { 0 };
