@@ -13,7 +13,6 @@
 #include <AK/String.h>
 #include <AK/Tuple.h>
 #include <LibCore/Forward.h>
-#include <LibJS/Heap/Cell.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
@@ -23,6 +22,7 @@
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/InitialInsertion.h>
+#include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
 #include <LibWeb/HTML/POSTResource.h>
@@ -60,8 +60,8 @@ struct TargetSnapshotParams {
 };
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#navigable
-class WEB_API LocalNavigable : public JS::Cell {
-    GC_CELL(LocalNavigable, JS::Cell);
+class WEB_API LocalNavigable : public Navigable {
+    GC_CELL(LocalNavigable, Navigable);
     GC_DECLARE_ALLOCATOR(LocalNavigable);
 
 public:
@@ -80,10 +80,6 @@ public:
     Vector<GC::Root<LocalNavigable>> child_navigables() const;
 
     virtual bool is_traversable() const { return false; }
-
-    String const& id() const { return m_id; }
-    GC::Ptr<LocalNavigable> parent() const { return m_parent; }
-    bool is_ancestor_of(GC::Ref<LocalNavigable>) const;
 
     bool is_closing() const { return m_closing; }
     void set_closing(bool value) { m_closing = value; }
@@ -110,7 +106,7 @@ public:
     Optional<UniqueNodeID> active_document_id() const;
     void set_active_document(GC::Ptr<DOM::Document>);
     GC::Ptr<BrowsingContext> active_browsing_context();
-    GC::Ptr<WindowProxy> active_window_proxy();
+    virtual GC::Ptr<WindowProxy> active_window_proxy() override;
     GC::Ptr<Window> active_window();
 
     RefPtr<SessionHistoryEntry> get_the_target_history_entry(int target_step) const;
@@ -120,13 +116,12 @@ public:
     void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&);
     void restore_scroll_position_data(SessionHistoryEntry const&);
 
-    String target_name() const;
+    virtual String target_name() const override;
 
     GC::Ptr<NavigableContainer> container() const;
     GC::Ptr<DOM::Document> container_document() const;
 
-    GC::Ptr<TraversableNavigable> traversable_navigable() const;
-    GC::Ptr<TraversableNavigable> top_level_traversable();
+    GC::Ptr<LocalTraversableNavigable> traversable_navigable() const;
 
     virtual bool is_top_level_traversable() const { return false; }
 
@@ -330,12 +325,6 @@ private:
     void schedule_hover_update_after_async_scroll();
     void update_hover_after_async_scroll_stops();
     void cancel_hover_update_after_async_scroll();
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-id
-    String m_id;
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-parent
-    GC::Ptr<LocalNavigable> m_parent;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-current-history-entry
     RefPtr<SessionHistoryEntry> m_current_session_history_entry;

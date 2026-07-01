@@ -34,9 +34,9 @@
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/PaintConfig.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/AutoScrollHandler.h>
@@ -948,7 +948,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         // 1. If document's fullscreen element is not null, then:
         if (document->fullscreen()) {
             // 1. Fully exit fullscreen given document's node navigable's top-level traversable's active document.
-            m_navigable->top_level_traversable()->active_document()->fully_exit_fullscreen();
+            as<HTML::LocalNavigable>(*m_navigable->top_level_traversable()).active_document()->fully_exit_fullscreen();
             // 2. Return.
             return EventResult::Handled;
         }

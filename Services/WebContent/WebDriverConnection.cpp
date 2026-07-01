@@ -54,10 +54,11 @@
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SelectedFile.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/Loader/FileRequest.h>
@@ -141,7 +142,7 @@ static Gfx::IntRect compute_window_rect(Web::Page const& page)
     };
 }
 
-static Optional<size_t> current_top_level_entry_index(Web::HTML::TraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
+static Optional<size_t> current_top_level_entry_index(Web::HTML::LocalTraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
 {
     VERIFY(session_history_snapshot.current_used_step_index < session_history_snapshot.used_session_history_steps.size());
     auto current_step = session_history_snapshot.used_session_history_steps[session_history_snapshot.current_used_step_index];
@@ -155,7 +156,7 @@ static Optional<size_t> current_top_level_entry_index(Web::HTML::TraversableNavi
     return result;
 }
 
-static JsonObject serialize_session_history_snapshot_for_webdriver(Web::HTML::TraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
+static JsonObject serialize_session_history_snapshot_for_webdriver(Web::HTML::LocalTraversableNavigable::SessionHistorySnapshot const& session_history_snapshot)
 {
     JsonObject serialized;
     serialized.set("currentUsedStepIndex"sv, session_history_snapshot.current_used_step_index);
@@ -322,8 +323,7 @@ void WebDriverConnection::close_session()
 
     // 5. Optionally, close all top-level browsing contexts, without prompting to unload.
     for (auto navigable : Web::HTML::all_local_navigables()) {
-        if (auto traversable = navigable->top_level_traversable())
-            traversable->close_top_level_traversable();
+        as<Web::HTML::LocalTraversableNavigable>(*navigable->top_level_traversable()).close_top_level_traversable();
     }
 }
 
@@ -687,12 +687,12 @@ Messages::WebDriverClient::SwitchToWindowResponse WebDriverConnection::switch_to
     bool found_matching_context = false;
 
     for (auto navigable : Web::HTML::all_local_navigables()) {
-        auto traversable = navigable->top_level_traversable();
-        if (!traversable || !traversable->active_browsing_context())
+        auto& traversable = as<Web::HTML::LocalTraversableNavigable>(*navigable->top_level_traversable());
+        if (!traversable.active_browsing_context())
             continue;
 
-        if (handle == traversable->window_handle()) {
-            set_current_top_level_browsing_context(*traversable->active_browsing_context());
+        if (handle == traversable.window_handle()) {
+            set_current_top_level_browsing_context(*traversable.active_browsing_context());
             found_matching_context = true;
             break;
         }
@@ -2725,7 +2725,7 @@ void WebDriverConnection::set_current_browsing_context(Web::HTML::BrowsingContex
     // 2. Set the session's current parent browsing context to the parent browsing context of context, if that context
     //    exists, or null otherwise.
     if (auto navigable = browsing_context.active_document()->navigable(); navigable && navigable->parent())
-        m_current_parent_browsing_context = navigable->parent()->active_browsing_context();
+        m_current_parent_browsing_context = as<Web::HTML::LocalNavigable>(*navigable->parent()).active_browsing_context();
     else
         m_current_parent_browsing_context = nullptr;
 }

@@ -52,6 +52,7 @@
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Location.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
@@ -65,7 +66,6 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
@@ -609,7 +609,7 @@ void Window::consume_history_action_user_activation()
     auto top = navigable->top_level_traversable();
 
     // 3. Let navigables be the inclusive descendant navigables of top's active document.
-    auto navigables = top->active_document()->inclusive_descendant_navigables();
+    auto navigables = as<LocalTraversableNavigable>(*top).active_document()->inclusive_descendant_navigables();
 
     // 4. Let windows be the list of Window objects constructed by taking the active window of each item in navigables.
     GC::RootVector<GC::Ptr<Window>> windows;
@@ -634,7 +634,7 @@ void Window::consume_user_activation()
     auto top = navigable->top_level_traversable();
 
     // 3. Let navigables be the inclusive descendant navigables of top's active document.
-    auto navigables = top->active_document()->inclusive_descendant_navigables();
+    auto navigables = as<LocalTraversableNavigable>(*top).active_document()->inclusive_descendant_navigables();
 
     // 4. Let windows be the list of Window objects constructed by taking the active window of each item in navigables.
     GC::RootVector<GC::Ptr<Window>> windows;
@@ -913,7 +913,7 @@ void Window::close()
 
         // 2. Queue a task on the DOM manipulation task source to definitely close thisTraversable.
         HTML::queue_global_task(HTML::Task::Source::DOMManipulation, incumbent_global_object, GC::create_function(heap(), [traversable] {
-            as<TraversableNavigable>(*traversable).definitely_close_top_level_traversable();
+            as<LocalTraversableNavigable>(*traversable).definitely_close_top_level_traversable();
         }));
     }
 }
@@ -1118,7 +1118,7 @@ WebIDL::ExceptionOr<void> Window::set_opener(JS::Value value)
 GC::Ptr<WindowProxy const> Window::parent() const
 {
     // 1. Let navigable be this's navigable.
-    auto navigable = this->navigable();
+    GC::Ptr<Navigable> navigable = this->navigable();
 
     // 2. If navigable is null, then return null.
     if (!navigable)

@@ -153,6 +153,7 @@
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Location.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
@@ -173,7 +174,6 @@
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/StorageEvent.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
@@ -3706,11 +3706,13 @@ void Document::flush_autofocus_candidates()
         // 7. Let inclusiveAncestorDocuments be a list consisting of the active document of doc's inclusive ancestor navigables.
         GC::RootVector<GC::Ref<Document>> inclusive_ancestor_documents;
         inclusive_ancestor_documents.append(doc);
-        auto ancestor_navigable = doc_navigable->parent();
+        auto parent_navigable = doc_navigable->parent();
+        auto* ancestor_navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
         while (ancestor_navigable) {
             if (auto active = ancestor_navigable->active_document())
                 inclusive_ancestor_documents.append(*active);
-            ancestor_navigable = ancestor_navigable->parent();
+            parent_navigable = ancestor_navigable->parent();
+            ancestor_navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
         }
 
         // 8. If any Document in inclusiveAncestorDocuments has non-null target element, then continue.
@@ -5278,7 +5280,8 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
         return {};
 
     // 1. Let navigable be document's node navigable's parent.
-    auto navigable = document_node_navigable->parent();
+    auto parent_navigable = document_node_navigable->parent();
+    auto* navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
 
     // 2. Let ancestors be an empty list.
     Vector<GC::Root<HTML::LocalNavigable>> ancestors;
@@ -5289,7 +5292,8 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::ancestor_navigables()
         ancestors.prepend(*navigable);
 
         // 2. Set navigable to navigable's parent.
-        navigable = navigable->parent();
+        parent_navigable = navigable->parent();
+        navigable = parent_navigable ? &as<HTML::LocalNavigable>(*parent_navigable) : nullptr;
     }
 
     // 4. Return ancestors.
@@ -8219,7 +8223,7 @@ GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
     auto docs = collect_documents_to_unfullscreen();
 
     // 5. Let topLevelDoc be doc’s node navigable’s top-level traversable’s active document.
-    auto top_level_doc = navigable()->top_level_traversable()->active_document();
+    auto top_level_doc = as<HTML::LocalTraversableNavigable>(*navigable()->top_level_traversable()).active_document();
 
     // 6. If topLevelDoc is in docs, and it is a simple fullscreen document, then set doc to topLevelDoc and resize to true.
     GC::Ref<Document> doc { *this };

@@ -13,9 +13,9 @@
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationPosition.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
+#include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -279,11 +279,9 @@ EmulatedPositionData Geolocation::get_emulated_position_data() const
     auto traversable = navigable->top_level_traversable();
 
     // 4. If traversable is null, return null.
-    if (!traversable)
-        return Empty {};
-
+    // NB: This cannot be null.
     // 5. Return traversable's associated emulated position data.
-    return traversable->emulated_position_data();
+    return as<HTML::LocalTraversableNavigable>(*traversable).emulated_position_data();
 }
 
 // https://w3c.github.io/geolocation/#dfn-request-a-position
