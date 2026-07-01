@@ -619,6 +619,7 @@ set(SOURCES
     HTML/HTMLUListElement.cpp
     HTML/HTMLUnknownElement.cpp
     HTML/HTMLVideoElement.cpp
+    HTML/HyperlinkElementUtils.cpp
     HTML/ImageBitmap.cpp
     HTML/ImageData.cpp
     HTML/ImageRequest.cpp
@@ -828,6 +829,7 @@ set(SOURCES
     Loader/ProxyMappings.cpp
     Loader/ResourceLoader.cpp
     MathML/AttributeNames.cpp
+    MathML/MathMLAnchorElement.cpp
     MathML/MathMLElement.cpp
     MathML/MathMLMiElement.cpp
     MathML/MathMLMspaceElement.cpp

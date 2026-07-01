@@ -1,0 +1,7 @@
+Harness status: OK
+
+Found 2 tests
+
+2 Pass
+Pass	@scope with external stylesheet through link element
+Pass	@scope with external stylesheet through @import
