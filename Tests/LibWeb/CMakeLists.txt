@@ -12,6 +12,7 @@ set(TEST_SOURCES
     TestFetchResponse.cpp
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
+    TestImageData.cpp
     TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
@@ -21,6 +22,8 @@ set(TEST_SOURCES
     TestSessionHistoryEntry.cpp
     TestSourceHighlighter.cpp
     TestStrings.cpp
+    TestWebIDLBuffers.cpp
+    TestWebGLSpanWithStorage.cpp
 )
 
 foreach(source IN LISTS TEST_SOURCES)
@@ -34,10 +37,13 @@ target_link_libraries(TestControlMessageQueue PRIVATE LibSync)
 target_link_libraries(TestFetchResponse PRIVATE LibGC LibHTTP LibJS)
 target_link_libraries(TestFetchURL PRIVATE LibURL)
 target_link_libraries(TestAccumulatedVisualContext PRIVATE LibGfx)
+target_link_libraries(TestImageData PRIVATE LibGC LibJS)
 target_link_libraries(TestPage PRIVATE LibGC LibJS)
 target_link_libraries(TestSecureContexts PRIVATE LibURL)
 target_link_libraries(TestSessionHistoryEntry PRIVATE LibJS LibURL)
 target_link_libraries(TestSourceHighlighter PRIVATE LibURL LibWebView)
+target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
+target_link_libraries(TestWebGLSpanWithStorage PRIVATE LibGC LibJS)
 
 if (NOT WIN32)
     add_custom_target(test-css-tokenizer ALL DEPENDS css-tokenizer "${CMAKE_BINARY_DIR}/bin/test-css-tokenizer")

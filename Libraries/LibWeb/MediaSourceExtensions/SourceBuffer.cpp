@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteBuffer.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibMedia/PlaybackManager.h>
 #include <LibWeb/Bindings/Intrinsics.h>
@@ -333,8 +334,9 @@ WebIDL::ExceptionOr<void> SourceBuffer::append_buffer(WebIDL::BufferSource data)
     TRY(prepare_append(data.byte_length(), m_media_source->media_element_assigned_to()->playback_manager().current_time()));
 
     // 2. Add data to the end of the [[input buffer]].
-    if (auto array_buffer = data.viewed_array_buffer(); array_buffer && !array_buffer->is_detached()) {
-        auto bytes = array_buffer->bytes().slice(data.byte_offset(), data.byte_length());
+    if (auto array_buffer = data.viewed_array_buffer(); array_buffer && !array_buffer->is_detached() && !data.is_out_of_bounds()) {
+        auto bytes = MUST(ByteBuffer::create_uninitialized(data.byte_length()));
+        array_buffer->copy_to(data.byte_offset(), bytes);
         m_processor->append_to_input_buffer(bytes);
     }
 

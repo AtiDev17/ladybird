@@ -515,11 +515,13 @@ void InlineFormattingContext::generate_line_boxes()
                         continue;
 
                     if (box->display_before_box_type_transformation().is_block_outside()) {
-                        auto block_position = line_box.fragments().is_empty() ? marker.offset().y() : line_box.bottom();
-                        static_position_rect.rect = { { 0, block_position }, { 0, 0 } };
+                        auto block_position = marker.preceded_by_in_flow_content ? line_box.bottom() : marker.offset().y();
+                        static_position_rect.rect = { { 0, block_position }, { m_containing_block_used_values.content_width(), 0 } };
                     } else {
                         static_position_rect.rect = { marker.offset(), { 0, 0 } };
                     }
+                    if (direction == CSS::Direction::Rtl)
+                        static_position_rect.horizontal_alignment = StaticPositionRect::Alignment::End;
                     found_static_position_marker = true;
                     break;
                 }

@@ -552,6 +552,7 @@ pub const INSTRUCTIONS: &[InstructionInfo] = &[
         // Large offsets / non-power-of-two scales go through x9.
         ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
     ),
+    plain("load_c_symbol_address", &[GprOut, FuncSymbol]),
 
     // ------------------------------------------------------------------
     // Integer ALU
@@ -634,7 +635,7 @@ pub const INSTRUCTIONS: &[InstructionInfo] = &[
         None,
         false,
         false,
-        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["rax", "r11"], ..ArchSpec::NONE },
         ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
     ),
     info(
@@ -1159,6 +1160,13 @@ mod tests {
     fn table_entries_are_unique() {
         // Force the lazy index to build, which asserts uniqueness.
         let _ = index();
+    }
+
+    #[test]
+    fn and_declares_x86_large_immediate_scratch_registers() {
+        let info = lookup("and").expect("and instruction should exist");
+        assert!(info.x86_64.clobbers_gpr.contains(&"rax"));
+        assert!(info.x86_64.clobbers_gpr.contains(&"r11"));
     }
 
     #[test]

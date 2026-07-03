@@ -246,4 +246,11 @@ FlyString const& string_from_style_value(NonnullRefPtr<StyleValue const> const& 
     VERIFY_NOT_REACHED();
 }
 
+Keyword StyleValue::to_keyword() const
+{
+    if (is_keyword())
+        return static_cast<KeywordStyleValue const&>(*this).keyword();
+    return Keyword::Invalid;
+}
+
 }

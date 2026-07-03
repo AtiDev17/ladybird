@@ -80,11 +80,4 @@ private:
     Keyword m_keyword { Keyword::Invalid };
 };
 
-inline Keyword StyleValue::to_keyword() const
-{
-    if (is_keyword())
-        return static_cast<KeywordStyleValue const&>(*this).keyword();
-    return Keyword::Invalid;
-}
-
 }

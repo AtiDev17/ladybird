@@ -10,7 +10,7 @@
 #include <AK/Function.h>
 #include <AK/IntrusiveList.h>
 #include <AK/Variant.h>
-#include <AK/kmalloc.h>
+#include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/Completion.h>
@@ -61,7 +61,11 @@ struct DataBlock {
     class OwnedBackingStore {
     public:
         OwnedBackingStore() = default;
-        ~OwnedBackingStore() { kfree(m_data); }
+        ~OwnedBackingStore()
+        {
+            if (m_handle.is_valid())
+                GC::PrimitiveStorage::the().free(m_handle);
+        }
 
         OwnedBackingStore(OwnedBackingStore&& other)
         {
@@ -71,7 +75,8 @@ struct DataBlock {
         OwnedBackingStore& operator=(OwnedBackingStore&& other)
         {
             if (this != &other) {
-                kfree(m_data);
+                if (m_handle.is_valid())
+                    GC::PrimitiveStorage::the().free(m_handle);
                 move_from(move(other));
             }
             return *this;
@@ -83,67 +88,74 @@ struct DataBlock {
         static ErrorOr<OwnedBackingStore> create_zeroed(size_t size)
         {
             OwnedBackingStore buffer;
-            TRY(buffer.try_resize(size, ZeroFillNewBytes::Yes));
+            if (size > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_allocate(size, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
             return buffer;
         }
 
         static ErrorOr<OwnedBackingStore> create_uninitialized(size_t size)
         {
             OwnedBackingStore buffer;
-            TRY(buffer.try_resize(size, ZeroFillNewBytes::No));
+            if (size > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_allocate(size, GC::PrimitiveStorage::ZeroFillNewBytes::No));
             return buffer;
         }
 
-        u8* data() { return m_data; }
-        u8 const* data() const { return m_data; }
-        size_t size() const { return m_size; }
-        size_t capacity() const { return m_capacity; }
-        Bytes bytes() { return { data(), size() }; }
-        ReadonlyBytes bytes() const { return { data(), size() }; }
+        static ErrorOr<OwnedBackingStore> create_zeroed_with_capacity(size_t size, size_t capacity)
+        {
+            OwnedBackingStore buffer;
+            if (capacity > 0)
+                buffer.m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(size, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
+            return buffer;
+        }
+
+        u8* data() { return GC::PrimitiveStorage::the().data(m_handle); }
+        u8 const* data() const { return GC::PrimitiveStorage::the().data(m_handle); }
+        size_t size() const { return GC::PrimitiveStorage::the().size(m_handle); }
+        size_t capacity() const { return GC::PrimitiveStorage::the().capacity(m_handle); }
+        size_t offset() const { return GC::PrimitiveStorage::the().offset(m_handle); }
+        GC::PrimitiveStorageHandle handle() const { return m_handle; }
 
         void set_size(size_t new_size, ZeroFillNewBytes zero_fill_new_bytes = ZeroFillNewBytes::No)
         {
             VERIFY(new_size <= capacity());
-            if (zero_fill_new_bytes == ZeroFillNewBytes::Yes && new_size > m_size)
-                __builtin_memset(data() + m_size, 0, new_size - m_size);
-            m_size = new_size;
+            MUST(try_resize(new_size, zero_fill_new_bytes));
         }
 
         ErrorOr<void> try_resize(size_t new_size, ZeroFillNewBytes zero_fill_new_bytes = ZeroFillNewBytes::No)
         {
-            if (new_size <= m_size) {
-                m_size = new_size;
+            auto primitive_zero_fill = zero_fill_new_bytes == ZeroFillNewBytes::Yes
+                ? GC::PrimitiveStorage::ZeroFillNewBytes::Yes
+                : GC::PrimitiveStorage::ZeroFillNewBytes::No;
+
+            if (!m_handle.is_valid()) {
+                if (new_size == 0)
+                    return {};
+                m_handle = TRY(GC::PrimitiveStorage::the().try_allocate(new_size, primitive_zero_fill));
                 return {};
             }
-            if (new_size > capacity())
-                TRY(try_ensure_capacity(new_size));
-            set_size(new_size, zero_fill_new_bytes);
-            return {};
+
+            return GC::PrimitiveStorage::the().try_resize(m_handle, new_size, primitive_zero_fill);
         }
 
         ErrorOr<void> try_ensure_capacity(size_t new_capacity)
         {
             if (new_capacity <= capacity())
                 return {};
-            auto* new_data = static_cast<u8*>(krealloc(HeapPartition::ArrayBuffer, m_data, new_capacity));
-            if (!new_data)
-                return AK::Error::from_errno(ENOMEM);
-            m_data = new_data;
-            m_capacity = new_capacity;
-            return {};
+            if (!m_handle.is_valid()) {
+                m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(0, new_capacity, GC::PrimitiveStorage::ZeroFillNewBytes::No));
+                return {};
+            }
+            return GC::PrimitiveStorage::the().try_reserve(m_handle, new_capacity);
         }
 
     private:
         void move_from(OwnedBackingStore&& other)
         {
-            m_data = exchange(other.m_data, nullptr);
-            m_size = exchange(other.m_size, 0);
-            m_capacity = exchange(other.m_capacity, 0);
+            m_handle = exchange(other.m_handle, {});
         }
 
-        u8* m_data { nullptr };
-        size_t m_size { 0 };
-        size_t m_capacity { 0 };
+        GC::PrimitiveStorageHandle m_handle;
     };
 
     struct UnownedFixedLengthByteBuffer {
@@ -157,55 +169,208 @@ struct DataBlock {
         size_t size = 0;
     };
 
+    struct DynamicPrimitiveStorageSize {
+    };
+
     // AD-HOC: ECMA-262 models ArrayBuffer backing storage as a Data Block. We additionally allow
-    //         host code to provide an external byte store via callbacks so engine-independent
+    //         host code to provide an external caged primitive store, so engine-independent
     //         consumers like LibWeb can project spec-defined host objects onto ArrayBuffer without
     //         teaching LibJS about those hosts.
-    struct UnownedExternalBuffer {
-        using DataFunction = u8* (*)(void*);
-        using SizeFunction = size_t (*)(void*);
-
-        explicit UnownedExternalBuffer(GC::Ref<GC::Cell> owner, void* context, DataFunction data, SizeFunction size)
-            : context(context)
-            , data(data)
-            , size(size)
+    struct ExternalPrimitiveStorage {
+        explicit ExternalPrimitiveStorage(GC::Ref<GC::Cell> owner, GC::PrimitiveStorageHandle handle)
+            : handle(handle)
+            , size(DynamicPrimitiveStorageSize {})
             , owner(owner)
         {
         }
 
-        explicit UnownedExternalBuffer(GC::Ref<GC::Cell> owner, void* context, DataFunction data, size_t fixed_size)
-            : context(context)
-            , data(data)
+        explicit ExternalPrimitiveStorage(GC::Ref<GC::Cell> owner, GC::PrimitiveStorageHandle handle, size_t fixed_size)
+            : handle(handle)
             , size(fixed_size)
             , owner(owner)
         {
         }
 
-        void* context { nullptr };
-        DataFunction data { nullptr };
-        Variant<SizeFunction, size_t> size;
+        u8* data() { return GC::PrimitiveStorage::the().data(handle); }
+        u8 const* data() const { return GC::PrimitiveStorage::the().data(handle); }
+        size_t byte_length() const
+        {
+            return size.visit(
+                [&](DynamicPrimitiveStorageSize) { return GC::PrimitiveStorage::the().size(handle); },
+                [](size_t fixed_size) { return fixed_size; });
+        }
+        size_t capacity() const { return GC::PrimitiveStorage::the().capacity(handle); }
+        size_t offset() const { return GC::PrimitiveStorage::the().offset(handle); }
+
+        GC::PrimitiveStorageHandle handle;
+        Variant<DynamicPrimitiveStorageSize, size_t> size;
         GC::Ref<GC::Cell> owner;
     };
 
+private:
     u8* data()
     {
         return byte_buffer.visit(
             [](Empty) -> u8* { VERIFY_NOT_REACHED(); },
             [](OwnedBackingStore& value) -> u8* { return value.data(); },
             [](UnownedFixedLengthByteBuffer& value) -> u8* { return value.buffer->data(); },
-            [](UnownedExternalBuffer& value) -> u8* { return value.data ? value.data(value.context) : nullptr; });
+            [](ExternalPrimitiveStorage& value) -> u8* { return value.data(); });
     }
     u8 const* data() const { return const_cast<DataBlock*>(this)->data(); }
 
-    Bytes span() { return { data(), size() }; }
-    ReadonlyBytes span() const { return { data(), size() }; }
-    Bytes bytes() { return { data(), size() }; }
-    ReadonlyBytes bytes() const { return { data(), size() }; }
+public:
+    u8* data_at(size_t byte_offset)
+    {
+        return byte_buffer.visit(
+            [](Empty) -> u8* { VERIFY_NOT_REACHED(); },
+            [byte_offset](OwnedBackingStore& value) -> u8* {
+                if (!value.handle().is_valid()) {
+                    VERIFY(byte_offset == 0);
+                    return nullptr;
+                }
+                return GC::PrimitiveStorage::the().data(value.handle(), byte_offset);
+            },
+            [byte_offset](UnownedFixedLengthByteBuffer& value) -> u8* { return value.buffer->data() + byte_offset; },
+            [byte_offset](ExternalPrimitiveStorage& value) -> u8* { return GC::PrimitiveStorage::the().data(value.handle, byte_offset); });
+    }
+    u8 const* data_at(size_t byte_offset) const { return const_cast<DataBlock*>(this)->data_at(byte_offset); }
+
+    size_t contiguous_bytes_from(size_t byte_offset, size_t count) const
+    {
+        if (!is_caged() || count == 0)
+            return count;
+
+        auto data_offset = offset();
+        if (data_offset == GC::PrimitiveStorage::invalid_offset)
+            return count;
+
+        auto caged_offset = GC::PrimitiveStorage::mask_offset(data_offset + byte_offset);
+        return min(count, GC::PrimitiveStorage::default_cage_size - caged_offset);
+    }
+
+    size_t contiguous_bytes_before(size_t byte_offset, size_t count) const
+    {
+        if (!is_caged() || count == 0)
+            return count;
+
+        VERIFY(byte_offset > 0);
+
+        auto data_offset = offset();
+        if (data_offset == GC::PrimitiveStorage::invalid_offset)
+            return count;
+
+        auto caged_offset = GC::PrimitiveStorage::mask_offset(data_offset + byte_offset - 1);
+        return min(count, caged_offset + 1);
+    }
+
+    void copy_to(size_t offset, Bytes destination) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(destination.size() <= size() - offset);
+        size_t copied = 0;
+        while (copied < destination.size()) {
+            auto chunk_size = contiguous_bytes_from(offset + copied, destination.size() - copied);
+            __builtin_memcpy(destination.data() + copied, data_at(offset + copied), chunk_size);
+            copied += chunk_size;
+        }
+    }
+
+    void copy_to(DataBlock& destination, size_t source_offset, size_t destination_offset, size_t count) const
+    {
+        VERIFY(source_offset <= size());
+        VERIFY(count <= size() - source_offset);
+        VERIFY(destination_offset <= destination.size());
+        VERIFY(count <= destination.size() - destination_offset);
+
+        size_t copied = 0;
+        while (copied < count) {
+            auto source_chunk_size = contiguous_bytes_from(source_offset + copied, count - copied);
+            auto destination_chunk_size = destination.contiguous_bytes_from(destination_offset + copied, count - copied);
+            auto chunk_size = min(source_chunk_size, destination_chunk_size);
+            __builtin_memcpy(destination.data_at(destination_offset + copied), data_at(source_offset + copied), chunk_size);
+            copied += chunk_size;
+        }
+    }
+
+    ErrorOr<ByteBuffer> copy_to_byte_buffer(size_t offset, size_t count) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(count <= size() - offset);
+
+        auto destination = TRY(ByteBuffer::create_uninitialized(count));
+        copy_to(offset, destination);
+        return destination;
+    }
+
+    ErrorOr<ByteBuffer> copy_to_byte_buffer() const
+    {
+        return copy_to_byte_buffer(0, size());
+    }
+
+    template<typename Callback>
+    decltype(auto) with_readonly_bytes(size_t offset, size_t count, Callback callback) const
+    {
+        VERIFY(offset <= size());
+        VERIFY(count <= size() - offset);
+
+        if (count == 0)
+            return callback({});
+
+        if (contiguous_bytes_from(offset, count) == count)
+            return callback({ data_at(offset), count });
+
+        auto storage = MUST(copy_to_byte_buffer(offset, count));
+        return callback(storage.bytes());
+    }
+
     void overwrite(size_t offset, void const* source, size_t count)
     {
         VERIFY(offset <= size());
         VERIFY(count <= size() - offset);
-        __builtin_memcpy(data() + offset, source, count);
+        auto const* source_bytes = static_cast<u8 const*>(source);
+        size_t copied = 0;
+        while (copied < count) {
+            auto chunk_size = contiguous_bytes_from(offset + copied, count - copied);
+            __builtin_memcpy(data_at(offset + copied), source_bytes + copied, chunk_size);
+            copied += chunk_size;
+        }
+    }
+
+    void move_data(size_t destination_offset, size_t source_offset, size_t count)
+    {
+        VERIFY(destination_offset <= size());
+        VERIFY(count <= size() - destination_offset);
+        VERIFY(source_offset <= size());
+        VERIFY(count <= size() - source_offset);
+
+        if (count == 0 || destination_offset == source_offset)
+            return;
+
+        if (!is_caged()) {
+            __builtin_memmove(data_at(destination_offset), data_at(source_offset), count);
+            return;
+        }
+
+        if (source_offset < destination_offset && destination_offset < source_offset + count) {
+            size_t remaining = count;
+            while (remaining > 0) {
+                auto source_chunk_size = contiguous_bytes_before(source_offset + remaining, remaining);
+                auto destination_chunk_size = contiguous_bytes_before(destination_offset + remaining, remaining);
+                auto chunk_size = min(source_chunk_size, destination_chunk_size);
+                remaining -= chunk_size;
+                __builtin_memmove(data_at(destination_offset + remaining), data_at(source_offset + remaining), chunk_size);
+            }
+            return;
+        }
+
+        size_t copied = 0;
+        while (copied < count) {
+            auto source_chunk_size = contiguous_bytes_from(source_offset + copied, count - copied);
+            auto destination_chunk_size = contiguous_bytes_from(destination_offset + copied, count - copied);
+            auto chunk_size = min(source_chunk_size, destination_chunk_size);
+            __builtin_memmove(data_at(destination_offset + copied), data_at(source_offset + copied), chunk_size);
+            copied += chunk_size;
+        }
     }
 
     void set_size(size_t new_size, ZeroFillNewBytes zero_fill_new_bytes = ZeroFillNewBytes::No)
@@ -217,7 +382,7 @@ struct DataBlock {
             [&](Empty) { VERIFY_NOT_REACHED(); },
             [&](OwnedBackingStore& value) { value.set_size(new_size, zero_fill_new_bytes); },
             [&](UnownedFixedLengthByteBuffer& value) { value.buffer->set_size(new_size, byte_buffer_zero_fill); },
-            [&](UnownedExternalBuffer&) { VERIFY_NOT_REACHED(); });
+            [&](ExternalPrimitiveStorage&) { VERIFY_NOT_REACHED(); });
     }
 
     ErrorOr<void> try_resize(size_t new_size, ZeroFillNewBytes zero_fill_new_bytes = ZeroFillNewBytes::No)
@@ -229,7 +394,7 @@ struct DataBlock {
             [&](Empty) -> ErrorOr<void> { VERIFY_NOT_REACHED(); },
             [&](OwnedBackingStore& value) { return value.try_resize(new_size, zero_fill_new_bytes); },
             [&](UnownedFixedLengthByteBuffer& value) { return value.buffer->try_resize(new_size, byte_buffer_zero_fill); },
-            [&](UnownedExternalBuffer&) -> ErrorOr<void> { VERIFY_NOT_REACHED(); });
+            [&](ExternalPrimitiveStorage&) -> ErrorOr<void> { VERIFY_NOT_REACHED(); });
     }
 
     ErrorOr<void> try_ensure_capacity(size_t new_capacity)
@@ -238,7 +403,7 @@ struct DataBlock {
             [&](Empty) -> ErrorOr<void> { VERIFY_NOT_REACHED(); },
             [&](OwnedBackingStore& value) { return value.try_ensure_capacity(new_capacity); },
             [&](UnownedFixedLengthByteBuffer& value) { return value.buffer->try_ensure_capacity(new_capacity); },
-            [&](UnownedExternalBuffer&) -> ErrorOr<void> { VERIFY_NOT_REACHED(); });
+            [&](ExternalPrimitiveStorage&) -> ErrorOr<void> { VERIFY_NOT_REACHED(); });
     }
 
     size_t size() const
@@ -247,11 +412,34 @@ struct DataBlock {
             [](Empty) -> size_t { return 0u; },
             [](OwnedBackingStore const& buffer) { return buffer.size(); },
             [](UnownedFixedLengthByteBuffer const& value) { return value.size; },
-            [](UnownedExternalBuffer const& value) {
-                return value.size.visit(
-                    [](size_t size) { return size; },
-                    [&](auto& fn) { return fn ? fn(value.context) : 0zu; });
-            });
+            [](ExternalPrimitiveStorage const& value) { return value.byte_length(); });
+    }
+
+    size_t capacity() const
+    {
+        return byte_buffer.visit(
+            [](Empty) -> size_t { return 0; },
+            [](OwnedBackingStore const& buffer) { return buffer.capacity(); },
+            [](UnownedFixedLengthByteBuffer const& value) { return value.size; },
+            [](ExternalPrimitiveStorage const& value) { return value.capacity(); });
+    }
+
+    size_t offset() const
+    {
+        return byte_buffer.visit(
+            [](Empty) -> size_t { return GC::PrimitiveStorage::invalid_offset; },
+            [](OwnedBackingStore const& buffer) { return buffer.offset(); },
+            [](UnownedFixedLengthByteBuffer const&) { return GC::PrimitiveStorage::invalid_offset; },
+            [](ExternalPrimitiveStorage const& value) { return value.offset(); });
+    }
+
+    bool is_caged() const
+    {
+        return byte_buffer.visit(
+            [](Empty) { return false; },
+            [](OwnedBackingStore const& buffer) { return buffer.handle().is_valid() || buffer.size() == 0; },
+            [](UnownedFixedLengthByteBuffer const&) { return false; },
+            [](ExternalPrimitiveStorage const& value) { return value.handle.is_valid(); });
     }
 
     size_t external_memory_size() const
@@ -260,12 +448,19 @@ struct DataBlock {
             [](Empty) -> size_t { return 0; },
             [](OwnedBackingStore const& buffer) { return buffer.capacity(); },
             [](UnownedFixedLengthByteBuffer const&) -> size_t { return 0; },
-            [](UnownedExternalBuffer const&) -> size_t { return 0; });
+            [](ExternalPrimitiveStorage const&) -> size_t { return 0; });
     }
 
-    bool is_external() const { return byte_buffer.has<UnownedExternalBuffer>(); }
+    bool is_external() const { return byte_buffer.has<ExternalPrimitiveStorage>(); }
 
-    Variant<Empty, OwnedBackingStore, UnownedFixedLengthByteBuffer, UnownedExternalBuffer> byte_buffer;
+    bool shares_storage_with(DataBlock const& other) const
+    {
+        if (byte_buffer.has<Empty>() || other.byte_buffer.has<Empty>())
+            return false;
+        return data() == other.data();
+    }
+
+    Variant<Empty, OwnedBackingStore, UnownedFixedLengthByteBuffer, ExternalPrimitiveStorage> byte_buffer;
     Shared is_shared = { Shared::No };
 };
 
@@ -278,7 +473,6 @@ public:
     static GC::Ref<ArrayBuffer> create(Realm&, ByteBuffer, DataBlock::Shared = DataBlock::Shared::No);
     static GC::Ref<ArrayBuffer> create(Realm&, ByteBuffer*, DataBlock::Shared = DataBlock::Shared::No);
     static GC::Ref<ArrayBuffer> create(Realm&, DataBlock);
-    static GC::Ref<ArrayBuffer> create(Realm&, DataBlock::UnownedExternalBuffer, DataBlock::Shared = DataBlock::Shared::No);
 
     virtual ~ArrayBuffer() override = default;
 
@@ -286,14 +480,21 @@ public:
     virtual size_t external_memory_size() const override { return m_data_block.external_memory_size(); }
 
     // [[ArrayBufferData]]
-    u8* data() { return m_data_block.data(); }
-    u8 const* data() const { return m_data_block.data(); }
-    Bytes span() { return m_data_block.span(); }
-    ReadonlyBytes span() const { return m_data_block.span(); }
-    Bytes bytes() { return m_data_block.bytes(); }
-    ReadonlyBytes bytes() const { return m_data_block.bytes(); }
+    u8* data_at(size_t byte_index) { return m_data_block.data_at(byte_index); }
+    u8 const* data_at(size_t byte_index) const { return m_data_block.data_at(byte_index); }
+    void copy_to(size_t offset, Bytes destination) const { m_data_block.copy_to(offset, destination); }
+    ErrorOr<ByteBuffer> copy_to_byte_buffer(size_t offset, size_t count) const { return m_data_block.copy_to_byte_buffer(offset, count); }
+    ErrorOr<ByteBuffer> copy_to_byte_buffer() const { return m_data_block.copy_to_byte_buffer(); }
+    template<typename Callback>
+    decltype(auto) with_readonly_bytes(size_t offset, size_t count, Callback callback) const { return m_data_block.with_readonly_bytes(offset, count, move(callback)); }
+    void copy_data_to(ArrayBuffer& destination, size_t source_offset, size_t destination_offset, size_t count) const { m_data_block.copy_to(destination.m_data_block, source_offset, destination_offset, count); }
+    void copy_data_to(DataBlock& destination, size_t source_offset, size_t destination_offset, size_t count) const { m_data_block.copy_to(destination, source_offset, destination_offset, count); }
     void overwrite(size_t offset, void const* source, size_t count) { m_data_block.overwrite(offset, source, count); }
+    void move_data(size_t destination_offset, size_t source_offset, size_t count) { m_data_block.move_data(destination_offset, source_offset, count); }
     bool is_external() const { return m_data_block.is_external(); }
+    bool is_caged() const { return m_data_block.is_caged(); }
+    bool shares_storage_with(ArrayBuffer const& other) const { return m_data_block.shares_storage_with(other.m_data_block); }
+    size_t data_offset() const { return m_data_block.offset(); }
 
     // Detaches this ArrayBuffer and returns its underlying DataBlock for use in a TransferArrayBuffer-like operation.
     // If detach fails, the underlying storage is left untouched.
@@ -336,9 +537,9 @@ public:
         return true;
     }
 
-    bool can_cache_typed_array_view_data_pointer() const
+    bool can_cache_typed_array_view_data_offset() const
     {
-        return !is_detached() && is_fixed_length() && m_data_block.byte_buffer.has<DataBlock::OwnedBackingStore>();
+        return !is_detached() && is_fixed_length() && m_data_block.is_caged();
     }
 
     // 25.2.2.2 IsSharedArrayBuffer ( obj ), https://tc39.es/ecma262/#sec-issharedarraybuffer
@@ -371,13 +572,13 @@ public:
 private:
     ArrayBuffer(DataBlock::OwnedBackingStore buffer, DataBlock::Shared, Object& prototype);
     ArrayBuffer(ByteBuffer* buffer, DataBlock::Shared, Object& prototype);
-    ArrayBuffer(DataBlock::UnownedExternalBuffer buffer, DataBlock::Shared, Object& prototype);
 
     virtual bool is_array_buffer() const final { return true; }
 
     virtual void visit_edges(Visitor&) override;
 
     void account_external_memory_change(size_t old_external_memory_size, size_t new_external_memory_size);
+    void invalidate_cached_typed_array_view_offsets();
 
     DataBlock m_data_block;
     Optional<size_t> m_max_byte_length;
@@ -391,7 +592,7 @@ private:
 template<>
 inline bool Object::fast_is<ArrayBuffer>() const { return is_array_buffer(); }
 
-JS_API ThrowCompletionOr<DataBlock> create_byte_data_block(VM& vm, size_t size);
+JS_API ThrowCompletionOr<DataBlock> create_byte_data_block(VM& vm, size_t size, Optional<size_t> capacity = {});
 JS_API void copy_data_block_bytes(Bytes to_block, u64 to_index, ReadonlyBytes from_block, u64 from_index, u64 count);
 ThrowCompletionOr<ArrayBuffer*> allocate_array_buffer(VM&, FunctionObject& constructor, size_t byte_length, Optional<size_t> const& max_byte_length = {});
 ThrowCompletionOr<ArrayBuffer*> array_buffer_copy_and_detach(VM&, ArrayBuffer& array_buffer, Value new_length, PreserveResizability preserve_resizability);
@@ -512,11 +713,10 @@ Value ArrayBuffer::get_value(size_t byte_index, [[maybe_unused]] bool is_typed_a
     VERIFY(!is_detached());
 
     // 2. Assert: There are sufficient bytes in arrayBuffer starting at byteIndex to represent a value of type.
-    VERIFY(m_data_block.bytes().slice(byte_index).size() >= sizeof(T));
+    VERIFY(byte_index <= m_data_block.size());
+    VERIFY(sizeof(T) <= m_data_block.size() - byte_index);
 
     // 3. Let block be arrayBuffer.[[ArrayBufferData]].
-    auto block = m_data_block.bytes();
-
     // 4. Let elementSize be the Element Size value specified in Table 70 for Element Type type.
     auto element_size = sizeof(T);
 
@@ -536,7 +736,7 @@ Value ArrayBuffer::get_value(size_t byte_index, [[maybe_unused]] bool is_typed_a
     // 6. Else,
     else {
         // a. Let rawValue be a List whose elements are bytes from block at indices in the interval from byteIndex (inclusive) to byteIndex + elementSize (exclusive).
-        block.slice(byte_index, element_size).copy_to(raw_value);
+        m_data_block.copy_to(byte_index, raw_value.span());
     }
 
     // 7. Assert: The number of elements in rawValue is elementSize.
@@ -630,16 +830,14 @@ void ArrayBuffer::set_value(size_t byte_index, Value value, [[maybe_unused]] boo
     VERIFY(!is_detached());
 
     // 2. Assert: There are sufficient bytes in arrayBuffer starting at byteIndex to represent a value of type.
-    VERIFY(m_data_block.bytes().slice(byte_index).size() >= sizeof(T));
+    VERIFY(byte_index <= m_data_block.size());
+    VERIFY(sizeof(T) <= m_data_block.size() - byte_index);
 
     // 3. Assert: value is a BigInt if IsBigIntElementType(type) is true; otherwise, value is a Number.
     if constexpr (IsIntegral<T> && sizeof(T) == 8)
         VERIFY(value.is_bigint());
     else
         VERIFY(value.is_number());
-
-    // 4. Let block be arrayBuffer.[[ArrayBufferData]].
-    auto block = m_data_block.span();
 
     // FIXME: 5. Let elementSize be the Element Size value specified in Table 70 for Element Type type.
 
@@ -660,7 +858,7 @@ void ArrayBuffer::set_value(size_t byte_index, Value value, [[maybe_unused]] boo
     // 9. Else,
     else {
         // a. Store the individual bytes of rawBytes into block, starting at block[byteIndex].
-        raw_bytes.span().copy_to(block.slice(byte_index));
+        m_data_block.overwrite(byte_index, raw_bytes.data(), raw_bytes.size());
     }
 
     // 10. Return unused.
@@ -678,9 +876,9 @@ Value ArrayBuffer::get_modify_set_value(size_t byte_index, Value value, ReadWrit
     // FIXME: Check for shared buffer
 
     auto raw_bytes_read = MUST(ByteBuffer::create_uninitialized(sizeof(T)));
-    m_data_block.bytes().slice(byte_index, sizeof(T)).copy_to(raw_bytes_read);
+    m_data_block.copy_to(byte_index, raw_bytes_read);
     auto raw_bytes_modified = operation(raw_bytes_read, raw_bytes);
-    raw_bytes_modified.span().copy_to(m_data_block.span().slice(byte_index));
+    m_data_block.overwrite(byte_index, raw_bytes_modified.data(), raw_bytes_modified.size());
 
     return raw_bytes_to_numeric<T>(vm, raw_bytes_read, is_little_endian);
 }
