@@ -35,13 +35,13 @@ Color srgb_to_color(ColorComponents const& components)
 ColorComponents srgb_to_linear_srgb(ColorComponents const& srgb)
 {
     auto to_linear = [](float c) {
-        float sign = c < 0 ? -1.0f : 1.0f;
-        float absolute = abs(c);
+        double sign = c < 0 ? -1.0 : 1.0;
+        double absolute = abs(c);
 
-        if (absolute <= 0.04045f)
-            return c / 12.92f;
+        if (absolute <= 0.04045)
+            return static_cast<float>(c / 12.92);
 
-        return sign * static_cast<float>(pow((absolute + 0.055f) / 1.055f, 2.4));
+        return static_cast<float>(sign * pow((absolute + 0.055) / 1.055, 2.4));
     };
 
     return { to_linear(srgb[0]), to_linear(srgb[1]), to_linear(srgb[2]), srgb.alpha() };
@@ -224,13 +224,13 @@ ColorComponents lab_to_xyz50(ColorComponents const& lab)
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents linear_srgb_to_xyz65(ColorComponents const& components)
 {
-    float red = components[0];
-    float green = components[1];
-    float blue = components[2];
+    double red = components[0];
+    double green = components[1];
+    double blue = components[2];
     return {
-        0.4123907993f * red + 0.3575843394f * green + 0.1804807884f * blue,
-        0.2126390059f * red + 0.7151686788f * green + 0.0721923154f * blue,
-        0.0193308187f * red + 0.1191947798f * green + 0.9505321522f * blue,
+        static_cast<float>(0.4123907992659595 * red + 0.35758433938387796 * green + 0.1804807884018343 * blue),
+        static_cast<float>(0.2126390058715103 * red + 0.7151686787677559 * green + 0.07219231536073371 * blue),
+        static_cast<float>(0.01933081871559185 * red + 0.11919477979462599 * green + 0.9505321522496606 * blue),
         components.alpha(),
     };
 }
@@ -500,8 +500,8 @@ ColorComponents xyz65_to_linear_display_p3(ColorComponents const& components)
 ColorComponents a98_rgb_to_linear_a98_rgb(ColorComponents const& components)
 {
     auto to_linear = [](float c) {
-        float sign = c < 0.0f ? -1.0f : 1.0f;
-        return sign * static_cast<float>(pow(abs(c), 563.0 / 256.0));
+        double sign = c < 0.0f ? -1.0 : 1.0;
+        return static_cast<float>(sign * pow(abs(c), 563.0 / 256.0));
     };
 
     return { to_linear(components[0]), to_linear(components[1]), to_linear(components[2]), components.alpha() };
@@ -512,8 +512,8 @@ ColorComponents a98_rgb_to_linear_a98_rgb(ColorComponents const& components)
 ColorComponents linear_a98_rgb_to_a98_rgb(ColorComponents const& components)
 {
     auto to_gamma = [](float c) {
-        float sign = c < 0.0f ? -1.0f : 1.0f;
-        return sign * static_cast<float>(pow(abs(c), 256.0 / 563.0));
+        double sign = c < 0.0f ? -1.0 : 1.0;
+        return static_cast<float>(sign * pow(abs(c), 256.0 / 563.0));
     };
 
     return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };
@@ -523,13 +523,13 @@ ColorComponents linear_a98_rgb_to_a98_rgb(ColorComponents const& components)
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents linear_a98_rgb_to_xyz65(ColorComponents const& components)
 {
-    float red = components[0];
-    float green = components[1];
-    float blue = components[2];
+    double red = components[0];
+    double green = components[1];
+    double blue = components[2];
     return {
-        0.57666904f * red + 0.18555824f * green + 0.18822865f * blue,
-        0.29734498f * red + 0.62736357f * green + 0.07529146f * blue,
-        0.02703136f * red + 0.07068885f * green + 0.99133754f * blue,
+        static_cast<float>((573536.0 / 994567.0) * red + (263643.0 / 1420810.0) * green + (187206.0 / 994567.0) * blue),
+        static_cast<float>((591459.0 / 1989134.0) * red + (6239551.0 / 9945670.0) * green + (374412.0 / 4972835.0) * blue),
+        static_cast<float>((53769.0 / 1989134.0) * red + (351524.0 / 4972835.0) * green + (4929758.0 / 4972835.0) * blue),
         components.alpha(),
     };
 }
@@ -538,13 +538,13 @@ ColorComponents linear_a98_rgb_to_xyz65(ColorComponents const& components)
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents xyz65_to_linear_a98_rgb(ColorComponents const& components)
 {
-    float x = components[0];
-    float y = components[1];
-    float z = components[2];
+    double x = components[0];
+    double y = components[1];
+    double z = components[2];
     return {
-        +2.0415879038f * x - 0.5650069743f * y - 0.3473784579f * z,
-        -0.9692436363f * x + 1.8759675015f * y + 0.0415550574f * z,
-        +0.0134442806f * x - 0.1183623922f * y + 1.0151749944f * z,
+        static_cast<float>((1829569.0 / 896150.0) * x + (-506331.0 / 896150.0) * y + (-308931.0 / 896150.0) * z),
+        static_cast<float>((-851781.0 / 878810.0) * x + (1648619.0 / 878810.0) * y + (36519.0 / 878810.0) * z),
+        static_cast<float>((16779.0 / 1248040.0) * x + (-147721.0 / 1248040.0) * y + (1266979.0 / 1248040.0) * z),
         components.alpha(),
     };
 }
@@ -610,28 +610,42 @@ ColorComponents xyz50_to_linear_prophoto_rgb(ColorComponents const& components)
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-rec2020
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents rec2020_to_linear_rec2020(ColorComponents const& components)
 {
     auto to_linear = [](float c) -> float {
+        // AD-HOC: CSS Color 4 specifies a pure 2.4 gamma transfer function for rec2020, but all major engines
+        //         and the WPT rec2020 reftests use the piecewise OETF from ITU-R BT.2020-2, so we do the same.
+        constexpr auto alpha = 1.09929682680944;
+        constexpr auto beta = 0.018053968510807;
+
         float sign = c < 0.0f ? -1.0f : 1.0f;
         float absolute = abs(c);
 
-        return sign * static_cast<float>(pow(absolute, 2.4));
+        if (absolute < beta * 4.5)
+            return c / 4.5f;
+
+        return sign * static_cast<float>(pow((absolute + alpha - 1) / alpha, 1 / 0.45));
     };
 
     return { to_linear(components[0]), to_linear(components[1]), to_linear(components[2]), components.alpha() };
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-rec2020
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents linear_rec2020_to_rec2020(ColorComponents const& components)
 {
     auto to_gamma = [](float c) -> float {
+        // AD-HOC: CSS Color 4 specifies a pure 2.4 gamma transfer function for rec2020, but all major engines
+        //         and the WPT rec2020 reftests use the piecewise OETF from ITU-R BT.2020-2, so we do the same.
+        constexpr auto alpha = 1.09929682680944;
+        constexpr auto beta = 0.018053968510807;
+
         float sign = c < 0.0f ? -1.0f : 1.0f;
         float absolute = abs(c);
 
-        return sign * static_cast<float>(pow(absolute, 1.0 / 2.4));
+        if (absolute < beta)
+            return 4.5f * c;
+
+        return sign * static_cast<float>(alpha * pow(absolute, 0.45) - (alpha - 1));
     };
 
     return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };

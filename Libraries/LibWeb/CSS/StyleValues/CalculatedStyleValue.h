@@ -11,6 +11,7 @@
 
 #include <AK/Function.h>
 #include <LibWeb/CSS/Angle.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Flex.h>
 #include <LibWeb/CSS/Frequency.h>
 #include <LibWeb/CSS/Length.h>
@@ -108,6 +109,8 @@ public:
     Optional<double> resolve_number(CalculationResolutionContext const&) const;
     Optional<i32> resolve_integer(CalculationResolutionContext const&) const;
 
+    RefPtr<StyleValue const> resolve_as_style_value(CalculationResolutionContext const&) const;
+
     bool resolves_to_dimension() const { return m_resolved_type.matches_dimension(); }
 
     bool contains_percentage() const;
@@ -145,6 +148,7 @@ private:
 
 #define ENUMERATE_CALCULATION_NODE_TYPES(X) \
     X(Numeric)                              \
+    X(ChannelKeyword)                       \
     X(Min)                                  \
     X(Max)                                  \
     X(Clamp)                                \
@@ -295,6 +299,28 @@ public:
 private:
     NumericCalculationNode(NumericValue, NumericType);
     NumericValue m_value;
+};
+
+// https://drafts.csswg.org/css-color-5/#relative-color
+class ChannelKeywordCalculationNode final : public CalculationNode {
+public:
+    static NonnullRefPtr<ChannelKeywordCalculationNode const> create(ChannelKeyword, CalculationContext const&);
+    ~ChannelKeywordCalculationNode();
+
+    ChannelKeyword channel() const { return m_channel; }
+
+    virtual bool contains_percentage() const override { return false; }
+    virtual NonnullRefPtr<CalculationNode const> with_simplified_children(CalculationContext const&, CalculationResolutionContext const&) const override { return *this; }
+
+    virtual Vector<NonnullRefPtr<CalculationNode const>> children() const override { return {}; }
+
+    virtual void dump(StringBuilder&, int indent) const override;
+    virtual bool equals(CalculationNode const&) const override;
+    virtual bool is_computationally_independent() const override { return true; }
+
+private:
+    ChannelKeywordCalculationNode(ChannelKeyword);
+    ChannelKeyword m_channel;
 };
 
 class SumCalculationNode final : public CalculationNode {
