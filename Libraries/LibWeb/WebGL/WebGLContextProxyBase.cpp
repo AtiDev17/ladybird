@@ -9,6 +9,7 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
+#include <LibIPC/Limits.h>
 #include <LibWeb/WebGL/WebGLContextProxy.h>
 #include <LibWeb/WebGL/WebGLContextProxyBase.h>
 
@@ -45,12 +46,29 @@ void WebGLContextProxyBase::flush_commands()
     m_pending_bitmaps.clear_with_capacity();
 }
 
+u32 WebGLContextProxyBase::append_pending_bitmap(Gfx::DecodedImageFrame frame)
+{
+    static_assert(IPC::MAX_MESSAGE_FD_COUNT > 1);
+    // WebGL command bytes are transferred in one anonymous buffer attachment.
+    static constexpr size_t max_bitmap_attachments_per_message = IPC::MAX_MESSAGE_FD_COUNT - 1;
+
+    if (m_pending_bitmaps.size() >= max_bitmap_attachments_per_message)
+        flush_commands();
+
+    auto bitmap_index = static_cast<u32>(m_pending_bitmaps.size());
+    m_pending_bitmaps.append(move(frame));
+    return bitmap_index;
+}
+
 ByteBuffer WebGLContextProxyBase::send_sync_call(ByteBuffer request)
 {
     if (m_lost)
         return {};
     flush_commands();
-    return m_transport->sync_call(move(request));
+    auto reply = m_transport->sync_call(move(request));
+    if (reply.is_empty())
+        set_lost();
+    return reply;
 }
 
 ReadPixelsResult WebGLContextProxyBase::read_pixels_robust_angle_into_shared_buffer(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, Core::AnonymousBuffer const& pixels)
@@ -98,8 +116,7 @@ void WebGLContextProxyBase::tex_image2d_from_bitmap(GLenum target, GLint level, 
 {
     if (m_lost)
         return;
-    auto bitmap_index = static_cast<u32>(m_pending_bitmaps.size());
-    m_pending_bitmaps.append(move(frame));
+    auto bitmap_index = append_pending_bitmap(move(frame));
     auto has_explicit_destination_size = destination_size.has_value();
     record(Commands::TexImage2DFromBitmap {
         .target = target,
@@ -120,14 +137,59 @@ void WebGLContextProxyBase::tex_sub_image2d_from_bitmap(GLenum target, GLint lev
 {
     if (m_lost)
         return;
-    auto bitmap_index = static_cast<u32>(m_pending_bitmaps.size());
-    m_pending_bitmaps.append(move(frame));
+    auto bitmap_index = append_pending_bitmap(move(frame));
     auto has_explicit_destination_size = destination_size.has_value();
     record(Commands::TexSubImage2DFromBitmap {
         .target = target,
         .level = level,
         .xoffset = xoffset,
         .yoffset = yoffset,
+        .format = format,
+        .type = type,
+        .bitmap_index = bitmap_index,
+        .has_explicit_destination_size = has_explicit_destination_size,
+        .destination_width = has_explicit_destination_size ? destination_size->width() : 0,
+        .destination_height = has_explicit_destination_size ? destination_size->height() : 0,
+        .flip_y = flip_y,
+        .premultiply_alpha = premultiply_alpha,
+    });
+}
+
+void WebGLContextProxyBase::tex_image3d_from_bitmap(GLenum target, GLint level, GLint internalformat, GLsizei depth, GLenum format, GLenum type, Gfx::DecodedImageFrame frame, Optional<Gfx::IntSize> destination_size, bool flip_y, bool premultiply_alpha)
+{
+    if (m_lost)
+        return;
+    auto bitmap_index = append_pending_bitmap(move(frame));
+    auto has_explicit_destination_size = destination_size.has_value();
+    record(Commands::TexImage3DFromBitmap {
+        .target = target,
+        .level = level,
+        .internalformat = internalformat,
+        .depth = depth,
+        .format = format,
+        .type = type,
+        .bitmap_index = bitmap_index,
+        .has_explicit_destination_size = has_explicit_destination_size,
+        .destination_width = has_explicit_destination_size ? destination_size->width() : 0,
+        .destination_height = has_explicit_destination_size ? destination_size->height() : 0,
+        .flip_y = flip_y,
+        .premultiply_alpha = premultiply_alpha,
+    });
+}
+
+void WebGLContextProxyBase::tex_sub_image3d_from_bitmap(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei depth, GLenum format, GLenum type, Gfx::DecodedImageFrame frame, Optional<Gfx::IntSize> destination_size, bool flip_y, bool premultiply_alpha)
+{
+    if (m_lost)
+        return;
+    auto bitmap_index = append_pending_bitmap(move(frame));
+    auto has_explicit_destination_size = destination_size.has_value();
+    record(Commands::TexSubImage3DFromBitmap {
+        .target = target,
+        .level = level,
+        .xoffset = xoffset,
+        .yoffset = yoffset,
+        .zoffset = zoffset,
+        .depth = depth,
         .format = format,
         .type = type,
         .bitmap_index = bitmap_index,

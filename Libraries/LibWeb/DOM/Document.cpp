@@ -105,6 +105,7 @@
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOM/TreeWalker.h>
@@ -762,6 +763,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_potentially_named_elements);
     m_anchor_name_map.visit_edges(visitor);
+    if (m_query_selector_result_cache)
+        m_query_selector_result_cache->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -3546,6 +3549,11 @@ void Document::adopt_node(Node& node)
             old_document.m_node_iterators.remove(&node_iterator);
             m_node_iterators.set(&node_iterator);
         }
+
+        // AD-HOC: A parentless node leaves oldDocument without any mutation observable through oldDocument's
+        //         dom_tree_version. Bump it so that caches keyed on that version can't serve stale results for this
+        //         node if it is later adopted back after being mutated under another document.
+        old_document.bump_dom_tree_version();
     }
 }
 
@@ -9523,7 +9531,7 @@ static bool contains_named_namespace(CSS::SelectorList const& selectors)
     return false;
 }
 
-Optional<CSS::SelectorList> const& Document::parse_or_cache_selector_list(StringView selector_text) const
+RefPtr<SelectorQuery const> Document::selector_query_for(StringView selector_text) const
 {
     static constexpr size_t MAX_SELECTOR_QUERY_CACHE_SIZE = 512;
 
@@ -9538,13 +9546,22 @@ Optional<CSS::SelectorList> const& Document::parse_or_cache_selector_list(String
     if (maybe_selectors.has_value() && contains_named_namespace(maybe_selectors.value()))
         maybe_selectors.clear();
 
+    RefPtr<SelectorQuery const> query;
+    if (maybe_selectors.has_value())
+        query = SelectorQuery::create(maybe_selectors.release_value());
+
     if (m_selector_query_cache.size() >= MAX_SELECTOR_QUERY_CACHE_SIZE)
         m_selector_query_cache.remove(m_selector_query_cache.begin());
 
-    m_selector_query_cache.set(selector_text_string, move(maybe_selectors));
-    auto it = m_selector_query_cache.find(selector_text_string);
-    VERIFY(it != m_selector_query_cache.end());
-    return it->value;
+    m_selector_query_cache.set(selector_text_string, query);
+    return query;
+}
+
+QuerySelectorResultCache& Document::query_selector_result_cache()
+{
+    if (!m_query_selector_result_cache)
+        m_query_selector_result_cache = make<QuerySelectorResultCache>();
+    return *m_query_selector_result_cache;
 }
 
 }
