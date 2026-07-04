@@ -551,6 +551,21 @@ void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& ds
         return;
     append_command(DrawScaledDecodedImageFrame {
         .dst_rect = dst_rect,
+        .src_rect = {},
+        .frame_id = resource_storage().add_image_frame(frame),
+        .scaling_mode = scaling_mode,
+    });
+}
+
+void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& dst_rect, Gfx::FloatRect const& src_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode)
+{
+    if (dst_rect.is_empty())
+        return;
+    if (src_rect.is_empty())
+        return;
+    append_command(DrawScaledDecodedImageFrame {
+        .dst_rect = dst_rect,
+        .src_rect = src_rect,
         .frame_id = resource_storage().add_image_frame(frame),
         .scaling_mode = scaling_mode,
     });
@@ -579,6 +594,23 @@ void DisplayListRecorder::draw_repeated_display_list(Gfx::IntRect dst_rect, Gfx:
         .display_list_id = resource_storage().add_display_list(display_list.display_list, display_list.visual_context_tree),
         .scaling_mode = scaling_mode,
         .repeat = { repeat_x, repeat_y },
+    });
+}
+
+void DisplayListRecorder::draw_tiled_decoded_image_frame(DrawTiledDecodedImageFrameParams const& params)
+{
+    if (params.tile_rect.is_empty() || params.clip_rect.is_empty() || params.src_rect.is_empty())
+        return;
+
+    append_command(DrawTiledDecodedImageFrame {
+        .tile_rect = params.tile_rect,
+        .clip_rect = params.clip_rect,
+        .src_rect = params.src_rect,
+        .tile_step = params.tile_step,
+        .frame_id = resource_storage().add_image_frame(params.frame),
+        .scaling_mode = params.scaling_mode,
+        .tile_count_x = params.tile_count_x,
+        .tile_count_y = params.tile_count_y,
     });
 }
 
