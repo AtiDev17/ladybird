@@ -8,6 +8,21 @@
 
 namespace Web::Painting {
 
+static StringView scaling_mode_name(Gfx::ScalingMode scaling_mode)
+{
+    switch (scaling_mode) {
+    case Gfx::ScalingMode::None:
+        return "None"sv;
+    case Gfx::ScalingMode::Bilinear:
+        return "Bilinear"sv;
+    case Gfx::ScalingMode::BilinearMipmap:
+        return "BilinearMipmap"sv;
+    case Gfx::ScalingMode::NearestNeighbor:
+        return "NearestNeighbor"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 Gfx::IntRect PaintOuterBoxShadow::bounding_rect() const
 {
     auto rect = shadow_rect;
@@ -38,6 +53,11 @@ void DrawScaledDecodedImageFrame::dump(StringBuilder& builder) const
 void DrawRepeatedDecodedImageFrame::dump(StringBuilder& builder) const
 {
     builder.appendff(" dst_rect={} clip_rect={}", dst_rect, clip_rect);
+}
+
+void DrawRepeatedDisplayList::dump(StringBuilder& builder) const
+{
+    builder.appendff(" dst_rect={} clip_rect={} scaling_mode={}", dst_rect, clip_rect, scaling_mode_name(scaling_mode));
 }
 
 void DrawCompositedContext::dump(StringBuilder& builder) const
