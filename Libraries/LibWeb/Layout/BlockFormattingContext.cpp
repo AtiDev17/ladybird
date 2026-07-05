@@ -89,12 +89,9 @@ static bool margins_collapse_through(Box const& box, LayoutState& state)
     if (FormattingContext::creates_block_formatting_context(box))
         return false;
 
-    // https://drafts.csswg.org/css-flexbox-1/#flex-containers
-    // [..] the flex container’s margins do not collapse with the margins of its contents.
-    // https://drafts.csswg.org/css-grid-2/#grid-containers
-    // [..] the grid container’s margins do not collapse with the margins of its contents.
-    auto display = box.display();
-    if (display.is_flex_inside() || display.is_grid_inside())
+    // https://drafts.csswg.org/css-display-3/#independent-formatting-context
+    // NOTE: [..] margins do not collapse across formatting context boundaries.
+    if (FormattingContext::formatting_context_type_created_by_box(box).has_value())
         return false;
 
     // NB: This should take care of the height and min-height constraints.
@@ -681,14 +678,15 @@ void BlockFormattingContext::compute_width_for_block_level_replaced_element_in_n
     auto const padding_right = computed_values.padding().right().to_px_or_zero(width_of_containing_block);
 
     auto& box_state = m_state.get_mutable(box);
-    auto width = compute_width_for_replaced_element(box, available_space, containing_block_constraints);
     box_state.margin_left = margin_left;
     box_state.margin_right = margin_right;
     box_state.border_left = computed_values.border_left().width;
     box_state.border_right = computed_values.border_right().width;
     box_state.padding_left = padding_left;
     box_state.padding_right = padding_right;
-    box_state.set_content_width(calculate_inner_width(box, available_space.width, CSS::Size::make_px(width), containing_block_constraints));
+
+    auto width = compute_width_for_replaced_element(box, available_space, containing_block_constraints);
+    box_state.set_content_width(width);
 }
 
 void BlockFormattingContext::resolve_used_height_if_not_treated_as_auto(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
@@ -1093,27 +1091,17 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
         // For boxes with auto height but non-auto min-height, we need to determine if the content height is less than
         // min-height. If so, we run layout with min-height as the available height.
+        Optional<CSSPixels> measured_content_height;
         if (should_treat_height_as_auto(box, available_space, layout_input.containing_block_constraints) && !box.computed_values().min_height().is_auto()) {
-            LayoutState throwaway_state(box);
-            // Populate ancestor state: the throwaway BFC may encounter abspos
-            // elements whose containing block is an ancestor above `box`, even if
-            // it is not in `box`'s containing block chain.
-            for (auto* ancestor = box.parent(); ancestor; ancestor = ancestor->parent()) {
-                auto* ancestor_box = as_if<Box>(*ancestor);
-                if (!ancestor_box || !m_state.try_get(*ancestor_box))
-                    continue;
-                throwaway_state.populate_node_from(m_state, *ancestor_box);
-            }
-
-            throwaway_state.create(box, layout_input.containing_block_constraints.percentage_basis_width, layout_input.containing_block_constraints.percentage_basis_height);
-            auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box);
-            measuring_context->run(layout_input.with_available_space(inner_available_space));
-            auto content_height = measuring_context->automatic_content_height();
+            auto content_height = measure_automatic_content_height(box, inner_available_space, layout_input.containing_block_constraints);
+            measured_content_height = content_height;
             auto min_height = calculate_inner_height(box, available_space, box.computed_values().min_height(), layout_input.containing_block_constraints);
             if (content_height < min_height) {
                 inner_available_space.height = AvailableSize::make_definite(min_height);
             }
         }
+
+        make_button_content_box_definite(box, available_space, layout_input.containing_block_constraints, measured_content_height);
 
         independent_formatting_context->run(layout_input.with_available_space(inner_available_space));
         if (is<TableWrapper>(block_container) && box.display().is_table_inside()) {
