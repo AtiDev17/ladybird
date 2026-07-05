@@ -44,6 +44,7 @@
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/BookmarkStore.h>
+#include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/PageInfo.h>
@@ -93,23 +94,6 @@ public:
     void load_navigation_error_page(StringView);
 
     void reload();
-    enum class HistoryTraversalStatus : u8 {
-        Started,
-        NoEntry,
-        Canceled,
-    };
-    // NB: The HTML Standard spells this algorithm argument "checkForCancelation".
-    enum class CheckForCancelation : u8 {
-        Yes,
-        No,
-        IfWebContentCannotTraverseTarget,
-    };
-    struct HistoryTraversalOutcome {
-        HistoryTraversalStatus status { HistoryTraversalStatus::NoEntry };
-        bool will_replace_web_content_process { false };
-        bool will_change_top_level_entry { false };
-        bool waiting_for_cancelation_check { false };
-    };
     struct SessionHistoryTraversalMenuItem {
         int delta { 0 };
         String title;
@@ -240,11 +224,21 @@ public:
 
     // Used by platform input methods to drive marked/preedit-text composition, and to query the on-screen caret
     // position for placing IME overlays.
+    struct InputMethodState {
+        bool is_enabled { false };
+        i32 cursor_position { 0 };
+        i32 anchor_position { 0 };
+        Utf16String text_before_cursor;
+        Utf16String text_after_cursor;
+        Optional<Web::DevicePixelRect> caret_rect;
+    };
+
     void set_marked_text_from_input_method(Utf16String const& text);
-    void commit_text_from_input_method(Utf16String const& text);
+    void commit_text_from_input_method(Utf16String const& text, i32 replacement_start = 0, i32 replacement_length = 0);
     void unmark_text_from_input_method();
     Optional<Web::DevicePixelRect> get_input_caret_rect();
-    void set_input_caret_rect(Badge<WebContentClient>, Optional<Web::DevicePixelRect>);
+    InputMethodState const& input_method_state() const { return m_input_method_state; }
+    void set_input_method_state(Badge<WebContentClient>, InputMethodState);
 
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
@@ -404,21 +398,18 @@ protected:
     void complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     void complete_webdriver_pending_navigation_if_url_matches(URL::URL const&);
     void update_navigation_action_state();
-    TraversableSessionHistory::UpdateResult update_session_history_from_web_content(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index, bool pending_step_after_fallback_load_was_restored, bool seed_web_content_on_invalid_snapshot);
-    bool adopt_web_content_session_history_after_rejected_seed(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index);
+    void apply_web_content_session_history_update(WebContentSessionHistoryUpdateResult const&);
     enum class SessionHistoryDumpMode {
         IfDebuggingEnabled,
         Always,
     };
     void dump_session_history(StringView reason, SessionHistoryDumpMode = SessionHistoryDumpMode::IfDebuggingEnabled) const;
     bool restore_pending_session_history_navigation(StringView reason);
-    void abandon_pending_web_content_session_history_seed();
     enum class AllowCurrentEntryReconstruction : u8 {
         No,
         Yes,
     };
     void seed_web_content_session_history_from_ui_process(AllowCurrentEntryReconstruction = AllowCurrentEntryReconstruction::No);
-    void prepare_to_seed_web_content_session_history_from_ui_process();
     void restore_current_session_history_entry_from_ui_process();
     void load_current_session_history_entry_from_ui_process();
     void load_session_history_traversal_target_from_ui_process(TraversableSessionHistory::TraversalTarget const&, StringView dump_reason);
@@ -541,61 +532,12 @@ protected:
     RefPtr<Core::Promise<LexicalPath>> m_pending_screenshot;
     RefPtr<Core::Promise<String>> m_pending_info_request;
 
-    Web::HTML::VisibilityState m_system_visibility_state { Web::HTML::VisibilityState::Hidden };
-
     Web::HTML::AudioPlayState m_audio_play_state { Web::HTML::AudioPlayState::Paused };
     size_t m_number_of_elements_playing_audio { 0 };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
-    struct PendingSessionHistoryNavigation {
-        enum class WebContentRestoreMode : u8 {
-            PreserveCurrentProcessState,
-            RestoreFromUIProcess,
-        };
-
-        URL::URL url;
-        TraversableSessionHistory previous_session_history;
-        WebContentRestoreMode web_content_restore_mode { WebContentRestoreMode::PreserveCurrentProcessState };
-    };
-    static StringView pending_session_history_navigation_web_content_restore_mode_to_string(PendingSessionHistoryNavigation::WebContentRestoreMode);
-
-    struct PendingWebContentSessionHistorySeed {
-        bool should_send_entries { false };
-        bool ignore_updates_until_seed { false };
-        bool waiting_for_ack { false };
-        bool should_reseed_after_current_history_load { false };
-        Optional<i32> step_after_loading_top_level_entry;
-
-        void clear() { *this = {}; }
-    };
-
-    struct PendingSessionHistoryTraversal {
-        enum class Stage : u8 {
-            ApplyingInWebContent,
-            CheckingCancelation,
-            LoadingEntryFromUIProcess,
-            ReplacingWebContentProcess,
-            RestoringNestedStepAfterSeed,
-        };
-
-        i32 target_step { 0 };
-        size_t target_step_index { 0 };
-        u64 cancelation_check_request_id { 0 };
-        bool will_change_top_level_entry { false };
-        bool will_replace_web_content_process { false };
-        Stage stage { Stage::ApplyingInWebContent };
-        Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete;
-    };
-    static StringView pending_session_history_traversal_stage_to_string(PendingSessionHistoryTraversal::Stage);
-
-    TraversableSessionHistory m_session_history;
-    bool m_current_web_content_session_history_matches_mirror { false };
-    Optional<PendingSessionHistoryNavigation> m_pending_session_history_navigation;
-    Optional<PendingSessionHistoryTraversal> m_pending_session_history_traversal;
-    u64 m_next_traverse_history_step_cancelation_check_request_id { 0 };
-    Optional<URL::URL> m_session_history_entry_url_loading_from_ui_process;
-    PendingWebContentSessionHistorySeed m_pending_web_content_session_history_seed;
+    CanonicalTraversable m_top_level_traversable;
     Optional<URL::URL> m_webdriver_pending_navigation_url;
     bool m_webdriver_pending_navigation_completes_with_session_history_update { false };
     RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;
@@ -608,8 +550,8 @@ protected:
     u64 m_next_webdriver_navigation_completion_request_id { 0 };
     HashMap<u64, OwnPtr<WebDriverNavigationCompletionRequest>> m_pending_webdriver_navigation_completion_requests;
 
-    // Most recent caret position pushed by WebContent, Used for placing platform IME overlays without a sync IPC.
-    Optional<Web::DevicePixelRect> m_input_caret_rect;
+    // Most recent input-method state pushed by WebContent. Used for platform IME callbacks without a sync IPC.
+    InputMethodState m_input_method_state;
 
     Web::ViewportIsFullscreen m_is_fullscreen { Web::ViewportIsFullscreen::No };
 
