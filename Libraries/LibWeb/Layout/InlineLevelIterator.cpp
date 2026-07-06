@@ -114,7 +114,9 @@ void InlineLevelIterator::exit_node_with_box_model_metrics()
 Layout::Node const* InlineLevelIterator::next_inline_node_in_pre_order(Layout::Node const& current, Layout::Node const* stay_within)
 {
     if (current.first_child()
-        && (current.first_child()->display().is_inline_outside() || is_inline_flow_interrupting_block(*current.first_child()))
+        && (current.first_child()->display().is_inline_outside()
+            || is_inline_flow_interrupting_block(*current.first_child())
+            || current.first_child()->is_out_of_flow(m_inline_formatting_context))
         && current.display().is_flow_inside()
         && !is_inline_flow_interrupting_block(current)
         && !current.is_replaced_box()) {
@@ -376,10 +378,13 @@ Optional<InlineLevelIterator::Item> InlineLevelIterator::generate_next_item()
 
     if (m_current_node->is_absolutely_positioned()) {
         auto const& node = *m_current_node;
+        auto has_unattached_inline_start_edges = m_extra_leading_metrics.has_value()
+            && (m_extra_leading_metrics->margin != 0 || m_extra_leading_metrics->border != 0 || m_extra_leading_metrics->padding != 0);
         skip_to_next();
         return Item {
             .type = Item::Type::AbsolutelyPositionedElement,
             .node = &node,
+            .preceded_by_unattached_inline_start_edges = has_unattached_inline_start_edges,
         };
     }
 

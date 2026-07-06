@@ -13,6 +13,7 @@
 #include <AK/SourceLocation.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/WeakPtr.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/SharedImage.h>
@@ -38,7 +39,7 @@
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/Forward.h>
-#include <LibWebView/SiteIsolationManager.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentServerEndpoint.h>
 
@@ -53,8 +54,6 @@ class WEBVIEW_API WebContentClient final
 
 public:
     using InitTransport = Messages::WebContentServer::InitTransport;
-    using ChildFrameOwner = SiteIsolationManager::ChildFrameOwner;
-    using ChildFrameHost = SiteIsolationManager::ChildFrameHost;
 
     template<CallableAs<IterationDecision, WebContentClient&> Callback>
     static void for_each_client(Callback callback);
@@ -62,20 +61,29 @@ public:
     static size_t client_count() { return clients().size(); }
     static Optional<WebContentClient&> client_for_compositor_context_id(Web::Compositor::CompositorContextId);
 
-    WebContentClient(NonnullOwnPtr<IPC::Transport>, u64 initial_page_id);
+    WebContentClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, u64 initial_page_id);
     ~WebContentClient();
 
+    IsPrivate is_private() const { return m_is_private; }
+
     void assign_view(Badge<Application>, ViewImplementation&);
-    void set_compositor_connection_id(Badge<Application>, i32);
-    Optional<i32> compositor_connection_id(Badge<Application>) const { return m_compositor_connection_id; }
     void register_view(u64 page_id, ViewImplementation&);
     void unregister_view(u64 page_id);
+
+    void set_compositor_connection_id(Badge<Application>, i32);
+    Optional<i32> compositor_connection_id(Badge<Application>) const { return m_compositor_connection_id; }
+
     void prepare_for_detached_close(u64 page_id);
     void request_close(u64 page_id);
 
     void web_ui_disconnected(Badge<WebUI>);
-    void register_embedded_page(u64 page_id);
+    void register_embedded_page(u64 page_id, CanonicalNavigable&);
     void unregister_embedded_page(u64 page_id);
+
+    CanonicalNavigable* embedded_page_host(u64 page_id);
+    CanonicalNavigable* navigable_for_page(u64 page_id);
+
+    Optional<CanonicalNavigable&> child_frame(u64 page_id, StringView frame_id);
 
     bool has_views() const { return !m_views.is_empty(); }
 
@@ -93,10 +101,6 @@ public:
     void notify_presented_bitmap_ready_to_paint(u64 page_id, i32 bitmap_id);
     void did_present_backing_stores(u64 page_id, i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store);
     void did_present_bitmap(u64 page_id, Gfx::IntRect, i32 bitmap_id);
-    Optional<ChildFrameHost const&> child_frame(u64 page_id, StringView frame_id) const;
-
-    template<CallableAs<IterationDecision, String const&, ChildFrameHost const&> Callback>
-    void for_each_child_frame(u64 page_id, Callback callback) const;
 
     pid_t pid() const { return m_process_handle.pid; }
     void set_pid(pid_t pid) { m_process_handle.pid = pid; }
@@ -256,8 +260,10 @@ private:
     void forget_renderer_owned_download(u64 download_id);
     void fail_renderer_owned_downloads();
 
+    IsPrivate m_is_private { IsPrivate::No };
+
     HashMap<u64, NonnullRawPtr<ViewImplementation>> m_views;
-    HashTable<u64> m_embedded_pages;
+    HashMap<u64, WeakPtr<CanonicalNavigable>> m_embedded_pages;
     HashTable<u64> m_detached_pages_pending_close;
     HashMap<Web::Compositor::CompositorContextId, Optional<u64>> m_compositor_contexts;
     HashMap<u64, u64> m_renderer_owned_downloads;
@@ -280,12 +286,6 @@ void WebContentClient::for_each_client(Callback callback)
         if (callback(*it) == IterationDecision::Break)
             return;
     }
-}
-
-template<CallableAs<IterationDecision, String const&, WebContentClient::ChildFrameHost const&> Callback>
-void WebContentClient::for_each_child_frame(u64 page_id, Callback callback) const
-{
-    SiteIsolationManager::the().for_each_child_frame(page_id, move(callback));
 }
 
 }

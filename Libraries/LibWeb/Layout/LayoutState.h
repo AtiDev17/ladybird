@@ -216,6 +216,13 @@ struct LayoutState {
 
         Vector<LineBox> line_boxes;
 
+        // Baselines of this box's in-flow content, relative to the box's content-box top edge.
+        // Populated eagerly by the formatting context that lays out this box's children.
+        // An empty Optional means the box has no baseline set (https://drafts.csswg.org/css-align-3/#baseline-export);
+        // consumers synthesize a baseline from the margin box instead.
+        Optional<CSSPixels> first_baseline;
+        Optional<CSSPixels> last_baseline;
+
         CSSPixels margin_box_left() const { return margin_left + border_left_collapsed() + padding_left; }
         CSSPixels margin_box_right() const { return margin_right + border_right_collapsed() + padding_right; }
         CSSPixels margin_box_top() const { return margin_top + border_top_collapsed() + padding_top; }
@@ -236,13 +243,6 @@ struct LayoutState {
         CSSPixels padding_box_height() const { return padding_top + content_height() + padding_bottom; }
 
         Optional<LineBoxFragmentCoordinate> containing_line_box_fragment;
-
-        void set_inline_end_static_position_rect(StaticPositionRect const& static_position_rect) { ensure_rare_data().inline_end_static_position_rect = static_position_rect; }
-        Optional<StaticPositionRect> const& inline_end_static_position_rect() const
-        {
-            static Optional<StaticPositionRect> const empty;
-            return m_rare ? m_rare->inline_end_static_position_rect : empty;
-        }
 
         void add_floating_descendant(Box const& box) { ensure_rare_data().floating_descendants.set(&box); }
         HashTable<Box const*> const& floating_descendants() const
@@ -369,7 +369,6 @@ struct LayoutState {
             Optional<Painting::Paintable::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
             Optional<StaticPositionRect> static_position_rect;
-            Optional<StaticPositionRect> inline_end_static_position_rect;
         };
 
         RareData& ensure_rare_data()

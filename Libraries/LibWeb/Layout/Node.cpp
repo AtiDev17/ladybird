@@ -717,7 +717,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_font_list(computed_style.computed_font_list(document().font_computer()));
     computed_values.set_font_size(computed_style.font_size());
     computed_values.set_font_weight(computed_style.font_weight());
-    computed_values.set_line_height(computed_style.line_height());
+    computed_values.set_line_height(computed_style.line_height(document().font_computer()));
     computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     // NOTE: color must be set after color-scheme to ensure currentColor can be resolved in other properties (e.g. background-color).
@@ -1562,7 +1562,9 @@ bool Node::has_layout_containment() const
         return false;
 
     // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Implement this.
+    // FIXME: Also check for internal ruby boxes.
+    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
+        return false;
 
     if (computed_values().contain().layout_containment)
         return true;
@@ -1610,7 +1612,9 @@ bool Node::has_paint_containment() const
         return false;
 
     // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Implement this
+    // FIXME: Also check for internal ruby boxes.
+    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
+        return false;
 
     if (computed_values().contain().paint_containment)
         return true;

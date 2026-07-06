@@ -88,6 +88,9 @@ ViewImplementation::~ViewImplementation()
 
     if (m_client_state.client)
         m_client_state.client->unregister_view(m_client_state.page_index);
+
+    if (m_is_private == IsPrivate::Yes)
+        Application::the().maybe_close_private_browsing_session();
 }
 
 WebContentClient& ViewImplementation::client()
@@ -115,6 +118,7 @@ void ViewImplementation::set_url(URL::URL url)
 
     auto previous_host = current_host();
     m_url = move(url);
+    m_top_level_traversable.did_commit_navigation(m_url);
     update_bookmark_action();
 
     if (current_host() != previous_host)
@@ -131,9 +135,10 @@ void ViewImplementation::set_favicon(Badge<WebContentClient>, Gfx::Bitmap const&
     }
 
     if (m_favicon_base64_png.has_value()) {
-        Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
+        if (m_is_private == IsPrivate::No)
+            Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
         if (!m_should_suppress_history_for_current_load)
-            Application::history_store().update_favicon(m_url, *m_favicon_base64_png);
+            Application::history_store(m_is_private).update_favicon(m_url, *m_favicon_base64_png);
     }
 
     if (on_favicon_change)
@@ -336,7 +341,7 @@ Vector<ViewImplementation::SessionHistoryTraversalMenuItem> ViewImplementation::
 
     Vector<SessionHistoryTraversalMenuItem> items;
     auto append_item = [&](size_t target_step_index, TraversableSessionHistory::Entry const& target_entry) {
-        auto history_entry = Application::history_store().entry_for_url(target_entry.url);
+        auto history_entry = Application::history_store(m_is_private).entry_for_url(target_entry.url);
         auto url = target_entry.url.serialize();
         auto title = history_entry.has_value() && history_entry->title.has_value() && !history_entry->title->is_empty()
             ? move(*history_entry->title)
@@ -380,7 +385,9 @@ void ViewImplementation::zoom_in()
         return;
     m_zoom_level = round_to<int>((m_zoom_level + ZOOM_STEP) * 100) / 100.0;
     update_zoom();
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::zoom_out()
@@ -389,7 +396,9 @@ void ViewImplementation::zoom_out()
         return;
     m_zoom_level = round_to<int>((m_zoom_level - ZOOM_STEP) * 100) / 100.0;
     update_zoom();
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::set_zoom(double zoom_level)
@@ -403,7 +412,9 @@ void ViewImplementation::reset_zoom()
     m_zoom_level = 1.0;
     update_zoom();
     client().async_reset_zoom(m_client_state.page_index);
-    Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host(), m_zoom_level);
 }
 
 void ViewImplementation::enqueue_input_event(Web::InputEvent event)
@@ -2116,7 +2127,7 @@ void ViewImplementation::initialize_context_menus()
         if (download_path.is_error())
             return;
 
-        Application::the().file_downloader().download_file(m_context_menu_url, download_path.release_value());
+        Application::the().file_downloader().download_file(m_context_menu_url, download_path.release_value(), is_private());
     });
     m_copy_image_action = Action::create("Copy Image"sv, ActionID::CopyImage, [this]() {
         if (!m_image_context_menu_bitmap.has_value())

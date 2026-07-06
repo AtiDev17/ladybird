@@ -11,6 +11,7 @@
 #include <LibWeb/HTML/ActivateTab.h>
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
@@ -94,10 +95,11 @@ public:
         Yes,
     };
 
-    BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window = IsPopupWindow::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
+    BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window = IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
     virtual ~BrowserWindow() override;
 
     WebContentView& view() const { return m_current_tab->view(); }
+    WebView::IsPrivate is_private() const { return m_is_private; }
 
     int tab_count() { return m_tabs_container->count(); }
     int tab_index(Tab*);
@@ -166,6 +168,7 @@ private:
     Tab& create_new_tab(Web::HTML::ActivateTab, Tab& parent, Optional<u64> page_index);
     void initialize_tab(Tab*);
     void uninitialize_tab(Tab*);
+    void update_window_title(QString const&);
 
     void set_current_tab(Tab* tab);
     bool position_is_in_rounded_corner_cutout(QPoint const&) const;
@@ -215,6 +218,8 @@ private:
     double m_device_pixel_ratio { 0 };
     double m_refresh_rate { 60.0 };
 
+    WebView::IsPrivate m_is_private { WebView::IsPrivate::No };
+
     TabWidget* m_tabs_container { nullptr };
     Tab* m_current_tab { nullptr };
     DevToolsBanner* m_devtools_banner { nullptr };
@@ -229,6 +234,7 @@ private:
 
     QAction* m_new_tab_action { nullptr };
     QAction* m_new_window_action { nullptr };
+    QAction* m_new_private_window_action { nullptr };
     QAction* m_reopen_recently_closed_tab_action { nullptr };
     QAction* m_find_in_page_action { nullptr };
 

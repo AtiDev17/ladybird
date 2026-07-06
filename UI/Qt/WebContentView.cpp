@@ -94,8 +94,10 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
 #endif
 
     m_device_pixel_ratio = devicePixelRatio();
+    m_is_private = initial_state.is_private;
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
     m_display_id = initial_state.display_id;
+
     set_page_background_color_to_system_canvas(is_using_dark_system_theme(*this));
 
     QObject::connect(qGuiApp, &QGuiApplication::screenRemoved, [this](QScreen*) {
@@ -431,8 +433,7 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
 {
     // Browser chrome shortcuts that manage tabs, windows, or focus should not wait for
     // WebContent to decide whether the page wants to suppress them.
-    if (event.matches(QKeySequence::StandardKey::AddTab)
-        || event.matches(QKeySequence::StandardKey::Close)
+    if (event.matches(QKeySequence::StandardKey::Close)
         || event.matches(QKeySequence::StandardKey::New)
         || event.matches(QKeySequence::StandardKey::Quit))
         return true;
@@ -440,7 +441,11 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
     auto const modifiers = event.modifiers() & (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier | Qt::MetaModifier);
     auto const key = event.key();
 
+    if (modifiers == Qt::ControlModifier && key == Qt::Key_T)
+        return true;
     if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_T)
+        return true;
+    if (modifiers == (Qt::ControlModifier | Qt::ShiftModifier) && key == Qt::Key_N)
         return true;
 
     if (modifiers == Qt::ControlModifier && (key == Qt::Key_L || key == Qt::Key_Tab || key == Qt::Key_PageDown))

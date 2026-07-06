@@ -530,7 +530,12 @@ static void build_paint_tree(Node& node, Painting::Paintable* fallback_parent_pa
         }
     }
     for (auto child = node.first_child(); child; child = child->next_sibling()) {
-        build_paint_tree(*child, node.first_paintable().ptr(), is<InlineNode>(node) ? &paintable_by_line_index : nullptr);
+        // An InlineNode without paintables of its own (an anonymous inline whose only children are
+        // out-of-flow boxes generates no line fragments) must not orphan its descendants' paintables;
+        // pass the nearest ancestor paintable through. Other paintable-less nodes (e.g. non-rendered
+        // SVG subtrees) keep their descendants disconnected on purpose.
+        auto* fallback_for_children = node.first_paintable() ? node.first_paintable().ptr() : (is<InlineNode>(node) ? fallback_parent_paintable : nullptr);
+        build_paint_tree(*child, fallback_for_children, is<InlineNode>(node) ? &paintable_by_line_index : nullptr);
     }
 }
 
@@ -929,6 +934,8 @@ LayoutState::UsedValues& LayoutState::UsedValues::operator=(UsedValues const& ot
     inset_top = other.inset_top;
     inset_bottom = other.inset_bottom;
     line_boxes = other.line_boxes;
+    first_baseline = other.first_baseline;
+    last_baseline = other.last_baseline;
     containing_line_box_fragment = other.containing_line_box_fragment;
 
     m_node = other.m_node;

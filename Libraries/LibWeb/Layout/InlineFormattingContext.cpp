@@ -88,6 +88,8 @@ void InlineFormattingContext::run(LayoutInput const& layout_input)
     //       This ensures that any floated boxes are taken into account.
     m_automatic_content_width = parent().greatest_child_width(containing_block());
     m_automatic_content_height = content_height;
+
+    compute_and_store_baselines(m_containing_block_used_values);
 }
 
 void InlineFormattingContext::dimension_box_on_line(Box const& box, LayoutMode layout_mode)
@@ -438,7 +440,11 @@ void InlineFormattingContext::generate_line_boxes()
         }
         case InlineLevelIterator::Item::Type::AbsolutelyPositionedElement:
             if (auto const* box = as_if<Box>(*item.node)) {
-                line_builder.append_static_position_marker(*box);
+                // Enclosing inline boxes' start edges arrive either still unattached in the iterator
+                // or restashed onto this item from a skipped collapsible whitespace chunk.
+                auto preceded_by_inline_box_start_edges = item.preceded_by_unattached_inline_start_edges
+                    || item.margin_start != 0 || item.border_start != 0 || item.padding_start != 0;
+                line_builder.append_static_position_marker(*box, preceded_by_inline_box_start_edges);
                 absolute_boxes.append(box);
             }
             break;
@@ -451,6 +457,7 @@ void InlineFormattingContext::generate_line_boxes()
                 (void)parent().clear_floating_boxes(*item.node, *this);
                 // Even if this introduces clearance, we do NOT reset the margin state, because that is clearance
                 // between floats and does not contribute to the height of the Inline Formatting Context.
+                line_builder.set_unbreakable_run_width_interrupted_by_float(iterator.next_non_whitespace_sequence_width());
                 parent().layout_floating_box(*box, containing_block(), *m_layout_input, 0, &line_builder);
             }
             break;
@@ -563,7 +570,6 @@ void InlineFormattingContext::generate_line_boxes()
     }
 
     line_builder.remove_last_line_if_empty();
-    m_containing_block_used_values.set_inline_end_static_position_rect(calculate_inline_end_static_position_rect());
 }
 
 bool InlineFormattingContext::any_floats_intrude_in_block_range(CSSPixels block_start, CSSPixels block_end) const
@@ -599,52 +605,6 @@ CSSPixels InlineFormattingContext::vertical_float_clearance() const
 void InlineFormattingContext::set_vertical_float_clearance(CSSPixels vertical_float_clearance)
 {
     m_vertical_float_clearance = vertical_float_clearance;
-}
-
-StaticPositionRect InlineFormattingContext::calculate_inline_end_static_position_rect() const
-{
-    CSSPixels logical_inline_position = 0;
-    CSSPixels logical_block_position = 0;
-
-    auto to_physical_position = [](CSS::WritingMode writing_mode, CSSPixels logical_inline_position, CSSPixels logical_block_position) {
-        if (writing_mode != CSS::WritingMode::HorizontalTb)
-            return CSSPixelPoint { logical_block_position, logical_inline_position };
-        return CSSPixelPoint { logical_inline_position, logical_block_position };
-    };
-    auto writing_mode = containing_block().computed_values().writing_mode();
-
-    if (m_containing_block_used_values.line_boxes.is_empty())
-        return { .rect = { to_physical_position(writing_mode, logical_inline_position, logical_block_position), { 0, 0 } } };
-
-    CSSPixels line_boxes_bottom = 0;
-    for (auto const& line_box : m_containing_block_used_values.line_boxes)
-        line_boxes_bottom = max(line_boxes_bottom, line_box.bottom());
-
-    auto const& last_line_box = m_containing_block_used_values.line_boxes.last();
-    if (last_line_box.has_forced_break()) {
-        logical_block_position = line_boxes_bottom;
-        return { .rect = { to_physical_position(writing_mode, logical_inline_position, logical_block_position), { 0, 0 } } };
-    }
-
-    if (last_line_box.fragments().is_empty()) {
-        logical_block_position = line_boxes_bottom;
-        return { .rect = { to_physical_position(writing_mode, logical_inline_position, logical_block_position), { 0, 0 } } };
-    }
-
-    auto const& last_fragment = last_line_box.fragments().last();
-    auto direction = containing_block().computed_values().direction();
-    if (containing_block().is_anonymous() && containing_block().parent())
-        direction = containing_block().parent()->computed_values().direction();
-
-    if (direction == CSS::Direction::Rtl) {
-        logical_inline_position = last_fragment.inline_offset();
-    } else {
-        auto last_fragment_visual_inline_end = last_fragment.inline_offset() + last_fragment.inline_length();
-        logical_inline_position = max(last_fragment_visual_inline_end, last_line_box.inline_length());
-    }
-    logical_block_position = last_fragment.block_offset();
-
-    return { .rect = { to_physical_position(last_fragment.writing_mode(), logical_inline_position, logical_block_position), { 0, 0 } } };
 }
 
 }

@@ -25,7 +25,7 @@ public:
     void break_line(ForcedBreak, Optional<CSSPixels> next_item_width = {});
     void append_box(Box const&, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin);
     void append_text_chunk(TextNode const&, size_t offset_in_node, size_t length_in_node, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin, CSSPixels content_width, CSSPixels content_height, RefPtr<Gfx::GlyphRun>);
-    void append_static_position_marker(Box const&);
+    void append_static_position_marker(Box const&, bool preceded_by_inline_box_start_edges);
     void prepare_to_append_inline_content();
     void commit_pending_margin_before_float();
     void finish_current_line_before_block_level_box();
@@ -51,6 +51,7 @@ public:
 
     void recalculate_available_space();
     CSSPixels ceiling_for_float_to_be_inserted_here(Box const&);
+    void set_unbreakable_run_width_interrupted_by_float(CSSPixels width) { m_unbreakable_run_width_interrupted_by_float = width; }
 
     void did_introduce_clearance(CSSPixels);
 
@@ -67,6 +68,7 @@ private:
     AvailableSize m_available_width_for_current_line { AvailableSize::make_indefinite() };
     CSSPixels m_current_block_offset { 0 };
     CSSPixels m_max_height_on_current_line { 0 };
+    CSSPixels m_unbreakable_run_width_interrupted_by_float { 0 };
     CSSPixels m_text_indent { 0 };
     bool m_text_indent_hanging : 1 { false };
     bool m_text_indent_each_line : 1 { false };

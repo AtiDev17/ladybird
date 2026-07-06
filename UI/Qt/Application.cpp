@@ -131,7 +131,7 @@ public:
 
 #if defined(AK_OS_MACOS)
         if (event_type == QEvent::ApplicationActivate && !has_visible_browser_window())
-            application.open_new_window();
+            application.open_new_window(WebView::IsPrivate::No);
 #endif
 
         return handled;
@@ -143,7 +143,7 @@ public:
         if (!m_reopen_recently_closed_tab_action)
             return;
 
-        auto recently_closed_entry = Application::history_store().most_recently_closed_entry();
+        auto recently_closed_entry = Application::history_store(WebView::IsPrivate::No).most_recently_closed_entry();
         m_reopen_recently_closed_tab_action->setText("&Reopen Recently Closed Tab");
         m_reopen_recently_closed_tab_action->setEnabled(recently_closed_entry.has_value());
     }
@@ -161,14 +161,19 @@ public:
 
         auto* file_menu = m_application_menu_bar->addMenu("&File");
 
-        auto* new_tab_action = add_application_menu_action(*file_menu, "New &Tab", QKeySequence::keyBindings(QKeySequence::StandardKey::AddTab));
+        auto* new_tab_action = add_application_menu_action(*file_menu, "New &Tab", { QKeySequence(Qt::CTRL | Qt::Key_T) });
         QObject::connect(new_tab_action, &QAction::triggered, this, [] {
             Application::the().open_new_tab();
         });
 
         auto* new_window_action = add_application_menu_action(*file_menu, "New &Window", QKeySequence::keyBindings(QKeySequence::StandardKey::New));
         QObject::connect(new_window_action, &QAction::triggered, this, [] {
-            Application::the().open_new_window();
+            Application::the().open_new_window(WebView::IsPrivate::No);
+        });
+
+        auto* new_private_window_action = add_application_menu_action(*file_menu, "New Pri&vate Window", { QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N) });
+        QObject::connect(new_private_window_action, &QAction::triggered, this, [] {
+            Application::the().open_new_window(WebView::IsPrivate::Yes);
         });
 
         m_reopen_recently_closed_tab_action = add_application_menu_action(*file_menu, {}, { QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T) });
@@ -297,9 +302,9 @@ Core::EventLoop& Application::create_platform_event_loop()
     return event_loop;
 }
 
-BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, Tab* parent_tab, Optional<u64> page_index)
+BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<u64> page_index)
 {
-    auto* window = new BrowserWindow(initial_urls, is_popup_window, parent_tab, move(page_index));
+    auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, parent_tab, move(page_index));
     set_active_window(*window);
     QObject::connect(window, &QObject::destroyed, m_application.ptr(), [this, window] {
         if (m_active_window == window) {
@@ -374,9 +379,10 @@ void Application::open_new_tab()
     tab.focus_location_editor();
 }
 
-void Application::open_new_window()
+void Application::open_new_window(WebView::IsPrivate is_private)
 {
-    new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window());
+    // FIXME: Create a new tab page specific to private windows.
+    new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
 }
 
 void Application::focus_location_editor()
@@ -392,13 +398,13 @@ void Application::focus_location_editor()
 
 void Application::reopen_recently_closed_tab()
 {
-    auto recently_closed_entry = Application::history_store().pop_most_recently_closed_entry();
+    auto recently_closed_entry = Application::history_store(WebView::IsPrivate::No).pop_most_recently_closed_entry();
     if (recently_closed_entry.has_value()) {
         if (recently_closed_entry->was_window) {
             auto& window = new_window(recently_closed_entry->urls);
             window.activate_tab(static_cast<int>(recently_closed_entry->active_tab_index));
         } else if (!recently_closed_entry->urls.is_empty()) {
-            if (!m_active_window)
+            if (!m_active_window || m_active_window->is_private() == WebView::IsPrivate::Yes)
                 new_window({ recently_closed_entry->urls[0] });
             else
                 m_active_window->new_tab_from_url(recently_closed_entry->urls[0], Web::HTML::ActivateTab::Yes);
@@ -521,7 +527,8 @@ bool Application::activate_tab_with_url(URL::URL const& url) const
 
 void Application::open_url_in_new_window(URL::URL const& url)
 {
-    this->new_window({ url });
+    auto is_private = m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No;
+    this->new_window({ url }, {}, BrowserWindow::IsPopupWindow::No, is_private);
 }
 
 Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const

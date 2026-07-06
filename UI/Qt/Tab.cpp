@@ -619,6 +619,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     tab_layout->setContentsMargins(0, 0, 0, 0);
 
     auto view_initial_state = WebContentViewInitialState {
+        .is_private = window->is_private(),
         .maximum_frames_per_second = window->refresh_rate(),
         .display_id = window->display_id(),
     };
@@ -644,7 +645,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     toolbar_layout->setSpacing(6);
     toolbar_layout->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN, TOOLBAR_HORIZONTAL_MARGIN, TOOLBAR_VERTICAL_MARGIN);
 
-    m_location_edit = new LocationEdit(this);
+    m_location_edit = new LocationEdit(this, m_window->is_private());
     m_bookmarks_bar = new BookmarksBar(this);
     m_loading_animation_timer = new QTimer(this);
     m_loading_animation_timer->setInterval(80);
@@ -670,6 +671,13 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     toolbar_container_layout->addWidget(m_bookmarks_bar);
     tab_layout->addWidget(m_view);
     tab_layout->addWidget(m_find_in_page);
+
+    m_private_badge = new QLabel("Private", m_toolbar);
+    m_private_badge->setObjectName("LadybirdPrivateBadge");
+    m_private_badge->setAlignment(Qt::AlignCenter);
+    m_private_badge->setFixedHeight(22);
+    m_private_badge->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_private_badge->setVisible(m_window->is_private() == WebView::IsPrivate::Yes);
 
     m_hamburger_button = new HamburgerButton(m_toolbar);
     m_hamburger_button->setText("Show &Menu");
@@ -748,6 +756,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
     location_edit_layout->addWidget(m_location_edit);
     toolbar_layout->addWidget(location_edit_container, 1);
+    toolbar_layout->addWidget(m_private_badge, 0, Qt::AlignVCenter);
     m_right_toggle_vertical_tabs_expanded_button = create_toolbar_button(*m_toolbar, *m_toggle_vertical_tabs_expanded_action);
     toolbar_layout->addWidget(m_right_toggle_vertical_tabs_expanded_button, 0, Qt::AlignTop);
     m_downloads_button = new DownloadsButton(m_toolbar);

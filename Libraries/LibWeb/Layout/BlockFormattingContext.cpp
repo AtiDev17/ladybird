@@ -150,6 +150,10 @@ void BlockFormattingContext::run(LayoutInput const& layout_input)
             m_state.get_mutable(*child_box).margin_bottom = m_margin_state.current_collapsed_margin();
             break;
         }
+
+        // The margin reassignment above changed a child's margin box, which the root's baselines may
+        // have been derived from (a scroll container child exports its bottom margin edge), so re-derive them.
+        compute_and_store_baselines(m_state.get_mutable(root()));
     }
 }
 
@@ -979,24 +983,11 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
             auto& box_state = is<ListItemMarkerBox>(box) || box_is_document_element
                 ? m_state.get_mutable(box)
                 : m_state.create(box, {}, {});
+            // NB: An originally-inline absolutely positioned box never reaches this path; the tree
+            //     builder keeps out-of-flow boxes in inline context, where static position markers
+            //     pin them at their exact flow position.
             StaticPositionRect static_position;
-            auto static_position_x = CSSPixels(0);
-            auto static_position_y = m_y_offset_of_current_block_container.value();
-            if (box.display_before_box_type_transformation().is_inline_outside()) {
-                auto sibling_ref = box.previous_sibling();
-                auto const* sibling = as_if<Box>(sibling_ref.ptr());
-                if (sibling && sibling->is_anonymous() && sibling->children_are_inline()) {
-                    // The sibling may have been skipped by layout entirely (e.g. a whitespace-only
-                    // anonymous container), in which case it has no state to derive a position from.
-                    if (auto const* sibling_state = m_state.try_get(*sibling)) {
-                        if (auto const& inline_end_static_position_rect = sibling_state->inline_end_static_position_rect(); inline_end_static_position_rect.has_value()) {
-                            static_position_x = sibling_state->offset.x() + inline_end_static_position_rect->rect.x();
-                            static_position_y = sibling_state->offset.y() + inline_end_static_position_rect->rect.y();
-                        }
-                    }
-                }
-            }
-            static_position.rect = { { static_position_x, static_position_y }, { 0, 0 } };
+            static_position.rect = { { 0, m_y_offset_of_current_block_container.value() }, { 0, 0 } };
             box_state.set_static_position_rect(static_position);
         }
         return;
@@ -1252,6 +1243,8 @@ void BlockFormattingContext::layout_block_level_children(BlockContainer const& b
             block_container_state.set_content_height(bottom_of_lowest_margin_box);
         }
     }
+
+    compute_and_store_baselines(m_state.get_mutable(block_container));
 }
 
 // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
@@ -1324,6 +1317,8 @@ void BlockFormattingContext::layout_fieldset_with_rendered_legend(FieldSetBox co
     auto fieldset_border_box_top_in_content = -(fieldset_state.border_top + fieldset_state.padding_top);
     auto legend_content_y = fieldset_border_box_top_in_content + legend_border_box_centering_offset + legend_state.border_box_top();
     legend_state.set_content_y(legend_content_y);
+
+    compute_and_store_baselines(fieldset_state);
 }
 
 void BlockFormattingContext::resolve_vertical_box_model_metrics(Box const& box, CSSPixels width_of_containing_block)

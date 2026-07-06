@@ -22,6 +22,7 @@
 #include <LibDatabase/Database.h>
 #include <LibDevTools/DevToolsServer.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibImageDecoderClient/Client.h>
 #include <LibURL/InternalURLs.h>
 #include <LibURL/Parser.h>
@@ -132,6 +133,55 @@ Application::~Application()
     m_process_manager = nullptr;
 
     s_the = nullptr;
+}
+
+HistoryStore& Application::history_store(IsPrivate is_private)
+{
+    return is_private == IsPrivate::Yes
+        ? *the().ensure_private_browsing_session().history_store
+        : *the().m_history_store;
+}
+
+CookieJar& Application::cookie_jar(IsPrivate is_private)
+{
+    return is_private == IsPrivate::Yes
+        ? *the().ensure_private_browsing_session().cookie_jar
+        : *the().m_cookie_jar;
+}
+
+HSTSStore& Application::hsts_store(IsPrivate is_private)
+{
+    return is_private == IsPrivate::Yes
+        ? *the().ensure_private_browsing_session().hsts_store
+        : *the().m_hsts_store;
+}
+
+StorageJar& Application::storage_jar(IsPrivate is_private)
+{
+    return is_private == IsPrivate::Yes
+        ? *the().ensure_private_browsing_session().storage_jar
+        : *the().m_storage_jar;
+}
+
+Requests::RequestClient& Application::request_server_client(IsPrivate is_private)
+{
+    if (is_private == IsPrivate::No)
+        return *the().m_request_server_client;
+
+    if (!the().m_private_request_server_client) {
+        auto handle = connect_new_request_server_client(IsPrivate::Yes).release_value_but_fixme_should_propagate_errors();
+        auto transport = handle.create_transport().release_value_but_fixme_should_propagate_errors();
+        auto request_server_client = make_ref_counted<Requests::RequestClient>(move(transport));
+
+#ifdef AK_OS_WINDOWS
+        auto response = request_server_client->send_sync<Messages::RequestServer::InitTransport>(Core::System::getpid());
+        request_server_client->transport().set_peer_pid(response->peer_pid());
+#endif
+
+        the().m_private_request_server_client = move(request_server_client);
+    }
+
+    return *the().m_private_request_server_client;
 }
 
 ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
@@ -538,12 +588,12 @@ void Application::open_url_in_new_window(URL::URL const& url)
     dbgln("open_url_in_new_window() is unsupported on this platform (url: {})", url);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, u64 initial_page_id)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, u64 initial_page_id)
 {
-    auto request_server_handle = TRY(connect_new_request_server_client());
+    auto request_server_handle = TRY(connect_new_request_server_client(is_private));
     auto image_decoder_handle = TRY(connect_new_image_decoder_client());
 
-    auto client = TRY(WebView::launch_web_content_process(initial_page_id));
+    auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id));
     client->async_initialize(initial_page_id);
     if (view.has_value())
         client->assign_view({}, *view);
@@ -559,6 +609,50 @@ u64 Application::allocate_page_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
     return m_next_page_or_compositor_context_id++;
+}
+
+PrivateBrowsingSession& Application::ensure_private_browsing_session()
+{
+    if (!m_private_browsing_session) {
+        m_private_browsing_session = adopt_own(*new PrivateBrowsingSession {
+            .cookie_jar = CookieJar::create(IsPrivate::Yes),
+            .storage_jar = StorageJar::create(),
+            .hsts_store = HSTSStore::create(),
+            .history_store = HistoryStore::create_disabled(),
+        });
+    }
+
+    return *m_private_browsing_session;
+}
+
+void Application::maybe_close_private_browsing_session()
+{
+    if (!m_private_browsing_session)
+        return;
+
+    auto has_private_view = false;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        if (view.is_private() == IsPrivate::No)
+            return IterationDecision::Continue;
+
+        has_private_view = true;
+        return IterationDecision::Break;
+    });
+    if (has_private_view)
+        return;
+
+    auto has_private_client = false;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (client.is_private() == IsPrivate::No)
+            return IterationDecision::Continue;
+
+        has_private_client = true;
+        return IterationDecision::Break;
+    });
+    if (has_private_client)
+        return;
+
+    m_private_browsing_session = nullptr;
 }
 
 Web::Compositor::CompositorContextId Application::allocate_compositor_context_id()
@@ -705,6 +799,9 @@ void Application::crash_compositor_process()
 
 ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process(ViewImplementation& view)
 {
+    if (view.is_private() == IsPrivate::Yes)
+        return create_web_content_client(view, IsPrivate::Yes, allocate_page_id());
+
     if (m_spare_web_content_process) {
         auto web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
@@ -714,13 +811,13 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     }
 
     launch_spare_web_content_process();
-    return create_web_content_client(view, allocate_page_id());
+    return create_web_content_client(view, IsPrivate::No, allocate_page_id());
 }
 
-ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process()
+ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private)
 {
     auto page_id = allocate_page_id();
-    auto client = TRY(create_web_content_client({}, page_id));
+    auto client = TRY(create_web_content_client({}, is_private, page_id));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -748,7 +845,7 @@ void Application::launch_spare_web_content_process()
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
 
-        auto web_content_client = create_web_content_client({}, allocate_page_id());
+        auto web_content_client = create_web_content_client({}, IsPrivate::No, allocate_page_id());
         if (web_content_client.is_error()) {
             dbgln("Unable to create spare web content client: {}", web_content_client.error());
             return;
@@ -956,11 +1053,12 @@ ErrorOr<void> Application::launch_request_server()
 {
     m_request_server_client = TRY(launch_request_server_process());
 
-    m_request_server_client->on_retrieve_http_cookie = [this](URL::URL const& url) -> String {
+    m_request_server_client->on_retrieve_http_cookie = [](URL::URL const& url, RequestServer::IsPrivate is_private) -> String {
+        auto& cookie_jar = Application::cookie_jar(is_private == RequestServer::IsPrivate::Yes ? IsPrivate::Yes : IsPrivate::No);
         if constexpr (!REQUESTSERVER_WIRE_DEBUG)
-            return m_cookie_jar->get_cookie(url, HTTP::Cookie::Source::Http);
+            return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
         auto started_at = MonotonicTime::now();
-        auto cookie = m_cookie_jar->get_cookie(url, HTTP::Cookie::Source::Http);
+        auto cookie = cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http);
         auto elapsed_ms = (MonotonicTime::now() - started_at).to_milliseconds();
         if (elapsed_ms > 5) {
             dbgln("UI wire-cookie: get_cookie({}) took {} ms ({} bytes returned)",
@@ -971,6 +1069,7 @@ ErrorOr<void> Application::launch_request_server()
 
     m_request_server_client->on_request_server_died = [this]() {
         m_request_server_client = nullptr;
+        m_private_request_server_client = nullptr;
 
         if (Core::EventLoop::current().was_exit_requested())
             return;
@@ -980,14 +1079,31 @@ ErrorOr<void> Application::launch_request_server()
             VERIFY_NOT_REACHED();
         }
 
-        auto client_count = WebContentClient::client_count();
-        auto request_server_response = m_request_server_client->send_sync_but_allow_failure<Messages::RequestServer::ConnectNewClients>(client_count);
-        if (!request_server_response || request_server_response->handles().is_empty()) {
-            warnln("\033Failed to connect {} new clients to ImageDecoder\033[0m", client_count);
-            VERIFY_NOT_REACHED();
-        }
+        size_t normal_client_count = 0;
+        size_t private_client_count = 0;
+        WebContentClient::for_each_client([&](WebContentClient& client) {
+            client.is_private() == IsPrivate::No ? ++normal_client_count : ++private_client_count;
+            return IterationDecision::Continue;
+        });
 
-        WebContentClient::for_each_client([handles = request_server_response->take_handles()](WebContentClient& client) mutable {
+        auto create_handles = [&](auto is_private, auto client_count) -> Vector<IPC::TransportHandle> {
+            if (client_count == 0)
+                return {};
+
+            auto response = m_request_server_client->send_sync_but_allow_failure<Messages::RequestServer::ConnectNewClients>(client_count, is_private);
+            if (!response || response->handles().size() != client_count) {
+                warnln("Failed to connect {} new clients to RequestServer", client_count);
+                VERIFY_NOT_REACHED();
+            }
+
+            return response->take_handles();
+        };
+
+        auto normal_handles = create_handles(RequestServer::IsPrivate::No, normal_client_count);
+        auto private_handles = create_handles(RequestServer::IsPrivate::Yes, private_client_count);
+
+        WebContentClient::for_each_client([&](WebContentClient& client) {
+            auto& handles = client.is_private() == IsPrivate::No ? normal_handles : private_handles;
             client.async_connect_to_request_server(handles.take_last());
             return IterationDecision::Continue;
         });
@@ -1402,6 +1518,12 @@ void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
         m_cookie_jar->expire_cookies_accessed_since(options.since);
         m_storage_jar->remove_items_accessed_since(options.since);
         m_hsts_store->remove_policies_observed_since(options.since);
+
+        if (m_private_browsing_session) {
+            m_private_browsing_session->cookie_jar->expire_cookies_accessed_since(options.since);
+            m_private_browsing_session->storage_jar->remove_items_accessed_since(options.since);
+            m_private_browsing_session->hsts_store->remove_policies_observed_since(options.since);
+        }
     }
 
     if (did_change_history)
@@ -2001,15 +2123,17 @@ void Application::traverse_the_history_by_delta(DevTools::TabDescription const& 
 
 Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
 {
-    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
         return {};
 
-    return Application::cookie_jar().get_all_cookies();
+    return Application::cookie_jar(view->is_private()).get_all_cookies();
 }
 
 ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& description, Optional<HTTP::Cookie::Cookie> old_cookie, HTTP::Cookie::Cookie cookie) const
 {
-    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
         return Error::from_string_literal("Unable to locate tab");
 
     auto url = URL::Parser::basic_parse(description.url);
@@ -2020,17 +2144,18 @@ ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& descriptio
     if (old_cookie.has_value())
         old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
 
-    TRY(Application::cookie_jar().set_cookie_from_devtools(*url, move(old_key), move(cookie)));
+    TRY(Application::cookie_jar(view->is_private()).set_cookie_from_devtools(*url, move(old_key), move(cookie)));
     return {};
 }
 
 void Application::delete_cookies(DevTools::TabDescription const& description, Vector<HTTP::Cookie::Cookie> cookies) const
 {
-    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
         return;
 
     for (auto const& cookie : cookies)
-        Application::cookie_jar().delete_cookie({ cookie.name, cookie.domain, cookie.path });
+        Application::cookie_jar(view->is_private()).delete_cookie({ cookie.name, cookie.domain, cookie.path });
 }
 
 void Application::listen_for_host_cookie_changes(DevTools::TabDescription const& description, OnHostCookieChange on_host_cookie_change) const
@@ -2081,7 +2206,7 @@ ErrorOr<Optional<String>> Application::set_storage_item(DevTools::TabDescription
         return TRY(storage_set_result_to_error_or_old_value(result.release_value()));
     }
 
-    auto old_value = TRY(storage_set_result_to_error_or_old_value(Application::storage_jar().set_item(storage_endpoint, storage_key, key, value)));
+    auto old_value = TRY(storage_set_result_to_error_or_old_value(Application::storage_jar(view->is_private()).set_item(storage_endpoint, storage_key, key, value)));
     if (!old_value.has_value()) {
         view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Added, key });
     } else if (*old_value != value) {
@@ -2100,11 +2225,11 @@ ErrorOr<Optional<String>> Application::remove_storage_item(DevTools::TabDescript
     if (storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage)
         return view->remove_session_storage_item(key);
 
-    auto old_value = Application::storage_jar().get_item(storage_endpoint, storage_key, key);
+    auto old_value = Application::storage_jar(view->is_private()).get_item(storage_endpoint, storage_key, key);
     if (!old_value.has_value())
         return Optional<String> {};
 
-    Application::storage_jar().remove_item(storage_endpoint, storage_key, key);
+    Application::storage_jar(view->is_private()).remove_item(storage_endpoint, storage_key, key);
     view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Deleted, key });
     return old_value;
 }
@@ -2120,11 +2245,11 @@ ErrorOr<void> Application::clear_storage(DevTools::TabDescription const& descrip
         return {};
     }
 
-    auto keys = Application::storage_jar().get_all_keys(storage_endpoint, storage_key);
+    auto keys = Application::storage_jar(view->is_private()).get_all_keys(storage_endpoint, storage_key);
     if (keys.is_empty())
         return {};
 
-    Application::storage_jar().clear_storage_key(storage_endpoint, storage_key);
+    Application::storage_jar(view->is_private()).clear_storage_key(storage_endpoint, storage_key);
     view->notify_storage_changed({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, {} });
     return {};
 }

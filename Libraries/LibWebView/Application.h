@@ -33,6 +33,7 @@
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Options.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/Process.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/Settings.h>
@@ -70,7 +71,7 @@ public:
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
     static WebContentOptions& web_content_options() { return the().m_web_content_options; }
 
-    static Requests::RequestClient& request_server_client() { return *the().m_request_server_client; }
+    static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
 
     virtual bool supports_vertical_tabs() const { return false; }
@@ -83,10 +84,10 @@ public:
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id) { }
 
-    static HistoryStore& history_store() { return *the().m_history_store; }
-    static CookieJar& cookie_jar() { return *the().m_cookie_jar; }
-    static HSTSStore& hsts_store() { return *the().m_hsts_store; }
-    static StorageJar& storage_jar() { return *the().m_storage_jar; }
+    static HistoryStore& history_store(IsPrivate);
+    static CookieJar& cookie_jar(IsPrivate);
+    static HSTSStore& hsts_store(IsPrivate);
+    static StorageJar& storage_jar(IsPrivate);
 
     static ProcessManager& process_manager() { return *the().m_process_manager; }
 #if defined(AK_OS_MACOS)
@@ -99,8 +100,11 @@ public:
         NonnullRefPtr<WebContentClient> client;
         u64 page_id { 0 };
     };
-    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process();
+    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate);
     u64 allocate_page_id();
+
+    void maybe_close_private_browsing_session();
+
     Web::Compositor::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
     void register_compositor_context(WebContentClient&, Web::Compositor::CompositorContextId, Optional<u64> page_id);
@@ -256,7 +260,8 @@ protected:
     Main::Arguments& arguments() { return m_arguments; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, u64 initial_page_id);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id);
+    PrivateBrowsingSession& ensure_private_browsing_session();
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
     ErrorOr<void> launch_compositor_process();
@@ -367,6 +372,7 @@ private:
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
 
     RefPtr<Requests::RequestClient> m_request_server_client;
+    RefPtr<Requests::RequestClient> m_private_request_server_client;
     RefPtr<ImageDecoderClient::Client> m_image_decoder_client;
     RefPtr<CompositorClient> m_compositor_client;
     size_t m_compositor_restart_count { 0 };
@@ -386,6 +392,7 @@ private:
     OwnPtr<CookieJar> m_cookie_jar;
     OwnPtr<HSTSStore> m_hsts_store;
     OwnPtr<StorageJar> m_storage_jar;
+    OwnPtr<PrivateBrowsingSession> m_private_browsing_session;
 
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
 

@@ -82,7 +82,7 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(u64 initial_page_id)
+ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, u64 initial_page_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -142,7 +142,7 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(u64
         arguments.append("--mach-server-name"sv);
         arguments.append(server.value());
     }
-    return launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), initial_page_id);
+    return launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), is_private, initial_page_id);
 }
 
 ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> launch_image_decoder_process()
@@ -182,7 +182,7 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
     return launch_server_process<WebView::CompositorClient>("Compositor"sv, move(arguments));
 }
 
-ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings::AgentType type, Web::HTML::WorkerAgentId agent_id)
+ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings::AgentType type, IsPrivate is_private, Web::HTML::WorkerAgentId agent_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -218,7 +218,7 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings:
         arguments.append(server.value());
     }
 
-    return launch_server_process<WebWorkerClient>("WebWorker"sv, move(arguments), agent_id);
+    return launch_server_process<WebWorkerClient>("WebWorker"sv, move(arguments), is_private, agent_id);
 }
 
 ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process()
@@ -277,9 +277,9 @@ ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process()
     return client;
 }
 
-ErrorOr<IPC::TransportHandle> connect_new_request_server_client()
+ErrorOr<IPC::TransportHandle> connect_new_request_server_client(IsPrivate is_private)
 {
-    auto response = Application::request_server_client().send_sync_but_allow_failure<Messages::RequestServer::ConnectNewClient>();
+    auto response = Application::request_server_client().send_sync_but_allow_failure<Messages::RequestServer::ConnectNewClient>(is_private == IsPrivate::Yes ? RequestServer::IsPrivate::Yes : RequestServer::IsPrivate::No);
     if (!response)
         return Error::from_string_literal("Failed to connect to RequestServer");
     return response->take_handle();
