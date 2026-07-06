@@ -848,38 +848,6 @@ void HTMLInputElement::commit_pending_changes()
     dispatch_event(change_event);
 }
 
-// https://www.w3.org/TR/css-ui-4/#input-rules
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_visible()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 100%;
-                height: 1lh;
-                align-items: center;
-                overflow: auto;
-                scrollbar-width: none;
-                text-overflow: clip;
-                white-space: nowrap;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_hidden()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 0;
-                display: inline;
-            )~~~"sv);
-    }
-    return *style;
-}
-
 static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
@@ -913,11 +881,12 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
         style->set_declarations_from_text(R"~~~(
                 width: 100%;
                 height: 1lh;
-                align-items: center;
                 overflow: hidden;
-                scrollbar-width: none;
                 text-overflow: clip;
                 white-space: nowrap;
+                margin-inline-start: -100%;
+                pointer-events: none;
+                user-select: none;
             )~~~"sv);
     }
     return *style;
@@ -937,13 +906,10 @@ void HTMLInputElement::update_placeholder_visibility()
 {
     if (!m_placeholder_element)
         return;
-    if (this->placeholder_value().has_value()) {
-        m_inner_text_element->set_inline_style(inner_text_style_when_hidden());
+    if (this->placeholder_value().has_value())
         m_placeholder_element->set_inline_style(placeholder_style_when_visible());
-    } else {
-        m_inner_text_element->set_inline_style(inner_text_style_when_visible());
+    else
         m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
-    }
 }
 
 Utf16String HTMLInputElement::button_label() const
@@ -1186,7 +1152,26 @@ void HTMLInputElement::create_text_input_shadow_tree()
     }
     MUST(shadow_root->append_child(element));
 
-    // https://www.w3.org/TR/css-ui-4/#input-rules
+    auto text_container = element;
+    if (type_state() == TypeAttributeState::Number) {
+        text_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+        {
+            static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
+            if (!style) {
+                style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+                style->set_declarations_from_text(R"~~~(
+                    display: flex;
+                    align-items: center;
+                    flex: 1;
+                    min-width: 0;
+                )~~~"sv);
+            }
+            text_container->set_inline_style(*style);
+        }
+        MUST(element->append_child(*text_container));
+    }
+
+    // https://drafts.csswg.org/css-ui-4/#input-rules
     m_inner_text_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
@@ -1195,7 +1180,6 @@ void HTMLInputElement::create_text_input_shadow_tree()
             style->set_declarations_from_text(R"~~~(
                 width: 100%;
                 height: 1lh;
-                align-items: center;
                 overflow: auto;
                 scrollbar-width: none;
                 text-overflow: clip;
@@ -1204,7 +1188,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
         }
         m_inner_text_element->set_inline_style(*style);
     }
-    MUST(element->append_child(*m_inner_text_element));
+    MUST(text_container->append_child(*m_inner_text_element));
 
     m_text_node = realm().create<DOM::Text>(document(), m_value);
     if (type_state() == TypeAttributeState::Password)
@@ -1213,7 +1197,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(m_inner_text_element->append_child(*m_text_node));
 
     m_placeholder_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(element->append_child(*m_placeholder_element));
+    MUST(text_container->append_child(*m_placeholder_element));
     m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
 
     m_placeholder_text_node = realm().create<DOM::Text>(document(), Utf16String::from_utf8(placeholder()));
@@ -3219,6 +3203,21 @@ bool HTMLInputElement::is_single_line() const
 
 bool HTMLInputElement::has_activation_behavior() const
 {
+    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:activation-behaviour
+    // Input activation runs this element's input activation behavior, if any,
+    // and then popover target activation.
+    // https://html.spec.whatwg.org/multipage/input.html#button-state-(type=button)
+    // Button-state inputs have no input activation behavior.
+    //
+    // NB: Per spec, input elements have activation behavior even when those
+    //     steps are a no-op. However, making a no-op input button the
+    //     activation target prevents activation behavior on ancestor anchors.
+    //     For compatibility with other browsers, let plain input buttons yield
+    //     to ancestors.
+    if (type_state() == TypeAttributeState::Button
+        && !PopoverTargetAttributes::get_the_popover_target_element(const_cast<HTMLInputElement&>(*this)))
+        return false;
+
     return true;
 }
 

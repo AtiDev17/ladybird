@@ -1105,9 +1105,6 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
 
     propagate_style_to_anonymous_wrappers();
 
-    if (auto* box_node = as_if<NodeWithStyleAndBoxModelMetrics>(*this))
-        box_node->propagate_style_along_continuation(computed_style);
-
     rebuild_image_observers();
 }
 
@@ -1629,9 +1626,10 @@ bool Node::has_paint_containment() const
     return false;
 }
 
-bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
+bool NodeWithStyleAndBoxModelMetrics::is_inline_flow_interrupting_block() const
 {
-    // This node must have an inline parent.
+    // This node remains a layout child of its inline-flow parent. InlineLevelIterator emits it as a BlockLevelBox item
+    // so the inline formatting context can lay it out as an interrupting block.
     if (!parent())
         return false;
     auto const& parent_display = parent()->display();
@@ -1642,7 +1640,7 @@ bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
     if (display().is_inline_outside() || is_out_of_flow())
         return false;
 
-    // This node must not have `display: contents`; inline continuation gets handled by its children.
+    // This node must not have `display: contents`; interrupting block handling gets delegated to its children.
     if (display().is_contents())
         return false;
 
@@ -1654,29 +1652,20 @@ bool NodeWithStyleAndBoxModelMetrics::should_create_inline_continuation() const
     if (is<SVG::SVGForeignObjectElement>(parent()->dom_node()))
         return false;
 
-    // Non-root SVG elements and foreign object boxes should never be split.
+    // Non-root SVG elements and foreign object boxes should not interrupt inline flow.
     if (is_svg_box() || is_svg_foreign_object_box())
         return false;
 
-    // Nested SVG roots should never be split, but a top-level SVG root inside an HTML inline element should be.
+    // Nested SVG roots should not interrupt inline flow, but a top-level SVG root inside an HTML inline element should.
     if (is_svg_svg_box() && (parent()->is_svg_box() || parent()->is_svg_svg_box()))
         return false;
 
     // Replaced boxes with children (e.g. media elements with shadow DOM controls)
-    // have their own formatting context; don't split them.
+    // have their own formatting context; don't let their children interrupt inline flow.
     if (parent()->is_replaced_box_with_children())
         return false;
 
     return true;
-}
-
-void NodeWithStyleAndBoxModelMetrics::propagate_style_along_continuation(CSS::ComputedProperties const& computed_style) const
-{
-    auto continuation = continuation_of_node();
-    while (continuation && continuation->is_anonymous())
-        continuation = continuation->continuation_of_node();
-    if (continuation)
-        continuation->apply_style(computed_style);
 }
 
 void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason)

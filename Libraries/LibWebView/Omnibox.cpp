@@ -124,6 +124,14 @@ static Optional<size_t> index_of_suggestion(String const& suggestion_text, Vecto
     });
 }
 
+static Optional<size_t> index_of_exact_search_suggestion(String const& query, Vector<AutocompleteSuggestion> const& suggestions)
+{
+    return suggestions.find_first_index_if([&](auto const& suggestion) {
+        return suggestion.source == AutocompleteSuggestionSource::Search
+            && suggestion_matches_query_exactly(query, suggestion.text);
+    });
+}
+
 Omnibox::Omnibox()
     : Omnibox(make<AutocompleteSuggestionProvider>())
 {
@@ -347,6 +355,11 @@ Optional<size_t> Omnibox::update_completion_for_suggestions(Vector<AutocompleteS
 
     if (suggestions.is_empty())
         return {};
+
+    if (!suggestions.first().can_be_automatically_selected) {
+        restore_query_display();
+        return index_of_exact_search_suggestion(m_query, suggestions);
+    }
 
     // A literal URL always wins: no completion, restore the typed text.
     if (suggestions.first().source == AutocompleteSuggestionSource::LiteralURL) {
