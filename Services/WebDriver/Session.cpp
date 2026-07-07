@@ -20,8 +20,10 @@
 #    include <LibIPC/TransportBootstrapMach.h>
 #    include <LibWebView/Utilities.h>
 #endif
+#include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibIPC/Transport.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/WebDriver/Proxy.h>
@@ -223,13 +225,13 @@ void Session::close()
     m_pending_connections.clear();
 
     if (m_browser_process.has_value())
-        MUST(Core::System::kill(m_browser_process->pid(), SIGTERM));
+        MUST(Core::Process::terminate_process(m_browser_process->pid(), Core::Process::TerminationMode::Graceful));
 
 #if defined(AK_OS_MACOS)
     m_web_content_mach_port_server = nullptr;
 #else
     if (!m_web_content_endpoint.is_empty())
-        MUST(Core::System::unlink(m_web_content_endpoint));
+        MUST(FileSystem::remove(m_web_content_endpoint, FileSystem::RecursionMode::Disallowed));
 #endif
     m_web_content_endpoint = {};
 
@@ -427,7 +429,7 @@ ErrorOr<void> Session::create_server(NonnullRefPtr<ServerPromise> promise)
 
     return {};
 #else
-    (void)Core::System::unlink(m_web_content_endpoint);
+    (void)FileSystem::remove(m_web_content_endpoint, FileSystem::RecursionMode::Disallowed);
 
     auto server = Core::LocalServer::construct();
     server->listen(m_web_content_endpoint);

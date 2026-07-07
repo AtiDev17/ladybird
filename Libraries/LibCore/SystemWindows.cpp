@@ -13,12 +13,12 @@
 
 #include <AK/Array.h>
 #include <AK/ByteString.h>
-#include <AK/ScopeGuard.h>
+#include <AK/Checked.h>
+#include <LibCore/MappedFile.h>
 #include <LibCore/Process.h>
 #include <LibCore/SocketAddress.h>
 #include <LibCore/System.h>
 #include <direct.h>
-#include <sys/mman.h>
 
 #include <AK/Windows.h>
 #include <ws2tcpip.h>
@@ -26,16 +26,6 @@
 namespace Core::System {
 
 int windows_socketpair(SOCKET socks[2], int make_overlapped);
-
-ErrorOr<int> open(StringView path, int options, mode_t mode)
-{
-    ByteString str = path;
-    int fd = _open(str.characters(), options | O_BINARY | _O_OBTAIN_DIR, mode);
-    if (fd < 0)
-        return Error::from_syscall("open"sv, errno);
-    ScopeGuard guard = [&] { _close(fd); };
-    return dup(_get_osfhandle(fd));
-}
 
 ErrorOr<void> close(int handle)
 {
@@ -49,60 +39,10 @@ ErrorOr<void> close(int handle)
     return {};
 }
 
-ErrorOr<size_t> read(int handle, Bytes buffer)
+ErrorOr<void> set_socket_blocking(int socket, bool enabled)
 {
-    DWORD n_read = 0;
-    if (!ReadFile(to_handle(handle), buffer.data(), buffer.size(), &n_read, NULL))
-        return Error::from_windows_error();
-    return n_read;
-}
-
-ErrorOr<size_t> write(int handle, ReadonlyBytes buffer)
-{
-    DWORD n_written = 0;
-    if (!WriteFile(to_handle(handle), buffer.data(), buffer.size(), &n_written, NULL))
-        return Error::from_windows_error();
-    return n_written;
-}
-
-ErrorOr<off_t> lseek(int handle, off_t offset, int origin)
-{
-    static_assert(FILE_BEGIN == SEEK_SET && FILE_CURRENT == SEEK_CUR && FILE_END == SEEK_END, "SetFilePointerEx origin values are incompatible with lseek");
-    LARGE_INTEGER new_pointer = {};
-    if (!SetFilePointerEx(to_handle(handle), { .QuadPart = offset }, &new_pointer, origin))
-        return Error::from_windows_error();
-    return new_pointer.QuadPart;
-}
-
-ErrorOr<void> ftruncate(int handle, off_t length)
-{
-    auto position = TRY(lseek(handle, 0, SEEK_CUR));
-    ScopeGuard restore_position = [&] { MUST(lseek(handle, position, SEEK_SET)); };
-
-    TRY(lseek(handle, length, SEEK_SET));
-
-    if (!SetEndOfFile(to_handle(handle)))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<struct stat> fstat(int handle)
-{
-    struct stat st = {};
-    int fd = _open_osfhandle(TRY(dup(handle)), 0);
-    ScopeGuard guard = [&] { _close(fd); };
-    if (::fstat(fd, &st) < 0)
-        return Error::from_syscall("fstat"sv, errno);
-    return st;
-}
-
-ErrorOr<void> ioctl(int fd, unsigned request, ...)
-{
-    va_list ap;
-    va_start(ap, request);
-    u_long* arg = va_arg(ap, u_long*);
-    va_end(ap);
-    if (::ioctlsocket(fd, request, arg) == SOCKET_ERROR)
+    u_long value = enabled ? 0 : 1;
+    if (::ioctlsocket(socket, FIONBIO, &value) == SOCKET_ERROR)
         return Error::from_windows_error();
     return {};
 }
@@ -123,88 +63,6 @@ ErrorOr<void> chdir(StringView path)
     ByteString path_string = path;
     if (::_chdir(path_string.characters()) < 0)
         return Error::from_syscall("chdir"sv, errno);
-    return {};
-}
-
-ErrorOr<struct stat> stat(StringView path)
-{
-    struct stat st = {};
-    ByteString path_string = path;
-    if (::stat(path_string.characters(), &st) < 0)
-        return Error::from_syscall("stat"sv, errno);
-    return st;
-}
-
-ErrorOr<void> rmdir(StringView path)
-{
-    ByteString path_string = path;
-    if (_rmdir(path_string.characters()) < 0)
-        return Error::from_syscall("rmdir"sv, errno);
-    return {};
-}
-
-ErrorOr<void> unlink(StringView path)
-{
-    ByteString path_string = path;
-    if (_unlink(path_string.characters()) < 0)
-        return Error::from_syscall("unlink"sv, errno);
-    return {};
-}
-
-ErrorOr<void> link(StringView old_path, StringView new_path)
-{
-    ByteString old_path_string = old_path;
-    ByteString new_path_string = new_path;
-    if (!CreateHardLinkA(new_path_string.characters(), old_path_string.characters(), nullptr))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<void> mkdir(StringView path, mode_t)
-{
-    ByteString str = path;
-    if (_mkdir(str.characters()) < 0)
-        return Error::from_syscall("mkdir"sv, errno);
-    return {};
-}
-
-ErrorOr<void> rename(StringView old_path, StringView new_path)
-{
-    ByteString old_path_string = old_path;
-    ByteString new_path_string = new_path;
-    if (!MoveFileExA(old_path_string.characters(), new_path_string.characters(), MOVEFILE_REPLACE_EXISTING))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<int> openat(int, StringView, int, mode_t)
-{
-    dbgln("Core::System::openat() is not implemented");
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<struct stat> fstatat(int, StringView, int)
-{
-    dbgln("Core::System::fstatat() is not implemented");
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<void*> mmap(void* address, size_t size, int protection, int flags, int file_handle, off_t offset, size_t alignment, StringView)
-{
-    // custom alignment is not supported
-    VERIFY(!alignment);
-    int fd = _open_osfhandle(TRY(dup(file_handle)), 0);
-    ScopeGuard guard = [&] { _close(fd); };
-    void* ptr = ::mmap(address, size, protection, flags, fd, offset);
-    if (ptr == MAP_FAILED)
-        return Error::from_syscall("mmap"sv, errno);
-    return ptr;
-}
-
-ErrorOr<void> munmap(void* address, size_t size)
-{
-    if (::munmap(address, size) < 0)
-        return Error::from_syscall("munmap"sv, errno);
     return {};
 }
 
@@ -438,46 +296,16 @@ ErrorOr<AddressInfoVector> getaddrinfo(char const* nodename, char const* servnam
     return AddressInfoVector { move(addresses), results };
 }
 
-ErrorOr<void> kill(pid_t pid, int signal)
-{
-    if (signal == SIGTERM) {
-        if (!EnumWindows([](HWND hwnd, LPARAM l_param) -> BOOL {
-                DWORD window_pid = 0;
-                GetWindowThreadProcessId(hwnd, &window_pid);
-                if (window_pid == static_cast<DWORD>(l_param)) {
-                    PostMessage(hwnd, WM_CLOSE, 0, 0);
-                }
-                return TRUE;
-            },
-                pid))
-            return Error::from_windows_error();
-    } else {
-        return Error::from_string_literal("Unsupported signal value");
-    }
-    return {};
-}
-
 ErrorOr<size_t> transfer_file_through_socket(int source_fd, int target_fd, size_t source_offset, size_t source_length)
 {
     // FIXME: We could use TransmitFile (https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-transmitfile)
     //        here. But in order to transmit a subset of the file, we have to use overlapped IO.
 
-    static auto allocation_granularity = []() {
-        SYSTEM_INFO system_info {};
-        GetSystemInfo(&system_info);
+    if (!AK::is_within_range<off_t>(source_offset))
+        return Error::from_errno(EOVERFLOW);
 
-        return system_info.dwAllocationGranularity;
-    }();
-
-    // MapViewOfFile requires the offset to be aligned to the system allocation granularity, so we must handle that here.
-    auto aligned_source_offset = (source_offset / allocation_granularity) * allocation_granularity;
-    auto offset_adjustment = source_offset - aligned_source_offset;
-    auto mapped_source_length = source_length + offset_adjustment;
-
-    auto* mapped = TRY(mmap(nullptr, mapped_source_length, PROT_READ, MAP_SHARED, source_fd, aligned_source_offset));
-    ScopeGuard guard { [&]() { (void)munmap(mapped, mapped_source_length); } };
-
-    return send(target_fd, { static_cast<u8*>(mapped) + offset_adjustment, source_length }, 0);
+    auto mapped_file = TRY(MappedFile::map_from_fd_range_and_close(TRY(dup(source_fd)), {}, static_cast<off_t>(source_offset), source_length));
+    return send(target_fd, mapped_file->bytes(), 0);
 }
 
 }

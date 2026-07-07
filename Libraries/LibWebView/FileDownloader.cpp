@@ -8,7 +8,7 @@
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
@@ -39,6 +39,14 @@ struct FileDownloader::ActiveDownload {
     Core::ElapsedTimer progress_update_timer;
     bool stopped { false };
 };
+
+Optional<double> FileDownloader::Download::progress() const
+{
+    if (!total_size.has_value() || *total_size == 0)
+        return {};
+
+    return static_cast<double>(min(downloaded_size, *total_size)) / static_cast<double>(*total_size);
+}
 
 FileDownloader::FileDownloader() = default;
 FileDownloader::~FileDownloader() = default;
@@ -228,7 +236,7 @@ void FileDownloader::finish_download(u64 id)
 
     active->file = nullptr;
 
-    if (auto result = Core::System::rename(active->temporary_destination.string(), download->destination.string()); result.is_error()) {
+    if (auto result = FileSystem::move_file(download->destination.string(), active->temporary_destination.string()); result.is_error()) {
         fail_download(id, MUST(String::formatted("Unable to save downloaded file: {}", result.error())));
         return;
     }
@@ -287,7 +295,7 @@ void FileDownloader::discard_active_download(u64 id)
         active->on_cancel();
 
     active->file = nullptr;
-    (void)Core::System::unlink(active->temporary_destination.string());
+    (void)FileSystem::remove(active->temporary_destination.string(), FileSystem::RecursionMode::Disallowed);
 
     Core::deferred_invoke([this, id] {
         m_active_downloads.remove(id);

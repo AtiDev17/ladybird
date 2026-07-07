@@ -12,6 +12,17 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Stream.h>
 #include <LibCore/Export.h>
+#include <sys/stat.h>
+
+#ifdef AK_OS_WINDOWS
+// The CRT's <sys/stat.h> lacks the POSIX file-type classification macros.
+#    ifndef S_ISDIR
+#        define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#    endif
+#    ifndef S_ISREG
+#        define S_ISREG(mode) (((mode) & S_IFMT) == S_IFREG)
+#    endif
+#endif
 
 namespace Core {
 
@@ -68,12 +79,19 @@ public:
     virtual ErrorOr<size_t> tell() const override;
     virtual ErrorOr<void> truncate(size_t length) override;
 
+    ErrorOr<struct stat> stat() const;
+
+    static ErrorOr<struct stat> stat(StringView path);
+    static ErrorOr<struct stat> fstat(int fd);
+
+#if !defined(AK_OS_WINDOWS)
     // Sets the blocking mode of the file. If blocking mode is disabled, reads
     // will fail with EAGAIN when there's no data available to read, and writes
     // will fail with EAGAIN when the data cannot be written without blocking
     // (due to the send buffer being full, for example).
     // See also Socket::set_blocking.
     ErrorOr<void> set_blocking(bool enabled);
+#endif
 
     int leak_fd()
     {
@@ -92,7 +110,10 @@ public:
             close();
     }
 
+#if !defined(AK_OS_WINDOWS)
+    // Translates an OpenMode into O_* flags; only meaningful for the POSIX backend.
     static int open_mode_to_options(OpenMode mode);
+#endif
 
 private:
     File(OpenMode mode, ShouldCloseFileDescriptor should_close = ShouldCloseFileDescriptor::Yes)

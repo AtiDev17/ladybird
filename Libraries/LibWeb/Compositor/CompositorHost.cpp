@@ -6,6 +6,7 @@
 
 #include <LibGfx/PaintingSurface.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Painting/Canvas2DCommandStream.h>
 #include <LibWeb/Painting/DisplayList.h>
 
 namespace Web::Compositor {
@@ -33,6 +34,9 @@ void CompositorContextHandle::stop_presenting_to_client()
 
 void CompositorContextHandle::update_display_list(NonnullRefPtr<Painting::DisplayList> display_list, Painting::AccumulatedVisualContextTree visual_context_tree, Painting::DisplayListResourceTransaction&& resource_transaction, Painting::ScrollStateSnapshot&& scroll_state_snapshot)
 {
+    // Pending canvas commands (and present markers) must reach the Compositor
+    // before a display list that samples the presented canvas surfaces.
+    m_host.flush_canvas_2d_stream();
     m_host.update_display_list(m_context_id, move(display_list), move(visual_context_tree), move(resource_transaction), move(scroll_state_snapshot));
 }
 
@@ -84,12 +88,19 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
 
 void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)
 {
+    m_host.flush_canvas_2d_stream();
     m_host.present_frame(m_context_id, viewport_rect);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
 {
+    m_host.flush_canvas_2d_stream();
     m_host.request_screenshot(m_context_id, move(target_surface), move(callback));
+}
+
+CompositorHost::CompositorHost()
+    : m_canvas_2d_stream(adopt_ref(*new Painting::Canvas2DCommandStream()))
+{
 }
 
 CompositorHost::~CompositorHost() = default;
@@ -97,6 +108,18 @@ CompositorHost::~CompositorHost() = default;
 OwnPtr<CompositorContextHandle> CompositorHost::create_context(CompositorContextId context_id)
 {
     return adopt_own(*new CompositorContextHandle(*this, context_id));
+}
+
+void CompositorHost::flush_canvas_2d_stream()
+{
+    if (m_canvas_2d_stream->is_empty())
+        return;
+    send_canvas_2d_stream(*m_canvas_2d_stream);
+}
+
+void CompositorHost::discard_canvas_2d_stream()
+{
+    (void)m_canvas_2d_stream->take_segments();
 }
 
 }

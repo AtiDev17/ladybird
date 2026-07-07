@@ -12,7 +12,6 @@ set(SOURCES
     EventReceiver.cpp
     File.cpp
     ImmutableBytes.cpp
-    MappedFile.cpp
     MimeData.cpp
     Notifier.cpp
     ReportTime.cpp
@@ -33,7 +32,9 @@ if (WIN32)
     list(APPEND SOURCES
         AnonymousBufferWindows.cpp
         EventLoopImplementationWindows.cpp
+        FileWindows.cpp
         LocalServerWindows.cpp
+        MappedFileWindows.cpp
         ProcessWindows.cpp
         SocketWindows.cpp
         SocketpairWindows.cpp
@@ -45,7 +46,9 @@ else()
     list(APPEND SOURCES
         AnonymousBuffer.cpp
         EventLoopImplementationUnix.cpp
+        FilePosix.cpp
         LocalServer.cpp
+        MappedFile.cpp
         Process.cpp
         Socket.cpp
         System.cpp
