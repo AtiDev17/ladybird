@@ -52,6 +52,7 @@ enum class ActionID {
     BookmarkItem,
 
     AddBookmark,
+    AddBookmarkAllTabs,
     AddBookmarkFolder,
     DeleteBookmark,
     DeleteBookmarkFolder,
@@ -66,6 +67,8 @@ enum class ActionID {
 
     OpenInNewTab,
     OpenInNewWindow,
+    DownloadLinkedFile,
+    DownloadLinkedFileAs,
     CopyURL,
 
     OpenImage,
