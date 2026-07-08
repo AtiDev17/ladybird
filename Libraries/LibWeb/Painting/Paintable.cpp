@@ -285,15 +285,20 @@ Paintable::SelectionStyle Paintable::selection_style() const
 
 Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const& layout_node, GC::Ptr<DOM::Node const> node)
 {
+    // Selections render in a muted color while the window does not have focus.
+    auto navigable = layout_node.document().navigable();
+    auto window_is_active = navigable && navigable->is_focused();
+
     auto default_style_for_color_scheme = [&](CSS::PreferredColorScheme color_scheme, bool use_palette_for_normal_color_scheme = true) {
         auto palette = layout_node.document().page().palette();
         auto palette_color_scheme = palette.is_dark() ? CSS::PreferredColorScheme::Dark : CSS::PreferredColorScheme::Light;
-        if (color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme)
-            return SelectionStyle { CSS::SystemColor::transform_selection_background_color(palette.selection()) };
+        if (color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme) {
+            auto background = window_is_active ? palette.selection() : palette.inactive_selection();
+            return SelectionStyle { CSS::SystemColor::transform_selection_background_color(background) };
+        }
 
-        return SelectionStyle {
-            CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(color_scheme))
-        };
+        auto background = window_is_active ? CSS::SystemColor::highlight(color_scheme) : CSS::SystemColor::inactive_highlight(color_scheme);
+        return SelectionStyle { CSS::SystemColor::transform_selection_background_color(background) };
     };
 
     // For text nodes, check the parent element since text nodes don't have computed properties.
@@ -379,7 +384,7 @@ void Paintable::set_selection_state(SelectionState state)
     invalidate_paint_cache();
 }
 
-void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offset)
+void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offset, TextAffinity affinity)
 {
     auto scroll_to_cursor = [&](PaintableFragment const& fragment) {
         auto cursor_rect = fragment.range_rect(SelectionState::StartAndEnd, offset, offset);
@@ -391,13 +396,25 @@ void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offse
         }
     };
 
+    PaintableFragment const* fallback_fragment = nullptr;
     Layout::TextOffsetMapping mapping { text };
     mapping.for_each_paintable_fragment([&](PaintableFragment const& fragment) {
-        if (offset < fragment.dom_start_offset_in_node() || offset > fragment.dom_end_offset_in_node())
+        switch (fragment.caret_match(offset, affinity)) {
+        case PaintableFragment::CaretMatch::None:
             return TraversalDecision::Continue;
-        scroll_to_cursor(fragment);
-        return TraversalDecision::Break;
+        case PaintableFragment::CaretMatch::SoftWrapFallback:
+            if (!fallback_fragment)
+                fallback_fragment = &fragment;
+            return TraversalDecision::Continue;
+        case PaintableFragment::CaretMatch::Direct:
+            fallback_fragment = nullptr;
+            scroll_to_cursor(fragment);
+            return TraversalDecision::Break;
+        }
+        VERIFY_NOT_REACHED();
     });
+    if (fallback_fragment)
+        scroll_to_cursor(*fallback_fragment);
 }
 
 void Paintable::scroll_ancestor_to_offset_into_view(size_t offset)
@@ -669,6 +686,66 @@ static void record_wheel_hit_test_target(Paintable const& paintable_box, Display
     });
 }
 
+static bool is_canvas_background_source(Layout::NodeWithStyle const& layout_node)
+{
+    if (layout_node.is_root_element())
+        return true;
+
+    auto const* html_element = layout_node.document().html_element();
+    return layout_node.is_body() && html_element && html_element->should_use_body_background_properties();
+}
+
+static Color effective_scrollbar_background_color(Paintable const& paintable_box)
+{
+    auto background_color = paintable_box.document().canvas_background_color();
+
+    Vector<Layout::NodeWithStyle const*> ancestors;
+    for (auto const* layout_node = &paintable_box.layout_node(); layout_node; layout_node = layout_node->parent()) {
+        if (auto const* layout_node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
+            ancestors.append(layout_node_with_style);
+    }
+
+    for (auto const* layout_node : ancestors.in_reverse()) {
+        auto const& layout_node_with_style = *layout_node;
+        if (is_canvas_background_source(layout_node_with_style))
+            continue;
+
+        auto color = layout_node_with_style.computed_values().background_color();
+        if (color.alpha() == 0)
+            continue;
+
+        background_color = background_color.blend(color);
+    }
+
+    return background_color;
+}
+
+static CSS::ScrollbarColorData automatic_scrollbar_colors(Paintable const& paintable_box)
+{
+    auto background_color = effective_scrollbar_background_color(paintable_box);
+    auto black_thumb = Color(Color::Black).with_alpha(128);
+    auto white_thumb = Color(Color::White).with_alpha(128);
+
+    auto black_thumb_contrast = background_color.contrast_ratio(background_color.blend(black_thumb));
+    auto white_thumb_contrast = background_color.contrast_ratio(background_color.blend(white_thumb));
+    auto thumb_color = black_thumb_contrast >= white_thumb_contrast ? black_thumb : white_thumb;
+
+    return {
+        .thumb_color = thumb_color,
+        .track_color = thumb_color.with_alpha(25),
+        .is_auto = true,
+    };
+}
+
+static CSS::ScrollbarColorData scrollbar_colors_for_paint(Paintable const& paintable_box)
+{
+    auto scrollbar_colors = paintable_box.computed_values().scrollbar_color();
+    if (!scrollbar_colors.is_auto)
+        return scrollbar_colors;
+
+    return automatic_scrollbar_colors(paintable_box);
+}
+
 static void record_viewport_scrollbar_state(Paintable const& paintable_box, DisplayListRecordingContext& context)
 {
     if (!paintable_box.is_viewport_paintable())
@@ -680,7 +757,7 @@ static void record_viewport_scrollbar_state(Paintable const& paintable_box, Disp
     if (paintable_box.computed_values().scrollbar_width() == CSS::ScrollbarWidth::None)
         return;
 
-    auto scrollbar_colors = paintable_box.computed_values().scrollbar_color();
+    auto scrollbar_colors = scrollbar_colors_for_paint(paintable_box);
     auto const& metrics = context.chrome_metrics();
 
     for (auto direction : { Paintable::ScrollDirection::Vertical, Paintable::ScrollDirection::Horizontal }) {
@@ -693,9 +770,6 @@ static void record_viewport_scrollbar_state(Paintable const& paintable_box, Disp
         auto gutter_rect = context.rounded_device_rect(scrollbar_data->gutter_rect).to_type<int>();
         auto max_scroll_offset = css_point_to_device_point(maximum_scroll_offset_for(paintable_box), context.device_pixels_per_css_pixel());
         auto orientation = direction == Paintable::ScrollDirection::Horizontal ? Gfx::Orientation::Horizontal : Gfx::Orientation::Vertical;
-        auto thumb_color = scrollbar_colors.thumb_color;
-        if (gutter_rect.is_empty() && thumb_color == CSS::InitialValues::scrollbar_color().thumb_color)
-            thumb_color = thumb_color.with_alpha(128);
 
         context.display_list_recorder().compositor_viewport_scrollbar({
             .document_id = paintable_box.document().unique_id(),
@@ -707,7 +781,7 @@ static void record_viewport_scrollbar_state(Paintable const& paintable_box, Disp
             .scroll_size = scrollbar_data->thumb_travel_to_scroll_ratio.to_double(),
             .expanded_scroll_size = expanded_scrollbar_data->thumb_travel_to_scroll_ratio.to_double(),
             .max_scroll_offset = max_scroll_offset.primary_offset_for_orientation(orientation),
-            .thumb_color = thumb_color,
+            .thumb_color = scrollbar_colors.thumb_color,
             .track_color = scrollbar_colors.track_color,
             .vertical = direction == Paintable::ScrollDirection::Vertical,
         });
@@ -1649,22 +1723,19 @@ void Paintable::paint(DisplayListRecordingContext& context, PaintPhase phase) co
 
         if (((g_paint_viewport_scrollbars && !document().page().async_scrolling_enabled()) || !is_viewport_paintable())
             && computed_values().scrollbar_width() != CSS::ScrollbarWidth::None) {
-            auto scrollbar_colors = computed_values().scrollbar_color();
+            auto scrollbar_colors = scrollbar_colors_for_paint(*this);
 
             for (auto direction : { ScrollDirection::Vertical, ScrollDirection::Horizontal }) {
                 auto scrollbar_data = compute_scrollbar_data(direction, metrics);
                 if (!scrollbar_data.has_value())
                     continue;
                 auto gutter_rect = context.rounded_device_rect(scrollbar_data->gutter_rect).to_type<int>();
-                auto thumb_color = scrollbar_colors.thumb_color;
-                if (gutter_rect.is_empty() && thumb_color == CSS::InitialValues::scrollbar_color().thumb_color)
-                    thumb_color = thumb_color.with_alpha(128);
                 context.display_list_recorder().paint_scrollbar(
                     m_own_scroll_frame_index,
                     gutter_rect,
                     context.rounded_device_rect(scrollbar_data->thumb_rect).to_type<int>(),
                     scrollbar_data->thumb_travel_to_scroll_ratio.to_double(),
-                    thumb_color,
+                    scrollbar_colors.thumb_color,
                     scrollbar_colors.track_color,
                     direction == ScrollDirection::Vertical);
             }
@@ -2695,6 +2766,11 @@ BorderRadiiData Paintable::border_radii_data() const
 Optional<BordersData> Paintable::outline_data() const
 {
     auto const& computed_values = this->computed_values();
+
+    // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
+    if (computed_values.outline_style() == CSS::OutlineStyle::Auto && (!navigable() || !navigable()->is_focused()))
+        return {};
+
     return borders_data_for_outline(layout_node(), computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
 }
 

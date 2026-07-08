@@ -39,12 +39,15 @@ public:
     void append_box(Paintable const&, Paintable& target, CSSPixelRect, VisualContextIndex, BorderRadiiData);
     void append_svg_path(Paintable& target, Gfx::Path, Gfx::WindingRule, CSSPixelRect bounding_box, VisualContextIndex);
     void append_text_fragment(PaintableFragment const&, VisualContextIndex);
+    void append_empty_line(PaintableFragment const& sibling_fragment, size_t caret_offset, size_t line_box_index, CSSPixelRect line_rect, VisualContextIndex);
     void append_empty_editable(PaintableWithLines const&, CSSPixelRect, VisualContextIndex);
     void append_chrome_widget(Paintable const&, ChromeWidget&, VisualContextIndex);
 
     u64 visual_context_tree_version() const { return m_visual_context_tree_version; }
     [[nodiscard]] Optional<HitTestResult> hit_test(CSSPixelPoint, HitTestType, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&) const;
-    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, CaretPositionMode = CaretPositionMode::Normal) const;
+    // When constraint_scope is given, the caret position is constrained to lines inside that node, and points
+    // outside it resolve to the closest position within it.
+    [[nodiscard]] Optional<CaretPosition> caret_position_from_point(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, CaretPositionMode = CaretPositionMode::Normal, DOM::Node const* constraint_scope = nullptr) const;
     TraversalDecision hit_test_all(CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, ChromeMetrics const&, Function<TraversalDecision(HitTestResult)> const&) const;
 
 private:
@@ -54,6 +57,8 @@ private:
         Box,
         SvgPath,
         TextFragment,
+        // A line box with no fragments (e.g. a blank line in a textarea), recorded as a caret target only.
+        EmptyLine,
         EmptyEditable,
         ChromeWidget,
     };
@@ -63,6 +68,8 @@ private:
         NonnullRefPtr<Paintable> paintable;
         RefPtr<ChromeWidget> chrome_widget;
         PaintableFragment const* text_fragment { nullptr };
+        // For EmptyLine items: the caret offset in the text node of the sibling text_fragment.
+        size_t caret_offset { 0 };
         CSSPixelRect rect;
         CSSPixelRect caret_rect;
         Optional<size_t> caret_line_index;
@@ -97,7 +104,7 @@ private:
     void add_item_to_caret_items(size_t item_index);
     SpatialIndex& spatial_index_for(VisualContextIndex);
 
-    [[nodiscard]] Optional<CSSPixelPoint> local_point_for_visual_context(VisualContextIndex, CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel) const;
+    [[nodiscard]] Optional<CSSPixelPoint> local_point_for_visual_context(VisualContextIndex, CSSPixelPoint, ViewportPaintable const&, double device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior = AccumulatedVisualContextTree::ClipBehavior::Respect) const;
     [[nodiscard]] CSSPixelRect viewport_rect_for_item(Item const&, CSSPixelRect const&, ViewportPaintable const&, double device_pixels_per_css_pixel) const;
     [[nodiscard]] CSSPixelRect caret_line_rect_for_item(Item const&) const;
     [[nodiscard]] bool item_contains(Item const&, CSSPixelPoint local_point, ChromeMetrics const&) const;

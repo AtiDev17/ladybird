@@ -702,12 +702,28 @@ void WebContentView::dropEvent(QDropEvent* event)
 
 void WebContentView::focusInEvent(QFocusEvent*)
 {
-    client().async_set_has_focus(m_client_state.page_index, true);
+    update_page_focus();
 }
 
 void WebContentView::focusOutEvent(QFocusEvent*)
 {
-    client().async_set_has_focus(m_client_state.page_index, false);
+    update_page_focus();
+}
+
+void WebContentView::update_page_focus()
+{
+    // Focus can move between this widget, the native window container, and the embedded native window in bursts of
+    // events whose order is not meaningful (e.g. the container reports losing focus after native focus has already
+    // moved to the embedded window). Instead of trusting individual events, evaluate the resulting focus state once
+    // the burst has settled.
+    QTimer::singleShot(0, this, [this] {
+        auto focused = hasFocus();
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+        if (!focused)
+            focused = vulkan_window_has_native_focus();
+#endif
+        client().async_set_has_focus(m_client_state.page_index, focused);
+    });
 }
 
 Optional<WebContentView::Paintable> WebContentView::current_paintable() const
@@ -827,6 +843,23 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
     handle_resize();
 }
 
+void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, [[maybe_unused]] int right)
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    if (m_vertical_tab_overlay_left == left && m_vertical_tab_overlay_right == right)
+        return;
+
+    // While vertical tabs are hover-expanded they overlay this view. On the Vulkan presentation path, the native window
+    // would occlude them, so we clear these left/right strips (in logical pixels) to transparent, letting the tab
+    // column that paints in the widget backing store show through.
+    m_vertical_tab_overlay_left = left;
+    m_vertical_tab_overlay_right = right;
+
+    update_vulkan_window_input_region();
+    schedule_repaint();
+#endif
+}
+
 void WebContentView::set_zoom_level(double zoom_level)
 {
     m_zoom_level = zoom_level;
@@ -913,6 +946,18 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
     palette.set_color(Gfx::ColorRole::InactiveSelectionText, appkit_web_inactive_selection_text_color());
 #else
     translate(Gfx::ColorRole::Selection, QPalette::ColorRole::Highlight);
+
+    auto active_highlight = qt_palette.color(QPalette::Active, QPalette::ColorRole::Highlight);
+    auto inactive_highlight = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::Highlight);
+    if (inactive_highlight != active_highlight) {
+        palette.set_color(Gfx::ColorRole::InactiveSelection, Gfx::Color::from_bgra(inactive_highlight.rgba()));
+        auto inactive_highlighted_text = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::HighlightedText);
+        palette.set_color(Gfx::ColorRole::InactiveSelectionText, Gfx::Color::from_bgra(inactive_highlighted_text.rgba()));
+    } else {
+        // The Qt theme does not differentiate inactive selections; use a neutral gray.
+        auto inactive_selection = is_using_dark_system_theme(widget) ? Gfx::Color(0x60, 0x60, 0x60) : Gfx::Color(0xd4, 0xd4, 0xd4);
+        palette.set_color(Gfx::ColorRole::InactiveSelection, inactive_selection);
+    }
 #endif
 
     palette.set_flag(Gfx::FlagRole::IsDark, is_using_dark_system_theme(widget));
@@ -1118,6 +1163,9 @@ bool WebContentView::event(QEvent* event)
         event->accept();
         return true;
     }
+
+    if (event->type() == QEvent::ActivationChange)
+        update_page_focus();
 
     return WebContentViewBase::event(event);
 }

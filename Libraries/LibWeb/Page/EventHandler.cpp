@@ -37,6 +37,7 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/AutoScrollHandler.h>
@@ -1389,8 +1390,12 @@ EventResult EventHandler::handle_paste(Utf16String const& text)
     if (!target)
         return EventResult::Dropped;
 
-    FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertFromPaste, m_navigable, text));
-    target->handle_insert(UIEvents::InputTypes::insertFromPaste, text);
+    // Clipboard text can contain CRLF or lone CR line breaks (e.g. from the system clipboard); normalize them to
+    // newlines like other browsers, so that no raw carriage returns end up in the document.
+    auto normalized_text = Infra::normalize_newlines(text);
+
+    FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertFromPaste, m_navigable, normalized_text));
+    target->handle_insert(UIEvents::InputTypes::insertFromPaste, normalized_text);
 
     return EventResult::Handled;
 }
@@ -2140,9 +2145,9 @@ bool EventHandler::initiate_character_selection(DOM::Document& document, Paintin
         m_mouse_selection_target = active_target;
 
         if (shift_held)
-            active_target->set_selection_focus(*hit_node, index);
+            active_target->set_selection_focus(*hit_node, index, caret_position.affinity);
         else
-            active_target->set_selection_anchor(*hit_node, index);
+            active_target->set_selection_anchor(*hit_node, index, caret_position.affinity);
     } else {
         m_mouse_selection_target = nullptr;
 
@@ -2291,7 +2296,14 @@ void EventHandler::update_mouse_selection(CSSPixelPoint visual_viewport_position
 void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
 {
     auto& document = *m_navigable->active_document();
-    auto caret_position = document.caret_position_from_point_for_selection(visual_viewport_position);
+
+    // Selection driven through an input events target (a text control or editing host) is constrained to that
+    // target's scope, so the selection keeps tracking the mouse after it leaves the target.
+    DOM::Node const* constraint_scope = nullptr;
+    if (m_mouse_selection_target)
+        constraint_scope = m_mouse_selection_target->mouse_selection_scope();
+
+    auto caret_position = document.caret_position_from_point_for_selection(visual_viewport_position, constraint_scope);
     if (!caret_position.has_value())
         return;
 
@@ -2374,7 +2386,13 @@ void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
     if (m_mouse_selection_target) {
         if (anchor_offset.has_value())
             m_mouse_selection_target->set_selection_anchor(anchor_node ? *anchor_node : *focus_node, anchor_offset.value());
-        m_mouse_selection_target->set_selection_focus(*focus_node, focus_index);
+        // The hit test affinity only applies when the focus is exactly the hit position; word and paragraph selection
+        // modes override the focus with segment boundaries.
+        auto focus_affinity = m_selection_mode == SelectionMode::Character
+                && focus_node == caret_position->boundary.node && focus_index == caret_position->boundary.offset
+            ? caret_position->affinity
+            : TextAffinity::Downstream;
+        m_mouse_selection_target->set_selection_focus(*focus_node, focus_index, focus_affinity);
     } else {
         if (auto selection = document.get_selection()) {
             auto selection_anchor_node = anchor_node ? anchor_node : selection->anchor_node();

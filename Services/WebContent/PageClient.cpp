@@ -45,6 +45,7 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebView/SiteIsolation.h>
@@ -150,11 +151,22 @@ void PageClient::set_has_focus(bool has_focus)
 
     m_has_focus = has_focus;
 
-    if (auto document = page().top_level_traversable()->active_document()) {
-        if (has_focus)
-            document->reset_cursor_blink_cycle();
-        document->set_cursor_position_needs_repaint();
-    }
+    if (auto document = page().top_level_traversable()->active_document(); document && has_focus)
+        document->reset_cursor_blink_cycle();
+
+    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so
+    // nothing painted before the change can be reused; repaint every document in the traversable.
+    Function<void(Web::HTML::LocalNavigable&)> invalidate_cached_paint_recursively = [&](Web::HTML::LocalNavigable& navigable) {
+        if (auto navigable_document = navigable.active_document()) {
+            // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
+            // on the current paintable tree here, without requiring layout to be up to date first.
+            if (auto viewport_paintable = navigable_document->unsafe_paintable())
+                viewport_paintable->invalidate_all_cached_paint();
+        }
+        for (auto& child_navigable : navigable.child_navigables())
+            invalidate_cached_paint_recursively(*child_navigable);
+    };
+    invalidate_cached_paint_recursively(page().top_level_traversable());
 }
 
 void PageClient::set_window_handle(String window_handle)
