@@ -39,6 +39,8 @@
 
 namespace Web::CSS::Parser {
 
+Optional<FeatureComparison> parse_feature_comparison(TokenStream<ComponentValue>&);
+
 namespace CalcParsing {
 
 struct Operator {
@@ -170,6 +172,7 @@ public:
     RefPtr<StyleValue const> parse_as_css_value(PropertyID);
     RefPtr<StyleValue const> parse_as_descriptor_value(AtRuleID, DescriptorNameAndID const&);
     RefPtr<StyleValue const> parse_as_type(ValueType);
+    RefPtr<StyleValue const> parse_entirely_as_type(ValueType);
 
     Optional<ComponentValue> parse_as_component_value();
 

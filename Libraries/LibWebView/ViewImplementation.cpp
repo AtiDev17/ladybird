@@ -491,10 +491,10 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentClient>
 {
     auto event = m_pending_input_events.dequeue();
 
-    if (event_result == Web::EventResult::Handled)
+    if (event_result == Web::EventResult::Handled || event_result == Web::EventResult::Cancelled)
         return;
 
-    // Here we handle events that were not consumed or cancelled by the WebContent. Propagate the event back
+    // Here we handle events that were not consumed by the WebContent. Propagate the event back
     // to the concrete view implementation.
     event.visit(
         [this](Web::KeyEvent const& event) {
@@ -1144,6 +1144,20 @@ void ViewImplementation::did_change_audio_play_state(Badge<WebContentClient>, We
     }
 
     if (state_changed && on_audio_play_state_changed)
+        on_audio_play_state_changed(m_audio_play_state);
+}
+
+void ViewImplementation::reset_page_media_state()
+{
+    auto const should_notify_audio_play_state_changed = m_audio_play_state != Web::HTML::AudioPlayState::Paused
+        || m_number_of_elements_playing_audio != 0
+        || m_mute_state != Web::HTML::MuteState::Unmuted;
+
+    m_audio_play_state = Web::HTML::AudioPlayState::Paused;
+    m_number_of_elements_playing_audio = 0;
+    m_mute_state = Web::HTML::MuteState::Unmuted;
+
+    if (should_notify_audio_play_state_changed && on_audio_play_state_changed)
         on_audio_play_state_changed(m_audio_play_state);
 }
 
@@ -1808,6 +1822,8 @@ void ViewImplementation::handle_web_content_process_crash(LoadErrorPage load_err
     }
 
     ++m_crash_count;
+    reset_page_media_state();
+
     constexpr size_t max_reasonable_crash_count = 5U;
     if (m_crash_count >= max_reasonable_crash_count) {
         if (!headless_mode) {
