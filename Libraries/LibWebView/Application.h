@@ -29,6 +29,7 @@
 #include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/Compositor/Types.h>
 #include <LibWeb/HTML/ActivateTab.h>
+#include <LibWeb/HTML/NavigableId.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
@@ -76,6 +77,7 @@ public:
 
     virtual bool supports_vertical_tabs() const { return false; }
     virtual bool supports_server_side_window_decorations() const { return false; }
+    virtual bool supports_private_browsing_windows() const { return false; }
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
 
     static BookmarkStore& bookmark_store() { return the().m_bookmark_store; }
@@ -100,10 +102,12 @@ public:
         NonnullRefPtr<WebContentClient> client;
         u64 page_id { 0 };
     };
-    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate);
+    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Web::HTML::NavigableId root_navigable_id);
     u64 allocate_page_id();
+    Web::HTML::NavigableIdAllocator allocate_navigable_id_allocator();
 
     void maybe_close_private_browsing_session();
+    void reset_private_browsing_session();
 
     Web::Compositor::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
@@ -118,13 +122,15 @@ public:
     void notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id);
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
-    virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
     virtual bool activate_tab_with_url(URL::URL const&) const { return false; }
+
+    virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
+    virtual void open_url_in_new_window(URL::URL const&, IsPrivate) { }
+
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
 
     Main::Arguments const& command_line_arguments() const { return m_arguments; }
-    virtual void open_url_in_new_window(URL::URL const& url);
 
     void add_child_process(Process&&);
 
@@ -269,7 +275,7 @@ protected:
     Main::Arguments& arguments() { return m_arguments; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id, Optional<Web::HTML::NavigableId> root_navigable_id = {});
     PrivateBrowsingSession& ensure_private_browsing_session();
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
@@ -395,6 +401,7 @@ private:
     RefPtr<WebContentClient> m_spare_web_content_process;
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
     u64 m_next_page_or_compositor_context_id { 1 };
+    u64 m_next_navigable_id_namespace { 1 };
 
     RefPtr<Database::Database> m_database;
     RefPtr<Database::Database> m_history_database;
