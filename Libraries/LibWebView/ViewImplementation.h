@@ -41,11 +41,13 @@
 #include <LibWeb/HTML/SelectItem.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/DOMNodeProperties.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/PrivateBrowsing.h>
@@ -150,6 +152,8 @@ public:
     ByteString selected_text();
     ByteString cut_selected_text();
     Optional<String> selected_text_with_whitespace_collapsed();
+    Optional<DictionaryLookup> selected_text_for_dictionary_lookup();
+    bool look_up_selected_text_at(Gfx::IntPoint widget_position);
     void select_all();
     void find_in_page(String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
     void find_in_page_next_match();
@@ -251,6 +255,8 @@ public:
 
     void did_change_audio_play_state(Badge<WebContentClient>, Web::HTML::AudioPlayState);
     Web::HTML::AudioPlayState audio_play_state() const { return m_audio_play_state; }
+    void did_change_screen_wake_lock_state(Badge<WebContentClient>, Web::ScreenWakeLockState);
+    Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
     void did_update_session_history(Badge<WebContentClient>, Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32>, size_t current_used_step_index);
     void did_update_session_history_for_testing(Badge<WebContentClient>, Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32>, size_t current_used_step_index);
@@ -308,6 +314,7 @@ public:
     void remove_navigation_listener(u64 listener_id);
 
     Function<void(ByteString const& path, i32)> on_request_file;
+    Function<void(DictionaryLookup const&, Gfx::IntPoint)> on_request_dictionary_lookup;
     Function<void(Gfx::Bitmap const&)> on_favicon_change;
     Function<void(Gfx::Cursor const&)> on_cursor_change;
     Function<void(Gfx::IntPoint, ByteString const&)> on_request_tooltip_override;
@@ -363,11 +370,13 @@ public:
     Function<void(Gfx::Color)> on_theme_color_change;
     Function<void(Gfx::Color)> on_page_background_color_change;
     Function<void(Web::HTML::AudioPlayState)> on_audio_play_state_changed;
+    Function<void(Web::ScreenWakeLockState)> on_screen_wake_lock_state_changed;
     Function<void()> on_web_content_crashed;
     Function<void()> on_web_content_process_change_for_cross_site_navigation;
 
     Menu& page_context_menu() { return *m_page_context_menu; }
     Menu& link_context_menu() { return *m_link_context_menu; }
+    Menu& selected_text_link_context_menu() { return *m_selected_text_link_context_menu; }
     Menu& image_context_menu() { return *m_image_context_menu; }
     Menu& media_context_menu() { return *m_media_context_menu; }
 
@@ -459,6 +468,7 @@ protected:
     void update_bookmark_action();
 
     void initialize_context_menus();
+    void update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position);
     enum class PromptForPath : u8 {
         No,
         Yes,
@@ -494,6 +504,7 @@ protected:
 
     RefPtr<Menu> m_page_context_menu;
     RefPtr<Menu> m_link_context_menu;
+    RefPtr<Menu> m_selected_text_link_context_menu;
     RefPtr<Menu> m_image_context_menu;
     RefPtr<Menu> m_media_context_menu;
 
@@ -507,6 +518,10 @@ protected:
     RefPtr<Action> m_toggle_bookmark_action;
 
     RefPtr<Action> m_reset_zoom_action;
+
+    RefPtr<Action> m_look_up_selected_text_action;
+    Optional<DictionaryLookup> m_look_up;
+    Gfx::IntPoint m_look_up_position;
 
     RefPtr<Action> m_search_selected_text_action;
     Optional<String> m_search_text;
@@ -559,6 +574,7 @@ protected:
 
     Web::HTML::AudioPlayState m_audio_play_state { Web::HTML::AudioPlayState::Paused };
     size_t m_number_of_elements_playing_audio { 0 };
+    Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 

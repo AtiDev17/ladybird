@@ -12,6 +12,7 @@
 #include <AK/GenericShorthands.h>
 #include <AK/RefPtr.h>
 #include <AK/TypeCasts.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/CSS/InvalidationSet.h>
@@ -263,7 +264,7 @@ public:
 
     String base_uri() const;
 
-    virtual Optional<String> alternative_text() const;
+    virtual Optional<Utf16String> alternative_text() const;
 
     Utf16String descendant_text_content() const;
     Optional<Utf16String> text_content() const;
@@ -271,8 +272,8 @@ public:
 
     WebIDL::ExceptionOr<void> normalize();
 
-    Optional<String> node_value() const;
-    WebIDL::ExceptionOr<void> set_node_value(Optional<String> const&);
+    Optional<Utf16String> node_value() const;
+    WebIDL::ExceptionOr<void> set_node_value(Optional<Utf16String> const&);
 
     GC::Ptr<HTML::LocalNavigable> navigable() const;
 
@@ -440,7 +441,7 @@ public:
 
     void add_registered_observer(RegisteredObserver&);
 
-    void queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
+    void queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
 
     // https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-descendant
     template<typename Callback>
@@ -483,8 +484,8 @@ public:
         return nullptr;
     }
 
-    ErrorOr<String> accessible_name(Document const&, ShouldComputeRole = ShouldComputeRole::Yes) const;
-    ErrorOr<String> accessible_description(Document const&) const;
+    ErrorOr<Utf16String> accessible_name(Document const&, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> accessible_description(Document const&) const;
 
     Optional<String> locate_a_namespace(Optional<String> const& prefix) const;
     Optional<String> lookup_namespace_uri(Optional<String> prefix) const;
@@ -536,7 +537,7 @@ protected:
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
-    ErrorOr<String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
 
 private:
     void queue_tree_mutation_record(Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
@@ -548,7 +549,7 @@ private:
     void remove_child_impl(GC::Ref<Node>);
     void clear_layout_node_paintables();
 
-    static Optional<StringView> first_valid_id(StringView, Document const&);
+    static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
     GC::Ptr<NodeList> m_child_nodes;
 };

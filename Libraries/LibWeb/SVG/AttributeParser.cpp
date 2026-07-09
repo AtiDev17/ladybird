@@ -10,22 +10,23 @@
 #include <AK/GenericShorthands.h>
 #include <AK/StringBuilder.h>
 #include <AK/StringConversions.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/SVG/AttributeParser.h>
 
 namespace Web::SVG {
 
-AttributeParser::AttributeParser(StringView source)
+AttributeParser::AttributeParser(Utf16View source)
     : m_lexer(source)
 {
 }
 
-Optional<Vector<Transform>> AttributeParser::parse_transform(StringView input)
+Optional<Vector<Transform>> AttributeParser::parse_transform(Utf16View input)
 {
     AttributeParser parser { input };
     return parser.parse_transform();
 }
 
-Path AttributeParser::parse_path_data(StringView input)
+Path AttributeParser::parse_path_data(Utf16View input)
 {
     AttributeParser parser { input };
     parser.parse_whitespace();
@@ -41,34 +42,7 @@ Path AttributeParser::parse_path_data(StringView input)
     return Path { move(parser.m_instructions) };
 }
 
-Optional<float> AttributeParser::parse_coordinate(StringView input)
-{
-    AttributeParser parser { input };
-    parser.parse_whitespace();
-    auto result_or_error = parser.parse_coordinate();
-    if (result_or_error.is_error())
-        return {};
-    parser.parse_whitespace();
-    if (parser.done())
-        return result_or_error.value();
-    return {};
-}
-
-Optional<float> AttributeParser::parse_length(StringView input)
-{
-    AttributeParser parser { input };
-    parser.parse_whitespace();
-    auto result_or_error = parser.parse_length();
-    if (result_or_error.is_error())
-        return {};
-    parser.parse_whitespace();
-    if (parser.done())
-        return result_or_error.value();
-
-    return {};
-}
-
-Optional<i32> AttributeParser::parse_integer(StringView input)
+Optional<i32> AttributeParser::parse_integer(Utf16View input)
 {
     AttributeParser parser { input };
     parser.parse_whitespace();
@@ -89,7 +63,7 @@ float NumberPercentage::resolve_relative_to(float length) const
     return m_value * length;
 }
 
-Optional<NumberPercentage> AttributeParser::parse_number_percentage(StringView input)
+Optional<NumberPercentage> AttributeParser::parse_number_percentage(Utf16View input)
 {
     AttributeParser parser { input };
     parser.parse_whitespace();
@@ -107,17 +81,7 @@ Optional<NumberPercentage> AttributeParser::parse_number_percentage(StringView i
     return {};
 }
 
-Optional<float> AttributeParser::parse_positive_length(StringView input)
-{
-    // FIXME: Where this is used, the spec usually (always?) says "A negative value is an error (see Error processing)."
-    //        So, implement error processing! Maybe this should return ErrorOr.
-    auto result = parse_length(input);
-    if (result.has_value() && result.value() < 0)
-        result.clear();
-    return result;
-}
-
-Vector<Gfx::FloatPoint> AttributeParser::parse_points(StringView input)
+Vector<Gfx::FloatPoint> AttributeParser::parse_points(Utf16View input)
 {
     AttributeParser parser { input };
 
@@ -487,7 +451,7 @@ int AttributeParser::parse_sign()
     return 1;
 }
 
-static bool whitespace(char c)
+static bool whitespace(char16_t c)
 {
     // wsp:
     // Either a U+000A LINE FEED, U+000D CARRIAGE RETURN, U+0009 CHARACTER TABULATION, or U+0020 SPACE.
@@ -495,10 +459,10 @@ static bool whitespace(char c)
 }
 
 // https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute
-Optional<PreserveAspectRatio> AttributeParser::parse_preserve_aspect_ratio(StringView input)
+Optional<PreserveAspectRatio> AttributeParser::parse_preserve_aspect_ratio(Utf16View input)
 {
     // <align> <meetOrSlice>?
-    GenericLexer lexer { input };
+    Utf16GenericLexer lexer { input };
     lexer.ignore_while(whitespace);
     auto align_string = lexer.consume_until(whitespace);
     if (align_string.is_empty())
@@ -556,9 +520,9 @@ Optional<PreserveAspectRatio> AttributeParser::parse_preserve_aspect_ratio(Strin
 // https://svgwg.org/svg2-draft/pservers.html#LinearGradientElementGradientUnitsAttribute
 // https://drafts.fxtf.org/css-masking/#element-attrdef-mask-maskunits
 // https://drafts.fxtf.org/css-masking/#element-attrdef-mask-maskcontentunits
-Optional<SVGUnits> AttributeParser::parse_units(StringView input)
+Optional<SVGUnits> AttributeParser::parse_units(Utf16View input)
 {
-    GenericLexer lexer { input };
+    Utf16GenericLexer lexer { input };
     lexer.ignore_while(whitespace);
     auto gradient_units_string = lexer.consume_until(whitespace);
     if (gradient_units_string == "userSpaceOnUse"sv)
@@ -569,9 +533,9 @@ Optional<SVGUnits> AttributeParser::parse_units(StringView input)
 }
 
 // https://svgwg.org/svg2-draft/pservers.html#RadialGradientElementSpreadMethodAttribute
-Optional<SpreadMethod> AttributeParser::parse_spread_method(StringView input)
+Optional<SpreadMethod> AttributeParser::parse_spread_method(Utf16View input)
 {
-    GenericLexer lexer { input };
+    Utf16GenericLexer lexer { input };
     lexer.ignore_while(whitespace);
     auto spread_method_string = lexer.consume_until(whitespace);
     if (spread_method_string == "pad"sv)
@@ -584,7 +548,7 @@ Optional<SpreadMethod> AttributeParser::parse_spread_method(StringView input)
 }
 
 // https://drafts.fxtf.org/filter-effects-1/#element-attrdef-fecomponenttransfer-tablevalues
-Vector<float> AttributeParser::parse_table_values(StringView input)
+Vector<float> AttributeParser::parse_table_values(Utf16View input)
 {
     Vector<float> table_values;
 
@@ -746,7 +710,7 @@ Optional<Vector<Transform>> AttributeParser::parse_transform()
     return transform_list;
 }
 
-Optional<ViewBox> AttributeParser::parse_viewbox(StringView input)
+Optional<ViewBox> AttributeParser::parse_viewbox(Utf16View input)
 {
     AttributeParser parser { input };
     ViewBox viewbox;
@@ -792,7 +756,7 @@ bool AttributeParser::match_whitespace() const
 {
     if (done())
         return false;
-    char c = ch();
+    char16_t c = ch();
     return c == 0x9 || c == 0x20 || c == 0xa || c == 0xc || c == 0xd;
 }
 

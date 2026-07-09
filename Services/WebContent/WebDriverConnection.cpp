@@ -1444,7 +1444,7 @@ Messages::WebDriverClient::GetElementAttributeResponse WebDriverConnection::get_
         else {
             // The result of getting an attribute by name name.
             if (auto attr = element->get_attribute(name); attr.has_value())
-                result = attr.release_value();
+                result = attr.release_value().to_utf8();
         }
 
         // 5. Return success with data result.
@@ -1671,7 +1671,7 @@ Messages::WebDriverClient::GetComputedLabelResponse WebDriverConnection::get_com
         auto label = element->accessible_name(element->document()).release_value_but_fixme_should_propagate_errors();
 
         // 5. Return success with data label.
-        async_driver_execution_complete({ move(label) });
+        async_driver_execution_complete({ label.to_utf8() });
     });
 
     return JsonValue {};

@@ -235,7 +235,7 @@ double number_from_style_value(NonnullRefPtr<StyleValue const> const& style_valu
     VERIFY_NOT_REACHED();
 }
 
-FlyString const& string_from_style_value(NonnullRefPtr<StyleValue const> const& style_value)
+Utf16FlyString const& string_from_style_value(NonnullRefPtr<StyleValue const> const& style_value)
 {
     if (style_value->is_string())
         return style_value->as_string().string_value();

@@ -8,6 +8,7 @@
 
 #include <LibCore/EventLoop.h>
 #include <LibURL/URL.h>
+#include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/DownloadPresentation.h>
@@ -655,6 +656,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     m_page_context_menu = create_context_menu(*this, view(), view().page_context_menu());
     m_link_context_menu = create_context_menu(*this, view(), view().link_context_menu());
+    m_selected_text_link_context_menu = create_context_menu(*this, view(), view().selected_text_link_context_menu());
     m_image_context_menu = create_context_menu(*this, view(), view().image_context_menu());
     m_media_context_menu = create_context_menu(*this, view(), view().media_context_menu());
 
@@ -896,11 +898,11 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
                     accepted_file_filters.append(qformatted("{} ({})", title, extensions.join(" ")));
                 },
                 [&](Web::HTML::FileFilter::MimeType const& filter) {
-                    if (auto mime_type = mime_database.mimeTypeForName(qstring_from_ak_string(filter.value)); mime_type.isValid())
+                    if (auto mime_type = mime_database.mimeTypeForName(qstring_from_utf16_string(filter.value)); mime_type.isValid())
                         accepted_file_filters.append(mime_type.filterString());
                 },
                 [&](Web::HTML::FileFilter::Extension const& filter) {
-                    accepted_file_filters.append(qformatted("*.{}", filter.value));
+                    accepted_file_filters.append(qformatted("*.{}", qstring_from_utf16_string(filter.value)));
                 });
         }
 
@@ -960,6 +962,10 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     view().on_audio_play_state_changed = [this](auto play_state) {
         emit audio_play_state_changed(tab_index(), play_state);
+    };
+
+    view().on_screen_wake_lock_state_changed = [this](auto wake_lock_state) {
+        set_screen_wake_lock_state(wake_lock_state);
     };
 
     auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
@@ -1229,6 +1235,21 @@ void Tab::open_file()
 int Tab::tab_index()
 {
     return m_window->tab_index(this);
+}
+
+void Tab::set_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
+{
+    switch (wake_lock_state) {
+    case Web::ScreenWakeLockState::Released:
+        m_screen_display_sleep_inhibitor.clear();
+        break;
+    case Web::ScreenWakeLockState::Acquired:
+        if (m_screen_display_sleep_inhibitor.has_value())
+            break;
+        if (auto inhibitor = WakeLock::DisplaySleepInhibitor::create("Ladybird Content"sv); !inhibitor.is_error())
+            m_screen_display_sleep_inhibitor = inhibitor.release_value();
+        break;
+    }
 }
 
 void Tab::resizeEvent(QResizeEvent* event)

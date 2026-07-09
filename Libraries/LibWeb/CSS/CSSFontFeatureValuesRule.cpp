@@ -18,17 +18,23 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSFontFeatureValuesRule);
 
-GC::Ref<CSSFontFeatureValuesRule> CSSFontFeatureValuesRule::create(JS::Realm& realm, Vector<FlyString> font_families)
+GC::Ref<CSSFontFeatureValuesRule> CSSFontFeatureValuesRule::create(JS::Realm& realm, Vector<Utf16FlyString> font_families)
 {
     return realm.create<CSSFontFeatureValuesRule>(realm, move(font_families));
 }
 
-bool CSSFontFeatureValuesRule::is_font_feature_value_type_at_keyword(FlyString const& keyword)
+bool CSSFontFeatureValuesRule::is_font_feature_value_type_at_keyword(Utf16View keyword)
 {
-    return first_is_one_of(keyword, "stylistic", "historical-forms", "styleset", "character-variant", "swash", "ornaments", "annotation");
+    return keyword.equals_ignoring_ascii_case("stylistic"sv)
+        || keyword.equals_ignoring_ascii_case("historical-forms"sv)
+        || keyword.equals_ignoring_ascii_case("styleset"sv)
+        || keyword.equals_ignoring_ascii_case("character-variant"sv)
+        || keyword.equals_ignoring_ascii_case("swash"sv)
+        || keyword.equals_ignoring_ascii_case("ornaments"sv)
+        || keyword.equals_ignoring_ascii_case("annotation"sv);
 }
 
-CSSFontFeatureValuesRule::CSSFontFeatureValuesRule(JS::Realm& realm, Vector<FlyString> font_families)
+CSSFontFeatureValuesRule::CSSFontFeatureValuesRule(JS::Realm& realm, Vector<Utf16FlyString> font_families)
     : CSSRule(realm, CSSRule::Type::FontFeatureValues)
     , m_font_families(move(font_families))
     , m_annotation(realm.create<CSSFontFeatureValuesMap>(realm, 1, *this))
@@ -41,7 +47,7 @@ CSSFontFeatureValuesRule::CSSFontFeatureValuesRule(JS::Realm& realm, Vector<FlyS
 {
 }
 
-FlyString CSSFontFeatureValuesRule::font_family() const
+String CSSFontFeatureValuesRule::font_family() const
 {
     StringBuilder builder;
 
@@ -49,7 +55,7 @@ FlyString CSSFontFeatureValuesRule::font_family() const
         if (builder.length() > 0)
             builder.append(", "sv);
 
-        if (family.code_points().contains_any_of(Infra::ASCII_WHITESPACE_CODE_POINTS))
+        if (family.view().contains_any_of(Infra::ASCII_WHITESPACE_CODE_POINTS))
             serialize_a_string(builder, family);
         else
             serialize_an_identifier(builder, family);
@@ -58,12 +64,12 @@ FlyString CSSFontFeatureValuesRule::font_family() const
     return MUST(builder.to_string());
 }
 
-void CSSFontFeatureValuesRule::set_font_family(FlyString const& value)
+void CSSFontFeatureValuesRule::set_font_family(String const& value)
 {
-    Vector<FlyString> family_names;
+    Vector<Utf16FlyString> family_names;
 
     for (auto const& family_name : value.bytes_as_string_view().split_view(','))
-        family_names.append(MUST(FlyString::from_utf8(family_name.trim_whitespace())));
+        family_names.append(Utf16FlyString { Utf16String::from_utf8(family_name.trim_whitespace()) });
 
     m_font_families = move(family_names);
 }

@@ -60,9 +60,9 @@ void HTMLTableElement::adjust_computed_style(CSS::ComputedProperties::Builder& s
         style.set_property(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Start));
 }
 
-static unsigned parse_border(StringView value)
+static unsigned parse_border(Utf16View value)
 {
-    return value.to_number<unsigned>().value_or(0);
+    return parse_non_negative_integer(value).value_or(0);
 }
 
 bool HTMLTableElement::is_presentational_hint(FlyString const& name) const
@@ -154,7 +154,7 @@ void HTMLTableElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
     });
 }
 
-void HTMLTableElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLTableElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 

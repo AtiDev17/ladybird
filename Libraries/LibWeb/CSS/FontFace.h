@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16View.h>
 #include <LibGfx/Font/Typeface.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibURL/URL.h>
@@ -30,7 +32,8 @@ public:
     [[nodiscard]] static GC::Ref<FontFace> create_css_connected(JS::Realm&, CSSFontFaceRule&);
     virtual ~FontFace() override;
 
-    String family() const { return m_family; }
+    String family() const { return MUST(m_family.view().to_utf8()); }
+    Utf16FlyString const& family_name() const { return m_family; }
     WebIDL::ExceptionOr<void> set_family(String const&);
     void set_family_impl(NonnullRefPtr<StyleValue const> const& value);
 
@@ -122,7 +125,7 @@ private:
     [[nodiscard]] Optional<ComputationContext> computation_context() const;
 
     // FIXME: Should we be storing StyleValues instead?
-    String m_family;
+    Utf16FlyString m_family;
     String m_style;
     String m_weight;
     String m_stretch;
@@ -155,8 +158,10 @@ private:
 };
 
 bool font_format_is_supported(FlyString const& name);
+bool font_format_is_supported(Utf16View name);
 
 bool font_tech_is_supported(FontTech);
 bool font_tech_is_supported(FlyString const& name);
+bool font_tech_is_supported(Utf16View name);
 
 }

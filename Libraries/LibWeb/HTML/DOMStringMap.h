@@ -22,12 +22,12 @@ public:
 
     virtual ~DOMStringMap() override;
 
-    String determine_value_of_named_property(FlyString const&) const;
+    Utf16String determine_value_of_named_property(Utf16FlyString const&) const;
 
-    virtual WebIDL::ExceptionOr<void> set_value_of_new_named_property(String const&, JS::Value) override;
-    virtual WebIDL::ExceptionOr<void> set_value_of_existing_named_property(String const&, JS::Value) override;
+    virtual WebIDL::ExceptionOr<void> set_value_of_new_named_property(Utf16FlyString const&, JS::Value) override;
+    virtual WebIDL::ExceptionOr<void> set_value_of_existing_named_property(Utf16FlyString const&, JS::Value) override;
 
-    virtual WebIDL::ExceptionOr<DidDeletionFail> delete_value(String const&) override;
+    virtual WebIDL::ExceptionOr<DidDeletionFail> delete_value(Utf16FlyString const&) override;
 
 private:
     explicit DOMStringMap(DOM::Element&);
@@ -36,12 +36,12 @@ private:
     virtual void visit_edges(Cell::Visitor&) override;
 
     // ^PlatformObject
-    virtual JS::Value named_item_value(FlyString const&) const override;
-    virtual Vector<FlyString> supported_property_names() const override;
+    virtual JS::Value named_item_value(Utf16FlyString const&) const override;
+    virtual Vector<Utf16FlyString> supported_property_names() const override;
 
     struct NameValuePair {
-        FlyString name;
-        String value;
+        Utf16FlyString name;
+        Utf16String value;
     };
 
     Vector<NameValuePair> get_name_value_pairs() const;

@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <AK/FlyString.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Variant.h>
 #include <LibWeb/CSS/Number.h>
 #include <LibWeb/CSS/Parser/SourcePosition.h>
@@ -66,17 +66,17 @@ public:
     // Use this only to create types that don't have their own create_foo() methods below.
     static Token create(Type, String original_source_text = {});
 
-    static Token create_ident(FlyString ident, String original_source_text = {});
-    static Token create_function(FlyString name, String original_source_text = {});
-    static Token create_at_keyword(FlyString name, String original_source_text = {});
-    static Token create_hash(FlyString value, HashType hash_type, String original_source_text = {});
-    static Token create_string(FlyString value, String original_source_text = {});
-    static Token create_url(FlyString url, String original_source_text = {});
+    static Token create_ident(Utf16FlyString ident, String original_source_text = {});
+    static Token create_function(Utf16FlyString name, String original_source_text = {});
+    static Token create_at_keyword(Utf16FlyString name, String original_source_text = {});
+    static Token create_hash(Utf16FlyString value, HashType hash_type, String original_source_text = {});
+    static Token create_string(Utf16FlyString value, String original_source_text = {});
+    static Token create_url(Utf16FlyString url, String original_source_text = {});
     static Token create_delim(u32 delim, String original_source_text = {});
     static Token create_number(Number value, String original_source_text = {});
     static Token create_percentage(Number value, String original_source_text = {});
-    static Token create_dimension(Number value, FlyString unit, String original_source_text = {});
-    static Token create_dimension(double value, FlyString unit, String original_source_text = {})
+    static Token create_dimension(Number value, Utf16FlyString unit, String original_source_text = {});
+    static Token create_dimension(double value, Utf16FlyString unit, String original_source_text = {})
     {
         return create_dimension(Number { Number::Type::Number, value }, move(unit), move(original_source_text));
     }
@@ -85,13 +85,13 @@ public:
     Type type() const { return m_type; }
     bool is(Type type) const { return m_type == type; }
 
-    FlyString const& ident() const
+    Utf16FlyString const& ident() const
     {
         VERIFY(m_type == Type::Ident);
         return string_value();
     }
 
-    FlyString const& function() const
+    Utf16FlyString const& function() const
     {
         VERIFY(m_type == Type::Function);
         return string_value();
@@ -103,19 +103,19 @@ public:
         return m_value.get<u32>();
     }
 
-    FlyString const& string() const
+    Utf16FlyString const& string() const
     {
         VERIFY(m_type == Type::String);
         return string_value();
     }
 
-    FlyString const& url() const
+    Utf16FlyString const& url() const
     {
         VERIFY(m_type == Type::Url);
         return string_value();
     }
 
-    FlyString const& at_keyword() const
+    Utf16FlyString const& at_keyword() const
     {
         VERIFY(m_type == Type::AtKeyword);
         return string_value();
@@ -126,7 +126,7 @@ public:
         VERIFY(m_type == Type::Hash);
         return m_value.get<HashValue>().type;
     }
-    FlyString const& hash_value() const
+    Utf16FlyString const& hash_value() const
     {
         VERIFY(m_type == Type::Hash);
         return m_value.get<HashValue>().value;
@@ -155,7 +155,7 @@ public:
         return m_value.get<Number>().integer_value();
     }
 
-    FlyString const& dimension_unit() const
+    Utf16FlyString const& dimension_unit() const
     {
         VERIFY(m_type == Type::Dimension);
         return m_value.get<DimensionValue>().unit;
@@ -192,7 +192,7 @@ public:
 
 private:
     struct HashValue {
-        FlyString value;
+        Utf16FlyString value;
         HashType type { HashType::Unrestricted };
 
         bool operator==(HashValue const&) const = default;
@@ -200,17 +200,17 @@ private:
 
     struct DimensionValue {
         Number number;
-        FlyString unit;
+        Utf16FlyString unit;
 
         bool operator==(DimensionValue const&) const = default;
     };
 
-    FlyString const& string_value() const;
+    Utf16FlyString const& string_value() const;
     Number const& number_value_for_type() const;
 
     Type m_type { Type::Invalid };
 
-    Variant<Empty, FlyString, u32, Number, HashValue, DimensionValue> m_value;
+    Variant<Empty, Utf16FlyString, u32, Number, HashValue, DimensionValue> m_value;
 
     String m_original_source_text;
     SourcePosition m_start_position;

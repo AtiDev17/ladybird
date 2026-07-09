@@ -43,10 +43,12 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Dump.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -64,6 +66,7 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/FlexLayoutData.h>
 #include <LibWeb/Layout/GridLayoutData.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/ProxyMappings.h>
@@ -74,7 +77,9 @@
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/Selection/Selection.h>
 #include <LibWebView/Attribute.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/ViewImplementation.h>
 #include <WebContent/CompositorConnection.h>
 #include <WebContent/ConnectionFromClient.h>
@@ -742,8 +747,8 @@ void ConnectionFromClient::inspect_storage(u64 page_id, Web::StorageAPI::Storage
             continue;
 
         JsonObject item;
-        item.set("name"sv, name.release_value());
-        item.set("value"sv, value.release_value());
+        item.set("name"sv, name.release_value().to_utf8());
+        item.set("value"sv, value.release_value().to_utf8());
         storage_items.must_append(move(item));
     }
 
@@ -773,12 +778,12 @@ Messages::WebContentServer::SetSessionStorageItemResponse ConnectionFromClient::
     if (!storage.has_value())
         return Optional<WebView::StorageSetResult> {};
 
-    auto old_value = (*storage)->get_item(key);
-    auto result = (*storage)->set_item(key, value);
+    auto old_value = (*storage)->get_item(Utf16String::from_utf8(key));
+    auto result = (*storage)->set_item(Utf16String::from_utf8(key), Utf16String::from_utf8(value));
     if (result.is_exception())
         return WebView::StorageSetResult { WebView::StorageOperationError::QuotaExceededError };
 
-    return WebView::StorageSetResult { move(old_value) };
+    return WebView::StorageSetResult { old_value.map([](auto const& value) { return MUST(value.utf16_view().to_utf8()); }) };
 }
 
 Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClient::remove_session_storage_item(u64 page_id, String key)
@@ -791,10 +796,10 @@ Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClien
     if (!storage.has_value())
         return Optional<String> {};
 
-    auto old_value = (*storage)->get_item(key);
+    auto old_value = (*storage)->get_item(Utf16String::from_utf8(key));
     if (old_value.has_value())
-        (*storage)->remove_item(key);
-    return old_value;
+        (*storage)->remove_item(Utf16String::from_utf8(key));
+    return old_value.map([](auto const& value) { return MUST(value.utf16_view().to_utf8()); });
 }
 
 Messages::WebContentServer::ClearSessionStorageResponse ConnectionFromClient::clear_session_storage(u64 page_id)
@@ -2031,6 +2036,99 @@ Messages::WebContentServer::GetSelectedTextResponse ConnectionFromClient::get_se
     return ByteString {};
 }
 
+static WebView::DictionaryLookupTextStyle dictionary_lookup_text_style_from_layout_node(Web::Layout::Node const& layout_node, double zoom_level)
+{
+    auto const& font = layout_node.first_available_font();
+    return {
+        .font_family = font.family().to_string(),
+        .ui_point_size = font.pixel_size() * static_cast<float>(zoom_level),
+        .weight = font.weight(),
+        .slope = font.slope(),
+    };
+}
+
+static Web::Layout::Node const* layout_node_for_dictionary_lookup(Web::DOM::Node const& node)
+{
+    for (auto const* current = &node; current; current = current->parent_or_shadow_host_node()) {
+        auto const* layout_node = current->layout_node();
+        if (layout_node && layout_node->has_style_or_parent_with_style())
+            return layout_node;
+    }
+
+    return nullptr;
+}
+
+static Optional<Gfx::IntPoint> dictionary_lookup_baseline_origin_for_range(Web::DOM::Range& range, Web::Page& page, Web::Layout::Node const& layout_node)
+{
+    auto& document = range.start_container()->document();
+    auto navigable = document.navigable();
+    if (!navigable)
+        return {};
+
+    auto to_top_level_viewport_point = [&](Web::CSSPixelPoint point) {
+        auto scroll_offset = navigable->viewport_scroll_offset();
+        Web::CSSPixelPoint viewport_point { point.x() - scroll_offset.x(), point.y() - scroll_offset.y() };
+        return navigable->to_top_level_position(viewport_point);
+    };
+
+    auto rect = range.get_bounding_client_rect();
+    if (rect->width() <= 0 || rect->height() <= 0)
+        return {};
+
+    auto const& font = layout_node.first_available_font();
+    Web::CSSPixelPoint baseline_origin {
+        Web::CSSPixels::nearest_value_for(rect->x()),
+        Web::CSSPixels::nearest_value_for(rect->y() + font.pixel_metrics().ascent),
+    };
+    return page.css_to_device_point(to_top_level_viewport_point(baseline_origin)).to_type<int>();
+}
+
+Messages::WebContentServer::GetSelectedTextForLookupResponse ConnectionFromClient::get_selected_text_for_lookup(u64 page_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return Optional<WebView::DictionaryLookup> {};
+
+    auto& navigable = page->page().focused_navigable();
+    auto text = navigable.selected_text();
+    if (text.is_empty())
+        return Optional<WebView::DictionaryLookup> {};
+
+    auto document = navigable.active_document();
+    auto range = document ? document->get_selection()->range() : nullptr;
+    auto const* layout_node = range ? layout_node_for_dictionary_lookup(range->start_container()) : nullptr;
+    if (!layout_node && document) {
+        if (auto active_element = document->active_element())
+            layout_node = layout_node_for_dictionary_lookup(*active_element);
+    }
+
+    Optional<WebView::DictionaryLookupTextStyle> style;
+    Optional<Gfx::IntPoint> baseline_origin;
+    if (layout_node) {
+        style = dictionary_lookup_text_style_from_layout_node(*layout_node, navigable.page().client().zoom_level());
+        if (range)
+            baseline_origin = dictionary_lookup_baseline_origin_for_range(*range, page->page(), *layout_node);
+    }
+
+    return WebView::DictionaryLookup {
+        .text = move(text),
+        .style = move(style),
+        .baseline_origin = baseline_origin,
+    };
+}
+
+Messages::WebContentServer::SelectWordForDictionaryLookupResponse ConnectionFromClient::select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position)
+{
+#if defined(AK_OS_MACOS)
+    if (auto page = this->page(page_id); page.has_value())
+        return page->page().select_word_for_dictionary_lookup(position);
+#else
+    (void)page_id;
+    (void)position;
+#endif
+    return false;
+}
+
 Messages::WebContentServer::CutSelectedTextResponse ConnectionFromClient::cut_selected_text(u64 page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -2396,10 +2494,10 @@ void ConnectionFromClient::toggle_media_controls_state(u64 page_id)
         page->page().toggle_media_controls_state();
 }
 
-void ConnectionFromClient::toggle_page_mute_state(u64 page_id)
+void ConnectionFromClient::set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->page().toggle_page_mute_state();
+        page->page().set_page_mute_state(mute_state);
 }
 
 void ConnectionFromClient::set_user_style(u64 page_id, String source)

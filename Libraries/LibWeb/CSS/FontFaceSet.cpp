@@ -243,7 +243,7 @@ static WebIDL::ExceptionOr<GC::Ref<JS::Set>> find_matching_font_faces(JS::Realm&
 
         for (auto font_face_value : *available_font_faces) {
             auto& font_face = as<FontFace>(font_face_value.as_object());
-            if (font_face.family() != font_family_name)
+            if (font_face.family_name() != font_family_name)
                 continue;
 
             matched_font_faces->set_add(font_face_value);

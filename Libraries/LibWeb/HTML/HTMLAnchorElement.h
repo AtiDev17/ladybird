@@ -22,8 +22,11 @@ public:
 
     virtual Optional<URL::Origin> extract_an_origin() const override { return hyperlink_element_utils_extract_an_origin(); }
 
-    String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
-    String download() const { return get_attribute_value(HTML::AttributeNames::download); }
+    Utf16String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
+    void set_rel(Utf16String const& rel) { set_attribute_value(HTML::AttributeNames::rel, rel); }
+
+    Utf16String download() const { return get_attribute_value(HTML::AttributeNames::download); }
+    void set_download(Utf16String const& download) { set_attribute_value(HTML::AttributeNames::download, download); }
 
     GC::Ref<DOM::DOMTokenList> rel_list();
 
@@ -53,7 +56,7 @@ private:
     virtual void activation_behavior(Web::DOM::Event const&) override;
 
     // ^DOM::Element
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
     virtual i32 default_tab_index_value() const override;
 
     // ^HTML::HyperlinkElementUtils

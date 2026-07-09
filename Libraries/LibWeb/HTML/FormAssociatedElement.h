@@ -93,7 +93,7 @@ public:
     bool suffering_from_a_custom_error() const;
 
     virtual Utf16String form_value() const { return {}; }
-    virtual Optional<String> optional_value() const { VERIFY_NOT_REACHED(); }
+    virtual Optional<Utf16String> optional_value() const { VERIFY_NOT_REACHED(); }
 
     virtual HTMLElement& form_associated_element_to_html_element() = 0;
     HTMLElement const& form_associated_element_to_html_element() const { return const_cast<FormAssociatedElement&>(*this).form_associated_element_to_html_element(); }
@@ -154,12 +154,12 @@ protected:
     virtual void form_associated_element_was_inserted();
     virtual void form_associated_element_was_removed(DOM::Node*);
     virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>);
-    virtual void form_associated_element_attribute_changed(FlyString const&, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&);
+    virtual void form_associated_element_attribute_changed(FlyString const&, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<FlyString> const&);
 
     void form_node_was_inserted();
     void form_node_was_removed();
     void form_node_was_moved();
-    void form_node_attribute_changed(FlyString const&, Optional<String> const&);
+    void form_node_attribute_changed(FlyString const&, Optional<Utf16String> const&);
 
     void visit_edges(JS::Cell::Visitor&);
 

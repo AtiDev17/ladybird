@@ -52,16 +52,15 @@ Utf16String normalize_newlines(Utf16String const& string)
     if (!string.contains('\r'))
         return string;
 
-    // FIXME: Implement a UTF-16 GenericLexer.
     Utf16StringBuilder builder(string.length_in_code_units());
+    Utf16GenericLexer lexer { string.utf16_view() };
 
-    for (size_t i = 0; i < string.length_in_code_units(); ++i) {
-        if (auto code_unit = string.code_unit_at(i); code_unit == '\r') {
-            if (i + 1 < string.length_in_code_units() && string.code_unit_at(i + 1) == '\n')
-                ++i;
+    while (!lexer.is_eof()) {
+        builder.append(lexer.consume_until('\r'));
+
+        if (lexer.peek() == '\r') {
+            lexer.ignore(1 + static_cast<size_t>(lexer.peek(1) == '\n'));
             builder.append_ascii('\n');
-        } else {
-            builder.append_code_unit(code_unit);
         }
     }
 
@@ -115,6 +114,12 @@ bool is_code_unit_prefix(StringView potential_prefix_utf8, StringView input_utf8
     auto potential_prefix = Utf16String::from_utf8(potential_prefix_utf8);
     auto input = Utf16String::from_utf8(input_utf8);
 
+    return is_code_unit_prefix(potential_prefix.utf16_view(), input.utf16_view());
+}
+
+// https://infra.spec.whatwg.org/#code-unit-prefix
+bool is_code_unit_prefix(Utf16View potential_prefix, Utf16View input)
+{
     // 1. Let i be 0.
     size_t i = 0;
 
@@ -150,6 +155,19 @@ ErrorOr<String> convert_to_scalar_value_string(StringView string)
     StringBuilder scalar_value_builder;
     auto utf8_view = Utf8View { string };
     for (u32 code_point : utf8_view) {
+        if (is_unicode_surrogate(code_point))
+            code_point = 0xFFFD;
+        scalar_value_builder.append_code_point(code_point);
+    }
+    return scalar_value_builder.to_string();
+}
+
+// https://infra.spec.whatwg.org/#scalar-value-string
+ErrorOr<Utf16String> convert_to_scalar_value_string(Utf16View string)
+{
+    // To convert a string into a scalar value string, replace any surrogates with U+FFFD.
+    Utf16StringBuilder scalar_value_builder;
+    for (u32 code_point : string) {
         if (is_unicode_surrogate(code_point))
             code_point = 0xFFFD;
         scalar_value_builder.append_code_point(code_point);

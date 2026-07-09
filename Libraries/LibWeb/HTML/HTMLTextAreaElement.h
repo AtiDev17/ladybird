@@ -74,7 +74,7 @@ public:
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const override;
 
     virtual void form_associated_element_was_inserted() override;
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
 
     virtual void children_changed(ChildrenChangedMetadata const&) override;
 
@@ -143,7 +143,7 @@ public:
     GC::Ptr<DOM::Element> placeholder_element() { return m_placeholder_element; }
     GC::Ptr<DOM::Element const> placeholder_element() const { return m_placeholder_element; }
 
-    Optional<String> placeholder_value() const;
+    Optional<Utf16String> placeholder_value() const;
 
 private:
     HTMLTextAreaElement(DOM::Document&, DOM::QualifiedName);

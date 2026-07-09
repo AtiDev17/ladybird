@@ -217,10 +217,10 @@ Optional<ARIA::Role> HTMLTableCellElement::default_role() const
             // tests at https://wpt.fyi/results/html-aam/table-roles.html require doing these ancestor checks — and
             // implementing them causes the behavior to match that of other engines.
             // https://w3c.github.io/html-aam/#el-th-columnheader
-            if (get_attribute(HTML::AttributeNames::scope) == "columnheader" || ancestor->local_name() == TagNames::thead)
+            if (get_attribute(HTML::AttributeNames::scope) == "columnheader"sv || ancestor->local_name() == TagNames::thead)
                 return ARIA::Role::columnheader;
             // https://w3c.github.io/html-aam/#el-th-rowheader
-            if (get_attribute(HTML::AttributeNames::scope) == "rowheader" || ancestor->local_name() == TagNames::tbody)
+            if (get_attribute(HTML::AttributeNames::scope) == "rowheader"sv || ancestor->local_name() == TagNames::tbody)
                 return ARIA::Role::rowheader;
         }
     }

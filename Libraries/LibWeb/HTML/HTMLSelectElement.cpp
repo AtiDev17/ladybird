@@ -174,10 +174,10 @@ Optional<JS::Value> HTMLSelectElement::item_value(size_t index) const
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem
-HTMLOptionElement* HTMLSelectElement::named_item(FlyString const& name)
+HTMLOptionElement* HTMLSelectElement::named_item(Utf16String const& name)
 {
     // The namedItem(name) method must return the value returned by the method of the same name on the options collection, when invoked with the same argument.
-    return as<HTMLOptionElement>(const_cast<HTMLOptionsCollection&>(*options()).named_item(name));
+    return as<HTMLOptionElement>(const_cast<HTMLOptionsCollection&>(*options()).named_item(Utf16FlyString::from_utf16(name.utf16_view())));
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add
@@ -586,16 +586,16 @@ void HTMLSelectElement::show_the_picker_if_applicable()
                 for (auto const& child : opt_group_element->children_as_vector()) {
                     if (auto const& option_element = as_if<HTMLOptionElement>(*child)) {
                         if (!option_element->has_attribute(Web::HTML::AttributeNames::hidden))
-                            option_group_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, MUST(Infra::strip_and_collapse_whitespace(option_element->label())), option_element->value().to_utf8_but_should_be_ported_to_utf16() });
+                            option_group_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, Infra::strip_and_collapse_whitespace(option_element->label()), option_element->value() });
                     }
                 }
-                m_select_items.append(SelectItemOptionGroup { opt_group_element->get_attribute(AttributeNames::label).value_or(String {}), option_group_items });
+                m_select_items.append(SelectItemOptionGroup { opt_group_element->get_attribute(AttributeNames::label).value_or({}), option_group_items });
             }
         }
 
         if (auto const& option_element = as_if<HTMLOptionElement>(*child)) {
             if (!option_element->has_attribute(Web::HTML::AttributeNames::hidden))
-                m_select_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, MUST(Infra::strip_and_collapse_whitespace(option_element->label())), option_element->value().to_utf8_but_should_be_ported_to_utf16() });
+                m_select_items.append(SelectItemOption { id_counter++, option_element->selected(), option_element->disabled(), option_element, Infra::strip_and_collapse_whitespace(option_element->label()), option_element->value() });
         }
 
         if (auto const* hr_element = as_if<HTMLHRElement>(*child)) {
@@ -682,7 +682,7 @@ void HTMLSelectElement::form_associated_element_was_inserted()
     create_shadow_tree_if_needed();
 }
 
-void HTMLSelectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const&)
+void HTMLSelectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<FlyString> const&)
 {
     if (name == HTML::AttributeNames::multiple) {
         // If the multiple attribute is absent then update the selectedness of the option elements.
@@ -781,7 +781,7 @@ void HTMLSelectElement::clone_selected_option_into_select_button()
 
     // 3. If option is not null, then set text to option's label.
     if (option.has_value())
-        text = Utf16String::from_utf8((*option)->label());
+        text = (*option)->label();
 
     // 4. Set select's select fallback button text to text.
     m_inner_text_element->string_replace_all(move(text));

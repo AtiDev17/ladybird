@@ -41,7 +41,7 @@ public:
     WebIDL::ExceptionOr<void> set_length(WebIDL::UnsignedLong);
     HTMLOptionElement* item(WebIDL::UnsignedLong index);
     virtual Optional<JS::Value> item_value(size_t index) const override;
-    HTMLOptionElement* named_item(FlyString const& name);
+    HTMLOptionElement* named_item(Utf16String const& name);
     WebIDL::ExceptionOr<void> add(HTMLOptionOrOptGroupElement element, NullableHTMLElementOrElementIndex before = { Empty {} });
     virtual WebIDL::ExceptionOr<void> set_value_of_indexed_property(u32, JS::Value) override;
     void remove();
@@ -100,7 +100,7 @@ public:
     virtual void activation_behavior(DOM::Event const&) override;
 
     virtual void form_associated_element_was_inserted() override;
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
 
     void did_select_item(Optional<u32> const& id);
 

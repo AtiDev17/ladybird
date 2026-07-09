@@ -6,6 +6,7 @@
 
 #include <AK/FFIHelpers.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/CSS/CharacterTypes.h>
@@ -112,7 +113,9 @@ static SourcePosition position_from_ffi(size_t line, size_t column)
 Token RustTokenizer::token_from_ffi(FFI::CssToken const& ffi_token)
 {
     auto original_source_text = ffi_string(ffi_token.original_source_ptr, ffi_token.original_source_len);
-    auto payload = ffi_fly_string(ffi_token.value_ptr, ffi_token.value_len);
+    auto payload = ffi_token.value_len == 0
+        ? Utf16FlyString {}
+        : Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(ffi_token.value_ptr), ffi_token.value_len });
 
     Token token;
     switch (ffi_token.token_type) {
@@ -158,7 +161,10 @@ Token RustTokenizer::token_from_ffi(FFI::CssToken const& ffi_token)
         token = Token::create_percentage(Number { css_number_type_from_ffi(ffi_token.number_type), ffi_token.number_value }, move(original_source_text));
         break;
     case FFI::CssTokenType::Dimension:
-        token = Token::create_dimension(Number { css_number_type_from_ffi(ffi_token.number_type), ffi_token.number_value }, move(payload), move(original_source_text));
+        token = Token::create_dimension(
+            Number { css_number_type_from_ffi(ffi_token.number_type), ffi_token.number_value },
+            move(payload),
+            move(original_source_text));
         break;
     case FFI::CssTokenType::Whitespace:
         token = Token::create_whitespace(move(original_source_text));

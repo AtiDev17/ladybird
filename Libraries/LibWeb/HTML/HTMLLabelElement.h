@@ -17,7 +17,7 @@ class HTMLLabelElement final : public HTMLElement {
 public:
     virtual ~HTMLLabelElement() override;
 
-    Optional<String> for_() const { return attribute(HTML::AttributeNames::for_); }
+    Optional<Utf16String> for_() const { return attribute(HTML::AttributeNames::for_); }
 
     GC::Ptr<HTMLElement> control() const;
     GC::Ptr<HTMLFormElement> form() const;

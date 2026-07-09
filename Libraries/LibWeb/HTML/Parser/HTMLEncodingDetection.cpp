@@ -344,7 +344,7 @@ Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document& document, 
                 //    * If the attribute's name is "http-equiv"
                 if (attribute_name == AttributeNames::http_equiv) {
                     // If the attribute's value is "content-type", then set got pragma to true.
-                    got_pragma = attribute->value() == "content-type";
+                    got_pragma = attribute->value() == "content-type"sv;
                 }
 
                 //    * If the attribute's name is "content"

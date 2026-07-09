@@ -871,6 +871,7 @@ set(SOURCES
     Page/InputEvent.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
+    Page/ScreenWakeLockHandle.cpp
     Painting/AccumulatedVisualContext.cpp
     Painting/BackgroundPainting.cpp
     Painting/Blending.cpp

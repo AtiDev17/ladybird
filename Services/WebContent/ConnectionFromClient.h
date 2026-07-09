@@ -191,7 +191,7 @@ private:
     virtual void toggle_media_fullscreen_state(u64 page_id) override;
     virtual void toggle_media_controls_state(u64 page_id) override;
 
-    virtual void toggle_page_mute_state(u64 page_id) override;
+    virtual void set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state) override;
 
     virtual void set_user_style(u64 page_id, String) override;
 
@@ -201,6 +201,8 @@ private:
     virtual void request_internal_page_info(u64 page_id, WebView::PageInfoType) override;
 
     virtual Messages::WebContentServer::GetSelectedTextResponse get_selected_text(u64 page_id) override;
+    virtual Messages::WebContentServer::GetSelectedTextForLookupResponse get_selected_text_for_lookup(u64 page_id) override;
+    virtual Messages::WebContentServer::SelectWordForDictionaryLookupResponse select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) override;
     virtual Messages::WebContentServer::CutSelectedTextResponse cut_selected_text(u64 page_id) override;
     virtual void select_all(u64 page_id) override;
 

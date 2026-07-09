@@ -7,6 +7,7 @@
 
 #include <AK/Debug.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/Bindings/HTMLScriptElement.h>
 #include <LibWeb/Bindings/Intrinsics.h>
@@ -64,14 +65,14 @@ void HTMLScriptElement::adopted_from(DOM::Document& old_document)
         m_document_load_event_delayer.emplace(document());
 }
 
-void HTMLScriptElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLScriptElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == HTML::AttributeNames::crossorigin) {
         m_crossorigin = cors_setting_attribute_from_keyword(value);
     } else if (name == HTML::AttributeNames::referrerpolicy) {
-        m_referrer_policy = ReferrerPolicy::from_string(value.value_or(""_string)).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+        m_referrer_policy = ReferrerPolicy::from_string(value.value_or({})).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
     } else if (name == HTML::AttributeNames::src) {
         // https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:concept-element-attributes-change-ext
         // 1. If namespace is not null, then return.
@@ -166,7 +167,7 @@ void HTMLScriptElement::execute_script()
             document->set_current_script({}, nullptr);
 
         if (m_from_an_external_file)
-            dbgln_if(HTML_SCRIPT_DEBUG, "HTMLScriptElement: Running script {}", attribute(HTML::AttributeNames::src).value_or(String {}));
+            dbgln_if(HTML_SCRIPT_DEBUG, "HTMLScriptElement: Running script {}", attribute(HTML::AttributeNames::src).value_or({}));
         else
             dbgln_if(HTML_SCRIPT_DEBUG, "HTMLScriptElement: Running inline script");
 
@@ -226,7 +227,6 @@ void HTMLScriptElement::prepare_script()
 
     // 6. Let source text be el’s script text value.
     auto source_text = m_script_text;
-    auto source_text_utf8 = source_text.to_utf8_but_should_be_ported_to_utf16();
 
     // 7. If el has no src attribute, and source text is the empty string, then return.
     if (!has_attribute(HTML::AttributeNames::src) && source_text.is_empty()) {
@@ -241,24 +241,28 @@ void HTMLScriptElement::prepare_script()
     //    - el has a type attribute whose value is the empty string;
     //    - el has no type attribute but it has a language attribute and that attribute's value is the empty string; or
     //    - el has neither a type attribute nor a language attribute
-    String script_block_type;
+    Utf16String script_block_type;
     auto maybe_type_attribute = attribute(HTML::AttributeNames::type);
     auto maybe_language_attribute = attribute(HTML::AttributeNames::language);
     if ((maybe_type_attribute.has_value() && maybe_type_attribute->is_empty())
         || (!maybe_type_attribute.has_value() && maybe_language_attribute.has_value() && maybe_language_attribute->is_empty())
         || (!maybe_type_attribute.has_value() && !maybe_language_attribute.has_value())) {
         // then let the script block's type string for this script element be "text/javascript".
-        script_block_type = "text/javascript"_string;
+        script_block_type = "text/javascript"_utf16;
     }
     // Otherwise, if el has a type attribute,
     else if (maybe_type_attribute.has_value()) {
         // then let the script block's type string be the value of that attribute with leading and trailing ASCII whitespace stripped.
-        script_block_type = MUST(maybe_type_attribute->trim(Infra::ASCII_WHITESPACE));
+        auto trimmed_type_attribute = maybe_type_attribute->trim(Infra::ASCII_WHITESPACE);
+        script_block_type = trimmed_type_attribute;
     }
     // Otherwise, el has a non-empty language attribute;
     else if (maybe_language_attribute.has_value() && !maybe_language_attribute->is_empty()) {
         // let the script block's type string be the concatenation of "text/" and the value of el's language attribute.
-        script_block_type = MUST(String::formatted("text/{}", maybe_language_attribute.value()));
+        Utf16StringBuilder builder;
+        builder.append("text/"sv);
+        builder.append(*maybe_language_attribute);
+        script_block_type = builder.to_string();
     }
 
     // 10. If the script block's type string is a JavaScript MIME type essence match,
@@ -318,7 +322,7 @@ void HTMLScriptElement::prepare_script()
     // 22. If el does not have a src content attribute, and the Should element's inline behavior be blocked by Content
     //     Security Policy? algorithm returns "Blocked" when given el, cspType, and source text, then return [CSP]
     if (!has_attribute(AttributeNames::src)
-        && ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm(), *this, ContentSecurityPolicy::Directives::Directive::InlineType::Script, source_text_utf8) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+        && ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm(), *this, ContentSecurityPolicy::Directives::Directive::InlineType::Script, source_text) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         dbgln("HTMLScriptElement: Refusing to run inline script because it violates the Content Security Policy.");
         return;
     }
@@ -332,18 +336,18 @@ void HTMLScriptElement::prepare_script()
         auto event = get_attribute_value(HTML::AttributeNames::event);
 
         // 3. Strip leading and trailing ASCII whitespace from event and for.
-        for_ = MUST(for_.trim(Infra::ASCII_WHITESPACE));
-        event = MUST(event.trim(Infra::ASCII_WHITESPACE));
+        for_ = for_.trim(Infra::ASCII_WHITESPACE);
+        event = event.trim(Infra::ASCII_WHITESPACE);
 
         // 4. If for is not an ASCII case-insensitive match for the string "window", then return.
-        if (!for_.equals_ignoring_ascii_case("window"sv)) {
+        if (!for_.equals_ignoring_ascii_case("window"_utf16)) {
             dbgln("HTMLScriptElement: Refusing to run classic script because the provided 'for' attribute is not equal to 'window'");
             return;
         }
 
         // 5. If event is not an ASCII case-insensitive match for either the string "onload" or the string "onload()", then return.
-        if (!event.equals_ignoring_ascii_case("onload"sv)
-            && !event.equals_ignoring_ascii_case("onload()"sv)) {
+        if (!event.equals_ignoring_ascii_case("onload"_utf16)
+            && !event.equals_ignoring_ascii_case("onload()"_utf16)) {
             dbgln("HTMLScriptElement: Refusing to run classic script because the provided 'event' attribute is not equal to 'onload' or 'onload()'");
             return;
         }
@@ -378,7 +382,7 @@ void HTMLScriptElement::prepare_script()
     //     Otherwise, let integrity metadata be the empty string.
     String integrity_metadata;
     if (auto maybe_integrity = attribute(HTML::AttributeNames::integrity); maybe_integrity.has_value()) {
-        integrity_metadata = *maybe_integrity;
+        integrity_metadata = maybe_integrity->to_utf8();
     }
 
     // 29. Let referrer policy be the current state of el's referrerpolicy content attribute.
@@ -506,7 +510,7 @@ void HTMLScriptElement::prepare_script()
         if (m_script_type == ScriptType::Classic) {
             // 1. Let script be the result of creating a classic script using source text, settings object, base URL, and options.
             // FIXME: Pass options.
-            auto script = ClassicScript::create(m_document->url().to_byte_string(), source_text_utf8, settings_object, base_url, m_source_line_number, ClassicScript::MutedErrors::No, ScriptRegistry::IsInlineSource::Yes);
+            auto script = ClassicScript::create(m_document->url().to_byte_string(), source_text, settings_object, base_url, m_source_line_number, ClassicScript::MutedErrors::No, ScriptRegistry::IsInlineSource::Yes);
 
             // 2. Mark as ready el given script.
             mark_as_ready(Result(move(script)));
@@ -763,7 +767,7 @@ WebIDL::ExceptionOr<void> HTMLScriptElement::set_src(TrustedTypes::TrustedScript
         TrustedTypes::Script.to_string()));
 
     // 2. Set this’s src content attribute to value.
-    set_attribute_value(AttributeNames::src, value.to_utf8_but_should_be_ported_to_utf16());
+    set_attribute_value(AttributeNames::src, value);
     return {};
 }
 

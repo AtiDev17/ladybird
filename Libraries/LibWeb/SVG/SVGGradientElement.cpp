@@ -21,16 +21,16 @@ SVGGradientElement::SVGGradientElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-void SVGGradientElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGGradientElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == AttributeNames::gradientUnits) {
-        m_gradient_units = AttributeParser::parse_units(value.value_or(String {}));
+        m_gradient_units = AttributeParser::parse_units(value.value_or({}));
     } else if (name == AttributeNames::spreadMethod) {
-        m_spread_method = AttributeParser::parse_spread_method(value.value_or(String {}));
+        m_spread_method = AttributeParser::parse_spread_method(value.value_or({}));
     } else if (name == AttributeNames::gradientTransform) {
-        if (auto transform_list = AttributeParser::parse_transform(value.value_or(String {})); transform_list.has_value()) {
+        if (auto transform_list = AttributeParser::parse_transform(value.value_or({})); transform_list.has_value()) {
             m_gradient_transform = transform_from_transform_list(*transform_list);
         } else {
             m_gradient_transform = {};
@@ -133,11 +133,12 @@ GC::Ptr<SVGGradientElement const> SVGGradientElement::linked_gradient(GC::RootHa
         auto id = url->fragment();
         if (!id.has_value() || id->is_empty())
             return {};
+        auto id_as_utf16 = Utf16String::from_utf8(id.value());
         GC::Ptr<DOM::Element> element;
         if (auto containing_shadow = containing_shadow_root())
-            element = containing_shadow->get_element_by_id(id.value());
+            element = containing_shadow->get_element_by_id(id_as_utf16);
         if (!element)
-            element = document().get_element_by_id(id.value());
+            element = document().get_element_by_id(id_as_utf16);
         if (!element)
             return {};
         if (element == this)

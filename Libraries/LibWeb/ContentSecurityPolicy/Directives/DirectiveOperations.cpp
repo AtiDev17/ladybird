@@ -629,7 +629,7 @@ MatchResult does_response_match_source_list(GC::Ref<Fetch::Infrastructure::Respo
 }
 
 // https://w3c.github.io/webappsec-csp/#match-nonce-to-source-list
-MatchResult does_nonce_match_source_list(String const& nonce, Vector<String> const& source_list)
+MatchResult does_nonce_match_source_list(Utf16View nonce, Vector<String> const& source_list)
 {
     // 1. Assert: source list is not null.
     // Already done by only accept references.
@@ -868,8 +868,8 @@ enum class NonceableResult {
 
             // 2. If attribute’s value contains an ASCII case-insensitive match for "<script" or "<style", return
             //    "Not Nonceable".
-            auto const& attribute_value = attribute->value();
-            if (attribute_value.contains("<script"sv, CaseSensitivity::CaseInsensitive) || attribute_value.contains("<style"sv, CaseSensitivity::CaseInsensitive))
+            auto attribute_value = attribute->value();
+            if (attribute_value.find_code_unit_offset_ignoring_case("<script"sv).has_value() || attribute_value.find_code_unit_offset_ignoring_case("<style"sv).has_value())
                 return NonceableResult::NotNonceable;
         }
     }
@@ -885,7 +885,7 @@ enum class NonceableResult {
 }
 
 // https://w3c.github.io/webappsec-csp/#match-element-to-source-list
-MatchResult does_element_match_source_list_for_type_and_source(GC::Ptr<DOM::Element const> element, Vector<String> const& source_list, Directive::InlineType type, String const& source)
+MatchResult does_element_match_source_list_for_type_and_source(GC::Ptr<DOM::Element const> element, Vector<String> const& source_list, Directive::InlineType type, Utf16View source)
 {
     // Spec Note: Regardless of the encoding of the document, source will be converted to UTF-8 before applying any
     //            hashing algorithms.
@@ -912,7 +912,7 @@ MatchResult does_element_match_source_list_for_type_and_source(GC::Ptr<DOM::Elem
                 VERIFY(element);
                 VERIFY(is<HTML::HTMLElement>(element.ptr()) || is<SVG::SVGElement>(element.ptr()));
 
-                String element_nonce;
+                Utf16String element_nonce;
                 if (auto* html_element = as_if<HTML::HTMLElement>(element.ptr())) {
                     element_nonce = html_element->nonce();
                 } else {
@@ -920,7 +920,7 @@ MatchResult does_element_match_source_list_for_type_and_source(GC::Ptr<DOM::Elem
                     element_nonce = svg_element.nonce();
                 }
 
-                if (nonce_source_parse_result->base64_value == element_nonce)
+                if (element_nonce == nonce_source_parse_result->base64_value.value())
                     return MatchResult::Matches;
             }
         }
@@ -946,9 +946,10 @@ MatchResult does_element_match_source_list_for_type_and_source(GC::Ptr<DOM::Elem
         // 1. Set source to the result of executing UTF-8 encode on the result of executing JavaScript string
         //    converting on source.
         auto converted_source = MUST(Infra::convert_to_scalar_value_string(source));
+        auto converted_source_utf8 = converted_source.to_utf8(AllowLonelySurrogates::No);
 
-        // NOTE: converted_source is already UTF-8 encoded.
-        auto converted_source_bytes = converted_source.bytes();
+        // NOTE: converted_source_utf8 is already UTF-8 encoded.
+        auto converted_source_bytes = converted_source_utf8.bytes();
 
         // 2. For each expression of list:
         for (auto const& expression : source_list) {

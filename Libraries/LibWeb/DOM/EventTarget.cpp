@@ -771,7 +771,7 @@ JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(FlyStri
             // 2. If event's returnValue attribute's value is the empty string, then set event's returnValue attribute's value to return value.
             auto& before_unload_event = static_cast<HTML::BeforeUnloadEvent&>(event);
             if (before_unload_event.return_value().is_empty())
-                before_unload_event.set_return_value(TRY(return_value.to_utf16_string(vm())).to_utf8_but_should_be_ported_to_utf16());
+                before_unload_event.set_return_value(TRY(return_value.to_utf16_string(vm())));
         }
     }
 
@@ -798,7 +798,7 @@ JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(FlyStri
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:concept-element-attributes-change-ext
-void EventTarget::element_event_handler_attribute_changed(FlyString const& local_name, Optional<String> const& value)
+void EventTarget::element_event_handler_attribute_changed(FlyString const& local_name, Optional<Utf16String> const& value)
 {
     // NOTE: Step 1 of this algorithm was handled in HTMLElement::attribute_changed.
 
@@ -819,7 +819,7 @@ void EventTarget::element_event_handler_attribute_changed(FlyString const& local
     // 5. Otherwise:
     //  1. If the Should element's inline behavior be blocked by Content Security Policy? algorithm returns "Blocked" when executed upon element, "script attribute", and value, then return. [CSP]
     auto& this_as_element = as<DOM::Element>(*this);
-    if (ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm(), this_as_element, ContentSecurityPolicy::Directives::Directive::InlineType::ScriptAttribute, value.value()) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+    if (ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm(), this_as_element, ContentSecurityPolicy::Directives::Directive::InlineType::ScriptAttribute, *value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         dbgln("EventTarget: Refusing to add inline event handler as it violates the Content Security Policy.");
         return;
     }

@@ -49,16 +49,16 @@ void NamedNodeMap::visit_edges(Cell::Visitor& visitor)
 }
 
 // https://dom.spec.whatwg.org/#ref-for-dfn-supported-property-names%E2%91%A0
-Vector<FlyString> NamedNodeMap::supported_property_names() const
+Vector<Utf16FlyString> NamedNodeMap::supported_property_names() const
 {
     // 1. Let names be the qualified names of the attributes in this NamedNodeMap object’s attribute list, with duplicates omitted, in order.
-    Vector<FlyString> names;
+    Vector<Utf16FlyString> names;
     names.ensure_capacity(m_attributes.size());
 
     for (auto const& attribute : m_attributes) {
-        auto const attribute_name = attribute->name();
+        auto const attribute_name = Utf16FlyString::from_fly_string(attribute->name());
         if (!names.contains_slow(attribute_name))
-            names.append(attribute_name.to_string());
+            names.append(attribute_name);
     }
 
     // 2. If this NamedNodeMap object’s element is in the HTML namespace and its node document is an HTML document, then for each name of names:
@@ -209,7 +209,7 @@ WebIDL::ExceptionOr<GC::Ptr<Attr>> NamedNodeMap::set_attribute(Attr& attribute)
         attribute.local_name(),
         attribute.namespace_uri().has_value() ? Utf16String::from_utf8(attribute.namespace_uri().value()) : Optional<Utf16String>(),
         associated_element(),
-        Utf16String::from_utf8(attribute.value())));
+        attribute.value()));
 
     // 2. If attr’s element is neither null nor element, throw an "InUseAttributeError" DOMException.
     if ((attribute.owner_element() != nullptr) && (attribute.owner_element() != &associated_element()))
@@ -224,7 +224,7 @@ WebIDL::ExceptionOr<GC::Ptr<Attr>> NamedNodeMap::set_attribute(Attr& attribute)
         return &attribute;
 
     // 5. Set attr’s value to verifiedValue.
-    TRY(attribute.set_value(verifiedValue.to_utf8_but_should_be_ported_to_utf16()));
+    TRY(attribute.set_value(verifiedValue));
 
     // 6. If oldAttr is non-null, then replace oldAttr with attr.
     if (old_attribute) {
@@ -339,9 +339,15 @@ Optional<JS::Value> NamedNodeMap::item_value(size_t index) const
     return node;
 }
 
-JS::Value NamedNodeMap::named_item_value(FlyString const& name) const
+JS::Value NamedNodeMap::named_item_value(Utf16FlyString const& name) const
 {
-    auto const* node = get_named_item(name);
+    Attr const* node = nullptr;
+    for (auto const& attribute : m_attributes) {
+        if (name.view() == attribute->name().bytes_as_string_view()) {
+            node = attribute.ptr();
+            break;
+        }
+    }
     if (!node)
         return JS::js_undefined();
     return node;

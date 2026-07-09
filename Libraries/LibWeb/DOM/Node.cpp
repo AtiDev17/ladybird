@@ -183,7 +183,7 @@ HTML::HTMLElement const* Node::enclosing_html_element_with_attribute(FlyString c
     return nullptr;
 }
 
-Optional<String> Node::alternative_text() const
+Optional<Utf16String> Node::alternative_text() const
 {
     return {};
 }
@@ -216,7 +216,7 @@ Optional<Utf16String> Node::text_content() const
 
     // If Attr node, return this's value.
     if (auto const* attribute = as_if<Attr>(*this))
-        return Utf16String::from_utf8(attribute->value());
+        return attribute->value();
 
     // Otherwise, return null
     return {};
@@ -245,7 +245,7 @@ WebIDL::ExceptionOr<void> Node::set_text_content(Optional<Utf16String> const& ma
 
     // If Attr, set an existing attribute value with this and the given value.
     else if (auto* attribute = as_if<Attr>(*this)) {
-        TRY(attribute->set_value(content.to_utf8_but_should_be_ported_to_utf16()));
+        TRY(attribute->set_value(content));
     }
 
     // Otherwise, do nothing.
@@ -374,7 +374,7 @@ WebIDL::ExceptionOr<void> Node::normalize()
 }
 
 // https://dom.spec.whatwg.org/#dom-node-nodevalue
-Optional<String> Node::node_value() const
+Optional<Utf16String> Node::node_value() const
 {
     // The nodeValue getter steps are to return the following, switching on the interface this implements:
 
@@ -385,7 +385,7 @@ Optional<String> Node::node_value() const
 
     // If CharacterData, return this’s data.
     if (auto* character_data = as_if<CharacterData>(this)) {
-        return character_data->data().to_utf8_but_should_be_ported_to_utf16();
+        return character_data->data();
     }
 
     // Otherwise, return null.
@@ -393,18 +393,18 @@ Optional<String> Node::node_value() const
 }
 
 // https://dom.spec.whatwg.org/#ref-for-dom-node-nodevalue%E2%91%A0
-WebIDL::ExceptionOr<void> Node::set_node_value(Optional<String> const& maybe_value)
+WebIDL::ExceptionOr<void> Node::set_node_value(Optional<Utf16String> const& maybe_value)
 {
     // The nodeValue setter steps are to, if the given value is null, act as if it was the empty string instead,
     // and then do as described below, switching on the interface this implements:
-    auto value = maybe_value.value_or(String {});
+    auto value = maybe_value.value_or({});
 
     // If Attr, set an existing attribute value with this and the given value.
     if (auto* attr = as_if<Attr>(this)) {
-        TRY(attr->set_value(move(value)));
+        TRY(attr->set_value(value));
     } else if (auto* character_data = as_if<CharacterData>(this)) {
         // If CharacterData, replace data with node this, offset 0, count this’s length, and data the given value.
-        character_data->set_data(Utf16String::from_utf8(value));
+        character_data->set_data(value);
     }
 
     // Otherwise, do nothing.
@@ -2100,8 +2100,8 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<StringBuilder>& object) c
 
         if (element->has_attributes()) {
             auto attributes = MUST(object.add_object("attributes"sv));
-            element->for_each_attribute([&attributes](auto& name, auto& value) {
-                MUST(attributes.add(name, value));
+            element->for_each_attribute([&attributes](FlyString const& name, Utf16String const& value) {
+                MUST(attributes.add(name, value.to_utf8()));
             });
             MUST(attributes.finish());
         }
@@ -2503,7 +2503,7 @@ Optional<String> Node::locate_a_namespace(Optional<String> const& prefix) const
                     if ((attr.prefix() == "xmlns" && attr.local_name() == prefix) || (!prefix.has_value() && !attr.prefix().has_value() && attr.local_name() == "xmlns")) {
                         auto value = attr.value();
                         if (!value.is_empty())
-                            return value;
+                            return value.to_utf8();
 
                         return {};
                     }
@@ -2782,7 +2782,7 @@ RefPtr<Painting::Paintable> Node::unsafe_paintable_box()
 }
 
 // https://dom.spec.whatwg.org/#queue-a-mutation-record
-void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
+void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
 {
     auto& document = this->document();
     auto& page = document.page();
@@ -2793,7 +2793,7 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
 
     // 1. Let interestedObservers be an empty map.
     // mutationObserver -> mappedOldValue
-    OrderedHashMap<MutationObserver*, Optional<String>> interested_observers;
+    OrderedHashMap<MutationObserver*, Optional<Utf16String>> interested_observers;
 
     // 2. Let nodes be the inclusive ancestors of target.
     // 3. For each node of nodes, and then for each registered of node’s registered observer list:
@@ -2947,14 +2947,27 @@ void Node::build_accessibility_tree(AccessibilityTreeNode& parent)
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_te
-ErrorOr<String> Node::name_or_description(NameOrDescription target, Document const& document, HashTable<UniqueNodeID>& visited_nodes, IsDescendant is_descendant, ShouldComputeRole should_compute_role) const
+static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<IterationDecision(Utf16View)> const& callback)
+{
+    size_t start = 0;
+    for (size_t i = 0; i <= input.length_in_code_units(); ++i) {
+        if (i != input.length_in_code_units() && !Infra::is_ascii_whitespace(input.code_unit_at(i)))
+            continue;
+
+        if (i > start && callback(input.substring_view(start, i - start)) == IterationDecision::Break)
+            return;
+        start = i + 1;
+    }
+}
+
+ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Document const& document, HashTable<UniqueNodeID>& visited_nodes, IsDescendant is_descendant, ShouldComputeRole should_compute_role) const
 {
     // The text alternative for a given element is computed as follows:
     // 1. Set the root node to the given element, the current node to the root node, and the total accumulated text to the
     //    empty string (""). If the root node's role prohibits naming, return the empty string ("").
     auto const* root_node = this;
     auto const* current_node = root_node;
-    StringBuilder total_accumulated_text;
+    Utf16StringBuilder total_accumulated_text;
     visited_nodes.set(unique_id());
 
     if (is_element()) {
@@ -3014,24 +3027,30 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             // i. Set the accumulated text to the empty string.
             total_accumulated_text.clear();
 
-            Vector<StringView> id_list;
+            Vector<Utf16View> id_list;
             if (target == NameOrDescription::Name) {
-                id_list = aria_labelled_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
+                for_each_ascii_whitespace_separated_token(aria_labelled_by->utf16_view(), [&](auto id) {
+                    id_list.append(id);
+                    return IterationDecision::Continue;
+                });
             } else {
-                id_list = aria_described_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
+                for_each_ascii_whitespace_separated_token(aria_described_by->utf16_view(), [&](auto id) {
+                    id_list.append(id);
+                    return IterationDecision::Continue;
+                });
             }
 
             // ii. For each IDREF:
             for (auto const& id_ref : id_list) {
-                auto node = document.get_element_by_id(MUST(FlyString::from_utf8(id_ref)));
+                auto node = document.get_element_by_id(id_ref);
                 if (!node)
                     continue;
                 // AD-HOC: The “For each IDREF” substep in the spec doesn’t seem to explicitly require the following
                 // check for an aria-label value; but the “div group explicitly labelledby self and heading” subtest at
                 // https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass unless we do this check.
                 // https://github.com/w3c/aria/issues/2388
-                if (target == NameOrDescription::Name && node->aria_label().has_value() && !node->aria_label()->is_empty() && !node->aria_label()->bytes_as_string_view().is_whitespace()) {
-                    total_accumulated_text.append(' ');
+                if (target == NameOrDescription::Name && node->aria_label().has_value() && !node->aria_label()->is_empty() && !node->aria_label()->is_ascii_whitespace()) {
+                    total_accumulated_text.append_ascii(' ');
                     total_accumulated_text.append(node->aria_label().value());
                 }
                 if (visited_nodes.contains(node->unique_id()))
@@ -3042,7 +3061,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 // b. Compute the text alternative of the current node beginning with step 2. Set the result to that text alternative.
                 auto result = TRY(node->name_or_description(target, document, visited_nodes));
                 // c. Append the result, with a space, to the accumulated text.
-                total_accumulated_text.append(' ');
+                total_accumulated_text.append_ascii(' ');
                 total_accumulated_text.append(result);
             }
 
@@ -3052,7 +3071,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             // falls back to aria-label” subtest at https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass
             // unless we do this check.
             // https://github.com/w3c/aria/issues/2388
-            if (total_accumulated_text.string_view().is_whitespace() && target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->bytes_as_string_view().is_whitespace())
+            if (total_accumulated_text.view().is_ascii_whitespace() && target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace())
                 return element->aria_label().release_value();
             return total_accumulated_text.to_string();
         }
@@ -3065,7 +3084,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         // necessitate doing so, and the “input with label for association is superceded by aria-label” subtest at
         // https://wpt.fyi/results/accname/name/comp_label.html won’t pass unless we do this reordering.
         // Spec PR: https://github.com/w3c/aria/pull/2377
-        if (target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->bytes_as_string_view().is_whitespace()) {
+        if (target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace()) {
             // TODO: - If traversal of the current node is due to recursion and the current node is an embedded control as defined in step 2E, ignore aria-label and skip to rule 2E.
             // https://github.com/w3c/aria/pull/2385 and https://github.com/w3c/accname/issues/173
             if (!element->is_html_slot_element())
@@ -3079,10 +3098,10 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         if (is<HTML::HTMLElement>(this))
             labels = (const_cast<HTML::HTMLElement&>(static_cast<HTML::HTMLElement const&>(*current_node))).labels();
         if (labels != nullptr && labels->length() > 0) {
-            StringBuilder builder;
+            Utf16StringBuilder builder;
             for (u32 i = 0; i < labels->length(); i++) {
                 if (!builder.is_empty())
-                    builder.append(" "sv);
+                    builder.append_ascii(" "sv);
                 auto nodes = labels->item(i)->children_as_vector();
                 for (auto const& node : nodes) {
                     // AD-HOC: https://wpt.fyi/results/accname/name/comp_host_language_label.html has “encapsulation”
@@ -3132,7 +3151,8 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                                 if (child->is_element()) {
                                     auto const& element = static_cast<DOM::Element const&>(*child);
                                     auto role = element.role_or_default();
-                                    if (role == ARIA::Role::option && element.aria_selected() == "true")
+                                    auto aria_selected = element.aria_selected();
+                                    if (role == ARIA::Role::option && aria_selected.has_value() && aria_selected->utf16_view() == u"true"sv)
                                         builder.append(element.text_content().value());
                                 }
                             }
@@ -3176,12 +3196,12 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             return element->get_attribute(HTML::AttributeNames::alt).value();
 
         // https://w3c.github.io/svg-aam/#mapping_additional_nd
-        Optional<String> title_element_text;
+        Optional<Utf16String> title_element_text;
         if (element->is_svg_element()) {
             // If the current node has at least one direct child title element, select the appropriate title based on
             // the language rules for the SVG specification, and return the title text alternative as a flat string.
             element->for_each_child_of_type<SVG::SVGTitleElement>([&](SVG::SVGTitleElement const& title) mutable {
-                title_element_text = title.text_content().map([](auto const& title) { return title.to_utf8_but_should_be_ported_to_utf16(); });
+                title_element_text = title.text_content();
                 return IterationDecision::Break;
             });
             if (title_element_text.has_value())
@@ -3198,16 +3218,16 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         //    then use the subtree of the first such element.
         if (is<HTML::HTMLTableElement>(*element))
             if (auto& table = (const_cast<HTML::HTMLTableElement&>(static_cast<HTML::HTMLTableElement const&>(*element))); table.caption())
-                return table.caption()->text_content()->to_utf8_but_should_be_ported_to_utf16();
+                return table.caption()->text_content().value();
 
         // https://w3c.github.io/html-aam/#fieldset-element-accessible-name-computation
         // 2. If the accessible name is still empty, then: if the fieldset element has a child that is a legend element,
         //    then use the subtree of the first such element.
         if (is<HTML::HTMLFieldSetElement>(*element)) {
-            Optional<String> legend;
+            Optional<Utf16String> legend;
             auto& fieldset = (const_cast<HTML::HTMLFieldSetElement&>(static_cast<HTML::HTMLFieldSetElement const&>(*element)));
             fieldset.for_each_child_of_type<HTML::HTMLLegendElement>([&](HTML::HTMLLegendElement const& element) mutable {
-                legend = element.text_content()->to_utf8_but_should_be_ported_to_utf16();
+                legend = element.text_content().value();
                 return IterationDecision::Break;
             });
             if (legend.has_value())
@@ -3255,11 +3275,11 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 auto const& content = before->computed_values().content().value();
 
                 if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
+                    total_accumulated_text.append(Utf16String::from_utf8(content.alt_text.value()));
                 } else {
                     for (auto const& item : content.data) {
                         if (auto const* string = item.get_pointer<String>())
-                            total_accumulated_text.append(*string);
+                            total_accumulated_text.append(Utf16String::from_utf8(*string));
                     }
                 }
             }
@@ -3306,7 +3326,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 // J. Append a space character and the result of each step above to the total accumulated text.
                 // AD-HOC: Doing the space-adding here is in a different order from what the spec states.
                 if (should_add_space)
-                    total_accumulated_text.append(' ');
+                    total_accumulated_text.append_ascii(' ');
 
                 // c. Append the result to the accumulated text.
                 total_accumulated_text.append(result);
@@ -3321,11 +3341,11 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 auto const& content = after->computed_values().content().value();
 
                 if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
+                    total_accumulated_text.append(Utf16String::from_utf8(content.alt_text.value()));
                 } else {
                     for (auto& item : content.data) {
                         if (auto const* string = item.get_pointer<String>())
-                            total_accumulated_text.append(*string);
+                            total_accumulated_text.append(Utf16String::from_utf8(*string));
                     }
                 }
             }
@@ -3355,9 +3375,9 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 builder.append(slice.text_for_rendering());
             });
             if (!builder.is_empty())
-                return builder.to_string().to_utf8_but_should_be_ported_to_utf16();
+                return builder.to_string();
         }
-        return text_content()->to_utf8_but_should_be_ported_to_utf16();
+        return text_content().value();
     }
 
     // H. Otherwise, if the current node is a descendant of an element whose Accessible Name or Accessible Description
@@ -3388,7 +3408,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_name
-ErrorOr<String> Node::accessible_name(Document const& document, ShouldComputeRole should_compute_role) const
+ErrorOr<Utf16String> Node::accessible_name(Document const& document, ShouldComputeRole should_compute_role) const
 {
     HashTable<UniqueNodeID> visited_nodes;
     // User agents MUST compute an accessible name using the rules outlined below in the section titled Accessible Name and Description Computation.
@@ -3396,23 +3416,27 @@ ErrorOr<String> Node::accessible_name(Document const& document, ShouldComputeRol
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_description
-ErrorOr<String> Node::accessible_description(Document const& document) const
+ErrorOr<Utf16String> Node::accessible_description(Document const& document) const
 {
     // If aria-describedby is present, user agents MUST compute the accessible description by concatenating the text alternatives for elements referenced by an aria-describedby attribute on the current element.
     // The text alternatives for the referenced elements are computed using a number of methods, outlined below in the section titled Accessible Name and Description Computation.
     if (!is_element())
-        return String {};
+        return Utf16String {};
 
     auto const* element = static_cast<Element const*>(this);
     auto described_by = element->aria_described_by();
     if (!described_by.has_value())
-        return String {};
+        return Utf16String {};
 
     HashTable<UniqueNodeID> visited_nodes;
-    StringBuilder builder;
-    auto id_list = described_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
-    for (auto const& id : id_list) {
-        if (auto description_element = document.get_element_by_id(MUST(FlyString::from_utf8(id)))) {
+    Utf16StringBuilder builder;
+    Vector<Utf16View> id_list;
+    for_each_ascii_whitespace_separated_token(described_by->utf16_view(), [&](auto id) {
+        id_list.append(id);
+        return IterationDecision::Continue;
+    });
+    for (auto id : id_list) {
+        if (auto description_element = document.get_element_by_id(id)) {
             auto description = TRY(
                 description_element->name_or_description(NameOrDescription::Description, document,
                     visited_nodes));
@@ -3420,7 +3444,7 @@ ErrorOr<String> Node::accessible_description(Document const& document) const
                 if (builder.is_empty()) {
                     builder.append(description);
                 } else {
-                    builder.append(" "sv);
+                    builder.append_ascii(" "sv);
                     builder.append(description);
                 }
             }
@@ -3429,13 +3453,18 @@ ErrorOr<String> Node::accessible_description(Document const& document) const
     return builder.to_string();
 }
 
-Optional<StringView> Node::first_valid_id(StringView value, Document const& document)
+Optional<Utf16View> Node::first_valid_id(Utf16View value, Document const& document)
 {
-    auto id_list = value.split_view_if(Infra::is_ascii_whitespace);
-    for (auto const& id : id_list) {
-        if (document.get_element_by_id(MUST(FlyString::from_utf8(id))))
-            return id;
-    }
+    Optional<Utf16View> first_id;
+    for_each_ascii_whitespace_separated_token(value, [&](auto id) {
+        if (document.get_element_by_id(id)) {
+            first_id = id;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
+    });
+    if (first_id.has_value())
+        return first_id;
     return {};
 }
 

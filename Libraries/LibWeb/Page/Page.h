@@ -58,6 +58,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/PixelUnits.h>
@@ -85,6 +86,9 @@ public:
 
     PageClient& client() { return m_client; }
     PageClient const& client() const { return m_client; }
+    void acquire_screen_wake_lock();
+    void release_screen_wake_lock();
+    bool is_screen_wake_lock_active() const { return m_active_screen_wake_lock_count > 0; }
     bool has_compositor_host() const;
     void ensure_compositor_host();
     Compositor::CompositorHost& compositor_host();
@@ -130,6 +134,9 @@ public:
     EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
+#if defined(AK_OS_MACOS)
+    bool select_word_for_dictionary_lookup(DevicePixelPoint);
+#endif
     UniqueNodeID node_id_at_position(DevicePixelPoint);
     EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr);
 
@@ -259,7 +266,7 @@ public:
     void toggle_media_controls_state();
 
     HTML::MuteState page_mute_state() const { return m_mute_state; }
-    void toggle_page_mute_state();
+    void set_page_mute_state(HTML::MuteState);
 
     Optional<String> const& user_style() const { return m_user_style_sheet_source; }
     void set_user_style(String source);
@@ -371,6 +378,7 @@ private:
     Optional<UniqueNodeID> m_media_context_menu_element_id;
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
+    size_t m_active_screen_wake_lock_count { 0 };
 
     Optional<String> m_user_style_sheet_source;
 
@@ -601,6 +609,7 @@ public:
     virtual void page_did_update_primary_selection(String const&) { }
 
     virtual void page_did_change_audio_play_state(HTML::AudioPlayState) { }
+    virtual void page_did_change_screen_wake_lock_state(ScreenWakeLockState) { }
 
     virtual void page_did_start_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] ByteString const& method, [[maybe_unused]] Vector<HTTP::Header> const& request_headers, [[maybe_unused]] ReadonlyBytes request_body, [[maybe_unused]] Optional<String> initiator_type) { }
     virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers) { }

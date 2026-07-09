@@ -27,7 +27,7 @@ interface HTMLInputElement : HTMLElement {
     [CEReactions, Reflect] attribute boolean multiple;
     [CEReactions, Reflect] attribute DOMString name;
     [CEReactions, Reflect] attribute DOMString pattern;
-    [CEReactions, Reflect] attribute DOMString placeholder;
+    [CEReactions, Reflect] attribute Utf16DOMString placeholder;
     [CEReactions, Reflect=readonly] attribute boolean readOnly;
     [CEReactions, Reflect] attribute boolean required;
     [CEReactions] attribute unsigned long size;
@@ -36,7 +36,7 @@ interface HTMLInputElement : HTMLElement {
     // https://whatpr.org/html-attr-input-switch/9546/input.html#the-input-element:dom-input-switch
     [CEReactions, Reflect] attribute boolean switch;
     [CEReactions] attribute DOMString type;
-    [CEReactions, Reflect=value] attribute DOMString defaultValue;
+    [CEReactions, Reflect=value] attribute Utf16DOMString defaultValue;
     [CEReactions, LegacyNullToEmptyString] attribute Utf16DOMString value;
     attribute object? valueAsDate;
     attribute unrestricted double valueAsNumber;

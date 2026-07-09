@@ -17,14 +17,14 @@ class HTMLBaseElement final : public HTMLElement {
 public:
     virtual ~HTMLBaseElement() override;
 
-    String href() const;
-    void set_href(String const& href);
+    Utf16String href() const;
+    void set_href(Utf16String const& href);
 
     URL::URL const& frozen_base_url() const { return m_frozen_base_url; }
 
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
 
 private:
     HTMLBaseElement(DOM::Document&, DOM::QualifiedName);

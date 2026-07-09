@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericLexer.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <LibTextCodec/Decoder.h>
@@ -211,7 +212,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
             return {};
 
         // 3. Let result be null.
-        Optional<String> result;
+        Optional<Utf16String> result;
 
         // 4. If submitter is an input element whose type attribute is in the Image Button state, then:
         if (is<HTMLInputElement>(*submitter)) {
@@ -222,7 +223,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
                 auto [x, y] = input_element.selected_coordinate();
 
                 // 2. Set result to the concatenation of x, ",", and y.
-                result = MUST(String::formatted("{},{}", x, y));
+                result = Utf16String::formatted("{},{}", x, y);
             }
         }
 
@@ -243,7 +244,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
 
     // 13. If action is the empty string, let action be the URL of the form document.
     if (action.is_empty())
-        action = form_document->url_string();
+        action = Utf16String::from_utf8(form_document->url_string());
 
     // 14. Let parsed action be the result of encoding-parsing a URL given action, relative to submitter's node document.
     auto parsed_action = submitter->document().encoding_parse_url(action);
@@ -261,7 +262,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
     auto encoding_type = encoding_type_state_from_form_element(submitter);
 
     // 18. Let formTarget be null.
-    Optional<String> form_target;
+    Optional<Utf16String> form_target;
 
     // 19. If the submitter element is a submit button and it has a formtarget attribute, then set formTarget to the
     //     formtarget attribute value.
@@ -279,7 +280,8 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
 
     // 22. Let targetNavigable be the first return value of applying the rules for choosing a navigable given target,
     //     form's node navigable, and noopener.
-    auto target_navigable = form_document->navigable()->choose_a_navigable(target, no_opener).navigable;
+    auto target_utf8 = target.to_utf8();
+    auto target_navigable = form_document->navigable()->choose_a_navigable(target_utf8, no_opener).navigable;
 
     // 23. If targetNavigable is null, then return.
     if (!target_navigable) {
@@ -422,7 +424,7 @@ void HTMLFormElement::remove_associated_element(Badge<FormAssociatedElement>, HT
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fs-action
-String HTMLFormElement::action_from_form_element(GC::Ref<HTMLElement> element) const
+Utf16String HTMLFormElement::action_from_form_element(GC::Ref<HTMLElement> element) const
 {
     // The action of an element is the value of the element's formaction attribute, if the element is a submit button
     // and has such an attribute, or the value of its form owner's action attribute, if it has one, or else the empty
@@ -436,14 +438,14 @@ String HTMLFormElement::action_from_form_element(GC::Ref<HTMLElement> element) c
     if (auto maybe_attribute = attribute(AttributeNames::action); maybe_attribute.has_value())
         return maybe_attribute.release_value();
 
-    return String {};
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-attributes:attr-fs-method-2
-static HTMLFormElement::MethodAttributeState method_attribute_to_method_state(StringView method)
+static HTMLFormElement::MethodAttributeState method_attribute_to_method_state(Utf16View method)
 {
 #define __ENUMERATE_FORM_METHOD_ATTRIBUTE(keyword, state) \
-    if (#keyword##sv.equals_ignoring_ascii_case(method))  \
+    if (method.equals_ignoring_ascii_case(#keyword##sv))  \
         return HTMLFormElement::MethodAttributeState::state;
     ENUMERATE_FORM_METHOD_ATTRIBUTES
 #undef __ENUMERATE_FORM_METHOD_ATTRIBUTE
@@ -462,22 +464,21 @@ HTMLFormElement::MethodAttributeState HTMLFormElement::method_state_from_form_el
         if (auto maybe_formmethod = element->attribute(AttributeNames::formmethod); maybe_formmethod.has_value()) {
             // NOTE: `formmethod` is the same as `method`, except that it has no missing value default.
             //       This is handled by not calling `method_attribute_to_method_state` in the first place if there is no `formmethod` attribute.
-            return method_attribute_to_method_state(maybe_formmethod.value());
+            return method_attribute_to_method_state(*maybe_formmethod);
         }
     }
 
-    if (auto maybe_method = attribute(AttributeNames::method); maybe_method.has_value()) {
-        return method_attribute_to_method_state(maybe_method.value());
-    }
+    if (auto maybe_method = attribute(AttributeNames::method); maybe_method.has_value())
+        return method_attribute_to_method_state(*maybe_method);
 
     return MethodAttributeState::GET;
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-attributes:attr-fs-enctype-2
-static HTMLFormElement::EncodingTypeAttributeState encoding_type_attribute_to_encoding_type_state(StringView encoding_type)
+static HTMLFormElement::EncodingTypeAttributeState encoding_type_attribute_to_encoding_type_state(Utf16View encoding_type)
 {
 #define __ENUMERATE_FORM_METHOD_ENCODING_TYPE(keyword, state)  \
-    if (keyword##sv.equals_ignoring_ascii_case(encoding_type)) \
+    if (encoding_type.equals_ignoring_ascii_case(keyword##sv)) \
         return HTMLFormElement::EncodingTypeAttributeState::state;
     ENUMERATE_FORM_METHOD_ENCODING_TYPES
 #undef __ENUMERATE_FORM_METHOD_ENCODING_TYPE
@@ -497,14 +498,28 @@ HTMLFormElement::EncodingTypeAttributeState HTMLFormElement::encoding_type_state
             // NOTE: `formenctype` is the same as `enctype`, except that it has nomissing value default.
             //       This is handled by not calling `encoding_type_attribute_to_encoding_type_state` in the first place if there is no
             //       `formenctype` attribute.
-            return encoding_type_attribute_to_encoding_type_state(formenctype.value());
+            return encoding_type_attribute_to_encoding_type_state(*formenctype);
         }
     }
 
     if (auto maybe_enctype = attribute(AttributeNames::enctype); maybe_enctype.has_value())
-        return encoding_type_attribute_to_encoding_type_state(maybe_enctype.value());
+        return encoding_type_attribute_to_encoding_type_state(*maybe_enctype);
 
     return EncodingTypeAttributeState::FormUrlEncoded;
+}
+
+static bool has_link_type(Utf16View input, Utf16View link_type)
+{
+    size_t start = 0;
+    for (size_t i = 0; i <= input.length_in_code_units(); ++i) {
+        if (i != input.length_in_code_units() && !Infra::is_ascii_whitespace(input.code_unit_at(i)))
+            continue;
+
+        if (i > start && input.substring_view(start, i - start).equals_ignoring_ascii_case(link_type))
+            return true;
+        start = i + 1;
+    }
+    return false;
 }
 
 static bool is_form_control(DOM::Element const& element, HTMLFormElement const& form)
@@ -691,13 +706,13 @@ void HTMLFormElement::set_action(String const& value)
     set_attribute_value(AttributeNames::action, value);
 }
 
-void HTMLFormElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLFormElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.value_or({}));
     }
 }
 
@@ -713,7 +728,17 @@ ErrorOr<String> HTMLFormElement::pick_an_encoding() const
         auto input = maybe_input.release_value();
 
         // 2. Let candidate encoding labels be the result of splitting input on ASCII whitespace.
-        auto candidate_encoding_labels = input.bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
+        auto is_ascii_whitespace = [](char16_t code_unit) {
+            return Infra::is_ascii_whitespace(code_unit);
+        };
+        Utf16GenericLexer lexer { input };
+        Vector<Utf16View> candidate_encoding_labels;
+        while (!lexer.is_eof()) {
+            lexer.ignore_while(is_ascii_whitespace);
+            auto token = lexer.consume_until(is_ascii_whitespace);
+            if (!token.is_empty())
+                TRY(candidate_encoding_labels.try_append(token));
+        }
 
         // 3. Let candidate encodings be an empty list of character encodings.
         Vector<StringView> candidate_encodings;
@@ -749,24 +774,26 @@ static ErrorOr<Vector<DOMURL::QueryParam>> convert_to_list_of_name_value_pairs(G
     for (auto const& entry : entry_list) {
         // 1. Let name be entry's name, with every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF)
         //    not preceded by U+000D (CR), replaced by a string consisting of U+000D (CR) and U+000A (LF).
-        auto name = TRY(normalize_line_breaks(entry.name));
+        auto name = TRY(normalize_line_breaks(entry.name.utf16_view()));
 
         // 2. If entry's value is a File object, then let value be entry's value's name. Otherwise, let value be entry's value.
-        String value;
+        Utf16String value;
         entry.value.visit(
             [&value](GC::Ref<FileAPI::File> file) {
-                value = file->name();
+                value = Utf16String::from_utf8(file->name());
             },
-            [&value](String const& string) {
+            [&value](Utf16String const& string) {
                 value = string;
             });
 
         // 3. Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of
         //    U+000A (LF) not preceded by U+000D (CR), in value, by a string consisting of U+000D (CR) and U+000A (LF).
-        auto normalized_value = TRY(normalize_line_breaks(value));
+        auto normalized_value = TRY(normalize_line_breaks(value.utf16_view()));
 
         // 4. Append to list a new name-value pair whose name is name and whose value is value.
-        TRY(list.try_append(DOMURL::QueryParam { .name = move(name), .value = move(normalized_value) }));
+        TRY(list.try_append(DOMURL::QueryParam {
+            .name = TRY(name.utf16_view().to_utf8()),
+            .value = TRY(normalized_value.utf16_view().to_utf8()) }));
     }
 
     // 3. Return list.
@@ -965,9 +992,7 @@ void HTMLFormElement::plan_to_navigate_to(URL::URL url, Variant<Empty, String, P
     ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
 
     // 2. If the form element's link types include the noreferrer keyword, then set referrerPolicy to "no-referrer".
-    auto rel = MUST(get_attribute_value(HTML::AttributeNames::rel).to_lowercase());
-    auto link_types = rel.bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
-    if (link_types.contains_slow("noreferrer"sv))
+    if (has_link_type(get_attribute_value(HTML::AttributeNames::rel), u"noreferrer"sv))
         referrer_policy = ReferrerPolicy::ReferrerPolicy::NoReferrer;
 
     // 3. If the form has a non-null planned navigation, remove it from its task queue.
@@ -1011,7 +1036,7 @@ Optional<JS::Value> HTMLFormElement::item_value(size_t index) const
     return {};
 }
 
-bool HTMLFormElement::is_supported_property_name(FlyString const& name) const
+bool HTMLFormElement::is_supported_property_name(Utf16FlyString const& name) const
 {
     // NB: This is a simplified version of ::supported_property_names() that does not require sorting or allocations.
     for (auto const& candidate : m_associated_elements) {
@@ -1025,14 +1050,14 @@ bool HTMLFormElement::is_supported_property_name(FlyString const& name) const
 }
 
 // https://html.spec.whatwg.org/multipage/forms.html#the-form-element:supported-property-names
-Vector<FlyString> HTMLFormElement::supported_property_names() const
+Vector<Utf16FlyString> HTMLFormElement::supported_property_names() const
 {
     // The supported property names consist of the names obtained from the following algorithm, in the order obtained from this algorithm:
 
     // 1. Let sourced names be an initially empty ordered list of tuples consisting of a string, an element, a source,
     //    where the source is either id, name, or past, and, if the source is past, an age.
     struct SourcedName {
-        FlyString name;
+        Utf16FlyString name;
         GC::Ptr<DOM::Element const> element;
         enum class Source {
             Id,
@@ -1100,18 +1125,22 @@ Vector<FlyString> HTMLFormElement::supported_property_names() const
     // 6. Remove any entries in sourced names that have the empty string as their name.
     // 7. Remove any entries in sourced names that have the same name as an earlier entry in the map.
     // 8. Return the list of names from sourced names, maintaining their relative order.
-    OrderedHashTable<FlyString> names;
+    OrderedHashTable<Utf16FlyString> names;
     names.ensure_capacity(sourced_names.size());
     for (auto const& entry : sourced_names) {
         if (entry.name.is_empty())
             continue;
         names.set(entry.name, AK::HashSetExistingEntryBehavior::Keep);
     }
-    return names.values();
+    Vector<Utf16FlyString> result;
+    result.ensure_capacity(names.size());
+    for (auto const& name : names)
+        result.append(name);
+    return result;
 }
 
 // https://html.spec.whatwg.org/multipage/forms.html#dom-form-nameditem
-JS::Value HTMLFormElement::named_item_value(FlyString const& name) const
+JS::Value HTMLFormElement::named_item_value(Utf16FlyString const& name) const
 {
     auto& realm = this->realm();
     auto& root = as<ParentNode>(this->root());

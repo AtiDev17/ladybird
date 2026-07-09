@@ -30,9 +30,12 @@ public:
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
 
-    String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
-    String type() const { return get_attribute_value(HTML::AttributeNames::type); }
-    String href() const { return get_attribute_value(HTML::AttributeNames::href); }
+    Utf16String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
+    void set_rel(Utf16String const& value) { set_attribute_value(HTML::AttributeNames::rel, value); }
+    Utf16String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+    void set_type(Utf16String const& value) { set_attribute_value(HTML::AttributeNames::type, value); }
+    Utf16String href() const { return get_attribute_value(HTML::AttributeNames::href); }
+    void set_href(Utf16String const& value) { set_attribute_value(HTML::AttributeNames::href, value); }
 
     GC::Ref<DOM::DOMTokenList> rel_list();
     GC::Ref<DOM::DOMTokenList> sizes();
@@ -46,8 +49,8 @@ public:
     void set_parser_document(Badge<HTMLParser>, GC::Ref<DOM::Document> document) { m_parser_document = document; }
     void set_was_enabled_when_created_by_parser(Badge<HTMLParser>, bool was_enabled_when_created_by_parser) { m_was_enabled_when_created_by_parser = was_enabled_when_created_by_parser; }
 
-    void set_media(String);
-    String media() const;
+    void set_media(Utf16String const&);
+    Utf16String media() const;
 
     GC::Ptr<CSS::CSSStyleSheet> sheet() const;
 
@@ -71,13 +74,13 @@ private:
             GC::Ref<HTML::EnvironmentSettingsObject> environment,
             GC::Ref<HTML::PolicyContainer> policy_container,
             GC::Ptr<Web::DOM::Document> document,
-            String cryptographic_nonce_metadata,
+            Utf16String cryptographic_nonce_metadata,
             Fetch::Infrastructure::Request::Priority fetch_priority);
 
         virtual void visit_edges(Cell::Visitor& visitor) override;
 
         // href (default the empty string)
-        String href;
+        Utf16String href;
 
         // initiator (default "link")
         Optional<Fetch::Infrastructure::Request::InitiatorType> initiator { Fetch::Infrastructure::Request::InitiatorType::Link };
@@ -86,11 +89,11 @@ private:
         String integrity;
 
         // type (default the empty string)
-        String type;
+        Utf16String type;
 
         // cryptographic nonce metadata (default the empty string)
         //     A string
-        String cryptographic_nonce_metadata;
+        Utf16String cryptographic_nonce_metadata;
 
         // destination (default the empty string)
         //     A destination type.
@@ -146,7 +149,7 @@ private:
     virtual bool is_html_link_element() const override { return true; }
 
     // ^HTMLElement
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
     virtual bool contributes_a_script_blocking_style_sheet() const final;
     virtual bool is_implicitly_potentially_render_blocking() const override;
 
@@ -204,7 +207,7 @@ private:
 
     bool m_was_enabled_when_created_by_parser { false };
 
-    Optional<String> m_mime_type;
+    Optional<Utf16String> m_mime_type;
 
     GC::Weak<DOM::Document> m_parser_document;
 };

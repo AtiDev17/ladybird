@@ -19,6 +19,7 @@
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/Forward.h>
@@ -249,20 +250,20 @@ public:
     void set_cookie_version_index(Core::SharedVersionIndex cookie_version_index) { m_cookie_version_index = cookie_version_index; }
     void reset_cookie_version() { m_cookie_version = Core::INVALID_SHARED_VERSION; }
 
-    String fg_color() const;
-    void set_fg_color(String const&);
+    Utf16String fg_color() const;
+    void set_fg_color(Utf16String const&);
 
-    String link_color() const;
-    void set_link_color(String const&);
+    Utf16String link_color() const;
+    void set_link_color(Utf16String const&);
 
-    String vlink_color() const;
-    void set_vlink_color(String const&);
+    Utf16String vlink_color() const;
+    void set_vlink_color(Utf16String const&);
 
-    String alink_color() const;
-    void set_alink_color(String const&);
+    Utf16String alink_color() const;
+    void set_alink_color(Utf16String const&);
 
-    String bg_color() const;
-    void set_bg_color(String const&);
+    Utf16String bg_color() const;
+    void set_bg_color(Utf16String const&);
 
     String referrer() const;
     void set_referrer(String);
@@ -287,7 +288,9 @@ public:
     void set_opener_policy(HTML::OpenerPolicy policy) { m_opener_policy = move(policy); }
 
     Optional<URL::URL> encoding_parse_url(StringView) const;
+    Optional<URL::URL> encoding_parse_url(Utf16View) const;
     Optional<String> encoding_parse_and_serialize_url(StringView) const;
+    Optional<String> encoding_parse_and_serialize_url(Utf16String const&) const;
 
     CSS::StyleComputer& style_computer() { return *m_style_computer; }
     CSS::StyleComputer const& style_computer() const { return *m_style_computer; }
@@ -387,9 +390,9 @@ public:
     Optional<Color> visited_link_color() const;
     void set_visited_link_color(Color);
 
-    Optional<Vector<String> const&> supported_color_schemes() const;
-    void set_supported_color_schemes(Vector<String>);
-    void set_supported_color_schemes(Optional<Vector<String>>);
+    Optional<Vector<Utf16FlyString> const&> supported_color_schemes() const;
+    void set_supported_color_schemes(Vector<Utf16FlyString>);
+    void set_supported_color_schemes(Optional<Vector<Utf16FlyString>>);
     void obtain_supported_color_schemes();
 
     void obtain_theme_color();
@@ -568,8 +571,8 @@ public:
     String const& content_type() const { return m_content_type; }
     void set_content_type(String content_type) { m_content_type = move(content_type); }
 
-    Optional<String> const& pragma_set_default_language() const { return m_pragma_set_default_language; }
-    void set_pragma_set_default_language(String language) { m_pragma_set_default_language = move(language); }
+    Optional<Utf16String> const& pragma_set_default_language() const { return m_pragma_set_default_language; }
+    void set_pragma_set_default_language(Utf16String language) { m_pragma_set_default_language = move(language); }
     Optional<String> const& http_content_language() const { return m_http_content_language; }
 
     bool has_encoding() const { return m_encoding.has_value(); }
@@ -784,7 +787,7 @@ public:
     WebIDL::ExceptionOr<bool> query_command_indeterm(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_supported(FlyString const& command);
-    WebIDL::ExceptionOr<String> query_command_value(FlyString const& command);
+    WebIDL::ExceptionOr<Utf16String> query_command_value(FlyString const& command);
 
     WebIDL::ExceptionOr<GC::Ref<XPath::XPathExpression>> create_expression(String const& expression, GC::Ptr<XPath::XPathNSResolver> resolver = nullptr);
     WebIDL::ExceptionOr<GC::Ref<XPath::XPathResult>> evaluate(String const& expression, DOM::Node const& context_node, GC::Ptr<XPath::XPathNSResolver> resolver = nullptr, WebIDL::UnsignedShort type = 0, GC::Ptr<XPath::XPathResult> result = nullptr);
@@ -831,7 +834,7 @@ public:
     void start_intersection_observing_a_lazy_loading_element(Element&);
     void stop_intersection_observing_a_lazy_loading_element(Element&);
 
-    void shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
+    void shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
 
     struct TopOfTheDocument { };
     using IndicatedPart = Variant<Element*, TopOfTheDocument>;
@@ -883,7 +886,7 @@ public:
     RefPtr<HTML::SessionHistoryEntry> latest_entry() const { return m_latest_entry; }
     void set_latest_entry(RefPtr<HTML::SessionHistoryEntry>);
 
-    void element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<FlyString> old_id);
+    void element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<Utf16FlyString> old_id);
     void element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
     void element_with_id_was_removed(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
     void element_name_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
@@ -892,7 +895,7 @@ public:
 
     // https://drafts.csswg.org/css-anchor-position-1/#determining
     AnchorNameMap& anchor_name_map() { return m_anchor_name_map; }
-    GC::Ptr<Element> element_by_anchor_name(FlyString const& name, Node const& querying_node) const;
+    GC::Ptr<Element> element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node) const;
 
     void add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
     void remove_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
@@ -949,8 +952,8 @@ public:
     void schedule_accumulated_visual_context_value_update(Element&);
     void schedule_accumulated_visual_context_value_update(Layout::Node const&);
 
-    virtual JS::Value named_item_value(FlyString const& name) const override;
-    virtual Vector<FlyString> supported_property_names() const override;
+    virtual JS::Value named_item_value(Utf16FlyString const& name) const override;
+    virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
 
     void gather_active_observations_at_depth(size_t depth);
@@ -1170,7 +1173,7 @@ public:
     CSS::StyleScope& style_scope() { return m_style_scope; }
     String const& content_blocker_style_sheet();
     void invalidate_content_blocker_style_sheet();
-    bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyString const* id, ReadonlySpan<FlyString> class_names);
+    bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names);
 
     void exit_pointer_lock();
 
@@ -1228,7 +1231,7 @@ private:
     void queue_intersection_observer_task();
     void queue_an_intersection_observer_entry(IntersectionObserver::IntersectionObserver&, HighResolutionTime::DOMHighResTimeStamp time, GC::Ref<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<Element> target);
 
-    Element* find_a_potential_indicated_element(FlyString const& fragment) const;
+    Element* find_a_potential_indicated_element(Utf16String const& fragment) const;
 
     void dispatch_events_for_transition(GC::Ref<CSS::CSSTransition>);
 
@@ -1295,7 +1298,7 @@ private:
     Optional<Color> m_active_link_color;
     Optional<Color> m_visited_link_color;
 
-    Optional<Vector<String>> m_supported_color_schemes;
+    Optional<Vector<Utf16FlyString>> m_supported_color_schemes;
 
     GC::Ptr<HTML::HTMLParser> m_parser;
     bool m_active_parser_was_aborted { false };
@@ -1351,7 +1354,7 @@ private:
     //            browsing context.
     HTML::DocumentReadyState m_readiness { HTML::DocumentReadyState::Complete };
     String m_content_type { "application/xml"_string };
-    Optional<String> m_pragma_set_default_language;
+    Optional<Utf16String> m_pragma_set_default_language;
     Optional<String> m_http_content_language;
     Optional<String> m_encoding;
 
@@ -1572,8 +1575,8 @@ private:
 
     Optional<String> m_content_blocker_style_sheet;
     // Class/id tokens already covered by the cached content blocker stylesheet.
-    HashTable<FlyString> m_content_blocker_style_sheet_checked_classes;
-    HashTable<FlyString> m_content_blocker_style_sheet_checked_ids;
+    HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_classes;
+    HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_ids;
 
     Optional<AK::UnixDateTime> m_last_modified;
 

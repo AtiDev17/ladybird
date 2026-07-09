@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
@@ -23,7 +24,7 @@ struct ImageSource {
         CSSPixels value { 0 };
     };
 
-    String url;
+    Utf16String url;
     Variant<Empty, PixelDensityDescriptorValue, WidthDescriptorValue> descriptor;
 };
 
@@ -34,7 +35,7 @@ struct ImageSourceAndPixelDensity {
 
 // https://html.spec.whatwg.org/multipage/images.html#source-set
 struct SourceSet {
-    static SourceSet create(DOM::Element const& element, String const& default_source, String const& srcset, String const& sizes, HTML::HTMLImageElement const* img = nullptr);
+    static SourceSet create(DOM::Element const& element, Utf16View default_source, Utf16View srcset, Utf16View sizes, HTML::HTMLImageElement const* img = nullptr);
 
     [[nodiscard]] bool is_empty() const;
 
@@ -50,7 +51,7 @@ struct SourceSet {
     NonnullRefPtr<CSS::StyleValue const> m_source_size;
 };
 
-SourceSet parse_a_srcset_attribute(StringView);
-[[nodiscard]] NonnullRefPtr<CSS::StyleValue const> parse_a_sizes_attribute(DOM::Element const& element, StringView sizes, HTML::HTMLImageElement const* img = nullptr);
+SourceSet parse_a_srcset_attribute(Utf16View);
+[[nodiscard]] NonnullRefPtr<CSS::StyleValue const> parse_a_sizes_attribute(DOM::Element const& element, Utf16View sizes, HTML::HTMLImageElement const* img = nullptr);
 
 }

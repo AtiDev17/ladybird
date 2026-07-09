@@ -5,6 +5,7 @@
  */
 
 #include <AK/Array.h>
+#include <AK/CharacterTypes.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibTextCodec/Encoder.h>
@@ -418,8 +419,7 @@ StringView request_destination_to_string(Request::Destination destination)
     VERIFY_NOT_REACHED();
 }
 
-// https://fetch.spec.whatwg.org/#concept-potential-destination-translate
-Optional<Request::Destination> translate_potential_destination(StringView potential_destination)
+static Optional<Request::Destination> translate_potential_destination_impl(auto potential_destination)
 {
     // 1. If potentialDestination is "fetch", then return the empty string.
     if (potential_destination == "fetch"sv)
@@ -472,6 +472,17 @@ Optional<Request::Destination> translate_potential_destination(StringView potent
     if (potential_destination == "xslt"sv)
         return Request::Destination::XSLT;
     VERIFY_NOT_REACHED();
+}
+
+// https://fetch.spec.whatwg.org/#concept-potential-destination-translate
+Optional<Request::Destination> translate_potential_destination(StringView potential_destination)
+{
+    return translate_potential_destination_impl(potential_destination);
+}
+
+Optional<Request::Destination> translate_potential_destination(Utf16View potential_destination)
+{
+    return translate_potential_destination_impl(potential_destination);
 }
 
 // https://fetch.spec.whatwg.org/#request-destination-script-like
@@ -563,6 +574,35 @@ Optional<Request::Priority> request_priority_from_string(StringView string)
     if (string.equals_ignoring_ascii_case("auto"sv))
         return Request::Priority::Auto;
     return {};
+}
+
+static bool equals_ignoring_ascii_case(Utf16View string, StringView ascii_string)
+{
+    if (string.length_in_code_units() != ascii_string.length())
+        return false;
+
+    for (size_t i = 0; i < string.length_in_code_units(); ++i) {
+        if (AK::to_ascii_lowercase(string.code_unit_at(i)) != AK::to_ascii_lowercase(ascii_string[i]))
+            return false;
+    }
+
+    return true;
+}
+
+Optional<Request::Priority> request_priority_from_string(Utf16View string)
+{
+    if (equals_ignoring_ascii_case(string, "high"sv))
+        return Request::Priority::High;
+    if (equals_ignoring_ascii_case(string, "low"sv))
+        return Request::Priority::Low;
+    if (equals_ignoring_ascii_case(string, "auto"sv))
+        return Request::Priority::Auto;
+    return {};
+}
+
+Optional<Request::Priority> request_priority_from_string(Utf16String const& string)
+{
+    return request_priority_from_string(string.utf16_view());
 }
 
 }

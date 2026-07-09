@@ -94,7 +94,7 @@ void HTMLObjectElement::adopted_from(DOM::Document& old_document)
         delayer = DOM::DocumentLoadEventDelayer { document() };
 }
 
-void HTMLObjectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&)
+void HTMLObjectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<FlyString> const&)
 {
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element
     // Whenever one of the following conditions occur:
@@ -414,8 +414,8 @@ void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const&
         else if (auto type = this->type(); !type.is_empty() && (type != "application/octet-stream"sv)) {
             // 1. If the attribute's value is a type that starts with "image/" that is not also an XML MIME type, then
             //    let the resource type be the type specified in that type attribute.
-            if (type.starts_with_bytes("image/"sv)) {
-                auto parsed_type = MimeSniff::MimeType::parse(type);
+            if (type.starts_with(u"image/"sv)) {
+                auto parsed_type = MimeSniff::MimeType::parse(type.to_utf8());
 
                 if (parsed_type.has_value() && !parsed_type->is_xml())
                     resource_type = move(parsed_type);

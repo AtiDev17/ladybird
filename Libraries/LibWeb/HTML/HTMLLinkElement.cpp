@@ -132,16 +132,16 @@ GC::Ref<DOM::DOMTokenList> HTMLLinkElement::sizes()
     return *m_sizes;
 }
 
-void HTMLLinkElement::set_media(String media)
+void HTMLLinkElement::set_media(Utf16String const& media)
 {
     set_attribute_value(HTML::AttributeNames::media, media);
     if (auto sheet = m_loaded_style_sheet)
-        sheet->set_media(move(media));
+        sheet->set_media(media.utf16_view());
 }
 
-String HTMLLinkElement::media() const
+Utf16String HTMLLinkElement::media() const
 {
-    return attribute(HTML::AttributeNames::media).value_or(String {});
+    return get_attribute_value(HTML::AttributeNames::media);
 }
 
 // https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
@@ -165,7 +165,7 @@ bool HTMLLinkElement::has_icon_keyword() const
     return m_relationship & Relationship::Icon;
 }
 
-void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -183,30 +183,37 @@ void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> 
     // 4.6.7 Link types - https://html.spec.whatwg.org/multipage/links.html#linkTypes
     auto old_relationship = m_relationship;
     if (name == HTML::AttributeNames::rel) {
-        m_relationship = 0;
-        // Keywords are always ASCII case-insensitive, and must be compared as such.
-        auto lowercased_value = value.value_or(String {}).to_ascii_lowercase();
         // To determine which link types apply to a link, a, area, or form element,
         // the element's rel attribute must be split on ASCII whitespace.
         // The resulting tokens are the keywords for the link types that apply to that element.
-        auto parts = lowercased_value.bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
-        for (auto& part : parts) {
-            if (part == "stylesheet"sv)
-                m_relationship |= Relationship::Stylesheet;
-            else if (part == "alternate"sv)
-                m_relationship |= Relationship::Alternate;
-            else if (part == "preload"sv)
-                m_relationship |= Relationship::Preload;
-            else if (part == "dns-prefetch"sv)
-                m_relationship |= Relationship::DNSPrefetch;
-            else if (part == "preconnect"sv)
-                m_relationship |= Relationship::Preconnect;
-            else if (part == "icon"sv)
-                m_relationship |= Relationship::Icon;
+        m_relationship = 0;
+        auto link_types = value.value_or({});
+        size_t start = 0;
+        for (size_t i = 0; i <= link_types.length_in_code_units(); ++i) {
+            if (i != link_types.length_in_code_units() && !Infra::is_ascii_whitespace(link_types.code_unit_at(i)))
+                continue;
+
+            if (i > start) {
+                auto token = link_types.substring_view(start, i - start);
+                if (token.equals_ignoring_ascii_case("stylesheet"sv))
+                    m_relationship |= Relationship::Stylesheet;
+                else if (token.equals_ignoring_ascii_case("alternate"sv))
+                    m_relationship |= Relationship::Alternate;
+                else if (token.equals_ignoring_ascii_case("preload"sv))
+                    m_relationship |= Relationship::Preload;
+                else if (token.equals_ignoring_ascii_case("dns-prefetch"sv))
+                    m_relationship |= Relationship::DNSPrefetch;
+                else if (token.equals_ignoring_ascii_case("preconnect"sv))
+                    m_relationship |= Relationship::Preconnect;
+                else if (token.equals_ignoring_ascii_case("icon"sv))
+                    m_relationship |= Relationship::Icon;
+            }
+
+            start = i + 1;
         }
 
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.value_or(String {}));
+            m_rel_list->associated_attribute_changed(value.value_or({}));
     }
 
     // https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:explicitly-enabled
@@ -219,7 +226,7 @@ void HTMLLinkElement::attribute_changed(FlyString const& name, Optional<String> 
             document_or_shadow_root_style_sheets().remove_a_css_style_sheet(*m_loaded_style_sheet);
             m_loaded_style_sheet = nullptr;
         } else if (name == HTML::AttributeNames::media) {
-            m_loaded_style_sheet->set_media(value.value_or(String {}));
+            m_loaded_style_sheet->set_media(value.value_or({}));
         }
     }
 
@@ -345,15 +352,15 @@ GC::Ref<HTMLLinkElement::LinkProcessingOptions> HTMLLinkElement::create_link_opt
 
     // 3. If el has an href attribute, then set options's href to the value of el's href attribute.
     if (auto maybe_href = get_attribute(AttributeNames::href); maybe_href.has_value())
-        options->href = maybe_href.value();
+        options->href = maybe_href.release_value();
 
     // 4. If el has an integrity attribute, then set options's integrity to the value of el's integrity content attribute.
     if (auto maybe_integrity = get_attribute(AttributeNames::integrity); maybe_integrity.has_value())
-        options->integrity = maybe_integrity.value();
+        options->integrity = maybe_integrity->to_utf8();
 
     // 5. If el has a type attribute, then set options's type to the value of el's type attribute.
     if (auto maybe_type = get_attribute(AttributeNames::type); maybe_type.has_value())
-        options->type = maybe_type.value();
+        options->type = maybe_type.release_value();
 
     // FIXME: 6. Assert: options's href is not the empty string, or options's source set is not null.
     //           A link element with neither an href or an imagesrcset does not represent a link.
@@ -373,7 +380,7 @@ GC::Ptr<Fetch::Infrastructure::Request> HTMLLinkElement::create_link_request(HTM
     // 3. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
     // FIXME: Spec issue: We should be parsing this URL relative to a document or environment settings object.
     //        https://github.com/whatwg/html/issues/9715
-    auto url = DOMURL::parse(options.href, options.base_url);
+    auto url = DOMURL::parse(options.href.utf16_view(), options.base_url);
 
     // 4. If url is failure, then return null.
     if (!url.has_value())
@@ -622,7 +629,7 @@ void HTMLLinkElement::preconnect(LinkProcessingOptions const& options)
     // 2. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
     // FIXME: Spec issue: We should be parsing this URL relative to a document or environment settings object.
     //        https://github.com/whatwg/html/issues/9715
-    auto url = DOMURL::parse(options.href, options.base_url);
+    auto url = DOMURL::parse(options.href.utf16_view(), options.base_url);
 
     // 3. If url is failure, then return.
     if (!url.has_value())
@@ -646,7 +653,7 @@ void HTMLLinkElement::preconnect(LinkProcessingOptions const& options)
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#match-preload-type
-static bool type_matches_destination(StringView type, Optional<Fetch::Infrastructure::Request::Destination> destination)
+static bool type_matches_destination(Utf16View type, Optional<Fetch::Infrastructure::Request::Destination> destination)
 {
     using enum Fetch::Infrastructure::Request::Destination;
 
@@ -834,12 +841,12 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
     auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response.header_list());
     if (extracted_mime_type.has_value()) {
         if (!mime_type_string.has_value())
-            mime_type_string = extracted_mime_type->essence();
+            mime_type_string = Utf16String::from_utf8(extracted_mime_type->essence());
         if (auto charset = extracted_mime_type->parameters().get("charset"sv); charset.has_value())
             mime_type_charset = charset.value();
     }
 
-    if (mime_type_string.has_value() && mime_type_string != "text/css"sv)
+    if (mime_type_string.has_value() && mime_type_string != "text/css"_utf16)
         success = false;
 
     // 2. If el no longer creates an external resource link that contributes to the styling processing model, or
@@ -883,7 +890,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
         //     2. Otherwise, return the document's character encoding. [DOM]
         Optional<StringView> environment_encoding;
         if (auto charset = attribute(HTML::AttributeNames::charset); charset.has_value())
-            environment_encoding = TextCodec::get_standardized_encoding(charset.release_value());
+            environment_encoding = TextCodec::get_standardized_encoding(*charset);
 
         if (!environment_encoding.has_value() && document().encoding().has_value())
             environment_encoding = document().encoding().value();
@@ -899,7 +906,7 @@ void HTMLLinkElement::process_stylesheet_resource(bool success, Fetch::Infrastru
                 "text/css"_string,
                 this,
                 attribute(HTML::AttributeNames::media).value_or({}),
-                in_a_document_tree() ? attribute(HTML::AttributeNames::title).value_or({}) : String {},
+                in_a_document_tree() ? attribute(HTML::AttributeNames::title).value_or({}) : Utf16String {},
                 (m_relationship & Relationship::Alternate && !m_explicitly_enabled) ? CSS::StyleSheetList::Alternate::Yes : CSS::StyleSheetList::Alternate::No,
                 CSS::StyleSheetList::OriginClean::Yes,
                 response.url_list().first(),
@@ -1088,7 +1095,7 @@ HTMLLinkElement::LinkProcessingOptions::LinkProcessingOptions(
     GC::Ref<HTML::EnvironmentSettingsObject> environment,
     GC::Ref<HTML::PolicyContainer> policy_container,
     GC::Ptr<Web::DOM::Document> document,
-    String cryptographic_nonce_metadata,
+    Utf16String cryptographic_nonce_metadata,
     Fetch::Infrastructure::Request::Priority fetch_priority)
     : cryptographic_nonce_metadata(move(cryptographic_nonce_metadata))
     , crossorigin(crossorigin)

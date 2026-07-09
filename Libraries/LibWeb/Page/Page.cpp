@@ -51,6 +51,19 @@ Page::Page(GC::Ref<PageClient> client)
 
 Page::~Page() = default;
 
+void Page::acquire_screen_wake_lock()
+{
+    if (m_active_screen_wake_lock_count++ == 0)
+        client().page_did_change_screen_wake_lock_state(ScreenWakeLockState::Acquired);
+}
+
+void Page::release_screen_wake_lock()
+{
+    VERIFY(m_active_screen_wake_lock_count > 0);
+    if (--m_active_screen_wake_lock_count == 0)
+        client().page_did_change_screen_wake_lock_state(ScreenWakeLockState::Released);
+}
+
 bool Page::has_compositor_host() const
 {
     return m_client->compositor_host();
@@ -341,6 +354,13 @@ EventResult Page::handle_mouseleave()
 {
     return top_level_traversable()->event_handler().handle_mouseleave();
 }
+
+#if defined(AK_OS_MACOS)
+bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
+{
+    return top_level_traversable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
+}
+#endif
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
@@ -810,9 +830,12 @@ void Page::toggle_media_controls_state()
         media_element->set_attribute_value(HTML::AttributeNames::controls, String {});
 }
 
-void Page::toggle_page_mute_state()
+void Page::set_page_mute_state(HTML::MuteState mute_state)
 {
-    m_mute_state = HTML::invert_mute_state(m_mute_state);
+    if (m_mute_state == mute_state)
+        return;
+
+    m_mute_state = mute_state;
 
     for_each_media_element([&](auto& media_element) {
         media_element.page_mute_state_changed({});

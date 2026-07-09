@@ -99,7 +99,7 @@ void HTMLButtonElement::set_type_for_bindings(String const& type)
     set_attribute_value(HTML::AttributeNames::type, type);
 }
 
-void HTMLButtonElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLButtonElement::form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
 }
@@ -139,11 +139,11 @@ bool HTMLButtonElement::is_submit_button() const
 Utf16String HTMLButtonElement::value() const
 {
     // The element's value is the value of the element's value attribute, if there is one; otherwise the empty string.
-    return Utf16String::from_utf8(attribute(AttributeNames::value).value_or(String {}));
+    return attribute(AttributeNames::value).value_or({});
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:concept-fe-optional-value
-Optional<String> HTMLButtonElement::optional_value() const
+Optional<Utf16String> HTMLButtonElement::optional_value() const
 {
     // The element's optional value is the value of the element's value attribute, if there is one; otherwise null.
     return attribute(AttributeNames::value);
@@ -155,14 +155,14 @@ bool HTMLButtonElement::has_activation_behavior() const
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#determine-if-command-is-valid
-static bool determine_if_a_command_is_valid_for_a_target(String command, GC::Ptr<Web::DOM::Element> target)
+static bool determine_if_a_command_is_valid_for_a_target(Utf16String const& command, GC::Ptr<Web::DOM::Element> target)
 {
     // 1. If command is in the Unknown state, then return false.
     if (command.is_empty())
         return false;
 
     // 2. If command is in the Custom state, then return true.
-    if (command.starts_with_bytes("--"sv))
+    if (command.starts_with(u"--"sv))
         return true;
 
     // 3. If target is not an HTML element, then return false.
@@ -175,7 +175,7 @@ static bool determine_if_a_command_is_valid_for_a_target(String command, GC::Ptr
     //    - Show Popover
     //    - Hide Popover
     //    then return true.
-    if (command == "toggle-popover"sv || command == "show-popover"sv || command == "hide-popover"sv)
+    if (command == u"toggle-popover"sv || command == u"show-popover"sv || command == u"hide-popover"sv)
         return true;
 
     // 5. If this standard does not define is valid command steps for target's local name, then return false.
@@ -247,13 +247,13 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
             return;
 
         // 6. If command is in the Custom state, then return.
-        if (command.starts_with_bytes("--"sv))
+        if (command.starts_with(u"--"sv))
             return;
 
         auto target_element = as<HTMLElement>(target.ptr());
 
         // 7. If command is in the Hide Popover state:
-        if (command == "hide-popover") {
+        if (command == u"hide-popover"sv) {
             // 1. If the result of running check popover validity given target, true, false, and null is true,
             //    then run the hide popover algorithm given target, true, true, false, and element.
             if (MUST(target_element->check_popover_validity(ExpectedToBeShowing::Yes, ThrowExceptions::No, nullptr, IgnoreDomState::No))) {
@@ -262,7 +262,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
         }
 
         // 8. Otherwise, if command is in the Toggle Popover state:
-        else if (command == "toggle-popover") {
+        else if (command == u"toggle-popover"sv) {
             // 1. If the result of running check popover validity given target, false, false, and null is true,
             //    then run the show popover algorithm given target, false, and element.
             if (MUST(target_element->check_popover_validity(ExpectedToBeShowing::No, ThrowExceptions::No, nullptr, IgnoreDomState::No))) {
@@ -277,7 +277,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
         }
 
         // 9. Otherwise, if command is in the Show Popover state:
-        else if (command == "show-popover") {
+        else if (command == u"show-popover"sv) {
             // 1. If the result of running check popover validity given target, false, false, and null is true,
             //    then run the show popover algorithm given target, false, and element.
             if (MUST(target_element->check_popover_validity(ExpectedToBeShowing::No, ThrowExceptions::No, nullptr, IgnoreDomState::No))) {
@@ -303,7 +303,7 @@ bool HTMLButtonElement::is_focusable() const
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-command
-String HTMLButtonElement::command() const
+Utf16String HTMLButtonElement::command() const
 {
     // 1. Let command be this's command attribute.
     auto command = get_attribute(AttributeNames::command);
@@ -318,11 +318,11 @@ String HTMLButtonElement::command() const
     // request-close            Request Close  Requests to close the targeted dialog element.
     // show-modal               Show Modal     Opens the targeted dialog element as modal.
     // A custom command keyword Custom         Only dispatches the command event on the targeted element.
-    Array valid_values { "toggle-popover"_string, "show-popover"_string, "hide-popover"_string, "close"_string, "request-close"_string, "show-modal"_string };
+    Array valid_values { u"toggle-popover"sv, u"show-popover"sv, u"hide-popover"sv, u"close"sv, u"request-close"sv, u"show-modal"sv };
 
     // 2. If command is in the Custom state, then return command's value.
     //    A custom command keyword is a string that starts with "--".
-    if (command.has_value() && command.value().starts_with_bytes("--"sv)) {
+    if (command.has_value() && command.value().starts_with(u"--"sv)) {
         return command.value();
     }
 
@@ -330,10 +330,9 @@ String HTMLButtonElement::command() const
 
     // 4. Return the keyword corresponding to the value of command.return
     if (command.has_value()) {
-        auto command_value = command.value();
         for (auto const& value : valid_values) {
-            if (value.equals_ignoring_ascii_case(command_value)) {
-                return value;
+            if (command.value().equals_ignoring_ascii_case(value)) {
+                return Utf16String::from_utf16(value);
             }
         }
     }
@@ -344,7 +343,7 @@ String HTMLButtonElement::command() const
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:dom-button-command-2
-void HTMLButtonElement::set_command(String const& value)
+void HTMLButtonElement::set_command(Utf16String const& value)
 {
     set_attribute_value(AttributeNames::command, value);
 }

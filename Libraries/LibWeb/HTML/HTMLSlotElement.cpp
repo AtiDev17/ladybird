@@ -132,7 +132,7 @@ void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
 }
 
 // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext
-void HTMLSlotElement::attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLSlotElement::attribute_changed(FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(local_name, old_value, value, namespace_);
 
@@ -143,11 +143,11 @@ void HTMLSlotElement::attribute_changed(FlyString const& local_name, Optional<St
             return;
 
         // 2. If value is null and oldValue is the empty string, then return.
-        if (!value.has_value() && old_value == String {})
+        if (!value.has_value() && old_value == Utf16String {})
             return;
 
         // 3. If value is the empty string and oldValue is null, then return.
-        if (value == String {} && !old_value.has_value())
+        if (value == Utf16String {} && !old_value.has_value())
             return;
 
         // OPTIMIZATION: Update the slot registry before changing the name.

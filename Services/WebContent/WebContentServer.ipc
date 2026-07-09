@@ -12,6 +12,7 @@
 #include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
+#include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/AutoplayPolicy.h>
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/BroadcastChannelMessage.h>
@@ -27,6 +28,7 @@
 #include <LibWeb/WebDriver/ExecuteScript.h>
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/Attribute.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/Settings.h>
@@ -134,6 +136,8 @@ endpoint WebContentServer
     request_internal_page_info(u64 page_id, WebView::PageInfoType type) =|
 
     get_selected_text(u64 page_id) => (ByteString selection)
+    get_selected_text_for_lookup(u64 page_id) => (Optional<WebView::DictionaryLookup> lookup)
+    select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) => (bool selected)
     cut_selected_text(u64 page_id) => (ByteString selection)
     select_all(u64 page_id) =|
     paste(u64 page_id, Utf16String text) =|
@@ -184,7 +188,7 @@ endpoint WebContentServer
     toggle_media_fullscreen_state(u64 page_id) =|
     toggle_media_controls_state(u64 page_id) =|
 
-    toggle_page_mute_state(u64 page_id) =|
+    set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state) =|
 
     set_user_style(u64 page_id, String source) =|
 

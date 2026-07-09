@@ -263,7 +263,7 @@ void HTMLImageElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
     });
 }
 
-void HTMLImageElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const&)
+void HTMLImageElement::form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<FlyString> const&)
 {
     if (name == HTML::AttributeNames::crossorigin) {
         m_cors_setting = cors_setting_attribute_from_keyword(value);
@@ -359,12 +359,33 @@ void HTMLImageElement::set_height(WebIDL::UnsignedLong height)
     set_attribute_value(HTML::AttributeNames::height, String::number(height));
 }
 
+static float current_pixel_density_or_default(ImageRequest const& image_request)
+{
+    auto density = image_request.current_pixel_density();
+    if (density <= 0)
+        return 1.0f;
+    return density;
+}
+
+static Optional<CSSPixels> density_correct_dimension(Optional<CSSPixels> dimension, float density)
+{
+    if (!dimension.has_value())
+        return {};
+    return CSSPixels::nearest_value_for(dimension->to_double() / density);
+}
+
+// https://html.spec.whatwg.org/multipage/images.html#density-corrected-intrinsic-width-and-height
+// To determine the density-corrected natural width and height of an img element img:
+// - Let density be img's current request's current pixel density.
+// - If the current request's preferred density-corrected dimensions are not null, divide those dimensions by density.
+// - Otherwise, divide the image's intrinsic width and intrinsic height by density.
+// The intrinsic ratio is not density-corrected, since dividing both dimensions by the same density leaves it unchanged.
+
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
 unsigned HTMLImageElement::natural_width() const
 {
     // 1. If the image is not available, then return 0.
     // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
-    // FIXME: Implement density-corrected algorithm.
     if (auto width = intrinsic_width(); width.has_value() && *width > 0)
         return width->to_int();
     return 0;
@@ -375,7 +396,6 @@ unsigned HTMLImageElement::natural_height() const
 {
     // 1. If the image is not available, then return 0.
     // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
-    // FIXME: Implement density-corrected algorithm.
     if (auto height = intrinsic_height(); height.has_value() && *height > 0)
         return height->to_int();
     return 0;
@@ -447,7 +467,7 @@ bool HTMLImageElement::complete() const
 String HTMLImageElement::current_src() const
 {
     // The currentSrc IDL attribute must return the img element's current request's current URL.
-    return m_current_request->current_url();
+    return m_current_request->current_url().to_utf8();
 }
 
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode
@@ -632,7 +652,7 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
     auto previous_url = m_current_request->current_url();
 
     // 4. Let selected source be null and selected pixel density be undefined.
-    Optional<String> selected_source;
+    Optional<Utf16String> selected_source;
     Optional<float> selected_pixel_density;
 
     // 5. If the element does not use srcset or picture
@@ -705,13 +725,13 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
                     restart_the_animation();
 
                 // 2. Set the current request's current URL to urlString.
-                m_current_request->set_current_url(document().realm(), *url_string);
+                m_current_request->set_current_url(document().realm(), Utf16String::from_utf8(*url_string));
 
                 set_needs_style_update(true);
                 set_needs_layout_update_or_repaint_after_image_data_change(*this, DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
 
                 // 3. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
-                if (!maybe_omit_events || previous_url != url_string)
+                if (!maybe_omit_events || previous_url != Utf16String::from_utf8(*url_string))
                     dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
             });
 
@@ -764,14 +784,14 @@ after_step_7:
                 }
 
                 // 1. Change the current request's current URL to the empty string.
-                m_current_request->set_current_url(document().realm(), String {});
+                m_current_request->set_current_url(document().realm(), {});
 
                 // 2. If all of the following conditions are true:
                 //    - the element has a src attribute or it uses srcset or picture; and
                 //    - maybe omit events is not set or previousURL is not the empty string
                 if (
                     (has_attribute(HTML::AttributeNames::src) || uses_srcset_or_picture())
-                    && (!maybe_omit_events || m_current_request->current_url() != ""sv)) {
+                    && (!maybe_omit_events || !m_current_request->current_url().is_empty())) {
                     dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
                 }
             });
@@ -818,12 +838,14 @@ after_step_7:
         }
 
         // 14. If the pending request is not null and urlString is the same as the pending request's current URL, then return.
-        if (m_pending_request && url_string == m_pending_request->current_url())
+        auto utf16_url_string = Utf16String::from_utf8(*url_string);
+
+        if (m_pending_request && utf16_url_string == m_pending_request->current_url())
             return;
 
         // 15. If urlString is the same as the current request's current URL and the current request's state is
         //     partially available:
-        if (url_string == m_current_request->current_url() && m_current_request->state() == ImageRequest::State::PartiallyAvailable) {
+        if (utf16_url_string == m_current_request->current_url() && m_current_request->state() == ImageRequest::State::PartiallyAvailable) {
             // 1. Abort the image request for the pending request.
             abort_the_image_request(realm(), m_pending_request);
 
@@ -847,7 +869,8 @@ after_step_7:
 
         // 17. Set image request to a new image request whose current URL is urlString.
         auto image_request = ImageRequest::create(document().realm(), document().page());
-        image_request->set_current_url(document().realm(), *url_string);
+        image_request->set_current_url(document().realm(), move(utf16_url_string));
+        image_request->set_current_pixel_density(pixel_density.value_or(1.0f));
 
         // 18. If the current request's state is unavailable or broken, then set the current request to image request.
         //     Otherwise, set the pending request to image request.
@@ -912,11 +935,12 @@ after_step_7:
     }));
 }
 
-void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> image_request, bool maybe_omit_events, String const& url_string, String const& previous_url)
+void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> image_request, bool maybe_omit_events, String const& url_string, Utf16String const& previous_url)
 {
+    auto utf16_url_string = Utf16String::from_utf8(url_string);
     image_request->add_callbacks(
-        [this, image_request, maybe_omit_events, url_string, previous_url]() {
-            batching_dispatcher().enqueue(GC::create_function(realm().heap(), [this, image_request, maybe_omit_events, url_string, previous_url] {
+        [this, image_request, maybe_omit_events, url_string, utf16_url_string, previous_url]() {
+            batching_dispatcher().enqueue(GC::create_function(realm().heap(), [this, image_request, maybe_omit_events, url_string, utf16_url_string, previous_url] {
                 // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
                 //         between when the fetch completed and when this batched callback runs.
                 if (!document().is_fully_active()) {
@@ -966,13 +990,13 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 set_needs_layout_update_or_repaint_after_image_data_change(*this, DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
 
                 // 4. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
-                if (!maybe_omit_events || previous_url != url_string)
+                if (!maybe_omit_events || previous_url != utf16_url_string)
                     dispatch_event(DOM::Event::create(realm(), HTML::EventNames::load));
 
                 m_load_event_delayer.clear();
             }));
         },
-        [this, image_request, maybe_omit_events, url_string, previous_url]() {
+        [this, image_request, maybe_omit_events, utf16_url_string, previous_url]() {
             // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
             //         between when the fetch completed and when this failure callback runs.
             if (!document().is_fully_active()) {
@@ -1007,7 +1031,7 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
             // and then, if maybe omit events is not set or previousURL is not equal to urlString,
             // queue an element task on the DOM manipulation task source given the img element
             // to fire an event named error at the img element.
-            if (!maybe_omit_events || previous_url != url_string)
+            if (!maybe_omit_events || previous_url != utf16_url_string)
                 dispatch_event(DOM::Event::create(realm(), HTML::EventNames::error));
 
             m_load_event_delayer.clear();
@@ -1042,7 +1066,7 @@ void HTMLImageElement::react_to_changes_in_the_environment()
 
     // 3. ⌛ Let selected source and selected pixel density be the URL and pixel density
     //       that results from selecting an image source, respectively.
-    Optional<String> selected_source;
+    Optional<Utf16String> selected_source;
     Optional<float> pixel_density;
     if (auto result = select_an_image_source(); result.has_value()) {
         selected_source = result.value().source.url;
@@ -1083,14 +1107,15 @@ void HTMLImageElement::react_to_changes_in_the_environment()
 
     // 12. ⌛ Let image request be a new image request whose current URL is urlString
     auto image_request = ImageRequest::create(document().realm(), document().page());
-    image_request->set_current_url(document().realm(), *url_string);
+    image_request->set_current_url(document().realm(), Utf16String::from_utf8(*url_string));
+    image_request->set_current_pixel_density(pixel_density.value_or(1.0f));
 
     // 13. ⌛ Set the element's pending request to image request.
     m_pending_request = image_request;
 
     // FIXME: 14. End the synchronous section, continuing the remaining steps in parallel.
 
-    auto step_16 = [this](String const& selected_source, GC::Ref<ImageRequest> image_request, ListOfAvailableImages::Key const& key, GC::Ref<DecodedImageData> image_data) {
+    auto step_16 = [this](Utf16String const& selected_source, GC::Ref<ImageRequest> image_request, ListOfAvailableImages::Key const& key, GC::Ref<DecodedImageData> image_data) {
         // 16. Queue an element task on the DOM manipulation task source given the img element and the following steps:
         queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, selected_source, image_request, key, image_data] {
             // 1. FIXME: If the img element has experienced relevant mutations since this algorithm started, then set the pending request to null and abort these steps.
@@ -1100,7 +1125,6 @@ void HTMLImageElement::react_to_changes_in_the_environment()
                 return;
 
             // 2. Set the img element's last selected source to selected source and the img element's current pixel density to selected pixel density.
-            // FIXME: pixel density
             m_last_selected_source = selected_source;
 
             // 3. Set the image request's state to completely available.
@@ -1250,13 +1274,13 @@ static void update_the_source_set(DOM::Element& element)
         // 1. If child is el:
         if (child == &element) {
             // 1. Let default source be the empty string.
-            String default_source;
+            Utf16String default_source;
 
             // 2. Let srcset be the empty string.
-            String srcset;
+            Utf16String srcset;
 
             // 3. Let sizes be the empty string.
-            String sizes;
+            Utf16String sizes;
 
             // 4. If el is an img element that has a srcset attribute, then set srcset to that attribute's value.
             if (is<HTMLImageElement>(element)) {
@@ -1385,9 +1409,10 @@ bool HTMLImageElement::allows_auto_sizes() const
     if (lazy_loading_attribute() != LazyLoading::Lazy)
         return false;
     auto sizes = attribute(HTML::AttributeNames::sizes);
-    return sizes.has_value()
-        && (sizes->equals_ignoring_ascii_case("auto"sv)
-            || sizes->starts_with_bytes("auto,"sv, AK::CaseSensitivity::CaseInsensitive));
+    if (!sizes.has_value())
+        return false;
+    return sizes->equals_ignoring_ascii_case("auto"sv)
+        || (sizes->length_in_code_units() >= 5 && sizes->substring_view(0, 5).equals_ignoring_ascii_case("auto,"sv));
 }
 
 GC::Ptr<DecodedImageData> HTMLImageElement::decoded_image_data() const
@@ -1395,6 +1420,50 @@ GC::Ptr<DecodedImageData> HTMLImageElement::decoded_image_data() const
     if (!m_current_request)
         return nullptr;
     return m_current_request->image_data();
+}
+
+Optional<CSSPixels> HTMLImageElement::intrinsic_width() const
+{
+    if (!m_current_request)
+        return {};
+
+    auto density = current_pixel_density_or_default(*m_current_request);
+    if (auto const& dimensions = m_current_request->preferred_density_corrected_dimensions(); dimensions.has_value())
+        return CSSPixels::nearest_value_for(dimensions->width() / density);
+
+    if (auto const& data = decoded_image_data())
+        return density_correct_dimension(data->intrinsic_width(), density);
+    return {};
+}
+
+Optional<CSSPixels> HTMLImageElement::intrinsic_height() const
+{
+    if (!m_current_request)
+        return {};
+
+    auto density = current_pixel_density_or_default(*m_current_request);
+    if (auto const& dimensions = m_current_request->preferred_density_corrected_dimensions(); dimensions.has_value())
+        return CSSPixels::nearest_value_for(dimensions->height() / density);
+
+    if (auto const& data = decoded_image_data())
+        return density_correct_dimension(data->intrinsic_height(), density);
+    return {};
+}
+
+Optional<CSSPixelFraction> HTMLImageElement::intrinsic_aspect_ratio() const
+{
+    if (!m_current_request)
+        return {};
+
+    if (auto const& dimensions = m_current_request->preferred_density_corrected_dimensions(); dimensions.has_value()) {
+        if (dimensions->width() > 0 && dimensions->height() > 0)
+            return CSSPixelFraction(dimensions->width(), dimensions->height());
+        return {};
+    }
+
+    if (auto const& data = decoded_image_data())
+        return data->intrinsic_aspect_ratio();
+    return {};
 }
 
 }

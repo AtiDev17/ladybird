@@ -10,6 +10,7 @@
 #include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
 #include <AK/Math.h>
+#include <AK/Utf16String.h>
 #include <LibCore/Process.h>
 #include <LibCore/Timer.h>
 #include <LibDevTools/IndexedDBSerialization.h>
@@ -1191,6 +1192,11 @@ void PageClient::page_did_change_audio_play_state(Web::HTML::AudioPlayState play
     client().async_did_change_audio_play_state(m_id, play_state);
 }
 
+void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
+{
+    client().async_did_change_screen_wake_lock_state(m_id, wake_lock_state);
+}
+
 Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
@@ -1215,7 +1221,12 @@ void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const
         VERIFY(attribute_name.has_value());
 
         auto const& element = as<Web::DOM::Element>(target);
-        mutation = WebView::AttributeMutation { *attribute_name, element.attribute(*attribute_name) };
+        mutation = WebView::AttributeMutation {
+            *attribute_name,
+            element.attribute(*attribute_name).map([](auto const& value) {
+                return value.to_utf8();
+            })
+        };
     } else if (type == Web::DOM::MutationType::characterData) {
         auto const& character_data = as<Web::DOM::CharacterData>(target);
         mutation = WebView::CharacterDataMutation { character_data.data().to_utf8_but_should_be_ported_to_utf16() };
@@ -1398,7 +1409,8 @@ void PageClient::run_javascript(StringView js_source)
     // Let script be the result of creating a classic script given scriptSource, settings, baseURL, and the default classic script fetch options.
     // FIXME: This doesn't pass in "default classic script fetch options"
     // FIXME: What should the filename be here?
-    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", js_source, settings, move(base_url));
+    auto script_source = Utf16String::from_utf8(js_source);
+    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", script_source, settings, move(base_url));
 
     // Let evaluationStatus be the result of running the classic script script.
     auto evaluation_status = script->run();

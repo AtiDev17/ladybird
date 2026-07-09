@@ -44,7 +44,7 @@ void SVGAnimatedString::visit_edges(Cell::Visitor& visitor)
 }
 
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGAnimatedString__baseVal
-String SVGAnimatedString::base_val() const
+Utf16String SVGAnimatedString::base_val() const
 {
     // On getting baseVal or animVal, the following steps are run:
     // 1. If the reflected attribute is not present, then:
@@ -58,7 +58,7 @@ String SVGAnimatedString::base_val() const
 
         // 2. Otherwise, if the reflected attribute has an initial value, then return it.
         if (m_initial_value.has_value())
-            return m_initial_value.value().to_string();
+            return Utf16String::from_utf8(m_initial_value.value());
 
         // 3. Otherwise, return the empty string.
         return {};

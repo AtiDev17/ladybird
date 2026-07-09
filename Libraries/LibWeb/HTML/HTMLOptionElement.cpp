@@ -60,7 +60,7 @@ void HTMLOptionElement::update_selection_label()
     }
 }
 
-void HTMLOptionElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLOptionElement::attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -109,14 +109,14 @@ Utf16String HTMLOptionElement::value() const
     // The value of an option element is the value of the value content attribute, if there is one.
     // ...or, if there is not, the value of the element's text IDL attribute.
     if (auto value = attribute(HTML::AttributeNames::value); value.has_value())
-        return Utf16String::from_utf8(*value);
+        return value.release_value();
     return text();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
 void HTMLOptionElement::set_value(Utf16String const& value)
 {
-    set_attribute_value(HTML::AttributeNames::value, value.to_utf8_but_should_be_ported_to_utf16());
+    set_attribute_value(HTML::AttributeNames::value, value);
 }
 
 static void concatenate_descendants_text_content(DOM::Node const* node, Utf16StringBuilder& builder)
@@ -132,17 +132,17 @@ static void concatenate_descendants_text_content(DOM::Node const* node, Utf16Str
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
-String HTMLOptionElement::label() const
+Utf16String HTMLOptionElement::label() const
 {
     // The label IDL attribute, on getting, if there is a label content attribute,
     // must return that attribute's value; otherwise, it must return the element's label.
     if (auto label = attribute(HTML::AttributeNames::label); label.has_value())
         return label.release_value();
-    return text().to_utf8_but_should_be_ported_to_utf16();
+    return text();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
-void HTMLOptionElement::set_label(String const& label)
+void HTMLOptionElement::set_label(Utf16String const& label)
 {
     set_attribute_value(HTML::AttributeNames::label, label);
     // Note: this causes attribute_changed() to be called, which will update the <select>'s label

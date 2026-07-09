@@ -76,7 +76,7 @@ class WEB_API HTMLElement
 public:
     virtual ~HTMLElement() override;
 
-    Optional<String> title() const { return attribute(HTML::AttributeNames::title); }
+    Optional<Utf16String> title() const { return attribute(HTML::AttributeNames::title); }
 
     bool translate() const;
     void set_translate(bool);
@@ -108,13 +108,13 @@ public:
 
     void click();
 
-    [[nodiscard]] String access_key_label() const;
+    [[nodiscard]] Utf16String access_key_label() const;
 
     bool spellcheck() const;
     void set_spellcheck(bool);
 
-    String writing_suggestions() const;
-    void set_writing_suggestions(String const&);
+    Utf16String writing_suggestions() const;
+    void set_writing_suggestions(Utf16String const&);
 
     enum class AutocapitalizationHint {
         Default,
@@ -125,8 +125,8 @@ public:
     };
 
     AutocapitalizationHint own_autocapitalization_hint() const;
-    String autocapitalize() const;
-    void set_autocapitalize(String const&);
+    Utf16String autocapitalize() const;
+    void set_autocapitalize(Utf16String const&);
 
     enum class AutocorrectionState {
         On,
@@ -179,8 +179,8 @@ public:
     bool draggable() const;
     void set_draggable(bool draggable);
 
-    virtual bool is_valid_command(String&) { return false; }
-    virtual void command_steps(DOM::Element&, String&) { }
+    virtual bool is_valid_command(Utf16String const&) { return false; }
+    virtual void command_steps(DOM::Element&, Utf16String const&) { }
 
     bool is_form_associated_custom_element() const;
 
@@ -195,7 +195,7 @@ protected:
 
     virtual void initialize(JS::Realm&) override;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
     virtual WebIDL::ExceptionOr<void> cloned(DOM::Node&, bool) const override;
     virtual void inserted() override;
 
@@ -225,7 +225,7 @@ private:
 
     void queue_a_popover_toggle_event_task(String old_state, String new_state, GC::Ptr<HTMLElement> source);
 
-    static Optional<String> popover_value_to_state(Optional<String> value);
+    static Optional<String> popover_value_to_state(Optional<Utf16String> const& value);
     void hide_popover_stack_until(Vector<GC::Ref<HTMLElement>> const& popover_list, FocusPreviousElement focus_previous_element, FireEvents fire_events);
     GC::Ptr<HTMLElement> nearest_inclusive_open_popover();
     GC::Ptr<HTMLElement> nearest_inclusive_target_popover();

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -60,7 +61,13 @@ void MathMLMspaceElement::apply_presentational_hints(Vector<CSS::StyleProperty>&
     auto depth_value = parse_non_percentage_value(AttributeNames::depth);
 
     if (height_value && depth_value) {
-        auto height_string = MUST(String::formatted("calc({} + {})", attribute(AttributeNames::height).value(), attribute(AttributeNames::depth).value()));
+        Utf16StringBuilder builder;
+        builder.append("calc("sv);
+        builder.append(attribute(AttributeNames::height).value());
+        builder.append(" + "sv);
+        builder.append(attribute(AttributeNames::depth).value());
+        builder.append(")"sv);
+        auto height_string = builder.to_string();
         if (auto height_value = parse_css_type(parsing_params, height_string, CSS::ValueType::Length))
             properties.append({ .property_id = CSS::PropertyID::Height, .value = height_value.release_nonnull() });
     } else if (height_value) {

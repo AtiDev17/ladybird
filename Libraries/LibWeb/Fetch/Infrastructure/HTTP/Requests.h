@@ -14,6 +14,8 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibGC/Ptr.h>
@@ -243,8 +245,8 @@ public:
     [[nodiscard]] String const& integrity_metadata() const { return m_integrity_metadata; }
     void set_integrity_metadata(String integrity_metadata) { m_integrity_metadata = move(integrity_metadata); }
 
-    [[nodiscard]] String const& cryptographic_nonce_metadata() const { return m_cryptographic_nonce_metadata; }
-    void set_cryptographic_nonce_metadata(String cryptographic_nonce_metadata) { m_cryptographic_nonce_metadata = move(cryptographic_nonce_metadata); }
+    [[nodiscard]] Utf16String const& cryptographic_nonce_metadata() const { return m_cryptographic_nonce_metadata; }
+    void set_cryptographic_nonce_metadata(Utf16String cryptographic_nonce_metadata) { m_cryptographic_nonce_metadata = move(cryptographic_nonce_metadata); }
 
     [[nodiscard]] Optional<ParserMetadata> const& parser_metadata() const { return m_parser_metadata; }
     void set_parser_metadata(Optional<ParserMetadata> parser_metadata) { m_parser_metadata = move(parser_metadata); }
@@ -465,7 +467,7 @@ private:
     // https://fetch.spec.whatwg.org/#concept-request-nonce-metadata
     // A request has associated cryptographic nonce metadata (a string). Unless stated otherwise, it is the empty
     // string.
-    String m_cryptographic_nonce_metadata;
+    Utf16String m_cryptographic_nonce_metadata;
 
     // https://fetch.spec.whatwg.org/#concept-request-parser-metadata
     // A request has associated parser metadata which is the empty string, "parser-inserted", or
@@ -523,11 +525,14 @@ private:
 
 WEB_API StringView request_destination_to_string(Request::Destination);
 Optional<Request::Destination> translate_potential_destination(StringView potential_destination);
+Optional<Request::Destination> translate_potential_destination(Utf16View potential_destination);
 bool destination_is_script_like(Request::Destination);
 
 WEB_API StringView request_mode_to_string(Request::Mode);
 WEB_API FlyString initiator_type_to_string(Request::InitiatorType);
 
 Optional<Request::Priority> request_priority_from_string(StringView);
+Optional<Request::Priority> request_priority_from_string(Utf16View);
+Optional<Request::Priority> request_priority_from_string(Utf16String const&);
 
 }

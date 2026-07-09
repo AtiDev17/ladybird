@@ -35,7 +35,7 @@ class HTMLFormElement final : public HTMLElement {
 public:
     virtual ~HTMLFormElement() override;
 
-    String action_from_form_element(GC::Ref<HTMLElement> element) const;
+    Utf16String action_from_form_element(GC::Ref<HTMLElement> element) const;
 
     enum class MethodAttributeState {
 #define __ENUMERATE_FORM_METHOD_ATTRIBUTE(_, state) state,
@@ -115,11 +115,11 @@ private:
 
     // ^PlatformObject
     virtual Optional<JS::Value> item_value(size_t index) const override;
-    virtual JS::Value named_item_value(FlyString const& name) const override;
-    virtual bool is_supported_property_name(FlyString const&) const override;
-    virtual Vector<FlyString> supported_property_names() const override;
+    virtual JS::Value named_item_value(Utf16FlyString const& name) const override;
+    virtual bool is_supported_property_name(Utf16FlyString const&) const override;
+    virtual Vector<Utf16FlyString> supported_property_names() const override;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_) override;
 
     ErrorOr<String> pick_an_encoding() const;
 
@@ -149,7 +149,7 @@ private:
             visitor.visit(node);
         }
     };
-    HashMap<FlyString, PastNameEntry> mutable m_past_names_map;
+    HashMap<Utf16FlyString, PastNameEntry> mutable m_past_names_map;
 
     GC::Ptr<HTMLFormControlsCollection> mutable m_elements;
 

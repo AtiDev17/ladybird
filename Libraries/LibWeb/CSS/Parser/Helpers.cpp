@@ -67,6 +67,13 @@ CSS::Parser::Parser::PropertiesAndCustomProperties parse_css_property_declaratio
     return CSS::Parser::Parser::create(context, css).parse_as_property_declaration_block();
 }
 
+CSS::Parser::Parser::PropertiesAndCustomProperties parse_css_property_declaration_block(CSS::Parser::ParsingParams const& context, Utf16View css)
+{
+    if (css.is_empty())
+        return {};
+    return CSS::Parser::Parser::create(context, css).parse_as_property_declaration_block();
+}
+
 Vector<CSS::Descriptor> parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const& parsing_params, CSS::AtRuleID at_rule_id, StringView css)
 {
     if (css.is_empty())
@@ -81,7 +88,21 @@ RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const& 
     return CSS::Parser::Parser::create(context, string).parse_as_css_value(property_id);
 }
 
+RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const& context, Utf16View string, CSS::PropertyID property_id)
+{
+    if (string.is_empty())
+        return nullptr;
+    return CSS::Parser::Parser::create(context, string).parse_as_css_value(property_id);
+}
+
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const& context, StringView string, CSS::ValueType value_type)
+{
+    if (string.is_empty())
+        return nullptr;
+    return CSS::Parser::Parser::create(context, string).parse_as_type(value_type);
+}
+
+RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const& context, Utf16View string, CSS::ValueType value_type)
 {
     if (string.is_empty())
         return nullptr;
@@ -131,7 +152,17 @@ RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const& cont
     return CSS::Parser::Parser::create(context, string).parse_as_media_query();
 }
 
+RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const& context, Utf16View string)
+{
+    return CSS::Parser::Parser::create(context, string).parse_as_media_query();
+}
+
 Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const& context, StringView string)
+{
+    return CSS::Parser::Parser::create(context, string).parse_as_media_query_list();
+}
+
+Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const& context, Utf16View string)
 {
     return CSS::Parser::Parser::create(context, string).parse_as_media_query_list();
 }
@@ -144,6 +175,11 @@ RefPtr<CSS::Supports> parse_css_supports(CSS::Parser::ParsingParams const& conte
 }
 
 Vector<CSS::Parser::ComponentValue> parse_component_values_list(CSS::Parser::ParsingParams const& parsing_params, StringView string)
+{
+    return CSS::Parser::Parser::create(parsing_params, string).parse_as_list_of_component_values();
+}
+
+Vector<CSS::Parser::ComponentValue> parse_component_values_list(CSS::Parser::ParsingParams const& parsing_params, Utf16View string)
 {
     return CSS::Parser::Parser::create(parsing_params, string).parse_as_list_of_component_values();
 }
@@ -220,10 +256,10 @@ ErrorOr<String> css_decode_bytes(Optional<StringView> const& environment_encodin
 }
 
 // https://drafts.csswg.org/css-values-4/#identifier-value
-bool is_valid_custom_ident(FlyString const& ident, ReadonlySpan<StringView> const& blacklist)
+bool is_valid_custom_ident(Utf16View ident, ReadonlySpan<StringView> const& blacklist)
 {
     // The CSS-wide keywords are not valid <custom-ident>s.
-    if (CSS::is_css_wide_keyword(ident))
+    if (auto keyword = CSS::keyword_from_string(ident); keyword.has_value() && CSS::is_css_wide_keyword(keyword.value()))
         return false;
 
     // The default keyword is reserved and is also not a valid <custom-ident>.

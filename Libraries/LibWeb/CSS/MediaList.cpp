@@ -67,6 +67,23 @@ void MediaList::set_media_text(StringView text)
     m_media = parse_media_query_list(Parser::ParsingParams { realm() }, text);
 }
 
+void MediaList::set_media_text(Utf16View text)
+{
+    auto previous_sheet_effects = m_associated_style_sheet
+        ? Optional<ShadowRootStylesheetEffects> { determine_shadow_root_stylesheet_effects(as<CSS::CSSStyleSheet>(*m_associated_style_sheet)) }
+        : Optional<ShadowRootStylesheetEffects> {};
+
+    ScopeGuard guard = [&] {
+        if (m_associated_style_sheet)
+            as<CSS::CSSStyleSheet>(*m_associated_style_sheet).invalidate_owners(DOM::StyleInvalidationReason::MediaListSetMediaText, previous_sheet_effects.has_value() ? &previous_sheet_effects.value() : nullptr);
+    };
+
+    m_media.clear();
+    if (text.is_empty())
+        return;
+    m_media = parse_media_query_list(Parser::ParsingParams { realm() }, text);
+}
+
 // https://www.w3.org/TR/cssom-1/#dom-medialist-item
 Optional<String> MediaList::item(u32 index) const
 {

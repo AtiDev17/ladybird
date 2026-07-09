@@ -509,7 +509,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
         // 1. Let value be the isomorphic decoding of the value of the header.
-        auto value = TextCodec::isomorphic_decode(maybe_refresh.value());
+        auto decoded_value = TextCodec::isomorphic_decode(maybe_refresh.value());
+        auto value = Utf16String::from_utf8(decoded_value.bytes_as_string_view());
 
         // 2. Run the shared declarative refresh steps with document and value.
         document->shared_declarative_refresh_steps(value, nullptr);
@@ -814,23 +815,21 @@ String const& Document::content_blocker_style_sheet()
         m_content_blocker_style_sheet_checked_classes.clear();
         m_content_blocker_style_sheet_checked_ids.clear();
 
-        Vector<String> classes;
-        Vector<String> ids;
+        Vector<Utf16FlyString> classes;
+        Vector<Utf16FlyString> ids;
         for_each_shadow_including_descendant([&](DOM::Node& node) {
             auto* element = as_if<DOM::Element>(node);
             if (!element)
                 return TraversalDecision::Continue;
 
             if (auto const& id = element->id(); id.has_value()) {
-                auto id_string = id->to_string();
-                if (!id_string.is_empty() && m_content_blocker_style_sheet_checked_ids.set(*id) == AK::HashSetResult::InsertedNewEntry)
-                    ids.append(move(id_string));
+                if (!id->is_empty() && m_content_blocker_style_sheet_checked_ids.set(*id) == AK::HashSetResult::InsertedNewEntry)
+                    ids.append(*id);
             }
 
             for (auto const& class_name : element->class_names()) {
-                auto class_string = class_name.to_string();
-                if (!class_string.is_empty() && m_content_blocker_style_sheet_checked_classes.set(class_name) == AK::HashSetResult::InsertedNewEntry)
-                    classes.append(move(class_string));
+                if (!class_name.is_empty() && m_content_blocker_style_sheet_checked_classes.set(class_name) == AK::HashSetResult::InsertedNewEntry)
+                    classes.append(class_name);
             }
 
             return TraversalDecision::Continue;
@@ -849,7 +848,7 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet_checked_ids.clear();
 }
 
-bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyString const* id, ReadonlySpan<FlyString> class_names)
+bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
 {
     if (is_decoded_svg())
         return false;
@@ -857,12 +856,11 @@ bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyS
     if (!m_content_blocker_style_sheet.has_value())
         return false;
 
-    Vector<String> classes_to_check;
-    Vector<String> ids_to_check;
-    auto append_new_token = [](FlyString const& token, HashTable<FlyString>& checked_tokens, Vector<String>& tokens_to_check) {
-        auto token_string = token.to_string();
-        if (!token_string.is_empty() && checked_tokens.set(token) == AK::HashSetResult::InsertedNewEntry)
-            tokens_to_check.append(move(token_string));
+    Vector<Utf16FlyString> classes_to_check;
+    Vector<Utf16FlyString> ids_to_check;
+    auto append_new_token = [](Utf16FlyString const& token, HashTable<Utf16FlyString>& checked_tokens, Vector<Utf16FlyString>& tokens_to_check) {
+        if (!token.is_empty() && checked_tokens.set(token) == AK::HashSetResult::InsertedNewEntry)
+            tokens_to_check.append(token);
     };
 
     if (id)
@@ -1430,7 +1428,7 @@ CSS::PreferredColorScheme Document::canvas_color_scheme() const
             color_scheme = CSS::PreferredColorScheme::Dark;
         } else if (root_color_scheme_is_normal && m_supported_color_schemes.has_value()) {
             auto preferred_color_scheme = page().preferred_color_scheme();
-            if (m_supported_color_schemes->contains_slow(CSS::preferred_color_scheme_to_string(preferred_color_scheme)))
+            if (m_supported_color_schemes->contains_slow(CSS::preferred_color_scheme_to_utf16_fly_string(preferred_color_scheme)))
                 color_scheme = preferred_color_scheme;
         }
     }
@@ -1633,6 +1631,12 @@ Optional<URL::URL> Document::encoding_parse_url(StringView url) const
     return DOMURL::parse(url, base_url, encoding);
 }
 
+Optional<URL::URL> Document::encoding_parse_url(Utf16View url) const
+{
+    auto encoding = encoding_or_default();
+    return DOMURL::parse(url, base_url(), encoding);
+}
+
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#encoding-parsing-and-serializing-a-url
 Optional<String> Document::encoding_parse_and_serialize_url(StringView url) const
 {
@@ -1644,6 +1648,14 @@ Optional<String> Document::encoding_parse_and_serialize_url(StringView url) cons
         return {};
 
     // 3. Return the result of applying the URL serializer to url.
+    return parsed_url->serialize();
+}
+
+Optional<String> Document::encoding_parse_and_serialize_url(Utf16String const& url) const
+{
+    auto parsed_url = encoding_parse_url(url);
+    if (!parsed_url.has_value())
+        return {};
     return parsed_url->serialize();
 }
 
@@ -2144,17 +2156,17 @@ void Document::set_visited_link_color(Color color)
     m_visited_link_color = color;
 }
 
-Optional<Vector<String> const&> Document::supported_color_schemes() const
+Optional<Vector<Utf16FlyString> const&> Document::supported_color_schemes() const
 {
     return m_supported_color_schemes;
 }
 
-void Document::set_supported_color_schemes(Vector<String> supported_color_schemes)
+void Document::set_supported_color_schemes(Vector<Utf16FlyString> supported_color_schemes)
 {
-    set_supported_color_schemes(Optional<Vector<String>> { move(supported_color_schemes) });
+    set_supported_color_schemes(Optional<Vector<Utf16FlyString>> { move(supported_color_schemes) });
 }
 
-void Document::set_supported_color_schemes(Optional<Vector<String>> supported_color_schemes)
+void Document::set_supported_color_schemes(Optional<Vector<Utf16FlyString>> supported_color_schemes)
 {
     if (m_supported_color_schemes == supported_color_schemes)
         return;
@@ -2167,7 +2179,7 @@ void Document::set_supported_color_schemes(Optional<Vector<String>> supported_co
 // https://html.spec.whatwg.org/multipage/semantics.html#meta-color-scheme
 void Document::obtain_supported_color_schemes()
 {
-    Optional<Vector<String>> supported_color_schemes;
+    Optional<Vector<Utf16FlyString>> supported_color_schemes;
 
     // 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
     for_each_in_subtree_of_type<HTML::HTMLMetaElement>([&](HTML::HTMLMetaElement& element) {
@@ -2220,7 +2232,7 @@ void Document::obtain_theme_color()
             }
 
             // 2. Let value be the result of stripping leading and trailing ASCII whitespace from the value of element's content attribute.
-            auto value = content->bytes_as_string_view().trim(Infra::ASCII_WHITESPACE);
+            auto value = content->utf16_view().trim(Infra::ASCII_WHITESPACE);
 
             // 3. Let color be the result of parsing value.
             auto css_value = parse_css_value(context, value, CSS::PropertyID::Color);
@@ -3347,7 +3359,8 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
         return Document::TopOfTheDocument {};
 
     // 3. Let potentialIndicatedElement be the result of finding a potential indicated element given document and fragment.
-    auto* potential_indicated_element = find_a_potential_indicated_element(*fragment);
+    auto fragment_as_utf16 = Utf16String::from_utf8(*fragment);
+    auto* potential_indicated_element = find_a_potential_indicated_element(fragment_as_utf16);
 
     // 4. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
     if (potential_indicated_element)
@@ -3358,7 +3371,8 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
     auto decoded_fragment = String::from_utf8_with_replacement_character(URL::percent_decode(*fragment), String::WithBOMHandling::No);
 
     // 7. Set potentialIndicatedElement to the result of finding a potential indicated element given document and decodedFragment.
-    potential_indicated_element = find_a_potential_indicated_element(decoded_fragment);
+    auto decoded_fragment_as_utf16 = Utf16String::from_utf8(decoded_fragment);
+    potential_indicated_element = find_a_potential_indicated_element(decoded_fragment_as_utf16);
 
     // 8. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
     if (potential_indicated_element)
@@ -3373,20 +3387,21 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#find-a-potential-indicated-element
-Element* Document::find_a_potential_indicated_element(FlyString const& fragment) const
+Element* Document::find_a_potential_indicated_element(Utf16String const& fragment) const
 {
     // To find a potential indicated element given a Document document and a string fragment, run these steps:
+    auto fragment_fly_string = Utf16FlyString::from_utf16(fragment.utf16_view());
 
     // 1. If there is an element in the document tree whose root is document and that has an ID equal to
     //    fragment, then return the first such element in tree order.
-    if (auto element = get_element_by_id(fragment))
+    if (auto element = get_element_by_id(fragment_fly_string))
         return const_cast<Element*>(element.ptr());
 
     // 2. If there is an a element in the document tree whose root is document that has a name attribute
     //    whose value is equal to fragment, then return the first such element in tree order.
     Element* element_with_name = nullptr;
     root().for_each_in_subtree_of_type<Element>([&](Element const& element) {
-        if (element.name() == fragment) {
+        if (element.name() == fragment_fly_string) {
             element_with_name = const_cast<Element*>(&element);
             return TraversalDecision::Break;
         }
@@ -3475,10 +3490,10 @@ void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transi
 
         Bindings::TransitionEventInit event_init {};
         event_init.bubbles = true;
-        event_init.property_name = transition->transition_property().to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
+        event_init.property_name = transition->transition_property().to_utf16_string();
         event_init.elapsed_time = elapsed_time_output;
         event_init.pseudo_element = transition->owning_element()->pseudo_element().map([](auto it) {
-                                                                                      return MUST(String::formatted("::{}", CSS::pseudo_element_name(it)));
+                                                                                      return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
                                                                                   })
                                         .value_or({});
 
@@ -3583,10 +3598,10 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
 
         Bindings::AnimationEventInit event_init {};
         event_init.bubbles = true;
-        event_init.animation_name = static_cast<String>(css_animation.animation_name());
+        event_init.animation_name = css_animation.animation_name().to_utf16_string();
         event_init.elapsed_time = elapsed_time_output;
         event_init.pseudo_element = owning_element->pseudo_element().map([](auto it) {
-                                                                        return MUST(String::formatted("::{}", CSS::pseudo_element_name(it)));
+                                                                        return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
                                                                     })
                                         .value_or({});
 
@@ -3982,66 +3997,66 @@ bool Document::is_cookie_averse() const
     return false;
 }
 
-String Document::fg_color() const
+Utf16String Document::fg_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::text);
-    return ""_string;
+    return {};
 }
 
-void Document::set_fg_color(String const& value)
+void Document::set_fg_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::text, value);
 }
 
-String Document::link_color() const
+Utf16String Document::link_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::link);
-    return ""_string;
+    return {};
 }
 
-void Document::set_link_color(String const& value)
+void Document::set_link_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::link, value);
 }
 
-String Document::vlink_color() const
+Utf16String Document::vlink_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::vlink);
-    return ""_string;
+    return {};
 }
 
-void Document::set_vlink_color(String const& value)
+void Document::set_vlink_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::vlink, value);
 }
 
-String Document::alink_color() const
+Utf16String Document::alink_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::alink);
-    return ""_string;
+    return {};
 }
 
-void Document::set_alink_color(String const& value)
+void Document::set_alink_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::alink, value);
 }
 
-String Document::bg_color() const
+Utf16String Document::bg_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::bgcolor);
-    return ""_string;
+    return {};
 }
 
-void Document::set_bg_color(String const& value)
+void Document::set_bg_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::bgcolor, value);
@@ -5984,14 +5999,14 @@ void Document::stop_intersection_observing_a_lazy_loading_element(Element& eleme
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#shared-declarative-refresh-steps
-void Document::shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::HTMLMetaElement const> meta_element)
+void Document::shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element)
 {
     // 1. If document's will declaratively refresh is true, then return.
     if (m_will_declaratively_refresh)
         return;
 
     // 2. Let position point at the first code point of input.
-    GenericLexer lexer(input);
+    Utf16GenericLexer lexer(input);
 
     // 3. Skip ASCII whitespace within input given position.
     lexer.ignore_while(Infra::is_ascii_whitespace);
@@ -6082,7 +6097,7 @@ void Document::shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::
         // 8. Skip quotes: If the code point in input pointed to by position is U+0027 (') or U+0022 ("), then let
         //    quote be that code point, and advance position to the next code point. Otherwise, let quote be the empty
         //    string.
-        Optional<char> quote;
+        Optional<u16> quote;
         if (lexer.peek() == '\'' || lexer.peek() == '"')
             quote = lexer.consume();
 
@@ -6691,7 +6706,7 @@ static void insert_in_tree_order(Vector<GC::Ref<DOM::Element>>& elements, DOM::E
         elements.append(element);
 }
 
-void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<FlyString> old_id)
+void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<Utf16FlyString> old_id)
 {
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         form_associated_element->element_id_changed({});
@@ -6761,7 +6776,7 @@ void Document::element_with_name_was_removed(Badge<DOM::Element>, GC::Ref<DOM::E
     }
 }
 
-GC::Ptr<Element> Document::element_by_anchor_name(FlyString const& name, Node const& querying_node) const
+GC::Ptr<Element> Document::element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node) const
 {
     // https://drafts.csswg.org/css-shadow-1/#tree-scoped-name
     // If a tree-scoped name is global (such as @font-face names), then when a tree-scoped reference is dereferenced to
@@ -7009,13 +7024,12 @@ static bool is_exposed(Element const& element)
     return true;
 }
 
-// https://html.spec.whatwg.org/multipage/dom.html#dom-tree-accessors:supported-property-names
-Vector<FlyString> Document::supported_property_names() const
+Vector<Utf16FlyString> Document::supported_property_names() const
 {
     // The supported property names of a Document object document at any moment consist of the following,
     // in tree order according to the element that contributed them, ignoring later duplicates,
     // and with values from id attributes coming before values from name attributes when the same element contributes both:
-    OrderedHashTable<FlyString> names;
+    OrderedHashTable<Utf16FlyString> names;
 
     for (auto const& element : m_potentially_named_elements) {
         // - the value of the name content attribute for all exposed embed, form, iframe, img, and exposed object elements
@@ -7047,10 +7061,14 @@ Vector<FlyString> Document::supported_property_names() const
         }
     }
 
-    return names.values();
+    Vector<Utf16FlyString> result;
+    result.ensure_capacity(names.size());
+    for (auto const& name : names)
+        result.append(name);
+    return result;
 }
 
-static bool is_named_element_with_name(Element const& element, FlyString const& name)
+static bool is_named_element_with_name(Element const& element, Utf16FlyString const& name)
 {
     // Named elements with the name name, for the purposes of the above algorithm, are those that are either:
 
@@ -7081,7 +7099,7 @@ static bool is_named_element_with_name(Element const& element, FlyString const& 
     return false;
 }
 
-static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& document, FlyString const& name)
+static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& document, Utf16FlyString const& name)
 {
     Vector<GC::Ref<DOM::Element>> named_elements;
 
@@ -7094,7 +7112,7 @@ static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& do
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem
-JS::Value Document::named_item_value(FlyString const& name) const
+JS::Value Document::named_item_value(Utf16FlyString const& name) const
 {
     // 1. Let elements be the list of named elements with the name name that are in a document tree with the Document as their root.
     // NOTE: There will be at least one such element, since the algorithm would otherwise not have been invoked by Web IDL.
@@ -8862,7 +8880,7 @@ Optional<Vector<CSS::Parser::ComponentValue>> Document::environment_variable_val
         if (!indices.is_empty())
             return invalid();
         return Vector {
-            CSS::Parser::ComponentValue { CSS::Parser::Token::create_dimension(0, "px"_fly_string) }
+            CSS::Parser::ComponentValue { CSS::Parser::Token::create_dimension(0, "px"_utf16_fly_string) }
         };
     case CSS::EnvironmentVariable::ViewportSegmentBottom:
     case CSS::EnvironmentVariable::ViewportSegmentHeight:

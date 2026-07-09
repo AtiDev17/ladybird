@@ -7,6 +7,7 @@
  */
 
 #include <AK/NeverDestroyed.h>
+#include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Variant.h>
 #include <LibCore/Timer.h>
@@ -97,7 +98,7 @@ struct NavigationParamsFetchStateHolder : public JS::Cell {
         Optional<URL::Origin> origin,
         Variant<Empty, String, POSTResource> resource,
         bool ever_populated,
-        String navigable_target_name)
+        Utf16String navigable_target_name)
         : coop_enforcement_result(move(coop_enforcement_result))
         , current_url(move(current_url))
         , request(request)
@@ -143,7 +144,7 @@ struct NavigationParamsFetchStateHolder : public JS::Cell {
     Optional<URL::Origin> origin;
     Variant<Empty, String, POSTResource> resource;
     bool ever_populated = false;
-    String navigable_target_name;
+    Utf16String navigable_target_name;
 
     // Accumulated redirect output
     Optional<URL::URL> redirected_url;
@@ -1006,7 +1007,7 @@ GC::Ptr<HTML::Window> LocalNavigable::active_window()
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target
-String LocalNavigable::target_name() const
+Utf16String LocalNavigable::target_name() const
 {
     // A navigable's target name is its active session history entry's document state's navigable target name.
     return active_session_history_entry()->document_state()->navigable_target_name();
@@ -1123,7 +1124,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(StringView na
     // 7. Otherwise, if name is not an ASCII case-insensitive match for "_blank" and noopener is false, then set chosen
     //    to the result of finding a navigable by target name given name and currentNavigable.
     else if (!name.equals_ignoring_ascii_case("_blank"sv) && no_opener == TokenizedFeature::NoOpener::No) {
-        chosen = find_a_navigable_by_target_name(name);
+        chosen = find_a_navigable_by_target_name(Utf16String::from_utf8(name));
     }
 
     // 8. If chosen is null, then a new top-level traversable is being requested, and what happens depends on the user
@@ -1172,11 +1173,11 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(StringView na
             //       nested documents that are cross-origin with their top-level browsing context's active document always set noopener to true.
 
             // 5. Let targetName be the empty string.
-            String target_name;
+            Utf16String target_name;
 
             // 6. If name is not an ASCII case-insensitive match for "_blank", then set targetName to name.
             if (!name.equals_ignoring_ascii_case("_blank"sv))
-                target_name = MUST(String::from_utf8(name));
+                target_name = Utf16String::from_utf8(name);
 
             auto create_new_traversable_closure = [this, no_opener, target_name, activate_tab, window_features](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalNavigable> {
                 auto hints = WebViewHints::from_tokenised_features(window_features.value_or({}), traversable_navigable()->page());
@@ -1231,7 +1232,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(StringView na
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#find-a-navigable-by-target-name
-GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(StringView name)
+GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(Utf16View name)
 {
     // 1. Let currentDocument be currentNavigable's active document.
     auto& current_document = *active_document();
@@ -1257,7 +1258,8 @@ GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(StringVi
                 continue;
 
             // 2. If navigable's target name is name, then return navigable.
-            if (navigable->target_name() == name)
+            auto target_name = navigable->target_name();
+            if (target_name.utf16_view() == name)
                 return *navigable;
         }
     }
@@ -1288,7 +1290,8 @@ GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(StringVi
                 continue;
 
             // 3. If navigable's target name is name, then return navigable.
-            if (navigable->target_name() == name)
+            auto target_name = navigable->target_name();
+            if (target_name.utf16_view() == name)
                 return *navigable;
         }
     }
@@ -1734,7 +1737,7 @@ static void create_navigation_params_by_fetching(
     Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
     Optional<URL::URL> about_base_url,
     Optional<URL::Origin> origin,
-    String navigable_target_name,
+    Utf16String navigable_target_name,
     bool reload_pending,
     bool ever_populated,
     GC::Ptr<LocalNavigable> navigable,
@@ -2017,7 +2020,7 @@ void LocalNavigable::populate_session_history_entry_document(
     Optional<URL::Origin> origin,
     Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
     Optional<URL::URL> about_base_url,
-    String navigable_target_name,
+    Utf16String navigable_target_name,
     bool reload_pending,
     bool ever_populated,
     GC::Ref<SourceSnapshotParams> source_snapshot_params,
@@ -2944,7 +2947,8 @@ GC::Ptr<DOM::Document> LocalNavigable::evaluate_javascript_url(URL::URL const& u
     auto encoded_script_source = url_string.bytes_as_string_view().substring_view(11);
 
     // 3. Let scriptSource be the UTF-8 decoding of the percent-decoding of encodedScriptSource.
-    auto script_source = URL::percent_decode(encoded_script_source);
+    auto percent_decoded_script_source = URL::percent_decode(encoded_script_source);
+    auto script_source = Utf16String::from_utf8(percent_decoded_script_source.view());
 
     // 4. Let settings be targetNavigable's active document's relevant settings object.
     auto& settings = active_document()->relevant_settings_object();
@@ -3312,7 +3316,7 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
     if (navigable->parent() == nullptr
         && !(pending_document->browsing_context()->is_auxiliary() && pending_document->browsing_context()->opener_browsing_context() != nullptr)
         && pending_document->origin() != navigable->active_document()->origin()) {
-        history_entry->document_state()->set_navigable_target_name(String {});
+        history_entry->document_state()->set_navigable_target_name(Utf16String {});
     }
 
     // 5. Let entryToReplace be navigable's active session history entry if historyHandling is "replace", otherwise null.

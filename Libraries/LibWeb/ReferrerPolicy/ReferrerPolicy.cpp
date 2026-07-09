@@ -4,9 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/CharacterTypes.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::ReferrerPolicy {
+
+static bool equals_ignoring_ascii_case(Utf16View string, StringView ascii_string)
+{
+    if (string.length_in_code_units() != ascii_string.length())
+        return false;
+
+    for (size_t i = 0; i < string.length_in_code_units(); ++i) {
+        if (AK::to_ascii_lowercase(string.code_unit_at(i)) != AK::to_ascii_lowercase(ascii_string[i]))
+            return false;
+    }
+
+    return true;
+}
 
 StringView to_string(ReferrerPolicy referrer_policy)
 {
@@ -52,6 +66,34 @@ Optional<ReferrerPolicy> from_string(StringView string)
     if (string.equals_ignoring_ascii_case("strict-origin-when-cross-origin"sv))
         return ReferrerPolicy::StrictOriginWhenCrossOrigin;
     if (string.equals_ignoring_ascii_case("unsafe-url"sv))
+        return ReferrerPolicy::UnsafeURL;
+    return {};
+}
+
+Optional<ReferrerPolicy> from_string(Utf16String const& string)
+{
+    return from_string(string.utf16_view());
+}
+
+Optional<ReferrerPolicy> from_string(Utf16View string)
+{
+    if (string.is_empty())
+        return ReferrerPolicy::EmptyString;
+    if (equals_ignoring_ascii_case(string, "no-referrer"sv))
+        return ReferrerPolicy::NoReferrer;
+    if (equals_ignoring_ascii_case(string, "no-referrer-when-downgrade"sv))
+        return ReferrerPolicy::NoReferrerWhenDowngrade;
+    if (equals_ignoring_ascii_case(string, "same-origin"sv))
+        return ReferrerPolicy::SameOrigin;
+    if (equals_ignoring_ascii_case(string, "origin"sv))
+        return ReferrerPolicy::Origin;
+    if (equals_ignoring_ascii_case(string, "strict-origin"sv))
+        return ReferrerPolicy::StrictOrigin;
+    if (equals_ignoring_ascii_case(string, "origin-when-cross-origin"sv))
+        return ReferrerPolicy::OriginWhenCrossOrigin;
+    if (equals_ignoring_ascii_case(string, "strict-origin-when-cross-origin"sv))
+        return ReferrerPolicy::StrictOriginWhenCrossOrigin;
+    if (equals_ignoring_ascii_case(string, "unsafe-url"sv))
         return ReferrerPolicy::UnsafeURL;
     return {};
 }

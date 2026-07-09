@@ -76,6 +76,12 @@ Parser Parser::create(ParsingParams const& context, StringView input, StringView
     return Parser { context, move(tokens) };
 }
 
+Parser Parser::create(ParsingParams const& context, Utf16View input)
+{
+    auto utf8_input = MUST(input.to_utf8());
+    return Parser::create(context, utf8_input.bytes_as_string_view());
+}
+
 Parser::Parser(ParsingParams const& context, Vector<Token> tokens)
     : m_document(context.document)
     , m_realm(context.realm)
@@ -341,7 +347,7 @@ OwnPtr<BooleanExpression> Parser::parse_supports_condition(TokenStream<Component
     return maybe_condition;
 }
 
-static bool at_rule_is_supported(FlyString const& name)
+static bool at_rule_is_supported(Utf16FlyString const& name)
 {
     // https://drafts.csswg.org/css-conditional-5/#support-definition-at-rules
     // A CSS processor supports an at-rule if it would accept an at-rule beginning with that
@@ -549,7 +555,7 @@ static Optional<StyleFeature::StyleRangeValue> parse_style_range_value(ReadonlyS
     if (trimmed_tokens.size() == 1 && trimmed_tokens.first().is(Token::Type::Ident)) {
         auto const& ident = trimmed_tokens.first().token().ident();
         if (is_a_custom_property_name_string(ident)) {
-            auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(ident));
+            auto property = PropertyNameAndID::from_name(ident);
             if (property.has_value())
                 return StyleFeature::StyleRangeValue { property.release_value() };
         }
@@ -575,10 +581,10 @@ OwnPtr<BooleanExpression> Parser::parse_style_feature(TokenStream<ComponentValue
 {
     // <style-feature> = <style-feature-plain> | <style-feature-boolean> | <style-range>
 
-    auto parse_style_feature_name = [](FlyString const& name) -> Optional<PropertyNameAndID> {
+    auto parse_style_feature_name = [](Utf16FlyString const& name) -> Optional<PropertyNameAndID> {
         // The <style-feature-name> can be either a supported CSS property or a valid <custom-property-name>.
         // NB: This is the same as what's allowed by PropertyNameAndID.
-        return PropertyNameAndID::from_name(Utf16FlyString::from_utf8(name));
+        return PropertyNameAndID::from_name(name);
     };
 
     // <style-range> = <style-range-value> <mf-comparison> <style-range-value>
@@ -953,7 +959,7 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
             auto& first_non_whitespace = prelude_tokens.consume_a_token();
             prelude_tokens.discard_whitespace();
             auto& second_non_whitespace = prelude_tokens.consume_a_token();
-            if (first_non_whitespace.is(Token::Type::Ident) && first_non_whitespace.token().ident().starts_with_bytes("--"sv)
+            if (first_non_whitespace.is(Token::Type::Ident) && first_non_whitespace.token().ident().starts_with("--"sv)
                 && second_non_whitespace.is(Token::Type::Colon)) {
                 // If nested is true, consume the remnants of a bad declaration from input, with nested set to true, and return nothing.
                 if (nested == Nested::Yes) {
@@ -1820,7 +1826,7 @@ Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_
     for (auto const& rule_or_list : declarations_and_at_rules) {
         if (auto* rule_declarations = rule_or_list.get_pointer<Vector<Declaration>>()) {
             for (auto const& declaration : *rule_declarations) {
-                auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name));
+                auto property = PropertyNameAndID::from_name(declaration.name);
 
                 StringBuilder value_builder;
                 for (auto const& value : declaration.value)
@@ -1842,6 +1848,16 @@ Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_
 }
 
 Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const& parsing_params, StringView declaration_block)
+{
+    auto devtools_parsing_params = parsing_params;
+    if (devtools_parsing_params.rule_context.is_empty())
+        devtools_parsing_params.rule_context.append(RuleContext::Style);
+
+    auto parser = Parser::create(devtools_parsing_params, declaration_block);
+    return parser.parse_as_devtools_property_declaration_block();
+}
+
+Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const& parsing_params, Utf16View declaration_block)
 {
     auto devtools_parsing_params = parsing_params;
     if (devtools_parsing_params.rule_context.is_empty())
@@ -1922,7 +1938,7 @@ bool Parser::is_valid_in_the_current_context(Declaration const& declaration) con
         // The <declaration-list> inside of <keyframe-block> accepts any CSS property except those defined in this
         // specification, but does accept the animation-timing-function property and interprets it specially
         // NB: animation-composition is defined in CSS Animations Level 2, so it is not excluded by this rule.
-        auto property = PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name));
+        auto property = PropertyNameAndID::from_name(declaration.name);
         if (!property.has_value())
             return true;
         switch (property->id()) {
@@ -1989,12 +2005,12 @@ bool Parser::is_valid_in_the_current_context(AtRule const& at_rule) const
 
     // Only grouping rules can be nested within style rules
     if (m_rule_context.contains_slow(RuleContext::Style))
-        return first_is_one_of(at_rule.name, "container", "layer", "media", "scope", "supports");
+        return at_rule.name.is_one_of("container"sv, "layer"sv, "media"sv, "scope"sv, "supports"sv);
 
     if (m_rule_context.contains_slow(RuleContext::AtFunction)) {
         // https://drafts.csswg.org/css-mixins-1/#function-body
         // The body of a @function rule accepts conditional group rules
-        return first_is_one_of(at_rule.name, "container", "media", "supports");
+        return at_rule.name.is_one_of("container"sv, "media"sv, "supports"sv);
     }
 
     switch (m_rule_context.last()) {
@@ -2012,7 +2028,7 @@ bool Parser::is_valid_in_the_current_context(AtRule const& at_rule) const
     case RuleContext::AtScope:
     case RuleContext::AtSupports:
         // Grouping rules can contain anything except @import or @namespace
-        return !first_is_one_of(at_rule.name, "import", "namespace");
+        return !at_rule.name.is_one_of("import"sv, "namespace"sv);
 
     case RuleContext::SupportsCondition:
         // @supports cannot check for at-rules
@@ -2114,14 +2130,13 @@ GC::Ref<CSSStyleProperties> Parser::convert_to_style_declaration(Vector<Declarat
 
 Optional<StylePropertyAndName> Parser::convert_to_style_property(Declaration const& declaration)
 {
-    auto utf16_declaration_name = Utf16FlyString::from_utf8(declaration.name);
-    auto property = PropertyNameAndID::from_name(utf16_declaration_name);
+    auto property = PropertyNameAndID::from_name(declaration.name);
 
     if (!property.has_value()) {
         if (has_ignored_vendor_prefix(declaration.name)) {
             return {};
         }
-        ErrorReporter::the().report(UnknownPropertyError { .property_name = utf16_declaration_name });
+        ErrorReporter::the().report(UnknownPropertyError { .property_name = declaration.name });
         return {};
     }
 
@@ -2236,13 +2251,14 @@ bool Parser::context_allows_random_functions() const
     return m_value_context.contains([](ValueParsingContext context) { return context.has<PropertyID>(); });
 }
 
-FlyString Parser::random_value_sharing_auto_name() const
+Utf16FlyString Parser::random_value_sharing_auto_name() const
 {
     auto top_level_property_context_index = m_value_context.find_first_index_if([](ValueParsingContext const& context) { return context.has<PropertyID>(); });
 
     auto property_name = string_from_property_id(m_value_context[top_level_property_context_index.value()].get<PropertyID>());
 
-    return MUST(String::formatted("{} {}", property_name, m_random_function_index));
+    auto auto_name = Utf16String::formatted("{} {}", property_name, m_random_function_index);
+    return Utf16FlyString::from_utf16(auto_name.utf16_view());
 }
 
 Vector<ComponentValue> Parser::parse_as_list_of_component_values()
@@ -2438,7 +2454,7 @@ Parser::ParseErrorOr<void> Parser::collect_arbitrary_substitution_function_prese
     return {};
 }
 
-bool Parser::has_ignored_vendor_prefix(StringView string)
+bool Parser::has_ignored_vendor_prefix(Utf16View string)
 {
     if (!string.starts_with('-'))
         return false;
@@ -2446,7 +2462,7 @@ bool Parser::has_ignored_vendor_prefix(StringView string)
         return false;
     if (string.starts_with("-libweb-"sv))
         return false;
-    if (string.count('-') == 1)
+    if (string.count("-"sv) == 1)
         return false;
     return true;
 }

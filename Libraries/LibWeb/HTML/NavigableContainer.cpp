@@ -78,11 +78,11 @@ void NavigableContainer::create_new_child_navigable()
     auto [browsing_context, document] = BrowsingContext::create_a_new_browsing_context_and_document(page, this->document(), *this, *group);
 
     // 4. Let targetName be null.
-    Optional<String> target_name;
+    Optional<Utf16String> target_name;
 
     // 5. If element has a name content attribute, then set targetName to the value of that attribute.
     if (name().has_value())
-        target_name = name().value().to_string();
+        target_name = name().value().to_utf16_string();
 
     // 6. Let documentState be a new document state, with
     //  - document: document
@@ -246,7 +246,7 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#navigate-an-iframe-or-frame
-void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<String> srcdoc_string, InitialInsertion initial_insertion)
+void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolicy::ReferrerPolicy referrer_policy, Optional<Utf16String> srcdoc_string, InitialInsertion initial_insertion)
 {
     // 1. Let historyHandling be "auto".
     auto history_handling = Bindings::NavigationHistoryBehavior::Auto;
@@ -274,7 +274,7 @@ void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolic
     //    initialInsertion.
     Variant<Empty, String, POSTResource> document_resource = Empty {};
     if (srcdoc_string.has_value())
-        document_resource = srcdoc_string.value();
+        document_resource = srcdoc_string->to_utf8();
 
     MUST(m_content_navigable->navigate({
         .url = move(url),
