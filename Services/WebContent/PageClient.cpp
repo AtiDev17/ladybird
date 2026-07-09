@@ -48,7 +48,6 @@
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/ViewImplementation.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/DevToolsConsoleClient.h>
@@ -212,12 +211,7 @@ Web::HTML::NavigableId PageClient::allocate_navigable_id()
 
 Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<Web::HTML::NavigableId> frame_id) const
 {
-    if (target != Web::NavigationTarget::TopLevel)
-        return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
-
-    return WebView::is_url_suitable_for_same_process_navigation(current_url, target_url, Web::NavigationTarget::TopLevel)
-        ? Web::NavigationProcessDecision::Local
-        : Web::NavigationProcessDecision::Remote;
+    return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
 }
 
 void PageClient::request_new_process_for_navigation(URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
@@ -233,9 +227,9 @@ void PageClient::request_new_process_for_child_frame_navigation(Web::HTML::Navig
     client().async_did_request_new_process_for_child_frame_navigation(m_id, frame_id, url, move(document_resource), history_handling);
 }
 
-void PageClient::page_did_create_child_frame(Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id)
+void PageClient::page_did_create_child_frame(Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
 {
-    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id);
+    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
 }
 
 void PageClient::page_did_update_child_frame_viewport(Web::HTML::NavigableId frame_id, Web::CSSPixelRect viewport_rect)
@@ -243,9 +237,9 @@ void PageClient::page_did_update_child_frame_viewport(Web::HTML::NavigableId fra
     client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
 }
 
-void PageClient::page_did_commit_child_frame_navigation(Web::HTML::NavigableId frame_id, URL::URL const& url)
+void PageClient::page_did_commit_child_frame_navigation(Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
 {
-    client().async_did_commit_child_frame_navigation(m_id, frame_id, url);
+    client().async_did_commit_child_frame_navigation(m_id, frame_id, replicated_state);
 }
 
 void PageClient::page_did_destroy_child_frame(Web::HTML::NavigableId frame_id)
@@ -569,6 +563,9 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
     auto& realm = document.realm();
 
     clear_pending_dom_mutations();
+
+    if (auto navigable = document.navigable())
+        client().async_did_change_top_level_active_document(m_id, navigable->replicated_state());
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();

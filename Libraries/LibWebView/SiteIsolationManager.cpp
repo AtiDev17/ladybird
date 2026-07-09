@@ -7,6 +7,8 @@
 #include <LibWebView/SiteIsolationManager.h>
 
 #include <AK/StringBuilder.h>
+#include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/SiteIsolation.h>
 #include <LibWebView/ViewImplementation.h>
@@ -20,14 +22,46 @@ SiteIsolationManager& SiteIsolationManager::the()
     return manager;
 }
 
-static URL::URL embedding_page_url_for_child_frame_navigation(CanonicalNavigable const& child_frame, URL::URL const& fallback_url)
+bool SiteIsolationManager::navigation_requires_process_swap(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target) const
 {
-    if (auto const* parent = child_frame.parent()) {
-        if (auto url = parent->document_url(); url.has_value())
-            return *url;
+    if (site_isolation_mode() == SiteIsolationMode::Disabled)
+        return false;
+
+    if (target == Web::NavigationTarget::IFrame && site_isolation_mode() != SiteIsolationMode::IFrame)
+        return false;
+
+    // Allow navigating from about:blank to any site.
+    if (Web::HTML::url_matches_about_blank(current_url))
+        return false;
+
+    // Make sure JavaScript URLs run in the same process.
+    if (target_url.scheme() == "javascript"sv)
+        return false;
+
+    // Allow cross-scheme non-HTTP(S) navigation. Disallow cross-scheme HTTP(s) navigation.
+    auto current_url_is_http = Web::Fetch::Infrastructure::is_http_or_https_scheme(current_url.scheme());
+    auto target_url_is_http = Web::Fetch::Infrastructure::is_http_or_https_scheme(target_url.scheme());
+
+    if (!current_url_is_http || !target_url_is_http)
+        return current_url_is_http || target_url_is_http;
+
+    // Disallow cross-site HTTP(S) navigation.
+    return !current_url.origin().is_same_site(target_url.origin());
+}
+
+bool SiteIsolationManager::child_frame_navigation_requires_process_swap(CanonicalNavigable const& child_frame, URL::URL const& current_url, URL::URL const& target_url) const
+{
+    if (site_isolation_mode() != SiteIsolationMode::IFrame)
+        return false;
+
+    // Use origin-based same-site checks for HTTP(S). about:blank, srcdoc, and data: need the initiator origin, so fall
+    // back to using a URL decision for now.
+    if (Web::Fetch::Infrastructure::is_http_or_https_scheme(target_url.scheme())) {
+        if (auto const* parent_frame = child_frame.parent(); parent_frame && parent_frame->replicated_state().has_value())
+            return !parent_frame->replicated_state()->active_document_origin.is_same_site(target_url.origin());
     }
 
-    return fallback_url;
+    return navigation_requires_process_swap(current_url, target_url, Web::NavigationTarget::IFrame);
 }
 
 Web::NavigationProcessDecision SiteIsolationManager::decide_navigation_process(WebContentClient& parent_client, u64 page_id, Optional<Web::HTML::NavigableId> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target)
@@ -36,12 +70,13 @@ Web::NavigationProcessDecision SiteIsolationManager::decide_navigation_process(W
     if (target == Web::NavigationTarget::IFrame && frame_id.has_value())
         child_frame = parent_client.child_frame(page_id, *frame_id);
 
-    if (child_frame.has_value())
-        current_url = embedding_page_url_for_child_frame_navigation(*child_frame, current_url);
+    auto requires_process_swap = child_frame.has_value()
+        ? child_frame_navigation_requires_process_swap(*child_frame, current_url, target_url)
+        : navigation_requires_process_swap(current_url, target_url, target);
 
-    auto decision = WebView::is_url_suitable_for_same_process_navigation(current_url, target_url, target)
-        ? Web::NavigationProcessDecision::Local
-        : Web::NavigationProcessDecision::Remote;
+    auto decision = requires_process_swap
+        ? Web::NavigationProcessDecision::Remote
+        : Web::NavigationProcessDecision::Local;
 
     if (child_frame.has_value()) {
         auto target_locality = decision == Web::NavigationProcessDecision::Local

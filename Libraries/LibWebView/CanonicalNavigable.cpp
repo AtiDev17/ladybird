@@ -148,21 +148,15 @@ void CanonicalNavigable::set_viewport(Web::DevicePixelRect viewport_rect, double
     }
 }
 
-void CanonicalNavigable::did_commit_navigation(URL::URL url)
+void CanonicalNavigable::set_replicated_state(Web::HTML::ReplicatedNavigableState state)
 {
-    m_last_committed_url = move(url);
-    m_pending_navigation.clear();
+    m_replicated_state = move(state);
 }
 
-Optional<URL::URL> CanonicalNavigable::document_url() const
+void CanonicalNavigable::did_commit_navigation(Web::HTML::ReplicatedNavigableState replicated_state)
 {
-    if (m_last_committed_url.has_value())
-        return m_last_committed_url;
-
-    if (m_pending_navigation.has_value())
-        return m_pending_navigation->target_url;
-
-    return {};
+    set_replicated_state(move(replicated_state));
+    m_pending_navigation.clear();
 }
 
 void CanonicalNavigable::record_pending_navigation(URL::URL const& url, HostLocality target_locality, Optional<u64> remote_page_id)
