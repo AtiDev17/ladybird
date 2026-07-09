@@ -85,8 +85,10 @@ ComputedProperties::Builder::Builder(ComputedProperties const& style)
     m_data->raw_cascaded_font_size = style.data().raw_cascaded_font_size;
     m_depends_on_viewport_metrics = style.depends_on_viewport_metrics();
     m_font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics();
+    m_in_display_none_subtree = style.in_display_none_subtree();
     m_style->m_depends_on_viewport_metrics = m_depends_on_viewport_metrics;
     m_style->m_font_metrics_depend_on_viewport_metrics = m_font_metrics_depend_on_viewport_metrics;
+    m_style->m_in_display_none_subtree = m_in_display_none_subtree;
     if (style.m_animated_properties)
         m_style->m_animated_properties = adopt_ref(*new AnimatedProperties(*style.m_animated_properties));
 }
@@ -95,6 +97,7 @@ NonnullRefPtr<ComputedProperties> ComputedProperties::Builder::build() &&
 {
     m_style->m_depends_on_viewport_metrics = m_depends_on_viewport_metrics;
     m_style->m_font_metrics_depend_on_viewport_metrics = m_font_metrics_depend_on_viewport_metrics;
+    m_style->m_in_display_none_subtree = m_in_display_none_subtree;
     return move(m_style);
 }
 
@@ -282,6 +285,12 @@ void ComputedProperties::Builder::set_font_metrics_depend_on_viewport_metrics()
 {
     m_font_metrics_depend_on_viewport_metrics = true;
     m_style->m_font_metrics_depend_on_viewport_metrics = true;
+}
+
+void ComputedProperties::Builder::set_in_display_none_subtree()
+{
+    m_in_display_none_subtree = true;
+    m_style->m_in_display_none_subtree = true;
 }
 
 void ComputedProperties::set_depends_on_viewport_metrics(Badge<StyleComputer>)
@@ -1509,8 +1518,11 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
             } else if (item->is_counter()) {
                 content_data.counter_style_dependencies.append(item->as_counter().counter_style()->as_counter_style().resolve_counter_style(element_reference.style_scope()));
                 content_data.data.append(item->as_counter().resolve(element_reference));
-            } else if (item->is_image()) {
-                content_data.data.append(NonnullRefPtr { const_cast<ImageStyleValue&>(item->as_image()) });
+            } else if (item->is_image() || item->is_image_set()) {
+                // https://drafts.csswg.org/css-content-3/#typedef-content-list
+                // https://drafts.csswg.org/css-images-4/#typedef-image
+                // <content-list> accepts <image>, and image-set() is an <image>.
+                content_data.data.append(NonnullRefPtr { const_cast<AbstractImageStyleValue&>(item->as_abstract_image()) });
             } else {
                 // TODO: Implement images, and other things.
                 dbgln("`{}` is not supported in `content` (yet?)", item->to_string(SerializationMode::Normal));
