@@ -37,6 +37,11 @@ jobs:
         shell: pwsh
         run: echo "version=$env:VCToolsVersion" >> $env:GITHUB_OUTPUT
 
+      - name: Setup Windows Specific Tools
+        shell: pwsh
+        run: |
+          choco install ccache pkgconfiglite -y --limit-output
+
       - name: Setup Environment
         uses: ./.github/actions/setup
         with:
@@ -76,7 +81,7 @@ jobs:
         id: vcpkg-key
         shell: bash
         run: |
-          echo "key=vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+          echo "key=vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}" >> $GITHUB_OUTPUT
 
       - name: Restore vcpkg cache
         id: vcpkg-restore
@@ -85,12 +90,8 @@ jobs:
           path: ${{ github.workspace }}/vcpkg_cache
           key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
-            vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-${{ steps.msvc.outputs.version }}-
-
-      - name: Setup Windows Specific Tools
-        shell: pwsh
-        run: |
-          choco install ccache pkgconfiglite -y --limit-output
+            vcpkg-Windows-x86_64-ClangCL-NORMAL-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-Windows-x86_64-ClangCL-NORMAL-
 
       - name: Build
         shell: pwsh
