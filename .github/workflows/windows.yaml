@@ -30,7 +30,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
 
       - name: MSVC Version Hash
         id: msvc
@@ -222,14 +222,13 @@ jobs:
           }
 
           $asset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip' }
+          $hashAsset = $latestRelease.assets | Where-Object { $_.name -eq 'ladybird-windows-x64.zip.sha256' }
 
           if ($asset) {
-              if (-not $asset.digest) {
-                  Write-Host 'Error: Missing digest (SHA256) for the release asset. Aborting to prevent corruption.' -ForegroundColor Red
+              if (!$hashAsset) {
+                  Write-Host 'Error: Security hash file not found in the remote release. Aborting to prevent corruption.' -ForegroundColor Red
                   exit 1
               }
-              $expectedHash = $asset.digest -replace '^sha256:', ''
-              $expectedHash = $expectedHash.Trim().ToUpper()
 
               $tmp = Join-Path $env:TEMP 'LadybirdUpdate'
               if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
@@ -246,6 +245,9 @@ jobs:
 
               Download-File -Url $asset.browser_download_url -OutFile "$tmp\update.zip"
 
+              Download-File -Url $hashAsset.browser_download_url -OutFile "$tmp\update.sha256"
+
+              $expectedHash = (Get-Content "$tmp\update.sha256").Trim().ToUpper()
               $actualHash = (Get-FileHash -Path "$tmp\update.zip" -Algorithm SHA256).Hash.ToUpper()
 
               if ($expectedHash -ne $actualHash) {
@@ -278,11 +280,13 @@ jobs:
 
           $batScript | Out-File -FilePath "ladybird-package/Ladybird/Update Ladybird.bat" -Encoding ASCII
 
-      - name: Create Archive
+      - name: Create Archive and Hash
         if: success()
         shell: pwsh
         run: |
           Compress-Archive -Path "ladybird-package/Ladybird" -DestinationPath "ladybird-windows-x64.zip" -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Path "ladybird-windows-x64.zip" -Algorithm SHA256).Hash
+          $hash | Out-File -FilePath "ladybird-windows-x64.zip.sha256" -Encoding ASCII
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
@@ -316,6 +320,7 @@ jobs:
             Commit: ${{ github.sha }}
           files: |
             ladybird-windows-x64.zip
+            ladybird-windows-x64.zip.sha256
           make_latest: true
 
       - name: Prune ccache
