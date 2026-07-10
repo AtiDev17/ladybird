@@ -1,0 +1,11 @@
+Harness status: OK
+
+Found 6 tests
+
+6 Pass
+Pass	appendChild() and DocumentFragment with host
+Pass	adoptNode() and DocumentFragment with host
+Pass	appendChild() and DocumentFragment
+Pass	adoptNode() and DocumentFragment
+Pass	appendChild() and ShadowRoot
+Pass	adoptNode() and ShadowRoot
