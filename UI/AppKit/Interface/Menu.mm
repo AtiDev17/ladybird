@@ -231,6 +231,7 @@ static void initialize_native_icon(WebView::Action& action, id control)
         break;
     case WebView::ActionID::ViewHistory:
         set_control_image(control, @"clock");
+        [control setKeyEquivalent:@"y"];
         break;
     case WebView::ActionID::ClearBrowsingData:
         set_control_image(control, @"trash");
@@ -311,6 +312,9 @@ static void initialize_native_icon(WebView::Action& action, id control)
         break;
     case WebView::ActionID::OpenInNewWindow:
         set_control_image(control, @"macwindow.badge.plus");
+        break;
+    case WebView::ActionID::OpenInNewPrivateWindow:
+        set_control_image(control, @"eyeglasses");
         break;
     case WebView::ActionID::CopyURL:
         set_control_image(control, @"document.on.document");

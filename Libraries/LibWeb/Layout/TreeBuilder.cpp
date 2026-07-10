@@ -75,6 +75,14 @@ static bool has_in_flow_block_children(Layout::Node const& layout_node)
     return false;
 }
 
+static bool is_out_of_flow_table_internal_child_of_table_root(Layout::NodeWithStyle const& parent, Layout::Node const& child)
+{
+    return parent.display().is_table_inside()
+        && !child.is_anonymous()
+        && child.is_out_of_flow()
+        && child.display_before_box_type_transformation().is_internal_table();
+}
+
 // The insertion_parent_for_*() functions maintain the invariant that the in-flow children of
 // block-level boxes must be either all block-level or all inline-level.
 
@@ -125,6 +133,11 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
     if (!has_inline_or_in_flow_block_children(*new_parent))
         return *new_parent;
 
+    // Table-internal boxes may have been blockified before insertion, but table fixup still needs to see them as
+    // direct table children instead of grouping them with neighboring table whitespace.
+    if (is_out_of_flow_table_internal_child_of_table_root(*new_parent, layout_node))
+        return *new_parent;
+
     // If the block is out-of-flow,
     if (layout_node.is_out_of_flow()) {
         // And we're appending while the parent's last child is an anonymous block, join that
@@ -153,6 +166,10 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
 
     for (auto child = new_parent->first_child(); child;) {
         auto next_child = child->next_sibling();
+        if (is_out_of_flow_table_internal_child_of_table_root(*new_parent, *child)) {
+            child = next_child;
+            continue;
+        }
         new_parent->remove_child(*child);
         wrapper->append_child(*child);
         child = next_child;
@@ -1334,6 +1351,45 @@ void TreeBuilder::fixup_tables(NodeWithStyle& root)
     missing_cells_fixup(table_root_boxes);
 }
 
+static bool is_first_or_last_child_with_table_non_root_sibling_if_any(Node const& node)
+{
+    auto is_table_non_root_box = [](Node const& node) {
+        auto const display = node.display();
+        return display.is_table_row()
+            || display.is_table_column()
+            || display.is_table_row_group()
+            || display.is_table_header_group()
+            || display.is_table_footer_group()
+            || display.is_table_column_group()
+            || display.is_table_cell()
+            || display.is_table_caption();
+    };
+
+    auto previous_sibling = node.previous_sibling();
+    auto next_sibling = node.next_sibling();
+    if (previous_sibling && next_sibling)
+        return false;
+
+    if (previous_sibling && !is_table_non_root_box(*previous_sibling))
+        return false;
+
+    if (next_sibling && !is_table_non_root_box(*next_sibling))
+        return false;
+
+    return true;
+}
+
+// https://drafts.csswg.org/css-tables-3/#tabular-container
+static bool is_tabular_container(Node const& node)
+{
+    auto const& display = node.display();
+    return display.is_table_inside()
+        || display.is_table_row()
+        || display.is_table_row_group()
+        || display.is_table_header_group()
+        || display.is_table_footer_group();
+}
+
 // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
 // 1. Remove irrelevant boxes:
 void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
@@ -1359,12 +1415,27 @@ void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
         });
     });
 
-    // FIXME:
-    // 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of which is a table-non-root box.
+    // FIXME: 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of
+    //           which is a table-non-root box.
+
     // 4. Anonymous inline boxes which meet all of the following criteria:
     //    - they contain only white space
     //    - they are the first and/or last child of a tabular container
     //    - whose immediate sibling, if any, is a table-non-root box
+    root.for_each_in_inclusive_subtree_of_type<Box>([&](auto& box) {
+        auto* parent = box.parent();
+        if (!parent
+            || !is_tabular_container(*parent)
+            || !is_first_or_last_child_with_table_non_root_sibling_if_any(box)) {
+            return TraversalDecision::Continue;
+        }
+
+        if (is_ignorable_whitespace(box)) {
+            to_remove.append(box);
+            return TraversalDecision::SkipChildrenAndContinue;
+        }
+        return TraversalDecision::Continue;
+    });
 
     for (auto& box : to_remove)
         box->parent()->remove_child(*box);
@@ -1385,9 +1456,22 @@ static bool is_table_track_group(CSS::Display display)
         || display.is_table_column_group();
 }
 
+static CSS::Display display_for_table_fixup(Node const& node)
+{
+    // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+    // For the purposes of these rules, out-of-flow elements are represented as inline elements of zero width and
+    // height. Their containing blocks are chosen accordingly.
+    //
+    // AD-HOC: Table-internal boxes can be blockified before fixup. Use the pre-transformation display for authored
+    // boxes so an out-of-flow table-header-group is still recognized as a proper table child during fixup.
+    if (!node.is_anonymous())
+        return node.display_before_box_type_transformation();
+    return node.display();
+}
+
 static bool is_proper_table_child(Node const& node)
 {
-    auto const display = node.display();
+    auto const display = display_for_table_fixup(node);
     return is_table_track_group(display) || is_table_track(display) || display.is_table_caption();
 }
 
@@ -1424,7 +1508,7 @@ static bool is_not_table_cell(Node const& node)
 
 static bool is_table_row_group_column_group_or_caption(Node const& node)
 {
-    auto const display = node.display();
+    auto const display = display_for_table_fixup(node);
     return is_table_track_group(display) || display.is_table_caption();
 }
 

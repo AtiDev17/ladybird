@@ -19,6 +19,7 @@
 #import <Interface/LadybirdWebView.h>
 #import <Interface/LocationSearchField.h>
 #import <Interface/Menu.h>
+#import <Interface/Palette.h>
 #import <Interface/Tab.h>
 #import <Interface/TabController.h>
 #import <Utilities/Conversions.h>
@@ -32,9 +33,21 @@ static NSString* const TOOLBAR_NAVIGATE_BACK_IDENTIFIER = @"ToolbarNavigateBackI
 static NSString* const TOOLBAR_NAVIGATE_FORWARD_IDENTIFIER = @"ToolbarNavigateForwardIdentifier";
 static NSString* const TOOLBAR_RELOAD_IDENTIFIER = @"ToolbarReloadIdentifier";
 static NSString* const TOOLBAR_LOCATION_IDENTIFIER = @"ToolbarLocationIdentifier";
+static NSString* const TOOLBAR_PRIVATE_BROWSING_IDENTIFIER = @"ToolbarPrivateBrowsingIdentifier";
 static NSString* const TOOLBAR_DOWNLOADS_IDENTIFIER = @"ToolbarDownloadsIdentifier";
 static NSString* const TOOLBAR_NEW_TAB_IDENTIFIER = @"ToolbarNewTabIdentifier";
 static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIdentifier";
+
+static constexpr CGFloat PRIVATE_BROWSING_BADGE_HEIGHT = 22;
+static constexpr CGFloat PRIVATE_BROWSING_BADGE_HORIZONTAL_PADDING = 10;
+static constexpr CGFloat PRIVATE_BROWSING_BADGE_CORNER_RADIUS = 10;
+
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_WIDTH = 320;
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_HORIZONTAL_PADDING = 16;
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_VERTICAL_PADDING = 14;
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_SPACING = 10;
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_BUTTON_SPACING = 8;
+static constexpr CGFloat PRIVATE_SESSION_POPOVER_CONTENT_WIDTH = PRIVATE_SESSION_POPOVER_WIDTH - (PRIVATE_SESSION_POPOVER_HORIZONTAL_PADDING * 2);
 
 static constexpr CGFloat DOWNLOADS_POPOVER_WIDTH = 380;
 static constexpr CGFloat DOWNLOADS_POPOVER_HORIZONTAL_PADDING = 12;
@@ -84,6 +97,168 @@ static NSInteger ns_index_for_selected_suggestion(Optional<size_t> selected_sugg
         return NSNotFound;
     return static_cast<NSInteger>(*selected_suggestion);
 }
+
+@interface PrivateBrowsingBadgeButton : NSButton
+@end
+
+@implementation PrivateBrowsingBadgeButton
+
+- (instancetype)init
+{
+    if (self = [super init]) {
+        [self setTitle:@"Private"];
+        [self setBordered:NO];
+        [self setButtonType:NSButtonTypeMomentaryChange];
+        [self setFocusRingType:NSFocusRingTypeNone];
+        [self setAlignment:NSTextAlignmentCenter];
+        [self setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightSemibold]];
+        [self setToolTip:@"Close all private windows and start a fresh private browsing session"];
+        [self updateTitleAttributes];
+
+        [self setWantsLayer:YES];
+        [self layer].cornerRadius = PRIVATE_BROWSING_BADGE_CORNER_RADIUS;
+        [self layer].borderWidth = 1;
+        [self updateLayerColors];
+
+        [[self heightAnchor] constraintEqualToConstant:PRIVATE_BROWSING_BADGE_HEIGHT].active = YES;
+
+        [self setContentHuggingPriority:NSLayoutPriorityRequired
+                         forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [self setContentHuggingPriority:NSLayoutPriorityRequired
+                         forOrientation:NSLayoutConstraintOrientationVertical];
+    }
+
+    return self;
+}
+
+- (NSSize)intrinsicContentSize
+{
+    auto* attributes = @{
+        NSFontAttributeName : [self font],
+    };
+    auto label_size = [[self title] sizeWithAttributes:attributes];
+    return NSMakeSize(label_size.width + (PRIVATE_BROWSING_BADGE_HORIZONTAL_PADDING * 2), PRIVATE_BROWSING_BADGE_HEIGHT);
+}
+
+- (void)viewDidChangeEffectiveAppearance
+{
+    [super viewDidChangeEffectiveAppearance];
+    [self updateTitleAttributes];
+    [self updateLayerColors];
+}
+
+- (void)updateTitleAttributes
+{
+    auto* attributes = @{
+        NSFontAttributeName : [self font],
+        NSForegroundColorAttributeName : [NSColor labelColor],
+    };
+    [self setAttributedTitle:[[NSAttributedString alloc] initWithString:@"Private"
+                                                             attributes:attributes]];
+}
+
+- (void)updateLayerColors
+{
+    auto is_dark = Ladybird::is_using_dark_system_theme();
+
+    auto* surface_color = is_dark
+        ? Ladybird::gfx_color_to_ns_color({ 0x19, 0x0c, 0x4a })
+        : Ladybird::gfx_color_to_ns_color({ 0xe0, 0xd4, 0xff });
+    auto* border_color = is_dark
+        ? Ladybird::gfx_color_to_ns_color({ 0x9c, 0x90, 0xc8 })
+        : Ladybird::gfx_color_to_ns_color({ 0x6c, 0x5f, 0x93 });
+
+    [self layer].backgroundColor = surface_color.CGColor;
+    [self layer].borderColor = border_color.CGColor;
+}
+
+@end
+
+@interface PrivateSessionPopoverViewController : NSViewController
+
+@property (nonatomic, copy) void (^onCancel)(void);
+@property (nonatomic, copy) void (^onConfirm)(void);
+
+@end
+
+@implementation PrivateSessionPopoverViewController
+
+- (void)loadView
+{
+    auto* stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0, 0, PRIVATE_SESSION_POPOVER_WIDTH, 0)];
+    [stack setOrientation:NSUserInterfaceLayoutOrientationVertical];
+    [stack setSpacing:PRIVATE_SESSION_POPOVER_SPACING];
+    [stack setEdgeInsets:NSEdgeInsets {
+                             PRIVATE_SESSION_POPOVER_VERTICAL_PADDING,
+                             PRIVATE_SESSION_POPOVER_HORIZONTAL_PADDING,
+                             PRIVATE_SESSION_POPOVER_VERTICAL_PADDING,
+                             PRIVATE_SESSION_POPOVER_HORIZONTAL_PADDING,
+                         }];
+    [[stack widthAnchor] constraintEqualToConstant:PRIVATE_SESSION_POPOVER_WIDTH].active = YES;
+
+    auto* title_label = [NSTextField labelWithString:@"Start a fresh private session?"];
+    [title_label setFont:[NSFont boldSystemFontOfSize:[NSFont systemFontSize]]];
+    [title_label setLineBreakMode:NSLineBreakByWordWrapping];
+    [title_label setMaximumNumberOfLines:0];
+    [title_label setPreferredMaxLayoutWidth:PRIVATE_SESSION_POPOVER_CONTENT_WIDTH];
+    [[title_label widthAnchor] constraintEqualToConstant:PRIVATE_SESSION_POPOVER_CONTENT_WIDTH].active = YES;
+    [stack addArrangedSubview:title_label];
+
+    auto* body_label = [NSTextField labelWithString:@"This closes all private windows and deletes history and other site data from the current private browsing session."];
+    [body_label setTextColor:[NSColor secondaryLabelColor]];
+    [body_label setLineBreakMode:NSLineBreakByWordWrapping];
+    [body_label setMaximumNumberOfLines:0];
+    [body_label setPreferredMaxLayoutWidth:PRIVATE_SESSION_POPOVER_CONTENT_WIDTH];
+    [[body_label widthAnchor] constraintEqualToConstant:PRIVATE_SESSION_POPOVER_CONTENT_WIDTH].active = YES;
+    [stack addArrangedSubview:body_label];
+
+    auto* button_row = [[NSStackView alloc] init];
+    [button_row setOrientation:NSUserInterfaceLayoutOrientationHorizontal];
+    [button_row setSpacing:PRIVATE_SESSION_POPOVER_BUTTON_SPACING];
+
+    auto* spacer = [[NSView alloc] init];
+    [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                       forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [button_row addArrangedSubview:spacer];
+
+    auto* cancel_button = [NSButton buttonWithTitle:@"Cancel"
+                                             target:self
+                                             action:@selector(cancelPrivateSessionReset:)];
+    [cancel_button setBezelStyle:NSBezelStyleRounded];
+    [button_row addArrangedSubview:cancel_button];
+
+    auto* restart_button = [NSButton buttonWithTitle:@"Restart Private Session"
+                                              target:self
+                                              action:@selector(confirmPrivateSessionReset:)];
+    [restart_button setBezelStyle:NSBezelStyleRounded];
+    [restart_button setKeyEquivalent:@"\r"];
+    [button_row addArrangedSubview:restart_button];
+
+    [stack addArrangedSubview:button_row];
+    [self setView:stack];
+
+    [stack layoutSubtreeIfNeeded];
+    auto fitting_size = [stack fittingSize];
+    fitting_size.width = PRIVATE_SESSION_POPOVER_WIDTH;
+    [self setPreferredContentSize:fitting_size];
+}
+
+- (void)cancelPrivateSessionReset:(id)sender
+{
+    if (self.onCancel)
+        self.onCancel();
+}
+
+- (void)confirmPrivateSessionReset:(id)sender
+{
+    if (self.onCancel)
+        self.onCancel();
+
+    if (self.onConfirm)
+        self.onConfirm();
+}
+
+@end
 
 @interface DownloadRowView : NSView
 
@@ -457,6 +632,7 @@ static NSInteger ns_index_for_selected_suggestion(Optional<size_t> selected_sugg
 
 @interface TabController () <NSToolbarDelegate, NSSearchFieldDelegate, AutocompleteObserver>
 {
+    WebView::IsPrivate m_is_private;
     u64 m_page_index;
 
     OwnPtr<WebView::Omnibox> m_omnibox;
@@ -481,9 +657,13 @@ static NSInteger ns_index_for_selected_suggestion(Optional<size_t> selected_sugg
 @property (nonatomic, strong) NSToolbarItem* navigate_forward_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* reload_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* location_toolbar_item;
+@property (nonatomic, strong) NSToolbarItem* private_browsing_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* downloads_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* new_tab_toolbar_item;
 @property (nonatomic, strong) NSToolbarItem* tab_overview_toolbar_item;
+
+@property (nonatomic, strong) NSPopover* private_session_popover;
+
 @property (nonatomic, strong) DownloadsButton* downloads_button;
 @property (nonatomic, strong) NSPopover* downloads_popover;
 
@@ -536,11 +716,12 @@ private:
 @synthesize navigate_forward_toolbar_item = _navigate_forward_toolbar_item;
 @synthesize reload_toolbar_item = _reload_toolbar_item;
 @synthesize location_toolbar_item = _location_toolbar_item;
+@synthesize private_browsing_toolbar_item = _private_browsing_toolbar_item;
 @synthesize downloads_toolbar_item = _downloads_toolbar_item;
 @synthesize new_tab_toolbar_item = _new_tab_toolbar_item;
 @synthesize tab_overview_toolbar_item = _tab_overview_toolbar_item;
 
-- (instancetype)init
+- (instancetype)init:(WebView::IsPrivate)is_private
 {
     if (self = [super init]) {
         __weak TabController* weak_self = self;
@@ -556,14 +737,16 @@ private:
         [self.toolbar setAllowsUserCustomization:NO];
         [self.toolbar setSizeMode:NSToolbarSizeModeRegular];
 
+        m_is_private = is_private;
         m_page_index = 0;
+
         m_is_applying_omnibox_display = false;
         m_fullscreen_requested_for_web_content = false;
         m_fullscreen_exit_was_ui_initiated = true;
         m_fullscreen_should_restore_tab_bar = false;
 
         self.autocomplete = [[Autocomplete alloc] init:self withToolbarItem:self.location_toolbar_item];
-        m_omnibox = make<WebView::Omnibox>(WebView::IsPrivate::No);
+        m_omnibox = make<WebView::Omnibox>(m_is_private);
         m_downloads_observer = make<DownloadsObserver>(self);
 
         m_omnibox->on_display_change = [weak_self](WebView::Omnibox::Display const& display) {
@@ -611,7 +794,7 @@ private:
 - (instancetype)initAsChild:(Tab*)parent
                   pageIndex:(u64)page_index
 {
-    if (self = [self init]) {
+    if (self = [self init:[parent isPrivate]]) {
         self.parent = parent;
 
         m_page_index = page_index;
@@ -624,6 +807,11 @@ private:
 }
 
 #pragma mark - Public methods
+
+- (WebView::IsPrivate)isPrivate
+{
+    return m_is_private;
+}
 
 - (void)loadURL:(URL::URL const&)url
 {
@@ -712,6 +900,7 @@ private:
 
     [delegate createNewTab:WebView::Application::settings().new_tab_page_url()
                    fromTab:[self tab]
+                 isPrivate:[[self tab] isPrivate]
                activateTab:Web::HTML::ActivateTab::Yes
                tabLocation:TabLocation::end()];
 
@@ -899,6 +1088,47 @@ private:
     self.tab.titlebarAppearsTransparent = NO;
     [self.window toggleTabOverview:sender];
     self.tab.titlebarAppearsTransparent = YES;
+}
+
+- (void)showPrivateSessionPopover:(id)sender
+{
+    if (m_is_private == WebView::IsPrivate::No)
+        return;
+
+    if (!self.private_session_popover) {
+        auto* content_view_controller = [[PrivateSessionPopoverViewController alloc] init];
+        __weak TabController* weak_self = self;
+        [content_view_controller setOnCancel:^{
+            TabController* self = weak_self;
+            if (self != nil)
+                [self.private_session_popover close];
+        }];
+        [content_view_controller setOnConfirm:^{
+            TabController* self = weak_self;
+            if (self == nil)
+                return;
+
+            auto* delegate = (ApplicationDelegate*)[NSApp delegate];
+            [delegate restartPrivateBrowsingSession];
+        }];
+
+        self.private_session_popover = [[NSPopover alloc] init];
+        [self.private_session_popover setAnimates:YES];
+        [self.private_session_popover setBehavior:NSPopoverBehaviorTransient];
+        [self.private_session_popover setContentViewController:content_view_controller];
+    }
+
+    [self.private_session_popover showRelativeToToolbarItem:self.private_browsing_toolbar_item];
+}
+
+- (void)togglePrivateSessionPopover:(id)sender
+{
+    if (self.private_session_popover && [self.private_session_popover isShown]) {
+        [self.private_session_popover close];
+        return;
+    }
+
+    [self showPrivateSessionPopover:sender];
 }
 
 - (void)showDownloadsPopover:(id)sender
@@ -1111,6 +1341,22 @@ private:
     return _location_toolbar_item;
 }
 
+- (NSToolbarItem*)private_browsing_toolbar_item
+{
+    if (!_private_browsing_toolbar_item) {
+        auto* badge_button = [[PrivateBrowsingBadgeButton alloc] init];
+        [badge_button setTarget:self];
+        [badge_button setAction:@selector(togglePrivateSessionPopover:)];
+
+        _private_browsing_toolbar_item = [[NSToolbarItem alloc] initWithItemIdentifier:TOOLBAR_PRIVATE_BROWSING_IDENTIFIER];
+        [_private_browsing_toolbar_item setView:badge_button];
+        [_private_browsing_toolbar_item setLabel:@"Private Browsing"];
+        [_private_browsing_toolbar_item setPaletteLabel:@"Private Browsing"];
+    }
+
+    return _private_browsing_toolbar_item;
+}
+
 - (NSToolbarItem*)downloads_toolbar_item
 {
     if (!_downloads_toolbar_item) {
@@ -1173,17 +1419,32 @@ private:
 - (NSArray*)toolbar_identifiers
 {
     if (!_toolbar_identifiers) {
-        _toolbar_identifiers = @[
-            TOOLBAR_NAVIGATE_BACK_IDENTIFIER,
-            TOOLBAR_NAVIGATE_FORWARD_IDENTIFIER,
-            NSToolbarFlexibleSpaceItemIdentifier,
-            TOOLBAR_RELOAD_IDENTIFIER,
-            TOOLBAR_LOCATION_IDENTIFIER,
-            TOOLBAR_DOWNLOADS_IDENTIFIER,
-            NSToolbarFlexibleSpaceItemIdentifier,
-            TOOLBAR_NEW_TAB_IDENTIFIER,
-            TOOLBAR_TAB_OVERVIEW_IDENTIFIER,
-        ];
+        if (m_is_private == WebView::IsPrivate::Yes) {
+            _toolbar_identifiers = @[
+                TOOLBAR_NAVIGATE_BACK_IDENTIFIER,
+                TOOLBAR_NAVIGATE_FORWARD_IDENTIFIER,
+                NSToolbarFlexibleSpaceItemIdentifier,
+                TOOLBAR_RELOAD_IDENTIFIER,
+                TOOLBAR_LOCATION_IDENTIFIER,
+                TOOLBAR_PRIVATE_BROWSING_IDENTIFIER,
+                TOOLBAR_DOWNLOADS_IDENTIFIER,
+                NSToolbarFlexibleSpaceItemIdentifier,
+                TOOLBAR_NEW_TAB_IDENTIFIER,
+                TOOLBAR_TAB_OVERVIEW_IDENTIFIER,
+            ];
+        } else {
+            _toolbar_identifiers = @[
+                TOOLBAR_NAVIGATE_BACK_IDENTIFIER,
+                TOOLBAR_NAVIGATE_FORWARD_IDENTIFIER,
+                NSToolbarFlexibleSpaceItemIdentifier,
+                TOOLBAR_RELOAD_IDENTIFIER,
+                TOOLBAR_LOCATION_IDENTIFIER,
+                TOOLBAR_DOWNLOADS_IDENTIFIER,
+                NSToolbarFlexibleSpaceItemIdentifier,
+                TOOLBAR_NEW_TAB_IDENTIFIER,
+                TOOLBAR_TAB_OVERVIEW_IDENTIFIER,
+            ];
+        }
     }
 
     return _toolbar_identifiers;
@@ -1195,7 +1456,7 @@ private:
 {
     self.window = self.parent
         ? [[Tab alloc] initAsChild:self.parent pageIndex:m_page_index]
-        : [[Tab alloc] init];
+        : [[Tab alloc] init:m_is_private];
 
     [self.window setDelegate:self];
 
@@ -1381,6 +1642,9 @@ private:
     }
     if ([identifier isEqual:TOOLBAR_LOCATION_IDENTIFIER]) {
         return self.location_toolbar_item;
+    }
+    if ([identifier isEqual:TOOLBAR_PRIVATE_BROWSING_IDENTIFIER]) {
+        return self.private_browsing_toolbar_item;
     }
     if ([identifier isEqual:TOOLBAR_DOWNLOADS_IDENTIFIER]) {
         return self.downloads_toolbar_item;

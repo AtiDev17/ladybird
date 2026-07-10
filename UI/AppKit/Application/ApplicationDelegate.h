@@ -10,6 +10,7 @@
 #include <AK/StringView.h>
 #include <LibURL/URL.h>
 #include <LibWeb/HTML/ActivateTab.h>
+#include <LibWebView/PrivateBrowsing.h>
 
 #import <Cocoa/Cocoa.h>
 
@@ -50,6 +51,7 @@ private:
 
 - (nonnull TabController*)createNewTab:(Optional<URL::URL> const&)url
                                fromTab:(nullable Tab*)tab
+                             isPrivate:(WebView::IsPrivate)is_private
                            activateTab:(Web::HTML::ActivateTab)activate_tab
                            tabLocation:(TabLocation)tab_location;
 
@@ -63,6 +65,8 @@ private:
 
 - (void)removeTab:(nonnull TabController*)controller;
 - (NSUInteger)tabCount;
+
+- (void)restartPrivateBrowsingSession;
 
 - (void)rebuildBookmarksMenu;
 

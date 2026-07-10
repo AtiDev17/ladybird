@@ -88,6 +88,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 }
 
 @property (nonatomic, strong) NSString* title;
+@property (nonatomic, strong) NSString* page_title;
 @property (nonatomic, strong) NSImage* favicon;
 
 @property (nonatomic, strong) NSTitlebarAccessoryViewController* bookmarks_bar_controller;
@@ -114,9 +115,9 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     return default_favicon;
 }
 
-- (instancetype)init
+- (instancetype)init:(WebView::IsPrivate)is_private
 {
-    auto* web_view = [[LadybirdWebView alloc] init:self];
+    auto* web_view = [[LadybirdWebView alloc] init:self isPrivate:is_private];
     return [self initWithWebView:web_view];
 }
 
@@ -135,11 +136,22 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     auto window_rect = NSMakeRect(position_x, position_y, WINDOW_WIDTH, WINDOW_HEIGHT);
 
     if (self = [super initWithWebView:web_view windowRect:window_rect]) {
-        // Remember last window position
-        self.frameAutosaveName = @"window";
+        [self setTabbingIdentifier:[self isPrivate] == WebView::IsPrivate::Yes
+                ? @"LadybirdPrivateBrowsing"
+                : @"LadybirdBrowsing"];
+
+        if ([self isPrivate] == WebView::IsPrivate::No) {
+            // Remember last window position.
+            self.frameAutosaveName = @"window";
+        } else {
+            // Adopt the last saved frame without persisting changes to it, and keep private windows out of window state
+            // restoration entirely.
+            [self setFrameUsingName:@"window"];
+            [self setRestorable:NO];
+        }
 
         self.favicon = [Tab defaultFavicon];
-        self.title = @"New Tab";
+        [self setPageTitle:@"New Tab"];
         [self updateTabTitleAndFavicon];
 
         [self setTitleVisibility:NSWindowTitleHidden];
@@ -180,6 +192,11 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 #pragma mark - Public methods
 
+- (WebView::IsPrivate)isPrivate
+{
+    return [[self web_view] view].is_private();
+}
+
 - (void)find:(id)sender
 {
     [self.search_panel find:sender];
@@ -214,12 +231,22 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
     return self.favicon;
 }
 
+- (void)setPageTitle:(NSString*)page_title
+{
+    self.page_title = page_title;
+
+    if ([self isPrivate] == WebView::IsPrivate::Yes)
+        [self setTitle:[NSString stringWithFormat:@"%@ (Private Browsing)", page_title]];
+    else
+        [self setTitle:page_title];
+}
+
 - (NSString*)displayTitle
 {
     if (!WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
-        return self.title;
+        return self.page_title;
 
-    auto title = MUST(String::formatted("{} [{}]", Ladybird::ns_string_to_string(self.title), [[self web_view] view].client().pid()));
+    auto title = MUST(String::formatted("{} [{}]", Ladybird::ns_string_to_string(self.page_title), [[self web_view] view].client().pid()));
     return Ladybird::string_to_ns_string(title);
 }
 
@@ -356,6 +383,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
     auto* controller = [delegate createNewTab:url
                                       fromTab:self
+                                    isPrivate:[self isPrivate]
                                   activateTab:activate_tab
                                   tabLocation:TabLocation::end()];
 
@@ -380,7 +408,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 - (void)onLoadStart:(URL::URL const&)url isRedirect:(BOOL)is_redirect
 {
-    self.title = Ladybird::string_to_ns_string(url.serialize());
+    [self setPageTitle:Ladybird::string_to_ns_string(url.serialize())];
     self.favicon = [Tab defaultFavicon];
     [self setTabLoading:YES];
     [self updateTabTitleAndFavicon];
@@ -402,7 +430,7 @@ static NSImage* tab_loading_spinner_icon(NSUInteger frame)
 
 - (void)onTitleChange:(Utf16String const&)title
 {
-    self.title = Ladybird::utf16_string_to_ns_string(title);
+    [self setPageTitle:Ladybird::utf16_string_to_ns_string(title)];
     [self updateTabTitleAndFavicon];
 }
 

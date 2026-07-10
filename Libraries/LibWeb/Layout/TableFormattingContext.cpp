@@ -221,7 +221,6 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
 void TableFormattingContext::compute_outer_content_sizes()
 {
     auto containing_block_width = m_table_constraints.percentage_basis_width.value_or(0);
-    auto containing_block_height = m_table_constraints.percentage_basis_height.value_or(0);
 
     size_t column_index = 0;
     TableGrid::for_each_child_box_matching(table_box(), is_table_column_group, [&](auto& column_group_box) {
@@ -239,6 +238,13 @@ void TableFormattingContext::compute_outer_content_sizes()
             column_index += span;
         });
     });
+
+    initialize_row_content_sizes();
+}
+
+void TableFormattingContext::initialize_row_content_sizes()
+{
+    auto containing_block_height = m_table_constraints.percentage_basis_height.value_or(0);
 
     for (auto& row : m_rows) {
         auto const& computed_values = row.box.computed_values();
@@ -1027,6 +1033,14 @@ void TableFormattingContext::compute_table_height()
             cell_state.set_content_height(independent_formatting_context->automatic_content_height());
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
+        if (m_needs_fixed_mode_row_measurement) {
+            auto const& computed_values = cell.box.computed_values();
+            auto min_height = computed_values.min_height().to_px(height_of_containing_block);
+            auto cell_intrinsic_height_offsets = cell_state.border_box_top() + cell_state.border_box_bottom();
+            auto measured_outer_height = max(cell_state.border_box_height(), min_height + cell_intrinsic_height_offsets);
+            cell.outer_min_height = measured_outer_height;
+            cell.outer_max_height = measured_outer_height;
+        }
 
         // https://drafts.csswg.org/css2/#height-layout
         // The baseline of a cell is the baseline of the first in-flow line box in the cell, or the first in-flow
@@ -1044,8 +1058,18 @@ void TableFormattingContext::compute_table_height()
             if (cell.row_span == 1) {
                 row.base_height = max(row.base_height, cell_state.border_box_height());
             }
-            row.base_height = max(row.base_height, m_rows[cell.row_index].min_size);
+            if (!m_needs_fixed_mode_row_measurement)
+                row.base_height = max(row.base_height, m_rows[cell.row_index].min_size);
             row.baseline = max(row.baseline, cell.baseline);
+        }
+    }
+
+    if (m_needs_fixed_mode_row_measurement) {
+        initialize_row_content_sizes();
+        compute_table_measures<Row>();
+        for (auto& row : m_rows) {
+            if (!row.is_collapsed)
+                row.base_height = max(row.base_height, row.min_size);
         }
     }
 
@@ -1783,8 +1807,20 @@ void TableFormattingContext::seed_table_participant_used_values(ContainingBlockC
         m_state.create(cell.box, participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
 
     for (auto child = table_box().first_child(); child; child = child->next_sibling()) {
-        if (child->display().is_table_caption())
-            m_state.create(as<Box>(*child), participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
+        auto* child_box = as_if<Box>(*child);
+        if (!child_box)
+            continue;
+
+        if (child_box->display().is_table_caption()) {
+            m_state.create(*child_box, participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
+            continue;
+        }
+
+        if (!child_box->is_absolutely_positioned() || m_state.try_get_mutable(*child_box))
+            continue;
+
+        auto& child_box_state = m_state.create(*child_box, participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
+        child_box_state.set_static_position_rect(calculate_static_position_rect(*child_box));
     }
 }
 
@@ -1811,10 +1847,22 @@ void TableFormattingContext::run_until_width_calculation(LayoutInput const& layo
     border_conflict_resolution();
 
     auto effective_row_measurement = row_measurement;
+    m_needs_fixed_mode_row_measurement = false;
     // OPTIMIZATION: Row intrinsic measurements are only needed when row height constraints or rowspans can affect
     //               the later row height distribution. Simple tables get their actual row heights from cell layout.
     if (effective_row_measurement == RowMeasurement::Include && can_skip_row_intrinsic_measurement())
         effective_row_measurement = RowMeasurement::Skip;
+    if (effective_row_measurement == RowMeasurement::Include && use_fixed_mode_layout()) {
+        // https://drafts.csswg.org/css-tables-3/#computing-column-measures
+        // For the purpose of measuring a column when laid out in fixed mode ... the min-content and max-content width
+        // of cells is considered zero.
+        //
+        // https://drafts.csswg.org/css-tables-3/#ROWMIN
+        // ROWMIN is defined as the sum of the minimum height of the rows after a first row layout pass.
+        // NB: So defer fixed-mode row measurement until after columns have their used widths.
+        effective_row_measurement = RowMeasurement::Skip;
+        m_needs_fixed_mode_row_measurement = true;
+    }
 
     // Compute the minimum width of each column.
     compute_cell_measures(effective_row_measurement);
@@ -1841,7 +1889,7 @@ void TableFormattingContext::parent_context_did_dimension_child_root_box()
         return;
 
     context_box().for_each_in_subtree_of_type<Box const>([&](Layout::Box const& box) {
-        if (box.is_absolutely_positioned()) {
+        if (box.is_absolutely_positioned() && !m_state.try_get(box)) {
             // FIXME: calculate_static_position_rect() is not aware of how to correctly calculate static position for
             //        a box nested inside a table, but we need to set some value, so layout_absolutely_positioned_element()
             //        won't crash trying to access it.
