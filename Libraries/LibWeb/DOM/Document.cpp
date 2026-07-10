@@ -1871,28 +1871,6 @@ void Document::update_layout(UpdateLayoutReason reason)
 
             layout_node.recompute_containing_block({});
 
-            auto* box = as_if<Layout::Box>(layout_node);
-            if (!box)
-                return TraversalDecision::Continue;
-
-            box->clear_contained_abspos_children();
-
-            if (!box->is_absolutely_positioned())
-                return TraversalDecision::Continue;
-
-            if (auto containing_block = box->containing_block()) {
-                auto closest_box_that_establishes_formatting_context = containing_block;
-                while (closest_box_that_establishes_formatting_context) {
-                    if (closest_box_that_establishes_formatting_context == m_layout_root)
-                        break;
-                    if (Layout::FormattingContext::formatting_context_type_created_by_box(*closest_box_that_establishes_formatting_context).has_value())
-                        break;
-                    closest_box_that_establishes_formatting_context = closest_box_that_establishes_formatting_context->containing_block();
-                }
-                VERIFY(closest_box_that_establishes_formatting_context);
-                closest_box_that_establishes_formatting_context->add_contained_abspos_child(*box);
-            }
-
             return TraversalDecision::Continue;
         });
 
@@ -6580,6 +6558,22 @@ void Document::update_animations_and_send_events(double timestamp)
     //    the previous step.
     for (auto const& event : events_to_dispatch)
         event.target->dispatch_event(event.event);
+
+    // AD-HOC: Nothing else re-requests a rendering update while time-driven animations are running, since
+    //         Document::set_needs_animated_style_update() only requests a frame when its flag flips from
+    //         false to true, and the flag is both set and cleared within the same rendering update.
+    //         Without this, animations only advance when unrelated tasks happen to schedule rendering
+    //         updates. Keep the frame pump going as long as some animation attached to a monotonically
+    //         increasing timeline is running.
+    for (auto const& animation : m_associated_animations) {
+        if (animation.play_state() != Bindings::AnimationPlayState::Running)
+            continue;
+        auto timeline = animation.timeline();
+        if (!timeline || !timeline->is_monotonically_increasing())
+            continue;
+        page().client().request_frame();
+        break;
+    }
 }
 
 // https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
@@ -8963,6 +8957,14 @@ void Document::did_change_custom_property_registrations()
 
 void Document::build_registered_properties_cache()
 {
+    // The set of effective @property rules can only change when the active stylesheet rule set changes, which also
+    // invalidates the document's style cache. Skip the rebuild until that happens.
+    if (!m_needs_registered_properties_cache_update)
+        return;
+    m_needs_registered_properties_cache_update = false;
+
+    ++m_style_invalidation_counters.registered_properties_cache_rebuilds;
+
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> cached_registered_properties_from_css_property_rules;
     for_each_active_css_style_sheet([&](CSS::CSSStyleSheet const& style_sheet) {
         style_sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSS::CSSRule const& rule) {

@@ -27,10 +27,18 @@
 #include <LibWeb/Layout/ListItemMarkerBox.h>
 #include <LibWeb/Layout/ReplacedBox.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
+#include <LibWeb/Layout/TableFormattingContext.h>
 #include <LibWeb/Layout/TableWrapper.h>
 #include <LibWeb/Layout/Viewport.h>
 
 namespace Web::Layout {
+
+static CSSPixels distance_between_marker_and_list_item(ListItemMarkerBox const& marker)
+{
+    if (marker.text().has_value())
+        return 0;
+    return CSSPixels::nearest_value_for(.5f * marker.first_available_font().pixel_size());
+}
 
 BlockFormattingContext::BlockFormattingContext(LayoutState& state, LayoutMode layout_mode, BlockContainer const& root, FormattingContext* parent)
     : FormattingContext(Type::Block, layout_mode, state, root, parent)
@@ -128,14 +136,16 @@ void BlockFormattingContext::run(LayoutInput const& layout_input)
         (void)column_width;
     }
 
+    auto root_layout_input = layout_input.with_content_box_position_in_bfc_root(CSSPixelPoint {});
+
     if (auto const* fieldset_box = as_if<FieldSetBox>(root()); fieldset_box && fieldset_box->rendered_legend()) {
-        layout_fieldset_with_rendered_legend(*fieldset_box, layout_input);
+        layout_fieldset_with_rendered_legend(*fieldset_box, root_layout_input);
         return;
     }
     if (root().children_are_inline())
-        layout_inline_children(root(), layout_input, available_space);
+        layout_inline_children(root(), root_layout_input, available_space);
     else
-        layout_block_level_children(root(), layout_input, available_space);
+        layout_block_level_children(root(), root_layout_input, available_space);
 
     // Fieldsets without a rendered legend skip collapsed margin assignment.
     if (is<FieldSetBox>(root()))
@@ -163,9 +173,10 @@ void BlockFormattingContext::parent_context_did_dimension_child_root_box()
     m_was_notified_after_parent_dimensioned_my_root_box = true;
 
     for (auto& floating_box : m_floats) {
+        auto content_y = floating_box->top_margin_edge + floating_box->used_values.margin_box_top();
         if (floating_box->side == FloatSide::Left) {
             // Left-side floats: offset_from_edge is from left edge (0) to left content edge of floating_box.
-            floating_box->used_values.set_content_x(floating_box->offset_from_edge);
+            place_child(floating_box->box, { floating_box->offset_from_edge, content_y });
         } else {
             // Right-side floats: offset_from_edge is from right edge (float_containing_block_width) to the left content edge of floating_box.
             auto float_containing_block_width = [&] {
@@ -179,14 +190,14 @@ void BlockFormattingContext::parent_context_did_dimension_child_root_box()
                 }
                 VERIFY_NOT_REACHED();
             }();
-            floating_box->used_values.set_content_x(float_containing_block_width - floating_box->offset_from_edge);
+            place_child(floating_box->box, { float_containing_block_width - floating_box->offset_from_edge, content_y });
         }
     }
 
     layout_absolutely_positioned_children();
 }
 
-bool BlockFormattingContext::box_should_avoid_floats_because_it_establishes_fc(Box const& box)
+bool BlockFormattingContext::box_should_avoid_floats_because_it_establishes_fc(Box const& box) const
 {
     // https://drafts.csswg.org/css2/#floats
     // The border box of a table, a block-level replaced element, or an element in the normal flow that establishes
@@ -214,14 +225,14 @@ bool BlockFormattingContext::box_should_avoid_floats_because_it_establishes_fc(B
         && first_is_one_of(formatting_context_type.value(), Type::Block, Type::Flex, Type::Grid);
 }
 
-void BlockFormattingContext::compute_width(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
+void BlockFormattingContext::compute_width(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, CSSPixelPoint content_position_in_root)
 {
     auto remaining_available_space = available_space;
 
     // Certain formatting contexts do not allow float intrusions, so reduce the available space for them.
     if (available_space.width.is_definite() && box_should_avoid_floats_because_it_establishes_fc(box)) {
         auto available_width = available_space.width.to_px_or_zero();
-        auto box_in_root_rect = content_box_rect_in_ancestor_coordinate_space(m_state.get(box), root());
+        auto box_in_root_rect = CSSPixelRect { content_position_in_root, m_state.get(box).content_size() };
         box_in_root_rect.set_width(available_width);
         auto intrusion = intrusions_for_band_into_rect(band_at(box_in_root_rect.y()), box_in_root_rect);
         auto remaining_width = available_width - intrusion.left - intrusion.right;
@@ -448,9 +459,8 @@ FormattingContext::SpaceUsedByFloats BlockFormattingContext::intrusions_for_band
     };
 }
 
-FormattingContext::SpaceUsedByFloats BlockFormattingContext::available_inline_space_in_box(LayoutState::UsedValues const& box_used_values, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const
+FormattingContext::SpaceUsedByFloats BlockFormattingContext::intrusion_by_floats_into_rect(CSSPixelRect const& box_in_root_rect, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const
 {
-    auto box_in_root_rect = content_box_rect_in_ancestor_coordinate_space(box_used_values, root());
     auto intrusions = available_inline_space(box_in_root_rect.y() + block_start_in_box, box_in_root_rect.y() + block_end_in_box);
     auto root_content_width = m_state.get(root()).content_width();
     return {
@@ -513,11 +523,14 @@ void BlockFormattingContext::ensure_band_boundary(CSSPixels block_start)
     m_bands.append(new_band);
 }
 
-void BlockFormattingContext::add_float_to_bands(FloatingBox const& floating_box, CSSPixelRect const& containing_block_rect_in_root)
+void BlockFormattingContext::add_float_to_bands(FloatingBox const& floating_box, CSSPixelRect containing_block_rect_in_root)
 {
+    auto const pending_y_adjustment = y_adjustment_from_pending_ancestor_top_margins(floating_box.box);
+    containing_block_rect_in_root.translate_by(0, pending_y_adjustment);
+
     auto const& box_state = floating_box.used_values;
     auto const root_content_width = m_state.get(root()).content_width();
-    auto const margin_box_rect_in_root = floating_box.margin_box_rect_in_root_coordinate_space;
+    auto const margin_box_rect_in_root = floating_box.margin_box_rect_in_root_coordinate_space.translated(0, pending_y_adjustment);
     auto const block_start = margin_box_rect_in_root.top();
     auto const block_end = margin_box_rect_in_root.bottom();
 
@@ -555,14 +568,37 @@ void BlockFormattingContext::rebuild_float_bands()
     m_lowest_left_margin_edge = 0;
     m_lowest_right_margin_edge = 0;
 
-    for (auto& floating_box : m_floats) {
-        floating_box->margin_box_rect_in_root_coordinate_space = margin_box_rect_in_ancestor_coordinate_space(floating_box->used_values, root());
-        auto const* containing_block = floating_box->used_values.node().containing_block();
-        VERIFY(containing_block);
-        auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(m_state.get(*containing_block), root());
-        floating_box->margin_box_rect_in_root_coordinate_space.set_x(margin_box_left_of_float_in_root(*floating_box, containing_block_rect_in_root));
-        add_float_to_bands(*floating_box, containing_block_rect_in_root);
+    for (auto& floating_box : m_floats)
+        add_float_to_bands(*floating_box, floating_box->containing_block_rect_in_root_coordinate_space);
+}
+
+void BlockFormattingContext::update_lowest_floating_descendant_bottom_margin_edge()
+{
+    Optional<CSSPixels> lowest;
+    for (auto const& floating_box : m_floats) {
+        auto bottom_margin_edge = floating_box->margin_box_rect_in_root_coordinate_space.bottom();
+        if (!lowest.has_value() || bottom_margin_edge > *lowest)
+            lowest = bottom_margin_edge;
     }
+    m_state.get_mutable(root()).set_lowest_floating_descendant_bottom_margin_edge(lowest);
+}
+
+void BlockFormattingContext::translate_floats_in_subtree(Box const& ancestor, CSSPixelPoint delta)
+{
+    if (delta.is_zero() || m_floats.is_empty())
+        return;
+    bool any_float_moved = false;
+    for (auto& floating_box : m_floats) {
+        if (!ancestor.is_ancestor_of(floating_box->box))
+            continue;
+        floating_box->margin_box_rect_in_root_coordinate_space.translate_by(delta);
+        floating_box->containing_block_rect_in_root_coordinate_space.translate_by(delta);
+        any_float_moved = true;
+    }
+    if (!any_float_moved)
+        return;
+    update_lowest_floating_descendant_bottom_margin_edge();
+    rebuild_float_bands();
 }
 
 CSSPixels BlockFormattingContext::margin_box_left_of_float_in_root(FloatingBox const& floating_box, CSSPixelRect const& containing_block_rect_in_root) const
@@ -583,26 +619,24 @@ CSSPixels BlockFormattingContext::border_box_left_of_box_avoiding_floats(Box con
     return space_used_by_floats.left + box_state.margin_left;
 }
 
-void BlockFormattingContext::avoid_float_intrusions(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
+CSSPixels BlockFormattingContext::avoid_float_intrusions(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, CSSPixels content_y, CSSPixelRect const& containing_block_rect_in_root)
 {
     if (!available_space.width.is_definite())
-        return;
+        return content_y;
     if (!box_should_avoid_floats_because_it_establishes_fc(box))
-        return;
+        return content_y;
 
     // https://drafts.csswg.org/css2/#floats
     // If necessary, implementations should clear the said element by placing it below any preceding floats, but may
     // place it adjacent to such floats if there is sufficient space.
-    auto& box_state = m_state.get_mutable(box);
-    auto const* containing_block = box.containing_block();
-    VERIFY(containing_block);
-    auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(m_state.get(*containing_block), root());
+    auto const& box_state = m_state.get(box);
     while (true) {
-        auto border_box_y_in_root = content_box_rect_in_ancestor_coordinate_space(box_state, root()).y() - box_state.border_box_top();
-        containing_block_rect_in_root.set_y(border_box_y_in_root);
-        containing_block_rect_in_root.set_height(box_state.border_box_height());
+        auto border_box_y_in_root = containing_block_rect_in_root.y() + content_y - box_state.border_box_top();
+        auto band_containing_block_rect = containing_block_rect_in_root;
+        band_containing_block_rect.set_y(border_box_y_in_root);
+        band_containing_block_rect.set_height(box_state.border_box_height());
         auto const& band = band_at(border_box_y_in_root);
-        auto space_used_by_floats = intrusions_for_band_into_rect(band, containing_block_rect_in_root);
+        auto space_used_by_floats = intrusions_for_band_into_rect(band, band_containing_block_rect);
         bool const constrained_by_floats = space_used_by_floats.left > 0 || space_used_by_floats.right > 0;
         auto border_box_left_in_containing_block = border_box_left_of_box_avoiding_floats(box, box_state, space_used_by_floats);
 
@@ -611,13 +645,15 @@ void BlockFormattingContext::avoid_float_intrusions(Box const& box, AvailableSpa
 
         if (!must_clear_below_current_band) {
             CSSPixelRect border_box_rect_in_root {
-                containing_block_rect_in_root.x() + border_box_left_in_containing_block,
+                band_containing_block_rect.x() + border_box_left_in_containing_block,
                 border_box_y_in_root,
                 box_state.border_box_width(),
                 box_state.border_box_height(),
             };
             must_clear_below_current_band = any_of(m_floats, [&](auto const& floating_box) {
-                return !floating_box->margin_box_rect_in_root_coordinate_space.intersected(border_box_rect_in_root).is_empty();
+                auto margin_box_rect_in_root = floating_box->margin_box_rect_in_root_coordinate_space.translated(
+                    0, y_adjustment_from_pending_ancestor_top_margins(floating_box->box));
+                return !margin_box_rect_in_root.intersected(border_box_rect_in_root).is_empty();
             });
         }
         if (!must_clear_below_current_band)
@@ -627,10 +663,11 @@ void BlockFormattingContext::avoid_float_intrusions(Box const& box, AvailableSpa
         if (!next_band_start.has_value())
             break;
 
-        box_state.set_content_y(box_state.offset.y() + next_band_start.value() - border_box_y_in_root);
-
-        compute_width(box, available_space, containing_block_constraints);
+        content_y += next_band_start.value() - border_box_y_in_root;
+        auto content_position_in_root = containing_block_rect_in_root.location().translated(0, content_y);
+        compute_width(box, available_space, containing_block_constraints, content_position_in_root);
     }
+    return content_y;
 }
 
 void BlockFormattingContext::compute_width_for_floating_box(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
@@ -852,8 +889,6 @@ void BlockFormattingContext::resolve_used_height_if_treated_as_auto(Box const& b
 
 void BlockFormattingContext::layout_inline_children(BlockContainer const& block_container, LayoutInput const& layout_input, AvailableSpace const& available_space_for_children)
 {
-    // The layout input describes block_container itself; the inline formatting context gets
-    // the input for its children derived here.
     auto const& available_space = layout_input.available_space;
     VERIFY(block_container.children_are_inline());
 
@@ -969,7 +1004,7 @@ CSSPixels BlockFormattingContext::compute_auto_height_for_block_level_element(Bo
                 margin_bottom = 0;
             }
 
-            return max(CSSPixels(0), child_box_state.offset.y() + child_box_state.content_height() + child_box_state.border_box_bottom() + margin_bottom);
+            return max(CSSPixels(0), child_box_state.content_offset().y() + child_box_state.content_height() + child_box_state.border_box_bottom() + margin_bottom);
         }
 
         // If no in-flow children were found but there's a marker, use the marker's line-height.
@@ -1001,13 +1036,13 @@ void BlockFormattingContext::layout_interrupting_block_inside_inline_context(Box
 
 CSSPixels BlockFormattingContext::commit_pending_margin_before_inline_content()
 {
-    auto margin_collapses_with_block_container = m_margin_state.has_block_container_waiting_for_final_y_position();
+    auto has_open_top_margin_group = m_margin_state.has_open_top_margin_group();
     auto collapsed_margin = m_margin_state.current_collapsed_margin();
 
-    m_margin_state.update_block_waiting_for_final_y_position();
+    m_margin_state.update_open_top_margin_group();
     m_margin_state.reset();
 
-    return margin_collapses_with_block_container ? CSSPixels(0) : collapsed_margin;
+    return has_open_top_margin_group ? CSSPixels(0) : collapsed_margin;
 }
 
 void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContainer const& block_container, CSSPixels& bottom_of_lowest_margin_box, LayoutInput const& layout_input)
@@ -1016,24 +1051,12 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
     if (box.is_absolutely_positioned()) {
         if (m_layout_mode == LayoutMode::Normal) {
-            // Absolutely positioned boxes enter layout here, in the context that contains them.
-            // Two kinds of boxes already have used values: list item markers, whose used values
-            // were created together with the ListItemBox that places them, and the document
-            // element, which was created by the layout entry point (and can end up absolutely
-            // positioned, e.g. as a popover).
-            auto box_is_document_element = box.dom_node() && box.dom_node() == box.document().document_element();
-            // The percentage basis of an absolutely positioned box is the padding box of its
-            // absolute positioning containing block; layout_absolutely_positioned_element() pins
-            // it once that rectangle is known.
-            auto& box_state = is<ListItemMarkerBox>(box) || box_is_document_element
-                ? m_state.get_mutable(box)
-                : m_state.create(box, {}, {});
             // NB: An originally-inline absolutely positioned box never reaches this path; the tree
             //     builder keeps out-of-flow boxes in inline context, where static position markers
             //     pin them at their exact flow position.
             StaticPositionRect static_position;
             static_position.rect = { { 0, m_y_offset_of_current_block_container.value() }, { 0, 0 } };
-            box_state.set_static_position_rect(static_position);
+            register_contained_abspos_child(box, static_position);
         }
         return;
     }
@@ -1064,19 +1087,22 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
     resolve_vertical_box_model_metrics(box, block_container_state.content_width());
 
+    VERIFY(box.containing_block() == &block_container);
+    auto containing_block_position_in_root = layout_input.content_box_position_in_bfc_root.value();
+
     if (box.is_floating()) {
         auto const y = m_y_offset_of_current_block_container.value();
-        auto margin_top = !m_margin_state.has_block_container_waiting_for_final_y_position() ? m_margin_state.current_collapsed_margin() : 0;
+        auto margin_top = m_margin_state.has_open_top_margin_group() ? 0 : m_margin_state.current_collapsed_margin();
         layout_floating_box(box, block_container, layout_input, margin_top + y);
-        bottom_of_lowest_margin_box = max(bottom_of_lowest_margin_box, box_state.offset.y() + box_state.content_height() + box_state.margin_box_bottom());
+        bottom_of_lowest_margin_box = max(bottom_of_lowest_margin_box, m_floats.last()->bottom_margin_edge);
         return;
     }
 
     m_margin_state.add_margin(box_state.margin_top);
-    auto introduce_clearance = clear_floating_boxes(box, {});
+    auto introduce_clearance = clear_floating_boxes(box, {}, containing_block_position_in_root);
     if (introduce_clearance == DidIntroduceClearance::Yes)
         m_margin_state.reset();
-    m_margin_state.update_block_waiting_for_final_y_position();
+    m_margin_state.update_open_top_margin_group();
 
     auto const y = m_y_offset_of_current_block_container.value();
 
@@ -1098,17 +1124,66 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
     CSSPixels margin_top = m_margin_state.current_collapsed_margin();
 
-    if (m_margin_state.has_block_container_waiting_for_final_y_position()) {
+    if (m_margin_state.has_open_top_margin_group()) {
         // If first child margin top will collapse with margin-top of containing block then margin-top of child is 0
         margin_top = 0;
     }
 
-    place_block_level_element_in_normal_flow_vertically(box, y + margin_top);
+    auto box_opens_top_margin_group = !independent_formatting_context
+        && box_state.border_top == 0 && box_state.padding_top == 0
+        && !m_margin_state.has_open_top_margin_group();
 
-    compute_width(box, available_space, layout_input.containing_block_constraints);
-    avoid_float_intrusions(box, available_space, layout_input.containing_block_constraints);
+    auto const* fieldset_box = as_if<FieldSetBox>(block_container);
+    auto box_is_positioned_by_fieldset_layout = fieldset_box && fieldset_box->rendered_legend() == &box;
 
-    place_block_level_element_in_normal_flow_horizontally(box, available_space);
+    // Earlier sibling placement may have invalidated cached float bands.
+    rebuild_float_bands();
+
+    auto content_y = y + margin_top + box_state.border_box_top();
+
+    auto const containing_block_rect_in_root = CSSPixelRect { containing_block_position_in_root, block_container_state.content_size() };
+
+    auto const containing_block_rect_in_root_now = containing_block_rect_in_root.translated(0, y_adjustment_from_pending_ancestor_top_margins(box));
+    auto content_position_in_root_now = [&](CSSPixels content_y) {
+        return containing_block_rect_in_root_now.location().translated(0, content_y);
+    };
+
+    compute_width(box, available_space, layout_input.containing_block_constraints, content_position_in_root_now(content_y));
+    content_y = avoid_float_intrusions(box, available_space, layout_input.containing_block_constraints, content_y, containing_block_rect_in_root_now);
+
+    auto content_x = compute_normal_flow_x(box, available_space, content_position_in_root_now(content_y));
+
+    // FIXME: We currently so not support ListItemBox-es generated by pseudo-elements. We will need to, eventually.
+    auto const* list_item_box = as_if<ListItemBox>(box);
+    auto is_list_item_box_without_css_content = list_item_box != nullptr;
+    if (auto const* dom_node = as_if<DOM::Element>(box.dom_node()); list_item_box && dom_node) {
+        if (auto const computed_properties = dom_node->computed_properties(CSS::PseudoElement::Marker))
+            is_list_item_box_without_css_content = !computed_properties->property(CSS::PropertyID::Content).is_content();
+    }
+
+    if (is_list_item_box_without_css_content && list_item_box->marker()) {
+        ensure_sizes_correct_for_left_offset_calculation(*list_item_box);
+
+        auto const& marker = *list_item_box->marker();
+        if (marker.list_style_position() == CSS::ListStylePosition::Inside
+            && box.computed_values().direction() == CSS::Direction::Ltr) {
+            content_x += m_state.get(marker).content_width() + distance_between_marker_and_list_item(marker);
+        }
+    }
+
+    auto* table_formatting_context = independent_formatting_context && independent_formatting_context->type() == Type::Table
+        ? static_cast<TableFormattingContext*>(independent_formatting_context.ptr())
+        : nullptr;
+
+    Optional<CSSPixelPoint> pending_position;
+
+    if (box_is_positioned_by_fieldset_layout) {
+        m_pending_legend_flow_position = CSSPixelPoint { content_x, content_y };
+    } else if (table_formatting_context) {
+        table_formatting_context->set_pending_table_box_content_offset_in_wrapper({ content_x, content_y });
+    } else if (!box_opens_top_margin_group) {
+        pending_position = CSSPixelPoint { content_x, content_y };
+    }
 
     AvailableSpace available_space_for_height_resolution = available_space;
     auto is_table_box = box.display().is_table_row() || box.display().is_table_row_group() || box.display().is_table_header_group() || box.display().is_table_footer_group() || box.display().is_table_cell() || box.display().is_table_caption();
@@ -1126,30 +1201,16 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
         resolve_used_height_if_treated_as_auto(box, available_space_for_height_resolution, layout_input.containing_block_constraints);
     }
 
-    // This monster basically means: "a ListItemBox that does not have specified content in the ::marker pseudo-element".
-    // This happens for ::marker with content 'normal'.
-    // FIXME: We currently so not support ListItemBox-es generated by pseudo-elements. We will need to, eventually.
-    auto const* li_box = as_if<ListItemBox>(box);
-    auto is_list_item_box_without_css_content = li_box != nullptr;
-    if (auto const* dom_node = as_if<DOM::Element>(box.dom_node()); li_box && dom_node) {
-        if (auto const computed_properties = dom_node->computed_properties(CSS::PseudoElement::Marker))
-            is_list_item_box_without_css_content = !computed_properties->property(CSS::PropertyID::Content).is_content();
-    }
-
     // Before we insert the children of a list item we need to know the location of the marker.
     // If we do not do this then left-floating elements inside the list item will push the marker to the right,
     // in some cases even causing it to overlap with the non-floating content of the list.
     SpaceUsedByFloats inline_space_used_before_children_formatted;
-    if (is_list_item_box_without_css_content && li_box->marker()) {
-        // We need to ensure that our height and width are final before we calculate our left offset.
-        // Otherwise, the y at which we calculate the intrusion by floats might be incorrect.
-        ensure_sizes_correct_for_left_offset_calculation(*li_box);
+    if (is_list_item_box_without_css_content && list_item_box->marker()) {
+        auto const& list_item_state = m_state.get(*list_item_box);
+        auto const& marker_state = m_state.get(*list_item_box->marker());
 
-        auto const& list_item_state = m_state.get(*li_box);
-        auto const& marker_state = m_state.get(*li_box->marker());
-
-        auto offset_y = max(CSSPixels(0), (li_box->marker()->computed_values().line_height() - marker_state.content_height()) / 2);
-        inline_space_used_before_children_formatted = intrusion_by_floats_into_box(list_item_state, offset_y);
+        auto offset_y = max(CSSPixels(0), (list_item_box->marker()->computed_values().line_height() - marker_state.content_height()) / 2);
+        inline_space_used_before_children_formatted = intrusion_by_floats_into_rect({ content_position_in_root_now(content_y).translated(content_x, 0), list_item_state.content_size() }, offset_y, offset_y);
     }
 
     if (independent_formatting_context) {
@@ -1173,7 +1234,9 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
         make_button_content_box_definite(box, available_space, layout_input.containing_block_constraints, measured_content_height);
 
-        independent_formatting_context->run(layout_input.with_available_space(inner_available_space));
+        independent_formatting_context->run(layout_input.for_child_formatting_context(inner_available_space));
+        if (table_formatting_context)
+            pending_position = table_formatting_context->pending_table_box_content_offset_in_wrapper();
         if (is<TableWrapper>(block_container) && box.display().is_table_inside()) {
             box_state.margin_left = max(box_state.margin_left, 0);
             box_state.margin_right = max(box_state.margin_right, 0);
@@ -1183,27 +1246,32 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
     } else {
         // This box participates in the current block container's flow.
         auto space_available_for_children = box.is_anonymous() ? available_space : box_state.available_inner_space_or_constraints_from(available_space);
-        auto registered_block_container_y_position_update_callback = false;
         if (box_state.border_top > 0 || box_state.padding_top > 0) {
             // margin-top of block container can't collapse with its children if it has non-zero border or padding.
             m_margin_state.reset();
-        } else if (!m_margin_state.has_block_container_waiting_for_final_y_position()) {
-            // margin-top of block container can be updated during children layout hence its final y position is yet to be determined.
-            m_margin_state.register_block_container_y_position_update_callback([this, &box, y, introduce_clearance](CSSPixels margin_top) {
-                if (introduce_clearance == DidIntroduceClearance::No) {
-                    place_block_level_element_in_normal_flow_vertically(box, margin_top + y);
-                }
-            });
-            registered_block_container_y_position_update_callback = true;
+        } else if (box_opens_top_margin_group) {
+            m_margin_state.open_top_margin_group(box, introduce_clearance == DidIntroduceClearance::Yes);
         }
 
-        if (box.children_are_inline())
-            layout_inline_children(as<BlockContainer>(box), layout_input, space_available_for_children);
-        else
-            layout_block_level_children(as<BlockContainer>(box), layout_input, space_available_for_children);
+        auto inside_layout_input = layout_input.with_content_box_position_in_bfc_root(
+            containing_block_position_in_root.translated(content_x, content_y));
 
-        if (registered_block_container_y_position_update_callback) {
-            m_margin_state.unregister_block_container_y_position_update_callback();
+        if (box.children_are_inline())
+            layout_inline_children(as<BlockContainer>(box), inside_layout_input, space_available_for_children);
+        else
+            layout_block_level_children(as<BlockContainer>(box), inside_layout_input, space_available_for_children);
+
+        if (box_opens_top_margin_group) {
+            auto resolved_margin_top = m_margin_state.take_pending_top_margin();
+            auto final_content_y = introduce_clearance == DidIntroduceClearance::No
+                ? y + resolved_margin_top + box_state.border_box_top()
+                : content_y;
+            if (box_is_positioned_by_fieldset_layout) {
+                m_pending_legend_flow_position = CSSPixelPoint { content_x, final_content_y };
+            } else {
+                pending_position = CSSPixelPoint { content_x, final_content_y };
+            }
+            translate_floats_in_subtree(box, { 0, final_content_y - content_y });
         }
     }
 
@@ -1216,23 +1284,26 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
     // Now that our children are formatted we place the ListItemBox with the left space we remembered.
     if (is_list_item_box_without_css_content)
         // The marker pseudo-element will be created from a ListItemMarkerBox
-        layout_list_item_marker(*li_box, inline_space_used_before_children_formatted);
+        layout_list_item_marker(*list_item_box, inline_space_used_before_children_formatted);
     // Otherwise, it will be a dealt with as a generic pseudo-element with the content of the ::marker pseudo-element.
+
+    if (pending_position.has_value())
+        place_child(box, *pending_position);
 
     if (independent_formatting_context || !margins_collapse_through(box, m_state)) {
         if (!m_margin_state.box_last_in_flow_child_margin_bottom_collapsed()) {
             m_margin_state.reset();
         }
-        m_y_offset_of_current_block_container = box_state.offset.y() + box_state.content_height() + box_state.border_box_bottom();
+        m_y_offset_of_current_block_container = box_state.content_offset().y() + box_state.content_height() + box_state.border_box_bottom();
     }
     m_margin_state.set_box_last_in_flow_child_margin_bottom_collapsed(false);
 
     m_margin_state.add_margin(box_state.margin_bottom);
-    m_margin_state.update_block_waiting_for_final_y_position();
+    m_margin_state.update_open_top_margin_group();
 
     compute_inset(box, content_box_rect(block_container_state).size());
 
-    bottom_of_lowest_margin_box = max(bottom_of_lowest_margin_box, box_state.offset.y() + box_state.content_height() + box_state.margin_box_bottom());
+    bottom_of_lowest_margin_box = max(bottom_of_lowest_margin_box, box_state.content_offset().y() + box_state.content_height() + box_state.margin_box_bottom());
 
     if (independent_formatting_context)
         independent_formatting_context->parent_context_did_dimension_child_root_box();
@@ -1240,7 +1311,6 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
 void BlockFormattingContext::layout_block_level_children(BlockContainer const& block_container, LayoutInput const& layout_input, AvailableSpace const& available_space_for_children)
 {
-    // The layout input describes block_container itself; its children get the input derived here.
     VERIFY(!block_container.children_are_inline());
 
     auto const& available_space = available_space_for_children;
@@ -1249,7 +1319,7 @@ void BlockFormattingContext::layout_block_level_children(BlockContainer const& b
     // through to the table box unchanged.
     auto child_layout_input = [&]() -> LayoutInput {
         if (is<TableWrapper>(block_container))
-            return LayoutInput { available_space_for_children, layout_input.containing_block_constraints };
+            return LayoutInput { available_space_for_children, layout_input.containing_block_constraints, layout_input.content_box_position_in_bfc_root };
         else
             return layout_input_for_child_context(m_state.get(block_container), layout_input, available_space_for_children);
     }();
@@ -1265,7 +1335,7 @@ void BlockFormattingContext::layout_block_level_children(BlockContainer const& b
     if (m_layout_mode == LayoutMode::IntrinsicSizing) {
         auto& block_container_state = m_state.get_mutable(block_container);
         if (!block_container_state.has_definite_width()) {
-            auto width = greatest_child_width(block_container);
+            auto width = greatest_child_width_in_rect(block_container, { layout_input.content_box_position_in_bfc_root->translated(0, y_adjustment_from_pending_ancestor_top_margins(block_container)), block_container_state.content_size() });
             auto const& computed_values = block_container.computed_values();
             // NOTE: Min and max constraints are not applied to a box that is being sized as intrinsic because
             //       according to css-sizing-3 spec:
@@ -1295,7 +1365,6 @@ void BlockFormattingContext::layout_block_level_children(BlockContainer const& b
 // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
 void BlockFormattingContext::layout_fieldset_with_rendered_legend(FieldSetBox const& fieldset_box, LayoutInput const& layout_input)
 {
-    // The layout input describes the fieldset itself; its children get the input derived here.
     auto const& available_space = layout_input.available_space;
     auto child_layout_input = layout_input_for_child_context(m_state.get(fieldset_box), layout_input, available_space);
 
@@ -1361,7 +1430,11 @@ void BlockFormattingContext::layout_fieldset_with_rendered_legend(FieldSetBox co
     auto legend_border_box_centering_offset = (effective_border - legend_state.border_box_height()) / 2;
     auto fieldset_border_box_top_in_content = -(fieldset_state.border_top + fieldset_state.padding_top);
     auto legend_content_y = fieldset_border_box_top_in_content + legend_border_box_centering_offset + legend_state.border_box_top();
-    legend_state.set_content_y(legend_content_y);
+    if (auto legend_flow_position = m_pending_legend_flow_position; legend_flow_position.has_value()) {
+        m_pending_legend_flow_position = {};
+        place_child(*legend, { legend_flow_position->x(), legend_content_y });
+        translate_floats_in_subtree(*legend, { 0, legend_content_y - legend_flow_position->y() });
+    }
 
     compute_and_store_baselines(fieldset_state);
 }
@@ -1392,7 +1465,7 @@ void BlockFormattingContext::resolve_horizontal_box_model_metrics(Box const& box
     box_state.padding_right = computed_values.padding().right().to_px_or_zero(width_of_containing_block);
 }
 
-BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floating_boxes(Node const& child_box, Optional<InlineFormattingContext&> inline_formatting_context)
+BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floating_boxes(Node const& child_box, Optional<InlineFormattingContext&> inline_formatting_context, CSSPixelPoint containing_block_position_in_root)
 {
     auto const& computed_values = child_box.computed_values();
     auto result = DidIntroduceClearance::No;
@@ -1406,9 +1479,8 @@ BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floa
         //       This means that we have to first convert to a root-space Y coordinate before clearing,
         //       and then convert back to a local Y coordinate when assigning the cleared offset to
         //       the `child_box` layout state.
-        CSSPixels clearance_y_in_containing_block = clearance_y_in_root;
-        for (auto containing_block = child_box.containing_block(); containing_block && containing_block != &root(); containing_block = containing_block->containing_block())
-            clearance_y_in_containing_block -= m_state.get(*containing_block).offset.y();
+        CSSPixels clearance_y_in_containing_block = clearance_y_in_root
+            - containing_block_position_in_root.y() - y_adjustment_from_pending_ancestor_top_margins(child_box);
 
         if (inline_formatting_context.has_value()) {
             if (clearance_y_in_containing_block > inline_formatting_context->vertical_float_clearance()) {
@@ -1430,23 +1502,15 @@ BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floa
     return result;
 }
 
-void BlockFormattingContext::place_block_level_element_in_normal_flow_vertically(Box const& child_box, CSSPixels y)
+CSSPixels BlockFormattingContext::compute_normal_flow_x(Box const& child_box, AvailableSpace const& available_space, CSSPixelPoint content_position_in_root) const
 {
-    auto& box_state = m_state.get_mutable(child_box);
-    y += box_state.border_box_top();
-    box_state.set_content_y(y);
-    rebuild_float_bands();
-}
-
-void BlockFormattingContext::place_block_level_element_in_normal_flow_horizontally(Box const& child_box, AvailableSpace const& available_space)
-{
-    auto& box_state = m_state.get_mutable(child_box);
+    auto const& box_state = m_state.get(child_box);
 
     CSSPixels x = 0;
     CSSPixels available_width_within_containing_block = available_space.width.to_px_or_zero();
 
     if (box_should_avoid_floats_because_it_establishes_fc(child_box)) {
-        auto space_used_by_floats = intrusion_by_floats_into_box(box_state, 0);
+        auto space_used_by_floats = intrusion_by_floats_into_rect({ content_position_in_root, box_state.content_size() }, 0, 0);
         available_width_within_containing_block -= space_used_by_floats.left + space_used_by_floats.right;
 
         // Subtracting the left margin here because it is applied again when the margin box offset is added below.
@@ -1462,7 +1526,7 @@ void BlockFormattingContext::place_block_level_element_in_normal_flow_horizontal
         x += box_state.margin_box_left();
     }
 
-    box_state.set_content_x(x);
+    return x;
 }
 
 void BlockFormattingContext::layout_floating_box(Box const& box, BlockContainer const& block_container, LayoutInput const& layout_input, CSSPixels y, LineBuilder* line_builder)
@@ -1476,7 +1540,10 @@ void BlockFormattingContext::layout_floating_box(Box const& box, BlockContainer 
     auto const& block_container_state = m_state.get(block_container);
     resolve_vertical_box_model_metrics(box, block_container_state.content_width());
 
-    compute_width(box, available_space, layout_input.containing_block_constraints);
+    auto const containing_block_rect_in_root = CSSPixelRect { layout_input.content_box_position_in_bfc_root.value(), block_container_state.content_size() };
+    auto const containing_block_rect_in_root_now = containing_block_rect_in_root.translated(0, y_adjustment_from_pending_ancestor_top_margins(block_container));
+
+    compute_width(box, available_space, layout_input.containing_block_constraints, containing_block_rect_in_root_now.location());
 
     resolve_used_height_if_not_treated_as_auto(box, available_space, layout_input.containing_block_constraints);
 
@@ -1485,7 +1552,7 @@ void BlockFormattingContext::layout_floating_box(Box const& box, BlockContainer 
         resolve_used_height_if_treated_as_auto(box, available_space, layout_input.containing_block_constraints);
     }
 
-    auto independent_formatting_context = layout_inside(box, m_layout_mode, layout_input.with_available_space(box_state.available_inner_space_or_constraints_from(available_space)));
+    auto independent_formatting_context = layout_inside(box, m_layout_mode, layout_input.for_child_formatting_context(box_state.available_inner_space_or_constraints_from(available_space)));
     // A floating table wrapper shrink-to-fits from cached intrinsic sizes, which may not match
     // the width table layout just produced; the wrapper is exactly as wide as the table grid box.
     if (is<TableWrapper>(box) && independent_formatting_context)
@@ -1504,23 +1571,23 @@ void BlockFormattingContext::layout_floating_box(Box const& box, BlockContainer 
     if (!side.has_value())
         return;
 
-    auto const containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(block_container_state, root());
     auto margin_box_ceiling = line_builder ? line_builder->ceiling_for_float_to_be_inserted_here(box) : y;
     auto clearance = computed_values.clear();
     if (side.value() == FloatSide::Left && first_is_one_of(clearance, CSS::Clear::Left, CSS::Clear::Both, CSS::Clear::InlineStart))
-        margin_box_ceiling = max(margin_box_ceiling, m_lowest_left_margin_edge - containing_block_rect_in_root.y());
+        margin_box_ceiling = max(margin_box_ceiling, m_lowest_left_margin_edge - containing_block_rect_in_root_now.y());
     if (side.value() == FloatSide::Right && first_is_one_of(clearance, CSS::Clear::Right, CSS::Clear::Both, CSS::Clear::InlineEnd))
-        margin_box_ceiling = max(margin_box_ceiling, m_lowest_right_margin_edge - containing_block_rect_in_root.y());
+        margin_box_ceiling = max(margin_box_ceiling, m_lowest_right_margin_edge - containing_block_rect_in_root_now.y());
 
-    auto ceiling_in_root = containing_block_rect_in_root.y() + margin_box_ceiling;
+    auto ceiling_in_root = containing_block_rect_in_root_now.y() + margin_box_ceiling;
     if (!m_floats.is_empty())
-        ceiling_in_root = max(ceiling_in_root, m_floats.last()->margin_box_rect_in_root_coordinate_space.top());
+        ceiling_in_root = max(ceiling_in_root, m_floats.last()->margin_box_rect_in_root_coordinate_space.top() + y_adjustment_from_pending_ancestor_top_margins(m_floats.last()->box));
 
-    auto placement = place_float(side.value(), box_state, available_space, containing_block_rect_in_root, ceiling_in_root);
-    auto content_y = placement.block_start - containing_block_rect_in_root.y() + box_state.margin_box_top();
-    box_state.set_content_y(content_y);
+    auto placement = place_float(side.value(), box_state, available_space, containing_block_rect_in_root_now, ceiling_in_root);
+    auto content_y = placement.block_start - containing_block_rect_in_root_now.y() + box_state.margin_box_top();
 
-    auto margin_box_rect_in_root = margin_box_rect_in_ancestor_coordinate_space(box_state, root());
+    auto margin_box_rect_in_root = margin_box_rect(box_state)
+                                       .translated(0, content_y)
+                                       .translated(containing_block_rect_in_root.location());
     m_floats.append(adopt_own(*new FloatingBox {
         .box = box,
         .used_values = box_state,
@@ -1529,13 +1596,18 @@ void BlockFormattingContext::layout_floating_box(Box const& box, BlockContainer 
         .top_margin_edge = content_y - box_state.margin_box_top(),
         .bottom_margin_edge = content_y + box_state.content_height() + box_state.margin_box_bottom(),
         .margin_box_rect_in_root_coordinate_space = margin_box_rect_in_root,
+        .containing_block_rect_in_root_coordinate_space = containing_block_rect_in_root,
         .percentage_basis_width = layout_input.containing_block_constraints.percentage_basis_width,
     }));
     auto& floating_box = *m_floats.last();
     floating_box.margin_box_rect_in_root_coordinate_space.set_x(margin_box_left_of_float_in_root(floating_box, containing_block_rect_in_root));
     add_float_to_bands(floating_box, containing_block_rect_in_root);
 
-    m_state.get_mutable(root()).add_floating_descendant(box);
+    auto& root_state = m_state.get_mutable(root());
+    auto bottom_margin_edge = m_floats.last()->margin_box_rect_in_root_coordinate_space.bottom();
+    auto lowest = root_state.lowest_floating_descendant_bottom_margin_edge();
+    if (!lowest.has_value() || bottom_margin_edge > *lowest)
+        root_state.set_lowest_floating_descendant_bottom_margin_edge(bottom_margin_edge);
 
     if (line_builder)
         line_builder->recalculate_available_space();
@@ -1585,12 +1657,7 @@ void BlockFormattingContext::layout_list_item_marker(ListItemBox const& list_ite
     auto& marker_state = m_state.get_mutable(marker);
     auto& list_item_state = m_state.get_mutable(list_item_box);
 
-    auto marker_text = marker.text();
-
-    // Text markers fit snug against the list item; non-text position themselves at 50% of the font size.
-    CSSPixels marker_distance = 0;
-    if (!marker_text.has_value())
-        marker_distance = CSSPixels::nearest_value_for(.5f * marker.first_available_font().pixel_size());
+    auto marker_distance = distance_between_marker_and_list_item(marker);
 
     auto marker_height = marker_state.content_height();
     auto marker_width = marker_state.content_width();
@@ -1602,41 +1669,30 @@ void BlockFormattingContext::layout_list_item_marker(ListItemBox const& list_ite
     auto marker_offset_y = max(CSSPixels(0), (marker.computed_values().line_height() - marker_height) / 2);
 
     if (marker.list_style_position() == CSS::ListStylePosition::Inside) {
-        // FIXME: Just adjusting the content width and position for an inside marker is wrong, as it will still position
+        // FIXME: Just adjusting the content width for an inside marker is wrong, as it will still position
         //        the marker outside of the box, instead of treating it more like an inline child on the first line.
-        if (list_item_direction == CSS::Direction::Ltr) {
-            list_item_state.set_content_x(list_item_state.offset.x() + marker_width + marker_distance);
-        }
         list_item_state.set_content_width(list_item_state.content_width() - marker_width - marker_distance);
     }
 
-    marker_state.set_content_offset({ round(marker_offset_x), round(marker_offset_y) });
+    // Animations can make `float` or `position` apply to ::marker.
+    if (!marker.is_floating() && !marker.is_absolutely_positioned())
+        place_child(marker, { round(marker_offset_x), round(marker_offset_y) });
 
     if (marker.computed_values().line_height() > list_item_state.content_height())
         list_item_state.set_content_height(marker.computed_values().line_height());
 }
 
-FormattingContext::SpaceUsedByFloats BlockFormattingContext::intrusion_by_floats_into_box(Box const& box, CSSPixels y_in_box) const
-{
-    return intrusion_by_floats_into_box(m_state.get(box), y_in_box);
-}
-
-FormattingContext::SpaceUsedByFloats BlockFormattingContext::intrusion_by_floats_into_box(LayoutState::UsedValues const& box_used_values, CSSPixels y_in_box) const
-{
-    return intrusion_by_floats_into_box(box_used_values, y_in_box, y_in_box);
-}
-
-FormattingContext::SpaceUsedByFloats BlockFormattingContext::intrusion_by_floats_into_box(LayoutState::UsedValues const& box_used_values, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const
-{
-    return available_inline_space_in_box(box_used_values, block_start_in_box, block_end_in_box);
-}
-
 CSSPixels BlockFormattingContext::greatest_child_width(Box const& box) const
+{
+    auto box_in_root_rect = content_box_rect_in_ancestor_coordinate_space(m_state.get(box), root());
+    return greatest_child_width_in_rect(box, box_in_root_rect);
+}
+
+CSSPixels BlockFormattingContext::greatest_child_width_in_rect(Box const& box, CSSPixelRect const& box_in_root_rect) const
 {
     // Similar to FormattingContext::greatest_child_width()
     // but this one takes floats into account!
     CSSPixels max_width = 0;
-    auto box_in_root_rect = content_box_rect_in_ancestor_coordinate_space(m_state.get(box), root());
     for (auto const& band : m_bands) {
         auto intrusions = intrusions_for_band_into_rect(band, box_in_root_rect);
         max_width = max(max_width, intrusions.left + intrusions.right);

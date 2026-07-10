@@ -219,6 +219,10 @@ void StyleScope::invalidate_style_cache()
 {
     invalidate_counter_style_cache();
     m_style_cache = nullptr;
+    // The registered custom properties cache is built from the document's active stylesheets, so it only needs a
+    // rebuild when the document scope's rule set changes.
+    if (m_node->is_document())
+        document().set_needs_registered_properties_cache_update();
 }
 
 void StyleScope::invalidate_user_style_sheet()
@@ -1187,6 +1191,7 @@ static void merge_pending_has_invalidation_mutation_features(PendingHasInvalidat
     target.is_conservative |= source.is_conservative;
     target.may_affect_sibling_relationships |= source.may_affect_sibling_relationships;
     target.may_affect_pseudo_classes |= source.may_affect_pseudo_classes;
+    target.may_affect_interaction_pseudo_classes |= source.may_affect_interaction_pseudo_classes;
     for (auto const& tag_name : source.tag_names)
         target.tag_names.set(tag_name);
     for (auto const& id : source.ids)
@@ -1218,23 +1223,12 @@ static void collect_pending_has_invalidation_features_from_element(PendingHasInv
     });
 }
 
-void StyleScope::record_conservative_pending_has_invalidation(GC::Ref<DOM::Node> scheduled_node, bool may_affect_sibling_relationships)
-{
-    auto previous_size = m_pending_has_invalidations.size();
-    auto& mutation_features = m_pending_has_invalidations.ensure(scheduled_node);
-    mutation_features.is_conservative = true;
-    mutation_features.may_affect_sibling_relationships |= may_affect_sibling_relationships;
-    mutation_features.may_affect_pseudo_classes = true;
-
-    if (m_pending_has_invalidations.size() != previous_size)
-        document().set_needs_invalidation_of_elements_affected_by_has();
-}
-
-static PendingHasInvalidationMutationFeatures collect_pending_has_invalidation_mutation_features(DOM::Node& mutation_root, bool includes_descendants)
+static PendingHasInvalidationMutationFeatures collect_pending_has_invalidation_mutation_features(DOM::Node& mutation_root, bool includes_descendants, HasMutationKind kind)
 {
     PendingHasInvalidationMutationFeatures features;
     features.may_affect_sibling_relationships = includes_descendants;
     features.may_affect_pseudo_classes = true;
+    features.may_affect_interaction_pseudo_classes = kind != HasMutationKind::Insertion;
     auto collect_node = [&](DOM::Node& node) {
         if (node.is_character_data())
             return;
@@ -1283,9 +1277,9 @@ static PendingHasInvalidationMutationFeatures collect_pending_has_invalidation_m
     return features;
 }
 
-void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, GC::Ref<DOM::Node> mutation_root, bool includes_descendants)
+void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, GC::Ref<DOM::Node> mutation_root, bool includes_descendants, HasMutationKind kind)
 {
-    auto features = collect_pending_has_invalidation_mutation_features(*mutation_root, includes_descendants);
+    auto features = collect_pending_has_invalidation_mutation_features(*mutation_root, includes_descendants, kind);
     auto previous_size = m_pending_has_invalidations.size();
     auto& existing_features = m_pending_has_invalidations.ensure(scheduled_node);
     if (m_pending_has_invalidations.size() == previous_size) {

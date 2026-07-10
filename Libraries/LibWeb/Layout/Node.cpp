@@ -32,6 +32,7 @@
 #include <LibWeb/Dump.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
+#include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/FormattingContext.h>
@@ -1145,6 +1146,13 @@ void NodeWithStyle::propagate_style_to_anonymous_wrappers()
     // Propagate style to all anonymous children (except table wrappers!)
     for_each_child_of_type<NodeWithStyle>([&](NodeWithStyle& child) {
         if (child.is_anonymous() && !is<TableWrapper>(child)) {
+            // NB: The principal box of a pseudo-element (::before, ::after, ::marker, etc) is anonymous in the
+            //     sense that it has no DOM node, but it's not an anonymous wrapper: it has its own computed style,
+            //     which is applied to it separately. Don't clobber that style with inherited values from this node.
+            if (auto pseudo_element = child.generated_for_pseudo_element(); pseudo_element.has_value()
+                && child.pseudo_element_generator()->pseudo_element_unsafe_layout_node(*pseudo_element) == &child) {
+                return IterationDecision::Continue;
+            }
             auto& child_computed_values = static_cast<CSS::MutableComputedValues&>(static_cast<CSS::ComputedValues&>(const_cast<CSS::ImmutableComputedValues&>(child.computed_values())));
             child_computed_values.inherit_from(computed_values());
             propagate_non_inherit_values(child);
@@ -1216,9 +1224,24 @@ bool Node::is_inline_table() const
     return display.is_inline_outside() && display.is_table_inside();
 }
 
+bool Node::is_replaced_element() const
+{
+    // Some native controls use a generic box so they can host their internal shadow tree, but
+    // remain replaced elements for CSS box generation and inline layout.
+    return is_replaced_box() || is<HTML::HTMLInputElement>(dom_node());
+}
+
+bool Node::has_replaced_element_table_display_adjustment() const
+{
+    if (!is_replaced_element())
+        return false;
+    auto display = display_before_box_type_transformation();
+    return display.is_table_inside() || display.is_internal_table() || display.is_table_caption();
+}
+
 bool Node::is_atomic_inline() const
 {
-    if (is_replaced_box())
+    if (is_replaced_element())
         return true;
     auto display = this->display();
     return display.is_inline_outside() && !display.is_flow_inside();

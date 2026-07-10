@@ -32,9 +32,11 @@ public:
     virtual void run(LayoutInput const&) override;
     virtual CSSPixels automatic_content_width() const override;
     virtual CSSPixels automatic_content_height() const override;
-    StaticPositionRect calculate_static_position_rect(Box const&) const;
 
     Box const& table_box() const { return context_box(); }
+
+    void set_pending_table_box_content_offset_in_wrapper(CSSPixelPoint offset) { m_pending_table_box_content_offset_in_wrapper = offset; }
+    CSSPixelPoint pending_table_box_content_offset_in_wrapper() const { return m_pending_table_box_content_offset_in_wrapper; }
 
     static bool border_is_less_specific(CSS::BorderData const& a, CSS::BorderData const& b);
 
@@ -86,6 +88,7 @@ private:
 
     CSSPixels m_table_height { 0 };
     CSSPixels m_automatic_content_height { 0 };
+    CSSPixelPoint m_pending_table_box_content_offset_in_wrapper {};
 
     Optional<AvailableSpace> m_available_space;
     bool m_needs_fixed_mode_row_measurement { false };

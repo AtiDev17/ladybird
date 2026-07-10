@@ -7,7 +7,7 @@
 #pragma once
 
 #include <AK/BumpAllocator.h>
-#include <AK/HashTable.h>
+#include <AK/HashMap.h>
 #include <AK/OwnPtr.h>
 #include <AK/kmalloc.h>
 #include <LibGfx/Path.h>
@@ -184,12 +184,9 @@ struct LayoutState {
 
         void materialize_from_paintable(Painting::Paintable const&);
 
-        void set_content_offset(CSSPixelPoint new_offset) { offset = new_offset; }
-        void set_content_x(CSSPixels x) { offset.set_x(x); }
-        void set_content_y(CSSPixels y) { offset.set_y(y); }
+        CSSPixelPoint content_offset() const { return m_content_offset.value_or({}); }
 
-        // offset from top-left corner of content area of box's containing block to top-left corner of box's content area
-        CSSPixelPoint offset;
+        bool is_placed() const { return m_content_offset.has_value(); }
 
         SizeConstraint width_constraint { SizeConstraint::None };
         SizeConstraint height_constraint { SizeConstraint::None };
@@ -244,11 +241,12 @@ struct LayoutState {
 
         Optional<LineBoxFragmentCoordinate> containing_line_box_fragment;
 
-        void add_floating_descendant(Box const& box) { ensure_rare_data().floating_descendants.set(&box); }
-        HashTable<Box const*> const& floating_descendants() const
+        void set_lowest_floating_descendant_bottom_margin_edge(Optional<CSSPixels> bottom_margin_edge) { ensure_rare_data().lowest_floating_descendant_bottom_margin_edge = bottom_margin_edge; }
+        Optional<CSSPixels> lowest_floating_descendant_bottom_margin_edge() const
         {
-            static auto const& empty = *new HashTable<Box const*>;
-            return m_rare ? m_rare->floating_descendants : empty;
+            if (!m_rare)
+                return {};
+            return m_rare->lowest_floating_descendant_bottom_margin_edge;
         }
 
         void set_override_borders_data(Painting::Paintable::BordersDataWithElementKind const& override_borders_data) { ensure_rare_data().override_borders_data = override_borders_data; }
@@ -318,16 +316,15 @@ struct LayoutState {
             return move(m_rare->flex_layout_data);
         }
 
-        void set_static_position_rect(StaticPositionRect const& static_position_rect) { ensure_rare_data().static_position_rect = static_position_rect; }
-        CSSPixelPoint static_position() const
-        {
-            if (!m_rare || !m_rare->static_position_rect.has_value())
-                return {};
-            return m_rare->static_position_rect->aligned_position_for_box_with_size({ margin_box_width(), margin_box_height() });
-        }
-
     private:
         friend struct LayoutState;
+        friend class FormattingContext;
+
+        void place(CSSPixelPoint content_offset)
+        {
+            VERIFY(!m_content_offset.has_value());
+            m_content_offset = content_offset;
+        }
 
         AvailableSize available_width_inside() const;
         AvailableSize available_height_inside() const;
@@ -344,14 +341,13 @@ struct LayoutState {
 
             RareData() = default;
             RareData(RareData const& other)
-                : floating_descendants(other.floating_descendants)
+                : lowest_floating_descendant_bottom_margin_edge(other.lowest_floating_descendant_bottom_margin_edge)
                 , table_cell_coordinates(other.table_cell_coordinates)
                 , computed_svg_path(other.computed_svg_path)
                 , grid_template_columns(other.grid_template_columns)
                 , grid_template_rows(other.grid_template_rows)
                 , override_borders_data(other.override_borders_data)
                 , computed_svg_transforms(other.computed_svg_transforms)
-                , static_position_rect(other.static_position_rect)
             {
                 if (other.grid_layout_data)
                     grid_layout_data = make<GridLayoutData>(*other.grid_layout_data);
@@ -359,7 +355,7 @@ struct LayoutState {
                     flex_layout_data = make<FlexLayoutData>(*other.flex_layout_data);
             }
 
-            HashTable<Box const*> floating_descendants;
+            Optional<CSSPixels> lowest_floating_descendant_bottom_margin_edge;
             Optional<Painting::Paintable::TableCellCoordinates> table_cell_coordinates;
             Optional<Gfx::Path> computed_svg_path;
             OwnPtr<GridLayoutData> grid_layout_data;
@@ -368,7 +364,6 @@ struct LayoutState {
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_rows;
             Optional<Painting::Paintable::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
-            Optional<StaticPositionRect> static_position_rect;
         };
 
         RareData& ensure_rare_data()
@@ -386,6 +381,8 @@ struct LayoutState {
 
         bool m_has_definite_width { false };
         bool m_has_definite_height { false };
+
+        Optional<CSSPixelPoint> m_content_offset;
 
         OwnPtr<RareData> m_rare;
     };
@@ -424,12 +421,20 @@ struct LayoutState {
 
     bool has_subtree_root() const { return m_subtree_root != nullptr; }
 
+    struct ContainedAbsposChild {
+        Box const* box { nullptr };
+        StaticPositionRect static_position_rect;
+    };
+    void register_contained_abspos_child(Box const& target, Box const& child, StaticPositionRect const&);
+    [[nodiscard]] Optional<ContainedAbsposChild> take_next_contained_abspos_child(Box const& target);
+
 private:
     void resolve_relative_positions();
 
     PagedStore<UsedValues> m_used_values_store;
     Layout::NodeWithStyle const* m_subtree_root { nullptr };
     bool m_should_collect_devtools_layout_data { false };
+    HashMap<Box const*, Vector<ContainedAbsposChild>> m_contained_abspos_children;
 };
 
 inline CSSPixels clamp_to_max_dimension_value(CSSPixels value)

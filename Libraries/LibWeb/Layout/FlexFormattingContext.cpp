@@ -260,6 +260,13 @@ void FlexFormattingContext::run(LayoutInput const& layout_input)
 
         resolve_baseline_aligned_items();
 
+        for (auto& item : m_flex_items) {
+            if (main_axis_is_horizontal())
+                place_child(item.box, { item.main_offset, item.cross_offset });
+            else
+                place_child(item.box, { item.cross_offset, item.main_offset });
+        }
+
         compute_and_store_baselines(m_flex_container_state);
     }
 
@@ -273,9 +280,8 @@ void FlexFormattingContext::parent_context_did_dimension_child_root_box()
         return;
 
     flex_container().for_each_child_of_type<Box>([&](Layout::Box& box) {
-        if (box.is_absolutely_positioned()) {
-            m_state.create(box, {}, {}).set_static_position_rect(calculate_static_position_rect(box));
-        }
+        if (box.is_absolutely_positioned())
+            register_contained_abspos_child(box, calculate_static_position_rect(box));
         return IterationDecision::Continue;
     });
 
@@ -568,14 +574,6 @@ void FlexFormattingContext::set_cross_size(FlexItem& item, CSSPixels size)
         item.used_values.set_content_width(size);
     else
         item.used_values.set_content_height(size);
-}
-
-void FlexFormattingContext::set_offset(FlexItem& item, CSSPixels main_offset, CSSPixels cross_offset)
-{
-    if (main_axis_is_horizontal())
-        item.used_values.set_content_offset({ main_offset, cross_offset });
-    else
-        item.used_values.set_content_offset({ cross_offset, main_offset });
 }
 
 void FlexFormattingContext::set_main_axis_first_margin(FlexItem& item, CSSPixels margin)
@@ -1764,11 +1762,7 @@ void FlexFormattingContext::resolve_baseline_aligned_items()
             if (!participates_in_baseline_alignment(item))
                 continue;
 
-            auto adjustment = max_baseline - box_baseline(item.box, BaselineSet::First);
-            if (main_axis_is_horizontal())
-                item.used_values.set_content_y(item.used_values.offset.y() + adjustment);
-            else
-                item.used_values.set_content_x(item.used_values.offset.x() + adjustment);
+            item.cross_offset += max_baseline - box_baseline(item.box, BaselineSet::First);
         }
     }
 }
@@ -1944,7 +1938,6 @@ void FlexFormattingContext::copy_dimensions_from_flex_items_to_boxes()
 
         set_main_size(item, item.main_size.value());
         set_cross_size(item, item.cross_size.value());
-        set_offset(item, item.main_offset, item.cross_offset);
     }
 }
 

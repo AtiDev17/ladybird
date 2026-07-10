@@ -214,6 +214,11 @@ FormattingContext::FormattingContext(Type type, LayoutMode layout_mode, LayoutSt
 
 FormattingContext::~FormattingContext() = default;
 
+void FormattingContext::place_child(Box const& child, CSSPixelPoint content_offset)
+{
+    m_state.get_mutable(child).place(content_offset);
+}
+
 bool FormattingContext::computed_height_establishes_definite_containing_block_height(CSS::Size const& computed_height)
 {
     // A resolved used height is not always a definite containing block height.
@@ -347,6 +352,15 @@ Optional<FormattingContext::Type> FormattingContext::formatting_context_type_cre
 
     auto display = box.display();
 
+    // Native controls can use a generic box to host their shadow tree. When a table-specific
+    // display was adjusted to inline or block, keep that box atomic and give its contents an
+    // independent context without changing the formatting of ordinary controls.
+    if (box.has_replaced_element_table_display_adjustment()) {
+        if (is<BlockContainer>(box))
+            return Type::Block;
+        return Type::InternalReplaced;
+    }
+
     if (display.is_flex_inside())
         return Type::Flex;
 
@@ -377,6 +391,27 @@ Optional<FormattingContext::Type> FormattingContext::formatting_context_type_cre
         return Type::InternalDummy;
     }
     return {};
+}
+
+Box const& FormattingContext::box_establishing_containing_formatting_context(Box const& child)
+{
+    auto const* box = child.containing_block();
+    VERIFY(box);
+    while (box->containing_block() && !formatting_context_type_created_by_box(*box).has_value())
+        box = box->containing_block();
+    return *box;
+}
+
+void FormattingContext::register_contained_abspos_child(Box const& child, StaticPositionRect const& static_position_rect)
+{
+    if (!child.containing_block())
+        return;
+    m_state.register_contained_abspos_child(box_establishing_containing_formatting_context(child), child, static_position_rect);
+}
+
+CSSPixelPoint FormattingContext::aligned_static_position(StaticPositionRect const& static_position_rect, LayoutState::UsedValues const& box_state)
+{
+    return static_position_rect.aligned_position_for_box_with_size({ box_state.margin_box_width(), box_state.margin_box_height() });
 }
 
 // FIXME: This is a hack. Get rid of it.
@@ -626,8 +661,7 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
             if (child_box.is_absolutely_positioned())
                 return IterationDecision::Continue;
 
-            // FIXME: This doesn't look right.
-            if ((root.computed_values().overflow_y() == CSS::Overflow::Visible) && child_box.is_floating())
+            if (child_box.is_floating())
                 return IterationDecision::Continue;
 
             // Children that have not been laid out yet contribute nothing to the auto height.
@@ -635,7 +669,7 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
             if (!child_box_state)
                 return IterationDecision::Continue;
 
-            CSSPixels child_box_bottom = child_box_state->offset.y() + child_box_state->content_height() + child_box_state->margin_box_bottom();
+            CSSPixels child_box_bottom = child_box_state->content_offset().y() + child_box_state->content_height() + child_box_state->margin_box_bottom();
 
             if (!bottom.has_value() || child_box_bottom > bottom.value())
                 bottom = child_box_bottom;
@@ -647,13 +681,9 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
     // In addition, if the element has any floating descendants
     // whose bottom margin edge is below the element's bottom content edge,
     // then the height is increased to include those edges.
-    for (auto floating_box : m_state.get(root).floating_descendants()) {
-        // NOTE: Floating box coordinates are relative to their own containing block,
-        //       which may or may not be the BFC root.
-        auto margin_box = margin_box_rect_in_ancestor_coordinate_space(*floating_box, root);
-        CSSPixels floating_box_bottom_margin_edge = margin_box.bottom();
-        if (!bottom.has_value() || floating_box_bottom_margin_edge > bottom.value())
-            bottom = floating_box_bottom_margin_edge;
+    if (auto lowest_float_bottom_margin_edge = m_state.get(root).lowest_floating_descendant_bottom_margin_edge(); lowest_float_bottom_margin_edge.has_value()) {
+        if (!bottom.has_value() || *lowest_float_bottom_margin_edge > bottom.value())
+            bottom = lowest_float_bottom_margin_edge;
     }
 
     return max(CSSPixels(0.0f), bottom.value_or(0) - top.value_or(0));
@@ -887,6 +917,7 @@ LayoutInput FormattingContext::layout_input_for_child_context(
     return LayoutInput {
         available_space,
         constraints_for_child_context(containing_block_used_values, containing_block_layout_input.containing_block_constraints),
+        containing_block_layout_input.content_box_position_in_bfc_root,
     };
 }
 
@@ -954,20 +985,20 @@ CSSPixels FormattingContext::tentative_width_for_replaced_element(Box const& box
     return used_width;
 }
 
-void FormattingContext::compute_width_for_absolutely_positioned_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
+void FormattingContext::compute_width_for_absolutely_positioned_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect)
 {
     if (box_is_sized_as_replaced_element(box, available_space, containing_block_constraints))
-        compute_width_for_absolutely_positioned_replaced_element(box, available_space, containing_block_constraints);
+        compute_width_for_absolutely_positioned_replaced_element(box, available_space, containing_block_constraints, static_position_rect);
     else
-        compute_width_for_absolutely_positioned_non_replaced_element(box, available_space, containing_block_constraints);
+        compute_width_for_absolutely_positioned_non_replaced_element(box, available_space, containing_block_constraints, static_position_rect);
 }
 
-void FormattingContext::compute_height_for_absolutely_positioned_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, BeforeOrAfterInsideLayout before_or_after_inside_layout)
+void FormattingContext::compute_height_for_absolutely_positioned_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect, BeforeOrAfterInsideLayout before_or_after_inside_layout)
 {
     if (box_is_sized_as_replaced_element(box, available_space, containing_block_constraints))
-        compute_height_for_absolutely_positioned_replaced_element(box, available_space, containing_block_constraints, before_or_after_inside_layout);
+        compute_height_for_absolutely_positioned_replaced_element(box, available_space, containing_block_constraints, static_position_rect, before_or_after_inside_layout);
     else
-        compute_height_for_absolutely_positioned_non_replaced_element(box, available_space, containing_block_constraints, before_or_after_inside_layout);
+        compute_height_for_absolutely_positioned_non_replaced_element(box, available_space, containing_block_constraints, static_position_rect, before_or_after_inside_layout);
 }
 
 CSSPixels FormattingContext::compute_width_for_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints) const
@@ -1085,7 +1116,7 @@ CSSPixels FormattingContext::compute_height_for_replaced_element(Box const& box,
     return used_height;
 }
 
-void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
+void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect)
 {
     auto width_of_containing_block = available_space.width.to_px_or_zero();
     auto const& computed_values = box.computed_values();
@@ -1148,7 +1179,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
             width = CSS::Length::make_px(content_width);
             m_state.get_mutable(box).set_content_width(content_width);
 
-            auto static_position = m_state.get(box).static_position();
+            auto static_position = aligned_static_position(static_position_rect, box_state);
 
             left = static_position.x();
             right = solve_for_right();
@@ -1204,7 +1235,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
         //    Then solve for 'left' (if 'direction is 'rtl') or 'right' (if 'direction' is 'ltr').
         else if (computed_left.is_auto() && computed_right.is_auto() && !width.is_auto()) {
             // FIXME: Check direction
-            auto static_position = m_state.get(box).static_position();
+            auto static_position = aligned_static_position(static_position_rect, box_state);
             left = static_position.x();
             right = solve_for_right();
         }
@@ -1269,7 +1300,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_non_replaced_ele
 }
 
 // https://drafts.csswg.org/css2/#abs-replaced-width
-void FormattingContext::compute_width_for_absolutely_positioned_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
+void FormattingContext::compute_width_for_absolutely_positioned_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect)
 {
     // 10.3.8 Absolutely positioned, replaced elements
     // In this case, section 10.3.7 applies up through and including the constraint equation,
@@ -1290,7 +1321,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_replaced_element
     auto margin_left = computed_values.margin().left();
     auto right = computed_values.inset().right();
     auto margin_right = computed_values.margin().right();
-    auto static_position = m_state.get(box).static_position();
+    auto static_position = aligned_static_position(static_position_rect, box_state);
 
     auto to_px = [&](CSS::LengthPercentageOrAuto const& l) {
         return l.to_px_or_zero(width_of_containing_block);
@@ -1353,7 +1384,7 @@ void FormattingContext::compute_width_for_absolutely_positioned_replaced_element
 }
 
 // https://drafts.csswg.org/css-position-3/#abs-non-replaced-height
-void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, BeforeOrAfterInsideLayout before_or_after_inside_layout)
+void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect, BeforeOrAfterInsideLayout before_or_after_inside_layout)
 {
     // 5.3. The Height Of Absolutely Positioned, Non-Replaced Elements
 
@@ -1467,7 +1498,7 @@ void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_el
             auto constrained_height = apply_min_max_height_constraints(height);
             m_state.get_mutable(box).set_content_height(constrained_height.to_px_or_zero());
 
-            auto static_position = m_state.get(box).static_position();
+            auto static_position = aligned_static_position(static_position_rect, state);
             top = CSS::Length::make_px(static_position.y());
 
             solve_for_bottom();
@@ -1522,7 +1553,7 @@ void FormattingContext::compute_height_for_absolutely_positioned_non_replaced_el
             // 2. If top and bottom are auto and height is not auto,
             else if (top.is_auto() && bottom.is_auto() && !height.is_auto()) {
                 // then set top to the static position,
-                top = CSS::Length::make_px(m_state.get(box).static_position().y());
+                top = CSS::Length::make_px(aligned_static_position(static_position_rect, state).y());
 
                 // then solve for bottom.
                 solve_for_bottom();
@@ -1746,7 +1777,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
             if (child->is_absolutely_positioned() || child->is_floating())
                 continue;
             auto const* child_used_values = state.try_get(*child);
-            auto child_offset = child_used_values ? offset + child_used_values->offset : offset;
+            auto child_offset = child_used_values ? offset + child_used_values->content_offset() : offset;
             auto const* box_child = as_if<Box>(child.ptr());
             if (box_child && !box_child->is_anonymous()) {
                 auto const* dom = box_child->dom_node();
@@ -1774,7 +1805,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
     CSSPixelPoint outer_offset;
     for (Node const* ancestor = outer_block; ancestor && ancestor != &abspos_containing_block; ancestor = ancestor->parent()) {
         if (auto const* used_values = state.try_get(*ancestor))
-            outer_offset.translate_by(used_values->offset);
+            outer_offset.translate_by(used_values->content_offset());
     }
     walk(*outer_block, outer_offset);
 
@@ -2188,19 +2219,24 @@ void FormattingContext::layout_absolutely_positioned_children(Box const& box)
 {
     if (m_layout_mode != LayoutMode::Normal)
         return;
-    for (auto& child : box.contained_abspos_children()) {
-        if (!child)
-            continue;
-        layout_absolutely_positioned_element(as<Box>(*child));
+    // Laying out one child can register further children onto this box (a fixed position
+    // box inside an absolutely positioned one shares its viewport containing block), so
+    // take one at a time instead of iterating a snapshot.
+    while (true) {
+        auto child = m_state.take_next_contained_abspos_child(box);
+        if (!child.has_value())
+            break;
+        layout_absolutely_positioned_element(const_cast<Box&>(*child->box), child->static_position_rect);
     }
 }
 
-void FormattingContext::layout_absolutely_positioned_element(Box& box)
+void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPositionRect const& static_position_rect)
 {
     // SVG elements cannot be absolutely positioned.
     VERIFY(!box.is_svg_box());
 
-    auto& box_state = m_state.get_mutable(box);
+    auto* existing_box_state = m_state.try_get_mutable(box);
+    auto& box_state = existing_box_state ? *existing_box_state : m_state.create(box, {}, {});
 
     resolve_anchor_insets(box);
 
@@ -2236,12 +2272,12 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
     box_state.padding_top = computed_values.padding().top().to_px_or_zero(containing_block_width);
     box_state.padding_bottom = computed_values.padding().bottom().to_px_or_zero(containing_block_width);
 
-    compute_width_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints);
+    compute_width_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints, static_position_rect);
 
     // NOTE: We compute height before *and* after doing inside layout.
     //       This is done so that inside layout can resolve percentage heights.
     //       In some situations, e.g with non-auto top & bottom values, the height can be determined early.
-    compute_height_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints, BeforeOrAfterInsideLayout::Before);
+    compute_height_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints, static_position_rect, BeforeOrAfterInsideLayout::Before);
 
     // If the box width and/or height is fixed and/or or resolved from inset properties,
     // mark the size as being definite (since layout was not required to resolve it, per CSS-SIZING-3).
@@ -2274,7 +2310,7 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
     auto independent_formatting_context = layout_inside(box, LayoutMode::Normal, LayoutInput { box_state.available_inner_space_or_constraints_from(available_space), absolutely_positioned_constraints });
 
     if (computed_values.height().is_auto()) {
-        compute_height_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints, BeforeOrAfterInsideLayout::After);
+        compute_height_for_absolutely_positioned_element(box, available_space, absolutely_positioned_constraints, static_position_rect, BeforeOrAfterInsideLayout::After);
     }
 
     // Apply grid alignment for auto inset axes
@@ -2323,7 +2359,7 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
 
     CSSPixelPoint used_offset;
 
-    auto static_position = m_state.get(box).static_position();
+    auto static_position = aligned_static_position(static_position_rect, box_state);
     auto const* static_position_cb = box.static_position_containing_block();
     auto actual_containing_block = box.containing_block();
     if (static_position_cb && static_position_cb != actual_containing_block) {
@@ -2337,7 +2373,7 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
         auto offset_relative_to_merge_point = [&](Box const& descendant) {
             CSSPixelPoint offset;
             for (auto const* node = &descendant; node != merge_point; node = node->containing_block())
-                offset += m_state.get(*node).offset;
+                offset += m_state.get(*node).content_offset();
             return offset;
         };
         static_position += offset_relative_to_merge_point(*static_position_cb) - offset_relative_to_merge_point(*actual_containing_block);
@@ -2357,13 +2393,13 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box)
 
     used_offset.translate_by(box_state.margin_box_left(), box_state.margin_box_top());
 
-    box_state.set_content_offset(used_offset);
+    place_child(box, used_offset);
 
     if (independent_formatting_context)
         independent_formatting_context->parent_context_did_dimension_child_root_box();
 }
 
-void FormattingContext::compute_height_for_absolutely_positioned_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, BeforeOrAfterInsideLayout before_or_after_inside_layout)
+void FormattingContext::compute_height_for_absolutely_positioned_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints, StaticPositionRect const& static_position_rect, BeforeOrAfterInsideLayout before_or_after_inside_layout)
 {
     // 10.6.5 Absolutely positioned, replaced elements
     // This situation is similar to 10.6.4, except that the element has an intrinsic height.
@@ -2383,7 +2419,7 @@ void FormattingContext::compute_height_for_absolutely_positioned_replaced_elemen
     auto margin_top = computed_values.margin().top();
     auto bottom = computed_values.inset().bottom();
     auto margin_bottom = computed_values.margin().bottom();
-    auto static_position = m_state.get(box).static_position();
+    auto static_position = aligned_static_position(static_position_rect, box_state);
 
     auto to_px = [&](CSS::LengthPercentageOrAuto const& l) {
         return l.to_px_or_zero(height_of_containing_block);
@@ -3026,7 +3062,7 @@ void FormattingContext::compute_and_store_baselines(LayoutState::UsedValues& use
             VERIFY(line_box.fragments().size() == 1);
             auto const& block_child = as<Box>(line_box.fragments().first().layout_node());
             auto const& block_child_state = m_state.get(block_child);
-            auto child_offset_from_margin_edge = block_child_state.offset.y() - block_child_state.margin_box_top();
+            auto child_offset_from_margin_edge = block_child_state.content_offset().y() - block_child_state.margin_box_top();
             return child_offset_from_margin_edge + box_baseline(block_child, baseline_set);
         };
 
@@ -3064,7 +3100,7 @@ void FormattingContext::compute_and_store_baselines(LayoutState::UsedValues& use
             auto const& child_baseline = deriving_first_baseline ? child_state->first_baseline : child_state->last_baseline;
             if (!child_baseline.has_value())
                 continue;
-            auto child_offset_from_margin_edge = child_state->offset.y() - child_state->margin_box_top();
+            auto child_offset_from_margin_edge = child_state->content_offset().y() - child_state->margin_box_top();
             return child_offset_from_margin_edge + box_baseline(*child_box, baseline_set);
         }
         return {};
@@ -3140,7 +3176,7 @@ CSSPixels FormattingContext::box_baseline(Box const& box, BaselineSet baseline_s
     return box_state.margin_box_height();
 }
 
-[[nodiscard]] static CSSPixelRect margin_box_rect(LayoutState::UsedValues const& used_values)
+CSSPixelRect FormattingContext::margin_box_rect(LayoutState::UsedValues const& used_values)
 {
     return {
         {
@@ -3161,7 +3197,7 @@ CSSPixelRect FormattingContext::content_box_rect(Box const& box) const
 
 CSSPixelRect FormattingContext::content_box_rect(LayoutState::UsedValues const& used_values) const
 {
-    return CSSPixelRect { used_values.offset, used_values.content_size() };
+    return CSSPixelRect { used_values.content_offset(), used_values.content_size() };
 }
 
 CSSPixelRect FormattingContext::content_box_rect_in_ancestor_coordinate_space(LayoutState::UsedValues const& used_values, Box const& ancestor_box) const
@@ -3170,7 +3206,7 @@ CSSPixelRect FormattingContext::content_box_rect_in_ancestor_coordinate_space(La
     for (auto const* current = &used_values; current;) {
         if (&current->node() == &ancestor_box)
             return rect;
-        rect.translate_by(current->offset);
+        rect.translate_by(current->content_offset());
         auto const* containing_block = current->node().containing_block();
         if (!containing_block)
             break;
@@ -3186,7 +3222,7 @@ CSSPixelRect FormattingContext::margin_box_rect_in_ancestor_coordinate_space(Lay
     for (auto const* current = &used_values; current;) {
         if (&current->node() == &ancestor_box)
             return rect;
-        rect.translate_by(current->offset);
+        rect.translate_by(current->content_offset());
         auto const* containing_block = current->node().containing_block();
         if (!containing_block)
             break;
@@ -3203,6 +3239,9 @@ CSSPixelRect FormattingContext::margin_box_rect_in_ancestor_coordinate_space(Box
 
 bool FormattingContext::box_is_sized_as_replaced_element(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints) const
 {
+    if (box.has_replaced_element_table_display_adjustment())
+        return true;
+
     // When a box has a preferred aspect ratio, its automatic sizes are calculated the same as for a
     // replaced element with a natural aspect ratio and no natural size in that axis, see e.g. CSS2 §10
     // and CSS Flexible Box Model Level 1 §9.2.

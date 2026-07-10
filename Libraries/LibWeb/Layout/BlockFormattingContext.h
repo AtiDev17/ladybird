@@ -26,9 +26,9 @@ public:
     virtual CSSPixels automatic_content_width() const override;
     virtual CSSPixels automatic_content_height() const override;
 
-    bool box_should_avoid_floats_because_it_establishes_fc(Box const&);
-    void compute_width(Box const&, AvailableSpace const&, ContainingBlockConstraints const& containing_block_constraints);
-    void avoid_float_intrusions(Box const&, AvailableSpace const&, ContainingBlockConstraints const&);
+    bool box_should_avoid_floats_because_it_establishes_fc(Box const&) const;
+    void compute_width(Box const&, AvailableSpace const&, ContainingBlockConstraints const& containing_block_constraints, CSSPixelPoint content_position_in_root);
+    [[nodiscard]] CSSPixels avoid_float_intrusions(Box const&, AvailableSpace const&, ContainingBlockConstraints const&, CSSPixels content_y, CSSPixelRect const& containing_block_rect_in_root);
 
     // https://www.w3.org/TR/css-display/#block-formatting-context-root
     BlockContainer const& root() const { return static_cast<BlockContainer const&>(context_box()); }
@@ -48,12 +48,23 @@ public:
     }
 
     [[nodiscard]] SpaceUsedByFloats available_inline_space(CSSPixels block_start_in_root, CSSPixels block_end_in_root) const;
-    [[nodiscard]] SpaceUsedByFloats intrusion_by_floats_into_box(Box const&, CSSPixels y_in_box) const;
-    [[nodiscard]] SpaceUsedByFloats intrusion_by_floats_into_box(LayoutState::UsedValues const&, CSSPixels y_in_box) const;
-    [[nodiscard]] SpaceUsedByFloats intrusion_by_floats_into_box(LayoutState::UsedValues const&, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const;
+    [[nodiscard]] SpaceUsedByFloats intrusion_by_floats_into_rect(CSSPixelRect const& box_in_root_rect, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const;
     [[nodiscard]] Optional<CSSPixels> next_float_band_block_start_after(CSSPixels y_in_root) const;
 
+    [[nodiscard]] CSSPixels y_adjustment_from_pending_ancestor_top_margins(Node const& box) const
+    {
+        CSSPixels adjustment = 0;
+        for (auto const& group : m_margin_state.pending_top_margin_groups()) {
+            if (group.pinned_by_clearance)
+                continue;
+            if (group.box->is_inclusive_ancestor_of(box))
+                adjustment += group.collapsed_margin - group.collapsed_margin_at_open;
+        }
+        return adjustment;
+    }
+
     virtual CSSPixels greatest_child_width(Box const&) const override;
+    [[nodiscard]] CSSPixels greatest_child_width_in_rect(Box const&, CSSPixelRect const& box_in_root_rect) const;
 
     void layout_floating_box(Box const& child, BlockContainer const& containing_block, LayoutInput const&, CSSPixels y, LineBuilder* = nullptr);
 
@@ -70,7 +81,7 @@ public:
         No,
     };
 
-    [[nodiscard]] DidIntroduceClearance clear_floating_boxes(Node const& child_box, Optional<InlineFormattingContext&> inline_formatting_context);
+    [[nodiscard]] DidIntroduceClearance clear_floating_boxes(Node const& child_box, Optional<InlineFormattingContext&> inline_formatting_context, CSSPixelPoint containing_block_position_in_root);
 
     void reset_margin_state() { m_margin_state.reset(); }
 
@@ -96,6 +107,7 @@ public:
         CSSPixels bottom_margin_edge { 0 };
 
         CSSPixelRect margin_box_rect_in_root_coordinate_space;
+        CSSPixelRect containing_block_rect_in_root_coordinate_space;
         Optional<CSSPixels> percentage_basis_width;
     };
 
@@ -110,8 +122,9 @@ private:
     void layout_inline_children(BlockContainer const&, LayoutInput const&, AvailableSpace const& available_space_for_children);
     void layout_fieldset_with_rendered_legend(FieldSetBox const&, LayoutInput const&);
 
-    void place_block_level_element_in_normal_flow_horizontally(Box const& child_box, AvailableSpace const&);
-    void place_block_level_element_in_normal_flow_vertically(Box const&, CSSPixels y);
+    [[nodiscard]] CSSPixels compute_normal_flow_x(Box const& child_box, AvailableSpace const&, CSSPixelPoint content_position_in_root) const;
+    void translate_floats_in_subtree(Box const& ancestor, CSSPixelPoint delta);
+    void update_lowest_floating_descendant_bottom_margin_edge();
 
     [[nodiscard]] CSSPixels border_box_left_of_box_avoiding_floats(Box const&, LayoutState::UsedValues const&, SpaceUsedByFloats const&) const;
 
@@ -143,10 +156,9 @@ private:
     [[nodiscard]] size_t band_index_at(CSSPixels y) const;
     [[nodiscard]] FloatBand const& band_at(CSSPixels y) const;
     [[nodiscard]] SpaceUsedByFloats intrusions_for_band_into_rect(FloatBand const&, CSSPixelRect const& rect_in_root) const;
-    [[nodiscard]] SpaceUsedByFloats available_inline_space_in_box(LayoutState::UsedValues const&, CSSPixels block_start_in_box, CSSPixels block_end_in_box) const;
     [[nodiscard]] FloatPlacement place_float(FloatSide, LayoutState::UsedValues const&, AvailableSpace const&, CSSPixelRect const& containing_block_rect_in_root, CSSPixels ceiling_in_root) const;
     void ensure_band_boundary(CSSPixels);
-    void add_float_to_bands(FloatingBox const&, CSSPixelRect const& containing_block_rect_in_root);
+    void add_float_to_bands(FloatingBox const&, CSSPixelRect containing_block_rect_in_root);
     void rebuild_float_bands();
     [[nodiscard]] CSSPixels margin_box_left_of_float_in_root(FloatingBox const&, CSSPixelRect const& containing_block_rect_in_root) const;
 
@@ -161,37 +173,54 @@ private:
             }
         }
 
-        void register_block_container_y_position_update_callback(ESCAPING Function<void(CSSPixels)> callback)
-        {
-            m_block_container_y_position_update_callback = move(callback);
-        }
-
-        void unregister_block_container_y_position_update_callback()
-        {
-            m_block_container_y_position_update_callback = {};
-        }
-
         CSSPixels current_collapsed_margin() const
         {
             return m_current_positive_collapsible_margin + m_current_negative_collapsible_margin;
         }
 
-        bool has_block_container_waiting_for_final_y_position() const
+        // Several ancestor groups may await placement, but only the last can remain open
+        // and continue accumulating collapsed margins.
+        struct PendingTopMarginGroup {
+            Box const* box { nullptr };
+            CSSPixels collapsed_margin_at_open;
+            CSSPixels collapsed_margin;
+            bool open { false };
+            bool pinned_by_clearance { false };
+        };
+
+        void open_top_margin_group(Box const& box, bool pinned_by_clearance)
         {
-            return static_cast<bool>(m_block_container_y_position_update_callback);
+            m_pending_top_margin_groups.append({
+                .box = &box,
+                .collapsed_margin_at_open = current_collapsed_margin(),
+                .collapsed_margin = current_collapsed_margin(),
+                .open = true,
+                .pinned_by_clearance = pinned_by_clearance,
+            });
         }
 
-        void update_block_waiting_for_final_y_position() const
+        CSSPixels take_pending_top_margin()
         {
-            if (m_block_container_y_position_update_callback) {
-                CSSPixels collapsed_margin = current_collapsed_margin();
-                m_block_container_y_position_update_callback(collapsed_margin);
-            }
+            return m_pending_top_margin_groups.take_last().collapsed_margin;
         }
+
+        bool has_open_top_margin_group() const
+        {
+            return !m_pending_top_margin_groups.is_empty() && m_pending_top_margin_groups.last().open;
+        }
+
+        void update_open_top_margin_group()
+        {
+            if (has_open_top_margin_group())
+                m_pending_top_margin_groups.last().collapsed_margin = current_collapsed_margin();
+        }
+
+        Vector<PendingTopMarginGroup, 4> const& pending_top_margin_groups() const { return m_pending_top_margin_groups; }
 
         void reset()
         {
-            m_block_container_y_position_update_callback = {};
+            if (has_open_top_margin_group())
+                m_pending_top_margin_groups.last().open = false;
             m_current_negative_collapsible_margin = 0;
             m_current_positive_collapsible_margin = 0;
         }
@@ -202,11 +231,13 @@ private:
     private:
         CSSPixels m_current_positive_collapsible_margin;
         CSSPixels m_current_negative_collapsible_margin;
-        Function<void(CSSPixels)> m_block_container_y_position_update_callback;
+        Vector<PendingTopMarginGroup, 4> m_pending_top_margin_groups;
         bool m_box_last_in_flow_child_margin_bottom_collapsed { false };
     };
 
     Optional<CSSPixels> m_y_offset_of_current_block_container;
+
+    Optional<CSSPixelPoint> m_pending_legend_flow_position;
 
     BlockMarginState m_margin_state;
 

@@ -1,0 +1,1 @@
+PASS: ::after width is unchanged by the transition

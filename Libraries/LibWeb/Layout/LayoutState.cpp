@@ -168,8 +168,8 @@ CSSPixelPoint LayoutState::cumulative_offset(UsedValues const& used_values) cons
     if (used_values.m_cumulative_offset.has_value())
         return *used_values.m_cumulative_offset;
     if (auto const* containing_block = used_values.node().containing_block())
-        return cumulative_offset(get(*containing_block)) + used_values.offset;
-    return used_values.offset;
+        return cumulative_offset(get(*containing_block)) + used_values.content_offset();
+    return used_values.content_offset();
 }
 
 // https://drafts.csswg.org/css-overflow-3/#scrollable-overflow-region
@@ -649,7 +649,7 @@ void LayoutState::commit(Box& root)
         if (auto* paintable_box = paintable.ptr()) {
             transfer_box_model_metrics(paintable_box->box_model(), used_values);
 
-            paintable_box->set_offset(used_values.offset);
+            paintable_box->set_offset(used_values.content_offset());
             paintable_box->set_content_size(used_values.content_width(), used_values.content_height());
             if (used_values.override_borders_data().has_value())
                 paintable_box->set_override_borders_data(used_values.override_borders_data().value());
@@ -779,13 +779,13 @@ void LayoutState::commit(Box& root)
                 if (containing_line_box_fragment.fragment_index < line_box.fragments().size())
                     offset = line_box.fragments()[containing_line_box_fragment.fragment_index].offset();
                 else
-                    offset = used_values.offset;
+                    offset = used_values.content_offset();
             } else {
-                offset = used_values.offset;
+                offset = used_values.content_offset();
             }
         } else {
             // Not an atomic inline, much simpler case.
-            offset = used_values.offset;
+            offset = used_values.content_offset();
         }
 
         // Apply relative position inset if appropriate.
@@ -925,7 +925,7 @@ LayoutState::UsedValues& LayoutState::UsedValues::operator=(UsedValues const& ot
     if (this == &other)
         return *this;
 
-    offset = other.offset;
+    m_content_offset = other.m_content_offset;
     width_constraint = other.width_constraint;
     height_constraint = other.height_constraint;
     margin_left = other.margin_left;
@@ -955,7 +955,6 @@ LayoutState::UsedValues& LayoutState::UsedValues::operator=(UsedValues const& ot
     m_content_height = other.m_content_height;
     m_has_definite_width = other.m_has_definite_width;
     m_has_definite_height = other.m_has_definite_height;
-
     if (other.m_rare)
         m_rare = make<RareData>(*other.m_rare);
     else
@@ -1095,7 +1094,7 @@ void LayoutState::UsedValues::materialize_from_paintable(Painting::Paintable con
     m_has_definite_width = true;
     m_has_definite_height = true;
 
-    set_content_offset(paintable.offset());
+    m_content_offset = paintable.offset();
     m_cumulative_offset = paintable.absolute_rect().location();
 
     margin_left = box_model.margin.left;
@@ -1128,6 +1127,7 @@ void LayoutState::UsedValues::materialize_from_paintable(Painting::Paintable con
 
 void LayoutState::UsedValues::set_content_width(CSSPixels width)
 {
+    VERIFY(!is_placed());
     if (width < 0) {
         // Negative widths are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
         dbgln_if(LIBWEB_CSS_DEBUG, "FIXME: Layout calculated a negative width for {}: {}", m_node->debug_description(), width);
@@ -1141,6 +1141,7 @@ void LayoutState::UsedValues::set_content_width(CSSPixels width)
 
 void LayoutState::UsedValues::set_content_height(CSSPixels height)
 {
+    VERIFY(!is_placed());
     if (height < 0) {
         // Negative heights are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
         dbgln_if(LIBWEB_CSS_DEBUG, "FIXME: Layout calculated a negative height for {}: {}", m_node->debug_description(), height);
@@ -1191,6 +1192,36 @@ void LayoutState::UsedValues::set_indefinite_content_width()
 void LayoutState::UsedValues::set_indefinite_content_height()
 {
     m_has_definite_height = false;
+}
+
+void LayoutState::register_contained_abspos_child(Box const& target, Box const& child, StaticPositionRect const& static_position_rect)
+{
+    auto& children = m_contained_abspos_children.ensure(&target);
+    // The same box can be encountered again when a subtree is intentionally laid out
+    // twice (percentage-height table cells); the fresh static position replaces the
+    // stale one instead of duplicating the entry. New entries are inserted in layout
+    // index order so consumption follows document order.
+    size_t insertion_index = children.size();
+    for (size_t i = 0; i < children.size(); ++i) {
+        if (children[i].box == &child) {
+            children[i].static_position_rect = static_position_rect;
+            return;
+        }
+        if (insertion_index == children.size() && child.layout_index() < children[i].box->layout_index())
+            insertion_index = i;
+    }
+    children.insert(insertion_index, { &child, static_position_rect });
+}
+
+Optional<LayoutState::ContainedAbsposChild> LayoutState::take_next_contained_abspos_child(Box const& target)
+{
+    auto it = m_contained_abspos_children.find(&target);
+    if (it == m_contained_abspos_children.end())
+        return {};
+    auto child = it->value.take_first();
+    if (it->value.is_empty())
+        m_contained_abspos_children.remove(it);
+    return child;
 }
 
 }
