@@ -28,7 +28,7 @@ public:
 
     bool box_should_avoid_floats_because_it_establishes_fc(Box const&);
     void compute_width(Box const&, AvailableSpace const&, ContainingBlockConstraints const& containing_block_constraints);
-    void avoid_float_intrusions(Box const&, AvailableSpace const&);
+    void avoid_float_intrusions(Box const&, AvailableSpace const&, ContainingBlockConstraints const&);
 
     // https://www.w3.org/TR/css-display/#block-formatting-context-root
     BlockContainer const& root() const { return static_cast<BlockContainer const&>(context_box()); }
@@ -113,6 +113,8 @@ private:
     void place_block_level_element_in_normal_flow_horizontally(Box const& child_box, AvailableSpace const&);
     void place_block_level_element_in_normal_flow_vertically(Box const&, CSSPixels y);
 
+    [[nodiscard]] CSSPixels border_box_left_of_box_avoiding_floats(Box const&, LayoutState::UsedValues const&, SpaceUsedByFloats const&) const;
+
     void ensure_sizes_correct_for_left_offset_calculation(ListItemBox const&);
     void layout_list_item_marker(ListItemBox const&, SpaceUsedByFloats const& inline_space_used_before_list_item_elements_formatted);
 
@@ -146,6 +148,7 @@ private:
     void ensure_band_boundary(CSSPixels);
     void add_float_to_bands(FloatingBox const&, CSSPixelRect const& containing_block_rect_in_root);
     void rebuild_float_bands();
+    [[nodiscard]] CSSPixels margin_box_left_of_float_in_root(FloatingBox const&, CSSPixelRect const& containing_block_rect_in_root) const;
 
     class BlockMarginState {
     public:
