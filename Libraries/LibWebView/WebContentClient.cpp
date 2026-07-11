@@ -597,13 +597,15 @@ void WebContentClient::did_start_loading(u64 page_id, URL::URL url, Variant<Empt
         view->did_start_navigation(url, move(document_resource), is_redirect, history_handling);
 
         view->set_url({}, url);
+        view->set_title({}, Utf16String::from_utf8(url.serialize()));
+        view->set_favicon({}, {});
 
         if (view->on_load_start)
-            view->on_load_start(url, is_redirect);
+            view->on_load_start();
 
         for (auto const& [id, listener] : view->m_navigation_listeners) {
             if (listener.on_load_start)
-                listener.on_load_start(url, is_redirect);
+                listener.on_load_start(url);
         }
     }
 }
@@ -811,28 +813,15 @@ void WebContentClient::did_change_title(u64 page_id, Utf16String title)
             title = Utf16String::from_utf8(view->url().serialize());
 
         view->set_title({}, title);
-
-        if (view->on_title_change)
-            view->on_title_change(title);
     }
 }
 
 void WebContentClient::did_change_url(u64 page_id, URL::URL url)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        // Some navigations report the same URL more than once. Keep those
-        // duplicate updates inside LibWebView so frontends do not reset
-        // location bar state or steal focus for a no-op change.
-        if (view->url() == url)
-            return;
-
+    if (auto view = view_for_page_id(page_id); view.has_value())
         view->set_url({}, url);
-
-        if (view->on_url_change)
-            view->on_url_change(url);
-    } else if (auto* child_frame = embedded_page_host(page_id)) {
+    else if (auto* child_frame = embedded_page_host(page_id))
         child_frame->reporting_client().async_run_iframe_load_event_steps(child_frame->reporting_page_id(), child_frame->id());
-    }
 }
 
 void WebContentClient::did_request_tooltip_override(u64 page_id, Gfx::IntPoint position, ByteString title)

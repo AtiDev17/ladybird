@@ -725,16 +725,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         m_hover_label->hide();
     };
 
-    view().on_load_start = [this](URL::URL const& url, bool) {
-        auto url_serialized = qstring_from_ak_string(url.serialize());
-
-        m_title = url_serialized;
-        update_tab_title();
-
-        m_favicon = {};
+    view().on_load_start = [this]() {
         set_loading(true);
-
-        m_location_edit->set_url(url);
     };
 
     view().on_load_finish = [this](auto const&) {
@@ -760,7 +752,13 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     };
 
     view().on_favicon_change = [this](auto const& bitmap) {
-        auto qimage = QImage(bitmap.scanline_u8(0), bitmap.width(), bitmap.height(), QImage::Format_ARGB32);
+        if (!bitmap.has_value()) {
+            m_favicon = {};
+            update_tab_icon();
+            return;
+        }
+
+        auto qimage = QImage(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), QImage::Format_ARGB32);
         if (qimage.isNull())
             return;
         auto qpixmap = QPixmap::fromImage(qimage);

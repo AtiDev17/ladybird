@@ -1933,7 +1933,7 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
     //     axis.
     //   - There is a target anchor element for the box it's used on, and the <anchor-name> value specified in the
     //     function.
-    // NB: The first two conditions are guaranteed: this function is called from layout_absolutely_positioned_element(),
+    // NB: The first two conditions are guaranteed: this function is only called for absolutely positioned boxes,
     //     and we only resolve anchor() values in inset properties.
     // FIXME: Support anchor-scope, position-try-fallbacks, anchor-size(), and other anchor positioning features.
 
@@ -2226,21 +2226,45 @@ void FormattingContext::layout_absolutely_positioned_children(Box const& box)
         auto child = m_state.take_next_contained_abspos_child(box);
         if (!child.has_value())
             break;
-        layout_absolutely_positioned_element(const_cast<Box&>(*child->box), child->static_position_rect);
+        auto& child_box = const_cast<Box&>(*child->box);
+        if (!m_state.try_get(child_box))
+            m_state.create(child_box, {}, {});
+        resolve_anchor_insets(child_box);
+        auto static_position_rect = resolve_static_position_relative_to_containing_block(child_box, child->static_position_rect);
+        layout_absolutely_positioned_element(child_box, static_position_rect, resolve_abspos_containing_block_info(child_box));
     }
 }
 
-void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPositionRect const& static_position_rect)
+StaticPositionRect FormattingContext::resolve_static_position_relative_to_containing_block(Box const& box, StaticPositionRect static_position_rect) const
+{
+    auto const* static_position_cb = box.static_position_containing_block();
+    auto const* actual_containing_block = box.containing_block();
+    if (!static_position_cb || static_position_cb == actual_containing_block)
+        return static_position_rect;
+
+    // The offset between the static position containing block and the actual containing block only depends on
+    // boxes at or below the point where their containing block chains merge. Accumulate offsets up to that
+    // point instead of comparing ICB-relative offsets: containing blocks above the merge point may be outside
+    // the scope of the current layout (e.g. during intrinsic sizing) and have no used values at all.
+    auto const* merge_point = static_position_cb;
+    while (merge_point != actual_containing_block && !merge_point->is_ancestor_of(*actual_containing_block))
+        merge_point = merge_point->containing_block();
+    auto offset_relative_to_merge_point = [&](Box const& descendant) {
+        CSSPixelPoint offset;
+        for (auto const* node = &descendant; node != merge_point; node = node->containing_block())
+            offset += m_state.get(*node).content_offset();
+        return offset;
+    };
+    static_position_rect.rect.translate_by(offset_relative_to_merge_point(*static_position_cb) - offset_relative_to_merge_point(*actual_containing_block));
+    return static_position_rect;
+}
+
+void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPositionRect const& static_position_rect, AbsposContainingBlockInfo const& containing_block_info)
 {
     // SVG elements cannot be absolutely positioned.
     VERIFY(!box.is_svg_box());
 
-    auto* existing_box_state = m_state.try_get_mutable(box);
-    auto& box_state = existing_box_state ? *existing_box_state : m_state.create(box, {}, {});
-
-    resolve_anchor_insets(box);
-
-    auto containing_block_info = resolve_abspos_containing_block_info(box);
+    auto& box_state = m_state.get_mutable(box);
 
     auto const available_space = AvailableSpace(AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.width())), AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.height())));
 
@@ -2360,24 +2384,6 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPos
     CSSPixelPoint used_offset;
 
     auto static_position = aligned_static_position(static_position_rect, box_state);
-    auto const* static_position_cb = box.static_position_containing_block();
-    auto actual_containing_block = box.containing_block();
-    if (static_position_cb && static_position_cb != actual_containing_block) {
-        // The offset between the static position containing block and the actual containing block only depends on
-        // boxes at or below the point where their containing block chains merge. Accumulate offsets up to that
-        // point instead of comparing ICB-relative offsets: containing blocks above the merge point may be outside
-        // the scope of the current layout (e.g. during intrinsic sizing) and have no used values at all.
-        auto const* merge_point = static_position_cb;
-        while (merge_point != actual_containing_block && !merge_point->is_ancestor_of(*actual_containing_block))
-            merge_point = merge_point->containing_block();
-        auto offset_relative_to_merge_point = [&](Box const& descendant) {
-            CSSPixelPoint offset;
-            for (auto const* node = &descendant; node != merge_point; node = node->containing_block())
-                offset += m_state.get(*node).content_offset();
-            return offset;
-        };
-        static_position += offset_relative_to_merge_point(*static_position_cb) - offset_relative_to_merge_point(*actual_containing_block);
-    }
 
     // Horizontal axis
     if (containing_block_info.horizontal_axis_mode == AbsposAxisMode::StaticPosition)

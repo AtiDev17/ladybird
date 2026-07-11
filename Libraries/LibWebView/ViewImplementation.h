@@ -79,10 +79,10 @@ public:
     void set_url(Badge<WebContentClient>, URL::URL url) { set_url(move(url)); }
     URL::URL const& url() const { return m_url; }
 
-    void set_title(Badge<WebContentClient>, Utf16String title) { m_title = move(title); }
+    void set_title(Badge<WebContentClient>, Utf16String title);
     Utf16String const& title() const { return m_title; }
 
-    void set_favicon(Badge<WebContentClient>, Gfx::Bitmap const&);
+    void set_favicon(Badge<WebContentClient>, Optional<Gfx::Bitmap const&>);
     Optional<String> const& favicon_base64_png() const { return m_favicon_base64_png; }
 
     String const& handle() const { return m_client_state.client_handle; }
@@ -295,6 +295,13 @@ public:
     Function<void()> prepare_for_immediate_close();
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
 
+    struct NavigationListener {
+        Function<void(URL::URL const&)> on_load_start;
+        Function<void(URL::URL const&)> on_load_finish;
+    };
+    u64 add_navigation_listener(NavigationListener);
+    void remove_navigation_listener(u64 listener_id);
+
     Function<void()> on_ready_to_paint;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<u64>)> on_new_web_view;
     Function<void()> on_activate_tab;
@@ -303,19 +310,11 @@ public:
     Function<void()> on_link_unhover;
     Function<void(Utf16String const&)> on_title_change;
     Function<void(URL::URL const&)> on_url_change;
-    Function<void(URL::URL const&, bool)> on_load_start;
+    Function<void()> on_load_start;
     Function<void(URL::URL const&)> on_load_finish;
-
-    struct NavigationListener {
-        Function<void(URL::URL const&, bool)> on_load_start;
-        Function<void(URL::URL const&)> on_load_finish;
-    };
-    u64 add_navigation_listener(NavigationListener);
-    void remove_navigation_listener(u64 listener_id);
-
     Function<void(ByteString const& path, i32)> on_request_file;
     Function<void(DictionaryLookup const&, Gfx::IntPoint)> on_request_dictionary_lookup;
-    Function<void(Gfx::Bitmap const&)> on_favicon_change;
+    Function<void(Optional<Gfx::Bitmap const&>)> on_favicon_change;
     Function<void(Gfx::Cursor const&)> on_cursor_change;
     Function<void(Gfx::IntPoint, ByteString const&)> on_request_tooltip_override;
     Function<void()> on_stop_tooltip_override;

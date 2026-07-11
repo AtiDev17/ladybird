@@ -123,22 +123,38 @@ void ViewImplementation::set_url(URL::URL url)
 
     if (current_host() != previous_host)
         apply_zoom_for_current_host();
+
+    if (on_url_change)
+        on_url_change(m_url);
 }
 
-void ViewImplementation::set_favicon(Badge<WebContentClient>, Gfx::Bitmap const& favicon)
+void ViewImplementation::set_title(Badge<WebContentClient>, Utf16String title)
+{
+    if (m_title == title)
+        return;
+
+    m_title = move(title);
+
+    if (on_title_change)
+        on_title_change(m_title);
+}
+
+void ViewImplementation::set_favicon(Badge<WebContentClient>, Optional<Gfx::Bitmap const&> favicon)
 {
     m_favicon_base64_png.clear();
 
-    if (auto favicon_png = Gfx::PNGWriter::encode(favicon); !favicon_png.is_error()) {
-        if (auto favicon_base64_png = encode_base64(favicon_png.value().bytes()); !favicon_base64_png.is_error())
-            m_favicon_base64_png = favicon_base64_png.release_value();
-    }
+    if (favicon.has_value()) {
+        if (auto favicon_png = Gfx::PNGWriter::encode(*favicon); !favicon_png.is_error()) {
+            if (auto favicon_base64_png = encode_base64(favicon_png.value().bytes()); !favicon_base64_png.is_error())
+                m_favicon_base64_png = favicon_base64_png.release_value();
+        }
 
-    if (m_favicon_base64_png.has_value()) {
-        if (m_is_private == IsPrivate::No)
-            Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
-        if (!m_should_suppress_history_for_current_load)
-            Application::history_store(m_is_private).update_favicon(m_url, *m_favicon_base64_png);
+        if (m_favicon_base64_png.has_value()) {
+            if (m_is_private == IsPrivate::No)
+                Application::bookmark_store().update_favicon(m_url, *m_favicon_base64_png);
+            if (!m_should_suppress_history_for_current_load)
+                Application::history_store(m_is_private).update_favicon(m_url, *m_favicon_base64_png);
+        }
     }
 
     if (on_favicon_change)
@@ -1216,10 +1232,8 @@ void ViewImplementation::apply_web_content_session_history_update(WebContentSess
 {
     if (update.current_url.has_value()) {
         auto current_url = *update.current_url;
-        auto const url_changed = m_url != current_url;
         set_url(current_url);
-        if (url_changed && on_url_change)
-            on_url_change(m_url);
+
         if (m_webdriver_pending_navigation_url.has_value() && *m_webdriver_pending_navigation_url != current_url)
             m_webdriver_pending_navigation_url = current_url;
         if (m_webdriver_pending_navigation_completes_with_session_history_update)
@@ -1450,10 +1464,7 @@ bool ViewImplementation::restore_pending_session_history_navigation(StringView r
 
     if (result.current_url.has_value()) {
         auto current_url = *result.current_url;
-        auto const url_changed = m_url != current_url;
         set_url(current_url);
-        if (url_changed && on_url_change)
-            on_url_change(m_url);
 
         if (result.web_content_restore_mode == PendingSessionHistoryNavigation::WebContentRestoreMode::RestoreFromUIProcess) {
             m_top_level_traversable.prepare_to_seed_web_content_session_history_from_ui_process();
@@ -1745,10 +1756,8 @@ void ViewImplementation::did_traverse_the_history_to_step(Badge<WebContentClient
         m_webdriver_pending_navigation_completes_with_session_history_update = false;
     if (step_result.current_url.has_value()) {
         auto current_url = *step_result.current_url;
-        auto const url_changed = m_url != current_url;
         set_url(current_url);
-        if (url_changed && on_url_change)
-            on_url_change(m_url);
+
         if (m_webdriver_pending_navigation_url.has_value() && *m_webdriver_pending_navigation_url != current_url)
             m_webdriver_pending_navigation_url = current_url;
     }

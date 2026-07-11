@@ -593,16 +593,18 @@ int GridFormattingContext::count_of_repeated_auto_fill_or_fit_tracks(GridDimensi
     // enough times for the name list to match the subgrid’s specified grid span (falling back to 0 if
     // the span is already fulfilled).
 
-    // Otherwise on a standalone axis, when auto-fill is given as the repetition number
-    // If the grid container has a definite size or max size in the relevant axis, then the number of
+    // Otherwise on a standalone axis, when auto-fill is given as the repetition number, if the grid
+    // container has a definite preferred size or maximum size in the relevant axis, then the number of
     // repetitions is the largest possible positive integer that does not cause the grid to overflow the
-    // content box of its grid container
+    // content box of its grid container taking gap into account; if any number of repetitions would
+    // overflow, then 1 repetition.
 
     auto const& grid_computed_values = grid_container().computed_values();
     CSSPixels size_of_repeated_tracks = 0;
-    // (treating each track as its max track sizing function if that is definite or its minimum track sizing
-    // function otherwise, flooring the max track sizing function by the min track sizing function if both
-    // are definite, and taking gap into account)
+    // For this purpose, each track is treated as its max track sizing function if that is definite or
+    // else its min track sizing function if that is definite. If both are definite, floor the max track
+    // sizing function by the min track sizing function. If neither are definite, the number of
+    // repetitions is one.
     auto const& repeat_track_list = repeated_track.repeat().grid_track_size_list().track_list();
     for (auto const& explicit_grid_track : repeat_track_list) {
         auto const& track_sizing_function = explicit_grid_track;
@@ -613,27 +615,25 @@ int GridFormattingContext::count_of_repeated_auto_fill_or_fit_tracks(GridDimensi
             if (max_size.is_definite()) {
                 track_size = resolve_definite_track_size(max_size, *m_available_space);
                 if (min_size.is_definite())
-                    track_size = min(track_size, resolve_definite_track_size(min_size, *m_available_space));
+                    track_size = max(track_size, resolve_definite_track_size(min_size, *m_available_space));
             } else if (min_size.is_definite()) {
                 track_size = resolve_definite_track_size(min_size, *m_available_space);
             } else {
-                VERIFY_NOT_REACHED();
+                return 1;
             }
         } else {
             track_size = resolve_definite_track_size(track_sizing_function.grid_size(), *m_available_space);
         }
-        size_of_repeated_tracks += track_size;
+        // For the purpose of finding the number of auto-repeated tracks in a standalone axis, the UA must
+        // floor the track size to a UA-specified value to avoid division by zero. It is suggested that this
+        // floor be 1px.
+        size_of_repeated_tracks += max(track_size, CSSPixels(1));
     }
-
-    if (size_of_repeated_tracks == 0)
-        return 0;
 
     auto const& available_size = dimension == GridDimension::Column ? m_available_space->width : m_available_space->height;
     auto const& gap = dimension == GridDimension::Column ? grid_computed_values.column_gap() : grid_computed_values.row_gap();
     auto gap_px = gap_to_px(gap, available_size.to_px_or_zero());
     auto size_of_repeated_tracks_with_gap = size_of_repeated_tracks + repeat_track_list.size() * gap_px;
-    // Otherwise, if the grid container has a definite min size in the relevant axis, the number of repetitions is the
-    // smallest possible positive integer that fulfills that minimum requirement
     if (available_size.is_definite()) {
         // NOTE: Gap size is added to free space to compensate for the fact that the last track does not have a gap
         auto free_space = available_size.to_px_or_zero();
@@ -641,12 +641,12 @@ int GridFormattingContext::count_of_repeated_auto_fill_or_fit_tracks(GridDimensi
         // If any number of repetitions would overflow, then 1 repetition.
         return max(1, number_of_repetitions);
     }
+
+    // FIXME: Otherwise, if the grid container has a definite minimum size in the relevant axis, the number of
+    //        repetitions is the smallest possible positive integer that fulfills that minimum requirement.
+
     // Otherwise, the specified track list repeats only once.
     return 1;
-
-    // For the purpose of finding the number of auto-repeated tracks in a standalone axis, the UA must
-    // floor the track size to a UA-specified value to avoid division by zero. It is suggested that this
-    // floor be 1px.
 }
 
 GridFormattingContext::PlacementPosition GridFormattingContext::resolve_grid_position(Box const& child_box, GridDimension dimension)
@@ -873,7 +873,7 @@ void GridFormattingContext::place_item_with_no_declared_position(Box const& chil
     // area does not overlap any occupied grid cells, or the cursor's column position, plus the item's
     // column span, overflow the number of columns in the implicit grid, as determined earlier in this
     // algorithm.
-    auto found_unoccupied_area = find_unoccupied_grid_area(dimension, auto_placement_cursor_column, auto_placement_cursor_row, column_span, row_span);
+    find_unoccupied_grid_area(dimension, auto_placement_cursor_column, auto_placement_cursor_row, column_span, row_span);
 
     // 4.1.2.2. If a non-overlapping position was found in the previous step, set the item's row-start
     // and column-start lines to the cursor's position. Otherwise, increment the auto-placement cursor's
@@ -882,18 +882,13 @@ void GridFormattingContext::place_item_with_no_declared_position(Box const& chil
     column_start = auto_placement_cursor_column;
     row_start = auto_placement_cursor_row;
 
-    auto_placement_cursor_column += column_span - 1;
-    auto_placement_cursor_row += row_span - 1;
-
-    if (found_unoccupied_area == FoundUnoccupiedPlace::Yes) {
-        if (dimension == GridDimension::Column) {
-            auto_placement_cursor_column++;
-            auto_placement_cursor_row = m_occupation_grid.min_row_index();
-        } else {
-            auto_placement_cursor_row++;
-            auto_placement_cursor_column = m_occupation_grid.min_column_index();
-        }
-    }
+    // NB: The cursor's major-axis position must stay at the item's start line, so that subsequent items
+    //     keep packing into the same row (or column, for column flow) before moving on. Only advance the
+    //     minor-axis position past the item.
+    if (dimension == GridDimension::Column)
+        auto_placement_cursor_column += column_span;
+    else
+        auto_placement_cursor_row += row_span;
 
     record_grid_placement(GridItem {
         .box = child_box,
@@ -966,7 +961,7 @@ bool GridFormattingContext::grid_area_is_occupied(int column_start, int row_star
     return m_occupation_grid.is_area_occupied(column_start, row_start, static_cast<int>(column_span), static_cast<int>(row_span));
 }
 
-FoundUnoccupiedPlace GridFormattingContext::find_unoccupied_grid_area(GridDimension dimension, int& column_index, int& row_index, size_t column_span, size_t row_span) const
+void GridFormattingContext::find_unoccupied_grid_area(GridDimension dimension, int& column_index, int& row_index, size_t column_span, size_t row_span) const
 {
     if (dimension == GridDimension::Column) {
         // Row-flow: columns are the inner (minor) axis, rows are the outer (major) axis.
@@ -981,7 +976,7 @@ FoundUnoccupiedPlace GridFormattingContext::find_unoccupied_grid_area(GridDimens
 
                 auto minor_axis_fits = candidate_column_index + static_cast<int>(candidate_column_span) - 1 <= m_occupation_grid.max_column_index();
                 if (minor_axis_fits && !m_occupation_grid.is_area_occupied(candidate_column_index, candidate_row_index, static_cast<int>(candidate_column_span), static_cast<int>(candidate_row_span)))
-                    return FoundUnoccupiedPlace::Yes;
+                    return;
                 column_index++;
             }
             row_index++;
@@ -1000,15 +995,13 @@ FoundUnoccupiedPlace GridFormattingContext::find_unoccupied_grid_area(GridDimens
 
                 auto minor_axis_fits = candidate_row_index + static_cast<int>(candidate_row_span) - 1 <= m_occupation_grid.max_row_index();
                 if (minor_axis_fits && !m_occupation_grid.is_area_occupied(candidate_column_index, candidate_row_index, static_cast<int>(candidate_column_span), static_cast<int>(candidate_row_span)))
-                    return FoundUnoccupiedPlace::Yes;
+                    return;
                 row_index++;
             }
             column_index++;
             row_index = m_occupation_grid.min_row_index();
         }
     }
-
-    return FoundUnoccupiedPlace::No;
 }
 
 void GridFormattingContext::record_grid_placement(GridItem grid_item)
@@ -1183,11 +1176,20 @@ void GridFormattingContext::initialize_gap_tracks(GridDimension dimension, Avail
 
     gap_tracks.ensure_capacity(grid_tracks.size() - 1);
 
+    // When a collapsed track's gutters collapse, they coincide exactly--the two gutters overlap so that their start
+    // and end edges coincide. If one side of a collapsed track does not have a gutter (e.g. if it is the first or
+    // last track of the implicit grid), then collapsing its gutters results in no gutter on either "side" of the
+    // collapsed track.
+    // NB: We model this by keeping the gutter that directly precedes each non-collapsed track (except the first such
+    //     track) and giving all other gutters a zero size.
+    bool seen_non_collapsed_track = false;
     for (size_t track_index = 0; track_index < grid_tracks.size(); track_index++) {
+        seen_non_collapsed_track |= !grid_tracks[track_index].is_collapsed;
         tracks_and_gaps.append(grid_tracks[track_index]);
 
         if (track_index != grid_tracks.size() - 1) {
-            gap_tracks.unchecked_append(GridTrack::create_gap(gap_size));
+            bool gutter_collapses = grid_tracks[track_index + 1].is_collapsed || !seen_non_collapsed_track;
+            gap_tracks.unchecked_append(GridTrack::create_gap(gutter_collapses ? CSSPixels(0) : gap_size));
             tracks_and_gaps.append(gap_tracks.last());
         }
     }
@@ -2679,9 +2681,12 @@ void GridFormattingContext::collapse_auto_fit_tracks_if_needed(GridDimension dim
         if (m_occupation_grid.is_occupied(dimension == GridDimension::Column ? track_index : 0, dimension == GridDimension::Row ? track_index : 0))
             continue;
 
-        // NOTE: A collapsed track is treated as having a fixed track sizing function of 0px
+        // A collapsed grid track is treated as having a fixed track sizing function of 0px, and the gutters on
+        // either side of it--including any space allotted through distributed alignment--collapse.
+        // NB: The gutter collapsing is handled by initialize_gap_tracks(), which runs after this.
         tracks[track_index].min_track_sizing_function = CSS::GridSize(CSS::LengthStyleValue::create(CSS::Length::make_px(0)));
         tracks[track_index].max_track_sizing_function = CSS::GridSize(CSS::LengthStyleValue::create(CSS::Length::make_px(0)));
+        tracks[track_index].is_collapsed = true;
     }
 }
 
@@ -2842,10 +2847,12 @@ void GridFormattingContext::run(LayoutInput const& layout_input)
 
     initialize_grid_tracks_for_columns_and_rows();
 
-    initialize_gap_tracks(available_space);
-
     collapse_auto_fit_tracks_if_needed(GridDimension::Column);
     collapse_auto_fit_tracks_if_needed(GridDimension::Row);
+
+    // NB: Gap tracks must be initialized after collapsing auto-fit tracks, since gutters next to collapsed tracks
+    //     collapse as well.
+    initialize_gap_tracks(available_space);
 
     // Do the first pass of resolving grid items box metrics to compute values that are independent of a track width
     resolve_items_box_metrics(GridDimension::Column);
