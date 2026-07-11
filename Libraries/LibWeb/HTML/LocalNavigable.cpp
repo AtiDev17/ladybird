@@ -2573,8 +2573,19 @@ void LocalNavigable::begin_navigation(NavigateParams params)
         auto continue_ = navigation->fire_a_push_replace_reload_navigate_event(navigation_type, url, false, user_involvement, source_element, entry_list_for_firing, navigation_api_state_for_firing);
 
         // 5. If continue is false, then return.
-        if (!continue_)
+        if (!continue_) {
+            // AD-HOC: This navigation is over: the navigate event either canceled it, or intercepted it and already
+            //         committed it as a same-document navigation. In the spec, an intercepted navigation's queued
+            //         same-document finalize sets the navigable's ongoing navigation to null moments later; our
+            //         synchronous same-document commit replaces that queued step but deliberately preserves foreign
+            //         navigation IDs, so clear our own ID here. Leaving it stamped makes later same-document
+            //         traversals treat themselves as superseded and lets WebDriver wait forever for this navigation
+            //         to finish. Preserve the Navigation API state: an intercepted navigate event stays ongoing
+            //         until its handlers settle.
+            if (ongoing_navigation() == navigation_id)
+                set_ongoing_navigation(Empty {}, NavigationAPIAbortBehavior::Preserve);
             return;
+        }
     }
 
     // FIXME: 22. If sourceDocument is navigable's container document, then reserve deferred fetch quota for navigable's container given url's origin.
@@ -2600,7 +2611,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                 if (unload_prompt_canceled != LocalTraversableNavigable::CheckIfUnloadingIsCanceledResult::Continue) {
                     // FIXME: 1. Invoke WebDriver BiDi navigation failed with navigable and a new WebDriver BiDi navigation status whose id is navigationId, status is "canceled", and url is url.
                     if (is_top_level_traversable())
-                        active_browsing_context()->page().client().page_did_cancel_loading(url);
+                        active_browsing_context()->page().client().page_did_cancel_loading(navigation_id, url);
 
                     // 2. Abort these steps.
                     set_delaying_load_events(false);
@@ -2658,7 +2669,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
 
                 // AD-HOC: Tell the UI that we started loading.
                 if (is_top_level_traversable()) {
-                    active_browsing_context()->page().client().page_did_start_loading(url, document_resource, false, history_handling);
+                    active_browsing_context()->page().client().page_did_start_loading(navigation_id, url, document_resource, false, history_handling);
                 }
 
                 // AD-HOC: Subsequent steps will fail if the navigable doesn't have an active window.
@@ -2803,7 +2814,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                     source_snapshot_params, target_snapshot_params, user_involvement, navigation_id, navigation_params, csp_navigation_type, true, GC::create_function(heap(), [this, history_entry, history_handling, navigation_id, user_involvement](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
                         if (output && output->download_handled) {
                             if (is_top_level_traversable())
-                                active_browsing_context()->page().client().page_did_cancel_loading(history_entry->url());
+                                active_browsing_context()->page().client().page_did_cancel_loading(navigation_id, history_entry->url());
                             set_ongoing_navigation({});
                             set_delaying_load_events(false);
                             return;

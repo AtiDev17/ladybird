@@ -691,15 +691,7 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
 
 CSSPixels FormattingContext::measure_automatic_content_height(Box const& box, AvailableSpace const& inner_available_space, ContainingBlockConstraints const& containing_block_constraints)
 {
-    LayoutState throwaway_state(box);
-    // Populate ancestor state: the throwaway formatting context may encounter abspos elements whose
-    // containing block is an ancestor above `box`, even if it is not in `box`'s containing block chain.
-    for (auto* ancestor = box.parent(); ancestor; ancestor = ancestor->parent()) {
-        auto* ancestor_box = as_if<Box>(*ancestor);
-        if (!ancestor_box || !m_state.try_get(*ancestor_box))
-            continue;
-        throwaway_state.populate_node_from(m_state, *ancestor_box);
-    }
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
     throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box);
     measuring_context->run(LayoutInput { inner_available_space, containing_block_constraints });
@@ -783,8 +775,7 @@ CSSPixels FormattingContext::compute_table_box_width_inside_table_wrapper(
     });
     VERIFY(table_box.has_value());
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
 
     // The table wrapper is invisible to percentage resolution, so the table box gets the
     // wrapper's constraints unchanged. Callers measuring a table wrapper for grid alignment
@@ -829,8 +820,7 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
     // table-wrapper can't have borders or paddings but it might have margin taken from table-root.
     auto available_height = height_of_containing_block - margin_top - margin_bottom;
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
     throwaway_state.create(box, table_wrapper_constraints.percentage_basis_width, table_wrapper_constraints.percentage_basis_height);
 
     auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box);
@@ -1713,45 +1703,32 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
             return CSSPixelRect { { inline_start, block_start }, { inline_size, block_size } };
         return CSSPixelRect { { block_start, inline_start }, { block_size, inline_size } };
     };
-    auto add_atomic_inline_fragment_rect = [&](Box const& box_child, LayoutState::UsedValues const& child_used_values) {
-        if (!child_used_values.containing_line_box_fragment.has_value())
+    // The fragment belongs to the line boxes of the box we're currently walking, so `offset`
+    // (that box's running offset from abspos_containing_block) is the fragment's coordinate
+    // space origin; no walk up the containing block chain is needed.
+    auto add_atomic_inline_fragment_rect = [&](LineBoxFragment const& fragment, CSSPixelPoint offset) {
+        auto const* child_used_values = state.try_get(fragment.layout_node());
+        if (!child_used_values)
             return;
 
-        auto const* containing_block = box_child.containing_block();
-        auto const* containing_block_used_values = containing_block ? state.try_get(*containing_block) : nullptr;
-        auto const* abspos_containing_block_used_values = state.try_get(abspos_containing_block);
-        if (!containing_block_used_values || !abspos_containing_block_used_values)
-            return;
-
-        auto const& containing_line_box_fragment = child_used_values.containing_line_box_fragment.value();
-        if (containing_line_box_fragment.line_box_index >= containing_block_used_values->line_boxes.size())
-            return;
-
-        auto const& line_box = containing_block_used_values->line_boxes[containing_line_box_fragment.line_box_index];
-        if (containing_line_box_fragment.fragment_index >= line_box.fragments().size())
-            return;
-
-        auto const& fragment = line_box.fragments()[containing_line_box_fragment.fragment_index];
-        auto const containing_block_offset = state.cumulative_offset(*containing_block_used_values)
-            - state.cumulative_offset(*abspos_containing_block_used_values);
         auto const writing_mode = fragment.writing_mode();
         auto const is_horizontal = writing_mode == CSS::WritingMode::HorizontalTb;
-        auto const inline_axis_border_box_start = fragment.inline_offset() - (is_horizontal ? child_used_values.border_box_left() : child_used_values.border_box_top());
+        auto const inline_axis_border_box_start = fragment.inline_offset() - (is_horizontal ? child_used_values->border_box_left() : child_used_values->border_box_top());
         auto const inline_axis_border_box_extent = is_horizontal
-            ? child_used_values.border_box_width()
-            : child_used_values.border_box_height();
+            ? child_used_values->border_box_width()
+            : child_used_values->border_box_height();
         auto const block_axis_line_height = inline_node.computed_values().line_height();
         auto const block_axis_start = [&] {
-            if (box_child.computed_values().block_axis_is_reverse())
-                return fragment.block_offset() + child_used_values.border_box_right() - block_axis_line_height;
-            return fragment.block_offset() - (is_horizontal ? child_used_values.border_box_top() : child_used_values.border_box_left());
+            if (fragment.layout_node().computed_values().block_axis_is_reverse())
+                return fragment.block_offset() + child_used_values->border_box_right() - block_axis_line_height;
+            return fragment.block_offset() - (is_horizontal ? child_used_values->border_box_top() : child_used_values->border_box_left());
         }();
         add_fragment_rect(make_physical_rect(writing_mode,
             inline_axis_border_box_start,
             block_axis_start,
             inline_axis_border_box_extent,
             block_axis_line_height)
-                .translated(containing_block_offset));
+                .translated(offset));
     };
 
     // Walk outer_block's subtree in pre-order, threading the running offset from
@@ -1764,11 +1741,14 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
         if (used_values && !used_values->line_boxes.is_empty()) {
             for (auto const& line_box : used_values->line_boxes) {
                 for (auto const& fragment : line_box.fragments()) {
-                    if (fragment.is_atomic_inline())
+                    auto const* dom = fragment.layout_node().dom_node();
+                    if (!dom || !inline_dom_node->is_inclusive_ancestor_of(*dom))
                         continue;
-                    if (auto const* dom = fragment.layout_node().dom_node(); dom && inline_dom_node->is_inclusive_ancestor_of(*dom)) {
-                        add_fragment_rect({ fragment.offset() + offset, fragment.size() });
+                    if (fragment.is_atomic_inline()) {
+                        add_atomic_inline_fragment_rect(fragment, offset);
+                        continue;
                     }
+                    add_fragment_rect({ fragment.offset() + offset, fragment.size() });
                 }
             }
         }
@@ -1783,11 +1763,10 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
                 auto const* dom = box_child->dom_node();
                 if (!dom || !inline_dom_node->is_inclusive_ancestor_of(*dom))
                     continue;
-                if (box_child->is_atomic_inline()) {
-                    if (child_used_values)
-                        add_atomic_inline_fragment_rect(*box_child, *child_used_values);
+                // Atomic inlines contribute their fragment rect via their containing block's
+                // line boxes above; don't descend into their independent subtree.
+                if (box_child->is_atomic_inline())
                     continue;
-                }
                 // child_offset addresses the box's content area; the border-box origin sits
                 // (border-left + padding-left, border-top + padding-top) before that.
                 if (child_used_values) {
@@ -2219,6 +2198,8 @@ void FormattingContext::layout_absolutely_positioned_children(Box const& box)
 {
     if (m_layout_mode != LayoutMode::Normal)
         return;
+    if (m_state.is_for_measurement())
+        return;
     // Laying out one child can register further children onto this box (a fixed position
     // box inside an absolutely positioned one shares its viewport containing block), so
     // take one at a time instead of iterating a snapshot.
@@ -2267,13 +2248,6 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPos
     auto& box_state = m_state.get_mutable(box);
 
     auto const available_space = AvailableSpace(AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.width())), AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.height())));
-
-    auto& containing_block_state = m_state.get_mutable(*box.containing_block());
-
-    // The size of the containing block of an abspos box is always definite from the perspective of the abspos box.
-    // Since abspos boxes are laid out last, we can mark the containing block as having definite sizes at this point.
-    containing_block_state.set_has_definite_width(true);
-    containing_block_state.set_has_definite_height(true);
 
     auto const& computed_values = box.computed_values();
 
@@ -2622,8 +2596,7 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box,
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.width_constraint = SizeConstraint::MinContent;
@@ -2711,8 +2684,7 @@ CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box,
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
 
     auto const& actual_box_state = m_state.get(box);
 
@@ -2762,8 +2734,7 @@ CSSPixels FormattingContext::calculate_min_content_height(Layout::Box const& box
     if (cache.has_value())
         return cache.value();
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.height_constraint = SizeConstraint::MinContent;
@@ -2798,8 +2769,7 @@ CSSPixels FormattingContext::calculate_max_content_height(Layout::Box const& box
     if (cache_slot.has_value())
         return cache_slot.value();
 
-    LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
+    LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.height_constraint = SizeConstraint::MaxContent;

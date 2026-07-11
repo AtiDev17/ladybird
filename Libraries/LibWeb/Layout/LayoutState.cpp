@@ -27,8 +27,9 @@
 
 namespace Web::Layout {
 
-LayoutState::LayoutState(NodeWithStyle const& subtree_root)
+LayoutState::LayoutState(NodeWithStyle const& subtree_root, Purpose purpose)
     : m_subtree_root(&subtree_root)
+    , m_purpose(purpose)
 {
 }
 
@@ -112,15 +113,6 @@ LayoutState::UsedValues& LayoutState::create(NodeWithStyle const& node, Optional
     return used_values;
 }
 
-void LayoutState::discard_used_values_for_descendants(Box const& root)
-{
-    root.for_each_in_subtree([&](auto const& descendant) {
-        if (auto const* node_with_style = as_if<NodeWithStyle>(descendant))
-            m_used_values_store.remove(node_with_style->layout_index());
-        return TraversalDecision::Continue;
-    });
-}
-
 LayoutState::UsedValues& LayoutState::populate_from_paintable(NodeWithStyle const& node, Painting::Paintable const& paintable)
 {
     VERIFY(m_subtree_root);
@@ -132,17 +124,6 @@ LayoutState::UsedValues& LayoutState::populate_from_paintable(NodeWithStyle cons
     used_values.m_node = &node;
     used_values.materialize_from_paintable(paintable);
     return used_values;
-}
-
-LayoutState::UsedValues& LayoutState::populate_node_from(LayoutState const& source, NodeWithStyle const& node)
-{
-    VERIFY(m_subtree_root);
-    auto index = node.layout_index();
-    VERIFY(!m_used_values_store.get(index));
-
-    auto& values = m_used_values_store.allocate(index);
-    values = source.get(node);
-    return values;
 }
 
 LayoutState::UsedValues const* LayoutState::try_get(NodeWithStyle const& node) const
@@ -1201,16 +1182,11 @@ void LayoutState::UsedValues::set_indefinite_content_height()
 void LayoutState::register_contained_abspos_child(Box const& target, Box const& child, StaticPositionRect const& static_position_rect)
 {
     auto& children = m_contained_abspos_children.ensure(&target);
-    // The same box can be encountered again when a subtree is intentionally laid out
-    // twice (percentage-height table cells); the fresh static position replaces the
-    // stale one instead of duplicating the entry. New entries are inserted in layout
-    // index order so consumption follows document order.
+    // Entries are inserted in layout index order so consumption follows document order.
     size_t insertion_index = children.size();
     for (size_t i = 0; i < children.size(); ++i) {
-        if (children[i].box == &child) {
-            children[i].static_position_rect = static_position_rect;
-            return;
-        }
+        // Every box is laid out at most once per state, so it can only be registered once.
+        VERIFY(children[i].box != &child);
         if (insertion_index == children.size() && child.layout_index() < children[i].box->layout_index())
             insertion_index = i;
     }
