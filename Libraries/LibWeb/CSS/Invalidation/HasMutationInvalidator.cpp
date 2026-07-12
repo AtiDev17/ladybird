@@ -377,13 +377,12 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
     };
 
     auto& counters = style_scope.document().style_invalidation_counters();
-    if (!style_scope.has_valid_rule_cache())
-        ++counters.has_invalidation_rule_cache_builds;
 
-    // It's ok to call have_has_selectors() instead of may_have_has_selectors() here and force
-    // rule cache build, because it's going to be built soon anyway, since we could get here
-    // only from update_style().
-    if (!style_scope.have_has_selectors())
+    // NB: Use the may_have variants here so a scope whose rule cache is currently invalid doesn't have to rebuild
+    //     it just to answer the early-out. When the conservative answer is wrong (a sheet has :has() selectors that
+    //     are not currently effective), the ancestor walk below still terminates immediately unless elements carry
+    //     stale :has() scope flags, in which case we over-invalidate, which is safe.
+    if (!style_scope.may_have_has_selectors())
         return;
 
     ++counters.has_ancestor_walk_invocations;
@@ -405,7 +404,7 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
     GC::OrderedRootHashMap<GC::Ref<DOM::Node>, PendingHasInvalidationMutationFeatures> pending_has_invalidations;
     for (auto& [node, features] : style_scope.m_pending_has_invalidations)
         pending_has_invalidations.set(node, features);
-    bool should_scan_ancestor_siblings = style_scope.have_has_selectors_with_relative_selector_that_has_sibling_combinator();
+    bool should_scan_ancestor_siblings = style_scope.may_have_has_selectors_with_relative_selector_that_has_sibling_combinator();
     for (auto& [node, mutation_features] : pending_has_invalidations) {
         GC::RootHashTable<GC::Ref<DOM::Element>> elements_skipped_by_has_feature_filter;
         GC::RootVector<GC::Ref<DOM::Element>, 16> has_scope_ancestors;
@@ -433,8 +432,11 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
             ++counters.has_ancestor_walk_visits;
             bool can_skip_unchanged_has_fanout = !element->root().is_shadow_root() && !element->assigned_slot_internal() && !element->is_shadow_host();
             bool should_invalidate_descendants = element->affected_by_has_pseudo_class_in_non_subject_position();
-            if (should_invalidate_descendants && can_skip_unchanged_has_fanout)
+            if (should_invalidate_descendants && can_skip_unchanged_has_fanout) {
+                if (!style_scope.has_valid_rule_cache())
+                    ++counters.has_invalidation_rule_cache_builds;
                 should_invalidate_descendants = has_rule_that_may_be_affected_by_mutation(style_scope, element, mutation_features);
+            }
             if (element->affected_by_has_pseudo_class_in_subject_position() || should_invalidate_descendants) {
                 invalidate_element(element, should_invalidate_descendants ? DescendantHasInvalidation::Yes : DescendantHasInvalidation::No);
             } else {
@@ -470,20 +472,22 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
 
 void invalidate_style_for_pending_has_mutations(DOM::Document& document)
 {
-    invalidate_style_of_elements_affected_by_pending_has_mutations(document.style_scope());
-    document.for_each_shadow_root([&](auto& shadow_root) {
-        bool has_active_style_sheets = false;
-        shadow_root.for_each_active_css_style_sheet([&](auto&) {
-            has_active_style_sheets = true;
-        });
-        if (!has_active_style_sheets) {
-            // Without shadow stylesheets, this scope cannot contain :has() selectors.
-            // Document-level user rules are handled by the document style scope above.
-            shadow_root.style_scope().m_pending_has_invalidations.clear();
-            return;
-        }
-        invalidate_style_of_elements_affected_by_pending_has_mutations(shadow_root.style_scope());
-    });
+    auto& counters = document.style_invalidation_counters();
+
+    // Only scopes that actually scheduled pending :has() invalidations registered themselves, so we don't have to
+    // iterate every shadow root in the document here. A scope adopted into another document re-registers there
+    // (see StyleScope::node_was_adopted_from), so every scope in this list still belongs to this document.
+    // NB: Keep the taken list rooted: the invalidation below can allocate (rule cache and user stylesheet builds),
+    //     and the member vector we moved out of is no longer visited.
+    GC::RootVector<GC::Ref<DOM::Node>> scopes;
+    scopes.extend(document.take_style_scopes_with_pending_has_invalidations());
+    for (auto& node : scopes) {
+        ++counters.has_flush_scopes_examined;
+        auto& style_scope = node->is_shadow_root()
+            ? as<DOM::ShadowRoot>(*node).style_scope()
+            : document.style_scope();
+        invalidate_style_of_elements_affected_by_pending_has_mutations(style_scope);
+    }
 }
 
 static void schedule_has_invalidation_for_child_list_mutation(DOM::Node& parent, DOM::Node& mutation_root, StyleScope& scope, HasMutationKind kind)

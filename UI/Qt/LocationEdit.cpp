@@ -198,10 +198,6 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         m_omnibox.suggestion_clicked(static_cast<size_t>(suggestion_index));
     });
 
-    connect(m_autocomplete, &Autocomplete::suggestion_hovered, this, [this](int suggestion_index) {
-        m_omnibox.suggestion_hovered(static_cast<size_t>(suggestion_index));
-    });
-
     connect(m_autocomplete, &Autocomplete::dismissed, this, [this] {
         m_omnibox.popup_dismissed();
     });
@@ -389,6 +385,13 @@ void LocationEdit::keyPressEvent(QKeyEvent* event)
     if (event->key() == Qt::Key_Up) {
         if (m_omnibox.select_previous_suggestion())
             return;
+    }
+
+    if (event->key() == Qt::Key_Right || event->key() == Qt::Key_End) {
+        if (m_omnibox.accept_completion()) {
+            event->accept();
+            return;
+        }
     }
 
     if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {

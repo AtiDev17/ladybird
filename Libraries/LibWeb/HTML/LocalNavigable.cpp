@@ -149,7 +149,7 @@ struct NavigationParamsFetchStateHolder : public JS::Cell {
 
     // Accumulated redirect output
     Optional<URL::URL> redirected_url;
-    Optional<SerializationRecord> redirect_classic_history_api_state;
+    Optional<StorageSerializationRecord> redirect_classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
 
@@ -187,7 +187,7 @@ public:
 
     // Redirect mutations (only set by fetch path)
     Optional<URL::URL> redirected_url;
-    Optional<SerializationRecord> classic_history_api_state;
+    Optional<StorageSerializationRecord> classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
 
@@ -2646,7 +2646,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                 auto& page_client = active_browsing_context()->page().client();
                 auto is_top_level_navigation = is_top_level_traversable();
                 auto target = is_top_level_navigation ? NavigationTarget::TopLevel : NavigationTarget::IFrame;
-                auto frame_id = is_top_level_navigation ? Optional<NavigableId> {} : Optional<NavigableId> { id() };
+                auto frame_id = is_top_level_navigation ? Optional<CrossProcessId> {} : Optional<CrossProcessId> { id() };
                 auto process_decision = page_client.decide_navigation_process(this->active_document()->url(), url, target, move(frame_id));
                 if (process_decision == NavigationProcessDecision::Remote && is_top_level_navigation) {
                     page_client.request_new_process_for_navigation(url, document_resource, history_handling);
@@ -2848,7 +2848,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-fragid
-void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ptr<DOM::Element> source_element, Optional<SerializationRecord> navigation_api_state, String navigation_id)
+void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, String navigation_id)
 {
     // 1. Let navigation be navigable's active window's navigation API.
     VERIFY(active_window());
@@ -3155,7 +3155,7 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#reload
-void LocalNavigable::reload(Optional<SerializationRecord> navigation_api_state, UserNavigationInvolvement user_involvement)
+void LocalNavigable::reload(Optional<StorageSerializationRecord> navigation_api_state, UserNavigationInvolvement user_involvement)
 {
     // 1. If userInvolvement is not "browser UI", then:
     if (user_involvement != UserNavigationInvolvement::BrowserUI) {
@@ -3316,6 +3316,17 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
     // NOTE: pending_document corresponds to historyEntry's document — it is the document produced by
     //       populate_session_history_entry_document, threaded here explicitly instead of being stored on the entry.
     if (!pending_document) {
+        // AD-HOC: Notify the UI that this navigation will never produce a document (e.g. an unhandled non-fetch
+        //         scheme like mailto:), so that it does not consider the page to be loading forever.
+        if (navigable->is_top_level_traversable())
+            navigable->active_browsing_context()->page().client().page_did_cancel_loading(expected_ongoing_navigation_id, history_entry->url());
+
+        // AD-HOC: Clear the ongoing navigation, like the "navigation must be a replace" and download cases do.
+        //         No history step will be applied for this navigation, so nothing else clears it, and a stale
+        //         ongoing navigation ID makes later same-document traversals consider themselves superseded.
+        if (expected_ongoing_navigation_id.has_value() && navigable->ongoing_navigation() == expected_ongoing_navigation_id)
+            navigable->set_ongoing_navigation({});
+
         on_complete->function()(HistoryStepResult::Applied);
         return;
     }
@@ -3441,7 +3452,7 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
-void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<SerializationRecord> serialized_data, HistoryHandlingBehavior history_handling)
+void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> serialized_data, HistoryHandlingBehavior history_handling)
 {
     // 1. Let navigable be document's node navigable.
     auto navigable = document.navigable();

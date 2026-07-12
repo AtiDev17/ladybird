@@ -1,0 +1,4 @@
+before toggle: 100x50
+after toggle:  200x100
+reference:     200x100
+PASS: toggled float matches from-scratch layout of the same state

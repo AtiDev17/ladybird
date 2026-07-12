@@ -5,9 +5,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/Find.h>
+#include <AK/QuickSort.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/Timer.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibTextCodec/Decoder.h>
@@ -16,6 +19,8 @@
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Autocomplete.h>
+#include <LibWebView/AutocompleteMuxer.h>
+#include <LibWebView/AutocompleteService.h>
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/URL.h>
@@ -45,12 +50,24 @@ Optional<AutocompleteEngine const&> find_autocomplete_engine_by_name(StringView 
 Autocomplete::Autocomplete(IsPrivate is_private)
     : m_is_private(is_private)
 {
+    m_service_client_id = Application::autocomplete_service().register_client([this](auto query_id, auto entries) {
+        local_query_complete(query_id, move(entries));
+    });
 }
 
-Autocomplete::~Autocomplete() = default;
+Autocomplete::~Autocomplete()
+{
+    cancel_pending_query();
+    Application::autocomplete_service().unregister_client(m_service_client_id);
+}
 
 void Autocomplete::cancel_pending_query()
 {
+    if (m_remote_query_timer) {
+        m_remote_query_timer->stop();
+        m_remote_query_timer.clear();
+    }
+
     if (m_request) {
         // This can be reached synchronously from inside the request's own completion callback: activating a suggestion
         // clears the location bar's focus, canceling the query. Stopping the request inline would destroy a still-
@@ -62,22 +79,75 @@ void Autocomplete::cancel_pending_query()
 
     // Buffered callbacks may still arrive after we stop the request, so clear
     // the active query as well and let the stale-response check discard them.
+    Application::autocomplete_service().cancel(m_service_client_id);
+    m_query_id = {};
     m_query = {};
-    m_history_suggestions.clear();
+    m_trimmed_query = {};
+    m_local_suggestions.clear();
+    m_remote_suggestions.clear();
 }
 
-StringView autocomplete_section_title(AutocompleteSuggestionSection section)
+void Autocomplete::record_engagement(OmniboxEngagement engagement)
 {
-    switch (section) {
-    case AutocompleteSuggestionSection::None:
-        return {};
-    case AutocompleteSuggestionSection::History:
-        return "History"sv;
-    case AutocompleteSuggestionSection::SearchSuggestions:
-        return "Search Suggestions"sv;
+    if (m_is_private == IsPrivate::Yes)
+        return;
+    if (engagement.destination_kind == OmniboxDestinationKind::Search && !Application::settings().search_engine().has_value())
+        return;
+    Application::autocomplete_service().record_engagement(move(engagement));
+}
+
+String autocomplete_suggestion_display_text(AutocompleteSuggestion const& suggestion)
+{
+    if (suggestion.source == AutocompleteSuggestionSource::Search)
+        return suggestion.text;
+
+    auto url = URL::create_with_url_or_path(suggestion.text.to_byte_string());
+    if (!url.has_value())
+        return suggestion.text;
+    return url_for_display(*url);
+}
+
+Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text)
+{
+    Vector<AutocompleteMatchRange> ranges;
+
+    for (auto token : input.split_view_if([](char ch) { return is_ascii_space(ch); })) {
+        if (token.is_empty())
+            continue;
+
+        for (size_t offset = 0; offset + token.length() <= text.length();) {
+            auto candidate = text.substring_view(offset, token.length());
+            if (candidate.equals_ignoring_ascii_case(token)) {
+                ranges.append({ offset, token.length() });
+                offset += token.length();
+            } else {
+                ++offset;
+            }
+        }
     }
 
-    VERIFY_NOT_REACHED();
+    quick_sort(ranges, [](auto const& left, auto const& right) {
+        return left.start < right.start;
+    });
+
+    Vector<AutocompleteMatchRange> merged_ranges;
+    for (auto const& range : ranges) {
+        if (merged_ranges.is_empty() || merged_ranges.last().start + merged_ranges.last().length < range.start) {
+            merged_ranges.append(range);
+            continue;
+        }
+        auto end = max(merged_ranges.last().start + merged_ranges.last().length, range.start + range.length);
+        merged_ranges.last().length = end - merged_ranges.last().start;
+    }
+    return merged_ranges;
+}
+
+Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<String> suggestions)
+{
+    suggestions.remove_all_matching([input](auto const& suggestion) {
+        return !suggestion.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive);
+    });
+    return suggestions;
 }
 
 [[maybe_unused]] static ByteString log_autocomplete_suggestions(Vector<AutocompleteSuggestion> const& suggestions)
@@ -91,64 +161,6 @@ StringView autocomplete_section_title(AutocompleteSuggestionSection section)
     return ByteString::formatted("[{}]", ByteString::join(", "sv, values));
 }
 
-static Optional<StringView> url_without_scheme(StringView url)
-{
-    auto scheme_separator = url.find("://"sv);
-    if (!scheme_separator.has_value())
-        return {};
-
-    return url.substring_view(*scheme_separator + 3);
-}
-
-static StringView autocomplete_searchable_url(StringView url)
-{
-    auto stripped_url = url_without_scheme(url).value_or(url);
-    if (stripped_url.starts_with("www."sv, CaseSensitivity::CaseInsensitive))
-        stripped_url = stripped_url.substring_view(4);
-
-    return stripped_url;
-}
-
-static StringView autocomplete_url_query(StringView query)
-{
-    auto stripped_query = url_without_scheme(query).value_or(query);
-    if (stripped_query.starts_with("www."sv, CaseSensitivity::CaseInsensitive))
-        stripped_query = stripped_query.substring_view(4);
-
-    return stripped_query;
-}
-
-static bool history_entry_url_matches_query(StringView query, StringView url)
-{
-    auto url_query = autocomplete_url_query(query);
-    if (url_query.is_empty())
-        return false;
-
-    auto searchable_url = autocomplete_searchable_url(url);
-    return searchable_url.starts_with(url_query, CaseSensitivity::CaseInsensitive);
-}
-
-static Vector<AutocompleteSuggestion> make_history_suggestions(StringView query, Vector<HistoryEntry> history_entries)
-{
-    Vector<AutocompleteSuggestion> suggestions;
-    suggestions.ensure_capacity(history_entries.size());
-
-    for (auto& entry : history_entries) {
-        auto can_be_automatically_selected = history_entry_url_matches_query(query, entry.url.bytes_as_string_view());
-        suggestions.unchecked_append({
-            .source = AutocompleteSuggestionSource::History,
-            .section = AutocompleteSuggestionSection::History,
-            .text = move(entry.url),
-            .title = move(entry.title),
-            .subtitle = {},
-            .favicon_base64_png = move(entry.favicon_base64_png),
-            .can_be_automatically_selected = can_be_automatically_selected,
-        });
-    }
-
-    return suggestions;
-}
-
 static Optional<AutocompleteSuggestion> search_for_query_suggestion(StringView query)
 {
     if (query.is_empty() || location_looks_like_url(query))
@@ -160,14 +172,19 @@ static Optional<AutocompleteSuggestion> search_for_query_suggestion(StringView q
 
     auto query_string = MUST(String::from_utf8(query));
     auto subtitle = MUST(String::formatted("Search with {}", search_engine->name));
+    auto contains_whitespace = any_of(query, [](auto code_unit) { return is_ascii_space(code_unit); });
 
     return AutocompleteSuggestion {
         .source = AutocompleteSuggestionSource::Search,
-        .section = AutocompleteSuggestionSection::SearchSuggestions,
         .text = query_string,
         .title = query_string,
         .subtitle = move(subtitle),
         .favicon_base64_png = {},
+        .highlight_input = {},
+        .relevance = contains_whitespace ? 1000 : 900,
+        .is_verbatim = true,
+        .can_be_automatically_selected = true,
+        .can_be_inline_completed = false,
     };
 }
 
@@ -178,203 +195,139 @@ static Optional<AutocompleteSuggestion> literal_url_suggestion(StringView query)
 
     return AutocompleteSuggestion {
         .source = AutocompleteSuggestionSource::LiteralURL,
-        .section = AutocompleteSuggestionSection::None,
         .text = MUST(String::from_utf8(query)),
         .title = {},
         .subtitle = {},
         .favicon_base64_png = {},
+        .highlight_input = {},
+        .relevance = 900,
+        .is_verbatim = true,
+        .can_be_automatically_selected = true,
+        .can_be_inline_completed = false,
     };
 }
 
-static Optional<AutocompleteSuggestion> preferred_literal_url_suggestion(StringView query, Vector<AutocompleteSuggestion> const& history_suggestions)
+static Vector<AutocompleteSuggestion> make_remote_suggestions(Vector<String> remote_suggestions)
 {
-    auto literal_suggestion = literal_url_suggestion(query);
-    if (!literal_suggestion.has_value())
-        return {};
-
-    // Once history still provides a richer completion for the typed prefix,
-    // keep that row instead of promoting a raw literal URL suggestion.
-    if (!history_suggestions.is_empty() && autocomplete_url_can_complete(query, history_suggestions.first().text)) {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Suppressing literal URL suggestion '{}' because top history suggestion '{}' still completes the query",
-            literal_suggestion->text,
-            history_suggestions.first().text);
-        return {};
-    }
-
-    return literal_suggestion;
-}
-
-static bool suggestions_match_for_deduplication(AutocompleteSuggestion const& existing_suggestion, AutocompleteSuggestion const& suggestion)
-{
-    if (existing_suggestion.text == suggestion.text)
-        return true;
-
-    if (existing_suggestion.source == AutocompleteSuggestionSource::Search
-        || suggestion.source == AutocompleteSuggestionSource::Search)
-        return false;
-
-    return autocomplete_urls_match(existing_suggestion.text, suggestion.text);
-}
-
-static bool should_replace_existing_suggestion(AutocompleteSuggestion const& existing_suggestion, AutocompleteSuggestion const& suggestion)
-{
-    return existing_suggestion.source == AutocompleteSuggestionSource::LiteralURL
-        && suggestion.source == AutocompleteSuggestionSource::History;
-}
-
-static void append_suggestion_if_unique(Vector<AutocompleteSuggestion>& suggestions, size_t max_suggestions, AutocompleteSuggestion suggestion)
-{
-    if (suggestions.size() >= max_suggestions)
-        return;
-
-    for (auto& existing_suggestion : suggestions) {
-        if (!suggestions_match_for_deduplication(existing_suggestion, suggestion))
-            continue;
-
-        if (should_replace_existing_suggestion(existing_suggestion, suggestion))
-            existing_suggestion = move(suggestion);
-
-        return;
-    }
-
-    suggestions.unchecked_append(move(suggestion));
-}
-
-static Vector<AutocompleteSuggestion> merge_suggestions(
-    Optional<AutocompleteSuggestion> search_for_query_suggestion,
-    Optional<AutocompleteSuggestion> literal_url_suggestion,
-    Vector<AutocompleteSuggestion> history_suggestions,
-    Vector<String> remote_suggestions,
-    size_t max_suggestions)
-{
+    static constexpr auto maximum_remote_candidates = 50uz;
     Vector<AutocompleteSuggestion> suggestions;
-    suggestions.ensure_capacity(min(max_suggestions, history_suggestions.size() + remote_suggestions.size() + (literal_url_suggestion.has_value() ? 1 : 0) + (search_for_query_suggestion.has_value() ? 1 : 0)));
+    suggestions.ensure_capacity(min(remote_suggestions.size(), maximum_remote_candidates));
 
-    // Reserve a slot for the synthesized "Search with <engine>" row so it
-    // is always visible, even when history results would otherwise fill the
-    // popup. Without this, a query with plenty of history hits leaves the
-    // user with no explicit search fallback.
-    auto reserved_for_search = search_for_query_suggestion.has_value() ? 1u : 0u;
-    auto history_and_url_cap = reserved_for_search < max_suggestions
-        ? max_suggestions - reserved_for_search
-        : max_suggestions;
-
-    if (literal_url_suggestion.has_value())
-        append_suggestion_if_unique(suggestions, history_and_url_cap, literal_url_suggestion.release_value());
-
-    for (auto& suggestion : history_suggestions)
-        append_suggestion_if_unique(suggestions, history_and_url_cap, move(suggestion));
-
-    if (search_for_query_suggestion.has_value())
-        append_suggestion_if_unique(suggestions, max_suggestions, search_for_query_suggestion.release_value());
-
-    for (auto& suggestion : remote_suggestions) {
-        auto remote_suggestion = AutocompleteSuggestion {
+    i32 relevance = 700;
+    for (size_t index = 0; index < remote_suggestions.size() && index < maximum_remote_candidates; ++index) {
+        suggestions.unchecked_append({
             .source = AutocompleteSuggestionSource::Search,
-            .section = AutocompleteSuggestionSection::SearchSuggestions,
-            .text = move(suggestion),
+            .text = move(remote_suggestions[index]),
             .title = {},
             .subtitle = {},
             .favicon_base64_png = {},
-        };
-        append_suggestion_if_unique(suggestions, max_suggestions, move(remote_suggestion));
+            .highlight_input = {},
+            .relevance = relevance,
+            .is_verbatim = false,
+            .can_be_automatically_selected = false,
+            .can_be_inline_completed = false,
+        });
+        --relevance;
     }
 
     return suggestions;
 }
 
-static bool should_defer_intermediate_suggestions(Vector<AutocompleteSuggestion> const& suggestions)
+void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, String query, size_t max_suggestions)
 {
-    // A lone history row tends to be a transient placeholder while remote
-    // suggestions are still in flight, so wait for the merged final list.
-    return suggestions.size() == 1
-        && suggestions.first().source == AutocompleteSuggestionSource::History;
-}
-
-void Autocomplete::query_autocomplete_engine(String query, size_t max_suggestions)
-{
+    if (m_remote_query_timer) {
+        m_remote_query_timer->stop();
+        m_remote_query_timer.clear();
+    }
     if (m_request) {
         m_request->stop();
         m_request.clear();
     }
+    Application::autocomplete_service().cancel(m_service_client_id);
 
     m_max_suggestions = max_suggestions;
+    m_query_id = query_id;
 
     auto trimmed_query = MUST(String::from_utf8(query.bytes_as_string_view().trim_whitespace()));
+    m_remote_suggestions = filter_remote_autocomplete_suggestions(trimmed_query, move(m_remote_suggestions));
+    m_trimmed_query = move(trimmed_query);
     m_query = move(query);
+    m_local_query_complete = false;
+    m_remote_query_complete = false;
+    m_local_suggestions.clear();
 
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Autocomplete query='{}' trimmed='{}'", m_query, trimmed_query);
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Autocomplete query='{}' trimmed='{}'", m_query, m_trimmed_query);
 
-    // In private windows, we use a disabled history store for most things, but we allow querying non-private history for autocomplete.
-    m_history_suggestions = make_history_suggestions(trimmed_query, Application::history_store(IsPrivate::No).autocomplete_entries(trimmed_query, m_max_suggestions));
-    auto literal_suggestion = preferred_literal_url_suggestion(trimmed_query, m_history_suggestions);
-    auto search_suggestion = search_for_query_suggestion(trimmed_query);
+    // Private windows may read normal-profile history but never write through this worker connection.
+    Application::autocomplete_service().query(m_service_client_id, query_id, m_trimmed_query, m_max_suggestions);
 
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] History autocomplete suggestions for '{}': {}", trimmed_query, log_autocomplete_suggestions(m_history_suggestions));
-
-    auto immediate_suggestions = merge_suggestions(search_suggestion, literal_suggestion, m_history_suggestions, {}, m_max_suggestions);
-
-    if (trimmed_query.is_empty()) {
-        invoke_autocomplete_query_complete(move(immediate_suggestions), AutocompleteResultKind::Final);
+    if (m_trimmed_query.is_empty()) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for empty query");
         return;
     }
 
-    if (trimmed_query.starts_with_bytes(file_url_prefix)) {
-        invoke_autocomplete_query_complete(move(immediate_suggestions), AutocompleteResultKind::Final);
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for file URL query '{}'", trimmed_query);
+    if (m_trimmed_query.starts_with_bytes(file_url_prefix)) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for file URL query '{}'", m_trimmed_query);
         return;
     }
 
     auto engine = Application::settings().autocomplete_engine();
     if (!engine.has_value()) {
-        invoke_autocomplete_query_complete(move(immediate_suggestions), AutocompleteResultKind::Final);
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete because no engine is configured");
         return;
     }
 
-    if (!immediate_suggestions.is_empty() && !should_defer_intermediate_suggestions(immediate_suggestions)) {
-        auto query_before_delivery = m_query;
-        invoke_autocomplete_query_complete(move(immediate_suggestions), AutocompleteResultKind::Intermediate);
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Scheduling remote autocomplete suggestions from {} for '{}'", engine->name, m_query);
 
-        // Delivering the immediate suggestions can activate one of them (pressing Enter re-queries stale results
-        // and activates once fresh results arrive). Activation clears the location bar's focus, which re-entrantly
-        // cancels or replaces this query, so bail out instead of requesting remote suggestions for it.
-        if (m_query != query_before_delivery)
+    static constexpr auto remote_query_debounce_delay_ms = 100;
+    m_remote_query_timer = Core::Timer::create_single_shot(remote_query_debounce_delay_ms, [this, query_id, engine = engine.release_value(), query = m_query] {
+        if (m_query_id != query_id)
             return;
-    } else if (!immediate_suggestions.is_empty()) {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Deferring singleton history intermediate result for '{}' until remote autocomplete responds", trimmed_query);
-    } else {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Deferring empty history autocomplete results for '{}' until remote autocomplete responds", trimmed_query);
-    }
+        start_remote_query(query_id, engine, move(query));
+    });
+    m_remote_query_timer->start();
+}
 
-    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Fetching remote autocomplete suggestions from {} for '{}'", engine->name, m_query);
+void Autocomplete::start_remote_query(AutocompleteQueryID query_id, AutocompleteEngine engine, String query)
+{
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Fetching remote autocomplete suggestions from {} for '{}'", engine.name, query);
 
-    auto url_string = MUST(String::formatted(engine->query_url, URL::percent_encode(m_query)));
+    auto url_string = MUST(String::formatted(engine.query_url, URL::percent_encode(query)));
     auto url = URL::Parser::basic_parse(url_string);
 
-    if (!url.has_value())
+    if (!url.has_value()) {
+        m_remote_query_complete = true;
+        deliver_current_result();
         return;
+    }
 
     m_request = Application::request_server_client(m_is_private).start_request("GET"sv, *url);
 
     m_request->set_buffered_request_finished_callback(
-        [this, engine = engine.release_value(), query = m_query, literal_suggestion, search_suggestion](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Core::ImmutableBytes payload) {
+        [this, query_id, engine, query = move(query)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Core::ImmutableBytes payload) {
             Core::deferred_invoke([this]() { m_request.clear(); });
 
-            if (m_query != query) {
+            if (m_query_id != query_id) {
                 dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Discarding stale remote autocomplete response for '{}' while current query is '{}'", query, m_query);
                 return;
             }
 
+            m_remote_query_complete = true;
+
             if (network_error.has_value()) {
                 warnln("Unable to fetch autocomplete suggestions: {}", Requests::network_error_to_string(*network_error));
-                invoke_autocomplete_query_complete(merge_suggestions(search_suggestion, literal_suggestion, m_history_suggestions, {}, m_max_suggestions), AutocompleteResultKind::Final);
+                deliver_current_result();
                 return;
             }
             if (response_code.has_value() && *response_code >= 400) {
                 warnln("Received error response code {} from autocomplete engine: {}", *response_code, reason_phrase);
-                invoke_autocomplete_query_complete(merge_suggestions(search_suggestion, literal_suggestion, m_history_suggestions, {}, m_max_suggestions), AutocompleteResultKind::Final);
+                deliver_current_result();
                 return;
             }
 
@@ -382,19 +335,50 @@ void Autocomplete::query_autocomplete_engine(String query, size_t max_suggestion
 
             if (auto result = received_autocomplete_respsonse(engine, content_type, payload.bytes()); result.is_error()) {
                 warnln("Unable to handle autocomplete response: {}", result.error());
-                invoke_autocomplete_query_complete(merge_suggestions(search_suggestion, literal_suggestion, m_history_suggestions, {}, m_max_suggestions), AutocompleteResultKind::Final);
+                deliver_current_result();
             } else {
-                auto remote_suggestions = result.release_value();
+                m_remote_suggestions = result.release_value();
 
-                dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Remote autocomplete suggestions for '{}': {}", query, history_log_suggestions(remote_suggestions));
-
-                auto merged_suggestions = merge_suggestions(search_suggestion, literal_suggestion, m_history_suggestions, move(remote_suggestions), m_max_suggestions);
-
-                dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Merged autocomplete suggestions for '{}': {}", query, log_autocomplete_suggestions(merged_suggestions));
-
-                invoke_autocomplete_query_complete(move(merged_suggestions), AutocompleteResultKind::Final);
+                dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Remote autocomplete suggestions for '{}': {}", query, history_log_suggestions(m_remote_suggestions));
+                deliver_current_result();
             }
         });
+}
+
+void Autocomplete::local_query_complete(AutocompleteQueryID query_id, Vector<AutocompleteSuggestion> suggestions)
+{
+    if (m_query_id != query_id)
+        return;
+
+    m_local_suggestions = move(suggestions);
+    m_local_query_complete = true;
+
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Local autocomplete suggestions for '{}': {}", m_trimmed_query, log_autocomplete_suggestions(m_local_suggestions));
+    deliver_current_result();
+}
+
+void Autocomplete::deliver_current_result()
+{
+    if (!m_query_id.has_value())
+        return;
+
+    auto verbatim_suggestion = literal_url_suggestion(m_query);
+    if (!verbatim_suggestion.has_value())
+        verbatim_suggestion = search_for_query_suggestion(m_query);
+    auto merged_suggestions = mux_autocomplete_suggestions(
+        m_trimmed_query,
+        move(verbatim_suggestion),
+        m_local_suggestions,
+        make_remote_suggestions(m_remote_suggestions),
+        m_max_suggestions);
+    for (auto& suggestion : merged_suggestions)
+        suggestion.highlight_input = m_trimmed_query;
+    auto result_kind = m_local_query_complete && m_remote_query_complete
+        ? AutocompleteResultKind::Final
+        : AutocompleteResultKind::Intermediate;
+
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Merged autocomplete suggestions for '{}': {}", m_query, log_autocomplete_suggestions(merged_suggestions));
+    invoke_autocomplete_query_complete(*m_query_id, move(merged_suggestions), result_kind);
 }
 
 static ErrorOr<Vector<String>> parse_duckduckgo_autocomplete(JsonValue const& json)
@@ -506,7 +490,7 @@ ErrorOr<Vector<String>> Autocomplete::received_autocomplete_respsonse(Autocomple
     return Error::from_string_literal("Invalid engine name");
 }
 
-void Autocomplete::invoke_autocomplete_query_complete(Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind result_kind) const
+void Autocomplete::invoke_autocomplete_query_complete(AutocompleteQueryID query_id, Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind result_kind) const
 {
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Delivering {} autocomplete suggestion(s) as a {} result: {}",
         suggestions.size(),
@@ -514,7 +498,7 @@ void Autocomplete::invoke_autocomplete_query_complete(Vector<AutocompleteSuggest
         log_autocomplete_suggestions(suggestions));
 
     if (on_autocomplete_query_complete)
-        on_autocomplete_query_complete(move(suggestions), result_kind);
+        on_autocomplete_query_complete(query_id, move(suggestions), result_kind);
 }
 
 }

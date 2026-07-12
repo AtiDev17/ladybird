@@ -30,6 +30,7 @@
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/AutocompleteService.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HSTSStore.h>
@@ -111,18 +112,52 @@ struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
     }
 };
 
+static void append_autocomplete_bookmarks(Vector<AutocompleteBookmark>& bookmarks, ReadonlySpan<BookmarkItem> items, Optional<String> const& parent_folder)
+{
+    for (auto const& item : items) {
+        if (item.is_bookmark()) {
+            auto const& bookmark = item.bookmark();
+            bookmarks.append({
+                .url = bookmark.url.serialize(URL::ExcludeFragment::Yes),
+                .title = bookmark.title,
+                .folder = parent_folder,
+                .favicon_base64_png = bookmark.favicon_base64_png,
+            });
+            continue;
+        }
+
+        auto folder = parent_folder;
+        if (item.folder().title.has_value() && !item.folder().title->is_empty()) {
+            folder = parent_folder.has_value()
+                ? MUST(String::formatted("{} / {}", *parent_folder, *item.folder().title))
+                : *item.folder().title;
+        }
+        append_autocomplete_bookmarks(bookmarks, item.folder().children, folder);
+    }
+}
+
+static Vector<AutocompleteBookmark> autocomplete_bookmark_snapshot(BookmarkStore const& bookmark_store)
+{
+    Vector<AutocompleteBookmark> bookmarks;
+    append_autocomplete_bookmarks(bookmarks, bookmark_store.root_items(), {});
+    return bookmarks;
+}
+
 Application::Application(Optional<ByteString> ladybird_binary_path)
     : m_settings(Settings::create({}))
     , m_bookmark_store(BookmarkStore::create({}))
 {
     VERIFY(!s_the);
     s_the = this;
+    m_ui_process_cross_process_id_allocator = allocate_cross_process_id_allocator();
 
     platform_init(move(ladybird_binary_path));
 }
 
 Application::~Application()
 {
+    m_autocomplete_service.clear();
+
     // Explicitly delete the observers first, as the observer destructors will refer to Application::the().
     m_settings_observer.clear();
     m_bookmark_store_observer.clear();
@@ -620,16 +655,16 @@ void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPriva
         open_url_in_new_window(bookmark->bookmark().url, is_private);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, u64 initial_page_id, Optional<Web::HTML::NavigableId> root_navigable_id)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, u64 initial_page_id, Optional<Web::HTML::CrossProcessId> root_navigable_id)
 {
     auto request_server_handle = TRY(connect_new_request_server_client(is_private));
     auto image_decoder_handle = TRY(connect_new_image_decoder_client());
 
-    auto navigable_id_allocator = allocate_navigable_id_allocator();
-    auto root_id = root_navigable_id.value_or(navigable_id_allocator.allocate());
+    auto cross_process_id_allocator = allocate_cross_process_id_allocator();
+    auto root_id = root_navigable_id.value_or(cross_process_id_allocator.allocate());
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_id));
-    client->async_initialize(initial_page_id, root_id, navigable_id_allocator);
+    client->async_initialize(initial_page_id, root_id, cross_process_id_allocator);
     if (view.has_value())
         client->assign_view({}, *view);
 
@@ -646,10 +681,15 @@ u64 Application::allocate_page_id()
     return m_next_page_or_compositor_context_id++;
 }
 
-Web::HTML::NavigableIdAllocator Application::allocate_navigable_id_allocator()
+Web::HTML::CrossProcessIdAllocator Application::allocate_cross_process_id_allocator()
 {
-    VERIFY(m_next_navigable_id_namespace > 0);
-    return Web::HTML::NavigableIdAllocator { .namespace_id = m_next_navigable_id_namespace++ };
+    VERIFY(m_next_cross_process_id_namespace > 0);
+    return Web::HTML::CrossProcessIdAllocator { .namespace_id = m_next_cross_process_id_namespace++ };
+}
+
+Web::HTML::CrossProcessId Application::allocate_ui_process_cross_process_id()
+{
+    return m_ui_process_cross_process_id_allocator.allocate();
 }
 
 PrivateBrowsingSession& Application::ensure_private_browsing_session()
@@ -861,7 +901,7 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     return create_web_content_client(view, IsPrivate::No, allocate_page_id());
 }
 
-ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Web::HTML::NavigableId root_navigable_id)
+ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Web::HTML::CrossProcessId root_navigable_id)
 {
     auto page_id = allocate_page_id();
     auto client = TRY(create_web_content_client({}, is_private, page_id, root_navigable_id));
@@ -915,9 +955,12 @@ ErrorOr<void> Application::launch_services()
         process_did_exit(move(process), exit_status);
     };
 
+    Optional<ByteString> history_database_directory;
+
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         // FIXME: Move this to a generic "Ladybird data directory" helper.
         auto database_path = ByteString::formatted("{}/Ladybird", Core::StandardPaths::user_data_directory());
+        history_database_directory = database_path;
 
         m_database = TRY(Database::Database::create(database_path, "Ladybird"sv));
         m_history_database = TRY(Database::Database::create(database_path, "History"sv));
@@ -970,10 +1013,12 @@ ErrorOr<void> Application::launch_services()
         else
             m_storage_jar = StorageJar::create();
 
-        if (TRY(HistoryStore::migrate_schema(*m_history_database)) == Database::MigrationOutcome::Success) {
+        auto history_outcome = TRY(HistoryStore::migrate_schema(*m_history_database));
+        if (history_outcome == Database::MigrationOutcome::Success) {
             m_history_store = TRY(HistoryStore::create(*m_history_database));
         } else {
             dbgln("History database was created by a newer Ladybird version; history will not be persisted this session");
+            history_database_directory = {};
             m_history_store = HistoryStore::create();
         }
     } else {
@@ -984,6 +1029,10 @@ ErrorOr<void> Application::launch_services()
         m_hsts_store = HSTSStore::create();
         m_storage_jar = StorageJar::create();
     }
+
+    VERIFY(m_event_loop);
+    m_autocomplete_service = make<AutocompleteService>(*m_event_loop, move(history_database_directory));
+    m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(m_bookmark_store));
 
     // No need to monitor the system time zone if the TZ environment variable is set, as it overrides system preferences.
     if (!Core::Environment::has("TZ"sv)) {
@@ -1916,6 +1965,8 @@ void Application::update_bookmark_action_for_current_web_view()
 
 void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
 {
+    if (m_autocomplete_service)
+        m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(m_bookmark_store));
     m_bookmarks_menu->shrink(m_bookmarks_menu_static_size);
     create_bookmark_menu_items();
     rebuild_bookmarks_menu();

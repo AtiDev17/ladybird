@@ -1,0 +1,8 @@
+[webgl] needsDisplayListRecord after getContext: true
+[webgl] needsDisplayListRecord before draw: false
+[webgl] needsRepaint after draw: true
+[webgl] needsDisplayListRecord after draw: false
+[webgl2] needsDisplayListRecord after getContext: true
+[webgl2] needsDisplayListRecord before draw: false
+[webgl2] needsRepaint after draw: true
+[webgl2] needsDisplayListRecord after draw: false

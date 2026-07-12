@@ -8,37 +8,21 @@
 #import <Utilities/Conversions.h>
 
 static NSString* const AUTOCOMPLETE_IDENTIFIER = @"Autocomplete";
-static NSString* const AUTOCOMPLETE_SECTION_HEADER_IDENTIFIER = @"AutocompleteSectionHeader";
 static constexpr CGFloat const POPOVER_PADDING = 8;
 static constexpr CGFloat const MINIMUM_WIDTH = 100;
-static constexpr CGFloat const CELL_HORIZONTAL_PADDING = 8;
-static constexpr CGFloat const CELL_VERTICAL_PADDING = 10;
-static constexpr CGFloat const CELL_ICON_SIZE = 16;
-static constexpr CGFloat const CELL_ICON_TEXT_SPACING = 6;
-static constexpr CGFloat const CELL_LABEL_VERTICAL_SPACING = 5;
-static constexpr CGFloat const SECTION_HEADER_HORIZONTAL_PADDING = 10;
-static constexpr CGFloat const SECTION_HEADER_VERTICAL_PADDING = 4;
+static constexpr CGFloat const CELL_HORIZONTAL_PADDING = 12;
+static constexpr CGFloat const CELL_VERTICAL_PADDING = 8;
+static constexpr CGFloat const CELL_ICON_SIZE = 20;
+static constexpr CGFloat const CELL_ICON_TEXT_SPACING = 10;
+static constexpr CGFloat const CELL_LABEL_VERTICAL_SPACING = 4;
+static constexpr size_t MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS = 6;
 
 static NSFont* autocomplete_primary_font();
 static NSFont* autocomplete_secondary_font();
-static NSFont* autocomplete_section_header_font();
-
-enum class AutocompleteRowKind {
-    SectionHeader,
-    Suggestion,
-};
-
-struct AutocompleteRowModel {
-    AutocompleteRowKind kind;
-    String text;
-    size_t suggestion_index { 0 };
-};
-
 static CGFloat autocomplete_text_field_height(NSFont* font)
 {
     static CGFloat primary_text_field_height = 0;
     static CGFloat secondary_text_field_height = 0;
-    static CGFloat section_header_text_field_height = 0;
     static dispatch_once_t token;
     dispatch_once(&token, ^{
         auto* text_field = [[NSTextField alloc] initWithFrame:NSZeroRect];
@@ -52,15 +36,10 @@ static CGFloat autocomplete_text_field_height(NSFont* font)
 
         [text_field setFont:autocomplete_secondary_font()];
         secondary_text_field_height = ceil([text_field fittingSize].height);
-
-        [text_field setFont:autocomplete_section_header_font()];
-        section_header_text_field_height = ceil([text_field fittingSize].height);
     });
 
     if (font == autocomplete_secondary_font())
         return secondary_text_field_height;
-    if (font == autocomplete_section_header_font())
-        return section_header_text_field_height;
     return primary_text_field_height;
 }
 
@@ -78,12 +57,12 @@ static CGFloat autocomplete_row_height()
     return row_height;
 }
 
-static CGFloat autocomplete_section_header_height()
+static CGFloat autocomplete_single_line_row_height()
 {
     static CGFloat row_height = 0;
     static dispatch_once_t token;
     dispatch_once(&token, ^{
-        row_height = ceil(autocomplete_text_field_height(autocomplete_section_header_font()) + (SECTION_HEADER_VERTICAL_PADDING * 2));
+        row_height = ceil(max(CELL_ICON_SIZE, autocomplete_text_field_height(autocomplete_primary_font())) + (CELL_VERTICAL_PADDING * 2));
     });
     return row_height;
 }
@@ -93,7 +72,7 @@ static NSFont* autocomplete_primary_font()
     static NSFont* font;
     static dispatch_once_t token;
     dispatch_once(&token, ^{
-        font = [NSFont systemFontOfSize:[NSFont systemFontSize] weight:NSFontWeightSemibold];
+        font = [NSFont systemFontOfSize:[NSFont systemFontSize] + 1.5 weight:NSFontWeightRegular];
     });
     return font;
 }
@@ -103,17 +82,7 @@ static NSFont* autocomplete_secondary_font()
     static NSFont* font;
     static dispatch_once_t token;
     dispatch_once(&token, ^{
-        font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
-    });
-    return font;
-}
-
-static NSFont* autocomplete_section_header_font()
-{
-    static NSFont* font;
-    static dispatch_once_t token;
-    dispatch_once(&token, ^{
-        font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightSemibold];
+        font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize] + 1];
     });
     return font;
 }
@@ -140,30 +109,68 @@ static NSImage* literal_url_suggestion_icon()
     return image;
 }
 
+static NSAttributedString* autocomplete_attributed_string(StringView text, StringView highlight_input, NSFont* font, NSColor* color, bool emphasize_origin)
+{
+    auto string = MUST(String::from_utf8(text));
+    auto* ns_string = Ladybird::string_to_ns_string(string);
+    auto* attributed_string = [[NSMutableAttributedString alloc] initWithString:ns_string
+                                                                     attributes:@ {
+                                                                         NSFontAttributeName : font,
+                                                                         NSForegroundColorAttributeName : color,
+                                                                     }];
+
+    if (emphasize_origin) {
+        auto slash = text.find('/');
+        auto origin_length = slash.value_or(text.length());
+        auto origin = Ladybird::string_to_ns_string(MUST(String::from_utf8(text.substring_view(0, origin_length))));
+        [attributed_string addAttribute:NSFontAttributeName value:[NSFont systemFontOfSize:font.pointSize weight:NSFontWeightMedium] range:NSMakeRange(0, origin.length)];
+    }
+
+    for (auto const& range : WebView::autocomplete_match_ranges(highlight_input, text)) {
+        auto prefix = Ladybird::string_to_ns_string(MUST(String::from_utf8(text.substring_view(0, range.start))));
+        auto match = Ladybird::string_to_ns_string(MUST(String::from_utf8(text.substring_view(range.start, range.length))));
+        auto ns_range = NSMakeRange(prefix.length, match.length);
+        [attributed_string addAttribute:NSFontAttributeName value:[NSFont systemFontOfSize:font.pointSize weight:NSFontWeightBold] range:ns_range];
+        [attributed_string addAttribute:NSForegroundColorAttributeName value:[NSColor labelColor] range:ns_range];
+    }
+    return attributed_string;
+}
+
 static CGFloat autocomplete_visible_width(NSView* view)
 {
     auto* scroll_view = view.enclosingScrollView;
     return scroll_view ? scroll_view.contentSize.width : NSWidth(view.bounds);
 }
 
-@protocol AutocompleteTableViewHoverObserver <NSObject>
-
-- (void)autocompleteTableViewHoveredRowChanged:(NSInteger)row;
-
-@end
-
 @interface AutocompleteRowView : NSTableRowView
+@property (nonatomic) BOOL hovered;
 @end
 
 @implementation AutocompleteRowView
 
+- (void)setHovered:(BOOL)hovered
+{
+    _hovered = hovered;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawBackgroundInRect:(NSRect)dirtyRect
+{
+    if (!self.hovered || self.isSelected)
+        return;
+    auto visible_bounds = NSMakeRect(0, 0, autocomplete_visible_width(self), NSHeight(self.bounds));
+    auto* path = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(visible_bounds, 4, 2) xRadius:7 yRadius:7];
+    [[[NSColor labelColor] colorWithAlphaComponent:0.06] setFill];
+    [path fill];
+}
+
 - (void)drawSelectionInRect:(NSRect)dirtyRect
 {
     auto visible_bounds = NSMakeRect(0, 0, autocomplete_visible_width(self), NSHeight(self.bounds));
-    auto selection_rect = NSInsetRect(visible_bounds, 2, 3);
-    auto* selection_path = [NSBezierPath bezierPathWithRoundedRect:selection_rect xRadius:6 yRadius:6];
+    auto selection_rect = NSInsetRect(visible_bounds, 4, 2);
+    auto* selection_path = [NSBezierPath bezierPathWithRoundedRect:selection_rect xRadius:7 yRadius:7];
 
-    [[[NSColor controlAccentColor] colorWithAlphaComponent:0.25] setFill];
+    [[[NSColor controlAccentColor] colorWithAlphaComponent:0.16] setFill];
     [selection_path fill];
 }
 
@@ -172,6 +179,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
 @interface AutocompleteSuggestionView : NSTableCellView
 
 @property (nonatomic, strong) NSImageView* icon_view;
+@property (nonatomic, strong) NSImageView* badge_view;
 @property (nonatomic, strong) NSTextField* title_text_field;
 @property (nonatomic, strong) NSTextField* url_text_field;
 
@@ -180,34 +188,21 @@ static CGFloat autocomplete_visible_width(NSView* view)
 @implementation AutocompleteSuggestionView
 @end
 
-@interface AutocompleteSectionHeaderView : NSTableCellView
-
-@property (nonatomic, strong) NSTextField* text_field;
-
-@end
-
-@implementation AutocompleteSectionHeaderView
-@end
-
-@interface AutocompleteScrollView : NSScrollView
-@end
-
-@implementation AutocompleteScrollView
-
-- (void)scrollWheel:(NSEvent*)event
-{
-}
-
-@end
-
 @interface AutocompleteTableView : NSTableView
 
-@property (nonatomic, weak) id<AutocompleteTableViewHoverObserver> hover_observer;
 @property (nonatomic, strong) NSTrackingArea* tracking_area;
+@property (nonatomic) NSInteger hovered_row;
 
 @end
 
 @implementation AutocompleteTableView
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+    if (self = [super initWithFrame:frame])
+        self.hovered_row = -1;
+    return self;
+}
 
 - (void)updateTrackingAreas
 {
@@ -228,13 +223,22 @@ static CGFloat autocomplete_visible_width(NSView* view)
     [super mouseMoved:event];
 
     auto point = [self convertPoint:event.locationInWindow fromView:nil];
-    [self.hover_observer autocompleteTableViewHoveredRowChanged:[self rowAtPoint:point]];
+    auto row = [self rowAtPoint:point];
+    if (row == self.hovered_row)
+        return;
+    if (self.hovered_row >= 0)
+        [(AutocompleteRowView*)[self rowViewAtRow:self.hovered_row makeIfNecessary:NO] setHovered:NO];
+    self.hovered_row = row;
+    if (self.hovered_row >= 0)
+        [(AutocompleteRowView*)[self rowViewAtRow:self.hovered_row makeIfNecessary:NO] setHovered:YES];
 }
 
 - (void)mouseExited:(NSEvent*)event
 {
     [super mouseExited:event];
-    [self.hover_observer autocompleteTableViewHoveredRowChanged:-1];
+    if (self.hovered_row >= 0)
+        [(AutocompleteRowView*)[self rowViewAtRow:self.hovered_row makeIfNecessary:NO] setHovered:NO];
+    self.hovered_row = -1;
 }
 
 @end
@@ -256,10 +260,9 @@ static CGFloat autocomplete_visible_width(NSView* view)
 
 @end
 
-@interface Autocomplete () <AutocompleteTableViewHoverObserver, NSTableViewDataSource, NSTableViewDelegate>
+@interface Autocomplete () <NSTableViewDataSource, NSTableViewDelegate>
 {
     Vector<WebView::AutocompleteSuggestion> m_suggestions;
-    Vector<AutocompleteRowModel> m_rows;
 }
 
 @property (nonatomic, weak) id<AutocompleteObserver> observer;
@@ -275,8 +278,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
 - (BOOL)isSelectableRow:(NSInteger)row;
 - (CGFloat)heightOfRowAtIndex:(size_t)row;
 - (CGFloat)tableHeightForVisibleSuggestionCount:(size_t)visible_suggestion_count;
-- (void)rebuildRows;
-- (void)selectRow:(NSInteger)row notifyObserver:(BOOL)notify_observer;
+- (void)selectRow:(NSInteger)row;
 
 @end
 
@@ -306,9 +308,8 @@ static CGFloat autocomplete_visible_width(NSView* view)
         [self.table_view setDataSource:self];
         [self.table_view setDelegate:self];
         [self.table_view setTarget:self];
-        [(AutocompleteTableView*)self.table_view setHover_observer:self];
 
-        self.scroll_view = [[AutocompleteScrollView alloc] initWithFrame:NSZeroRect];
+        self.scroll_view = [[NSScrollView alloc] initWithFrame:NSZeroRect];
         [self.scroll_view setAutohidesScrollers:YES];
         [self.scroll_view setBorderType:NSNoBorder];
         [self.scroll_view setDrawsBackground:NO];
@@ -321,7 +322,10 @@ static CGFloat autocomplete_visible_width(NSView* view)
         self.content_view = [[NSView alloc] initWithFrame:NSZeroRect];
         [self.content_view setWantsLayer:YES];
         [self.content_view.layer setBackgroundColor:[NSColor windowBackgroundColor].CGColor];
-        [self.content_view.layer setCornerRadius:8];
+        [self.content_view.layer setCornerRadius:10];
+        [self.content_view.layer setMaskedCorners:kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner];
+        [self.content_view.layer setBorderWidth:1];
+        [self.content_view.layer setBorderColor:[[NSColor separatorColor] colorWithAlphaComponent:0.55].CGColor];
         [self.content_view addSubview:self.scroll_view];
         self.suggestion_icons = [NSMutableDictionary dictionary];
 
@@ -347,7 +351,6 @@ static CGFloat autocomplete_visible_width(NSView* view)
     selectedSuggestionIndex:(NSInteger)selected_suggestion_index
 {
     m_suggestions = move(suggestions);
-    [self rebuildRows];
     [self.suggestion_icons removeAllObjects];
 
     for (auto const& suggestion : m_suggestions) {
@@ -360,7 +363,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
 
     [self.table_view reloadData];
 
-    if (m_rows.is_empty())
+    if (m_suggestions.is_empty())
         [self close];
     else
         [self show];
@@ -376,7 +379,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
     else if (table_row != self.table_view.selectedRow) {
         // Refreshing the default row should not behave like an explicit
         // highlight, or the location field will re-preview the suggestion.
-        [self selectRow:table_row notifyObserver:NO];
+        [self selectRow:table_row];
     }
 }
 
@@ -409,59 +412,30 @@ static CGFloat autocomplete_visible_width(NSView* view)
     if (![self isSelectableRow:row])
         return;
 
-    [self.observer onSelectedSuggestion:m_rows[row].suggestion_index];
+    [self.observer onSelectedSuggestion:static_cast<size_t>(row)];
 }
 
 #pragma mark - Private methods
 
-- (void)rebuildRows
-{
-    m_rows.clear();
-    m_rows.ensure_capacity(m_suggestions.size() * 2);
-
-    auto current_section = WebView::AutocompleteSuggestionSection::None;
-    for (size_t suggestion_index = 0; suggestion_index < m_suggestions.size(); ++suggestion_index) {
-        auto const& suggestion = m_suggestions[suggestion_index];
-        if (suggestion.section != WebView::AutocompleteSuggestionSection::None && suggestion.section != current_section) {
-            current_section = suggestion.section;
-            m_rows.append({
-                .kind = AutocompleteRowKind::SectionHeader,
-                .text = MUST(String::from_utf8(WebView::autocomplete_section_title(current_section))),
-            });
-        }
-
-        m_rows.append({ .kind = AutocompleteRowKind::Suggestion, .text = {}, .suggestion_index = suggestion_index });
-    }
-}
-
 - (BOOL)isSelectableRow:(NSInteger)row
 {
-    if (row < 0 || row >= static_cast<NSInteger>(m_rows.size()))
+    if (row < 0 || row >= static_cast<NSInteger>(m_suggestions.size()))
         return NO;
-    return m_rows[row].kind == AutocompleteRowKind::Suggestion;
+    return YES;
 }
 
 - (NSInteger)tableRowForSuggestionIndex:(NSInteger)suggestion_index
 {
-    if (suggestion_index < 0)
+    if (suggestion_index < 0 || suggestion_index >= static_cast<NSInteger>(m_suggestions.size()))
         return NSNotFound;
-
-    for (size_t row = 0; row < m_rows.size(); ++row) {
-        auto const& row_model = m_rows[row];
-        if (row_model.kind == AutocompleteRowKind::Suggestion
-            && row_model.suggestion_index == static_cast<size_t>(suggestion_index))
-            return static_cast<NSInteger>(row);
-    }
-
-    return NSNotFound;
+    return suggestion_index;
 }
 
 - (CGFloat)heightOfRowAtIndex:(size_t)row
 {
-    VERIFY(row < m_rows.size());
-    return m_rows[row].kind == AutocompleteRowKind::SectionHeader
-        ? autocomplete_section_header_height()
-        : autocomplete_row_height();
+    VERIFY(row < m_suggestions.size());
+    auto const& suggestion = m_suggestions[row];
+    return suggestion.title.has_value() ? autocomplete_row_height() : autocomplete_single_line_row_height();
 }
 
 - (CGFloat)tableHeightForVisibleSuggestionCount:(size_t)visible_suggestion_count
@@ -472,27 +446,14 @@ static CGFloat autocomplete_visible_width(NSView* view)
     CGFloat total_height = 0;
     size_t seen_suggestion_count = 0;
 
-    for (size_t row = 0; row < m_rows.size(); ++row) {
+    for (size_t row = 0; row < m_suggestions.size(); ++row) {
         total_height += [self heightOfRowAtIndex:row];
-        if (m_rows[row].kind == AutocompleteRowKind::Suggestion) {
-            ++seen_suggestion_count;
-            if (seen_suggestion_count >= visible_suggestion_count)
-                break;
-        }
+        ++seen_suggestion_count;
+        if (seen_suggestion_count >= visible_suggestion_count)
+            break;
     }
 
     return ceil(total_height);
-}
-
-- (void)autocompleteTableViewHoveredRowChanged:(NSInteger)row
-{
-    if (![self isSelectableRow:row])
-        return;
-
-    if (row == self.table_view.selectedRow)
-        return;
-
-    [self selectRow:row notifyObserver:YES];
 }
 
 - (void)show
@@ -503,13 +464,10 @@ static CGFloat autocomplete_visible_width(NSView* view)
         return;
     auto was_visible = self.popup_window.isVisible;
 
-    size_t visible_suggestion_count = 0;
-    for (auto const& row_model : m_rows) {
-        if (row_model.kind == AutocompleteRowKind::Suggestion)
-            ++visible_suggestion_count;
-    }
+    auto visible_suggestion_count = min(m_suggestions.size(), MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS);
 
     auto visible_table_height = [self tableHeightForVisibleSuggestionCount:visible_suggestion_count];
+    auto full_table_height = [self tableHeightForVisibleSuggestionCount:m_suggestions.size()];
     auto width = max<CGFloat>(toolbar_view.frame.size.width, MINIMUM_WIDTH);
     auto content_size = NSMakeSize(width, visible_table_height + (POPOVER_PADDING * 2));
 
@@ -517,7 +475,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
     [self.scroll_view setFrame:NSInsetRect(self.content_view.bounds, 0, POPOVER_PADDING)];
 
     CGFloat document_width = self.scroll_view.contentSize.width;
-    [self.table_view setFrame:NSMakeRect(0, 0, document_width, visible_table_height)];
+    [self.table_view setFrame:NSMakeRect(0, 0, document_width, full_table_height)];
 
     if (auto* column = self.table_view.tableColumns.firstObject)
         [column setWidth:document_width];
@@ -540,26 +498,19 @@ static CGFloat autocomplete_visible_width(NSView* view)
 }
 
 - (void)selectRow:(NSInteger)row
-    notifyObserver:(BOOL)notify_observer
 {
     if (![self isSelectableRow:row])
         return;
 
     [self.table_view selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
     [self.table_view scrollRowToVisible:[self.table_view selectedRow]];
-
-    if (notify_observer) {
-        auto row = [self.table_view selectedRow];
-        if ([self isSelectableRow:row])
-            [self.observer onHighlightedSuggestion:m_rows[row].suggestion_index];
-    }
 }
 
 #pragma mark - NSTableViewDataSource
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView*)tableView
 {
-    return static_cast<NSInteger>(m_rows.size());
+    return static_cast<NSInteger>(m_suggestions.size());
 }
 
 #pragma mark - NSTableViewDelegate
@@ -582,37 +533,6 @@ static CGFloat autocomplete_visible_width(NSView* view)
 {
     auto visible_width = autocomplete_visible_width(table_view);
 
-    auto const& row_model = m_rows[row];
-    if (row_model.kind == AutocompleteRowKind::SectionHeader) {
-        AutocompleteSectionHeaderView* view = (AutocompleteSectionHeaderView*)[table_view makeViewWithIdentifier:AUTOCOMPLETE_SECTION_HEADER_IDENTIFIER owner:self];
-
-        if (view == nil) {
-            view = [[AutocompleteSectionHeaderView alloc] initWithFrame:NSZeroRect];
-
-            NSTextField* text_field = [[NSTextField alloc] initWithFrame:NSZeroRect];
-            [text_field setBezeled:NO];
-            [text_field setDrawsBackground:NO];
-            [text_field setEditable:NO];
-            [text_field setFont:autocomplete_section_header_font()];
-            [text_field setSelectable:NO];
-            [view addSubview:text_field];
-            [view setText_field:text_field];
-            [view setIdentifier:AUTOCOMPLETE_SECTION_HEADER_IDENTIFIER];
-        }
-
-        auto* header_text = Ladybird::string_to_ns_string(row_model.text);
-        auto header_height = autocomplete_text_field_height(autocomplete_section_header_font());
-        [view setFrame:NSMakeRect(0, 0, visible_width, [self tableView:table_view heightOfRow:row])];
-        [view.text_field setStringValue:header_text];
-        [view.text_field setTextColor:[NSColor tertiaryLabelColor]];
-        [view.text_field setFrame:NSMakeRect(
-                                      SECTION_HEADER_HORIZONTAL_PADDING,
-                                      floor((NSHeight(view.bounds) - header_height) / 2.f),
-                                      NSWidth(view.bounds) - (SECTION_HEADER_HORIZONTAL_PADDING * 2),
-                                      header_height)];
-        return view;
-    }
-
     AutocompleteSuggestionView* view = (AutocompleteSuggestionView*)[table_view makeViewWithIdentifier:AUTOCOMPLETE_IDENTIFIER owner:self];
 
     if (view == nil) {
@@ -622,6 +542,13 @@ static CGFloat autocomplete_visible_width(NSView* view)
         [icon_view setImageScaling:NSImageScaleProportionallyDown];
         [view addSubview:icon_view];
         [view setIcon_view:icon_view];
+
+        NSImageView* badge_view = [[NSImageView alloc] initWithFrame:NSZeroRect];
+        [badge_view setImageScaling:NSImageScaleProportionallyDown];
+        [badge_view setImage:[NSImage imageWithSystemSymbolName:@"star.fill" accessibilityDescription:@""]];
+        [badge_view setContentTintColor:[NSColor secondaryLabelColor]];
+        [view addSubview:badge_view];
+        [view setBadge_view:badge_view];
 
         NSTextField* title_text_field = [[NSTextField alloc] initWithFrame:NSZeroRect];
         [title_text_field setBezeled:NO];
@@ -645,15 +572,16 @@ static CGFloat autocomplete_visible_width(NSView* view)
         [view setIdentifier:AUTOCOMPLETE_IDENTIFIER];
     }
 
-    auto const& suggestion = m_suggestions[row_model.suggestion_index];
+    auto const& suggestion = m_suggestions[row];
     auto* suggestion_text = Ladybird::string_to_ns_string(suggestion.text);
+    auto suggestion_display_text = WebView::autocomplete_suggestion_display_text(suggestion);
     auto* title_text = suggestion.title.has_value() ? Ladybird::string_to_ns_string(*suggestion.title) : nil;
-    auto* secondary_text = suggestion.subtitle.has_value() ? Ladybird::string_to_ns_string(*suggestion.subtitle) : suggestion_text;
     auto* favicon = [self.suggestion_icons objectForKey:suggestion_text];
     auto* icon = suggestion.source == WebView::AutocompleteSuggestionSource::LiteralURL
         ? literal_url_suggestion_icon()
         : suggestion.source == WebView::AutocompleteSuggestionSource::Search ? search_suggestion_icon()
-                                                                             : favicon;
+        : favicon != nil                                                     ? favicon
+                                                                             : literal_url_suggestion_icon();
 
     [view setFrame:NSMakeRect(0, 0, visible_width, [self tableView:table_view heightOfRow:row])];
 
@@ -668,16 +596,24 @@ static CGFloat autocomplete_visible_width(NSView* view)
                                  CELL_ICON_SIZE,
                                  CELL_ICON_SIZE)];
     [view.icon_view setImage:icon];
-    [view.icon_view setContentTintColor:suggestion.source != WebView::AutocompleteSuggestionSource::History ? [NSColor secondaryLabelColor] : nil];
-    [view.icon_view setHidden:(icon == nil)];
+    auto is_local_suggestion = suggestion.source == WebView::AutocompleteSuggestionSource::History
+        || suggestion.source == WebView::AutocompleteSuggestionSource::Bookmark
+        || suggestion.source == WebView::AutocompleteSuggestionSource::Adaptive;
+    [view.icon_view setContentTintColor:!is_local_suggestion || favicon == nil ? [NSColor secondaryLabelColor] : nil];
+    [view.icon_view setHidden:NO];
+    static constexpr CGFloat badge_size = 9;
+    [view.badge_view setFrame:NSMakeRect(CELL_HORIZONTAL_PADDING + CELL_ICON_SIZE - badge_size + 2,
+                                  floor((NSHeight(view.bounds) - CELL_ICON_SIZE) / 2.f) - 2,
+                                  badge_size,
+                                  badge_size)];
+    [view.badge_view setHidden:suggestion.source != WebView::AutocompleteSuggestionSource::Bookmark];
 
     if (title_text != nil) {
         CGFloat text_block_height = primary_text_height + CELL_LABEL_VERTICAL_SPACING + secondary_text_height;
         CGFloat text_block_origin_y = floor((NSHeight(view.bounds) - text_block_height) / 2.f);
 
         [view.title_text_field setHidden:NO];
-        [view.title_text_field setStringValue:title_text];
-        [view.title_text_field setTextColor:[NSColor textColor]];
+        [view.title_text_field setAttributedStringValue:autocomplete_attributed_string(suggestion.title->bytes_as_string_view(), suggestion.highlight_input, autocomplete_primary_font(), [NSColor textColor], false)];
         [view.title_text_field setFrame:NSMakeRect(
                                             text_origin_x,
                                             text_block_origin_y + secondary_text_height + CELL_LABEL_VERTICAL_SPACING,
@@ -694,7 +630,7 @@ static CGFloat autocomplete_visible_width(NSView* view)
     } else {
         [view.title_text_field setHidden:YES];
 
-        [view.url_text_field setFont:[NSFont systemFontOfSize:[NSFont systemFontSize]]];
+        [view.url_text_field setFont:autocomplete_primary_font()];
         [view.url_text_field setTextColor:[NSColor textColor]];
         [view.url_text_field setFrame:NSMakeRect(
                                           text_origin_x,
@@ -703,7 +639,13 @@ static CGFloat autocomplete_visible_width(NSView* view)
                                           primary_text_height)];
     }
 
-    [view.url_text_field setStringValue:(title_text != nil ? secondary_text : suggestion_text)];
+    auto secondary_string = suggestion.subtitle.has_value() ? suggestion.subtitle->bytes_as_string_view() : suggestion_display_text.bytes_as_string_view();
+    auto* secondary_font = title_text != nil ? autocomplete_secondary_font() : autocomplete_primary_font();
+    auto* secondary_color = title_text != nil || suggestion.source == WebView::AutocompleteSuggestionSource::Search
+        ? [NSColor secondaryLabelColor]
+        : [NSColor textColor];
+    auto emphasize_origin = suggestion.source != WebView::AutocompleteSuggestionSource::Search && !suggestion.subtitle.has_value();
+    [view.url_text_field setAttributedStringValue:autocomplete_attributed_string(secondary_string, suggestion.highlight_input, secondary_font, secondary_color, emphasize_origin)];
     return view;
 }
 

@@ -78,7 +78,7 @@ public:
     using NavigationParamsVariant = Variant<NullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
     void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document);
-    void set_id_for_session_history_reconstruction(NavigableId id) { set_id(id); }
+    void set_id_for_session_history_reconstruction(CrossProcessId id) { set_id(id); }
 
     void register_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
     void unregister_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
@@ -191,7 +191,7 @@ public:
         GC::Ptr<Fetch::Infrastructure::Response> response = nullptr;
         bool exceptions_enabled = false;
         Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto;
-        Optional<SerializationRecord> navigation_api_state = {};
+        Optional<StorageSerializationRecord> navigation_api_state = {};
         Optional<Vector<XHR::FormDataEntry>> form_data_entry_list = {};
         ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
         UserNavigationInvolvement user_involvement = UserNavigationInvolvement::None;
@@ -207,7 +207,7 @@ public:
 
     bool allowed_by_sandboxing_to_navigate(LocalNavigable const& target, SourceSnapshotParams const&);
 
-    void reload(Optional<SerializationRecord> navigation_api_state = {}, UserNavigationInvolvement = UserNavigationInvolvement::None);
+    void reload(Optional<StorageSerializationRecord> navigation_api_state = {}, UserNavigationInvolvement = UserNavigationInvolvement::None);
 
     // https://github.com/whatwg/html/issues/9690
     [[nodiscard]] bool has_been_destroyed() const { return m_has_been_destroyed; }
@@ -266,6 +266,7 @@ public:
 
     bool needs_repaint() const { return m_needs_repaint; }
     void set_needs_repaint() { m_needs_repaint = true; }
+    bool needs_to_record_display_list() const { return m_needs_to_record_display_list; }
     void set_needs_to_record_display_list() { m_needs_to_record_display_list = true; }
     void repaint_after_compositor_process_reconnect();
 
@@ -320,7 +321,7 @@ private:
     void begin_navigation(NavigateParams);
     void queue_pending_navigation(NavigateParams, PendingNavigationBehavior);
     void process_pending_navigations();
-    void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<SerializationRecord> navigation_api_state, String navigation_id);
+    void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<StorageSerializationRecord> navigation_api_state, String navigation_id);
     void navigate_to_a_javascript_url(URL::URL const&, HistoryHandlingBehavior, GC::Ref<SourceSnapshotParams>, URL::Origin const& initiator_origin, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, InitialInsertion, String navigation_id);
 
     void reset_cursor_blink_cycle();
@@ -416,7 +417,7 @@ public:
     bool download_handled = false;
 
     Optional<URL::URL> redirected_url;
-    Optional<SerializationRecord> classic_history_api_state;
+    Optional<StorageSerializationRecord> classic_history_api_state;
     RefPtr<DocumentState> replacement_document_state;
     bool resource_cleared = false;
 
@@ -432,6 +433,6 @@ Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navi
     LocalNavigable& parent_navigable, LocalNavigable& child_navigable, SessionHistoryEntry& history_entry);
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
 void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Optional<String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
-void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<SerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
+void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
 
 }

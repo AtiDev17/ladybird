@@ -16,7 +16,7 @@
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#dompointreadonly
-class DOMPointReadOnly
+class WEB_API DOMPointReadOnly
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(DOMPointReadOnly, Bindings::PlatformObject);
@@ -37,8 +37,8 @@ public:
 
     WebIDL::ExceptionOr<GC::Ref<DOMPoint>> matrix_transform(Bindings::DOMMatrixInit&) const;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 protected:
     DOMPointReadOnly(JS::Realm&, double x, double y, double z, double w);

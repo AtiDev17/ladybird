@@ -52,6 +52,7 @@ static constexpr StringView sql_error(int error_code)
     __ENUMERATE_TYPE(u32)                \
     __ENUMERATE_TYPE(unsigned long)      \
     __ENUMERATE_TYPE(unsigned long long) \
+    __ENUMERATE_TYPE(double)             \
     __ENUMERATE_TYPE(bool)
 
 ErrorOr<NonnullRefPtr<Database>> Database::create_memory_backed()
@@ -115,6 +116,42 @@ void Database::execute_statement_internal(StatementID statement_id, OnResult on_
     }
 }
 
+Database::StatementExecutionOutcome Database::execute_interruptible_statement_internal(StatementID statement_id, OnResult on_result)
+{
+    auto* statement = prepared_statement(statement_id);
+
+    while (true) {
+        auto result = sqlite3_step(statement);
+
+        switch (result) {
+        case SQLITE_DONE:
+            SQL_MUST(sqlite3_reset(statement));
+            return StatementExecutionOutcome::Completed;
+
+        case SQLITE_ROW:
+            if (on_result)
+                on_result(statement_id);
+            continue;
+
+        case SQLITE_INTERRUPT:
+            // sqlite3_reset() reports the interrupted statement's error code, so intentionally ignore
+            // its result here. Resetting still makes the prepared statement reusable.
+            sqlite3_reset(statement);
+            return StatementExecutionOutcome::Interrupted;
+
+        default:
+            sqlite3_reset(statement);
+            warnln("\033[31;1mDatabase error\033[0m: {}: {}", sql_error(result), sqlite3_errmsg(m_database));
+            VERIFY_NOT_REACHED();
+        }
+    }
+}
+
+void Database::interrupt()
+{
+    sqlite3_interrupt(m_database);
+}
+
 ErrorOr<void> Database::try_execute_statement_internal(StatementID statement_id, OnResult on_result)
 {
     auto* statement = prepared_statement(statement_id);
@@ -172,6 +209,8 @@ ErrorOr<void> Database::try_apply_placeholder(StatementID statement_id, int inde
         SQL_TRY(sqlite3_bind_blob(statement, index, value.characters(), static_cast<int>(value.length()), SQLITE_TRANSIENT));
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         TRY(try_apply_placeholder(statement_id, index, value.offset_to_epoch().to_milliseconds()));
+    } else if constexpr (IsSame<ValueType, double>) {
+        SQL_TRY(sqlite3_bind_double(statement, index, value));
     } else if constexpr (IsIntegral<ValueType>) {
         if constexpr (sizeof(ValueType) <= sizeof(int))
             SQL_TRY(sqlite3_bind_int(statement, index, static_cast<int>(value)));
@@ -205,6 +244,8 @@ ValueType Database::result_column(StatementID statement_id, int column)
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         auto milliseconds = result_column<sqlite3_int64>(statement_id, column);
         return UnixDateTime::from_milliseconds_since_epoch(milliseconds);
+    } else if constexpr (IsSame<ValueType, double>) {
+        return sqlite3_column_double(statement, column);
     } else if constexpr (IsIntegral<ValueType>) {
         if constexpr (sizeof(ValueType) <= sizeof(int))
             return static_cast<ValueType>(sqlite3_column_int(statement, column));
@@ -378,6 +419,14 @@ ErrorOr<void> Database::set_synchronous_pragma(Synchronous synchronous)
     auto pragma = ByteString::formatted("PRAGMA synchronous={};", synchronous_string);
     TRY(execute_raw(pragma));
 
+    return {};
+}
+
+ErrorOr<void> Database::set_busy_timeout(i32 milliseconds)
+{
+    if (milliseconds < 0)
+        return Error::from_string_literal("Database busy timeout must not be negative");
+    SQL_TRY(sqlite3_busy_timeout(m_database, milliseconds));
     return {};
 }
 

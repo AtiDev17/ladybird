@@ -218,7 +218,7 @@ static bool session_history_entry_descriptors_are_valid(Vector<SessionHistoryEnt
 }
 
 struct SessionHistoryEntryReconstructionState {
-    HashMap<u64, RefPtr<DocumentState>> document_states;
+    HashMap<CrossProcessId, RefPtr<DocumentState>> document_states;
 };
 
 static NonnullRefPtr<SessionHistoryEntry> create_session_history_entry_from_ui_process(SessionHistoryEntryDescriptor, SessionHistoryEntryReconstructionState&);
@@ -243,7 +243,7 @@ static void populate_nested_histories_from_ui_process(DocumentState& document_st
         // FIXME: This is temporary glue for the current load-then-seed ordering.
         //        A replacement WebContent process can create live child navigables
         //        before the UI process sends its canonical session-history tree.
-        //        Now that nested history ids are canonical NavigableIds, the UI id
+        //        Now that nested history ids are canonical CrossProcessIds, the UI id
         //        must win; retarget the already-created child to match it. The
         //        longer-term model should avoid creating a distinct temporary id
         //        for a child the UI process already knows about.
@@ -289,6 +289,7 @@ static void apply_session_history_entry_descriptor_from_ui_process(SessionHistor
 
 static void apply_session_history_document_state_descriptor_from_ui_process(DocumentState& document_state, SessionHistoryDocumentStateDescriptor const& document_state_descriptor)
 {
+    document_state.set_cross_process_id(document_state_descriptor.id);
     document_state.set_history_policy_container(document_state_descriptor.history_policy_container);
     document_state.set_request_referrer(document_state_descriptor.request_referrer);
     document_state.set_request_referrer_policy(document_state_descriptor.request_referrer_policy);
@@ -297,25 +298,21 @@ static void apply_session_history_document_state_descriptor_from_ui_process(Docu
     document_state.set_about_base_url(document_state_descriptor.about_base_url);
     document_state.set_resource(document_state_descriptor.resource);
     document_state.set_reload_pending(document_state_descriptor.reload_pending);
-    // AD-HOC: Descriptor ID 0 marks a provisional UI-created document state whose entry has not yet been populated
-    //         by WebContent. Treat it as already populated when reseeding the active entry, since a replacement
-    //         WebContent process already has the active document for that entry.
-    document_state.set_ever_populated(document_state_descriptor.id == 0 ? true : document_state_descriptor.ever_populated);
+    // AD-HOC: A UI-created document state can still be provisional when reseeded into WebContent. Do not let that
+    //         stale mirror state make an already-populated live document state appear unpopulated again.
+    document_state.set_ever_populated(document_state.ever_populated() || document_state_descriptor.ever_populated);
     document_state.set_navigable_target_name(document_state_descriptor.navigable_target_name);
 }
 
 static RefPtr<DocumentState> get_or_create_document_state_from_ui_process(SessionHistoryDocumentStateDescriptor const& document_state_descriptor, SessionHistoryEntryReconstructionState& reconstruction_state)
 {
     RefPtr<DocumentState> document_state;
-    if (document_state_descriptor.id != 0) {
-        if (auto existing_document_state = reconstruction_state.document_states.get(document_state_descriptor.id); existing_document_state.has_value())
-            document_state = *existing_document_state;
-    }
+    if (auto existing_document_state = reconstruction_state.document_states.get(document_state_descriptor.id); existing_document_state.has_value())
+        document_state = *existing_document_state;
 
     if (!document_state) {
         document_state = DocumentState::create();
-        if (document_state_descriptor.id != 0)
-            reconstruction_state.document_states.set(document_state_descriptor.id, document_state);
+        reconstruction_state.document_states.set(document_state_descriptor.id, document_state);
     }
 
     apply_session_history_document_state_descriptor_from_ui_process(*document_state, document_state_descriptor);
@@ -378,12 +375,12 @@ bool LocalTraversableNavigable::replace_top_level_session_history_entries_from_u
         //     incomplete or stale snapshot. Same-document history updates are committed synchronously in WebContent,
         //     while the UI-process mirror is necessarily fed by async IPC. If that mirror sends back an older current
         //     entry, accepting it would clobber the active document's live latest entry and make a queued traversal
-        //     target unreachable. Rejecting the seed lets the UI process converge from WebContent's current snapshot
-        //     instead. Descriptor ID 0 means the UI process only has a provisional document state; do not apply that
-        //     to a live non-initial document. Process-swap/preload seeds still go through the initial about:blank path
-        //     above.
+        //     target unreachable. A provisional descriptor is UI-owned state, not an authoritative description of an
+        //     already-live current document. The broader model should move toward a narrower seed-ack contract or
+        //     targeted UI-process mutations instead of sending a full async mirror back as authoritative state.
+        //     Process-swap/preload seeds still go through the initial about:blank path above.
         auto const& current_entry_from_ui_process = entries_from_ui_process[current_top_level_entry_index];
-        if (current_entry_from_ui_process.document_state.id == 0)
+        if (current_entry_from_ui_process.document_state.is_provisional)
             return false;
         // NB: Nested histories can be UI-owned state that is intentionally restored after the current top-level
         //     document has loaded. The live latest entry must still match the UI seed's top-level state, but requiring
@@ -437,11 +434,9 @@ bool LocalTraversableNavigable::replace_top_level_session_history_entries_from_u
     }
 
     SessionHistoryEntryReconstructionState reconstruction_state;
-    if (entries_from_ui_process[current_top_level_entry_index].document_state.id != 0) {
-        auto active_document_state = active_entry->document_state();
-        VERIFY(active_document_state);
-        reconstruction_state.document_states.set(entries_from_ui_process[current_top_level_entry_index].document_state.id, active_document_state);
-    }
+    auto active_document_state = active_entry->document_state();
+    VERIFY(active_document_state);
+    reconstruction_state.document_states.set(entries_from_ui_process[current_top_level_entry_index].document_state.id, active_document_state);
 
     Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
     entries.ensure_capacity(entries_from_ui_process.size());
@@ -1227,10 +1222,9 @@ void ApplyHistoryStepState::start()
                         ContentSecurityPolicy::Directives::Directive::NavigationType::Other, allow_POST,
                         GC::create_function(this->heap(), [this, after_document_populated, navigable](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
                             VERIFY(m_traversable->active_window());
-                            // AD-HOC: Queue with navigable's active Document instead of using queue_global_task(active_window).
-                            //         During initial about:blank Window reuse, active_window()->associated_document() can already be
-                            //         the pending Document. This continuation must stay runnable against the current active Document.
-                            queue_a_task(Task::Source::NavigationAndTraversal, nullptr, navigable->active_document(), GC::create_function(heap(), [after_document_populated, output]() {
+                            // AD-HOC: Queue through the apply-history helper so child completion tasks survive frame
+                            //         removal/deactivation. The continuation revalidates the navigable before applying.
+                            queue_apply_history_step_task(*navigable, navigable->active_document(), GC::create_function(heap(), [after_document_populated, output]() {
                                 after_document_populated->function()(output);
                             }));
                         }));
@@ -1495,7 +1489,9 @@ LocalTraversableNavigable::SessionHistorySnapshot LocalTraversableNavigable::cre
 
     Vector<SessionHistoryEntryDescriptor> top_level_session_history_entries;
     top_level_session_history_entries.ensure_capacity(session_history_entries().size());
-    SessionHistoryEntryDescriptorCreationState creation_state;
+    SessionHistoryEntryDescriptorCreationState creation_state { [this] {
+        return page().client().allocate_cross_process_id();
+    } };
     for (auto const& entry : session_history_entries())
         top_level_session_history_entries.unchecked_append(create_session_history_entry_descriptor(entry, creation_state));
 

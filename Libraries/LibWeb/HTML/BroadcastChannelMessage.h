@@ -20,7 +20,7 @@ struct WEB_API BroadcastChannelMessage {
     StorageAPI::StorageKey storage_key;
     Utf16String channel_name;
     URL::Origin source_origin;
-    SerializationRecord serialized_message;
+    IPCSerializationRecord serialized_message;
     pid_t source_process_id { -1 };
     u64 source_channel_id { 0 };
 };

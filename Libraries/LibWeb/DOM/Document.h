@@ -921,6 +921,25 @@ public:
         return true;
     }
 
+    // Style scopes (the document or shadow roots) that have scheduled pending :has() invalidations, so flushing
+    // doesn't have to iterate every scope in the document.
+    void register_style_scope_with_pending_has_invalidations(Node& document_or_shadow_root)
+    {
+        m_style_scopes_with_pending_has_invalidations.append(document_or_shadow_root);
+    }
+
+    void unregister_style_scope_with_pending_has_invalidations(Node& document_or_shadow_root)
+    {
+        m_style_scopes_with_pending_has_invalidations.remove_first_matching([&](auto const& node) { return node.ptr() == &document_or_shadow_root; });
+    }
+
+    [[nodiscard]] Vector<GC::Ref<Node>> take_style_scopes_with_pending_has_invalidations()
+    {
+        return move(m_style_scopes_with_pending_has_invalidations);
+    }
+
+    CSS::SheetSetStyleCacheRegistry& sheet_set_style_cache_registry() { return m_sheet_set_style_cache_registry; }
+
     // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
     struct StyleInvalidationCounters {
         u64 has_ancestor_walk_invocations { 0 };
@@ -928,6 +947,7 @@ public:
         u64 has_ancestor_sibling_element_checks { 0 };
         u64 has_invalidation_metadata_candidates { 0 };
         u64 has_invalidation_rule_cache_builds { 0 };
+        u64 has_flush_scopes_examined { 0 };
         u64 has_match_invocations { 0 };
         u64 has_result_cache_hits { 0 };
         u64 has_result_cache_misses { 0 };
@@ -941,6 +961,8 @@ public:
         u64 descendant_slot_invalidation_subtree_scans { 0 };
         u64 media_rule_evaluations { 0 };
         u64 registered_properties_cache_rebuilds { 0 };
+        u64 style_sheet_invalidation_set_builds { 0 };
+        u64 scope_rule_cache_builds { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const;
@@ -1567,6 +1589,8 @@ private:
     bool m_needs_accumulated_visual_contexts_update { false };
     Vector<WeakPtr<Painting::Paintable>> m_paintable_boxes_needing_visual_context_value_update;
     bool m_needs_invalidation_of_elements_affected_by_has { false };
+    Vector<GC::Ref<Node>> m_style_scopes_with_pending_has_invalidations;
+    CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 

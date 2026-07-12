@@ -43,6 +43,18 @@ void ShadowRoot::finalize()
     document().unregister_shadow_root({}, *this);
 }
 
+void ShadowRoot::adopted_from(Document& old_document)
+{
+    Base::adopted_from(old_document);
+
+    // The document tracks its shadow roots for document-wide walks (media invalidation, user style changes,
+    // tree-scoped name lookups), so adoption has to move this shadow root to the new document's list.
+    old_document.unregister_shadow_root({}, *this);
+    document().register_shadow_root({}, *this);
+
+    m_style_scope.node_was_adopted_from(old_document);
+}
+
 // https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
 GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
 {

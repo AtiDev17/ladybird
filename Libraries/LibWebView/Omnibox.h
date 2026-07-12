@@ -24,10 +24,11 @@ class WEBVIEW_API OmniboxSuggestionProvider {
 public:
     virtual ~OmniboxSuggestionProvider() = default;
 
-    Function<void(Vector<AutocompleteSuggestion>, AutocompleteResultKind)> on_suggestions;
+    Function<void(AutocompleteQueryID, Vector<AutocompleteSuggestion>)> on_suggestions;
 
-    virtual void query(String, size_t max_suggestions) = 0;
+    virtual void query(AutocompleteQueryID, String, size_t max_suggestions) = 0;
     virtual void cancel() = 0;
+    virtual void record_engagement(OmniboxEngagement) { }
 };
 
 // The state machine behind a browser location bar editing session.
@@ -45,13 +46,10 @@ public:
 //   - RowPreview:      the text of a highlighted suggestion that does not extend the query, shown fully
 //                      selected. The query is retained and restored when the popup goes away.
 //
-// The invariant that makes Enter trustworthy: whatever state we are in, on_commit carries exactly what the
-// bar displays. Enter resolves in this order: user-edited text is committed verbatim; otherwise, if the
-// visible popup rows belong to the current query, the selected row is activated; otherwise the rows are
-// stale (the user typed faster than suggestions arrive), so the query is re-run and the activation happens
-// as soon as a result worth acting on comes back. The predecessor of this model derived all of that from
-// widget selection offsets and a pile of latched booleans, and most omnibox bugs were one of those going
-// stale relative to what was actually on screen.
+// The invariant that makes Enter trustworthy: a selected row is activated only when it belongs to the
+// current query generation or the user selected it explicitly. When results lag behind fast typing, Enter
+// immediately commits the current input through the browser's normal URL-or-search resolution. It never
+// waits for a provider response that may arrive after the user's intent has changed.
 class WEBVIEW_API Omnibox {
     AK_MAKE_NONCOPYABLE(Omnibox);
     AK_MAKE_NONMOVABLE(Omnibox);
@@ -80,13 +78,13 @@ public:
     void show_all_suggestions();
     void text_edited(String text, bool cursor_at_end);
     void cursor_moved(bool cursor_at_end);
+    bool accept_completion();
     void will_delete_text();
     void return_pressed();
     EscapeAction escape_pressed();
     void popup_dismissed();
     bool select_next_suggestion();
     bool select_previous_suggestion();
-    void suggestion_hovered(size_t suggestion_index);
     void suggestion_clicked(size_t suggestion_index);
 
     // State for the chrome:
@@ -113,13 +111,12 @@ private:
         RowPreview,
     };
 
-    // The selection carries its own origin, so a "user choice" verdict cannot outlive or predate the row
-    // it is about. A deliberate choice wins over m_user_rejected_completion on Enter and survives
-    // Escape's completion-preserving path.
+    // The selection carries its own origin, so an explicit-choice verdict cannot outlive or predate the
+    // row it is about.
     struct Selection {
         enum class Origin {
             Automatic,
-            UserChoice,
+            ExplicitChoice,
         };
 
         size_t index { 0 };
@@ -136,12 +133,17 @@ private:
         Previous,
     };
 
-    void received_suggestions(Vector<AutocompleteSuggestion>, AutocompleteResultKind);
+    void start_query();
+    void received_suggestions(AutocompleteQueryID, Vector<AutocompleteSuggestion>);
+    void stabilize_automatic_default(Vector<AutocompleteSuggestion>&, bool is_same_generation_refresh) const;
     Optional<size_t> update_completion_for_suggestions(Vector<AutocompleteSuggestion> const&);
     bool select_adjacent_suggestion(StepDirection);
-    void highlight_suggestion(size_t suggestion_index);
+    void highlight_suggestion(size_t suggestion_index, Selection::Origin);
+    void display_suggestion(size_t suggestion_index);
     void activate_selected_suggestion();
+    void commit_suggestion(size_t suggestion_index, bool record_engagement, bool was_explicit);
     void commit_suggestion_text(String);
+    void commit_verbatim(String);
     void adopt_display_text_as_query();
     void apply_completion(String suggestion_text, String completion_text);
     void apply_preview(String suggestion_text);
@@ -152,7 +154,7 @@ private:
     void abandon_popup_session();
     void set_selection(Optional<Selection>);
     void commit(String text);
-    bool selection_is_user_choice() const;
+    bool selection_is_explicit() const;
     bool completion_is_suppressed() const;
 
     NonnullOwnPtr<OmniboxSuggestionProvider> m_provider;
@@ -177,23 +179,25 @@ private:
     // InlineCompleted: the suggestion whose text supplied the completion suffix.
     Optional<String> m_completion_suggestion;
 
+    // Accepting a completion makes the full display text the next query, but committing it without
+    // another edit must still teach the prefix that produced the completion.
+    Optional<String> m_retained_engagement_input;
+
     // The user deleted or typed over a completion, so Enter must submit the query as typed instead of
     // activating the popup's automatically selected row. Cleared as soon as a fresh completion is applied.
     bool m_user_rejected_completion { false };
 
     CompletionSuppression m_completion_suppression { Empty {} };
 
-    // m_popup_query records which query produced the rows on display. Rows can lag the query, since
-    // intermediate results do not repaint a visible popup and remote results arrive late; comparing it
-    // against m_query is how Enter distinguishes "activate what the user sees" from "wait for results".
-    // The rows survive close_popup() so the arrow keys can bring a dismissed popup back.
+    // The query ID makes provider delivery and popup freshness independent of comparing user-facing
+    // strings. The rows survive close_popup() so the arrow keys can bring a dismissed popup back.
     bool m_popup_visible { false };
-    String m_popup_query;
+    Optional<AutocompleteQueryID> m_popup_query_id;
     Vector<AutocompleteSuggestion> m_suggestions;
     Optional<Selection> m_selection;
 
-    // Enter was pressed while the popup rows were stale; activate as soon as fresh results arrive.
-    Optional<String> m_pending_activation_query;
+    u64 m_next_query_id { 0 };
+    Optional<AutocompleteQueryID> m_active_query_id;
 };
 
 }

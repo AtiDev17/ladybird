@@ -73,7 +73,7 @@ static bool is_download_in_progress(FileDownloader const& file_downloader, u64 d
     return download.has_value() && download->status == FileDownloader::DownloadStatus::InProgress;
 }
 
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, u64 initial_page_id, Web::HTML::NavigableId root_navigable_id)
+WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, u64 initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint>(*this, move(transport))
     , m_is_private(is_private)
     , m_initial_page_id(initial_page_id)
@@ -276,7 +276,7 @@ CanonicalNavigable* WebContentClient::navigable_for_page(u64 page_id)
     return nullptr;
 }
 
-Optional<CanonicalNavigable&> WebContentClient::child_frame(u64 page_id, Web::HTML::NavigableId frame_id)
+Optional<CanonicalNavigable&> WebContentClient::child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id)
 {
     auto* host = navigable_for_page(page_id);
     if (!host)
@@ -477,12 +477,12 @@ void WebContentClient::did_request_new_process_for_navigation(u64 page_id, URL::
         view->create_new_process_for_cross_site_navigation(url, move(document_resource), history_handling);
 }
 
-Messages::WebContentClient::DecideNavigationProcessResponse WebContentClient::decide_navigation_process(u64 page_id, Optional<Web::HTML::NavigableId> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target)
+Messages::WebContentClient::DecideNavigationProcessResponse WebContentClient::decide_navigation_process(u64 page_id, Optional<Web::HTML::CrossProcessId> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target)
 {
     return SiteIsolationManager::the().decide_navigation_process(*this, page_id, move(frame_id), move(current_url), move(target_url), target);
 }
 
-void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 page_id, Web::HTML::NavigableId frame_id, URL::URL url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, URL::URL url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     auto child_frame = this->child_frame(page_id, frame_id);
     if (!child_frame.has_value())
@@ -516,7 +516,7 @@ void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 pa
     SiteIsolationManager::the().transition_child_frame_to_remote(*this, page_id, frame_id, move(remote_client), remote_page_id);
 }
 
-void WebContentClient::did_create_child_frame(u64 page_id, Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
+void WebContentClient::did_create_child_frame(u64 page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
 {
     auto* host = navigable_for_page(page_id);
     if (!host)
@@ -526,13 +526,13 @@ void WebContentClient::did_create_child_frame(u64 page_id, Web::HTML::NavigableI
     child_frame.set_replicated_state(move(replicated_state));
 }
 
-void WebContentClient::did_update_child_frame_viewport(u64 page_id, Web::HTML::NavigableId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio)
+void WebContentClient::did_update_child_frame_viewport(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio)
 {
     if (auto child_frame = this->child_frame(page_id, frame_id); child_frame.has_value())
         child_frame->set_viewport(viewport_rect, device_pixel_ratio);
 }
 
-void WebContentClient::did_commit_child_frame_navigation(u64 page_id, Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
+void WebContentClient::did_commit_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
 {
     auto child_frame = this->child_frame(page_id, frame_id);
     if (!child_frame.has_value())
@@ -553,7 +553,7 @@ void WebContentClient::did_change_top_level_active_document(u64 page_id, Web::HT
     navigable->did_commit_navigation(move(replicated_state));
 }
 
-void WebContentClient::did_destroy_child_frame(u64 page_id, Web::HTML::NavigableId frame_id)
+void WebContentClient::did_destroy_child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id)
 {
     if (auto child_frame = this->child_frame(page_id, frame_id); child_frame.has_value())
         SiteIsolationManager::the().remove_child_frame_subtree(*child_frame);
@@ -580,7 +580,10 @@ void WebContentClient::maybe_record_history_visit_for_current_load(u64 page_id, 
 
     // Title and favicon updates already give us a useful history entry, so
     // do not wait for did_finish_loading() on pages that never reach it.
-    Application::history_store(m_is_private).record_visit(url, move(title));
+    auto transition = HistoryVisitTransition::Link;
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        transition = view->m_history_visit_transition_for_current_load;
+    Application::history_store(m_is_private).record_visit(url, move(title), UnixDateTime::now(), transition);
     m_history_recorded_urls_for_current_load.set(page_id, normalized_url.release_value());
 }
 
@@ -592,6 +595,12 @@ void WebContentClient::did_start_loading(u64 page_id, Optional<String> navigatio
     m_history_recorded_urls_for_current_load.remove(page_id);
 
     if (auto view = view_for_page_id(page_id); view.has_value()) {
+        if (is_redirect) {
+            view->m_history_visit_transition_for_current_load = HistoryVisitTransition::Redirect;
+        } else {
+            view->m_history_visit_transition_for_current_load = view->m_history_visit_transition_for_next_load;
+            view->m_history_visit_transition_for_next_load = HistoryVisitTransition::Link;
+        }
         view->m_is_waiting_for_navigation_start = false;
         view->m_loading_navigation_id = navigation_id;
         view->m_loading_url = url;
@@ -1745,16 +1754,17 @@ void WebContentClient::did_change_background_color(u64 page_id, Gfx::Color color
         view->did_change_background_color({}, color);
 }
 
-void WebContentClient::did_insert_clipboard_entry(u64, Web::Clipboard::SystemClipboardRepresentation entry, String)
+void WebContentClient::did_insert_clipboard_entry(u64 page_id, Web::Clipboard::SystemClipboardRepresentation entry, String)
 {
-    Application::the().insert_clipboard_entry(move(entry));
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->insert_clipboard_entry(move(entry));
 }
 
 void WebContentClient::did_request_clipboard_entries(u64 page_id, u64 request_id)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         Vector<Web::Clipboard::SystemClipboardItem> items;
-        if (auto entries = Application::the().clipboard_entries(); !entries.is_empty())
+        if (auto entries = view->clipboard_entries(); !entries.is_empty())
             items.empend(move(entries));
 
         view->retrieved_clipboard_entries(request_id, items);

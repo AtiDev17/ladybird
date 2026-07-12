@@ -295,10 +295,10 @@ TEST_CASE(context_menu_url_text)
 
 TEST_CASE(autocomplete_url_matching)
 {
-    expect_autocomplete_urls_match("google.com"sv, "https://www.google.com/"sv);
-    expect_autocomplete_urls_match("example.com/path?q=1"sv, "https://www.example.com/path?q=1"sv);
-    expect_autocomplete_urls_match("http://example.com"sv, "https://example.com/"sv);
+    expect_autocomplete_urls_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
 
+    expect_autocomplete_urls_do_not_match("google.com"sv, "https://www.google.com/"sv);
+    expect_autocomplete_urls_do_not_match("http://example.com"sv, "https://example.com/"sv);
     expect_autocomplete_urls_do_not_match("https://example.com/path"sv, "https://example.com/other"sv);
     expect_autocomplete_urls_do_not_match("https://example.com"sv, "https://example.com:8443"sv);
     expect_autocomplete_urls_do_not_match("hello"sv, "https://hello.example/"sv);
@@ -306,6 +306,7 @@ TEST_CASE(autocomplete_url_matching)
 
 TEST_CASE(autocomplete_url_completion)
 {
+    expect_autocomplete_url_can_complete("red"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_can_complete("reddit.co"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_can_complete("https://reddit.co"sv, "https://www.reddit.com/"sv);
     expect_autocomplete_url_can_complete("www.reddit.co"sv, "https://www.reddit.com/"sv);
@@ -314,4 +315,18 @@ TEST_CASE(autocomplete_url_completion)
     expect_autocomplete_url_cannot_complete("reddit.co"sv, "https://reddit.co/"sv);
     expect_autocomplete_url_cannot_complete("reddit.co"sv, "https://reddit.net/"sv);
     expect_autocomplete_url_cannot_complete("reddit.com/r"sv, "https://reddit.com/"sv);
+    expect_autocomplete_url_cannot_complete("http://reddit.co"sv, "https://reddit.com/"sv);
+}
+
+TEST_CASE(autocomplete_suggestion_display_text)
+{
+    WebView::AutocompleteSuggestion url_suggestion;
+    url_suggestion.source = WebView::AutocompleteSuggestionSource::History;
+    url_suggestion.text = "https://www.example.com/"_string;
+    EXPECT_EQ(WebView::autocomplete_suggestion_display_text(url_suggestion), "example.com"sv);
+
+    WebView::AutocompleteSuggestion search_suggestion;
+    search_suggestion.source = WebView::AutocompleteSuggestionSource::Search;
+    search_suggestion.text = "https://example.com/"_string;
+    EXPECT_EQ(WebView::autocomplete_suggestion_display_text(search_suggestion), "https://example.com/"sv);
 }

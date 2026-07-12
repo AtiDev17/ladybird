@@ -792,6 +792,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_adopted_style_sheets);
     visitor.visit(m_script_blocking_style_sheet_set);
+    visitor.visit(m_style_scopes_with_pending_has_invalidations);
+    m_sheet_set_style_cache_registry.visit_edges(visitor);
 
     visitor.visit(m_active_view_transition);
     visitor.visit(m_dynamic_view_transition_style_sheet);
@@ -4535,6 +4537,17 @@ void Document::schedule_html_parser_end_check()
         m_html_parser_end_state->schedule_progress_check();
     if (m_parser)
         m_parser->schedule_resume_check();
+
+    // NB: Whatever unblocked this document's load event may also have been the last thing delaying the load event of
+    //     an ancestor document, since NavigableContainer::currently_delays_the_load_event() considers everything that
+    //     delays the load event of a container's active document. Wake ancestor parser end states so they notice.
+    //     This implements the re-evaluation implied by "the end" step 8, which spins the event loop until there is
+    //     nothing that delays the load event in the ancestor's document. Repeated wake-ups within one event loop
+    //     turn coalesce into a single deferred progress check via HTMLParserEndState::m_check_pending.
+    if (auto navigable = this->navigable()) {
+        if (auto container = navigable->container())
+            container->document().schedule_html_parser_end_check();
+    }
 }
 
 void Document::set_ready_for_post_load_tasks(bool ready)

@@ -127,24 +127,93 @@ StyleScope::StyleScope(GC::Ref<DOM::Node> node)
 {
 }
 
+bool SheetSetStyleCacheRegistry::entry_is_current(Entry const& entry)
+{
+    for (size_t i = 0; i < entry.sheets.size(); ++i) {
+        if (entry.sheets[i]->shared_style_cache_generation() != entry.sheet_generations[i])
+            return false;
+    }
+    return true;
+}
+
+static u32 hash_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+{
+    u32 hash = u64_hash(sheets.size());
+    for (auto const& sheet : sheets)
+        hash = pair_int_hash(hash, ptr_hash(sheet.ptr()));
+    return hash;
+}
+
+NonnullRefPtr<StyleCache> SheetSetStyleCacheRegistry::ensure_style_cache_for_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+{
+    auto hash = hash_sheet_set(sheets);
+    if (auto entries = m_entries_by_hash.get(hash); entries.has_value()) {
+        entries->remove_all_matching([](Entry const& entry) { return !entry_is_current(entry); });
+        for (auto& entry : *entries) {
+            if (entry.sheets == sheets)
+                return entry.style_cache;
+        }
+    }
+
+    // NB: Entries are only revalidated when their bucket is consulted, so purge entries registry-wide on every
+    //     insert: stale ones, and current ones whose cache no longer has any scope using it (the registry holds
+    //     the only reference). Otherwise abandoned sheet sets would keep their sheets and built caches alive
+    //     through visit_edges for the lifetime of the document. Inserts only happen once per distinct sheet set
+    //     and generation, so this walk stays rare.
+    m_entries_by_hash.remove_all_matching([](auto&, Vector<Entry>& entries) {
+        entries.remove_all_matching([](Entry const& entry) { return !entry_is_current(entry) || entry.style_cache->ref_count() == 1; });
+        return entries.is_empty();
+    });
+
+    Entry entry {
+        .sheets = sheets,
+        .sheet_generations = {},
+        .style_cache = StyleCache::create(),
+    };
+    entry.sheet_generations.ensure_capacity(sheets.size());
+    for (auto const& sheet : sheets)
+        entry.sheet_generations.append(sheet->shared_style_cache_generation());
+
+    auto style_cache = entry.style_cache;
+    m_entries_by_hash.ensure(hash).append(move(entry));
+    return style_cache;
+}
+
+void SheetSetStyleCacheRegistry::visit_edges(GC::Cell::Visitor& visitor)
+{
+    for (auto& [hash, entries] : m_entries_by_hash) {
+        for (auto& entry : entries) {
+            visitor.visit(entry.sheets);
+            entry.style_cache->visit_edges(visitor);
+        }
+    }
+}
+
 StyleCache& StyleScope::ensure_style_cache()
 {
     if (m_style_cache)
         return *m_style_cache;
 
-    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node)) {
-        GC::Ptr<CSSStyleSheet> constructed_style_sheet;
-        bool saw_more_than_one_style_sheet = false;
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node); shadow_root && !document().page().user_style().has_value()) {
+        Vector<GC::Ref<CSSStyleSheet>> sheets;
+        bool all_sheets_are_constructed = true;
         shadow_root->for_each_active_css_style_sheet([&](CSSStyleSheet& style_sheet) {
-            if (constructed_style_sheet) {
-                saw_more_than_one_style_sheet = true;
-                return;
-            }
-            constructed_style_sheet = style_sheet;
+            if (!style_sheet.constructed())
+                all_sheets_are_constructed = false;
+            else
+                sheets.append(style_sheet);
         });
 
-        if (constructed_style_sheet && !saw_more_than_one_style_sheet && constructed_style_sheet->constructed() && !document().page().user_style().has_value()) {
-            m_style_cache = constructed_style_sheet->shared_single_constructed_sheet_style_cache();
+        if (all_sheets_are_constructed && !sheets.is_empty()) {
+            if (sheets.size() == 1) {
+                m_style_cache = sheets.first()->shared_single_constructed_sheet_style_cache();
+                return *m_style_cache;
+            }
+
+            // OPTIMIZATION: Scopes whose active stylesheets are the same ordered set of constructed sheets can
+            //               share one cache, for the same reason the single-constructed-sheet cache above is
+            //               shareable: the contents only depend on the sheets and document-wide state.
+            m_style_cache = document().sheet_set_style_cache_registry().ensure_style_cache_for_sheet_set(sheets);
             return *m_style_cache;
         }
     }
@@ -168,6 +237,8 @@ void StyleScope::build_rule_cache()
     //               the shared cache itself (see CSSStyleSheet::invalidate_shared_style_cache()).
     if (style_cache.rule_cache)
         return;
+
+    ++document().style_invalidation_counters().scope_rule_cache_builds;
 
     style_cache.rule_cache = make<StyleRuleCache>();
     populate_rule_cache(*style_cache.rule_cache);
@@ -1126,11 +1197,6 @@ bool StyleScope::may_have_user_pseudo_class_selectors(PseudoClass pseudo_class) 
     return may_have_user_pseudo_class_selectors;
 }
 
-bool StyleScope::have_has_selectors() const
-{
-    return rule_cache().selector_insights.has_has_selectors;
-}
-
 bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
 {
     if (!has_valid_rule_cache()) {
@@ -1144,11 +1210,6 @@ bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_
         return may_have_has_selectors_with_relative_selector_that_has_sibling_combinator;
     }
 
-    return rule_cache().selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator;
-}
-
-bool StyleScope::have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
-{
     return rule_cache().selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator;
 }
 
@@ -1176,6 +1237,27 @@ void StyleScope::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleShee
     }
 }
 
+// The document keeps a list of the scopes with pending :has() invalidations so flushes only examine those. The
+// scope must appear in that list exactly once, so only the transition from an empty pending map registers it.
+void StyleScope::did_schedule_pending_has_invalidation(size_t previous_size)
+{
+    if (previous_size == 0)
+        document().register_style_scope_with_pending_has_invalidations(m_node);
+    document().set_needs_invalidation_of_elements_affected_by_has();
+}
+
+void StyleScope::node_was_adopted_from(DOM::Document& old_document)
+{
+    // Pending :has() invalidations registered this scope with its old document. Move the registration to the new
+    // document so the next flush there picks the scope up; the scheduling paths only register a scope when its
+    // pending map goes from empty to non-empty, so they would never re-register it themselves.
+    if (m_pending_has_invalidations.is_empty())
+        return;
+    old_document.unregister_style_scope_with_pending_has_invalidations(m_node);
+    document().register_style_scope_with_pending_has_invalidations(m_node);
+    document().set_needs_invalidation_of_elements_affected_by_has();
+}
+
 void StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has(GC::Ref<DOM::Node> node)
 {
     auto previous_size = m_pending_has_invalidations.size();
@@ -1183,7 +1265,7 @@ void StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has(GC
     if (m_pending_has_invalidations.size() == previous_size)
         return;
     mutation_features.is_conservative = true;
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 static void merge_pending_has_invalidation_mutation_features(PendingHasInvalidationMutationFeatures& target, PendingHasInvalidationMutationFeatures const& source)
@@ -1287,7 +1369,7 @@ void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::
         return;
     }
     existing_features = move(features);
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, Vector<CSS::InvalidationSet::Property> const& properties)
@@ -1300,7 +1382,7 @@ void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::
         return;
     }
     existing_features = move(features);
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Utf16FlyString const& name) const

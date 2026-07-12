@@ -11,7 +11,7 @@
 
 namespace Web::FileAPI {
 
-class File : public Blob {
+class WEB_API File : public Blob {
     WEB_PLATFORM_OBJECT(File, Blob);
     GC_DECLARE_ALLOCATOR(File);
 
@@ -27,8 +27,8 @@ public:
     // https://w3c.github.io/FileAPI/#dfn-lastModified
     i64 last_modified() const { return m_last_modified; }
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 private:
     File(JS::Realm&, ByteBuffer, String file_name, String type, i64 last_modified);

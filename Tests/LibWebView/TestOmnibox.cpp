@@ -9,49 +9,66 @@
 
 namespace {
 
-using WebView::AutocompleteResultKind;
 using WebView::AutocompleteSuggestion;
-using WebView::AutocompleteSuggestionSection;
 using WebView::AutocompleteSuggestionSource;
 using WebView::Omnibox;
 
-AutocompleteSuggestion row(AutocompleteSuggestionSource source, AutocompleteSuggestionSection section, StringView text)
+AutocompleteSuggestion row(AutocompleteSuggestionSource source, StringView text)
 {
-    return { .source = source, .section = section, .text = MUST(String::from_utf8(text)), .title = {}, .subtitle = {}, .favicon_base64_png = {}, .can_be_automatically_selected = true };
+    return {
+        .source = source,
+        .text = MUST(String::from_utf8(text)),
+        .title = {},
+        .subtitle = {},
+        .favicon_base64_png = {},
+        .highlight_input = {},
+        .can_be_automatically_selected = true,
+        .can_be_inline_completed = source == AutocompleteSuggestionSource::History,
+    };
 }
 
-AutocompleteSuggestion history_row(StringView url)
+AutocompleteSuggestion history_row(StringView url, i32 relevance = 0)
 {
-    return row(AutocompleteSuggestionSource::History, AutocompleteSuggestionSection::History, url);
+    auto suggestion = row(AutocompleteSuggestionSource::History, url);
+    suggestion.relevance = relevance;
+    return suggestion;
 }
 
 AutocompleteSuggestion non_automatic_history_row(StringView url, StringView title)
 {
     return {
         .source = AutocompleteSuggestionSource::History,
-        .section = AutocompleteSuggestionSection::History,
         .text = MUST(String::from_utf8(url)),
         .title = MUST(String::from_utf8(title)),
         .subtitle = {},
         .favicon_base64_png = {},
+        .highlight_input = {},
         .can_be_automatically_selected = false,
     };
 }
 
+AutocompleteSuggestion non_inline_history_row(StringView url, i32 relevance = 0)
+{
+    auto suggestion = history_row(url, relevance);
+    suggestion.can_be_inline_completed = false;
+    return suggestion;
+}
+
 AutocompleteSuggestion search_row(StringView query)
 {
-    return row(AutocompleteSuggestionSource::Search, AutocompleteSuggestionSection::SearchSuggestions, query);
+    return row(AutocompleteSuggestionSource::Search, query);
 }
 
 AutocompleteSuggestion literal_row(StringView url)
 {
-    return row(AutocompleteSuggestionSource::LiteralURL, AutocompleteSuggestionSection::None, url);
+    return row(AutocompleteSuggestionSource::LiteralURL, url);
 }
 
 class ScriptedProvider final : public WebView::OmniboxSuggestionProvider {
 public:
-    virtual void query(String query, size_t) override
+    virtual void query(WebView::AutocompleteQueryID query_id, String query, size_t) override
     {
+        query_ids.append(query_id);
         queries.append(move(query));
     }
 
@@ -60,12 +77,25 @@ public:
         ++cancel_count;
     }
 
-    void deliver(Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind result_kind)
+    virtual void record_engagement(WebView::OmniboxEngagement engagement) override
     {
-        on_suggestions(move(suggestions), result_kind);
+        engagements.append(move(engagement));
+    }
+
+    void deliver(Vector<AutocompleteSuggestion> suggestions)
+    {
+        VERIFY(!query_ids.is_empty());
+        on_suggestions(query_ids.last(), move(suggestions));
+    }
+
+    void deliver(WebView::AutocompleteQueryID query_id, Vector<AutocompleteSuggestion> suggestions)
+    {
+        on_suggestions(query_id, move(suggestions));
     }
 
     Vector<String> queries;
+    Vector<WebView::AutocompleteQueryID> query_ids;
+    Vector<WebView::OmniboxEngagement> engagements;
     size_t cancel_count { 0 };
 };
 
@@ -158,14 +188,14 @@ struct Harness {
 
 }
 
-TEST_CASE(fast_typing_with_top_hit_flips_activates_the_visible_completion)
+TEST_CASE(fast_typing_publishes_each_local_generation)
 {
     Harness harness;
     harness.begin_editing();
 
     // "t" completes to the top history hit for "t".
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "twin.example"sv);
     EXPECT_EQ(harness.selection_start, 1u);
     EXPECT(harness.omnibox.is_popup_visible());
@@ -173,29 +203,25 @@ TEST_CASE(fast_typing_with_top_hit_flips_activates_the_visible_completion)
     // "th" no longer matches it; the completion breaks, and a different suggestion takes over.
     harness.press_key('h');
     EXPECT_EQ(harness.display_text, "th"sv);
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) });
     EXPECT_EQ(harness.display_text, "thee.example"sv);
 
     // The user keeps typing into and past that suggestion.
     harness.press_key('e');
     EXPECT_EQ(harness.display_text, "thee.example"sv);
     EXPECT_EQ(harness.selection_start, 3u);
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("the"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("the"sv) });
 
     harness.press_key('v');
     EXPECT_EQ(harness.display_text, "thev"sv);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("thev"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("thev"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
     EXPECT_EQ(harness.selection_start, 4u);
 
-    // The popup still shows rows for "t" (intermediate updates do not repaint it), so Enter re-queries and
-    // must activate the completed suggestion, not search for the typed prefix.
-    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.twin.example/"sv);
+    // Each generation publishes its local results immediately, so the popup and completion agree even
+    // when the user types faster than remote suggestions arrive.
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.thev.example/"sv);
     harness.omnibox.return_pressed();
-    EXPECT(harness.commits.is_empty());
-    EXPECT_EQ(harness.provider->queries.last(), "thev"sv);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("thev"sv) }, AutocompleteResultKind::Intermediate);
-
     EXPECT_EQ(harness.commits.size(), 1u);
     EXPECT_EQ(harness.commits.last(), "https://www.thev.example/"sv);
 }
@@ -206,13 +232,13 @@ TEST_CASE(editing_the_completion_submits_the_typed_text)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     // Typing something that breaks the completion means Enter takes the text literally.
     harness.press_key('x');
     EXPECT_EQ(harness.display_text, "tx"sv);
-    harness.provider->deliver({ search_row("tx"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ search_row("tx"sv) });
     EXPECT_EQ(harness.display_text, "tx"sv);
 
     harness.omnibox.return_pressed();
@@ -227,13 +253,13 @@ TEST_CASE(backspacing_the_completion_submits_the_typed_text)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     // Backspace deletes the selected completion; the suggestion must not come back for the same query.
     harness.press_backspace();
     EXPECT_EQ(harness.display_text, "t"sv);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "t"sv);
 
     harness.omnibox.return_pressed();
@@ -247,37 +273,36 @@ TEST_CASE(typing_after_backspace_lifts_the_suppression)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     harness.press_backspace();
     EXPECT_EQ(harness.display_text, "t"sv);
 
     // A new query means the user is typing again; completion resumes and Enter activates it.
     harness.press_key('h');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("th"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
     EXPECT_EQ(harness.selection_start, 2u);
 
     harness.omnibox.return_pressed();
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Intermediate);
     EXPECT_EQ(harness.commits.size(), 1u);
     EXPECT_EQ(harness.commits.last(), "https://www.thev.example/"sv);
 }
 
-TEST_CASE(intermediate_results_do_not_repaint_a_visible_popup)
+TEST_CASE(the_first_intermediate_result_repaints_for_each_generation)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.omnibox.suggestions().size(), 2u);
     EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.twin.example/"sv);
 
     harness.press_key('h');
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Intermediate);
-    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.twin.example/"sv);
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.thee.example/"sv);
 
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv), search_row("th zzz"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv), search_row("th zzz"sv) });
     EXPECT_EQ(harness.omnibox.suggestions().size(), 3u);
     EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.thee.example/"sv);
 
@@ -289,67 +314,195 @@ TEST_CASE(intermediate_results_do_not_repaint_a_visible_popup)
     EXPECT_EQ(harness.commits.last(), "https://www.thee.example/"sv);
 }
 
-TEST_CASE(pending_activation_waits_for_a_result_it_can_act_on)
+TEST_CASE(later_intermediate_results_refresh_the_active_generation)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ search_row("t"sv) });
+    auto repaints_after_first_delivery = harness.popup_repaints;
+
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv, 201), search_row("t"sv) });
+
+    EXPECT_EQ(harness.popup_repaints, repaints_after_first_delivery + 1);
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://www.thee.example/"sv);
+    EXPECT_EQ(harness.display_text, "thee.example"sv);
+}
+
+TEST_CASE(automatic_default_uses_point_and_percentage_hysteresis)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('a');
+    harness.provider->deliver({
+        non_inline_history_row("https://alpha.example/"sv, 2'000),
+        search_row("a"sv),
+    });
+
+    // This challenger clears the point margin, but not the ten-percent margin.
+    harness.provider->deliver({
+        non_inline_history_row("https://another.example/"sv, 2'110),
+        non_inline_history_row("https://alpha.example/"sv, 2'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://alpha.example/"sv);
+
+    // Clearing both margins permits a default change.
+    harness.provider->deliver({
+        non_inline_history_row("https://another.example/"sv, 2'201),
+        non_inline_history_row("https://alpha.example/"sv, 2'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://another.example/"sv);
+}
+
+TEST_CASE(inline_completion_has_a_larger_stability_margin)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('a');
+    harness.provider->deliver({
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.display_text, "alpha.example"sv);
+
+    // The challenger clears the default margins but remains within the 150-point inline margin.
+    harness.provider->deliver({
+        history_row("https://another.example/"sv, 1'110),
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://alpha.example/"sv);
+    EXPECT_EQ(harness.display_text, "alpha.example"sv);
+
+    harness.provider->deliver({
+        history_row("https://another.example/"sv, 1'151),
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://another.example/"sv);
+    EXPECT_EQ(harness.display_text, "another.example"sv);
+}
+
+TEST_CASE(a_non_inline_default_can_replace_an_inline_completion)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('a');
+    harness.provider->deliver({
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.display_text, "alpha.example"sv);
+
+    harness.provider->deliver({
+        non_inline_history_row("https://another.example/"sv, 1'201),
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.suggestions().first().text, "https://another.example/"sv);
+    EXPECT_EQ(harness.display_text, "a"sv);
+}
+
+TEST_CASE(explicit_selection_survives_same_generation_reordering)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('a');
+    harness.provider->deliver({
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT(harness.omnibox.select_next_suggestion());
+    EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
+
+    harness.provider->deliver({
+        history_row("https://another.example/"sv, 1'201),
+        history_row("https://alpha.example/"sv, 1'000),
+        search_row("a"sv),
+    });
+    EXPECT_EQ(harness.omnibox.selected_suggestion(), 2u);
+    EXPECT_EQ(harness.display_text, "a"sv);
+
+    harness.omnibox.return_pressed();
+    EXPECT_EQ(harness.commits.last(), "a"sv);
+    EXPECT(harness.provider->engagements.last().was_explicit);
+}
+
+TEST_CASE(search_selection_survives_equivalent_text_normalization)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    for (auto code_point : "lady bird"sv)
+        harness.press_key(code_point);
+    harness.provider->deliver({
+        non_inline_history_row("https://example.com/lady-bird"sv),
+        search_row("lady bird"sv),
+    });
+    EXPECT(harness.omnibox.select_next_suggestion());
+    EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
+
+    harness.provider->deliver({
+        non_inline_history_row("https://example.com/lady-bird"sv),
+        search_row("Lady   Bird"sv),
+    });
+    EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
+
+    harness.omnibox.return_pressed();
+    EXPECT_EQ(harness.commits.last(), "Lady   Bird"sv);
+    EXPECT(harness.provider->engagements.last().was_explicit);
+}
+
+TEST_CASE(enter_with_stale_results_commits_the_current_input_immediately)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('t');
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("t"sv) });
     harness.press_key('h');
     EXPECT_EQ(harness.display_text, "thee.example"sv);
 
-    // Enter with a stale popup: nothing to activate yet.
+    // Enter with a stale popup never waits for a provider response that may arrive after the user's
+    // intent has changed.
     harness.omnibox.return_pressed();
-    EXPECT(harness.commits.is_empty());
-
-    // An intermediate whose selected row merely equals the query is not worth activating; the final
-    // result may still bring a better row.
-    harness.provider->deliver({ search_row("th"sv) }, AutocompleteResultKind::Intermediate);
-    EXPECT(harness.commits.is_empty());
-
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Final);
     EXPECT_EQ(harness.commits.size(), 1u);
-    EXPECT_EQ(harness.commits.last(), "https://www.thee.example/"sv);
+    EXPECT_EQ(harness.commits.last(), "th"sv);
+
+    // Later deliveries may update the popup if editing is still active, but cannot trigger a second
+    // navigation.
+    harness.provider->deliver({ search_row("th"sv) });
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) });
+    EXPECT_EQ(harness.commits.size(), 1u);
 }
 
-TEST_CASE(escape_keeps_an_automatic_completion_but_closes_the_popup)
+TEST_CASE(escape_rejects_an_automatic_completion_and_closes_the_popup)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     auto cancels_before_escape = harness.provider->cancel_count;
     EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::ClosedPopup);
     EXPECT(!harness.omnibox.is_popup_visible());
-    EXPECT_EQ(harness.display_text, "thev.example"sv);
+    EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT_EQ(harness.provider->cancel_count, cancels_before_escape + 1);
 
-    // With the popup gone, Enter submits what is on display.
+    // With the popup gone, Enter submits the input the user actually entered.
     harness.omnibox.return_pressed();
-    EXPECT_EQ(harness.commits.last(), "thev.example"sv);
+    EXPECT_EQ(harness.commits.last(), "t"sv);
 
     EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::EndEditing);
-}
-
-TEST_CASE(escape_restores_the_query_over_a_preview)
-{
-    Harness harness;
-    harness.begin_editing();
-
-    harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), history_row("https://odd.example/t"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
-
-    // Hovering a row that cannot extend the query previews it in full.
-    harness.omnibox.suggestion_hovered(1);
-    EXPECT_EQ(harness.display_text, "https://odd.example/t"sv);
-    EXPECT_EQ(harness.selection_start, 0u);
-
-    EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::ClosedPopup);
-    EXPECT_EQ(harness.display_text, "t"sv);
 }
 
 TEST_CASE(arrow_keys_walk_the_suggestions_and_enter_activates_the_choice)
@@ -358,7 +511,7 @@ TEST_CASE(arrow_keys_walk_the_suggestions_and_enter_activates_the_choice)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
@@ -376,17 +529,64 @@ TEST_CASE(arrow_keys_walk_the_suggestions_and_enter_activates_the_choice)
     EXPECT_EQ(harness.commits.last(), "https://www.thev.example/"sv);
 }
 
+TEST_CASE(automatic_default_records_the_typed_input)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('t');
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
+    harness.omnibox.return_pressed();
+
+    EXPECT_EQ(harness.provider->engagements.size(), 1u);
+    EXPECT_EQ(harness.provider->engagements[0].input, "t"sv);
+    EXPECT_EQ(harness.provider->engagements[0].destination_kind, WebView::OmniboxDestinationKind::URL);
+    EXPECT_EQ(harness.provider->engagements[0].destination, "https://www.thev.example/"sv);
+    EXPECT(!harness.provider->engagements[0].was_explicit);
+}
+
+TEST_CASE(keyboard_choice_records_explicit_engagement)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('t');
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
+    EXPECT(harness.omnibox.select_next_suggestion());
+    harness.omnibox.return_pressed();
+
+    EXPECT_EQ(harness.provider->engagements.size(), 1u);
+    EXPECT_EQ(harness.provider->engagements[0].input, "t"sv);
+    EXPECT_EQ(harness.provider->engagements[0].destination_kind, WebView::OmniboxDestinationKind::Search);
+    EXPECT_EQ(harness.provider->engagements[0].destination, "t"sv);
+    EXPECT(harness.provider->engagements[0].was_explicit);
+}
+
+TEST_CASE(verbatim_commit_records_the_unmodified_input)
+{
+    Harness harness;
+    harness.begin_editing("ladybird browser"sv);
+
+    harness.omnibox.return_pressed();
+
+    EXPECT_EQ(harness.provider->engagements.size(), 1u);
+    EXPECT_EQ(harness.provider->engagements[0].input, "ladybird browser"sv);
+    EXPECT_EQ(harness.provider->engagements[0].destination_kind, WebView::OmniboxDestinationKind::Search);
+    EXPECT_EQ(harness.provider->engagements[0].destination, "ladybird browser"sv);
+    EXPECT(!harness.provider->engagements[0].was_explicit);
+}
+
 TEST_CASE(a_user_chosen_row_wins_over_edited_text)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
 
     // Break the completion so Enter would take the text literally...
     harness.press_key('x');
-    harness.provider->deliver({ history_row("https://www.txt.example/"sv), search_row("tx"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.txt.example/"sv), search_row("tx"sv) });
 
     // ...but explicitly arrowing onto a row overrides that.
     EXPECT(harness.omnibox.select_next_suggestion());
@@ -401,12 +601,26 @@ TEST_CASE(a_literal_url_suggestion_never_completes)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ literal_row("t.example/path"sv), history_row("https://www.thev.example/"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ literal_row("t.example/path"sv), history_row("https://www.thev.example/"sv) });
     EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
 
     harness.omnibox.return_pressed();
     EXPECT_EQ(harness.commits.last(), "t.example/path"sv);
+}
+
+TEST_CASE(an_automatic_default_does_not_imply_inline_completion)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('t');
+    harness.provider->deliver({ non_inline_history_row("https://www.thev.example/"sv), search_row("t"sv) });
+    EXPECT_EQ(harness.display_text, "t"sv);
+    EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
+
+    harness.omnibox.return_pressed();
+    EXPECT_EQ(harness.commits.last(), "https://www.thev.example/"sv);
 }
 
 TEST_CASE(a_top_row_that_does_not_match_the_prefix_is_not_automatically_selected)
@@ -415,7 +629,7 @@ TEST_CASE(a_top_row_that_does_not_match_the_prefix_is_not_automatically_selected
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ non_automatic_history_row("https://odd.example/t"sv, "Odd"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ non_automatic_history_row("https://odd.example/t"sv, "Odd"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
 
@@ -431,7 +645,7 @@ TEST_CASE(a_title_only_history_row_is_not_automatically_selected)
     for (auto code_point : "eau de"sv)
         harness.press_key(code_point);
 
-    harness.provider->deliver({ non_automatic_history_row("https://example.com/fragrance"sv, "Eau de Parfum"sv), search_row("eau de"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ non_automatic_history_row("https://example.com/fragrance"sv, "Eau de Parfum"sv), search_row("eau de"sv) });
     EXPECT_EQ(harness.display_text, "eau de"sv);
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
     EXPECT(harness.omnibox.is_popup_visible());
@@ -449,7 +663,7 @@ TEST_CASE(a_user_chosen_title_only_history_row_is_activated)
     for (auto code_point : "eau de"sv)
         harness.press_key(code_point);
 
-    harness.provider->deliver({ non_automatic_history_row("https://example.com/fragrance"sv, "Eau de Parfum"sv), search_row("eau de"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ non_automatic_history_row("https://example.com/fragrance"sv, "Eau de Parfum"sv), search_row("eau de"sv) });
 
     EXPECT(harness.omnibox.select_next_suggestion());
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
@@ -466,14 +680,14 @@ TEST_CASE(a_fresh_non_prefix_url_top_row_does_not_win_after_editing_a_completion
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     // The user types over the completion, and the fresh top hit is not
     // selected merely because the query appears somewhere in its URL.
     for (auto code_point : "itle match"sv)
         harness.press_key(code_point);
-    harness.provider->deliver({ non_automatic_history_row("https://news.ycombinator.com/title-match"sv, "Title Match"sv), search_row("title match"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ non_automatic_history_row("https://news.ycombinator.com/title-match"sv, "Title Match"sv), search_row("title match"sv) });
     EXPECT_EQ(harness.display_text, "title match"sv);
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 1u);
 
@@ -488,7 +702,7 @@ TEST_CASE(clicking_a_suggestion_commits_it)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
 
     harness.omnibox.suggestion_clicked(1);
     EXPECT_EQ(harness.commits.last(), "t"sv);
@@ -505,7 +719,7 @@ TEST_CASE(late_results_after_editing_ends_are_ignored)
     harness.omnibox.end_editing();
     EXPECT_EQ(harness.provider->cancel_count, cancels_before_end + 1);
 
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv) });
     EXPECT(!harness.omnibox.is_popup_visible());
     EXPECT(harness.commits.is_empty());
 }
@@ -517,7 +731,7 @@ TEST_CASE(showing_all_suggestions_does_not_complete_over_the_address)
     harness.omnibox.show_all_suggestions();
     EXPECT_EQ(harness.provider->queries.last(), "https://site.example/page"sv);
 
-    harness.provider->deliver({ history_row("https://site.example/page"sv), history_row("https://site.example/page2"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://site.example/page"sv), history_row("https://site.example/page2"sv) });
     EXPECT_EQ(harness.display_text, "https://site.example/page"sv);
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
 
@@ -531,10 +745,10 @@ TEST_CASE(empty_results_close_the_popup_and_restore_the_query)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
-    harness.provider->deliver({}, AutocompleteResultKind::Final);
+    harness.provider->deliver({});
     EXPECT(!harness.omnibox.is_popup_visible());
     EXPECT_EQ(harness.display_text, "t"sv);
 }
@@ -546,7 +760,7 @@ TEST_CASE(no_completion_is_applied_when_the_cursor_is_not_at_the_end)
 
     harness.omnibox.text_edited("t"_string, false);
     harness.display_text = "t"_string;
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT(!harness.omnibox.selected_suggestion().has_value());
 
@@ -561,7 +775,7 @@ TEST_CASE(dismissing_the_popup_restores_the_query)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     // A click elsewhere in the window dismisses the popup without ending the editing session.
@@ -571,45 +785,19 @@ TEST_CASE(dismissing_the_popup_restores_the_query)
     EXPECT(harness.omnibox.is_editing());
 }
 
-TEST_CASE(escape_cancels_a_pending_activation)
+TEST_CASE(deliveries_from_an_old_generation_are_ignored)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    auto old_query_id = harness.provider->query_ids.last();
     harness.press_key('h');
 
-    // Enter with stale rows arms a pending activation; Escape must disarm it.
-    harness.omnibox.return_pressed();
-    EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::ClosedPopup);
-
-    // A later delivery for the same query (for example after the focus shortcut re-queries it) must not
-    // fire the navigation the user cancelled.
-    harness.omnibox.show_all_suggestions();
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver(old_query_id, { history_row("https://www.thee.example/"sv), search_row("t"sv) });
+    EXPECT_EQ(harness.display_text, "th"sv);
+    EXPECT(!harness.omnibox.is_popup_visible());
     EXPECT(harness.commits.is_empty());
-}
-
-TEST_CASE(a_vanished_preview_row_stops_being_displayed)
-{
-    Harness harness;
-    harness.begin_editing();
-
-    harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), history_row("https://odd.example/t"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
-
-    harness.omnibox.suggestion_hovered(1);
-    EXPECT_EQ(harness.display_text, "https://odd.example/t"sv);
-
-    // The previewed row is gone from the refreshed results; the bar must not keep showing text that
-    // Enter would no longer act on.
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
-    EXPECT_EQ(harness.display_text, "t"sv);
-
-    // With no selected row left, Enter submits exactly what the bar shows.
-    harness.omnibox.return_pressed();
-    EXPECT_EQ(harness.commits.last(), "t"sv);
 }
 
 TEST_CASE(a_surviving_preview_row_remains_the_users_choice)
@@ -618,18 +806,18 @@ TEST_CASE(a_surviving_preview_row_remains_the_users_choice)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), history_row("https://odd.example/t"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), history_row("https://odd.example/t"sv), search_row("t"sv) });
 
     // Break the completion so Enter would otherwise take the query literally, then preview a row by
     // arrowing away and back onto it.
     harness.press_key('x');
-    harness.provider->deliver({ history_row("https://odd.example/tx"sv), search_row("tx"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://odd.example/tx"sv), search_row("tx"sv) });
     EXPECT(harness.omnibox.select_next_suggestion());
     EXPECT(harness.omnibox.select_previous_suggestion());
     EXPECT_EQ(harness.display_text, "https://odd.example/tx"sv);
 
     // A refresh that still contains the previewed row keeps it selected as the user's choice.
-    harness.provider->deliver({ history_row("https://odd.example/tx"sv), search_row("tx"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://odd.example/tx"sv), search_row("tx"sv) });
     EXPECT_EQ(harness.omnibox.selected_suggestion(), 0u);
 
     harness.omnibox.return_pressed();
@@ -642,14 +830,14 @@ TEST_CASE(showing_all_suggestions_adopts_an_active_completion)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
     // The focus shortcut queries whatever the bar displays; results must not truncate the bar back to
     // the typed prefix.
     harness.omnibox.show_all_suggestions();
     EXPECT_EQ(harness.provider->queries.last(), "thev.example"sv);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 }
 
@@ -659,7 +847,7 @@ TEST_CASE(arrow_keys_reopen_a_dismissed_popup)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
 
     EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::ClosedPopup);
     EXPECT(!harness.omnibox.is_popup_visible());
@@ -675,7 +863,7 @@ TEST_CASE(a_new_editing_session_does_not_inherit_popup_rows)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     harness.omnibox.end_editing();
 
     harness.begin_editing();
@@ -693,12 +881,12 @@ TEST_CASE(deliveries_while_suspended_are_dropped)
     // A context menu borrows focus without ending the session; a late delivery must not rewrite the
     // text or raise the popup while it is open.
     harness.omnibox.set_suspended(true);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT(!harness.omnibox.is_popup_visible());
 
     harness.omnibox.set_suspended(false);
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 }
 
@@ -713,7 +901,7 @@ TEST_CASE(no_completion_is_applied_after_the_cursor_moves_from_the_end)
     // The user clicks into the middle of the text; a late delivery must not rewrite it and yank the
     // caret away.
     harness.omnibox.cursor_moved(false);
-    harness.provider->deliver({ history_row("https://odd.example/"sv), search_row("od"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://odd.example/"sv), search_row("od"sv) });
     EXPECT_EQ(harness.display_text, "od"sv);
 }
 
@@ -723,12 +911,12 @@ TEST_CASE(final_results_repaint_a_visible_popup)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv) });
     EXPECT(harness.visible_popup);
     EXPECT_EQ(harness.visible_rows.first().text, "https://www.twin.example/"sv);
 
     // The final result set replaces the rows under an already-open popup; the chrome must be told.
-    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv), search_row("t zzz"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.twin.example/"sv), search_row("t"sv), search_row("t zzz"sv) });
     EXPECT_EQ(harness.visible_rows.size(), 3u);
     EXPECT_EQ(harness.visible_rows.last().text, "t zzz"sv);
     EXPECT_EQ(harness.visible_selection, 0u);
@@ -740,7 +928,7 @@ TEST_CASE(a_user_highlighted_completion_survives_a_refresh)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
 
     // Walk away and back so the highlight is a deliberate act.
     EXPECT(harness.omnibox.select_next_suggestion());
@@ -749,30 +937,28 @@ TEST_CASE(a_user_highlighted_completion_survives_a_refresh)
 
     // A refresh that keeps the chosen row selected keeps it the user's choice, so Escape restores the
     // typed text instead of preserving the completion.
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.omnibox.escape_pressed(), Omnibox::EscapeAction::ClosedPopup);
     EXPECT_EQ(harness.display_text, "t"sv);
 }
 
-TEST_CASE(pending_activation_survives_an_empty_intermediate_result)
+TEST_CASE(provider_results_after_a_stale_enter_do_not_navigate)
 {
     Harness harness;
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("t"sv) });
     harness.press_key('h');
     harness.omnibox.return_pressed();
-    EXPECT(harness.commits.is_empty());
-
-    // An empty intermediate result (no local matches, remote still pending) must not eat the activation
-    // the final result may still satisfy.
-    harness.provider->deliver({}, AutocompleteResultKind::Intermediate);
-    EXPECT(harness.commits.is_empty());
-
-    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) }, AutocompleteResultKind::Final);
     EXPECT_EQ(harness.commits.size(), 1u);
-    EXPECT_EQ(harness.commits.last(), "https://www.thee.example/"sv);
+    EXPECT_EQ(harness.commits.last(), "th"sv);
+
+    // Provider updates may continue until the chrome's commit handler ends editing, but no response is
+    // armed to perform another navigation.
+    harness.provider->deliver({});
+    harness.provider->deliver({ history_row("https://www.thee.example/"sv), search_row("th"sv) });
+    EXPECT_EQ(harness.commits.size(), 1u);
 }
 
 TEST_CASE(restarting_the_session_cancels_in_flight_queries)
@@ -796,15 +982,39 @@ TEST_CASE(a_moved_cursor_blocks_completions_under_any_provenance)
     harness.begin_editing();
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Intermediate);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
     EXPECT_EQ(harness.display_text, "thev.example"sv);
 
-    // The user clicks into the middle of the completed text; a late delivery must leave it alone even
-    // though a completion is currently on display.
+    // The user clicks into the middle of the completed text. The borrowed suffix is removed and a
+    // late delivery must not grow it back for the same input.
     harness.omnibox.cursor_moved(false);
-    harness.provider->deliver({ history_row("https://www.thevx.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
-    EXPECT_EQ(harness.display_text, "thev.example"sv);
+    EXPECT_EQ(harness.display_text, "t"sv);
+    harness.provider->deliver({ history_row("https://www.thevx.example/"sv), search_row("t"sv) });
+    EXPECT_EQ(harness.display_text, "t"sv);
     EXPECT(!harness.omnibox.selected_suggestion().has_value());
+}
+
+TEST_CASE(accepting_a_completion_requeries_without_losing_the_learning_prefix)
+{
+    Harness harness;
+    harness.begin_editing();
+
+    harness.press_key('g');
+    harness.press_key('i');
+    harness.provider->deliver({ history_row("https://github.com/LadybirdBrowser/ladybird"sv), search_row("gi"sv) });
+    EXPECT_EQ(harness.display_text, "github.com/LadybirdBrowser/ladybird"sv);
+    EXPECT(harness.selection_start.has_value());
+
+    EXPECT(harness.omnibox.accept_completion());
+    EXPECT_EQ(harness.display_text, "github.com/LadybirdBrowser/ladybird"sv);
+    EXPECT(!harness.selection_start.has_value());
+    EXPECT_EQ(harness.provider->queries.last(), "github.com/LadybirdBrowser/ladybird"sv);
+
+    harness.provider->deliver({ history_row("https://github.com/LadybirdBrowser/ladybird"sv) });
+    harness.omnibox.return_pressed();
+    EXPECT_EQ(harness.provider->engagements.size(), 1u);
+    EXPECT_EQ(harness.provider->engagements[0].input, "gi"sv);
+    EXPECT_EQ(harness.provider->engagements[0].destination, "https://github.com/LadybirdBrowser/ladybird"sv);
 }
 
 TEST_CASE(committing_may_reentrantly_end_editing)
@@ -819,7 +1029,7 @@ TEST_CASE(committing_may_reentrantly_end_editing)
     };
 
     harness.press_key('t');
-    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) }, AutocompleteResultKind::Final);
+    harness.provider->deliver({ history_row("https://www.thev.example/"sv), search_row("t"sv) });
 
     harness.omnibox.return_pressed();
     EXPECT_EQ(harness.commits.size(), 1u);

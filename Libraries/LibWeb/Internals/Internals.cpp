@@ -639,6 +639,11 @@ bool Internals::needs_repaint()
     return page().top_level_traversable()->needs_repaint();
 }
 
+bool Internals::needs_display_list_record()
+{
+    return page().top_level_traversable()->needs_to_record_display_list();
+}
+
 bool Internals::screen_wake_lock_active()
 {
     return page().is_screen_wake_lock_active();
@@ -839,6 +844,7 @@ JS::Object* Internals::get_style_invalidation_counters()
     object->define_direct_property("hasAncestorSiblingElementChecks"_utf16_fly_string, JS::Value(counters.has_ancestor_sibling_element_checks), JS::default_attributes);
     object->define_direct_property("hasInvalidationMetadataCandidates"_utf16_fly_string, JS::Value(counters.has_invalidation_metadata_candidates), JS::default_attributes);
     object->define_direct_property("hasInvalidationRuleCacheBuilds"_utf16_fly_string, JS::Value(counters.has_invalidation_rule_cache_builds), JS::default_attributes);
+    object->define_direct_property("hasFlushScopesExamined"_utf16_fly_string, JS::Value(counters.has_flush_scopes_examined), JS::default_attributes);
     object->define_direct_property("hasMatchInvocations"_utf16_fly_string, JS::Value(counters.has_match_invocations), JS::default_attributes);
     object->define_direct_property("hasResultCacheHits"_utf16_fly_string, JS::Value(counters.has_result_cache_hits), JS::default_attributes);
     object->define_direct_property("hasResultCacheMisses"_utf16_fly_string, JS::Value(counters.has_result_cache_misses), JS::default_attributes);
@@ -852,6 +858,8 @@ JS::Object* Internals::get_style_invalidation_counters()
     object->define_direct_property("descendantSlotInvalidationSubtreeScans"_utf16_fly_string, JS::Value(counters.descendant_slot_invalidation_subtree_scans), JS::default_attributes);
     object->define_direct_property("mediaRuleEvaluations"_utf16_fly_string, JS::Value(counters.media_rule_evaluations), JS::default_attributes);
     object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
+    object->define_direct_property("styleSheetInvalidationSetBuilds"_utf16_fly_string, JS::Value(counters.style_sheet_invalidation_set_builds), JS::default_attributes);
+    object->define_direct_property("scopeRuleCacheBuilds"_utf16_fly_string, JS::Value(counters.scope_rule_cache_builds), JS::default_attributes);
     return object;
 }
 

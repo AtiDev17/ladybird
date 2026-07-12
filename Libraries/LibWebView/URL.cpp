@@ -93,83 +93,62 @@ Optional<URL::URL> url_from_text(StringView text)
     return sanitize_url(trimmed_text);
 }
 
-static String normalized_web_url_for_autocomplete_comparison(URL::URL const& url)
-{
-    VERIFY(url.scheme().is_one_of("http"sv, "https"sv));
-
-    // Address bar suggestions intentionally treat `http` and `https` variants
-    // of the same web location as equivalent. Normalize away the scheme,
-    // leading `www.`, default root slash, and default port so comparisons
-    // match what the user actually typed.
-    StringBuilder builder;
-
-    if (!url.username().is_empty() || !url.password().is_empty()) {
-        builder.append(url.username());
-        if (!url.password().is_empty()) {
-            builder.append(':');
-            builder.append(url.password());
-        }
-        builder.append('@');
-    }
-
-    auto host = url.serialized_host();
-    auto host_view = host.bytes_as_string_view();
-    if (host_view.starts_with("www."sv, CaseSensitivity::CaseInsensitive))
-        host_view = host_view.substring_view(4);
-    builder.append(host_view);
-
-    auto default_port = URL::default_port_for_scheme(url.scheme());
-    if (url.port().has_value() && (!default_port.has_value() || *url.port() != *default_port))
-        builder.appendff(":{}", *url.port());
-
-    auto path = url.serialize_path();
-    if (path != "/"sv)
-        builder.append(path);
-
-    if (url.query().has_value()) {
-        builder.append('?');
-        builder.append(*url.query());
-    }
-
-    return MUST(builder.to_string());
-}
-
-static String normalized_url_for_autocomplete_prefix_matching(URL::URL const& url)
-{
-    if (url.scheme().is_one_of("http"sv, "https"sv))
-        return normalized_web_url_for_autocomplete_comparison(url);
-
-    return url.serialize(URL::ExcludeFragment::Yes);
-}
-
 bool autocomplete_urls_match(StringView left, StringView right)
 {
-    auto left_url = sanitize_url(left);
-    auto right_url = sanitize_url(right);
+    auto parse_destination = [](StringView value) {
+        auto url = URL::Parser::basic_parse(value);
+        if (url.has_value() && url->scheme().is_one_of("about"sv, "data"sv, "file"sv, "http"sv, "https"sv, "resource"sv))
+            return url;
+        return URL::Parser::basic_parse(MUST(String::formatted("https://{}", value)));
+    };
+
+    auto left_url = parse_destination(left);
+    auto right_url = parse_destination(right);
     if (!left_url.has_value() || !right_url.has_value())
         return false;
-
-    if (left_url->scheme().is_one_of("http"sv, "https"sv)
-        && right_url->scheme().is_one_of("http"sv, "https"sv))
-        return normalized_web_url_for_autocomplete_comparison(*left_url) == normalized_web_url_for_autocomplete_comparison(*right_url);
 
     return left_url->equals(*right_url, URL::ExcludeFragment::Yes);
 }
 
 bool autocomplete_url_can_complete(StringView query, StringView suggestion)
 {
-    auto query_url = sanitize_url(query);
-    auto suggestion_url = sanitize_url(suggestion);
-    if (!query_url.has_value() || !suggestion_url.has_value())
+    auto suggestion_url = URL::Parser::basic_parse(suggestion);
+    if (query.is_empty() || !suggestion_url.has_value())
         return false;
 
-    auto normalized_query = normalized_url_for_autocomplete_prefix_matching(*query_url);
-    auto normalized_suggestion = normalized_url_for_autocomplete_prefix_matching(*suggestion_url);
+    auto can_complete_form = [&](StringView form) {
+        if (form.ends_with('/'))
+            form = form.substring_view(0, form.length() - 1);
+        return form.length() > query.length()
+            && form.starts_with(query, CaseSensitivity::CaseInsensitive);
+    };
 
-    if (normalized_suggestion.bytes_as_string_view().length() <= normalized_query.bytes_as_string_view().length())
+    auto serialized_suggestion = suggestion_url->serialize(URL::ExcludeFragment::Yes);
+    if (can_complete_form(serialized_suggestion))
+        return true;
+
+    if (!suggestion_url->scheme().is_one_of("http"sv, "https"sv))
         return false;
 
-    return normalized_suggestion.starts_with_bytes(normalized_query, CaseSensitivity::CaseInsensitive);
+    auto serialized_suggestion_view = serialized_suggestion.bytes_as_string_view();
+    auto scheme_end = serialized_suggestion_view.find("://"sv);
+    VERIFY(scheme_end.has_value());
+    auto without_scheme = serialized_suggestion_view.substring_view(*scheme_end + 3);
+    if (can_complete_form(without_scheme))
+        return true;
+
+    if (without_scheme.starts_with("www."sv, CaseSensitivity::CaseInsensitive)) {
+        if (can_complete_form(without_scheme.substring_view(4)))
+            return true;
+
+        StringBuilder without_www;
+        without_www.append(serialized_suggestion_view.substring_view(0, *scheme_end + 3));
+        without_www.append(without_scheme.substring_view(4));
+        if (can_complete_form(without_www.string_view()))
+            return true;
+    }
+
+    return false;
 }
 
 Vector<URL::URL> sanitize_urls(ReadonlySpan<ByteString> raw_urls)
