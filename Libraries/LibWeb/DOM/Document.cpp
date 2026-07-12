@@ -580,27 +580,31 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
     m_is_decoded_svg = m_page->client().is_svg_page_client();
 
     m_cursor_blink_timer = heap().allocate<GC::Timer>();
-    m_cursor_blink_timer->start_repeating(500, GC::create_function(heap(), [this] {
-        auto cursor_position = this->cursor_position();
-        if (!cursor_position)
-            return;
-
-        auto navigable = this->navigable();
-        if (!navigable || !navigable->is_focused())
-            return;
-
-        auto node = cursor_position->node();
-        if (auto* text = as_if<DOM::Text>(*node)) {
-            auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
-            if (!layout_text_node)
+    // NB: In test mode, the caret must not blink so we can deterministically generate display lists. The blink state
+    //     is set whenever the cursor moves (see reset_cursor_blink_cycle()), so the caret is still painted.
+    if (!HTML::Window::in_test_mode()) {
+        m_cursor_blink_timer->start_repeating(500, GC::create_function(heap(), [this] {
+            auto cursor_position = this->cursor_position();
+            if (!cursor_position)
                 return;
-            m_cursor_blink_state = !m_cursor_blink_state;
-            layout_text_node->set_needs_repaint();
-        } else if (node->unsafe_paintable()) {
-            m_cursor_blink_state = !m_cursor_blink_state;
-            node->set_needs_repaint();
-        }
-    }));
+
+            auto navigable = this->navigable();
+            if (!navigable || !navigable->is_focused())
+                return;
+
+            auto node = cursor_position->node();
+            if (auto* text = as_if<DOM::Text>(*node)) {
+                auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
+                if (!layout_text_node)
+                    return;
+                m_cursor_blink_state = !m_cursor_blink_state;
+                layout_text_node->set_needs_repaint();
+            } else if (node->unsafe_paintable()) {
+                m_cursor_blink_state = !m_cursor_blink_state;
+                node->set_needs_repaint();
+            }
+        }));
+    }
 
     HTML::main_thread_event_loop().register_document({}, *this);
 }
@@ -804,6 +808,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_dialog_pointerdown_target);
     visitor.visit(m_console_client);
     visitor.visit(m_cursor_blink_timer);
+    visitor.visit(m_previously_repainted_cursor_position);
     visitor.visit(m_editing_host_manager);
     visitor.visit(m_local_storage_holder);
     visitor.visit(m_session_storage_holder);
@@ -8096,9 +8101,12 @@ Optional<CSSPixelRect> Document::current_caret_rect()
             return to_viewport_rect(*caret_rect);
     }
 
-    // Empty editable elements have no fragments; fall back to the padding-box corner.
+    // Empty editable elements have no fragments; fall back to the caret position for the cursor's child offset
+    // (which accounts for empty lines rendered by <br>), or the padding-box corner.
     if (auto* node_with_style = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*layout_node)) {
         auto paintable = node_with_style->first_paintable();
+        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(paintable.ptr()))
+            return to_viewport_rect(with_lines->caret_rect_for_child_offset(position->offset()));
         if (auto const* box = paintable.ptr()) {
             auto content_box = box->absolute_padding_box_rect();
             return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->computed_values().line_height() });
@@ -8118,18 +8126,25 @@ void Document::reset_cursor_blink_cycle()
 
 void Document::set_cursor_position_needs_repaint()
 {
+    auto repaint_position = [](DOM::Position& position) {
+        auto node = position.node();
+        if (auto* text = as_if<DOM::Text>(*node)) {
+            if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
+                layout_text_node->set_needs_repaint();
+            return;
+        }
+        node->set_needs_repaint();
+    };
+
     auto position = cursor_position();
-    if (!position)
-        return;
 
-    auto node = position->node();
-    if (auto* text = as_if<DOM::Text>(*node)) {
-        if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
-            layout_text_node->set_needs_repaint();
-        return;
-    }
+    // NB: Also repaint the node the cursor moved away from, so the old caret disappears.
+    if (m_previously_repainted_cursor_position && (!position || m_previously_repainted_cursor_position->node() != position->node()))
+        repaint_position(*m_previously_repainted_cursor_position);
+    m_previously_repainted_cursor_position = position;
 
-    node->set_needs_repaint();
+    if (position)
+        repaint_position(*position);
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#doc-container-document

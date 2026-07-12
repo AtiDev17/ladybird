@@ -59,6 +59,7 @@
 #include <LibWeb/UIEvents/MouseButton.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
 #include <LibWeb/UIEvents/PointerEvent.h>
+#include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/UIEvents/WheelEvent.h>
 
 #include <SDL3/SDL_events.h>
@@ -156,9 +157,9 @@ static Optional<Painting::CaretPosition> caret_position_from_editable_hit_node(D
     }
 
     auto paintable = boundary_node->paintable();
-    if (!paintable)
+    if (!paintable || !paintable->has_layout_node())
         paintable = hit_node.paintable();
-    if (!paintable)
+    if (!paintable || !paintable->has_layout_node())
         return {};
 
     return Painting::CaretPosition {
@@ -1043,7 +1044,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (should_ignore_device_input_event() && m_mousedown_target_is_drag_candidate && key == UIEvents::KeyCode::Key_Escape)
         return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, modifiers);
 
-    auto handle_delete_key = [&](InputEventsTarget& target, InputEventsTarget::DispatchInputEvent dispatch_input_event) -> Optional<EventResult> {
+    auto handle_delete_key = [&](InputEventsTarget& target) -> Optional<EventResult> {
         auto input_type = input_type_for_delete_key(key);
         if (!input_type.has_value())
             return {};
@@ -1052,20 +1053,13 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         if (beforeinput_result == EventResult::Cancelled)
             return beforeinput_result;
 
-        target.handle_delete(input_type.value(), dispatch_input_event);
+        target.handle_delete(input_type.value());
         return EventResult::Handled;
     };
 
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
-    if (dispatch_result == EventResult::Cancelled) {
-        if (auto document = m_navigable->active_document(); document && document->is_fully_active()) {
-            if (auto* target = document->active_input_events_target()) {
-                if (auto delete_result = handle_delete_key(*target, InputEventsTarget::DispatchInputEvent::No); delete_result.has_value())
-                    return delete_result.value();
-            }
-        }
+    if (dispatch_result != EventResult::Accepted)
         return dispatch_result;
-    }
 
     // https://w3c.github.io/uievents/#event-type-keypress
     // If supported by a user agent, this event MUST be dispatched when a key is pressed down, if and only if that key
@@ -1116,7 +1110,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     }
 
     if (auto* target = document->active_input_events_target()) {
-        if (auto delete_result = handle_delete_key(*target, InputEventsTarget::DispatchInputEvent::Yes); delete_result.has_value())
+        if (auto delete_result = handle_delete_key(*target); delete_result.has_value())
             return delete_result.value();
 
 #if defined(AK_OS_MACOS)
@@ -1206,6 +1200,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
             }
 
             FIRE(input_event(UIEvents::EventNames::beforeinput, input_type, m_navigable, code_point));
+            FIRE(fire_text_input_event(m_navigable, "\n"_string));
             if (target->handle_return_key(input_type) != EventResult::Handled)
                 target->handle_insert(input_type, Utf16String::from_code_point(code_point));
 
@@ -1215,6 +1210,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         // FIXME: Text editing shortcut keys (copy/paste etc.) should be handled here.
         if (!should_ignore_keydown_event(code_point, modifiers, should_insert_text)) {
             FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertText, m_navigable, code_point));
+            FIRE(fire_text_input_event(m_navigable, String::from_code_point(code_point)));
             target->handle_insert(UIEvents::InputTypes::insertText, Utf16String::from_code_point(code_point));
             return EventResult::Handled;
         }
@@ -1547,6 +1543,35 @@ EventResult EventHandler::fire_keyboard_event(FlyString const& event_name, HTML:
     return target->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
 }
 
+// https://w3c.github.io/uievents/#event-type-textInput
+// AD-HOC: The legacy textInput event is deprecated, but all major browsers still fire it between beforeinput and the
+//         actual text insertion, and cancelling it prevents the insertion. React sources its onBeforeInput synthetic
+//         event from textInput whenever the TextEvent interface is exposed, so controlled editors depend on it.
+EventResult EventHandler::fire_text_input_event(HTML::LocalNavigable& navigable, String const& data)
+{
+    auto document = navigable.active_document();
+    if (!document)
+        return EventResult::Dropped;
+    if (!document->is_fully_active())
+        return EventResult::Dropped;
+
+    if (auto focused_area = document->focused_area()) {
+        if (is<HTML::NavigableContainer>(*focused_area)) {
+            auto& navigable_container = as<HTML::NavigableContainer>(*focused_area);
+            if (navigable_container.content_navigable())
+                return fire_text_input_event(as<HTML::LocalNavigable>(*navigable_container.content_navigable()), data);
+        }
+
+        auto event = UIEvents::TextEvent::create(document->realm(), UIEvents::EventNames::textInput);
+        event->init_text_event(UIEvents::EventNames::textInput.to_string(), true, true, navigable.active_window_proxy(), data);
+        event->set_composed(true);
+        event->set_is_trusted(true);
+        return focused_area->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
+    }
+
+    return EventResult::Accepted;
+}
+
 EventResult EventHandler::input_event(FlyString const& event_name, FlyString const& input_type, HTML::LocalNavigable& navigable, Variant<u32, Utf16String> code_point_or_string)
 {
     auto document = navigable.active_document();
@@ -1831,6 +1856,8 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
         return;
     VERIFY(m_selection_mode != SelectionMode::None);
 
+    // NB: Initiating the selection may run script (setting a selection inside an editing host runs the focusing
+    //     steps on it), which may have rebuilt the layout tree and detached the caret position's paintable.
     if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
         m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
 }
@@ -1866,11 +1893,13 @@ Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Doc
     if (!paint_root())
         return {};
 
-    // NB: Now we can do selection with a caret-position hit test.
+    // NB: Now we can do selection with a caret-position hit test. The pre-focus hit node is only preferred while it
+    //     is still connected; focus handlers may have replaced it (e.g. an editor placeholder swapped for the real
+    //     editing host), in which case the fresh hit test result points at the replacement.
     auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
-    if (editable_hit_node_before_focus && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
-        if (editable_hit_node_before_focus)
-            caret_position = caret_position_from_editable_hit_node(*editable_hit_node_before_focus);
+    if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
+        if (auto caret_position_from_hit_node = caret_position_from_editable_hit_node(*editable_hit_node_before_focus); caret_position_from_hit_node.has_value())
+            caret_position = caret_position_from_hit_node;
     }
     if (!caret_position.has_value())
         return {};

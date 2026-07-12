@@ -782,12 +782,7 @@ public:
     void set_previous_document_unload_timing(DocumentUnloadTimingInfo const& previous_document_unload_timing) { m_previous_document_unload_timing = previous_document_unload_timing; }
 
     // https://w3c.github.io/editing/docs/execCommand/
-    enum class DispatchInputEvent {
-        No,
-        Yes,
-    };
     WebIDL::ExceptionOr<bool> exec_command(FlyString const& command, bool show_ui, Utf16String const& value);
-    WebIDL::ExceptionOr<bool> exec_command_internal(FlyString const& command, bool show_ui, Utf16String const& value, DispatchInputEvent);
     WebIDL::ExceptionOr<bool> query_command_enabled(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(FlyString const& command);
@@ -1619,6 +1614,10 @@ private:
 
     GC::Ptr<GC::Timer> m_cursor_blink_timer;
     bool m_cursor_blink_state { false };
+
+    // The cursor position most recently invalidated for caret painting, so that moving the caret to another node
+    // also repaints the node it moved away from.
+    GC::Ptr<DOM::Position> m_previously_repainted_cursor_position;
 
     // NOTE: This is GC::Weak, not GC::Ptr, on purpose. We don't want the document to keep some old detached navigable alive.
     GC::Weak<HTML::LocalNavigable> m_navigable;

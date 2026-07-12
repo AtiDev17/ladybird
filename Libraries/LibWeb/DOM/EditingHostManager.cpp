@@ -86,13 +86,13 @@ GC::Ptr<Selection::Selection> EditingHostManager::get_selection_for_navigation(C
     if (!selection)
         return {};
 
-    // and the focus node must be inside a text node,
+    // and the focus node must be a text node or an element directly housing the caret (e.g. an empty line),
     auto focus_node = selection->focus_node();
-    if (!is<Text>(focus_node.ptr()))
+    if (!focus_node || (!is<Text>(*focus_node) && !is<Element>(*focus_node)))
         return {};
 
     // and if we're performing collapsed navigation (i.e. moving the caret), the focus node must be editable.
-    if (collapse == CollapseSelection::Yes && !focus_node->is_editable())
+    if (collapse == CollapseSelection::Yes && !focus_node->is_editable_or_editing_host())
         return {};
 
     return selection;
@@ -174,7 +174,7 @@ void EditingHostManager::decrement_cursor_position_to_previous_line(CollapseSele
         selection->move_offset_to_previous_line(collapse == CollapseSelection::Yes);
 }
 
-void EditingHostManager::handle_delete(FlyString const& input_type, DispatchInputEvent dispatch_input_event)
+void EditingHostManager::handle_delete(FlyString const& input_type)
 {
     // https://w3c.github.io/editing/docs/execCommand/#additional-requirements
     // When the user instructs the user agent to delete the previous character inside an editing host, such as by
@@ -184,7 +184,7 @@ void EditingHostManager::handle_delete(FlyString const& input_type, DispatchInpu
     // the Delete key while the cursor is in an editable node, the user agent must call execCommand("forwarddelete") on
     // the relevant document.
     auto command = input_type == UIEvents::InputTypes::deleteContentBackward ? Editing::CommandNames::delete_ : Editing::CommandNames::forwardDelete;
-    auto editing_result = m_document->exec_command_internal(command, false, {}, dispatch_input_event == DispatchInputEvent::Yes ? DOM::Document::DispatchInputEvent::Yes : DOM::Document::DispatchInputEvent::No);
+    auto editing_result = m_document->exec_command(command, false, {});
     if (editing_result.is_exception())
         dbgln("handle_delete(): editing resulted in exception: {}", editing_result.exception());
 }
