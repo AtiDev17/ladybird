@@ -246,13 +246,6 @@ private:
         return {};
     }
 
-    virtual bool should_defer_main_thread_present_for_async_scroll(Web::Compositor::CompositorContextId context_id) const override
-    {
-        if (auto* connection = compositor_connection())
-            return connection->should_defer_main_thread_present_for_async_scroll(context_id);
-        return false;
-    }
-
     virtual Web::Compositor::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id) override
     {
         if (auto* connection = compositor_connection())
@@ -266,10 +259,10 @@ private:
             connection->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
     }
 
-    virtual void present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect) override
+    virtual void present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect) override
     {
         if (auto* connection = compositor_connection())
-            connection->present_frame(context_id, viewport_rect);
+            connection->present_frame(context_id, viewport_rect, damage_rect);
     }
 
     virtual void request_screenshot(Web::Compositor::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback) override

@@ -239,14 +239,6 @@ bool CompositorState::async_scroll_by(Web::Compositor::CompositorContextId conte
     return apply_context_update_result(context_id, *context, context->async_scroll_by(position, delta));
 }
 
-bool CompositorState::should_defer_main_thread_present_for_async_scroll(Web::Compositor::CompositorContextId context_id) const
-{
-    auto* context = context_if_present(context_id);
-    VERIFY(context);
-
-    return context->should_defer_main_thread_present_for_async_scroll();
-}
-
 Web::Compositor::PendingAsyncScrollUpdates CompositorState::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
 {
     auto* context = context_if_present(context_id);
@@ -281,21 +273,26 @@ void CompositorState::set_display_metadata(Web::Compositor::CompositorContextId 
         schedule_pending_present_frame(context_id, *context);
 }
 
-void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
 {
     auto* context = context_if_present(context_id);
     VERIFY(context);
-    schedule_present_frame(context_id, *context, viewport_rect);
+    if (context->should_defer_main_thread_present_for_async_scroll()) {
+        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread deferred present while async scroll is pending");
+        return;
+    }
+    damage_rect.intersect({ {}, viewport_rect.size() });
+    schedule_present_frame(context_id, *context, ContextState::PendingFrame { viewport_rect, damage_rect });
 }
 
-void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, Gfx::IntRect viewport_rect)
+void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
 {
     auto composited_context_resolver = resolver_for(context_id);
-    auto prepared_frame = context.prepare_frame(*m_display_list_player, viewport_rect, &composited_context_resolver);
+    auto prepared_frame = context.prepare_frame(*m_display_list_player, pending_frame, &composited_context_resolver);
     if (!prepared_frame.has_value())
         return;
 
-    m_pending_async_presents.append(context_id, viewport_rect, prepared_frame->bitmap_id);
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, pending_frame.damage_rect, prepared_frame->bitmap_id);
     auto* pending_present = &m_pending_async_presents.last();
 
     auto& event_loop = Core::EventLoop::current();
@@ -305,14 +302,22 @@ void CompositorState::present_frame(Web::Compositor::CompositorContextId context
             self->did_finish_async_present(*pending_present);
         });
     });
-    context.did_submit_prepared_frame(viewport_rect);
+    context.did_submit_prepared_frame(pending_frame.viewport_rect);
     schedule_gpu_completion_check();
+}
+
+void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
+{
+    context.queue_present_frame(pending_frame);
+    schedule_pending_present_frame(context_id, context);
 }
 
 void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, Gfx::IntRect viewport_rect)
 {
-    context.queue_present_frame(viewport_rect);
-    schedule_pending_present_frame(context_id, context);
+    schedule_present_frame(context_id, context, ContextState::PendingFrame {
+                                                    .viewport_rect = viewport_rect,
+                                                    .damage_rect = { {}, viewport_rect.size() },
+                                                });
 }
 
 void CompositorState::schedule_pending_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context)
@@ -368,8 +373,11 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id)
             continue;
 
         auto pending_present_frame = context.take_pending_present_frame_if_unblocked();
-        if (!pending_present_frame.has_value())
+        if (!pending_present_frame.has_value()) {
+            if (context.has_pending_present_frame_scheduled_on(display_id))
+                vsync_scheduler_for_display(display_id).schedule(context.display_refresh_rate());
             continue;
+        }
         present_frame(context_id, context, *pending_present_frame);
     }
 }
@@ -410,6 +418,7 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
 
     auto context_id = pending_present.context_id;
     auto viewport_rect = pending_present.viewport_rect;
+    auto damage_rect = pending_present.damage_rect;
     auto bitmap_id = pending_present.bitmap_id;
     auto was_cancelled = pending_present.was_cancelled;
     (void)m_pending_async_presents.remove(pending_present_iterator);
@@ -425,8 +434,9 @@ void CompositorState::did_finish_async_present(PendingAsyncPresent& pending_pres
     context->did_finish_gpu_present(bitmap_id);
     if (context->presents_to_client()) {
         VERIFY(m_client);
-        m_client->did_present_frame(context_id, viewport_rect, bitmap_id);
+        m_client->did_present_frame(context_id, viewport_rect, damage_rect, bitmap_id);
     }
+    resize_backing_stores_if_needed(context_id, *context);
     if (auto parent_context_id = context->parent_context_id(); parent_context_id.has_value()) {
         auto* parent_context = context_if_present(*parent_context_id);
         VERIFY(parent_context);
@@ -579,7 +589,7 @@ void CompositorState::publish_backing_stores(Web::Compositor::CompositorContextI
     VERIFY(m_client);
     VERIFY(context.presents_to_client());
 
-    m_client->did_allocate_backing_stores(context_id, publication.front_bitmap_id, move(publication.front_shared_image), publication.back_bitmap_id, move(publication.back_shared_image));
+    m_client->did_allocate_backing_stores(context_id, move(publication.bitmap_ids), move(publication.shared_images));
 }
 
 }

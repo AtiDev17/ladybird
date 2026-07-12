@@ -66,6 +66,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/DisplayListDamage.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -4219,11 +4220,16 @@ void LocalNavigable::unregister_navigation_observer(Badge<NavigationObserver>, N
     m_navigation_observers.remove(navigation_observer);
 }
 
-// https://html.spec.whatwg.org/multipage/document-lifecycle.html#nav-stop
+// https://html.spec.whatwg.org/multipage/document-lifecycle.html#stop-document-loading
 void LocalNavigable::stop_loading()
 {
     // 1. Let document be navigable's active document.
     auto document = active_document();
+
+    // AD-HOC: The HTML Standard does not cancel planned navigations here, but Chromium, WebKit, and Gecko do so when
+    //         handling window.stop(). Prevent navigations deferred behind an ongoing traversal from starting once it
+    //         completes. See https://github.com/whatwg/html/issues/12609.
+    clear_pending_navigations();
 
     // 2. If document's unload counter is 0, and navigable's ongoing navigation is a navigation ID, then set the ongoing navigation for navigable to null.
     if (document->unload_counter() == 0 && ongoing_navigation().has<String>())
@@ -4268,6 +4274,9 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
         m_needs_repaint = true;
         m_needs_to_record_display_list = true;
         m_compositor_display_list_paint_config.clear();
+        m_compositor_display_list.clear();
+        m_compositor_visual_context_tree.clear();
+        m_compositor_scroll_state_snapshot.clear();
         m_compositor_display_list_resources = {};
     }
 
@@ -4299,7 +4308,7 @@ void LocalNavigable::set_should_show_caret_hit_test_debug_overlay(bool value)
         child_navigable->set_should_show_caret_hit_test_debug_overlay(value);
 }
 
-bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config)
+bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_config, Gfx::IntRect* damage_rect)
 {
     if (!has_compositor_context())
         return false;
@@ -4339,7 +4348,32 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     document_paintable->refresh_scroll_state();
 
     Painting::ScrollStateSnapshot scroll_state_snapshot { document_paintable->scroll_state_snapshot() };
+    auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
+    Gfx::IntRect surface_rect { {}, viewport_rect.size() };
+    if (damage_rect)
+        *damage_rect = surface_rect;
     if (should_record_display_list) {
+        if (damage_rect
+            && m_compositor_display_list
+            && m_compositor_visual_context_tree.has_value()
+            && m_compositor_scroll_state_snapshot.has_value()
+            && m_compositor_scroll_state_snapshot->device_offsets() == scroll_state_snapshot.device_offsets()
+            && m_compositor_display_list_paint_config == paint_config) {
+            auto computed_damage = Painting::compute_display_list_damage(
+                m_compositor_display_list->command_bytes(),
+                *m_compositor_visual_context_tree,
+                *m_compositor_scroll_state_snapshot,
+                display_list->command_bytes(),
+                *visual_context_tree,
+                scroll_state_snapshot,
+                surface_rect);
+            if (computed_damage.has_value())
+                *damage_rect = *computed_damage;
+        }
+
+        m_compositor_display_list = display_list;
+        m_compositor_visual_context_tree = *visual_context_tree;
+        m_compositor_scroll_state_snapshot = scroll_state_snapshot;
         m_compositor_display_list_visual_context_tree_version = display_list->compatible_visual_context_tree_version();
         compositor_context().update_display_list(*display_list, visual_context_tree.release_value(), move(resource_transaction), move(scroll_state_snapshot));
         document_paintable->did_update_visual_context_tree_in_compositor();
@@ -4378,25 +4412,13 @@ void LocalNavigable::paint_next_frame()
             return;
     }
 
-    auto should_defer_main_thread_present_for_async_scroll = [&] {
-        return page().async_scrolling_enabled()
-            && compositor_context().should_defer_main_thread_present_for_async_scroll();
-    };
-    if (should_defer_main_thread_present_for_async_scroll())
-        return;
-
     m_needs_repaint = false;
 
-    if (!record_display_list_and_scroll_state(paint_config))
+    Gfx::IntRect damage_rect;
+    if (!record_display_list_and_scroll_state(paint_config, &damage_rect))
         return;
-
     viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
-    if (should_defer_main_thread_present_for_async_scroll()) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread deferred present while async scroll is pending");
-        return;
-    }
-
-    compositor_context().present_frame(viewport_rect);
+    compositor_context().present_frame(viewport_rect, damage_rect);
 }
 
 void LocalNavigable::render_screenshot(Gfx::PaintingSurface& painting_surface, PaintConfig paint_config, Function<void()>&& callback)

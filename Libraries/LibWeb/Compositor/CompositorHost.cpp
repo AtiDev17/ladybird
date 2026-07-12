@@ -71,11 +71,6 @@ AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID e
     return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, operation_tracking);
 }
 
-bool CompositorContextHandle::should_defer_main_thread_present_for_async_scroll() const
-{
-    return m_host.should_defer_main_thread_present_for_async_scroll(m_context_id);
-}
-
 PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates()
 {
     return m_host.take_pending_async_scroll_updates(m_context_id);
@@ -86,10 +81,10 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
     m_host.viewport_size_updated(m_context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)
+void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
 {
     m_host.flush_canvas_2d_stream();
-    m_host.present_frame(m_context_id, viewport_rect);
+    m_host.present_frame(m_context_id, viewport_rect, damage_rect);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)

@@ -458,12 +458,12 @@ void WebContentClient::notify_presented_bitmap_ready_to_paint(u64 page_id, i32 b
     Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
 
-void WebContentClient::did_present_bitmap(u64 page_id, Gfx::IntRect rect, i32 bitmap_id)
+void WebContentClient::did_present_bitmap(u64 page_id, Gfx::IntRect rect, Gfx::IntRect damage_rect, i32 bitmap_id)
 {
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI compositor IPC did_paint for page {} bitmap {} rect={}x{} at {},{}",
         page_id, bitmap_id, rect.width(), rect.height(), rect.x(), rect.y());
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        view->server_did_paint({}, bitmap_id, rect.size());
+        view->server_did_paint({}, bitmap_id, rect.size(), damage_rect);
     } else {
         dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping did_paint for page {} bitmap {}: no view",
             page_id, bitmap_id);
@@ -594,6 +594,7 @@ void WebContentClient::did_start_loading(u64 page_id, Optional<String> navigatio
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         view->m_is_waiting_for_navigation_start = false;
         view->m_loading_navigation_id = navigation_id;
+        view->m_loading_url = url;
         view->m_should_suppress_history_for_current_load = view->m_should_suppress_history_for_next_load;
         view->m_should_suppress_history_for_next_load = false;
         view->did_start_navigation(url, move(document_resource), is_redirect, history_handling);
@@ -621,6 +622,7 @@ void WebContentClient::did_cancel_loading(u64 page_id, Optional<String> navigati
             return;
         view->m_is_waiting_for_navigation_start = false;
         view->m_loading_navigation_id.clear();
+        view->m_loading_url.clear();
         view->did_cancel_navigation(url);
 
         auto const& client_url = view->url();
@@ -714,6 +716,7 @@ void WebContentClient::did_finish_loading(u64 page_id, Optional<String> navigati
             return;
 
         view->m_loading_navigation_id.clear();
+        view->m_loading_url.clear();
         auto client_url = url;
         // Browser-generated pages can finish with an internal document URL.
         // Keep exposing the URL accepted at load start for suppressed loads.
@@ -1831,15 +1834,13 @@ void WebContentClient::did_reset_session_history_for_testing(u64 page_id)
         view->did_reset_session_history_for_testing({});
 }
 
-void WebContentClient::did_present_backing_stores(u64 page_id, i32 front_bitmap_id, Gfx::SharedImage front_backing_store, i32 back_bitmap_id, Gfx::SharedImage back_backing_store)
+void WebContentClient::did_present_backing_stores(u64 page_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
-    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received backing stores for page {} front={} back={}",
-        page_id, front_bitmap_id, back_bitmap_id);
+    dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received {} backing stores for page {}", backing_stores.size(), page_id);
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        view->did_allocate_backing_stores({}, front_bitmap_id, move(front_backing_store), back_bitmap_id, move(back_backing_store));
+        view->did_allocate_backing_stores({}, move(bitmap_ids), move(backing_stores));
     } else {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping backing stores for page {} front={} back={}: no view",
-            page_id, front_bitmap_id, back_bitmap_id);
+        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping {} backing stores for page {}: no view", backing_stores.size(), page_id);
     }
 }
 

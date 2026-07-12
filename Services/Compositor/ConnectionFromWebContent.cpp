@@ -203,12 +203,6 @@ Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebCon
     return result;
 }
 
-Messages::CompositorWebContentServer::ShouldDeferMainThreadPresentForAsyncScrollResponse ConnectionFromWebContent::should_defer_main_thread_present_for_async_scroll(Web::Compositor::CompositorContextId context_id)
-{
-    verify_context_is_owned_by_this_connection(context_id);
-    return m_compositor_state->should_defer_main_thread_present_for_async_scroll(context_id);
-}
-
 Messages::CompositorWebContentServer::TakePendingAsyncScrollUpdatesResponse ConnectionFromWebContent::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
 {
     verify_context_is_owned_by_this_connection(context_id);
@@ -221,10 +215,10 @@ void ConnectionFromWebContent::viewport_size_updated(Web::Compositor::Compositor
     m_compositor_state->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void ConnectionFromWebContent::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+void ConnectionFromWebContent::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
 {
     verify_context_is_owned_by_this_connection(context_id);
-    m_compositor_state->present_frame(context_id, viewport_rect);
+    m_compositor_state->present_frame(context_id, viewport_rect, damage_rect);
 }
 
 void ConnectionFromWebContent::request_screenshot(Web::Compositor::CompositorContextId context_id, Web::Compositor::ScreenshotRequestId request_id, Gfx::ShareableBitmap target_bitmap)

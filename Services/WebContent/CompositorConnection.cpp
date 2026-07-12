@@ -163,19 +163,6 @@ Web::Compositor::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(
     return response->take_result();
 }
 
-bool CompositorConnection::should_defer_main_thread_present_for_async_scroll(Web::Compositor::CompositorContextId context_id)
-{
-    if (!can_send_message_to_compositor())
-        return false;
-
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::ShouldDeferMainThreadPresentForAsyncScroll>(context_id);
-    if (!response) {
-        did_lose_compositor();
-        return false;
-    }
-    return response->should_defer();
-}
-
 Web::Compositor::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
 {
     if (!can_send_message_to_compositor())
@@ -196,11 +183,11 @@ void CompositorConnection::viewport_size_updated(Web::Compositor::CompositorCont
     async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorConnection::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
+void CompositorConnection::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_present_frame(context_id, viewport_rect);
+    async_present_frame(context_id, viewport_rect, damage_rect);
 }
 
 Optional<Web::Painting::CanvasId> CompositorConnection::create_webgl_context(Web::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions)
