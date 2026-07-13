@@ -193,12 +193,14 @@ void HTMLInputElement::adjust_computed_style(CSS::ComputedProperties::Builder& s
     if (style.display().is_inline_outside() && style.display().is_flow_inside())
         style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::InlineBlock)));
 
-    // NOTE: Other browsers apply a minimum height of a single line's line-height to single-line input elements.
-    if (is_single_line() && style.property(CSS::PropertyID::Height).has_auto()) {
+    // https://drafts.csswg.org/css-ui-4/#input-rules
+    // * The content is vertically centered
+    // NB: Blink, WebKit, and Gecko clamp single-line input text to the font's normal line height. This prevents a
+    //     smaller author-specified line height from clipping glyph ink inside the vertically centered editor.
+    if (is_single_line()) {
         auto current_line_height = style.line_height(document().font_computer()).to_double();
         auto minimum_line_height = CSS::ComputedProperties::normal_line_height(style.first_available_computed_font(document().font_computer())->pixel_metrics()).to_double();
 
-        // FIXME: Instead of overriding line-height, we should set height here instead.
         if (current_line_height < minimum_line_height)
             style.set_property(CSS::PropertyID::LineHeight, CSS::KeywordStyleValue::create(CSS::Keyword::Normal));
     }
@@ -383,18 +385,19 @@ FileFilter HTMLInputElement::parse_accept_attribute() const
 void HTMLInputElement::update_the_file_selection(GC::Ref<FileAPI::FileList> files)
 {
     // 1. Queue an element task on the user interaction task source given element and the following steps:
-    queue_an_element_task(Task::Source::UserInteraction, [this, files] {
-        // 1. Update element's selected files so that it represents the user's selection.
-        this->set_files(files.ptr());
+    // https://github.com/whatwg/html/issues/1080
+    // INTEROP: Other engines perform these steps synchronously once the user has selected the files.
 
-        // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-        auto input_event = DOM::Event::create(this->realm(), EventNames::input, { .bubbles = true, .composed = true });
-        this->dispatch_event(input_event);
+    // 1. Update element's selected files so that it represents the user's selection.
+    set_files(files.ptr());
 
-        // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-        auto change_event = DOM::Event::create(this->realm(), EventNames::change, { .bubbles = true });
-        this->dispatch_event(change_event);
-    });
+    // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
+    auto input_event = DOM::Event::create(realm(), EventNames::input, { .bubbles = true, .composed = true });
+    dispatch_event(input_event);
+
+    // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
+    auto change_event = DOM::Event::create(realm(), EventNames::change, { .bubbles = true });
+    dispatch_event(change_event);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
@@ -612,18 +615,19 @@ void HTMLInputElement::did_pick_color(Optional<Color> picked_color, ColorPickerU
 
             // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
             // [...] any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input element to
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this] {
-                // set its user validity to true
-                m_user_validity = true;
+            // https://github.com/whatwg/html/issues/1080
+            // INTEROP: Other engines synchronously notify script when the user commits the change.
 
-                // AD-HOC: Setting the user validity changes which of the :user-valid and :user-invalid pseudo-classes match.
-                CSS::Invalidation::invalidate_style_after_validity_change(*this);
+            // set its user validity to true
+            m_user_validity = true;
 
-                // and fire an event named change at the input element, with the bubbles attribute initialized to true.
-                auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
-                change_event->set_bubbles(true);
-                dispatch_event(*change_event);
-            });
+            // AD-HOC: Setting the user validity changes which of the :user-valid and :user-invalid pseudo-classes match.
+            CSS::Invalidation::invalidate_style_after_validity_change(*this);
+
+            // and fire an event named change at the input element, with the bubbles attribute initialized to true.
+            auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
+            change_event->set_bubbles(true);
+            dispatch_event(*change_event);
         }
     }
 }
@@ -637,9 +641,9 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
     //    interaction task source given element to fire an event named cancel at element, with the bubbles attribute
     //    initialized to true.
     if (selected_files.is_empty()) {
-        queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::cancel, { .bubbles = true }));
-        });
+        // https://github.com/whatwg/html/issues/1080
+        // INTEROP: Other engines dispatch this event synchronously once the file picker closes.
+        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::cancel, { .bubbles = true }));
 
         return;
     }
@@ -665,25 +669,25 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
 
     // https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
     // 1. Queue an element task on the user interaction task source given element and the following steps:
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, files, multiple_handling]() mutable {
-        auto multiple = has_attribute(HTML::AttributeNames::multiple);
+    // https://github.com/whatwg/html/issues/1080
+    // INTEROP: Other engines perform these steps synchronously once the file picker closes.
+    auto multiple = has_attribute(HTML::AttributeNames::multiple);
 
-        // 1. Update element's selected files so that it represents the user's selection.
-        if (m_selected_files && multiple && multiple_handling == MultipleHandling::Append) {
-            for (size_t i = 0; i < files->length(); ++i)
-                m_selected_files->add_file(*files->item(i));
-        } else {
-            m_selected_files = files;
-        }
+    // 1. Update element's selected files so that it represents the user's selection.
+    if (m_selected_files && multiple && multiple_handling == MultipleHandling::Append) {
+        for (size_t i = 0; i < files->length(); ++i)
+            m_selected_files->add_file(*files->item(i));
+    } else {
+        m_selected_files = files;
+    }
 
-        update_file_input_shadow_tree();
+    update_file_input_shadow_tree();
 
-        // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::input, { .bubbles = true, .composed = true }));
+    // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
+    dispatch_event(DOM::Event::create(realm(), HTML::EventNames::input, { .bubbles = true, .composed = true }));
 
-        // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true }));
-    });
+    // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
+    dispatch_event(DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true }));
 }
 
 Utf16String HTMLInputElement::value() const
@@ -1495,16 +1499,17 @@ void HTMLInputElement::user_interaction_did_change_input_value(FlyString const& 
     // and for which the user interface involves both interactive manipulation and an explicit commit action,
     // then when the user changes the element's value, the user agent must queue an element task on the user interaction task source
     // given the input element to fire an event named input at the input element, with the bubbles and composed attributes initialized to true
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, input_type, data] {
-        // https://w3c.github.io/uievents/#event-type-input
-        Bindings::InputEventInit input_event_init;
-        input_event_init.bubbles = true;
-        input_event_init.composed = true;
-        input_event_init.input_type = input_type.to_string();
-        input_event_init.data = data;
-        auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
-        dispatch_event(*input_event);
-    });
+    // https://github.com/whatwg/html/issues/1080
+    // INTEROP: Other engines dispatch this event synchronously after changing the value. Controlled form controls
+    //          rely on observing each change before rendering can restore an older value.
+    // https://w3c.github.io/uievents/#event-type-input
+    Bindings::InputEventInit input_event_init;
+    input_event_init.bubbles = true;
+    input_event_init.composed = true;
+    input_event_init.input_type = input_type.to_string();
+    input_event_init.data = data;
+    auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
+    dispatch_event(*input_event);
     // and any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input
     // element to set its user validity to true and fire an event named change at the input element, with the bubbles attribute initialized to true.
     // NOTE: This is done manually as needed
