@@ -143,8 +143,9 @@ static bool accumulated_visual_context_change_is_value_only(CSS::PropertyID prop
 {
     switch (property_id) {
     case CSS::PropertyID::TransformOrigin:
+    case CSS::PropertyID::TransformBox:
     case CSS::PropertyID::PerspectiveOrigin:
-        // Origins never affect node presence.
+        // Origins and the reference box never affect node presence.
         return true;
     case CSS::PropertyID::Transform:
     case CSS::PropertyID::Translate:
@@ -209,6 +210,11 @@ RequiredInvalidationAfterStyleChange compute_property_invalidation(CSS::Property
     } else if (CSS::property_affects_layout(property_id)) {
         invalidation.ensure_at_least(InvalidationLevel::Relayout);
     }
+
+    // Scrollable overflow depends on these properties even though layout does not: a scroll container's
+    // scrollable overflow rect includes descendant border boxes as projected by their transforms.
+    if (CSS::property_affects_scrollable_overflow(property_id))
+        invalidation.set_needs_scrollable_overflow_recalculation();
 
     if (CSS::property_affects_stacking_context(property_id)) {
         // z-index changes always require rebuilding the stacking context tree because

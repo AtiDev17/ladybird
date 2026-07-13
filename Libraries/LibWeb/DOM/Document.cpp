@@ -185,6 +185,7 @@
 #include <LibWeb/Layout/BlockFormattingContext.h>
 #include <LibWeb/Layout/SVGFormattingContext.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
+#include <LibWeb/Layout/ScrollableOverflow.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/TreeBuilder.h>
@@ -1400,6 +1401,7 @@ void Document::tear_down_layout_tree()
     m_hit_test_display_list = nullptr;
     m_layout_root = nullptr;
     m_paintable = nullptr;
+    m_scrollable_overflow_contained_boxes_from_last_layout.clear();
     m_needs_full_layout_tree_update = true;
 }
 
@@ -1737,34 +1739,46 @@ static void propagate_scrollbar_width_to_viewport(Element& root_element, Layout:
 // https://drafts.csswg.org/css-overflow-3/#overflow-propagation
 static void propagate_overflow_to_viewport(Element& root_element, Layout::Viewport& viewport)
 {
+    auto& viewport_computed_values = viewport.mutable_computed_values();
+    viewport_computed_values.set_overflow_x(CSS::Overflow::Auto);
+    viewport_computed_values.set_overflow_y(CSS::Overflow::Auto);
+
     // https://drafts.csswg.org/css-contain-2/#contain-property
     // Additionally, when any containments are active on either the HTML <html> or <body> elements, propagation of
     // properties from the <body> element to the initial containing block, the viewport, or the canvas background, is
     // disabled. Notably, this affects:
     // - 'overflow' and its longhands (see CSS Overflow 3 § 3.3 Overflow Viewport Propagation)
-    if (root_element.is_html_html_element() && !root_element.computed_properties()->contain().is_empty())
-        return;
-
     auto* body_element = root_element.first_child_of_type<HTML::HTMLBodyElement>();
+    bool body_element_can_propagate_overflow = body_element
+        && !body_element->computed_properties()->display().is_none()
+        && body_element->unsafe_layout_node();
+    bool body_propagation_is_disabled_by_containment = root_element.is_html_html_element() && !root_element.computed_properties()->contain().is_empty();
     if (body_element && !body_element->computed_properties()->contain().is_empty())
-        return;
+        body_propagation_is_disabled_by_containment = true;
 
     // UAs must apply the overflow-* values set on the root element to the viewport
     // when the root element’s display value is not none.
-    // NB: Called during layout tree construction.
-    auto overflow_origin_node = root_element.unsafe_layout_node();
-    auto& viewport_computed_values = viewport.mutable_computed_values();
+    auto root_element_layout_node = root_element.unsafe_layout_node();
+    auto& root_element_layout_values = root_element_layout_node->mutable_computed_values();
+    auto const& root_element_computed_properties = *root_element.computed_properties();
+    root_element_layout_values.set_overflow_x(root_element_computed_properties.overflow_x());
+    root_element_layout_values.set_overflow_y(root_element_computed_properties.overflow_y());
+    if (body_element_can_propagate_overflow) {
+        auto& body_element_layout_values = body_element->unsafe_layout_node()->mutable_computed_values();
+        auto const& body_element_computed_properties = *body_element->computed_properties();
+        body_element_layout_values.set_overflow_x(body_element_computed_properties.overflow_x());
+        body_element_layout_values.set_overflow_y(body_element_computed_properties.overflow_y());
+    }
+
+    auto overflow_origin_node = root_element_layout_node;
 
     // However, when the root element is an [HTML] html element (including XML syntax for HTML)
     // whose overflow value is visible (in both axes), and that element has as a child
     // a body element whose display value is also not none,
     // user agents must instead apply the overflow-* values of the first such child element to the viewport.
-    if (root_element.is_html_html_element()) {
-        auto root_element_layout_node = root_element.unsafe_layout_node();
-        auto& root_element_computed_values = root_element_layout_node->mutable_computed_values();
-        if (root_element_computed_values.overflow_x() == CSS::Overflow::Visible && root_element_computed_values.overflow_y() == CSS::Overflow::Visible) {
-            auto* body_element = root_element.first_child_of_type<HTML::HTMLBodyElement>();
-            if (body_element && body_element->unsafe_layout_node())
+    if (root_element.is_html_html_element() && !body_propagation_is_disabled_by_containment) {
+        if (root_element_computed_properties.overflow_x() == CSS::Overflow::Visible && root_element_computed_properties.overflow_y() == CSS::Overflow::Visible) {
+            if (body_element_can_propagate_overflow)
                 overflow_origin_node = body_element->unsafe_layout_node();
         }
     }
@@ -1829,8 +1843,10 @@ void Document::update_layout(UpdateLayoutReason reason)
         auto const force_devtools_layout_data_collection = should_collect_devtools_layout_data
             && reason == UpdateLayoutReason::InspectDevToolsLayoutData;
 
-        if (layout_is_up_to_date() && !force_devtools_layout_data_collection)
+        if (layout_is_up_to_date() && !force_devtools_layout_data_collection) {
+            update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
             return;
+        }
 
         auto svg_roots_to_relayout = move(m_svg_roots_needing_relayout);
 
@@ -1843,9 +1859,15 @@ void Document::update_layout(UpdateLayoutReason reason)
         // Partial SVG relayout
         if (!needs_layout_tree_rebuild && !svg_roots_to_relayout.is_empty() && !m_layout_root->needs_layout_update()) {
             for (auto const& svg_root : svg_roots_to_relayout) {
-                if (svg_root)
+                if (svg_root) {
                     relayout_svg_root(*svg_root);
+                    // NB: The subtree commit reset the SVG root's descendant paintables, and the subtree's
+                    //     new size may change ancestor scrollable overflow; scheduling the root covers both.
+                    schedule_scrollable_overflow_recalculation(*svg_root);
+                }
             }
+
+            update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
 
             invalidate_stacking_context_tree();
             set_needs_to_record_display_list();
@@ -1872,16 +1894,21 @@ void Document::update_layout(UpdateLayoutReason reason)
             m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
 
             // NB: Called during layout update.
-            if (document_element && document_element->unsafe_layout_node()) {
-                propagate_overflow_to_viewport(*document_element, *m_layout_root);
+            if (document_element && document_element->unsafe_layout_node())
                 propagate_scrollbar_width_to_viewport(*document_element, *m_layout_root);
-            }
 
             set_needs_full_layout_tree_update(false);
 
             if constexpr (UPDATE_LAYOUT_DEBUG) {
                 dbgln("TREEBUILD {} µs", timer.elapsed_time().to_microseconds());
             }
+        }
+
+        if (document_element && document_element->unsafe_layout_node()) {
+            propagate_overflow_to_viewport(*document_element, *m_layout_root);
+        } else {
+            m_layout_root->mutable_computed_values().set_overflow_x(CSS::Overflow::Auto);
+            m_layout_root->mutable_computed_values().set_overflow_y(CSS::Overflow::Auto);
         }
 
         u32 layout_index_counter = 0;
@@ -1937,6 +1964,9 @@ void Document::update_layout(UpdateLayoutReason reason)
         }
 
         layout_state.commit(*m_layout_root);
+
+        style_invalidation_counters().relayouts_performed++;
+        update_scrollable_overflow(UpdateScrollableOverflowMode::AfterLayout);
 
         // Broadcast the current viewport rect to any new paintables, so they know whether they're visible or not.
         inform_all_viewport_clients_about_the_current_viewport_rect();
@@ -2109,6 +2139,194 @@ void Document::set_needs_animated_style_update()
         return;
 
     page().client().request_frame();
+}
+
+static void rebuild_sticky_insets(Layout::Node const& root)
+{
+    root.for_each_in_inclusive_subtree([&](auto& layout_node) {
+        auto const* node_with_style = as_if<Layout::NodeWithStyle>(layout_node);
+        if (!node_with_style || !node_with_style->is_sticky_position())
+            return TraversalDecision::Continue;
+
+        for (auto& paintable : layout_node.paintables()) {
+            auto* box_paintable = paintable.ptr();
+            if (!box_paintable)
+                continue;
+
+            // https://drafts.csswg.org/css-position/#insets
+            // For sticky positioned boxes, the inset is instead relative to the relevant scrollport’s size.
+            // Negative values are allowed.
+
+            auto sticky_insets = make<Painting::StickyInsets>();
+            auto const& inset = node_with_style->computed_values().inset();
+
+            auto nearest_scrollable_ancestor = box_paintable->nearest_scrollable_ancestor();
+            CSSPixelSize scrollport_size;
+            if (nearest_scrollable_ancestor)
+                scrollport_size = nearest_scrollable_ancestor->absolute_rect().size();
+
+            if (!inset.top().is_auto())
+                sticky_insets->top = inset.top().to_px_or_zero(scrollport_size.height());
+            if (!inset.right().is_auto())
+                sticky_insets->right = inset.right().to_px_or_zero(scrollport_size.width());
+            if (!inset.bottom().is_auto())
+                sticky_insets->bottom = inset.bottom().to_px_or_zero(scrollport_size.height());
+            if (!inset.left().is_auto())
+                sticky_insets->left = inset.left().to_px_or_zero(scrollport_size.width());
+            box_paintable->set_sticky_insets(move(sticky_insets));
+        }
+        return TraversalDecision::Continue;
+    });
+}
+
+void Document::update_scrollable_overflow(UpdateScrollableOverflowMode mode)
+{
+    // For every box that will be re-measured, the overflow data it had before, so the diff below
+    // can tell what actually changed; an empty value means the box's paintable was reset by a
+    // subtree layout commit and the old data is unknown.
+    HashMap<Layout::Box const*, Optional<Painting::Paintable::OverflowData>> old_overflow_data_by_box;
+
+    if (mode == UpdateScrollableOverflowMode::Scheduled) {
+        auto pending_paintables = move(m_paintable_boxes_needing_scrollable_overflow_recalculation);
+        auto needs_full_recalculation = exchange(m_needs_full_scrollable_overflow_recalculation, false);
+        if (pending_paintables.is_empty() && !needs_full_recalculation)
+            return;
+        if (!m_layout_root || !unsafe_paintable())
+            return;
+
+        style_invalidation_counters().scrollable_overflow_recalculations++;
+
+        // Returns false when the box was already recorded, in which case the rest of its
+        // containing block chain has been recorded too.
+        auto record_and_clear_overflow_data = [&](Layout::Box const& box) {
+            auto box_paintable = box.paintable_box();
+            if (!box_paintable)
+                return true;
+            if (old_overflow_data_by_box.contains(&box))
+                return false;
+            old_overflow_data_by_box.set(&box, box_paintable->overflow_data());
+            const_cast<Painting::Paintable&>(*box_paintable).clear_overflow_data();
+            return true;
+        };
+
+        if (needs_full_recalculation) {
+            m_layout_root->for_each_in_inclusive_subtree([&](auto& layout_node) {
+                if (auto const* box = as_if<Layout::Box>(layout_node))
+                    record_and_clear_overflow_data(*box);
+                return TraversalDecision::Continue;
+            });
+        } else {
+            for (auto const& weak_paintable : pending_paintables) {
+                auto paintable = weak_paintable.strong_ref();
+                if (!paintable)
+                    continue;
+                auto const* box = as_if<Layout::Box>(paintable->layout_node());
+                if (!box)
+                    continue;
+                auto box_paintable = box->paintable_box();
+                bool was_reset_by_subtree_layout_commit = box_paintable && !box_paintable->overflow_data().has_value();
+                if (was_reset_by_subtree_layout_commit) {
+                    // The subtree layout commit (partial SVG relayout) reset every paintable in
+                    // this box's subtree, so all of it needs re-measuring.
+                    box->for_each_in_inclusive_subtree([&](auto& layout_node) {
+                        if (auto const* subtree_box = as_if<Layout::Box>(layout_node); subtree_box && subtree_box->paintable_box())
+                            old_overflow_data_by_box.ensure(subtree_box);
+                        return TraversalDecision::Continue;
+                    });
+                }
+                // NB: A box's own scrollable overflow rect does not depend on its own transform; the
+                //     transform is applied by each containing block when uniting the box's contribution.
+                //     Only the containing block chain needs re-measuring.
+                for (auto const* containing_block = box->containing_block(); containing_block; containing_block = containing_block->containing_block()) {
+                    if (!record_and_clear_overflow_data(*containing_block))
+                        break;
+                }
+            }
+        }
+
+        if (old_overflow_data_by_box.is_empty())
+            return;
+    } else {
+        // NB: A full layout re-measures everything from freshly reset paintables, which subsumes any
+        //     pending scheduled recalculation.
+        m_paintable_boxes_needing_scrollable_overflow_recalculation.clear_with_capacity();
+        m_needs_full_scrollable_overflow_recalculation = false;
+    }
+
+    // The scroll offset can become invalid if the scrollable overflow rectangle has changed. For
+    // example, if the scroll container has been scrolled to the very end and then its scrollable
+    // overflow rect becomes smaller, the scroll offset would be out of bounds. Re-applying the
+    // current offset clamps it against the new rect.
+    auto clamp_scroll_offset = [](Painting::Paintable& paintable) {
+        if (!paintable.scroll_offset().is_zero())
+            paintable.set_scroll_offset(paintable.scroll_offset());
+    };
+
+    if (mode == UpdateScrollableOverflowMode::AfterLayout) {
+        // Every paintable was just reset, so this measures the whole tree.
+        auto work = Layout::collect_scrollable_overflow_measurement_work(*m_layout_root);
+        for (auto const* box : work.boxes_to_measure)
+            Layout::measure_scrollable_overflow(*box, work.contained_boxes_map);
+        for (auto const* box : work.boxes_to_measure)
+            clamp_scroll_offset(const_cast<Painting::Paintable&>(*box->paintable_box()));
+        rebuild_sticky_insets(*m_layout_root);
+        m_scrollable_overflow_contained_boxes_from_last_layout = move(work.contained_boxes_map);
+        return;
+    }
+
+    for (auto const& it : old_overflow_data_by_box)
+        Layout::measure_scrollable_overflow(*it.key, m_scrollable_overflow_contained_boxes_from_last_layout);
+
+    bool any_overflow_changed = false;
+    bool any_has_scrollable_overflow_flipped = false;
+    for (auto const& [box, old_overflow_data] : old_overflow_data_by_box) {
+        auto box_paintable = box->paintable_box();
+        if (!box_paintable || !box_paintable->overflow_data().has_value())
+            continue;
+        auto const& new_overflow_data = *box_paintable->overflow_data();
+        bool rect_changed;
+        bool has_scrollable_overflow_flipped;
+        if (old_overflow_data.has_value()) {
+            rect_changed = old_overflow_data->scrollable_overflow_rect != new_overflow_data.scrollable_overflow_rect;
+            has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data.has_scrollable_overflow;
+        } else {
+            // The subtree commit that reset this paintable also destroyed the scroll frame indices
+            // and sticky insets of every paintable in the reset subtree, including ones this diff
+            // never visits (such as inline-level sticky elements, whose line paintables are
+            // recreated by every commit), so the scroll frames have to be rebuilt no matter what
+            // this particular box's overflow looks like.
+            rect_changed = true;
+            has_scrollable_overflow_flipped = true;
+        }
+        if (!rect_changed && !has_scrollable_overflow_flipped)
+            continue;
+        any_overflow_changed = true;
+        any_has_scrollable_overflow_flipped |= has_scrollable_overflow_flipped;
+        clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
+    }
+
+    // Nothing derived from scrollable overflow needs updating. In particular, this keeps transform
+    // changes that ride the accumulated-visual-context value-update path free of display list
+    // re-recording when the overflow they produce is unchanged.
+    if (!any_overflow_changed)
+        return;
+
+    if (any_has_scrollable_overflow_flipped) {
+        // The set of scroll frames changed, and the accumulated visual context tree embeds scroll frame
+        // indices, so both have to be rebuilt. Sticky insets feed the sticky constraints computed during
+        // scroll frame assignment (and the set of scrollable ancestors they resolve against may have
+        // changed), so rebuild them first.
+        rebuild_sticky_insets(*m_layout_root);
+        unsafe_paintable()->reassign_scroll_frames();
+        set_needs_accumulated_visual_contexts_update(true);
+    } else {
+        // Sticky insets only depend on scrollport geometry and which ancestor is scrollable, neither of
+        // which changes without a flip; the constraints capture the scroll ancestor's scrollable
+        // overflow size though, so they have to be refreshed.
+        unsafe_paintable()->refresh_sticky_constraints();
+    }
+    set_needs_to_record_display_list();
+    m_document->set_needs_repaint();
 }
 
 void Document::update_paint_and_hit_testing_properties_if_needed()
@@ -8255,6 +8473,41 @@ void Document::schedule_accumulated_visual_context_value_update(Element& element
     element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
         if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
             schedule_accumulated_visual_context_value_update(*pseudo_element_layout_node);
+    });
+}
+
+void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& layout_node)
+{
+    // SVG layout consumes transforms when computing geometry, so a transform change on SVG content
+    // has to perform layout, matching the behavior of the transform presentation attribute.
+    if (layout_node.is_svg_box()) {
+        const_cast<Layout::Node&>(layout_node).set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
+        return;
+    }
+
+    if (m_needs_full_scrollable_overflow_recalculation)
+        return;
+
+    // NB: Cap the queue in case it's never consumed (e.g. forced style updates in a document that never
+    //     updates layout).
+    static constexpr size_t max_pending_scrollable_overflow_recalculations = 1024;
+    if (m_paintable_boxes_needing_scrollable_overflow_recalculation.size() >= max_pending_scrollable_overflow_recalculations) {
+        m_paintable_boxes_needing_scrollable_overflow_recalculation.clear();
+        m_needs_full_scrollable_overflow_recalculation = true;
+        return;
+    }
+
+    for (auto const& layout_node_paintable : layout_node.paintables())
+        m_paintable_boxes_needing_scrollable_overflow_recalculation.append(*layout_node_paintable);
+}
+
+void Document::schedule_scrollable_overflow_recalculation(Element& element)
+{
+    if (auto* layout_node = element.unsafe_layout_node())
+        schedule_scrollable_overflow_recalculation(*layout_node);
+    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
+        if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
+            schedule_scrollable_overflow_recalculation(*pseudo_element_layout_node);
     });
 }
 
