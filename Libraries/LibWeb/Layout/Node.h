@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include <AK/DoublyLinkedList.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefCounted.h>
@@ -79,24 +78,10 @@ public:
     bool is_generated_for_backdrop_pseudo_element() const { return m_generated_for == CSS::PseudoElement::Backdrop; }
     void set_generated_for(CSS::PseudoElement type, DOM::Element&);
 
-    using PaintableList = DoublyLinkedList<NonnullRefPtr<Painting::Paintable>>;
-
-    RefPtr<Painting::Paintable> first_paintable()
-    {
-        if (m_paintable.is_empty())
-            return nullptr;
-        return m_paintable.first();
-    }
-    RefPtr<Painting::Paintable const> first_paintable() const
-    {
-        if (m_paintable.is_empty())
-            return nullptr;
-        return m_paintable.first();
-    }
-    PaintableList& paintables() { return m_paintable; }
-    PaintableList const& paintables() const { return m_paintable; }
-    void add_paintable(RefPtr<Painting::Paintable>);
-    void clear_paintables();
+    RefPtr<Painting::Paintable> paintable() { return m_paintable; }
+    RefPtr<Painting::Paintable const> paintable() const { return m_paintable; }
+    void set_paintable(RefPtr<Painting::Paintable>);
+    void clear_paintable();
     void prepare_for_detach_from_layout_tree();
     void prepare_subtree_for_detach_from_layout_tree();
 
@@ -130,6 +115,7 @@ public:
     bool has_replaced_element_table_display_adjustment() const;
     bool is_atomic_inline() const;
     bool is_fragmented_inline() const;
+    NodeWithStyleAndBoxModelMetrics const* nearest_fragmented_inline_ancestor() const;
     bool is_transformable() const;
 
     bool is_out_of_flow(FormattingContext const&) const;
@@ -284,7 +270,7 @@ private:
     friend class NodeWithStyle;
 
     GC::Weak<DOM::Node> m_dom_node;
-    PaintableList m_paintable;
+    RefPtr<Painting::Paintable> m_paintable;
 
     Box* m_containing_block { nullptr };
 
@@ -382,7 +368,6 @@ class NodeWithStyleAndBoxModelMetrics : public NodeWithStyle {
 
 public:
     bool is_inline_flow_interrupting_block() const;
-    NonnullRefPtr<Painting::PaintableWithLines> create_paintable_for_line_with_index(size_t line_index) const;
 
 protected:
     NodeWithStyleAndBoxModelMetrics(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);

@@ -65,13 +65,13 @@ Node::Node(DOM::Document& document, DOM::Node* node, AttachToDOMNode attach_to_d
 
 Node::~Node()
 {
-    for (auto& paintable : m_paintable)
-        paintable->detach_from_layout_node({});
+    if (m_paintable)
+        m_paintable->detach_from_layout_node({});
 }
 
 static void invalidate_paint_caches(Node& node)
 {
-    for (auto& paintable : node.paintables())
+    if (auto paintable = node.paintable())
         paintable->invalidate_paint_cache();
 }
 
@@ -630,18 +630,6 @@ NodeWithStyleAndBoxModelMetrics::NodeWithStyleAndBoxModelMetrics(DOM::Document& 
 {
 }
 
-NonnullRefPtr<Painting::PaintableWithLines> NodeWithStyleAndBoxModelMetrics::create_paintable_for_line_with_index(size_t line_index) const
-{
-    for (auto const& paintable : paintables()) {
-        if (is<Painting::PaintableWithLines>(*paintable)) {
-            auto const& paintable_with_lines = static_cast<Painting::PaintableWithLines const&>(*paintable);
-            if (paintable_with_lines.line_index() == line_index)
-                return const_cast<Painting::PaintableWithLines&>(paintable_with_lines);
-        }
-    }
-    return Painting::PaintableWithLines::create(*this, line_index);
-}
-
 NodeWithStyle::ImageObserver::ImageObserver(NodeWithStyle& owner, NonnullRefPtr<CSS::ImageStyleValue const> image)
     : CSS::ImageStyleValue::Client(owner.document(), *image)
     , m_owner(owner)
@@ -658,7 +646,7 @@ void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleV
 {
     VERIFY(m_owner);
 
-    for (auto& paintable : m_owner->paintables())
+    if (auto paintable = m_owner->paintable())
         paintable->set_needs_repaint();
 
     // The body's background propagates to the root element's paintable, which holds the cached draw commands.
@@ -667,7 +655,7 @@ void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleV
         if (html_element) {
             if (auto html_layout_node = html_element->unsafe_layout_node()) {
                 if (html_element->should_use_body_background_properties()) {
-                    for (auto& paintable : html_layout_node->paintables())
+                    if (auto paintable = html_layout_node->paintable())
                         paintable->set_needs_repaint();
                 }
             }
@@ -1272,6 +1260,17 @@ bool Node::is_fragmented_inline() const
         || (is_list_item_box() && display().is_inline_outside() && display().is_flow_inside());
 }
 
+NodeWithStyleAndBoxModelMetrics const* Node::nearest_fragmented_inline_ancestor() const
+{
+    for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->display().is_inline_outside() || !ancestor->display().is_flow_inside())
+            break;
+        if (ancestor->is_fragmented_inline())
+            return static_cast<NodeWithStyleAndBoxModelMetrics const*>(ancestor);
+    }
+    return nullptr;
+}
+
 // https://drafts.csswg.org/css-transforms-1/#transformable-element
 bool Node::is_transformable() const
 {
@@ -1416,24 +1415,22 @@ bool NodeWithStyle::is_scroll_container() const
         || overflow_value_makes_box_a_scroll_container(computed_values().overflow_y());
 }
 
-void Node::add_paintable(RefPtr<Painting::Paintable> paintable)
+void Node::set_paintable(RefPtr<Painting::Paintable> paintable)
 {
-    if (!paintable)
-        return;
-    m_paintable.append(*paintable);
+    m_paintable = move(paintable);
 }
 
-void Node::clear_paintables()
+void Node::clear_paintable()
 {
-    if (!m_paintable.is_empty())
+    if (m_paintable)
         document().invalidate_stacking_context_tree();
 
     invalidate_paint_caches(*this);
-    for (auto& paintable : m_paintable) {
-        if (paintable->parent())
-            paintable->remove();
+    if (m_paintable) {
+        if (m_paintable->parent())
+            m_paintable->remove();
+        m_paintable = nullptr;
     }
-    m_paintable.clear();
 }
 
 RefPtr<Painting::Paintable> Node::create_paintable() const

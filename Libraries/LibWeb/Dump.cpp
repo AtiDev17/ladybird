@@ -50,6 +50,7 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Painting/InlinePaintable.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
@@ -212,13 +213,13 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
     }
 
     auto dump_position = [&] {
-        if (auto first_paintable = layout_node.first_paintable(); auto const* paintable_box = first_paintable.ptr())
+        if (auto paintable = layout_node.paintable(); auto const* paintable_box = paintable.ptr())
             builder.appendff("at {}", paintable_box->absolute_rect().location());
         else
             builder.appendff("(not painted)");
     };
     auto dump_box_model = [&] {
-        if (auto first_paintable = layout_node.first_paintable(); auto const* paintable_box = first_paintable.ptr()) {
+        if (auto paintable = layout_node.paintable(); auto const* paintable_box = paintable.ptr()) {
             auto const& box_model = paintable_box->box_model();
             // Dump the horizontal box properties
             builder.appendff(" [{}+{}+{} {} {}+{}+{}]",
@@ -386,20 +387,27 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
         block_container && block_container->children_are_inline() && block_container->paintable_with_lines()) {
         size_t fragment_index = 0;
         auto paintable_with_lines = block_container->paintable_with_lines();
-        for (auto const& fragment : paintable_with_lines->fragments())
+        for (auto const& fragment : paintable_with_lines->fragments()) {
+            // Fragments inside inline boxes are dumped under their box's layout node below.
+            if (fragment.layout_node().nearest_fragmented_inline_ancestor())
+                continue;
             dump_fragment(fragment, fragment_index++);
+        }
     }
 
-    if (is<Layout::InlineNode>(layout_node) && layout_node.first_paintable()) {
-        auto const& inline_node = static_cast<Layout::InlineNode const&>(layout_node);
-        for (auto const& paintable : inline_node.paintables()) {
-            auto const& paintable_with_lines = static_cast<Painting::PaintableWithLines const&>(*paintable);
-            auto const& fragments = paintable_with_lines.fragments();
-            for (size_t fragment_index = 0; fragment_index < fragments.size(); ++fragment_index) {
-                auto const& fragment = fragments[fragment_index];
-                dump_fragment(fragment, fragment_index);
+    if (auto const* inline_paintable = as_if<Painting::InlinePaintable>(layout_node.paintable().ptr())) {
+        Painting::InlineBoxPiece const* current_piece = nullptr;
+        size_t fragment_index_within_piece = 0;
+        inline_paintable->for_each_piece_fragment([&](Painting::InlineBoxPiece const& piece, Painting::PaintableFragment const& fragment) {
+            if (&piece != current_piece) {
+                current_piece = &piece;
+                fragment_index_within_piece = 0;
             }
-        }
+            // Fragments of nested inline boxes are dumped under their own box.
+            if (fragment.layout_node().nearest_fragmented_inline_ancestor() != &layout_node)
+                return;
+            dump_fragment(fragment, fragment_index_within_piece++);
+        });
     }
 
     if (show_computed_properties && layout_node.dom_node() && layout_node.dom_node()->is_element() && as<DOM::Element>(layout_node.dom_node())->computed_properties()) {
@@ -722,48 +730,37 @@ void dump_tree(Painting::Paintable const& paintable)
 
 void dump_tree(StringBuilder& builder, Painting::Paintable const& paintable, bool colorize, int indent)
 {
-    // Dump all paintables attached to this layout node at every level.
-    // This makes detached/disconnected paintables visible across the full subtree.
     StringView paintable_with_lines_color_on = ""sv;
     StringView paintable_box_color_on = ""sv;
-    StringView paintable_color_on = ""sv;
     StringView color_off = ""sv;
 
     if (colorize) {
         paintable_with_lines_color_on = "\033[34m"sv;
         paintable_box_color_on = "\033[33m"sv;
-        paintable_color_on = "\033[32m"sv;
         color_off = "\033[0m"sv;
     }
 
-    bool dumped_any = false;
-    for (auto const& node_paintable : paintable.layout_node().paintables()) {
-        if (dumped_any)
-            builder.append("\n"sv);
+    for (int i = 0; i < indent; ++i)
+        builder.append("  "sv);
 
-        for (int i = 0; i < indent; ++i)
-            builder.append("  "sv);
+    if (is<Painting::PaintableWithLines>(paintable))
+        builder.append(paintable_with_lines_color_on);
+    else
+        builder.append(paintable_box_color_on);
 
-        if (is<Painting::PaintableWithLines>(node_paintable))
-            builder.append(paintable_with_lines_color_on);
-        else
-            builder.append(paintable_box_color_on);
+    builder.appendff("{}{} ({})", paintable.class_name(), color_off, paintable.layout_node().debug_description());
 
-        builder.appendff("{}{} ({})", node_paintable->class_name(), color_off, node_paintable->layout_node().debug_description());
+    builder.appendff(" {}", paintable.absolute_border_box_rect());
 
-        builder.appendff(" {}", node_paintable->absolute_border_box_rect());
+    if (paintable.has_scrollable_overflow())
+        builder.appendff(" overflow: {}", paintable.scrollable_overflow_rect());
 
-        if (node_paintable->has_scrollable_overflow())
-            builder.appendff(" overflow: {}", node_paintable->scrollable_overflow_rect());
+    if (!paintable.scroll_offset().is_zero())
+        builder.appendff(" scroll-offset: {}", paintable.scroll_offset());
+    builder.append("\n"sv);
 
-        if (!node_paintable->scroll_offset().is_zero())
-            builder.appendff(" scroll-offset: {}", node_paintable->scroll_offset());
-        builder.append("\n"sv);
-
-        for (auto child = node_paintable->first_child(); child; child = child->next_sibling())
-            dump_tree(builder, *child, colorize, indent + 1);
-        dumped_any = true;
-    }
+    for (auto child = paintable.first_child(); child; child = child->next_sibling())
+        dump_tree(builder, *child, colorize, indent + 1);
 }
 
 }
