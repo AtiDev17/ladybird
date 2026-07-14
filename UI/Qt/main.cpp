@@ -18,6 +18,7 @@
 #include <QtGlobal>
 
 #if defined(AK_OS_MACOS)
+#    include <UI/AppKit/Utilities/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
 #endif
 
@@ -52,18 +53,18 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
+    if (app->should_exit_after_profile_coordination()) {
+        outln("Opening in existing process");
+        return 0;
+    }
+
     app->initialize_macos_application_menu();
-    WebView::BrowserProcess browser_process;
+    auto& browser_process = app->browser_process();
 
     if (auto const& browser_options = Ladybird::Application::browser_options(); !browser_options.headless_mode.has_value()) {
-        if (browser_options.force_new_process == WebView::ForceNewProcess::No) {
-            auto disposition = TRY(browser_process.connect(browser_options.raw_urls, browser_options.new_window));
-
-            if (disposition == WebView::BrowserProcess::ProcessDisposition::ExitProcess) {
-                outln("Opening in existing process");
-                return 0;
-            }
-        }
+#if defined(AK_OS_MACOS)
+        Ladybird::set_profile_application_icon(Ladybird::Application::profile());
+#endif
 
         app->on_open_file = [&](auto const& file_url) {
             if (auto* window = app->active_window_if_any()) {

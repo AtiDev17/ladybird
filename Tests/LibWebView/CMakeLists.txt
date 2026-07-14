@@ -5,13 +5,18 @@ set(TEST_SOURCES
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestOmnibox.cpp
+    TestProfile.cpp
     TestSessionHistory.cpp
     TestStorageJar.cpp
     TestWebViewURL.cpp
 )
 
 foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" LibWebView LIBS LibDatabase LibWebView LibURL)
+    set(test_libraries LibDatabase LibWebView LibURL)
+    if (source STREQUAL "TestProfile.cpp")
+        list(APPEND test_libraries LibHTTP)
+    endif()
+    ladybird_test("${source}" LibWebView LIBS ${test_libraries})
 endforeach()
 
 if (NOT WIN32)
