@@ -173,6 +173,7 @@ void ViewImplementation::create_new_process_for_cross_site_navigation(URL::URL c
     }
 
     if (m_client_state.client) {
+        m_client_state.client->async_notify_webdriver_of_window_replacement(m_client_state.page_index);
         m_client_state.client->unregister_view(m_client_state.page_index);
     }
 
@@ -1545,6 +1546,10 @@ void ViewImplementation::set_loading_state(bool is_loading)
 
 bool ViewImplementation::restore_pending_session_history_navigation(StringView reason)
 {
+    Optional<URL::URL> provisional_url;
+    if (auto const& pending_navigation = m_top_level_traversable.pending_session_history_navigation(); pending_navigation.has_value())
+        provisional_url = pending_navigation->url;
+
     auto result = m_top_level_traversable.restore_pending_session_history_navigation();
     if (!result.restored)
         return false;
@@ -1559,7 +1564,18 @@ bool ViewImplementation::restore_pending_session_history_navigation(StringView r
             m_should_suppress_history_for_next_load = false;
             m_webdriver_pending_navigation_url = current_url;
             m_webdriver_pending_navigation_completes_with_session_history_update = true;
-            load_current_session_history_entry_from_ui_process();
+            if (provisional_url.has_value() && SiteIsolationManager::the().navigation_requires_process_swap(*provisional_url, current_url)) {
+                auto load = m_top_level_traversable.prepare_current_session_history_entry_load(current_url);
+                auto view_id = m_view_id;
+                Core::deferred_invoke([view_id, load = move(load)]() mutable {
+                    auto view = ViewImplementation::find_view_by_id(view_id);
+                    if (!view.has_value())
+                        return;
+                    view->create_new_process_for_cross_site_navigation(load.url, move(load.document_resource), load.history_handling);
+                });
+            } else {
+                load_current_session_history_entry_from_ui_process();
+            }
         } else {
             m_webdriver_pending_navigation_url.clear();
             m_webdriver_pending_navigation_completes_with_session_history_update = false;
@@ -1785,6 +1801,13 @@ void ViewImplementation::load_current_session_history_entry_from_ui_process()
 
 void ViewImplementation::load_session_history_traversal_target_from_ui_process(TraversableSessionHistory::TraversalTarget const& target, StringView dump_reason)
 {
+    // NB: Preparing the traversal target clears the pending navigation, so capture whether its provisional
+    //     WebContent process must be replaced before preparing the load.
+    auto should_replace_provisional_web_content_process = false;
+    if (auto const& pending_navigation = m_top_level_traversable.pending_session_history_navigation(); pending_navigation.has_value()) {
+        should_replace_provisional_web_content_process = pending_navigation->web_content_restore_mode == PendingSessionHistoryNavigation::WebContentRestoreMode::RestoreFromUIProcess
+            && SiteIsolationManager::the().navigation_requires_process_swap(m_url, target.target_top_level_entry->url);
+    }
     auto target_url = m_top_level_traversable.prepare_to_load_session_history_traversal_target_from_ui_process(target, m_url);
     update_navigation_action_state();
 
@@ -1795,7 +1818,14 @@ void ViewImplementation::load_session_history_traversal_target_from_ui_process(T
     m_webdriver_pending_navigation_completes_with_session_history_update = true;
     set_url(target_url);
     dump_session_history(dump_reason);
-    load_current_session_history_entry_from_ui_process();
+    // NB: A cross-site provisional navigation has already installed its replacement WebContent process. If Back wins
+    //     the race, load the previous-site traversal target in another correctly isolated process.
+    if (should_replace_provisional_web_content_process) {
+        auto load = m_top_level_traversable.prepare_current_session_history_entry_load(m_url);
+        create_new_process_for_cross_site_navigation(load.url, move(load.document_resource), load.history_handling);
+    } else {
+        load_current_session_history_entry_from_ui_process();
+    }
 }
 
 NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_session_history_for_testing()
@@ -1872,9 +1902,9 @@ void ViewImplementation::did_traverse_the_history_to_step(Badge<WebContentClient
 }
 
 void ViewImplementation::did_check_if_traverse_history_step_is_canceled(
-    Badge<WebContentClient>, u64 request_id, i32 step, bool canceled)
+    Badge<WebContentClient>, u64 request_id, i32 step, Web::HTML::HistoryStepResult result)
 {
-    auto check_result = m_top_level_traversable.did_check_if_traverse_history_step_is_canceled(request_id, step, canceled);
+    auto check_result = m_top_level_traversable.did_check_if_traverse_history_step_is_canceled(request_id, step, result);
     if (check_result.should_update_webdriver_pending_navigation_to_current_url && m_webdriver_pending_navigation_url.has_value())
         m_webdriver_pending_navigation_url = m_url;
     if (check_result.should_reset_webdriver_pending_navigation_completion)
@@ -1884,6 +1914,20 @@ void ViewImplementation::did_check_if_traverse_history_step_is_canceled(
         complete_webdriver_pending_navigation_if_url_matches(m_url);
     if (check_result.should_update_navigation_action_state)
         update_navigation_action_state();
+
+    if (check_result.should_restore_pending_navigation) {
+        // NB: WebContent's stop_loading() does not send did_cancel_loading(), so clear the UI process's loading
+        //     bookkeeping before restoring the pending navigation.
+        set_loading_state(false);
+        m_is_waiting_for_navigation_start = false;
+        m_loading_navigation_id.clear();
+        m_loading_url.clear();
+        auto restored = restore_pending_session_history_navigation(check_result.dump_reason);
+        VERIFY(restored);
+        if (check_result.on_cancelation_check_complete)
+            check_result.on_cancelation_check_complete(move(check_result.outcome));
+        return;
+    }
 
     if (check_result.target.has_value()) {
         if (check_result.on_cancelation_check_complete)
