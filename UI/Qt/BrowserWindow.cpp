@@ -654,9 +654,10 @@ void BrowserWindow::initialize_tab(Tab* tab)
 
     tab->view().on_new_web_view = [this, tab](auto activate_tab, Web::HTML::WebViewHints hints, Optional<u64> page_index) {
         if (hints.popup) {
+            auto cascaded_configuration = Application::the().configuration_for_new_window();
             WindowConfiguration configuration {
-                .x = hints.screen_x,
-                .y = hints.screen_y,
+                .x = hints.screen_x.has_value() ? hints.screen_x : cascaded_configuration.x,
+                .y = hints.screen_y.has_value() ? hints.screen_y : cascaded_configuration.y,
                 .width = hints.width,
                 .height = hints.height,
             };
@@ -682,6 +683,7 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
 
     tab.set_window(*this);
     m_tabs_container->insert_tab(index, &tab, "New Tab");
+    tab.view().finish_window_move();
     initialize_tab(&tab);
     tab_title_changed(index, tab.title());
 
@@ -708,6 +710,7 @@ void BrowserWindow::move_tab_to_window(int index, BrowserWindow& target_window, 
         return;
 
     auto* tab = m_tabs_container->tab(index);
+    tab->view().prepare_for_window_move();
     uninitialize_tab(tab);
     m_tabs_container->take_tab(index);
     if (m_current_tab == tab)
@@ -734,8 +737,16 @@ void BrowserWindow::detach_tab_to_new_window(int index, QPoint global_position)
         .maximized = isMaximized(),
     };
 
-    auto& window = Application::the().new_window({}, configuration, IsPopupWindow::No, m_is_private);
+    auto& window = Application::the().new_window({}, configuration, IsPopupWindow::No, m_is_private, nullptr, {}, ShowWindow::No);
     move_tab_to_window(index, window, 0);
+
+    if (configuration.maximized == true)
+        window.showMaximized();
+    else
+        window.show();
+
+    window.activateWindow();
+    window.raise();
 }
 
 void BrowserWindow::set_current_tab(Tab* tab)
