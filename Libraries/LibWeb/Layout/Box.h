@@ -15,6 +15,13 @@
 
 namespace Web::Layout {
 
+struct AbsposLayoutInputs;
+
+enum class RequireExistingPaintable : u8 {
+    No,
+    Yes,
+};
+
 struct LineBoxFragmentCoordinate {
     size_t line_box_index { 0 };
     size_t fragment_index { 0 };
@@ -44,6 +51,11 @@ public:
     RefPtr<Painting::Paintable const> paintable_box() const;
     RefPtr<Painting::Paintable> paintable_box();
 
+    // A partial relayout boundary is a box whose subtree can be re-laid out in
+    // isolation: its own used size and position are guaranteed not to change
+    // when layout is invalidated somewhere inside its subtree.
+    bool is_partial_relayout_boundary(RequireExistingPaintable = RequireExistingPaintable::Yes) const;
+
     // https://www.w3.org/TR/css-images-3/#natural-dimensions
     virtual CSS::SizeWithAspectRatio natural_size() const { return {}; }
 
@@ -64,6 +76,19 @@ public:
     virtual void did_set_content_size() { }
 
     virtual RefPtr<Painting::Paintable> create_paintable() const override;
+
+    // The inputs the absolutely positioned element layout algorithm consumed the last time a
+    // committing layout pass laid this box out; a partial relayout can replay the algorithm
+    // from them without re-running the ancestor formatting context.
+    AbsposLayoutInputs const* saved_abspos_layout_inputs() const { return m_saved_abspos_layout_inputs.ptr(); }
+    void set_saved_abspos_layout_inputs(AbsposLayoutInputs const&);
+    void clear_saved_abspos_layout_inputs();
+
+    // Whether an absolutely or fixed positioned descendant of this box has its containing
+    // block outside this box's subtree, so the descendant's layout escapes the subtree.
+    // Re-derived whenever containing block pointers are recomputed.
+    bool abspos_descendant_escapes() const { return m_abspos_descendant_escapes; }
+    void set_abspos_descendant_escapes(bool value) { m_abspos_descendant_escapes = value; }
 
     void set_default_scroll_shift(WeakPtr<Node> anchor, bool compensates_for_scroll_in_x, bool compensates_for_scroll_in_y)
     {
@@ -92,9 +117,12 @@ protected:
 private:
     virtual bool is_box() const final { return true; }
 
+    OwnPtr<AbsposLayoutInputs> m_saved_abspos_layout_inputs;
+
     WeakPtr<Node> m_default_scroll_shift_anchor;
     bool m_compensates_for_scroll_in_x { false };
     bool m_compensates_for_scroll_in_y { false };
+    bool m_abspos_descendant_escapes { false };
 
     OwnPtr<IntrinsicSizes> mutable m_cached_intrinsic_sizes;
 };

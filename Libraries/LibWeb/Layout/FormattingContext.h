@@ -8,6 +8,7 @@
 
 #include <AK/OwnPtr.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Layout/AbsposLayoutInputs.h>
 #include <LibWeb/Layout/AvailableSpace.h>
 #include <LibWeb/Layout/LayoutInput.h>
 #include <LibWeb/Layout/LayoutState.h>
@@ -22,43 +23,9 @@ template<typename T>
     return ::max(min, ::min(value, max));
 }
 
-enum class Alignment {
-    Baseline,
-    Center,
-    End,
-    Normal,
-    Safe,
-    SelfEnd,
-    SelfStart,
-    SpaceAround,
-    SpaceBetween,
-    SpaceEvenly,
-    Start,
-    Stretch,
-    Unsafe,
-};
-
-enum class AbsposAxisMode {
-    // Both insets auto: offset = static_position + margin
-    StaticPosition,
-    // At least one explicit inset: offset = rect.origin + inset + margin
-    InsetFromRect,
-};
-
 enum class TableWrapperWidthMode {
     ClampToAvailableWidth,
     UseTableUsedWidthIfNotAuto,
-};
-
-struct AbsposContainingBlockInfo {
-    // Containing block rect in CB Box's content-edge coordinates.
-    CSSPixelRect rect;
-    AbsposAxisMode horizontal_axis_mode;
-    AbsposAxisMode vertical_axis_mode;
-    // Grid alignment for axes with auto CSS insets.
-    // When set, the base method applies alignment-driven insets after sizing.
-    Optional<Alignment> horizontal_alignment;
-    Optional<Alignment> vertical_alignment;
 };
 
 class FormattingContext {
@@ -77,6 +44,7 @@ public:
         Table,
         SVG,
         ReplacedWithChildren,
+        AbsposReplay,     // Hosts the absolutely positioned element algorithm when it is replayed from saved inputs.
         InternalReplaced, // Internal hack formatting context for replaced elements. FIXME: Get rid of this.
         InternalDummy,    // Internal hack formatting context for unimplemented things. FIXME: Get rid of this.
     };
@@ -98,6 +66,8 @@ public:
             return "SVG"sv;
         case Type::ReplacedWithChildren:
             return "Replaced, with children"sv;
+        case Type::AbsposReplay:
+            return "Abspos replay"sv;
         case Type::InternalReplaced:
             return "Replaced"sv;
         case Type::InternalDummy:
@@ -144,8 +114,23 @@ public:
     CSSPixels compute_width_for_replaced_element(Box const&, AvailableSpace const&, ContainingBlockConstraints const&) const;
     CSSPixels compute_height_for_replaced_element(Box const&, AvailableSpace const&, ContainingBlockConstraints const&) const;
 
-    OwnPtr<FormattingContext> create_independent_formatting_context_if_needed(LayoutState&, LayoutMode, Box const& child_box);
-    NonnullOwnPtr<FormattingContext> create_independent_formatting_context(LayoutState&, LayoutMode, Box const& child_box);
+    static OwnPtr<FormattingContext> create_independent_formatting_context_if_needed(LayoutState&, LayoutMode, Box const& child_box, FormattingContext* parent);
+    static NonnullOwnPtr<FormattingContext> create_independent_formatting_context(LayoutState&, LayoutMode, Box const& child_box, FormattingContext* parent);
+
+    // Re-runs the absolutely positioned element layout algorithm for a box from the inputs
+    // saved by the last committing layout pass, without running any ancestor formatting
+    // context. Partial relayout uses this to re-resolve a boundary's own size and position.
+    static void layout_absolutely_positioned_element_from_saved_inputs(LayoutState&, Box&);
+
+    // Whether the saved layout inputs are still valid for replaying the box's layout after a
+    // style change on the box itself: parts recorded as derived from the box's own computed
+    // values may be stale, while everything else derives from layout outside the subtree,
+    // which such a change cannot affect.
+    [[nodiscard]] static bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const&);
+
+    // Whether any of the box's inset properties carries anchor() functions, which only
+    // resolve_anchor_insets() can turn into plain values during a full layout pass.
+    [[nodiscard]] static bool box_inset_properties_contain_anchor_functions(Box const&);
 
     [[nodiscard]] static ContainingBlockConstraints constraints_for_child_context(
         LayoutState::UsedValues const& containing_block_used_values,
@@ -244,7 +229,7 @@ protected:
 
     ShrinkToFitResult calculate_shrink_to_fit_widths(Box const&, ContainingBlockConstraints const&);
 
-    void layout_absolutely_positioned_element(Box&, StaticPositionRect const&, AbsposContainingBlockInfo const&);
+    void layout_absolutely_positioned_element(Box&, AbsposLayoutInputs const&);
 
     CSSPixels gap_to_px(Variant<CSS::LengthPercentage, CSS::NormalGap> const& gap, CSSPixels reference_value) const;
 

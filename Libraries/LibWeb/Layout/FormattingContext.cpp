@@ -10,6 +10,7 @@
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
+#include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
@@ -483,7 +484,7 @@ struct DummyFormattingContext : public FormattingContext {
     virtual void run(LayoutInput const&) override { }
 };
 
-OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_context_if_needed(LayoutState& state, LayoutMode layout_mode, Box const& child_box)
+OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_context_if_needed(LayoutState& state, LayoutMode layout_mode, Box const& child_box, FormattingContext* parent)
 {
     auto type = formatting_context_type_created_by_box(child_box);
     if (!type.has_value())
@@ -491,17 +492,17 @@ OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_conte
 
     switch (type.value()) {
     case Type::Block:
-        return make<BlockFormattingContext>(state, layout_mode, as<BlockContainer>(child_box), this);
+        return make<BlockFormattingContext>(state, layout_mode, as<BlockContainer>(child_box), parent);
     case Type::SVG:
-        return make<SVGFormattingContext>(state, layout_mode, child_box, this);
+        return make<SVGFormattingContext>(state, layout_mode, child_box, parent);
     case Type::Flex:
-        return make<FlexFormattingContext>(state, layout_mode, child_box, this);
+        return make<FlexFormattingContext>(state, layout_mode, child_box, parent);
     case Type::Grid:
-        return make<GridFormattingContext>(state, layout_mode, child_box, this);
+        return make<GridFormattingContext>(state, layout_mode, child_box, parent);
     case Type::Table:
-        return make<TableFormattingContext>(state, layout_mode, child_box, this);
+        return make<TableFormattingContext>(state, layout_mode, child_box, parent);
     case Type::ReplacedWithChildren:
-        return make<ReplacedWithChildrenFormattingContext>(state, layout_mode, child_box, this);
+        return make<ReplacedWithChildrenFormattingContext>(state, layout_mode, child_box, parent);
     case Type::InternalReplaced:
         return make<ReplacedFormattingContext>(state, layout_mode, child_box);
     case Type::InternalDummy:
@@ -515,9 +516,9 @@ OwnPtr<FormattingContext> FormattingContext::create_independent_formatting_conte
     }
 }
 
-NonnullOwnPtr<FormattingContext> FormattingContext::create_independent_formatting_context(LayoutState& state, LayoutMode layout_mode, Box const& child_box)
+NonnullOwnPtr<FormattingContext> FormattingContext::create_independent_formatting_context(LayoutState& state, LayoutMode layout_mode, Box const& child_box, FormattingContext* parent)
 {
-    if (auto context = create_independent_formatting_context_if_needed(state, layout_mode, child_box))
+    if (auto context = create_independent_formatting_context_if_needed(state, layout_mode, child_box, parent))
         return context.release_nonnull();
 
     if (auto child_block_container = as_if<BlockContainer>(child_box))
@@ -556,7 +557,7 @@ OwnPtr<FormattingContext> FormattingContext::layout_inside(Box const& child_box,
     if (!child_box.can_have_children())
         return {};
 
-    auto independent_formatting_context = create_independent_formatting_context_if_needed(m_state, layout_mode, child_box);
+    auto independent_formatting_context = create_independent_formatting_context_if_needed(m_state, layout_mode, child_box, this);
     if (independent_formatting_context)
         independent_formatting_context->run(layout_input);
     else
@@ -740,7 +741,7 @@ CSSPixels FormattingContext::measure_automatic_content_height(Box const& box, Av
 {
     LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
     throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
-    auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box);
+    auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box, this);
     measuring_context->run(LayoutInput { inner_available_space, containing_block_constraints });
     return measuring_context->automatic_content_height();
 }
@@ -870,7 +871,7 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
     LayoutState throwaway_state(box, LayoutState::Purpose::Measurement);
     throwaway_state.create(box, table_wrapper_constraints.percentage_basis_width, table_wrapper_constraints.percentage_basis_height);
 
-    auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box);
+    auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box, this);
     VERIFY(context);
     context->run(LayoutInput { m_state.get(box).available_inner_space_or_constraints_from(available_space), table_wrapper_constraints });
 
@@ -1852,17 +1853,25 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
     return bounding_rect;
 }
 
+struct AbsposAxisModes {
+    AbsposAxisMode horizontal;
+    AbsposAxisMode vertical;
+};
+
+// Per-axis mode: auto+auto insets -> static position, otherwise -> inset from rect.
+static AbsposAxisModes abspos_axis_modes_from_computed_insets(CSS::ComputedValues const& computed_values)
+{
+    auto const& inset = computed_values.inset();
+    return {
+        .horizontal = inset.left().is_auto() && inset.right().is_auto() ? AbsposAxisMode::StaticPosition : AbsposAxisMode::InsetFromRect,
+        .vertical = inset.top().is_auto() && inset.bottom().is_auto() ? AbsposAxisMode::StaticPosition : AbsposAxisMode::InsetFromRect,
+    };
+}
+
 AbsposContainingBlockInfo FormattingContext::resolve_abspos_containing_block_info(Box const& box)
 {
     auto const& computed_values = box.computed_values();
-
-    // Per-axis mode: auto+auto insets -> static position, otherwise -> inset from rect
-    auto horizontal_axis_mode = (computed_values.inset().left().is_auto() && computed_values.inset().right().is_auto())
-        ? AbsposAxisMode::StaticPosition
-        : AbsposAxisMode::InsetFromRect;
-    auto vertical_axis_mode = (computed_values.inset().top().is_auto() && computed_values.inset().bottom().is_auto())
-        ? AbsposAxisMode::StaticPosition
-        : AbsposAxisMode::InsetFromRect;
+    auto [horizontal_axis_mode, vertical_axis_mode] = abspos_axis_modes_from_computed_insets(computed_values);
 
     // Check if there's an inline element that should be the real containing block.
     auto inline_containing_block = box.inline_containing_block_if_applicable();
@@ -1894,6 +1903,42 @@ static bool calculation_tree_contains_anchor(CSS::CalculationNode const& root)
             return true;
     }
     return false;
+}
+
+static bool style_value_contains_anchor(CSS::StyleValue const& value)
+{
+    if (value.is_anchor())
+        return true;
+    if (value.is_calculated())
+        return calculation_tree_contains_anchor(value.as_calculated().calculation());
+    return false;
+}
+
+// NB: Generated boxes for pseudo-elements are anonymous, so their computed properties live in
+//     the generator element under the relevant pseudo-element rather than on a DOM node of
+//     their own.
+static Optional<DOM::AbstractElement> abstract_element_for_box(Box const& box)
+{
+    if (box.is_generated_for_pseudo_element())
+        return DOM::AbstractElement { *box.pseudo_element_generator(), box.generated_for_pseudo_element() };
+    if (auto const* element = as_if<DOM::Element>(box.dom_node()))
+        return DOM::AbstractElement { *element };
+    return {};
+}
+
+bool FormattingContext::box_inset_properties_contain_anchor_functions(Box const& box)
+{
+    auto abstract_element = abstract_element_for_box(box);
+    if (!abstract_element.has_value())
+        return false;
+
+    auto const* computed = abstract_element->computed_properties();
+    if (!computed)
+        return false;
+    return style_value_contains_anchor(computed->property(CSS::PropertyID::Top))
+        || style_value_contains_anchor(computed->property(CSS::PropertyID::Right))
+        || style_value_contains_anchor(computed->property(CSS::PropertyID::Bottom))
+        || style_value_contains_anchor(computed->property(CSS::PropertyID::Left));
 }
 
 static Box const* nearest_scroll_container_ancestor(Box const& box)
@@ -1967,34 +2012,17 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
     // previous layout.
     box.set_default_scroll_shift({}, false, false);
 
-    // NB: Generated boxes for pseudo-elements are anonymous, so their anchor insets live in the generator element's
-    //     computed properties for the relevant pseudo-element rather than on a DOM node of their own.
-    DOM::Element const* element = nullptr;
-    Optional<CSS::PseudoElement> pseudo_element;
-    if (box.is_generated_for_pseudo_element()) {
-        element = box.pseudo_element_generator();
-        pseudo_element = box.generated_for_pseudo_element();
-    } else {
-        element = as_if<DOM::Element>(box.dom_node());
-    }
-    if (!element)
+    auto abstract_element = abstract_element_for_box(box);
+    if (!abstract_element.has_value())
         return;
 
-    auto computed = element->computed_properties(pseudo_element);
+    auto const* computed = abstract_element->computed_properties();
     if (!computed)
         return;
     auto const& top = computed->property(CSS::PropertyID::Top);
     auto const& right = computed->property(CSS::PropertyID::Right);
     auto const& bottom = computed->property(CSS::PropertyID::Bottom);
     auto const& left = computed->property(CSS::PropertyID::Left);
-
-    auto style_value_contains_anchor = [](CSS::StyleValue const& value) {
-        if (value.is_anchor())
-            return true;
-        if (value.is_calculated())
-            return calculation_tree_contains_anchor(value.as_calculated().calculation());
-        return false;
-    };
 
     bool top_contains_anchor = style_value_contains_anchor(top);
     bool right_contains_anchor = style_value_contains_anchor(right);
@@ -2059,7 +2087,7 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
     // FIXME: Prefer the nearest ancestor of query el that satisfies the conditions over the last element in tree
     //        order.
     auto target_anchor_box = [&](Utf16FlyString const& anchor_name) -> Box* {
-        auto anchor_element = element->document().element_by_anchor_name(anchor_name, *element, is_acceptable_anchor_element);
+        auto anchor_element = abstract_element->element().document().element_by_anchor_name(anchor_name, abstract_element->element(), is_acceptable_anchor_element);
         if (!anchor_element)
             return nullptr;
         return as_if<Box>(anchor_element->unsafe_layout_node());
@@ -2300,8 +2328,11 @@ void FormattingContext::layout_absolutely_positioned_children(Box const& box)
         if (!m_state.try_get(child_box))
             m_state.create(child_box, {}, {});
         resolve_anchor_insets(child_box);
-        auto static_position_rect = resolve_static_position_relative_to_containing_block(child_box, child->static_position_rect);
-        layout_absolutely_positioned_element(child_box, static_position_rect, resolve_abspos_containing_block_info(child_box));
+        AbsposLayoutInputs inputs {
+            .static_position_rect = resolve_static_position_relative_to_containing_block(child_box, child->static_position_rect),
+            .containing_block_info = resolve_abspos_containing_block_info(child_box),
+        };
+        layout_absolutely_positioned_element(child_box, inputs);
     }
 }
 
@@ -2329,10 +2360,74 @@ StaticPositionRect FormattingContext::resolve_static_position_relative_to_contai
     return static_position_rect;
 }
 
-void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPositionRect const& static_position_rect, AbsposContainingBlockInfo const& containing_block_info)
+// Hosts replays of the absolutely positioned element layout algorithm outside any ancestor
+// formatting context run; the algorithm is defined on the FormattingContext base and consumes
+// nothing from the concrete context hosting it.
+class AbsposLayoutReplayContext final : public FormattingContext {
+public:
+    AbsposLayoutReplayContext(LayoutState& state, Box const& containing_block)
+        : FormattingContext(Type::AbsposReplay, LayoutMode::Normal, state, containing_block)
+    {
+    }
+
+    virtual CSSPixels automatic_content_width() const override { VERIFY_NOT_REACHED(); }
+    virtual CSSPixels automatic_content_height() const override { VERIFY_NOT_REACHED(); }
+    virtual void run(LayoutInput const&) override { VERIFY_NOT_REACHED(); }
+};
+
+bool FormattingContext::can_replay_saved_abspos_layout_inputs_after_style_change(Box const& box)
+{
+    if (!box.containing_block())
+        return false;
+
+    auto const& inputs = *box.saved_abspos_layout_inputs();
+    if (inputs.containing_block_info.derives_from_own_computed_values)
+        return false;
+
+    auto axis_modes = abspos_axis_modes_from_computed_insets(box.computed_values());
+    bool uses_static_position = axis_modes.horizontal == AbsposAxisMode::StaticPosition
+        || axis_modes.vertical == AbsposAxisMode::StaticPosition;
+    if (uses_static_position && inputs.static_position_rect.alignment_derives_from_own_computed_values)
+        return false;
+
+    return true;
+}
+
+void FormattingContext::layout_absolutely_positioned_element_from_saved_inputs(LayoutState& state, Box& box)
+{
+    auto* containing_block = box.containing_block();
+    VERIFY(containing_block);
+    VERIFY(box.saved_abspos_layout_inputs());
+    auto inputs = *box.saved_abspos_layout_inputs();
+
+    AbsposLayoutReplayContext context(state, *containing_block);
+
+    // The axis modes are the only replay-relevant input derived from the box's own computed
+    // values, which a style change on the box itself may have altered since capture, so
+    // recompute them from the live insets. Inputs that record deriving from the box's own
+    // computed values pin their axis modes structurally and never replay after such a change.
+    if (!inputs.containing_block_info.derives_from_own_computed_values) {
+        auto axis_modes = abspos_axis_modes_from_computed_insets(box.computed_values());
+        inputs.containing_block_info.horizontal_axis_mode = axis_modes.horizontal;
+        inputs.containing_block_info.vertical_axis_mode = axis_modes.vertical;
+    }
+
+    // Mirror how the ancestor formatting context prepares an absolutely positioned child
+    // during a full pass: create its used values first.
+    state.create(box, {}, {});
+
+    // Runs the full pipeline: sizing, inside layout, and the box's own absolutely positioned
+    // children via parent_context_did_dimension_child_root_box().
+    context.layout_absolutely_positioned_element(box, inputs);
+}
+
+void FormattingContext::layout_absolutely_positioned_element(Box& box, AbsposLayoutInputs const& inputs)
 {
     // SVG elements cannot be absolutely positioned.
     VERIFY(!box.is_svg_box());
+
+    auto const& static_position_rect = inputs.static_position_rect;
+    auto const& containing_block_info = inputs.containing_block_info;
 
     auto& box_state = m_state.get_mutable(box);
 
@@ -2463,6 +2558,11 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPos
     used_offset.translate_by(box_state.margin_box_left(), box_state.margin_box_top());
 
     place_child(box, used_offset);
+
+    // The inputs reach the box itself only through LayoutState::commit(), so recording them
+    // into a throwaway measurement state would just be discarded work.
+    if (m_layout_mode == LayoutMode::Normal && !m_state.is_for_measurement())
+        box_state.set_abspos_layout_inputs(inputs);
 
     if (independent_formatting_context)
         independent_formatting_context->parent_context_did_dimension_child_root_box();
@@ -2702,7 +2802,7 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box,
     box_state.width_constraint = SizeConstraint::MinContent;
     box_state.set_indefinite_content_width();
 
-    auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
+    auto context = create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box, const_cast<FormattingContext*>(this));
 
     auto available_width = AvailableSize::make_min_content();
     auto available_height = box_state.has_definite_height()
@@ -2791,7 +2891,7 @@ CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box,
     box_state.width_constraint = SizeConstraint::MaxContent;
     box_state.set_indefinite_content_width();
 
-    auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
+    auto context = create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box, const_cast<FormattingContext*>(this));
 
     auto available_width = AvailableSize::make_max_content();
     auto available_height = box_state.has_definite_height()
@@ -2836,7 +2936,7 @@ CSSPixels FormattingContext::calculate_min_content_height(Layout::Box const& box
     box_state.set_indefinite_content_height();
     box_state.set_content_width(width);
 
-    auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
+    auto context = create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box, const_cast<FormattingContext*>(this));
 
     auto available_space = AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_min_content());
     context->run(LayoutInput { available_space, containing_block_constraints });
@@ -2873,7 +2973,7 @@ CSSPixels FormattingContext::calculate_max_content_height(Layout::Box const& box
     box_state.set_indefinite_content_height();
     box_state.set_content_width(width);
 
-    auto context = const_cast<FormattingContext*>(this)->create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box);
+    auto context = create_independent_formatting_context(throwaway_state, LayoutMode::IntrinsicSizing, box, const_cast<FormattingContext*>(this));
 
     auto available_space = AvailableSpace(AvailableSize::make_definite(width), AvailableSize::make_max_content());
     context->run(LayoutInput { available_space, containing_block_constraints });

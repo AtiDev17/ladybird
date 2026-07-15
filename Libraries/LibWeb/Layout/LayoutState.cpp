@@ -227,13 +227,13 @@ void LayoutState::resolve_relative_positions()
     });
 }
 
-static void build_paint_tree(Node& node, Painting::Paintable* parent_paintable = nullptr)
+static void build_paint_tree(Node& node, Painting::Paintable* parent_paintable = nullptr, Painting::Paintable* insert_before_paintable = nullptr)
 {
     Painting::Paintable* paintable_for_children = nullptr;
     if (auto paintable = node.paintable()) {
         if (parent_paintable && !paintable->forms_unconnected_subtree()) {
             VERIFY(!paintable->parent());
-            parent_paintable->append_child(*paintable);
+            parent_paintable->insert_before(*paintable, insert_before_paintable);
         }
         paintable->set_dom_node(node.dom_node());
         if (node.dom_node())
@@ -253,15 +253,32 @@ static void build_paint_tree(Node& node, Painting::Paintable* parent_paintable =
 
 void LayoutState::commit(Box& root)
 {
-    RefPtr<Painting::Paintable> parent_paintable;
     if (!root.is_viewport()) {
-        if (auto existing = root.paintable(); auto* existing_box = existing.ptr()) {
-            parent_paintable = existing_box->parent();
-            if (parent_paintable)
-                parent_paintable->remove_child(*existing_box);
+        if (auto existing_paintable = root.paintable()) {
+            commit(root, *existing_paintable);
+            return;
         }
     }
 
+    commit_used_values_and_build_paint_tree(root, nullptr, nullptr);
+}
+
+void LayoutState::commit(Box& root, Painting::Paintable& paintable_to_replace)
+{
+    // Splice the rebuilt paint subtree exactly where the replaced paintable stands, because
+    // paint and hit-test order between siblings with equal stacking follow paintable tree
+    // order.
+    NonnullRefPtr<Painting::Paintable> protect_replaced_paintable = paintable_to_replace;
+    RefPtr<Painting::Paintable> parent_paintable = paintable_to_replace.parent();
+    RefPtr<Painting::Paintable> insert_before_paintable = paintable_to_replace.next_sibling();
+    if (parent_paintable)
+        parent_paintable->remove_child(paintable_to_replace);
+
+    commit_used_values_and_build_paint_tree(root, move(parent_paintable), move(insert_before_paintable));
+}
+
+void LayoutState::commit_used_values_and_build_paint_tree(Box& root, RefPtr<Painting::Paintable> parent_paintable, RefPtr<Painting::Paintable> insert_before_paintable)
+{
     // Cache existing paintables before clearing.
     HashMap<Node const*, NonnullRefPtr<Painting::Paintable>> paintable_cache;
     root.for_each_in_inclusive_subtree([&](Node& node) {
@@ -302,6 +319,15 @@ void LayoutState::commit(Box& root)
 
         if (m_subtree_root && !m_subtree_root->is_inclusive_ancestor_of(node))
             return;
+
+        // Clearing on absence keeps saved inputs from a previous pass from surviving a pass
+        // that no longer laid the box out as absolutely positioned.
+        if (auto* layout_box = as_if<Box>(const_cast<NodeWithStyle&>(node))) {
+            if (auto const* abspos_layout_inputs = used_values.abspos_layout_inputs())
+                layout_box->set_saved_abspos_layout_inputs(*abspos_layout_inputs);
+            else
+                layout_box->clear_saved_abspos_layout_inputs();
+        }
 
         RefPtr<Painting::Paintable> paintable;
 
@@ -441,7 +467,7 @@ void LayoutState::commit(Box& root)
         paintable.set_offset(offset);
     });
 
-    build_paint_tree(root, parent_paintable.ptr());
+    build_paint_tree(root, parent_paintable.ptr(), insert_before_paintable.ptr());
 
     resolve_relative_positions();
 

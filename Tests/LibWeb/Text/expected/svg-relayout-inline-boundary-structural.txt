@@ -1,0 +1,3 @@
+svg=40,20
+partial-layouts=1 full-layouts=0
+PASS

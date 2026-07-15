@@ -1685,9 +1685,36 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
     tear_down_layout_tree();
 }
 
-void Document::mark_svg_root_as_needing_relayout(Layout::SVGSVGBox& svg_root)
+void Document::PartialRelayoutInvalidation::record_boundary(Layout::Box& box)
 {
-    m_svg_roots_needing_relayout.set(svg_root.make_weak_ptr<Layout::SVGSVGBox>());
+    m_registered_roots.set(box.make_weak_ptr<Layout::Box>());
+}
+
+void Document::PartialRelayoutInvalidation::record_escape(PartialRelayoutEscapeReason reason)
+{
+    dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates escape partial relayout boundaries ({})", to_string(reason));
+    m_escapes = true;
+}
+
+void Document::PartialRelayoutInvalidation::clear_escape(PartialRelayoutEscapeClearReason reason)
+{
+    if (m_escapes)
+        dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates no longer escape partial relayout boundaries ({})", to_string(reason));
+    m_escapes = false;
+}
+
+// Anchor names publish geometry that anchor() functions on positioned boxes anywhere in the
+// document consume, and only a full layout pass re-resolves all of them, so anchor positioning
+// in use takes updates off the partial relayout path entirely.
+bool Document::any_anchor_names_are_registered() const
+{
+    if (m_anchor_name_map.has_registered_names())
+        return true;
+    for (auto const& shadow_root : m_shadow_roots) {
+        if (shadow_root.anchor_name_map().has_registered_names())
+            return true;
+    }
+    return false;
 }
 
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
@@ -1695,27 +1722,102 @@ void Document::set_needs_container_query_evaluation_after_layout(Element const& 
     m_query_containers_needing_container_query_evaluation_after_layout.set(const_cast<Element&>(query_container));
 }
 
-static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
+static void compute_subtree_layout(Layout::Box& subtree_root, Layout::LayoutState& layout_state, Painting::Paintable const& root_geometry_source)
 {
-    Layout::LayoutState layout_state(svg_root, Layout::LayoutState::Purpose::Commit);
+    // The boundary's own size and position are frozen at the previous layout's values.
+    layout_state.populate_from_paintable(subtree_root, root_geometry_source);
 
-    // Pre-populate the svg_root itself.
-    if (auto paintable = svg_root.paintable_box())
-        layout_state.populate_from_paintable(svg_root, *paintable);
+    // Pre-populate the viewport for position:fixed elements inside the subtree.
+    auto& viewport = subtree_root.root();
+    if (auto paintable = viewport.paintable_box())
+        layout_state.populate_from_paintable(viewport, *paintable);
 
-    auto const& svg_state = layout_state.get(svg_root);
-    auto content_width = svg_state.content_width();
-    auto content_height = svg_state.content_height();
+    auto const& root_state = layout_state.get(subtree_root);
+    auto available_space = Layout::AvailableSpace(
+        Layout::AvailableSize::make_definite(root_state.content_width()),
+        Layout::AvailableSize::make_definite(root_state.content_height()));
 
-    Layout::SVGFormattingContext svg_context(layout_state, Layout::LayoutMode::Normal, svg_root, nullptr);
-    auto available_space = Layout::AvailableSpace(Layout::AvailableSize::make_definite(content_width), Layout::AvailableSize::make_definite(content_height));
-    svg_context.run(Layout::LayoutInput { available_space });
-    layout_state.commit(svg_root);
+    auto context = Layout::FormattingContext::create_independent_formatting_context_if_needed(
+        layout_state, Layout::LayoutMode::Normal, subtree_root, nullptr);
+    VERIFY(context);
 
-    svg_root.for_each_in_inclusive_subtree([](auto& node) {
+    // NOTE: containing_block_constraints stays empty: the subtree root has definite sizes in
+    //       both axes, so nothing below it resolves percentages against inherited constraints.
+    context->run(Layout::LayoutInput { available_space });
+
+    // Lay out the subtree root's own absolutely positioned children, like the parent formatting
+    // context would do after dimensioning the root box during a full layout.
+    context->parent_context_did_dimension_child_root_box();
+}
+
+static void relayout_subtree(Layout::Box& subtree_root, Painting::Paintable& old_paintable)
+{
+    Layout::LayoutState layout_state(subtree_root, Layout::LayoutState::Purpose::Commit);
+    // Absolutely positioned boundaries re-resolve their own size and position by replaying
+    // their layout from saved inputs; SVG root boundaries keep the frozen geometry from the
+    // previous layout, taken from the old paintable since a replaced box no longer has one.
+    if (subtree_root.is_absolutely_positioned())
+        Layout::FormattingContext::layout_absolutely_positioned_element_from_saved_inputs(layout_state, subtree_root);
+    else
+        compute_subtree_layout(subtree_root, layout_state, old_paintable);
+    // The commit takes over the old paintable's position in the paint tree, whether the
+    // subtree root reuses it (a surviving box) or replaces it (a rebuilt box).
+    layout_state.commit(subtree_root, old_paintable);
+
+    subtree_root.for_each_in_inclusive_subtree([](auto& node) {
         node.reset_needs_layout_update();
         return TraversalDecision::Continue;
     });
+}
+
+// The pre-order traversal visits ancestors before the descendants that mark them, so clearing
+// the flag on visit and marking upwards compose within one walk.
+void Document::recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node& layout_node)
+{
+    layout_node.recompute_containing_block({});
+
+    auto* box = as_if<Layout::Box>(layout_node);
+    if (!box)
+        return;
+    box->set_abspos_descendant_escapes(false);
+
+    if (!box->is_absolutely_positioned())
+        return;
+    auto const* containing_block = box->containing_block();
+    for (auto* ancestor = box->parent(); ancestor && ancestor != containing_block; ancestor = ancestor->parent()) {
+        if (auto* ancestor_box = as_if<Layout::Box>(*ancestor))
+            ancestor_box->set_abspos_descendant_escapes(true);
+    }
+}
+
+// Refreshes every structure derived from committed layout results, shared by the partial and
+// full layout paths so neither can forget one.
+void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
+{
+    // NB: Called during layout update.
+    m_layout_root->invalidate_text_blocks_cache();
+
+    invalidate_stacking_context_tree();
+    set_needs_to_record_display_list();
+    set_needs_to_refresh_scroll_state(true);
+
+    unsafe_paintable()->reassign_scroll_frames();
+
+    set_needs_accumulated_visual_contexts_update(true);
+    update_paint_and_hit_testing_properties_if_needed();
+
+    // Selection state lives on paintable fragments, which the commit has rebuilt.
+    if (auto range = get_selection()->range())
+        unsafe_paintable()->recompute_selection_states(*range);
+
+    if (layout_tree_changed == LayoutTreeChanged::Yes) {
+        // Broadcast the current viewport rect to any new paintables, so they know whether
+        // they're visible or not, and re-collect the content-visibility:auto set.
+        inform_all_viewport_clients_about_the_current_viewport_rect();
+        collect_paintable_boxes_with_auto_content_visibility();
+    }
+
+    m_document->set_needs_repaint();
 }
 
 static void propagate_scrollbar_width_to_viewport(Element& root_element, Layout::Viewport& viewport)
@@ -1804,6 +1906,164 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         update_layout(reason);
 }
 
+bool Document::needs_style_update_after_layout()
+{
+    return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        || m_needs_animated_style_update
+        || m_needs_invalidation_of_elements_affected_by_has
+        || m_style_invalidator->has_pending_invalidations()
+        || needs_full_style_update()
+        || needs_style_update()
+        || child_needs_style_update();
+}
+
+// Attempts to satisfy the pending layout update by re-laying out only the registered partial
+// relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
+// are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
+// the full layout path without rebuilding again.
+Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
+{
+    if (!m_layout_root
+        || needs_full_layout_tree_update()
+        || m_partial_relayout_invalidation.escapes()
+        || registered_partial_relayout_roots.is_empty()
+        || m_layout_root->needs_layout_update()
+        || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        || layout_node_indices_outgrew_dense_range()
+        || should_collect_devtools_layout_data
+        || any_anchor_names_are_registered())
+        return PartialRelayoutResult::NotEligible;
+
+    bool layout_tree_was_built_in_partial_branch = false;
+    bool pending_updates_escaped_during_partial_build = false;
+    Vector<Layout::Node*> rebuilt_subtree_roots;
+    if (needs_layout_tree_rebuild) {
+        auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
+        Layout::TreeBuilder tree_builder;
+        m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+        needs_layout_tree_rebuild = false;
+        layout_tree_was_built_in_partial_branch = true;
+        pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
+            || tree_builder.layout_tree_update_escaped_rebuild_roots();
+        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::PartialLayoutTreeBuild);
+        rebuilt_subtree_roots = tree_builder.rebuilt_subtree_roots();
+
+        if constexpr (UPDATE_LAYOUT_DEBUG) {
+            dbgln("TREEBUILD {} µs", tree_build_timer.elapsed_time().to_microseconds());
+        }
+    }
+
+    if (m_layout_root->needs_layout_update() || pending_updates_escaped_during_partial_build)
+        return PartialRelayoutResult::NotEligible;
+
+    // Nodes created by the incremental build have no containing blocks assigned yet, and the
+    // mutation may have moved where existing out-of-flow descendants belong; recompute both so
+    // boundary qualification below reads facts matching the just-built tree.
+    for (auto* rebuilt_root : rebuilt_subtree_roots) {
+        rebuilt_root->for_each_in_inclusive_subtree([](Layout::Node& node) {
+            recompute_containing_block_and_derive_abspos_escape_flags(node);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // Collect the live boundary set from the post-build tree: registered boundaries that
+    // survived the build, plus the nearest boundary containing each rebuilt subtree - which
+    // re-discovers a boundary whose own box the build replaced, since the saved layout inputs
+    // carried over to the replacement.
+    struct PartialRelayoutRoot {
+        Layout::Box* box { nullptr };
+        RefPtr<Painting::Paintable> old_paintable;
+    };
+    Vector<PartialRelayoutRoot> partial_relayout_roots;
+    HashTable<Layout::Box*> collected_boundaries;
+    auto collect_boundary = [&](Layout::Box& box, bool box_was_replaced) {
+        if (collected_boundaries.set(&box) != AK::HashSetResult::InsertedNewEntry)
+            return true;
+
+        RefPtr<Painting::Paintable> old_paintable = box.paintable_box();
+        if (!old_paintable && box_was_replaced && box.dom_node()) {
+            // A replaced box has no paintable yet; the previous one stays referenced by the
+            // DOM node until the next commit replaces it there.
+            old_paintable = box.dom_node()->unsafe_paintable();
+        }
+        if (!old_paintable)
+            return false;
+
+        // A replaced box applies the saved-inputs validity check unconditionally: the change
+        // that drove the replacement cannot be classified anymore.
+        bool saved_inputs_may_be_style_stale = box.needs_own_geometry_update() || box_was_replaced;
+        if (saved_inputs_may_be_style_stale && box.is_absolutely_positioned() && !Layout::FormattingContext::can_replay_saved_abspos_layout_inputs_after_style_change(box))
+            return false;
+
+        partial_relayout_roots.append({
+            .box = &box,
+            .old_paintable = old_paintable,
+        });
+        return true;
+    };
+
+    for (auto const& root : registered_partial_relayout_roots) {
+        auto* box = root.ptr();
+        // A boundary that did not survive the build was either replaced (re-discovered
+        // through the rebuilt subtree roots below) or removed together with the dirt
+        // inside it (the removal dirtied its parent, whose own marking covers the
+        // mutation).
+        if (!box || !box->parent())
+            continue;
+        if (!box->is_partial_relayout_boundary() || !collect_boundary(*box, false))
+            return PartialRelayoutResult::NotEligible;
+    }
+
+    for (auto* rebuilt_root : rebuilt_subtree_roots) {
+        // Every rebuilt subtree must lie inside a boundary for its dirt to be confined.
+        // The rebuilt box itself may qualify with its paintable still pending; boundaries
+        // above it were not replaced and must have one.
+        Layout::Box* containing_boundary = nullptr;
+        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary(Layout::RequireExistingPaintable::No))
+            containing_boundary = rebuilt_box;
+        for (auto* ancestor = rebuilt_root->parent(); !containing_boundary && ancestor; ancestor = ancestor->parent()) {
+            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && ancestor_box->is_partial_relayout_boundary())
+                containing_boundary = ancestor_box;
+        }
+        if (!containing_boundary || !collect_boundary(*containing_boundary, containing_boundary == rebuilt_root))
+            return PartialRelayoutResult::NotEligible;
+    }
+
+    // A root nested inside another root is relaid out as part of the ancestor's subtree.
+    partial_relayout_roots.remove_all_matching([&](auto const& root) {
+        for (auto* ancestor = root.box->parent(); ancestor; ancestor = ancestor->parent()) {
+            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && collected_boundaries.contains(ancestor_box))
+                return true;
+        }
+        return false;
+    });
+
+    if (partial_relayout_roots.is_empty())
+        return PartialRelayoutResult::NotEligible;
+
+    for (auto const& root : partial_relayout_roots) {
+        relayout_subtree(*root.box, *root.old_paintable);
+        // NB: The subtree commit reset the root's descendant paintables, and the subtree's
+        //     new size may change ancestor scrollable overflow; scheduling the root covers both.
+        schedule_scrollable_overflow_recalculation(*root.box);
+    }
+
+    // The rebuild can replace boxes referenced by the contained-boxes map cached at the
+    // last full layout; refresh it before scheduled overflow measurement follows them.
+    if (layout_tree_was_built_in_partial_branch) {
+        auto work = Layout::collect_scrollable_overflow_measurement_work(*m_layout_root);
+        m_scrollable_overflow_contained_boxes_from_last_layout = move(work.contained_boxes_map);
+    }
+
+    update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
+    ++m_partial_layout_count;
+
+    after_layout_commit(layout_tree_was_built_in_partial_branch ? LayoutTreeChanged::Yes : LayoutTreeChanged::No);
+    if (needs_style_update_after_layout() || !layout_is_up_to_date())
+        return PartialRelayoutResult::NeedsAnotherLayoutPass;
+    return PartialRelayoutResult::Done;
+}
+
 void Document::update_layout(UpdateLayoutReason reason)
 {
     auto navigable = this->navigable();
@@ -1815,16 +2075,6 @@ void Document::update_layout(UpdateLayoutReason reason)
     ScopeGuard guard = [&] {
         m_is_running_update_layout = false;
         page().client().flush_pending_dom_mutations();
-    };
-
-    auto needs_style_update_after_layout = [&] {
-        return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
-            || m_needs_animated_style_update
-            || m_needs_invalidation_of_elements_affected_by_has
-            || m_style_invalidator->has_pending_invalidations()
-            || needs_full_style_update()
-            || needs_style_update()
-            || child_needs_style_update();
     };
 
     constexpr size_t max_container_query_layout_passes = 8;
@@ -1840,41 +2090,22 @@ void Document::update_layout(UpdateLayoutReason reason)
             return;
         }
 
-        auto svg_roots_to_relayout = move(m_svg_roots_needing_relayout);
+        auto registered_partial_relayout_roots = m_partial_relayout_invalidation.take_registered_roots();
 
         // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
         if (m_created_for_appropriate_template_contents)
             return;
 
-        auto const needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
+        auto needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
 
-        // Partial SVG relayout
-        if (!needs_layout_tree_rebuild && !svg_roots_to_relayout.is_empty() && !m_layout_root->needs_layout_update()) {
-            for (auto const& svg_root : svg_roots_to_relayout) {
-                if (svg_root) {
-                    relayout_svg_root(*svg_root);
-                    // NB: The subtree commit reset the SVG root's descendant paintables, and the subtree's
-                    //     new size may change ancestor scrollable overflow; scheduling the root covers both.
-                    schedule_scrollable_overflow_recalculation(*svg_root);
-                }
-            }
-
-            update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
-
-            invalidate_stacking_context_tree();
-            set_needs_to_record_display_list();
-
-            set_needs_accumulated_visual_contexts_update(true);
-            update_paint_and_hit_testing_properties_if_needed();
-            m_document->set_needs_repaint();
+        switch (try_partial_relayout(move(registered_partial_relayout_roots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
+        case PartialRelayoutResult::Done:
             return;
+        case PartialRelayoutResult::NeedsAnotherLayoutPass:
+            continue;
+        case PartialRelayoutResult::NotEligible:
+            break;
         }
-
-        // Clear text blocks cache so we rebuild them on the next find action.
-        if (m_layout_root)
-            m_layout_root->invalidate_text_blocks_cache();
-
-        set_needs_to_record_display_list();
 
         auto* document_element = this->document_element();
         auto viewport_rect = navigable->viewport_rect();
@@ -1908,10 +2139,16 @@ void Document::update_layout(UpdateLayoutReason reason)
             if (auto* node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
                 node_with_style->set_layout_index(layout_index_counter++);
 
-            layout_node.recompute_containing_block({});
+            recompute_containing_block_and_derive_abspos_escape_flags(layout_node);
 
             return TraversalDecision::Continue;
         });
+
+        // The walk above re-derived every fact partial relayout boundary qualification depends
+        // on, so pending changes that escaped classification are accounted for from here on.
+        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::FullLayoutPass);
+
+        reset_layout_node_index_counter(layout_index_counter);
 
         Layout::LayoutState layout_state;
         layout_state.ensure_capacity(layout_index_counter);
@@ -1960,32 +2197,9 @@ void Document::update_layout(UpdateLayoutReason reason)
         style_invalidation_counters().relayouts_performed++;
         update_scrollable_overflow(UpdateScrollableOverflowMode::AfterLayout);
 
-        // Broadcast the current viewport rect to any new paintables, so they know whether they're visible or not.
-        inform_all_viewport_clients_about_the_current_viewport_rect();
+        ++m_full_layout_count;
 
-        m_document->set_needs_repaint();
-
-        // NB: Called during layout update.
-        unsafe_paintable()->assign_scroll_frames();
-
-        set_needs_accumulated_visual_contexts_update(true);
-        update_paint_and_hit_testing_properties_if_needed();
-
-        if (auto range = get_selection()->range()) {
-            unsafe_paintable()->recompute_selection_states(*range);
-        }
-
-        // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
-        Vector<WeakPtr<Painting::Paintable>> paintable_boxes_with_auto_content_visibility;
-        unsafe_paintable()->for_each_in_subtree_of_type<Painting::Paintable>([&](auto& paintable_box) {
-            if (paintable_box.dom_node()
-                && paintable_box.dom_node()->is_element()
-                && paintable_box.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
-                paintable_boxes_with_auto_content_visibility.append(paintable_box);
-            }
-            return TraversalDecision::Continue;
-        });
-        unsafe_paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintable_boxes_with_auto_content_visibility));
+        after_layout_commit(LayoutTreeChanged::Yes);
 
         m_layout_root->for_each_in_inclusive_subtree([](auto& node) {
             node.reset_needs_layout_update();
@@ -2023,6 +2237,21 @@ void Document::update_layout(UpdateLayoutReason reason)
     VERIFY(layout_is_up_to_date());
 }
 
+// Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
+void Document::collect_paintable_boxes_with_auto_content_visibility()
+{
+    Vector<WeakPtr<Painting::Paintable>> paintables_with_auto_content_visibility;
+    unsafe_paintable()->for_each_in_subtree_of_type<Painting::Paintable>([&](auto& paintable) {
+        if (paintable.dom_node()
+            && paintable.dom_node()->is_element()
+            && paintable.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
+            paintables_with_auto_content_visibility.append(paintable);
+        }
+        return TraversalDecision::Continue;
+    });
+    unsafe_paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintables_with_auto_content_visibility));
+}
+
 void Document::clear_devtools_layout_inspection_data()
 {
     clear_grid_highlighted_node(nullptr);
@@ -2049,7 +2278,7 @@ bool Document::layout_is_up_to_date() const
         && !needs_layout_tree_update()
         && !child_needs_layout_tree_update()
         && !needs_full_layout_tree_update()
-        && m_svg_roots_needing_relayout.is_empty();
+        && !m_partial_relayout_invalidation.has_registered_roots();
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -9431,6 +9660,30 @@ Utf16View to_string(UpdateLayoutReason reason)
         return #e##sv;
         ENUMERATE_UPDATE_LAYOUT_REASONS(ENUMERATE_UPDATE_LAYOUT_REASON)
 #undef ENUMERATE_UPDATE_LAYOUT_REASON
+    }
+    VERIFY_NOT_REACHED();
+}
+
+Utf16View to_string(PartialRelayoutEscapeReason reason)
+{
+    switch (reason) {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) \
+    case PartialRelayoutEscapeReason::e:            \
+        return #e##sv;
+        ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON
+    }
+    VERIFY_NOT_REACHED();
+}
+
+Utf16View to_string(PartialRelayoutEscapeClearReason reason)
+{
+    switch (reason) {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) \
+    case PartialRelayoutEscapeClearReason::e:             \
+        return #e##sv;
+        ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
     }
     VERIFY_NOT_REACHED();
 }

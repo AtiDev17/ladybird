@@ -166,6 +166,33 @@ enum class UpdateLayoutReason {
 
 [[nodiscard]] Utf16View to_string(UpdateLayoutReason);
 
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X)       \
+    X(AnchorNamesUnregisteredByElementRemoval)             \
+    X(AnchorNamesUnregisteredByStyleChange)                \
+    X(ContainingBlockEstablishmentChangedByKeyframeEffect) \
+    X(ContainingBlockEstablishmentChangedByStyleChange)    \
+    X(DirtyDomNodeHasDetachedLayoutNode)
+
+enum class PartialRelayoutEscapeReason {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) e,
+    ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON
+};
+
+[[nodiscard]] Utf16View to_string(PartialRelayoutEscapeReason);
+
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(X) \
+    X(FullLayoutPass)                                      \
+    X(PartialLayoutTreeBuild)
+
+enum class PartialRelayoutEscapeClearReason {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) e,
+    ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
+};
+
+[[nodiscard]] Utf16View to_string(PartialRelayoutEscapeClearReason);
+
 // https://html.spec.whatwg.org/multipage/dom.html#document-load-timing-info
 struct DocumentLoadTimingInfo {
     // https://html.spec.whatwg.org/multipage/dom.html#navigation-start-time
@@ -408,7 +435,14 @@ public:
     CSS::ComputedProperties const* update_style_for_element(AbstractElement const&, StyleUpdateMode);
     [[nodiscard]] bool element_needs_style_update(AbstractElement const&) const;
     void update_layout(UpdateLayoutReason);
+    enum class PartialRelayoutResult : u8 {
+        NotEligible,
+        Done,
+        NeedsAnotherLayoutPass,
+    };
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
+    [[nodiscard]] u64 partial_layout_count() const { return m_partial_layout_count; }
+    [[nodiscard]] u64 full_layout_count() const { return m_full_layout_count; }
     [[nodiscard]] bool layout_is_up_to_date() const;
     void clear_devtools_layout_inspection_data();
     enum class UpdateScrollableOverflowMode : u8 {
@@ -708,7 +742,43 @@ public:
     [[nodiscard]] bool needs_full_layout_tree_update() const { return m_needs_full_layout_tree_update; }
     void set_needs_full_layout_tree_update(bool b) { m_needs_full_layout_tree_update = b; }
 
-    void mark_svg_root_as_needing_relayout(Layout::SVGSVGBox&);
+    // Layout indices key the per-pass used values store in LayoutState. Every layout node gets
+    // one at construction; a full layout pass renumbers the whole tree densely and resets the
+    // counter past the dense range.
+    [[nodiscard]] u32 allocate_layout_node_index() { return m_next_layout_node_index++; }
+    void reset_layout_node_index_counter(u32 next_index)
+    {
+        m_next_layout_node_index = next_index;
+        m_layout_node_index_count_after_last_full_pass = next_index;
+    }
+
+    // The per-pass used values store sizes its page table by the highest index it touches, and
+    // partial relayout never renumbers, so between-pass indices grow its cost without bound.
+    // Once they outgrow the dense range, the next layout must be a full, renumbering pass.
+    [[nodiscard]] bool layout_node_indices_outgrew_dense_range() const
+    {
+        return m_next_layout_node_index > 2 * m_layout_node_index_count_after_last_full_pass + 2048;
+    }
+
+    // Attribution of pending updates for partial relayout. Invariant: every update recorded
+    // since the last layout pass is either attributed to a boundary in the registered root
+    // set, or the escape bit is set. The dispatch may only run partial relayout while the
+    // escape bit is clear; a full layout pass re-derives every fact boundary qualification
+    // depends on, so it clears the bit.
+    class PartialRelayoutInvalidation {
+    public:
+        void record_boundary(Layout::Box&);
+        void record_escape(PartialRelayoutEscapeReason);
+        void clear_escape(PartialRelayoutEscapeClearReason);
+        [[nodiscard]] bool escapes() const { return m_escapes; }
+        [[nodiscard]] bool has_registered_roots() const { return !m_registered_roots.is_empty(); }
+        [[nodiscard]] HashTable<WeakPtr<Layout::Box>> take_registered_roots() { return move(m_registered_roots); }
+
+    private:
+        HashTable<WeakPtr<Layout::Box>> m_registered_roots;
+        bool m_escapes { false };
+    };
+    [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
 
     void set_needs_to_refresh_scroll_state(bool b);
 
@@ -1260,6 +1330,16 @@ private:
     void tear_down_layout_tree();
 
     void update_active_element();
+    void collect_paintable_boxes_with_auto_content_visibility();
+    bool needs_style_update_after_layout();
+    bool any_anchor_names_are_registered() const;
+    PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    static void recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node&);
+    enum class LayoutTreeChanged : u8 {
+        No,
+        Yes,
+    };
+    void after_layout_commit(LayoutTreeChanged);
 
     void run_unloading_cleanup_steps();
 
@@ -1460,7 +1540,13 @@ private:
 
     bool m_is_running_update_layout { false };
 
-    HashTable<WeakPtr<Layout::SVGSVGBox>> m_svg_roots_needing_relayout;
+    u32 m_next_layout_node_index { 0 };
+    u32 m_layout_node_index_count_after_last_full_pass { 0 };
+
+    PartialRelayoutInvalidation m_partial_relayout_invalidation;
+
+    u64 m_partial_layout_count { 0 };
+    u64 m_full_layout_count { 0 };
 
     bool m_needs_animated_style_update { false };
 

@@ -1,0 +1,3 @@
+rects-match=true
+partial-layouts=1 full-layouts=0
+PASS

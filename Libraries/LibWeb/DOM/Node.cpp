@@ -28,6 +28,7 @@
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Comment.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
@@ -70,6 +71,7 @@
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
@@ -1781,6 +1783,24 @@ EventTarget* Node::get_parent(Event const&)
     return parent();
 }
 
+// Whether the reason describes a mutation that only affects the node's children and can never
+// change the node's own box kind, so a rebuild on a partial relayout boundary stays confined
+// to its subtree. Reasons not classified here forfeit partial relayout for their mutations.
+static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateReason reason)
+{
+    switch (reason) {
+    case SetNeedsLayoutTreeUpdateReason::NodeInsertBefore:
+    case SetNeedsLayoutTreeUpdateReason::NodeRemove:
+    case SetNeedsLayoutTreeUpdateReason::NodeSetTextContent:
+    case SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData:
+    case SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML:
+    case SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReason reason)
 {
     if (m_needs_layout_tree_update == value)
@@ -1831,11 +1851,25 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
 
         // NB: Propagating layout invalidation, layout is not up to date.
         if (auto layout_node = this->unsafe_layout_node()) {
-            layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+            if (!layout_node->parent() && !layout_node->is_viewport())
+                document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::DirtyDomNodeHasDetachedLayoutNode);
+
+            bool registered_boundary_self_rebuild = false;
+            if (auto* box = as_if<Layout::Box>(layout_node); box
+                && is_structural_boundary_self_rebuild_reason(reason)
+                && box->is_partial_relayout_boundary()) {
+                box->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
+                registered_boundary_self_rebuild = true;
+            } else {
+                layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+            }
 
             // If the layout node has an anonymous parent, rebuild from the nearest non-anonymous ancestor.
+            // A boundary that registered itself for a structural change skips this escalation: a child-list
+            // mutation cannot change its own box kind, so replacing its box in place cannot require
+            // restructuring the surrounding anonymous siblings.
             // FIXME: This is not optimal, and we should figure out how to rebuild a smaller part of the tree.
-            if (layout_node->parent() && layout_node->parent()->is_anonymous()) {
+            if (!registered_boundary_self_rebuild && layout_node->parent() && layout_node->parent()->is_anonymous()) {
                 auto* ancestor = layout_node->parent();
                 while (ancestor && ancestor->is_anonymous())
                     ancestor = ancestor->parent();
@@ -1843,6 +1877,9 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
                     ancestor->dom_node()->set_needs_layout_tree_update(true, reason);
             }
         }
+        // NB: A dirty node with no layout node needs no escape tracking: rebuilding it either
+        //     still produces no layout node, or the change is covered by the escalations
+        //     above, which mark a node whose layout node classifies it in the ancestor walk.
     }
 }
 
@@ -2846,8 +2883,13 @@ void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_lis
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
 {
+    set_needs_layout_update(reason, Layout::LayoutUpdatePropagation::ThroughAncestors);
+}
+
+void Node::set_needs_layout_update(SetNeedsLayoutReason reason, Layout::LayoutUpdatePropagation propagation)
+{
     if (auto* node = unsafe_layout_node()) {
-        node->set_needs_layout_update(reason);
+        node->set_needs_layout_update(reason, propagation);
         document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
     }
 }

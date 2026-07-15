@@ -32,6 +32,7 @@
 #include <LibWeb/Dump.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/Layout/AbsposLayoutInputs.h>
 #include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/FieldSetBox.h>
 #include <LibWeb/Layout/ImageBox.h>
@@ -47,11 +48,18 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
 
 namespace Web::Layout {
 
 TreeBuilder::TreeBuilder() = default;
+
+void TreeBuilder::note_tree_restructuring_at(Layout::Node const& node)
+{
+    if (m_current_rebuild_root && !m_current_rebuild_root->is_inclusive_ancestor_of(node))
+        m_layout_tree_update_escaped_rebuild_roots = true;
+}
 
 static bool has_inline_or_in_flow_block_children(Layout::Node const& layout_node)
 {
@@ -133,7 +141,7 @@ static Layout::Node& insertion_parent_for_inline_node(Layout::NodeWithStyle& lay
     return last_child_creating_anonymous_wrapper_if_needed(layout_parent);
 }
 
-static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layout_parent, Layout::Node& layout_node, TreeBuilder::AppendOrPrepend mode)
+static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layout_parent, Layout::Node& layout_node, TreeBuilder::AppendOrPrepend mode, TreeBuilder& tree_builder)
 {
     // Inline is fine for in-flow block children (interrupting blocks) and for out-of-flow children;
     // the inline formatting context emits items for both.
@@ -177,6 +185,7 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
         return *new_parent;
 
     // Parent block has inline-level children (our siblings); wrap these siblings into an anonymous wrapper block.
+    tree_builder.note_tree_restructuring_at(*new_parent);
     auto wrapper = new_parent->create_anonymous_wrapper();
     wrapper->set_children_are_inline(true);
 
@@ -203,7 +212,11 @@ void TreeBuilder::insert_node_into_inline_or_block_ancestor(Layout::Node& node, 
     auto& nearest_insertion_ancestor = *m_ancestor_stack.last();
 
     auto& insertion_point = display.is_inline_outside() ? insertion_parent_for_inline_node(nearest_insertion_ancestor)
-                                                        : insertion_parent_for_block_node(nearest_insertion_ancestor, node, mode);
+                                                        : insertion_parent_for_block_node(nearest_insertion_ancestor, node, mode, *this);
+
+    // Insertion parents can be above the subtree being rebuilt in place: inline ancestors are
+    // skipped, and out-of-flow boxes can join a trailing anonymous sibling.
+    note_tree_restructuring_at(insertion_point);
 
     if (mode == AppendOrPrepend::Prepend)
         insertion_point.prepend_child(node);
@@ -837,8 +850,12 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
             auto& element = static_cast<DOM::Element&>(dom_node);
             // ::backdrop is a sibling of the element, not a child, so unlike other pseudo-elements, it's not
             // automatically discarded when element's layout is recomputed. We must remove it manually.
-            if (auto old_backdrop_node = element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop))
+            if (auto old_backdrop_node = element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop)) {
+                // A sibling-level mutation that runs before this element's own rebuild root is
+                // established, so it always escapes the rebuilt subtrees.
+                m_layout_tree_update_escaped_rebuild_roots = true;
                 old_backdrop_node->remove();
+            }
             element.clear_synthetic_pseudo_element_layout_nodes(Badge<TreeBuilder> {});
             // Elements inside a `display:none` subtree are skipped by
             // `Document::update_style_recursively`, so a bypass path (top-layer iteration, slot
@@ -910,6 +927,16 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
         && old_layout_node
         && old_layout_node->parent()
         && old_layout_node != layout_node;
+    Optional<TemporaryChange<Layout::Node*>> current_rebuild_root_change;
+    if (may_replace_existing_layout_node && !m_current_rebuild_root) {
+        current_rebuild_root_change.emplace(m_current_rebuild_root, layout_node.ptr());
+        m_rebuilt_subtree_roots.append(layout_node.ptr());
+    } else if (should_create_layout_node && !old_layout_node && !m_current_rebuild_root && !dom_node.is_document()) {
+        // A fresh subtree that replaces no box in place (a ShadowRoot direct child, or a
+        // top-layer element revealed from display:none) belongs to no rebuild root, so nothing
+        // would lay its new boxes out on the partial path.
+        m_layout_tree_update_escaped_rebuild_roots = true;
+    }
 
     if (dom_node.is_element() && should_create_layout_node) {
         auto& element = static_cast<DOM::Element&>(dom_node);
@@ -919,6 +946,8 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
             // Otherwise, we need to insert the ::backdrop before old_layout_node so it's behind the layout_node.
             if (may_replace_existing_layout_node) {
                 if (auto backdrop_node = create_pseudo_element_if_needed(element, CSS::PseudoElement::Backdrop, {})) {
+                    // The ::backdrop box is a fresh sibling of the rebuild root, outside it.
+                    note_tree_restructuring_at(*old_layout_node->parent());
                     old_layout_node->parent()->insert_before(*backdrop_node, old_layout_node);
                 }
             } else {
@@ -931,6 +960,30 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
         m_layout_root = layout_node;
     } else if (should_create_layout_node) {
         if (may_replace_existing_layout_node) {
+            // The replacement box represents the same element in the same tree position, so the
+            // layout inputs saved by the previous layout pass carry over to it.
+            if (auto const* old_box = as_if<Box>(*old_layout_node)) {
+                if (auto* new_box = as_if<Box>(*layout_node)) {
+                    if (old_box->saved_abspos_layout_inputs())
+                        new_box->set_saved_abspos_layout_inputs(*old_box->saved_abspos_layout_inputs());
+                }
+            }
+            // A replaced node that participated in inline layout is referenced by the flat
+            // fragment and inline-box-piece lists held by its containing block; repoint those
+            // references at the replacement, since a subtree relayout that skips the containing
+            // block never rebuilds them.
+            if (auto* containing_block = old_layout_node->containing_block()) {
+                if (auto* paintable_with_lines = as_if<Painting::PaintableWithLines>(containing_block->paintable().ptr())) {
+                    for (auto& fragment : paintable_with_lines->fragments()) {
+                        if (fragment.has_layout_node() && &fragment.layout_node() == old_layout_node.ptr())
+                            fragment.set_layout_node(*layout_node);
+                    }
+                    for (auto& piece : paintable_with_lines->inline_box_pieces()) {
+                        if (piece.node.ptr() == old_layout_node.ptr())
+                            piece.node = layout_node.ptr();
+                    }
+                }
+            }
             old_layout_node->prepare_subtree_for_detach_from_layout_tree();
             old_layout_node->parent()->replace_child(*layout_node, *old_layout_node);
         } else if (layout_node->is_svg_box()) {

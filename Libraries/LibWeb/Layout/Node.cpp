@@ -38,7 +38,6 @@
 #include <LibWeb/Layout/ImageBox.h>
 #include <LibWeb/Layout/InlineNode.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Layout/TableWrapper.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
@@ -610,6 +609,7 @@ bool Node::is_sticky_position() const
 NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, CSS::ComputedProperties const& computed_style)
     : Node(document, node)
     , m_computed_values(make<CSS::ComputedValues>())
+    , m_layout_index(document.allocate_layout_node_index())
 {
     m_has_style = true;
     m_is_body = node && node == document.body();
@@ -619,6 +619,7 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, CSS::Comp
 NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, NonnullOwnPtr<CSS::ComputedValues> computed_values)
     : Node(document, node)
     , m_computed_values(move(computed_values))
+    , m_layout_index(document.allocate_layout_node_index())
 {
     m_has_style = true;
     m_is_body = node && node == document.body();
@@ -1692,19 +1693,27 @@ bool NodeWithStyleAndBoxModelMetrics::is_inline_flow_interrupting_block() const
     return true;
 }
 
-void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason)
+void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason, LayoutUpdatePropagation propagation)
 {
-    if (m_needs_layout_update)
-        return;
-
-    if constexpr (UPDATE_LAYOUT_DEBUG) {
-        // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
-        auto navigable = this->navigable();
-        if (navigable && navigable->active_document() == &document())
-            dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", DOM::to_string(reason));
+    if (m_needs_layout_update && propagation == LayoutUpdatePropagation::ThroughAncestors) {
+        // A dirty node normally implies dirty ancestors, but the walk that marked a partial
+        // relayout boundary stopped there and left its ancestors clean, so a through-ancestors
+        // invalidation arriving on the boundary itself must still walk and mark them.
+        auto* box = as_if<Box>(this);
+        if (!box || !box->is_partial_relayout_boundary())
+            return;
     }
 
-    m_needs_layout_update = true;
+    if (!m_needs_layout_update) {
+        if constexpr (UPDATE_LAYOUT_DEBUG) {
+            // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
+            auto navigable = this->navigable();
+            if (navigable && navigable->active_document() == &document())
+                dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", DOM::to_string(reason));
+        }
+
+        m_needs_layout_update = true;
+    }
 
     if (auto* box = as_if<Box>(this))
         box->reset_cached_intrinsic_sizes();
@@ -1719,12 +1728,17 @@ void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason)
         return IterationDecision::Continue;
     });
 
+    if (propagation == LayoutUpdatePropagation::BoundarySelfOnly) {
+        document().partial_relayout_invalidation().record_boundary(as<Box>(*this));
+        return;
+    }
+
     for (auto* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
         if (ancestor->m_needs_layout_update)
             break;
         ancestor->m_needs_layout_update = true;
-        if (auto* svg_box = as_if<SVGSVGBox>(ancestor)) {
-            document().mark_svg_root_as_needing_relayout(*svg_box);
+        if (auto* box = as_if<Box>(ancestor); box && box->is_partial_relayout_boundary()) {
+            document().partial_relayout_invalidation().record_boundary(*box);
             break;
         }
     }

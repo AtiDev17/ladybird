@@ -12,6 +12,7 @@
 #include <AK/kmalloc.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/Point.h>
+#include <LibWeb/Layout/AbsposLayoutInputs.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LineBox.h>
 #include <LibWeb/Painting/Paintable.h>
@@ -27,35 +28,6 @@ enum class SizeConstraint {
 
 class AvailableSize;
 class AvailableSpace;
-
-// https://www.w3.org/TR/css-position-3/#static-position-rectangle
-struct StaticPositionRect {
-    enum class Alignment {
-        Start,
-        Center,
-        End,
-    };
-
-    CSSPixelRect rect;
-    Alignment horizontal_alignment { Alignment::Start };
-    Alignment vertical_alignment { Alignment::Start };
-
-    CSSPixelPoint aligned_position_for_box_with_size(CSSPixelSize const& size) const
-    {
-        CSSPixelPoint position = rect.location();
-        if (horizontal_alignment == Alignment::Center)
-            position.set_x(position.x() + (rect.width() - size.width()) / 2);
-        else if (horizontal_alignment == Alignment::End)
-            position.set_x(position.x() + rect.width() - size.width());
-
-        if (vertical_alignment == Alignment::Center)
-            position.set_y(position.y() + (rect.height() - size.height()) / 2);
-        else if (vertical_alignment == Alignment::End)
-            position.set_y(position.y() + rect.height() - size.height());
-
-        return position;
-    }
-};
 
 // Sparse, index-based container using two-level page tables.
 // Layout state is throwaway — rebuilt on every layout pass — so a
@@ -303,6 +275,14 @@ struct LayoutState {
             return move(m_rare->flex_layout_data);
         }
 
+        void set_abspos_layout_inputs(AbsposLayoutInputs abspos_layout_inputs) { ensure_rare_data().abspos_layout_inputs = move(abspos_layout_inputs); }
+        AbsposLayoutInputs const* abspos_layout_inputs() const
+        {
+            if (!m_rare || !m_rare->abspos_layout_inputs.has_value())
+                return nullptr;
+            return &*m_rare->abspos_layout_inputs;
+        }
+
     private:
         friend struct LayoutState;
         friend class FormattingContext;
@@ -335,6 +315,7 @@ struct LayoutState {
                 , grid_template_rows(other.grid_template_rows)
                 , override_borders_data(other.override_borders_data)
                 , computed_svg_transforms(other.computed_svg_transforms)
+                , abspos_layout_inputs(other.abspos_layout_inputs)
             {
                 if (other.grid_layout_data)
                     grid_layout_data = make<GridLayoutData>(*other.grid_layout_data);
@@ -351,6 +332,7 @@ struct LayoutState {
             RefPtr<CSS::GridTrackSizeListStyleValue const> grid_template_rows;
             Optional<Painting::Paintable::BordersDataWithElementKind> override_borders_data;
             Optional<Painting::SVGGraphicsPaintable::ComputedTransforms> computed_svg_transforms;
+            Optional<AbsposLayoutInputs> abspos_layout_inputs;
         };
 
         RareData& ensure_rare_data()
@@ -385,8 +367,11 @@ struct LayoutState {
 
     bool is_for_measurement() const { return m_purpose == Purpose::Measurement; }
 
-    // Commits the used values produced by layout and builds a paintable tree.
+    // Commits the used values produced by layout and builds a paintable tree. The overload
+    // taking a paintable to replace splices the rebuilt paint subtree in at that paintable's
+    // position; the plain overload replaces the root's own paintable when there is one.
     void commit(Box& root);
+    void commit(Box& root, Painting::Paintable& paintable_to_replace);
 
     void ensure_capacity(u32 node_count);
 
@@ -422,6 +407,8 @@ private:
 
     PagedStore<UsedValues> m_used_values_store;
     Layout::NodeWithStyle const* m_subtree_root { nullptr };
+    void commit_used_values_and_build_paint_tree(Box& root, RefPtr<Painting::Paintable> parent_paintable, RefPtr<Painting::Paintable> insert_before_paintable);
+
     Purpose m_purpose { Purpose::Commit };
     bool m_should_collect_devtools_layout_data { false };
     HashMap<Box const*, Vector<ContainedAbsposChild>> m_contained_abspos_children;
