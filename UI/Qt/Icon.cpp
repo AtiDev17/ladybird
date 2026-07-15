@@ -262,7 +262,7 @@ static QPixmap create_chrome_icon_pixmap(ChromeIcon icon, QColor color, qreal de
         painter.drawLine(QPointF(14.5, 5.65), QPointF(5.5, 15.15));
         break;
     case ChromeIcon::Menu:
-        painter.setPen(chrome_icon_pen(color, 1.75));
+        painter.setPen(chrome_icon_pen(color, 1.55));
         painter.drawLine(QPointF(4.1, 6.2), QPointF(15.9, 6.2));
         painter.drawLine(QPointF(4.1, 10.0), QPointF(15.9, 10.0));
         painter.drawLine(QPointF(4.1, 13.8), QPointF(15.9, 13.8));
@@ -411,7 +411,7 @@ QIcon create_chrome_icon(ChromeIcon icon, QPalette const& palette)
     active.setAlpha(icon == ChromeIcon::Close || icon == ChromeIcon::TabClose ? 220 : 236);
 
     auto disabled = ChromeStyle::chrome_muted_text(palette);
-    disabled.setAlpha(icon == ChromeIcon::Close || icon == ChromeIcon::TabClose ? 78 : 96);
+    disabled.setAlpha(icon == ChromeIcon::Close || icon == ChromeIcon::TabClose ? 78 : 82);
 
     QIcon qicon;
 

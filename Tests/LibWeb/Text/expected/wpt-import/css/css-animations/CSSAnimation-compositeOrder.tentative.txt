@@ -1,0 +1,7 @@
+Harness status: OK
+
+Found 2 tests
+
+2 Pass
+Pass	Animations are composited by their order in the animation-name property.
+Pass	Web-animation replaces CSS animation

@@ -59,10 +59,10 @@
 namespace Ladybird {
 
 static constexpr auto LADYBIRD_TAB_MIME_TYPE = "application/x-ladybird-tab";
-static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 44;
-static constexpr int HORIZONTAL_TAB_HEIGHT = 38;
+static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 42;
+static constexpr int HORIZONTAL_TAB_HEIGHT = 36;
 static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 128;
-static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 240;
+static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 232;
 static constexpr int VERTICAL_TAB_HEIGHT = 38;
 static constexpr int VERTICAL_TABS_COLLAPSED_WIDTH = browser_chrome_layout_policy().collapsed_sidebar_width;
 static constexpr int VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH = browser_chrome_layout_policy().expanded_sidebar_width;
