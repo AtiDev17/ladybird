@@ -119,10 +119,18 @@ static Optional<Gfx::AffineTransform> svg_to_css_pixels_transform(Paintable cons
     return {};
 }
 
+static bool computed_values_have_transform(CSS::ComputedValues const& computed_values)
+{
+    return !computed_values.transformations().is_empty()
+        || !computed_values.rotate().is_null()
+        || !computed_values.translate().is_null()
+        || !computed_values.scale().is_null();
+}
+
 // https://drafts.csswg.org/css-transforms-2/#ctm
 Optional<TransformData> compute_transform(Paintable const& paintable_box, CSS::ComputedValues const& computed_values, double pixel_ratio)
 {
-    if (!paintable_box.has_css_transform())
+    if (!computed_values_have_transform(computed_values) || !paintable_box.layout_node().is_transformable())
         return {};
 
     // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
@@ -174,11 +182,8 @@ Optional<TransformData> compute_transform(Paintable const& paintable_box, CSS::C
 // https://drafts.csswg.org/css-transforms-2/#perspective-matrix
 static Optional<Gfx::FloatMatrix4x4> compute_perspective_matrix(Paintable const& paintable_box, CSS::ComputedValues const& computed_values)
 {
-    if (!paintable_box.layout_node().is_transformable())
-        return {};
-
     auto perspective = computed_values.perspective();
-    if (!perspective.has_value())
+    if (!perspective.has_value() || !paintable_box.layout_node().is_transformable())
         return {};
 
     // The perspective matrix is computed as follows:
@@ -216,7 +221,9 @@ static Optional<ClipData> compute_clip_data(Paintable const& paintable_box, CSS:
     //    any such mechanism through other properties, such as overflow, resize, or text-overflow.
     //    NOTE: This clipping shape respects overflow-clip-margin, allowing an element with paint containment
     //          to still slightly overflow its normal bounds.
-    if (paintable_box.layout_node().has_paint_containment()) {
+    auto has_paint_containment = computed_values.contain().paint_containment
+        || computed_values.content_visibility() == CSS::ContentVisibility::Auto;
+    if (has_paint_containment && paintable_box.layout_node().has_paint_containment()) {
         // NOTE: Note: The behavior is described in this paragraph is equivalent to changing 'overflow-x: visible' into
         //       'overflow-x: clip' and 'overflow-y: visible' into 'overflow-y: clip' at used value time, while leaving other
         //       values of 'overflow-x' and 'overflow-y' unchanged.
@@ -266,8 +273,10 @@ static Optional<ClipData> compute_clip_data(Paintable const& paintable_box, CSS:
     return {};
 }
 
-static Optional<ClipData> compute_css_clip_data(Paintable const& paintable_box, DevicePixelConverter const& converter)
+static Optional<ClipData> compute_css_clip_data(Paintable const& paintable_box, CSS::ComputedValues const& computed_values, DevicePixelConverter const& converter)
 {
+    if (!computed_values.clip().is_rect())
+        return {};
     if (auto css_clip = paintable_box.get_clip_rect(); css_clip.has_value()) {
         auto effective_rect = effective_css_clip_rect(*css_clip);
         return ClipData { converter.rounded_device_rect(effective_rect), {} };
@@ -305,15 +314,19 @@ static Optional<PerspectiveData> compute_perspective_data(Paintable const& paint
 }
 
 // NB: Resolves the box's filter as a side effect, since the effects data embeds the resolved gfx filter.
-static Optional<EffectsData> compute_effects_data(Paintable& box, double pixel_ratio)
+static Optional<EffectsData> compute_effects_data(Paintable& box, CSS::ComputedValues const& computed_values, double pixel_ratio)
 {
-    auto const& computed_values = box.computed_values();
     if (computed_values.filter().has_filters())
         box.set_filter(resolve_css_filter(computed_values.filter(), box));
-    else
+    else if (box.filter().has_filters() || box.filter().svg_filter_bounds.has_value())
         box.set_filter({});
 
-    auto gfx_filter = to_gfx_filter(box.filter(), pixel_ratio);
+    if (!box.filter().has_filters() && computed_values.opacity() == 1 && computed_values.mix_blend_mode() == CSS::MixBlendMode::Normal)
+        return {};
+
+    Optional<Gfx::Filter> gfx_filter;
+    if (box.filter().has_filters())
+        gfx_filter = to_gfx_filter(box.filter(), pixel_ratio);
     EffectsData effects {
         computed_values.opacity(),
         mix_blend_mode_to_compositing_and_blending_operator(computed_values.mix_blend_mode()),
@@ -350,8 +363,9 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         VisualContextIndex fixed_position;
     };
 
-    auto build_paintable_box = [&](auto& self, Paintable& paintable_box, DescendantVisualContexts inherited_contexts) -> void {
+    auto build_paintable_box = [&](Paintable& paintable_box, DescendantVisualContexts inherited_contexts, bool may_be_root_element) -> DescendantVisualContexts {
         auto first_visual_context_node_index = visual_context_tree.nodes().size();
+        auto& layout_node = paintable_box.layout_node();
 
         VisualContextIndex inherited_state;
 
@@ -374,7 +388,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         //     box. When the anchor is itself an anchor-positioned box, its layout position does not include its own
         //     paint-time shift, so each chained anchor's shift is emitted as well, masked to the axes that every link
         //     below it compensates in. The visited set and depth cap guard against malformed anchor chains.
-        if (auto const* box = as_if<Layout::Box>(&paintable_box.layout_node())) {
+        if (auto const* box = as_if<Layout::Box>(&layout_node)) {
             auto const& scroll_state = viewport_paintable.scroll_state();
             bool compensate_x = true;
             bool compensate_y = true;
@@ -421,20 +435,26 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
                 own_state = append_node(own_state, ScrollData { sticky_idx, true });
         }
 
-        auto const& computed_values = paintable_box.computed_values();
+        auto const& computed_values = layout_node.computed_values();
 
-        if (auto effects = compute_effects_data(paintable_box, pixel_ratio); effects.has_value())
+        if (auto effects = compute_effects_data(paintable_box, computed_values, pixel_ratio); effects.has_value())
             append_to_own_and_positioned_descendant_contexts(effects.value());
 
-        if (auto transform_data = compute_transform(paintable_box, computed_values, pixel_ratio); transform_data.has_value()) {
-            paintable_box.set_has_non_invertible_css_transform(!transform_data->matrix.is_invertible());
-            own_state = append_node(own_state, *transform_data);
+        if (computed_values_have_transform(computed_values)) {
+            if (auto transform_data = compute_transform(paintable_box, computed_values, pixel_ratio); transform_data.has_value()) {
+                paintable_box.set_has_non_invertible_css_transform(!transform_data->matrix.is_invertible());
+                own_state = append_node(own_state, *transform_data);
+            } else {
+                paintable_box.set_has_non_invertible_css_transform(false);
+            }
         } else {
             paintable_box.set_has_non_invertible_css_transform(false);
         }
 
-        if (auto css_clip = compute_css_clip_data(paintable_box, converter); css_clip.has_value())
-            append_to_own_and_positioned_descendant_contexts(css_clip.value());
+        if (computed_values.clip().is_rect()) {
+            if (auto css_clip = compute_css_clip_data(paintable_box, computed_values, converter); css_clip.has_value())
+                append_to_own_and_positioned_descendant_contexts(css_clip.value());
+        }
 
         if (auto clip_path_data = compute_basic_shape_clip_path_data(paintable_box, computed_values, converter, scale); clip_path_data.has_value())
             append_to_own_and_positioned_descendant_contexts(clip_path_data.value());
@@ -442,7 +462,8 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         paintable_box.set_accumulated_visual_context(own_state);
 
         Vector<CSS::BackgroundLayerData> const* background_layers = &computed_values.background_layers();
-        if (paintable_box.layout_node_with_style_and_box_metrics().is_root_element()) {
+        auto is_root_element = may_be_root_element && layout_node.is_root_element();
+        if (is_root_element) {
             if (auto* html_element = as_if<HTML::HTMLHtmlElement>(paintable_box.dom_node().ptr())) {
                 if (html_element->should_use_body_background_properties())
                     background_layers = paintable_box.document().background_layers();
@@ -464,8 +485,8 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
                 // their ancestor elements) and do not have their background propagated to the canvas, a value of fixed
                 // for the background-attachment property is treated as if it had a value of scroll.
                 auto has_transform_ancestor = false;
-                if (!paintable_box.layout_node_with_style_and_box_metrics().is_root_element()) {
-                    for (auto const* node = &paintable_box.layout_node(); node && !node->is_viewport(); node = node->parent()) {
+                if (!is_root_element) {
+                    for (auto const* node = &layout_node; node && !node->is_viewport(); node = node->parent()) {
                         if (node->has_css_transform()) {
                             has_transform_ancestor = true;
                             break;
@@ -491,11 +512,19 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         // Build state for descendants: own state + perspective + clip + scroll.
         VisualContextIndex state_for_descendants = own_state;
 
-        if (auto perspective_data = compute_perspective_data(paintable_box, computed_values, scale); perspective_data.has_value())
-            state_for_descendants = append_node(state_for_descendants, *perspective_data);
+        if (computed_values.perspective().has_value()) {
+            if (auto perspective_data = compute_perspective_data(paintable_box, computed_values, scale); perspective_data.has_value())
+                state_for_descendants = append_node(state_for_descendants, *perspective_data);
+        }
 
-        if (auto clip_data = compute_clip_data(paintable_box, computed_values, converter); clip_data.has_value())
-            state_for_descendants = append_node(state_for_descendants, clip_data.value());
+        auto may_have_clip = computed_values.overflow_x() != CSS::Overflow::Visible
+            || computed_values.overflow_y() != CSS::Overflow::Visible
+            || computed_values.contain().paint_containment
+            || computed_values.content_visibility() == CSS::ContentVisibility::Auto;
+        if (may_have_clip) {
+            if (auto clip_data = compute_clip_data(paintable_box, computed_values, converter); clip_data.has_value())
+                state_for_descendants = append_node(state_for_descendants, clip_data.value());
+        }
 
         if (paintable_box.own_scroll_frame_index().value()) {
             auto is_sticky_without_scrollable_overflow = paintable_box.is_sticky_position() && paintable_box.enclosing_scroll_frame_index() == paintable_box.own_scroll_frame_index();
@@ -505,20 +534,17 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
 
         paintable_box.set_accumulated_visual_context_for_descendants(state_for_descendants);
         paintable_box.set_visual_context_node_range(first_visual_context_node_index, visual_context_tree.nodes().size());
-        if (paintable_box.layout_node().establishes_an_absolute_positioning_containing_block())
+        auto positioning_containing_blocks = layout_node.establishes_positioning_containing_blocks();
+        if (positioning_containing_blocks.absolute)
             state_for_absolute_position_descendants = state_for_descendants;
-        if (paintable_box.layout_node().establishes_a_fixed_positioning_containing_block())
+        if (positioning_containing_blocks.fixed)
             state_for_fixed_position_descendants = state_for_descendants;
 
-        DescendantVisualContexts child_contexts {
+        return DescendantVisualContexts {
             state_for_descendants,
             state_for_absolute_position_descendants,
             state_for_fixed_position_descendants,
         };
-        paintable_box.for_each_child_of_type<Paintable>([&](Paintable& child) {
-            self(self, child, child_contexts);
-            return IterationDecision::Continue;
-        });
     };
 
     DescendantVisualContexts viewport_contexts {
@@ -526,10 +552,22 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         viewport_state_for_descendants,
         visual_viewport_context_index,
     };
-    viewport_paintable.for_each_child_of_type<Paintable>([&](Paintable& child) {
-        build_paintable_box(build_paintable_box, child, viewport_contexts);
-        return IterationDecision::Continue;
-    });
+
+    struct PendingPaintable {
+        Paintable* paintable;
+        DescendantVisualContexts inherited_contexts;
+        bool may_be_root_element;
+    };
+    Vector<PendingPaintable, 64> pending_paintables;
+    for (auto* child = viewport_paintable.last_child_ptr(); child; child = child->previous_sibling_ptr())
+        pending_paintables.append({ child, viewport_contexts, true });
+
+    while (!pending_paintables.is_empty()) {
+        auto pending = pending_paintables.take_last();
+        auto child_contexts = build_paintable_box(*pending.paintable, pending.inherited_contexts, pending.may_be_root_element);
+        for (auto* child = pending.paintable->last_child_ptr(); child; child = child->previous_sibling_ptr())
+            pending_paintables.append({ child, child_contexts, false });
+    }
 
     return visual_context_tree;
 }
@@ -547,7 +585,7 @@ bool update_accumulated_visual_context_values(ViewportPaintable& viewport_painta
     auto pixel_ratio = viewport_paintable.document().page().client().device_pixels_per_css_pixel();
     auto const& computed_values = paintable_box.computed_values();
 
-    auto effects = compute_effects_data(paintable_box, pixel_ratio);
+    auto effects = compute_effects_data(paintable_box, computed_values, pixel_ratio);
     auto transform = compute_transform(paintable_box, computed_values, pixel_ratio);
     auto perspective = compute_perspective_data(paintable_box, computed_values, static_cast<float>(pixel_ratio));
 

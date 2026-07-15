@@ -216,9 +216,15 @@ public:
 
     bool establishes_stacking_context() const;
 
+    struct PositioningContainingBlockEstablishment {
+        bool absolute;
+        bool fixed;
+    };
+
     bool computed_values_establish_absolute_positioning_containing_block() const;
     bool establishes_an_absolute_positioning_containing_block() const;
     bool establishes_a_fixed_positioning_containing_block() const;
+    PositioningContainingBlockEstablishment establishes_positioning_containing_blocks() const;
 
     Gfx::Font const& first_available_font() const;
     Gfx::Font const& font(DisplayListRecordingContext&) const;
@@ -249,14 +255,12 @@ public:
 
     [[nodiscard]] bool has_css_transform() const
     {
-        if (!is_transformable())
-            return false;
-
         auto const& computed_values = this->computed_values();
-        return !computed_values.transformations().is_empty()
+        auto has_transform = !computed_values.transformations().is_empty()
             || computed_values.rotate()
             || computed_values.translate()
             || computed_values.scale();
+        return has_transform && is_transformable();
     }
 
     // https://drafts.csswg.org/css-ui/#propdef-user-select
