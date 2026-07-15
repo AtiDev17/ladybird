@@ -369,6 +369,28 @@ cleanup_run_dirs() {
     sudo_and_ask "" rm -fr "${BUILD_DIR}/wpt"
 }
 
+WPT_PROFILES_PARENT="${BUILD_DIR}/wpt-profiles"
+WPT_PROFILES_ROOT="${WPT_PROFILES_PARENT}/run-$$"
+
+# Each WebDriver instance creates its browser profile under this run's profile root. The root is
+# removed when this script exits; roots leaked by previous unclean exits are swept before running.
+ensure_profiles_root() {
+    local stale pid
+    for stale in "${WPT_PROFILES_PARENT}"/run-*; do
+        [ -d "$stale" ] || continue
+        pid="${stale##*/run-}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$stale"
+        fi
+    done
+    mkdir -p "${WPT_PROFILES_ROOT}"
+    WPT_ARGS+=( "--webdriver-arg=--profiles-directory=${WPT_PROFILES_ROOT}" )
+}
+
+cleanup_profiles_root() {
+    rm -rf "${WPT_PROFILES_ROOT}"
+}
+
 cleanup_merge_dirs_and_infra() {
     # Cleanup is only needed on Linux
     if [[ $OSTYPE == 'linux'* ]]; then
@@ -376,7 +398,7 @@ cleanup_merge_dirs_and_infra() {
         cleanup_run_infra
     fi
 }
-trap cleanup_merge_dirs_and_infra EXIT INT TERM
+trap 'cleanup_merge_dirs_and_infra; cleanup_profiles_root' EXIT INT TERM
 
 make_instances() {
     if [ "${PARALLEL_INSTANCES}" = 1 ]; then
@@ -551,7 +573,7 @@ run_wpt_chunked() {
 
     echo "Preparing the venv setup..."
     base_venv="${BUILD_DIR}/wpt-prep/_venv"
-    ./wpt --venv "$base_venv" run "${WPT_ARGS[@]}" ladybird THIS_TEST_CANNOT_POSSIBLY_EXIST "${WPT_TEST_TYPE_ARGS[@]}"
+    ./wpt --venv "$base_venv" run "${WPT_ARGS[@]}" --list-tests ladybird THIS_TEST_CANNOT_POSSIBLY_EXIST "${WPT_TEST_TYPE_ARGS[@]}"
 
     echo "Launching $procs chunked instances (concurrency=$concurrency each)"
     local logs=()
@@ -567,10 +589,10 @@ run_wpt_chunked() {
         touch "$logpath"
         logs+=("$logpath")
 
+        rm -rf "${runpath}/_venv"
         cp -r "$base_venv" "${runpath}/_venv"
 
         command=(./wpt --venv "${runpath}/_venv" \
-            --skip-venv-setup \
             run \
             --this-chunk="$((i + 1))" \
             --total-chunks="$procs" \
@@ -606,6 +628,8 @@ update_hosts_file_if_needed() {
 
 execute_wpt() {
     local procs
+
+    ensure_profiles_root
 
     procs=$(make_instances)
     if [[ "$procs" -le 1 ]]; then
@@ -822,11 +846,10 @@ if [[ "$CMD" =~ ^(update|clean|run|serve|bisect|compare|import|list-tests)$ ]]; 
             run_wpt "${@}"
             ;;
         clean)
+            rm -rf "${WPT_PROFILES_PARENT}"
             if [[ $OSTYPE == 'linux'* ]]; then
                 cleanup_run_infra
                 cleanup_run_dirs true
-            else
-                echo "Cleanup is only needed on Linux"
             fi
             ;;
         serve)
