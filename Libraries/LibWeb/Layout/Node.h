@@ -94,6 +94,8 @@ public:
 
     RefPtr<Painting::Paintable> paintable() { return m_paintable; }
     RefPtr<Painting::Paintable const> paintable() const { return m_paintable; }
+    Painting::Paintable* paintable_ptr() { return m_paintable.ptr(); }
+    Painting::Paintable const* paintable_ptr() const { return m_paintable.ptr(); }
     void set_paintable(RefPtr<Painting::Paintable>);
     void clear_paintable();
     void prepare_for_detach_from_layout_tree();
@@ -122,21 +124,22 @@ public:
 
     virtual bool can_have_children() const { return true; }
 
-    CSS::Display display() const;
-    CSS::Display display_before_box_type_transformation() const;
-
     bool is_inline() const;
-    bool is_inline_block() const;
-    bool is_inline_table() const;
 
     bool is_replaced_element() const;
-    bool has_replaced_element_table_display_adjustment() const;
     bool is_atomic_inline() const;
     bool is_fragmented_inline() const;
     NodeWithStyleAndBoxModelMetrics const* nearest_fragmented_inline_ancestor() const;
-    bool is_transformable() const;
 
     bool is_out_of_flow(FormattingContext const&) const;
+
+    // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
+    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
+    bool is_out_of_flow() const;
+
+    // An element is called in-flow if it is not out-of-flow.
+    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
+    bool is_in_flow() const { return !is_out_of_flow(); }
 
     // These are used to optimize hot is<T> variants for some classes where dynamic_cast is too slow.
     virtual bool is_box() const { return false; }
@@ -169,12 +172,6 @@ public:
 
     template<typename T>
     bool fast_is() const = delete;
-
-    bool is_floating() const;
-    bool is_positioned() const;
-    bool is_absolutely_positioned() const;
-    bool is_fixed_position() const;
-    bool is_sticky_position() const;
 
     bool is_flex_item() const { return m_is_flex_item; }
     void set_flex_item(bool b) { m_is_flex_item = b; }
@@ -218,23 +215,9 @@ public:
     // https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level
     Box const* non_anonymous_containing_block() const;
 
-    bool establishes_stacking_context() const;
-
-    struct PositioningContainingBlockEstablishment {
-        bool absolute;
-        bool fixed;
-    };
-
-    bool computed_values_establish_absolute_positioning_containing_block() const;
-    bool establishes_an_absolute_positioning_containing_block() const;
-    bool establishes_a_fixed_positioning_containing_block() const;
-    PositioningContainingBlockEstablishment establishes_positioning_containing_blocks() const;
-
     Gfx::Font const& first_available_font() const;
     Gfx::Font const& font(DisplayListRecordingContext&) const;
     Gfx::Font const& font(float scale_factor) const;
-
-    CSS::ImmutableComputedValues const& computed_values() const;
 
     NodeWithStyle* parent();
     NodeWithStyle const* parent() const;
@@ -249,33 +232,8 @@ public:
     u32 initial_quote_nesting_level() const { return m_initial_quote_nesting_level; }
     void set_initial_quote_nesting_level(u32 value) { m_initial_quote_nesting_level = value; }
 
-    // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
-    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
-    bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
-
-    // An element is called in-flow if it is not out-of-flow.
-    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
-    bool is_in_flow() const { return !is_out_of_flow(); }
-
-    [[nodiscard]] bool has_css_transform() const
-    {
-        auto const& computed_values = this->computed_values();
-        auto has_transform = !computed_values.transformations().is_empty()
-            || computed_values.rotate()
-            || computed_values.translate()
-            || computed_values.scale();
-        return has_transform && is_transformable();
-    }
-
     // https://drafts.csswg.org/css-ui/#propdef-user-select
     CSS::UserSelect user_select_used_value() const;
-
-    // https://drafts.csswg.org/css-contain-2/#containment-types
-    bool has_size_containment() const;
-    bool has_inline_size_containment() const;
-    bool has_layout_containment() const;
-    bool has_style_containment() const;
-    bool has_paint_containment() const;
 
     [[nodiscard]] bool has_been_wrapped_in_table_wrapper() const { return m_has_been_wrapped_in_table_wrapper; }
     void set_has_been_wrapped_in_table_wrapper(bool value) { m_has_been_wrapped_in_table_wrapper = value; }
@@ -341,44 +299,102 @@ public:
         NonnullRefPtr<CSS::ImageStyleValue const> m_image;
     };
 
-    CSS::ImmutableComputedValues const& computed_values() const { return static_cast<CSS::ImmutableComputedValues const&>(*m_computed_values); }
-    CSS::MutableComputedValues& mutable_computed_values() { return static_cast<CSS::MutableComputedValues&>(*m_computed_values); }
+    CSS::ComputedValues const& computed_values() const { return *m_computed_values; }
+
+    template<typename Callback>
+    void modify_computed_values(Callback callback)
+    {
+        CSS::ComputedValues::Builder builder(computed_values());
+        callback(*builder.operator->());
+        set_computed_values(move(builder).build());
+    }
+
+    CSS::Display display() const { return computed_values().display(); }
+    CSS::Display display_before_box_type_transformation() const { return computed_values().display_before_box_type_transformation(); }
+    bool is_inline_block() const;
+    bool is_inline_table() const;
+    bool has_replaced_element_table_display_adjustment() const;
+    bool is_transformable() const;
+
+    bool is_floating() const;
+    bool is_positioned() const;
+    bool is_absolutely_positioned() const;
+    bool is_fixed_position() const;
+    bool is_sticky_position() const;
+
+    // https://www.w3.org/TR/css-display-3/#out-of-flow
+    bool is_out_of_flow(FormattingContext const&) const;
+
+    // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
+    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
+    bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
+
+    // An element is called in-flow if it is not out-of-flow.
+    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
+    bool is_in_flow() const { return !is_out_of_flow(); }
+
+    bool establishes_stacking_context() const;
+    bool computed_values_establish_absolute_positioning_containing_block() const;
+    bool establishes_an_absolute_positioning_containing_block() const;
+    bool establishes_a_fixed_positioning_containing_block() const;
+
+    struct PositioningContainingBlockEstablishment {
+        bool absolute;
+        bool fixed;
+    };
+    PositioningContainingBlockEstablishment establishes_positioning_containing_blocks() const;
+
+    // https://drafts.csswg.org/css-contain-2/#containment-types
+    bool has_size_containment() const;
+    bool has_inline_size_containment() const;
+    bool has_layout_containment() const;
+    bool has_style_containment() const;
+    bool has_paint_containment() const;
+
+    [[nodiscard]] bool has_css_transform() const
+    {
+        auto const& computed_values = this->computed_values();
+        auto has_transform = !computed_values.transformations().is_empty()
+            || computed_values.rotate()
+            || computed_values.translate()
+            || computed_values.scale();
+        return has_transform && is_transformable();
+    }
 
     void clear_image_observers();
-    void apply_style(CSS::ComputedProperties const&);
+    void apply_style(NonnullRefPtr<CSS::ComputedValues const>);
+    void attach_style_resources();
 
     Gfx::Font const& first_available_font() const;
     Vector<CSS::BackgroundLayerData> const& background_layers() const { return computed_values().background_layers(); }
-    CSS::AbstractImageStyleValue const* list_style_image() const { return m_list_style_image; }
+    CSS::AbstractImageStyleValue const* list_style_image() const { return computed_values().list_style_image(); }
     CSS::StyleScope const& style_scope() const;
 
     NonnullRefPtr<NodeWithStyle> create_anonymous_wrapper() const;
 
-    void transfer_table_box_computed_values_to_wrapper_computed_values(CSS::ComputedValues& wrapper_computed_values);
+    void transfer_table_box_computed_values_to_wrapper_computed_values(CSS::ComputedValues::Builder& wrapper_computed_values);
 
     bool is_body() const { return m_is_body; }
     bool is_scroll_container() const;
 
-    void set_computed_values(NonnullOwnPtr<CSS::ComputedValues>);
+    void set_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
 
     u32 layout_index() const { return m_layout_index; }
     void set_layout_index(u32 index) { m_layout_index = index; }
 
 protected:
-    NodeWithStyle(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);
-    NodeWithStyle(DOM::Document&, DOM::Node*, NonnullOwnPtr<CSS::ComputedValues>);
+    NodeWithStyle(DOM::Document&, DOM::Node*, NonnullRefPtr<CSS::ComputedValues const>);
 
 private:
     virtual bool is_node_with_style() const final { return true; }
 
     void reset_table_box_computed_values_used_by_wrapper_to_init_values();
-    void propagate_non_inherit_values(NodeWithStyle& target_node) const;
+    void propagate_non_inherit_values(CSS::ComputedValues::Builder&) const;
     void propagate_style_to_anonymous_wrappers();
 
     void rebuild_image_observers();
 
-    NonnullOwnPtr<CSS::ComputedValues> m_computed_values;
-    RefPtr<CSS::AbstractImageStyleValue const> m_list_style_image;
+    NonnullRefPtr<CSS::ComputedValues const> m_computed_values;
     Vector<NonnullOwnPtr<ImageObserver>> m_image_observers;
     u32 m_layout_index { 0 };
 };
@@ -393,9 +409,7 @@ public:
     bool is_inline_flow_interrupting_block() const;
 
 protected:
-    NodeWithStyleAndBoxModelMetrics(DOM::Document&, DOM::Node*, CSS::ComputedProperties const&);
-
-    NodeWithStyleAndBoxModelMetrics(DOM::Document& document, DOM::Node* node, NonnullOwnPtr<CSS::ComputedValues> computed_values)
+    NodeWithStyleAndBoxModelMetrics(DOM::Document& document, DOM::Node* node, NonnullRefPtr<CSS::ComputedValues const> computed_values)
         : NodeWithStyle(document, node, move(computed_values))
     {
     }
@@ -431,23 +445,14 @@ inline Gfx::Font const& Node::font(float scale_factor) const
     return font.with_size(font.point_size() * scale_factor);
 }
 
-inline CSS::ImmutableComputedValues const& Node::computed_values() const
-{
-    VERIFY(has_style_or_parent_with_style());
-
-    if (m_has_style)
-        return static_cast<NodeWithStyle const*>(this)->computed_values();
-    return parent()->computed_values();
-}
-
 inline NodeWithStyle const* Node::parent() const
 {
-    return static_cast<NodeWithStyle const*>(Base::parent().ptr());
+    return static_cast<NodeWithStyle const*>(Base::parent_ptr());
 }
 
 inline NodeWithStyle* Node::parent()
 {
-    return static_cast<NodeWithStyle*>(Base::parent().ptr());
+    return static_cast<NodeWithStyle*>(Base::parent_ptr());
 }
 
 inline Gfx::Font const& NodeWithStyle::first_available_font() const

@@ -45,13 +45,30 @@ private:
     }
 };
 
+// https://drafts.csswg.org/css-conditional-5/#style-container
+class StyleQueryFunction final : public BooleanExpression {
+public:
+    static NonnullOwnPtr<StyleQueryFunction> create(NonnullOwnPtr<BooleanExpression>&&);
+    virtual ~StyleQueryFunction() override = default;
+
+    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
+    virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
+    virtual void serialize_to(Utf16StringBuilder&) const override;
+    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
+
+private:
+    explicit StyleQueryFunction(NonnullOwnPtr<BooleanExpression>&&);
+
+    NonnullOwnPtr<BooleanExpression> m_query;
+};
+
 // https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
 class StyleFeature final : public BooleanExpression {
 public:
     using StyleRangeValue = Variant<PropertyNameAndID, Vector<Parser::ComponentValue>>;
 
     static NonnullOwnPtr<StyleFeature> create_boolean(PropertyNameAndID);
-    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value);
+    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value, Optional<String> original_value_text = {});
     static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison comparison, StyleRangeValue right);
     static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison left_comparison, StyleRangeValue middle, FeatureComparison right_comparison, StyleRangeValue right);
 
@@ -63,6 +80,7 @@ public:
     struct StyleFeaturePlain {
         PropertyNameAndID property;
         Optional<Vector<Parser::ComponentValue>> value;
+        Optional<String> original_value_text;
     };
 
     struct StyleRange {
@@ -92,6 +110,7 @@ public:
     bool matches() const { return m_matches; }
     ContainerQueryFeatureRequirements const& feature_requirements() const { return m_feature_requirements; }
     bool contains_size_feature() const { return m_feature_requirements.contains_size_feature(); }
+    bool contains_style_feature() const { return m_feature_requirements.contains_style_feature(); }
     MatchResult evaluate(DOM::AbstractElement const&, Optional<Utf16FlyString> const& container_name) const;
     Utf16String to_string() const;
 

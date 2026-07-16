@@ -651,8 +651,8 @@
     "high-quality",
     "pixelated",
     "smooth",
-    "optimizespeed=pixelated",
-    "optimizequality=smooth"
+    "optimizespeed",
+    "optimizequality"
   ],
   "isolation": [
     "auto",
@@ -949,6 +949,10 @@
     "nearest",
     "to-zero",
     "up"
+  ],
+  "scroll-behavior": [
+    "auto",
+    "smooth"
   ],
   "scrollbar-gutter": [
     "auto",

@@ -32,6 +32,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/Paintable.h>
 
@@ -182,19 +183,55 @@ void SizeFeature::dump(StringBuilder& builder, int indent_levels) const
     builder.appendff("SizeFeature: {}\n", to_string());
 }
 
+NonnullOwnPtr<StyleQueryFunction> StyleQueryFunction::create(NonnullOwnPtr<BooleanExpression>&& query)
+{
+    return adopt_own(*new StyleQueryFunction(move(query)));
+}
+
+StyleQueryFunction::StyleQueryFunction(NonnullOwnPtr<BooleanExpression>&& query)
+    : m_query(move(query))
+{
+}
+
+MatchResult StyleQueryFunction::evaluate(BooleanExpressionEvaluationContext const& context) const
+{
+    return m_query->evaluate(context);
+}
+
+void StyleQueryFunction::collect_container_query_feature_requirements(ContainerQueryFeatureRequirements& requirements) const
+{
+    m_query->collect_container_query_feature_requirements(requirements);
+}
+
+void StyleQueryFunction::serialize_to(Utf16StringBuilder& builder) const
+{
+    builder.append("style("_utf16);
+    m_query->serialize_to(builder);
+    builder.append(")"_utf16);
+}
+
+void StyleQueryFunction::dump(StringBuilder& builder, int indent_levels) const
+{
+    indent(builder, indent_levels);
+    builder.append("StyleQueryFunction:\n"sv);
+    m_query->dump(builder, indent_levels + 1);
+}
+
 NonnullOwnPtr<StyleFeature> StyleFeature::create_boolean(PropertyNameAndID property)
 {
     return adopt_own(*new StyleFeature(StyleFeaturePlain {
         .property = move(property),
         .value = {},
+        .original_value_text = {},
     }));
 }
 
-NonnullOwnPtr<StyleFeature> StyleFeature::create_plain(PropertyNameAndID property, Vector<Parser::ComponentValue> value)
+NonnullOwnPtr<StyleFeature> StyleFeature::create_plain(PropertyNameAndID property, Vector<Parser::ComponentValue> value, Optional<String> original_value_text)
 {
     return adopt_own(*new StyleFeature(StyleFeaturePlain {
         .property = move(property),
         .value = move(value),
+        .original_value_text = move(original_value_text),
     }));
 }
 
@@ -249,23 +286,20 @@ static NonnullRefPtr<StyleValue const> inherited_custom_property_value(DOM::Abst
 static ColorResolutionContext fallback_color_resolution_context_for_style_query(DOM::AbstractElement const& element, ComputationContext const& computation_context)
 {
     auto calculation_resolution_context = CalculationResolutionContext::from_computation_context(computation_context);
-    auto color_resolution_context_for_style = [&](ComputedProperties const& style) {
-        auto const& document = element.document();
-        auto color_scheme = style.color_scheme(document.page().preferred_color_scheme(), document.supported_color_schemes());
+    auto color_resolution_context_for_style = [&](ComputedValues const& style) {
         ColorResolutionContext color_resolution_context {
-            .color_scheme = color_scheme,
-            .current_color = InitialValues::color(),
+            .color_scheme = style.color_scheme(),
+            .current_color = style.color(),
             .calculation_resolution_context = calculation_resolution_context,
         };
-        color_resolution_context.current_color = style.color(PropertyID::Color, color_resolution_context);
         return color_resolution_context;
     };
 
-    if (auto const* style = element.computed_properties())
+    if (auto const* style = element.computed_values())
         return color_resolution_context_for_style(*style);
 
-    if (auto parent = element.element_to_inherit_style_from(); parent.has_value() && parent->computed_properties())
-        return color_resolution_context_for_style(*parent->computed_properties());
+    if (auto parent = element.element_to_inherit_style_from(); parent.has_value() && parent->computed_values())
+        return color_resolution_context_for_style(*parent->computed_values());
 
     return {
         .color_scheme = element.document().page().preferred_color_scheme(),
@@ -473,7 +507,9 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
     if (auto const* range = m_feature.get_pointer<StyleRange>())
         return evaluate_style_range(*range, context);
 
-    auto const& [property, value] = m_feature.get<StyleFeaturePlain>();
+    auto const& feature = m_feature.get<StyleFeaturePlain>();
+    auto const& property = feature.property;
+    auto const& value = feature.value;
 
     // FIXME: Non-custom properties are valid style features, but if() is evaluated before the element's own
     //        non-custom computed values exist. Supporting these requires on-demand property resolution.
@@ -629,8 +665,12 @@ void StyleFeature::serialize_to(Utf16StringBuilder& builder) const
             if (!feature.value.has_value())
                 return;
             builder.append_ascii(": "sv);
-            auto serialized_value = serialize_a_series_of_component_values(feature.value.value());
-            builder.append(serialized_value.utf16_view());
+            if (feature.original_value_text.has_value()) {
+                builder.append(feature.original_value_text->bytes_as_string_view());
+            } else {
+                auto serialized_value = serialize_a_series_of_component_values(feature.value.value());
+                builder.append(serialized_value.utf16_view());
+            }
         },
         [&](StyleRange const& range) {
             auto serialized_left = serialize_style_range_value_to_utf16(range.left);
@@ -670,7 +710,7 @@ ContainerQuery::ContainerQuery(NonnullOwnPtr<BooleanExpression>&& condition)
 
 static bool container_satisfies_requirements(DOM::Element const& element, ContainerQueryFeatureRequirements const& requirements)
 {
-    auto style = element.computed_properties();
+    auto style = element.computed_values();
     if (!style)
         return false;
 
@@ -732,6 +772,7 @@ MatchResult ContainerQuery::evaluate(DOM::AbstractElement const& element, Option
         return m_condition->evaluate({
             .document = &element.document(),
             .query_container = container,
+            .style_query_element = DOM::AbstractElement { *container },
         });
     }
 
@@ -756,7 +797,7 @@ bool container_name_matches(DOM::Element const& element, Optional<Utf16FlyString
     if (!container_name.has_value())
         return true;
 
-    if (auto style = element.computed_properties())
+    if (auto style = element.computed_values())
         return style->container_name().contains_slow(*container_name);
 
     return false;

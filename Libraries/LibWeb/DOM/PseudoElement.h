@@ -33,7 +33,7 @@ public:
     virtual Layout::NodeWithStyle* layout_node() const = 0;
     virtual Layout::NodeWithStyle* unsafe_layout_node() const = 0;
 
-    virtual RefPtr<CSS::ComputedProperties const> computed_properties() const = 0;
+    virtual RefPtr<CSS::ComputedValues const> computed_values() const = 0;
     virtual void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) = 0;
 
     virtual RefPtr<CSS::CustomPropertyData const> custom_property_data() const = 0;
@@ -52,10 +52,11 @@ public:
     Layout::NodeWithStyle* unsafe_layout_node() const override { return m_layout_node.ptr(); }
     void set_layout_node(Layout::NodeWithStyle*);
 
-    RefPtr<CSS::ComputedProperties const> computed_properties() const override;
+    RefPtr<CSS::ComputedValues const> computed_values() const override;
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
-    void set_computed_properties(RefPtr<CSS::ComputedProperties> value);
-    void set_computed_properties_in_display_none_subtree();
+    void set_computed_style(RefPtr<CSS::ComputedValues const>);
+    void refresh_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
+    void set_computed_values_in_display_none_subtree();
 
     RefPtr<CSS::CustomPropertyData const> custom_property_data() const override;
     void set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value) override;
@@ -74,7 +75,7 @@ private:
     struct CustomPropertyDataStorage;
 
     WeakPtr<Layout::NodeWithStyle> m_layout_node;
-    RefPtr<CSS::ComputedProperties> m_computed_properties;
+    RefPtr<CSS::ComputedValues const> m_computed_values;
     OwnPtr<CustomPropertyDataStorage> m_custom_property_data;
     OwnPtr<CSS::CountersSet> m_counters_set;
     CSSPixelPoint m_scroll_offset {};
@@ -107,7 +108,7 @@ class WEB_API ElementReferencePseudoElement : public PseudoElement {
     Layout::NodeWithStyle* layout_node() const override;
     Layout::NodeWithStyle* unsafe_layout_node() const override;
 
-    RefPtr<CSS::ComputedProperties const> computed_properties() const override;
+    RefPtr<CSS::ComputedValues const> computed_values() const override;
     void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&) override;
 
     RefPtr<CSS::CustomPropertyData const> custom_property_data() const override;

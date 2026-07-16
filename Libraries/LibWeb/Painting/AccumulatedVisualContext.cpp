@@ -473,7 +473,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         if (background_layers) {
             bool has_fixed_background = false;
             for (auto const& layer : *background_layers) {
-                if (layer.attachment == CSS::BackgroundAttachment::Fixed) {
+                if (layer.background_image && layer.attachment == CSS::BackgroundAttachment::Fixed) {
                     has_fixed_background = true;
                     break;
                 }
@@ -486,7 +486,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
                 // for the background-attachment property is treated as if it had a value of scroll.
                 auto has_transform_ancestor = false;
                 if (!is_root_element) {
-                    for (auto const* node = &layout_node; node && !node->is_viewport(); node = node->parent()) {
+                    for (Layout::NodeWithStyle const* node = &layout_node; node && !node->is_viewport(); node = node->parent()) {
                         if (node->has_css_transform()) {
                             has_transform_ancestor = true;
                             break;
@@ -646,6 +646,14 @@ VisualContextIndex AccumulatedVisualContextTree::append(VisualContextData data, 
     auto index = VisualContextIndex(m_nodes.size());
     m_nodes.append({ move(data), parent_index, depth, empty_clip });
     return index;
+}
+
+void AccumulatedVisualContextTree::shrink(size_t node_count)
+{
+    // The visual viewport root node must always remain.
+    VERIFY(node_count >= 1);
+    VERIFY(node_count <= m_nodes.size());
+    m_nodes.shrink(node_count, true);
 }
 
 void AccumulatedVisualContextTree::set_visual_viewport_transform(TransformData transform)

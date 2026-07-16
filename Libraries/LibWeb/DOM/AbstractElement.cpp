@@ -144,9 +144,9 @@ bool AbstractElement::is_before(AbstractElement const& other) const
     return this_node && other_node && this_node->is_before(*other_node);
 }
 
-CSS::ComputedProperties const* AbstractElement::computed_properties() const
+CSS::ComputedValues const* AbstractElement::computed_values() const
 {
-    return m_element->computed_properties(m_pseudo_element);
+    return m_element->computed_values(m_pseudo_element);
 }
 
 GC::Ptr<CSS::CSSStyleProperties const> AbstractElement::inline_style() const

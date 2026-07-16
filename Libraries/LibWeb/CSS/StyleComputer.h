@@ -103,11 +103,11 @@ public:
     void push_ancestor(DOM::Element const&);
     void pop_ancestor(DOM::Element const&);
 
-    [[nodiscard]] NonnullRefPtr<ComputedProperties> create_document_style() const;
+    [[nodiscard]] NonnullRefPtr<ComputedValues const> create_document_style() const;
 
-    [[nodiscard]] NonnullRefPtr<ComputedProperties> compute_style(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}) const;
-    [[nodiscard]] NonnullRefPtr<ComputedProperties> compute_style_with_seeded_ancestors(DOM::AbstractElement);
-    [[nodiscard]] RefPtr<ComputedProperties> compute_pseudo_element_style_if_needed(DOM::AbstractElement, Optional<bool&> did_change_custom_properties) const;
+    [[nodiscard]] NonnullRefPtr<ComputedValues const> compute_style(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}) const;
+    [[nodiscard]] NonnullRefPtr<ComputedValues const> compute_style_with_seeded_ancestors(DOM::AbstractElement);
+    [[nodiscard]] RefPtr<ComputedValues const> compute_pseudo_element_style_if_needed(DOM::AbstractElement, Optional<bool&> did_change_custom_properties) const;
     [[nodiscard]] JsonArray collect_devtools_applied_style_rules(DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
 
     struct ScopedMatchingRule {
@@ -161,6 +161,9 @@ public:
         Yes,
     };
 
+    [[nodiscard]] NonnullRefPtr<ComputedValues const> build_computed_values(ComputedProperties&, DOM::AbstractElement, StyleScope const&) const;
+    [[nodiscard]] NonnullRefPtr<ComputedProperties> reconstruct_computed_properties(ComputedValues const&) const;
+
 private:
     virtual void visit_edges(Visitor&) override;
 
@@ -192,7 +195,7 @@ private:
     [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, bool did_match_any_pseudo_element_rules, ComputeStyleMode, MatchingRuleSet const&) const;
     void collect_animation_into(DOM::AbstractElement, GC::Ref<Animations::KeyframeEffect> animation, ComputedProperties&, ComputedProperties::Builder*) const;
     void compute_custom_properties(ComputedProperties&, DOM::AbstractElement) const;
-    void start_needed_transitions(ComputedProperties const& old_style, ComputedProperties::Builder& new_style, DOM::AbstractElement) const;
+    void start_needed_transitions(ComputedValues const& old_style, ComputedProperties::Builder& new_style, DOM::AbstractElement) const;
     void resolve_effective_overflow_values(ComputedProperties::Builder&) const;
     void transform_box_type_if_needed(ComputedProperties::Builder&, DOM::AbstractElement) const;
 

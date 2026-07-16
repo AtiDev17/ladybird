@@ -326,7 +326,8 @@ static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collec
     if (!layout_node->has_style_or_parent_with_style())
         return items;
 
-    auto const& computed_values = layout_node->computed_values();
+    auto const* layout_node_with_style = as_if<Layout::NodeWithStyle>(*layout_node);
+    auto const& computed_values = layout_node_with_style ? layout_node_with_style->computed_values() : layout_node->parent()->computed_values();
 
     // 2. If node's computed value of 'visibility' is not 'visible', then return items.
     if (computed_values.visibility() != CSS::Visibility::Visible)
@@ -563,7 +564,7 @@ GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
         //    fixed, and no ancestor establishes a fixed position containing block, terminate this algorithm and return
         //    null.
         bool ancestor_is_closed_shadow_hidden = ancestor->is_closed_shadow_hidden_from(*this);
-        bool ancestor_is_fixed_position = ancestor->computed_properties()->position() == CSS::Positioning::Fixed;
+        bool ancestor_is_fixed_position = ancestor->computed_values()->position() == CSS::Positioning::Fixed;
         auto const* ancestor_layout_node = ancestor->layout_node();
         if (ancestor_is_closed_shadow_hidden
             && ancestor_is_fixed_position
@@ -595,7 +596,7 @@ GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
                     return const_cast<Element*>(ancestor);
                 // - The computed value of the position property of the element is static and the ancestor is one of
                 //   the following HTML elements: td, th, or table.
-                if (computed_properties()->position() == CSS::Positioning::Static && ancestor->local_name().is_one_of(HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::table))
+                if (computed_values()->position() == CSS::Positioning::Static && ancestor->local_name().is_one_of(HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::table))
                     return const_cast<Element*>(ancestor);
             }
             // - FIXME: The element has a different effective zoom than ancestor.

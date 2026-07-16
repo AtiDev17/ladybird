@@ -7,38 +7,59 @@
 
 #pragma once
 
+#include <AK/FixedBitmap.h>
 #include <AK/FlyString.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <AK/Utf16FlyString.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/InterpolationColorSpace.h>
 #include <LibGfx/ScalingMode.h>
+#include <LibWeb/CSS/Angle.h>
 #include <LibWeb/CSS/Clip.h>
 #include <LibWeb/CSS/ColumnCount.h>
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Display.h>
+#include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Filter.h>
+#include <LibWeb/CSS/FontFeatureData.h>
 #include <LibWeb/CSS/GridTrackPlacement.h>
 #include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
+#include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/Ratio.h>
 #include <LibWeb/CSS/Size.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/BasicShapeStyleValue.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CursorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
+#include <LibWeb/CSS/Time.h>
 #include <LibWeb/CSS/URL.h>
+#include <LibWeb/Export.h>
+
+namespace Web::DOM {
+
+class Document;
+
+}
 
 namespace Web::CSS {
+
+class AnimatedProperties;
+
+class ComputedProperties;
+class StyleScope;
 
 using ClipRule = FillRule;
 
@@ -48,6 +69,72 @@ using FlexBasis = Variant<FlexBasisContent, Size>;
 struct AspectRatio {
     bool use_natural_aspect_ratio_if_available;
     Optional<Ratio> preferred_ratio;
+    bool computed_use_natural_aspect_ratio_if_available;
+    Optional<Ratio> computed_ratio;
+};
+
+struct AnchorScopeData {
+    bool all { false };
+    Vector<Utf16FlyString> names;
+
+    bool operator==(AnchorScopeData const&) const = default;
+};
+
+struct PositionVisibilityData {
+    bool always { false };
+    bool anchors_valid { false };
+    bool anchors_visible { true };
+    bool no_overflow { false };
+
+    bool operator==(PositionVisibilityData const&) const = default;
+};
+
+struct PositionAreaData {
+    Vector<PositionArea> keywords;
+    bool operator==(PositionAreaData const&) const = default;
+};
+
+struct PositionTryFallbackData {
+    Optional<Utf16FlyString> name;
+    Vector<TryTactic> tactics;
+    Optional<PositionAreaData> position_area;
+    bool operator==(PositionTryFallbackData const&) const = default;
+};
+
+struct TimelineScopeData {
+    bool all { false };
+    Vector<Utf16FlyString> names;
+    bool operator==(TimelineScopeData const&) const = default;
+};
+
+struct ViewTimelineInsetData {
+    LengthPercentageOrAuto start { LengthPercentageOrAuto::make_auto() };
+    LengthPercentageOrAuto end { LengthPercentageOrAuto::make_auto() };
+    bool operator==(ViewTimelineInsetData const&) const = default;
+};
+
+struct AnimationTimelineData {
+    enum class Type : u8 {
+        Auto,
+        None,
+        Name,
+        Scroll,
+        View,
+    };
+
+    Type type { Type::Auto };
+    Utf16FlyString name;
+    Scroller scroller { Scroller::Nearest };
+    Axis axis { Axis::Block };
+    ViewTimelineInsetData inset;
+
+    bool operator==(AnimationTimelineData const&) const = default;
+};
+
+struct ShapeOutsideData {
+    Variant<Empty, URL, NonnullRefPtr<AbstractImageStyleValue const>> image;
+    RefPtr<BasicShapeStyleValue const> basic_shape;
+    Optional<ShapeBox> shape_box;
 };
 
 struct GridAutoFlow {
@@ -82,6 +169,18 @@ struct Position {
             y = rect.height() - y;
         return CSSPixelPoint { rect.x() + x, rect.y() + y };
     }
+};
+
+struct PositionAnchor {
+    enum class Type : u8 {
+        Normal,
+        None,
+        Auto,
+        Name,
+    };
+
+    Type type { Type::Normal };
+    Optional<Utf16FlyString> name;
 };
 
 // https://drafts.csswg.org/css-contain-2/#containment-types
@@ -138,6 +237,7 @@ struct WillChange {
     bool has_contents() const { return m_value.contains_slow(Type::Contents); }
     bool has_scroll_position() const { return m_value.contains_slow(Type::ScrollPosition); }
     bool has_property(PropertyID property_id) const { return m_value.contains_slow(property_id); }
+    Vector<WillChangeEntry> const& entries() const { return m_value; }
 
 private:
     WillChange()
@@ -165,13 +265,41 @@ struct OverflowClipMarginData {
     bool operator==(OverflowClipMarginData const&) const = default;
 };
 
-using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, Utf16String>;
+struct ListStyleSymbols {
+    NonnullRefPtr<CounterStyle const> counter_style;
+    SymbolsType type;
+    Vector<Utf16FlyString> symbols;
+
+    bool operator==(ListStyleSymbols const&) const = default;
+};
+
+using ListStyleType = Variant<Empty, RefPtr<CounterStyle const>, Utf16String, Utf16FlyString, ListStyleSymbols>;
+
+struct ComputedFontStyle {
+    FontStyleKeyword keyword { FontStyleKeyword::Normal };
+    Optional<Variant<Angle, NonnullRefPtr<CalculatedStyleValue const>>> angle;
+
+    bool operator==(ComputedFontStyle const&) const = default;
+};
+
+enum class OverflowWrap : u8 {
+    Normal,
+    BreakWord,
+    Anywhere,
+};
 
 class InitialValues {
 public:
-    static AspectRatio aspect_ratio() { return AspectRatio { true, {} }; }
+    static AspectRatio aspect_ratio() { return AspectRatio { true, {}, true, {} }; }
     static CSSPixels font_size() { return 16; }
     static double font_weight() { return 400; }
+    static Percentage font_width() { return Percentage(100); }
+    static FontOpticalSizing font_optical_sizing() { return FontOpticalSizing::Auto; }
+    static ComputedFontStyle font_style() { return {}; }
+    static FontFeatureData font_feature_data()
+    {
+        return {};
+    }
     static CSSPixels line_height() { return 0; }
     static Float float_() { return Float::None; }
     static CSSPixels border_spacing() { return 0; }
@@ -193,7 +321,12 @@ public:
     static TextAlign text_align() { return TextAlign::Start; }
     static TextJustify text_justify() { return TextJustify::Auto; }
     static Positioning position() { return Positioning::Static; }
-    static Optional<Utf16FlyString> position_anchor() { return {}; }
+    static PositionAnchor position_anchor() { return {}; }
+    static PositionAreaData position_area() { return {}; }
+    static Vector<PositionTryFallbackData> position_try_fallbacks() { return {}; }
+    static Optional<TryOrder> position_try_order() { return {}; }
+    static PositionVisibilityData position_visibility() { return {}; }
+    static TimelineScopeData timeline_scope() { return {}; }
     static TextDecorationLine text_decoration_line() { return TextDecorationLine::None; }
     static TextDecorationSkipInk text_decoration_skip_ink() { return TextDecorationSkipInk::Auto; }
     static TextDecorationStyle text_decoration_style() { return TextDecorationStyle::Solid; }
@@ -201,7 +334,11 @@ public:
     static TextOverflow text_overflow() { return TextOverflow::Clip; }
     static TextIndentData text_indent() { return { Length::make_px(0) }; }
     static TextWrapMode text_wrap_mode() { return TextWrapMode::Wrap; }
+    static TextWrapStyle text_wrap_style() { return TextWrapStyle::Auto; }
     static CSSPixels text_underline_offset() { return 2; }
+    static OverflowWrap overflow_wrap() { return OverflowWrap::Normal; }
+    static u64 orphans() { return 2; }
+    static u64 widows() { return 2; }
     static TextUnderlinePosition text_underline_position() { return { .horizontal = TextUnderlinePositionHorizontal::Auto, .vertical = TextUnderlinePositionVertical::Auto }; }
     static Display display() { return Display { DisplayOutside::Inline, DisplayInside::Flow }; }
     static Color color() { return Color::Black; }
@@ -250,6 +387,8 @@ public:
     static LengthBox inset() { return {}; }
     static LengthBox margin() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
     static LengthBox padding() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
+    static LengthBox scroll_margin() { return { Length::make_px(0), Length::make_px(0), Length::make_px(0), Length::make_px(0) }; }
+    static LengthBox scroll_padding() { return {}; }
     static OverflowClipMarginData overflow_clip_margin() { return {}; }
     static Size width() { return Size::make_auto(); }
     static Size min_width() { return Size::make_auto(); }
@@ -309,6 +448,7 @@ public:
     static MathStyle math_style() { return MathStyle::Normal; }
     static int math_depth() { return 0; }
 
+    static ScrollBehavior scroll_behavior() { return ScrollBehavior::Auto; }
     static ScrollbarColorData scrollbar_color()
     {
         return ScrollbarColorData {
@@ -317,8 +457,12 @@ public:
             .is_auto = true,
         };
     }
+    static ScrollbarGutter scrollbar_gutter() { return ScrollbarGutter::Auto; }
     static ScrollbarWidth scrollbar_width() { return ScrollbarWidth::Auto; }
     static Resize resize() { return Resize::None; }
+    static double shape_image_threshold() { return 0; }
+    static LengthPercentage shape_margin() { return Length::make_px(0); }
+    static ShapeOutsideData shape_outside() { return {}; }
     static ShapeRendering shape_rendering() { return ShapeRendering::Auto; }
     static PaintOrderList paint_order() { return { PaintOrder::Fill, PaintOrder::Stroke, PaintOrder::Markers }; }
     static WillChange will_change() { return WillChange::make_auto(); }
@@ -336,7 +480,7 @@ public:
     static SVGPaint from_style_value(NonnullRefPtr<StyleValue const> const& style_value, ColorResolutionContext const& color_resolution_context)
     {
         if (style_value->has_color())
-            return style_value->to_color(color_resolution_context).value();
+            return { style_value->to_color(color_resolution_context).value(), style_value->to_keyword() == Keyword::Currentcolor };
 
         if (style_value->is_value_list()) {
             auto const& values = style_value->as_value_list().values();
@@ -346,19 +490,21 @@ public:
             if (values[1]->is_empty_optional())
                 return values[0]->as_url().url();
 
-            return { values[0]->as_url().url(), values[1]->to_color(color_resolution_context) };
+            return { values[0]->as_url().url(), values[1]->to_color(color_resolution_context), values[1]->to_keyword() == Keyword::Currentcolor };
         }
 
         VERIFY_NOT_REACHED();
     }
 
-    SVGPaint(Color color)
+    SVGPaint(Color color, bool color_is_currentcolor = false)
         : m_value(color)
+        , m_color_is_currentcolor(color_is_currentcolor)
     {
     }
-    SVGPaint(URL const& url, Optional<Color> fallback_color = {})
+    SVGPaint(URL const& url, Optional<Color> fallback_color = {}, bool fallback_color_is_currentcolor = false)
         : m_value(url)
         , m_fallback_color(fallback_color)
+        , m_color_is_currentcolor(fallback_color_is_currentcolor)
     {
     }
 
@@ -367,10 +513,12 @@ public:
     Color as_color() const { return m_value.get<Color>(); }
     URL const& as_url() const { return m_value.get<URL>(); }
     Optional<Color> const& fallback_color() const { return m_fallback_color; }
+    bool color_is_currentcolor() const { return m_color_is_currentcolor; }
 
 private:
     Variant<URL, Color> m_value;
     Optional<Color> m_fallback_color;
+    bool m_color_is_currentcolor { false };
 };
 
 // https://drafts.fxtf.org/css-masking-1/#typedef-mask-reference
@@ -417,32 +565,47 @@ private:
 };
 
 struct BackgroundLayerData {
-    NonnullRefPtr<AbstractImageStyleValue const> background_image;
+    RefPtr<AbstractImageStyleValue const> background_image;
+    RefPtr<StyleValue const> image_style_value;
     BackgroundAttachment attachment { BackgroundAttachment::Scroll };
     BackgroundBox origin { BackgroundBox::PaddingBox };
     BackgroundBox clip { BackgroundBox::BorderBox };
-    LengthPercentage position_x { Length::make_px(0) };
-    LengthPercentage position_y { Length::make_px(0) };
+    LengthPercentage position_x { Percentage(0) };
+    LengthPercentage position_y { Percentage(0) };
     BackgroundSize size_type { BackgroundSize::LengthPercentage };
     LengthPercentageOrAuto size_x { LengthPercentageOrAuto::make_auto() };
     LengthPercentageOrAuto size_y { LengthPercentageOrAuto::make_auto() };
     Repetition repeat_x { Repetition::Repeat };
     Repetition repeat_y { Repetition::Repeat };
     MixBlendMode blend_mode { MixBlendMode::Normal };
+    bool mask_clip_is_no_clip { false };
+    CoordBox mask_clip { CoordBox::BorderBox };
+    CompositingOperator mask_composite { CompositingOperator::Add };
+    MaskingMode mask_mode { MaskingMode::MatchSource };
+    CoordBox mask_origin { CoordBox::BorderBox };
 };
 
+struct BorderImageWidthAuto { };
+
+using BorderImageSliceValue = Variant<double, Percentage, NonnullRefPtr<CalculatedStyleValue const>>;
+using BorderImageWidthValue = Variant<double, LengthPercentage, BorderImageWidthAuto>;
+using BorderImageOutsetValue = Variant<double, Length>;
+
+template<typename T>
 struct BorderImageSideValues {
-    NonnullRefPtr<StyleValue const> top;
-    NonnullRefPtr<StyleValue const> right;
-    NonnullRefPtr<StyleValue const> bottom;
-    NonnullRefPtr<StyleValue const> left;
+    T top;
+    T right;
+    T bottom;
+    T left;
 };
 
 struct BorderImageData {
-    NonnullRefPtr<AbstractImageStyleValue const> source;
-    BorderImageSideValues slice;
-    BorderImageSideValues width;
-    BorderImageSideValues outset;
+    RefPtr<AbstractImageStyleValue const> source;
+    BorderImageSideValues<BorderImageSliceValue> slice { Percentage(100), Percentage(100), Percentage(100), Percentage(100) };
+    BorderImageSideValues<BorderImageWidthValue> width { 1.0, 1.0, 1.0, 1.0 };
+    BorderImageSideValues<BorderImageOutsetValue> outset { 0.0, 0.0, 0.0, 0.0 };
+    u8 width_value_count { 1 };
+    u8 outset_value_count { 1 };
     bool fill { false };
     BorderImageRepeat repeat_x { BorderImageRepeat::Stretch };
     BorderImageRepeat repeat_y { BorderImageRepeat::Stretch };
@@ -499,6 +662,7 @@ struct ShadowData {
     CSSPixels blur_radius { 0 };
     CSSPixels spread_distance { 0 };
     Color color {};
+    ColorSyntax color_syntax { ColorSyntax::Legacy };
     ShadowPlacement placement { ShadowPlacement::Outer };
 };
 
@@ -512,6 +676,48 @@ struct ContentData {
     Vector<Variant<Utf16String, NonnullRefPtr<AbstractImageStyleValue>>> data;
     Vector<ValueComparingRefPtr<CounterStyle const>> counter_style_dependencies;
     Optional<Utf16String> alt_text {};
+};
+
+struct ContentDataAndQuoteNestingLevel {
+    ContentData content_data;
+    u32 final_quote_nesting_level { 0 };
+};
+
+struct ComputedContentCounter {
+    enum class Function : u8 {
+        Counter,
+        Counters,
+    };
+
+    struct SymbolsFunction {
+        SymbolsType type;
+        Vector<Utf16FlyString> symbols;
+
+        bool operator==(SymbolsFunction const&) const = default;
+    };
+
+    Function function;
+    Utf16FlyString name;
+    Utf16FlyString join_string;
+    Variant<Utf16FlyString, SymbolsFunction> style;
+
+    bool operator==(ComputedContentCounter const&) const = default;
+};
+
+using ComputedContentItem = Variant<Utf16String, Keyword, ComputedContentCounter, NonnullRefPtr<AbstractImageStyleValue const>>;
+
+struct ComputedContentData {
+    enum class Type : u8 {
+        Normal,
+        None,
+        List,
+    };
+
+    Type type { Type::Normal };
+    Vector<ComputedContentItem> items;
+    Vector<ComputedContentItem> alt_text;
+
+    bool operator==(ComputedContentData const&) const = default;
 };
 
 struct CounterData {
@@ -531,10 +737,58 @@ struct BorderRadiusData {
     }
 };
 
+enum class ComputedFontFamilySyntax {
+    CustomIdent,
+    String,
+};
+
+struct ComputedFontFamilyName {
+    Utf16FlyString name;
+    ComputedFontFamilySyntax syntax { ComputedFontFamilySyntax::CustomIdent };
+
+    bool operator==(ComputedFontFamilyName const&) const = default;
+};
+
+using ComputedFontFamily = Variant<GenericFontFamily, ComputedFontFamilyName>;
+
+enum class ComputedAnimationNameSyntax {
+    None,
+    CustomIdent,
+    String,
+};
+
+struct ComputedAnimationName {
+    Utf16FlyString name;
+    ComputedAnimationNameSyntax syntax { ComputedAnimationNameSyntax::None };
+
+    bool operator==(ComputedAnimationName const&) const = default;
+};
+
 struct TextDecorationThickness {
     struct Auto { };
     struct FromFont { };
     Variant<Auto, FromFont, LengthPercentage> value;
+};
+
+struct AccentColor {
+    struct Auto { };
+
+    Variant<Auto, Color> computed_value { Auto {} };
+    Color used_value { Color::Black };
+};
+
+struct TextUnderlineOffset {
+    struct Auto { };
+
+    Variant<Auto, LengthPercentage> computed_value { Auto {} };
+    CSSPixels used_value { 2 };
+};
+
+struct LineHeightData {
+    struct Normal { };
+
+    Variant<Normal, double, Length> computed_value { Normal {} };
+    CSSPixels used_value { InitialValues::line_height() };
 };
 
 // FIXME: Find a better place for this helper.
@@ -543,11 +797,13 @@ inline Gfx::ScalingMode to_gfx_scaling_mode(ImageRendering css_value, Gfx::IntSi
     switch (css_value) {
     case ImageRendering::Auto:
     case ImageRendering::HighQuality:
+    case ImageRendering::Optimizequality:
     case ImageRendering::Smooth:
         if (target.width() < source.width() && target.height() < source.height())
             return Gfx::ScalingMode::BilinearMipmap;
         return Gfx::ScalingMode::Bilinear;
     case ImageRendering::CrispEdges:
+    case ImageRendering::Optimizespeed:
     case ImageRendering::Pixelated:
         return Gfx::ScalingMode::NearestNeighbor;
     }
@@ -567,15 +823,54 @@ inline Gfx::InterpolationColorSpace to_interpolation_color_space(ColorInterpolat
     VERIFY_NOT_REACHED();
 }
 
-class ComputedValues {
+class WEB_API ComputedValues final : public RefCounted<ComputedValues> {
     AK_MAKE_NONCOPYABLE(ComputedValues);
     AK_MAKE_NONMOVABLE(ComputedValues);
 
 public:
-    ComputedValues() = default;
-    ~ComputedValues() = default;
+    class Builder;
+    class Mutator;
+
+    enum class WithAnimationsApplied {
+        No,
+        Yes,
+    };
+
+    static NonnullRefPtr<ComputedValues const> create(ComputedProperties const&, DOM::Document const&, StyleScope const&, ColorResolutionContext);
+
+    RefPtr<StyleValue const> computed_style_value(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
+    RefPtr<StyleValue const> computed_style_value_for_inheritance(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
+    RefPtr<StyleValue const> color_style_value() const;
+    ComputedValues const& base_values() const { return m_base_values ? *m_base_values : *this; }
+    bool has_animated_values() const { return m_base_values; }
+    AnimatedProperties const* animated_properties() const { return m_animated_properties.ptr(); }
+    RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
+
+    bool is_property_important(PropertyID property_id) const { return m_property_important.get(property_bitmap_index(property_id)); }
+    bool is_property_inherited(PropertyID property_id) const { return m_property_inherited.get(property_bitmap_index(property_id)); }
+    bool depends_on_viewport_metrics() const { return m_depends_on_viewport_metrics; }
+    bool font_metrics_depend_on_viewport_metrics() const { return m_font_metrics_depend_on_viewport_metrics; }
+    bool in_display_none_subtree() const { return m_in_display_none_subtree; }
+    bool has_pseudo_element_style(PseudoElement pseudo_element) const { return m_pseudo_element_styles & (1ull << to_underlying(pseudo_element)); }
+    HashMap<PropertyID, NonnullRefPtr<StyleValue const>> const& inheritance_dependent_specified_values() const { return m_inheritance_dependent_specified_values; }
+    RefPtr<StyleValue const> raw_cascaded_font_size() const { return m_raw_cascaded_font_size; }
+
+    ~ComputedValues();
 
     AspectRatio aspect_ratio() const { return m_noninherited.aspect_ratio; }
+    Vector<Utf16FlyString> const& anchor_names() const { return m_noninherited.anchor_names; }
+    AnchorScopeData const& anchor_scope() const { return m_noninherited.anchor_scope; }
+    Vector<ComputedAnimationName> const& animation_names() const { return m_noninherited.animation_names; }
+    Vector<AnimationComposition> const& animation_compositions() const { return m_noninherited.animation_compositions; }
+    Vector<Time> const& animation_delays() const { return m_noninherited.animation_delays; }
+    Vector<AnimationDirection> const& animation_directions() const { return m_noninherited.animation_directions; }
+    Vector<Optional<Time>> const& animation_durations() const { return m_noninherited.animation_durations; }
+    Vector<AnimationFillMode> const& animation_fill_modes() const { return m_noninherited.animation_fill_modes; }
+    Vector<double> const& animation_iteration_counts() const { return m_noninherited.animation_iteration_counts; }
+    Vector<AnimationPlayState> const& animation_play_states() const { return m_noninherited.animation_play_states; }
+    Vector<AnimationTimelineData> const& animation_timelines() const { return m_noninherited.animation_timelines; }
+    Vector<EasingFunction> const& animation_timing_functions() const { return m_noninherited.animation_timing_functions; }
+    StyleValueVector const& animation_timing_function_style_values() const { return m_noninherited.animation_timing_function_style_values; }
     BoxSizing box_sizing_for_aspect_ratio() const
     {
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
@@ -595,9 +890,16 @@ public:
     ColorInterpolation color_interpolation() const { return m_inherited.color_interpolation; }
     ColorInterpolation color_interpolation_filters() const { return m_inherited.color_interpolation_filters; }
     PreferredColorScheme color_scheme() const { return m_inherited.color_scheme; }
+    Vector<Utf16FlyString> const& color_schemes() const { return m_inherited.color_schemes; }
+    bool color_scheme_only() const { return m_inherited.color_scheme_only; }
     ContentVisibility content_visibility() const { return m_inherited.content_visibility; }
     Vector<CursorData> const& cursor() const { return m_inherited.cursor; }
     Optional<ContentData> const& content() const { return m_noninherited.content; }
+    ComputedContentData const& computed_content() const { return m_noninherited.computed_content; }
+    ContentDataAndQuoteNestingLevel resolved_content(DOM::AbstractElement&, u32 initial_quote_nesting_level) const;
+    Vector<CounterData, 0> const& counter_increment() const { return m_noninherited.counter_increment; }
+    Vector<CounterData, 0> const& counter_reset() const { return m_noninherited.counter_reset; }
+    Vector<CounterData, 0> const& counter_set() const { return m_noninherited.counter_set; }
     PointerEvents pointer_events() const { return m_inherited.pointer_events; }
     Display display() const { return m_noninherited.display; }
     Display display_before_box_type_transformation() const { return m_noninherited.display_before_box_type_transformation; }
@@ -607,7 +909,9 @@ public:
     TextJustify text_justify() const { return m_inherited.text_justify; }
     TextIndentData const& text_indent() const { return m_inherited.text_indent; }
     TextWrapMode text_wrap_mode() const { return m_inherited.text_wrap_mode; }
-    CSSPixels text_underline_offset() const { return m_inherited.text_underline_offset; }
+    TextWrapStyle text_wrap_style() const { return m_inherited.text_wrap_style; }
+    TextUnderlineOffset const& text_underline_offset_value() const { return m_inherited.text_underline_offset; }
+    CSSPixels text_underline_offset() const { return m_inherited.text_underline_offset.used_value; }
     TextUnderlinePosition text_underline_position() const { return m_inherited.text_underline_position; }
     Vector<TextDecorationLine> const& text_decoration_line() const { return m_noninherited.text_decoration_line; }
     TextDecorationThickness const& text_decoration_thickness() const { return m_noninherited.text_decoration_thickness; }
@@ -618,24 +922,53 @@ public:
     TextOverflow text_overflow() const { return m_noninherited.text_overflow; }
     Vector<ShadowData> const& text_shadow() const { return m_inherited.text_shadow; }
     Positioning position() const { return m_noninherited.position; }
-    Optional<Utf16FlyString> const& position_anchor() const { return m_noninherited.position_anchor; }
+    PositionAnchor const& position_anchor_value() const { return m_noninherited.position_anchor; }
+    Optional<Utf16FlyString> const& position_anchor() const { return m_noninherited.position_anchor.name; }
+    PositionAreaData const& position_area() const { return m_noninherited.position_area; }
+    Vector<PositionTryFallbackData> const& position_try_fallbacks() const { return m_noninherited.position_try_fallbacks; }
+    Optional<TryOrder> position_try_order() const { return m_noninherited.position_try_order; }
+    PositionVisibilityData const& position_visibility() const { return m_noninherited.position_visibility; }
+    Vector<Optional<Utf16FlyString>> const& scroll_timeline_names() const { return m_noninherited.scroll_timeline_names; }
+    Vector<Axis> const& scroll_timeline_axes() const { return m_noninherited.scroll_timeline_axes; }
+    TimelineScopeData const& timeline_scope() const { return m_noninherited.timeline_scope; }
+    Vector<Optional<Utf16FlyString>> const& view_timeline_names() const { return m_noninherited.view_timeline_names; }
+    Vector<Axis> const& view_timeline_axes() const { return m_noninherited.view_timeline_axes; }
+    Vector<ViewTimelineInsetData> const& view_timeline_insets() const { return m_noninherited.view_timeline_insets; }
+    Vector<Optional<Utf16FlyString>> const& transition_properties() const { return m_noninherited.transition_properties; }
+    Vector<Time> const& transition_durations() const { return m_noninherited.transition_durations; }
+    Vector<EasingFunction> const& transition_timing_functions() const { return m_noninherited.transition_timing_functions; }
+    StyleValueVector const& transition_timing_function_style_values() const { return m_noninherited.transition_timing_function_style_values; }
+    Vector<Time> const& transition_delays() const { return m_noninherited.transition_delays; }
+    Vector<TransitionBehavior> const& transition_behaviors() const { return m_noninherited.transition_behaviors; }
     WhiteSpaceCollapse white_space_collapse() const { return m_inherited.white_space_collapse; }
     WhiteSpaceTrimData white_space_trim() const { return m_noninherited.white_space_trim; }
     WordBreak word_break() const { return m_inherited.word_break; }
+    OverflowWrap overflow_wrap() const { return m_inherited.overflow_wrap; }
+    u64 orphans() const { return m_inherited.orphans; }
+    u64 widows() const { return m_inherited.widows; }
     FontVariantEmoji font_variant_emoji() const { return m_inherited.font_variant_emoji; }
     CSSPixels const& word_spacing() const { return m_inherited.word_spacing; }
     CSSPixels letter_spacing() const { return m_inherited.letter_spacing; }
+    RefPtr<StyleValue const> word_spacing_style_value() const { return m_inherited.word_spacing_style_value; }
+    RefPtr<StyleValue const> letter_spacing_style_value() const { return m_inherited.letter_spacing_style_value; }
     FlexDirection flex_direction() const { return m_noninherited.flex_direction; }
     FlexWrap flex_wrap() const { return m_noninherited.flex_wrap; }
     FlexBasis const& flex_basis() const { return m_noninherited.flex_basis; }
-    float flex_grow() const { return m_noninherited.flex_grow; }
-    float flex_shrink() const { return m_noninherited.flex_shrink; }
-    int order() const { return m_noninherited.order; }
-    Optional<Color> accent_color() const { return m_inherited.accent_color; }
+    double flex_grow() const { return m_noninherited.flex_grow; }
+    double flex_shrink() const { return m_noninherited.flex_shrink; }
+    i32 order() const { return m_noninherited.order; }
+    AccentColor const& accent_color_value() const { return m_inherited.accent_color; }
+    Optional<Color> accent_color() const
+    {
+        if (m_inherited.accent_color.computed_value.has<AccentColor::Auto>())
+            return {};
+        return m_inherited.accent_color.used_value;
+    }
     AlignContent align_content() const { return m_noninherited.align_content; }
     AlignItems align_items() const { return m_noninherited.align_items; }
     AlignSelf align_self() const { return m_noninherited.align_self; }
     Appearance appearance() const { return m_noninherited.appearance; }
+    Appearance computed_appearance() const { return m_noninherited.computed_appearance; }
     float opacity() const { return m_noninherited.opacity; }
     Visibility visibility() const { return m_inherited.visibility; }
     ImageRendering image_rendering() const { return m_inherited.image_rendering; }
@@ -717,35 +1050,64 @@ public:
     ShapeRendering shape_rendering() const { return m_noninherited.shape_rendering; }
 
     LengthBox const& inset() const { return m_noninherited.inset; }
+    RefPtr<StyleValue const> anchor_inset(PropertyID property_id) const
+    {
+        switch (property_id) {
+        case PropertyID::Top:
+            return m_noninherited.top_anchor_inset;
+        case PropertyID::Right:
+            return m_noninherited.right_anchor_inset;
+        case PropertyID::Bottom:
+            return m_noninherited.bottom_anchor_inset;
+        case PropertyID::Left:
+            return m_noninherited.left_anchor_inset;
+        default:
+            return {};
+        }
+    }
     LengthBox const& margin() const { return m_noninherited.margin; }
     LengthBox const& padding() const { return m_noninherited.padding; }
+    LengthBox const& scroll_margin() const { return m_noninherited.scroll_margin; }
+    LengthBox const& scroll_padding() const { return m_noninherited.scroll_padding; }
     OverflowClipMarginData const& overflow_clip_margin() const { return m_noninherited.overflow_clip_margin; }
 
     BorderData const& border_left() const { return m_noninherited.border_left; }
     BorderData const& border_top() const { return m_noninherited.border_top; }
     BorderData const& border_right() const { return m_noninherited.border_right; }
     BorderData const& border_bottom() const { return m_noninherited.border_bottom; }
+    CSSPixels border_left_computed_width() const { return m_noninherited.border_left_computed_width; }
+    CSSPixels border_top_computed_width() const { return m_noninherited.border_top_computed_width; }
+    CSSPixels border_right_computed_width() const { return m_noninherited.border_right_computed_width; }
+    CSSPixels border_bottom_computed_width() const { return m_noninherited.border_bottom_computed_width; }
 
     bool has_noninitial_border_radii() const { return m_noninherited.has_noninitial_border_radii; }
     BorderRadiusData const& border_bottom_left_radius() const { return m_noninherited.border_bottom_left_radius; }
     BorderRadiusData const& border_bottom_right_radius() const { return m_noninherited.border_bottom_right_radius; }
     BorderRadiusData const& border_top_left_radius() const { return m_noninherited.border_top_left_radius; }
     BorderRadiusData const& border_top_right_radius() const { return m_noninherited.border_top_right_radius; }
+    double corner_bottom_left_shape() const { return m_noninherited.corner_bottom_left_shape; }
+    double corner_bottom_right_shape() const { return m_noninherited.corner_bottom_right_shape; }
+    double corner_top_left_shape() const { return m_noninherited.corner_top_left_shape; }
+    double corner_top_right_shape() const { return m_noninherited.corner_top_right_shape; }
 
     Overflow overflow_x() const { return m_noninherited.overflow_x; }
     Overflow overflow_y() const { return m_noninherited.overflow_y; }
 
     Color color() const { return m_inherited.color; }
     Color background_color() const { return m_noninherited.background_color; }
+    RefPtr<StyleValue const> background_color_style_value() const { return m_noninherited.background_color_style_value; }
     BackgroundBox background_color_clip() const { return m_noninherited.background_color_clip; }
     Vector<BackgroundLayerData> const& background_layers() const { return m_noninherited.background_layers; }
     Vector<BackgroundLayerData> const& mask_layers() const { return m_noninherited.mask_layers; }
-    Optional<BorderImageData> const& border_image() const { return m_noninherited.border_image; }
+    Vector<Position> const& mask_positions() const { return m_noninherited.mask_positions; }
+    BorderImageData const& border_image() const { return m_noninherited.border_image; }
 
     Color webkit_text_fill_color() const { return m_inherited.webkit_text_fill_color; }
+    bool webkit_text_fill_color_is_current_color() const { return m_inherited.webkit_text_fill_color_is_current_color; }
 
     ListStyleType const& list_style_type() const { return m_inherited.list_style_type; }
     ListStylePosition list_style_position() const { return m_inherited.list_style_position; }
+    AbstractImageStyleValue const* list_style_image() const { return m_inherited.list_style_image.ptr(); }
 
     Optional<SVGPaint> const& fill() const { return m_inherited.fill; }
     FillRule fill_rule() const { return m_inherited.fill_rule; }
@@ -770,11 +1132,13 @@ public:
     Color flood_color() const { return m_noninherited.flood_color; }
     float flood_opacity() const { return m_noninherited.flood_opacity; }
     PaintOrderList paint_order() const { return m_inherited.paint_order; }
+    u8 paint_order_serialization_length() const { return m_inherited.paint_order_serialization_length; }
+    bool paint_order_is_normal() const { return m_inherited.paint_order_is_normal; }
 
     LengthPercentage const& cx() const { return m_noninherited.cx; }
     LengthPercentage const& cy() const { return m_noninherited.cy; }
     LengthPercentage const& r() const { return m_noninherited.r; }
-    LengthPercentageOrAuto const& rx() const { return m_noninherited.ry; }
+    LengthPercentageOrAuto const& rx() const { return m_noninherited.rx; }
     LengthPercentageOrAuto const& ry() const { return m_noninherited.ry; }
     LengthPercentage const& x() const { return m_noninherited.x; }
     LengthPercentage const& y() const { return m_noninherited.y; }
@@ -790,14 +1154,21 @@ public:
     Position const& perspective_origin() const { return m_noninherited.perspective_origin; }
 
     Gfx::FontCascadeList const& font_list() const { return *m_inherited.font_list; }
+    Vector<ComputedFontFamily> const& font_families() const { return m_inherited.font_families; }
     CSSPixels font_size() const { return m_inherited.font_size; }
     double font_weight() const { return m_inherited.font_weight; }
+    Percentage font_width() const { return m_inherited.font_width; }
+    ComputedFontStyle const& font_style() const { return m_inherited.font_style; }
+    FontOpticalSizing font_optical_sizing() const { return m_inherited.font_optical_sizing; }
+    FontFeatureData const& font_feature_data() const { return m_inherited.font_feature_data; }
     Optional<Utf16FlyString> font_language_override() const { return m_inherited.font_language_override; }
     HashMap<Utf16FlyString, double> font_variation_settings() const { return m_inherited.font_variation_settings; }
-    CSSPixels line_height() const { return m_inherited.line_height; }
+    CSSPixels line_height() const { return m_inherited.line_height.used_value; }
+    LineHeightData const& line_height_data() const { return m_inherited.line_height; }
 
     Color outline_color() const { return m_noninherited.outline_color; }
     CSSPixels outline_offset() const { return m_noninherited.outline_offset; }
+    RefPtr<StyleValue const> outline_offset_style_value() const { return m_noninherited.outline_offset_style_value; }
     OutlineStyle outline_style() const { return m_noninherited.outline_style; }
     CSSPixels outline_width() const { return m_noninherited.outline_width; }
 
@@ -809,27 +1180,40 @@ public:
     MathStyle math_style() const { return m_inherited.math_style; }
     int math_depth() const { return m_inherited.math_depth; }
 
+    ScrollBehavior scroll_behavior() const { return m_noninherited.scroll_behavior; }
     ScrollbarColorData scrollbar_color() const { return m_inherited.scrollbar_color; }
+    ScrollbarGutter scrollbar_gutter() const { return m_noninherited.scrollbar_gutter; }
     ScrollbarWidth scrollbar_width() const { return m_noninherited.scrollbar_width; }
     Resize resize() const { return m_noninherited.resize; }
+    double shape_image_threshold() const { return m_noninherited.shape_image_threshold; }
+    LengthPercentage const& shape_margin() const { return m_noninherited.shape_margin; }
+    ShapeOutsideData const& shape_outside() const { return m_noninherited.shape_outside; }
     WillChange const& will_change() const { return m_noninherited.will_change; }
 
-    NonnullOwnPtr<ComputedValues> clone_inherited_values() const
+private:
+    ComputedValues();
+
+    static size_t property_bitmap_index(PropertyID property_id)
     {
-        auto clone = make<ComputedValues>();
-        clone->m_inherited = m_inherited;
-        return clone;
+        VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
+        return to_underlying(property_id) - to_underlying(first_longhand_property_id);
     }
 
-protected:
+    void inherit_from(ComputedValues const& other) { m_inherited = other.m_inherited; }
+
     struct InheritedValues {
         Color caret_color { InitialValues::caret_color() };
         CSSPixels font_size { InitialValues::font_size() };
         RefPtr<Gfx::FontCascadeList const> font_list {};
+        Vector<ComputedFontFamily> font_families { GenericFontFamily::Serif };
         double font_weight { InitialValues::font_weight() };
+        Percentage font_width { InitialValues::font_width() };
+        ComputedFontStyle font_style { InitialValues::font_style() };
+        FontOpticalSizing font_optical_sizing { InitialValues::font_optical_sizing() };
+        FontFeatureData font_feature_data { InitialValues::font_feature_data() };
         Optional<Utf16FlyString> font_language_override;
         HashMap<Utf16FlyString, double> font_variation_settings;
-        CSSPixels line_height { InitialValues::line_height() };
+        LineHeightData line_height;
         BorderCollapse border_collapse { InitialValues::border_collapse() };
         CaptionSide caption_side { InitialValues::caption_side() };
         EmptyCells empty_cells { InitialValues::empty_cells() };
@@ -837,12 +1221,16 @@ protected:
         CSSPixels border_spacing_horizontal { InitialValues::border_spacing() };
         CSSPixels border_spacing_vertical { InitialValues::border_spacing() };
         Color color { InitialValues::color() };
+        RefPtr<StyleValue const> color_style_value;
         ColorInterpolation color_interpolation { InitialValues::color_interpolation() };
         ColorInterpolation color_interpolation_filters { InitialValues::color_interpolation_filters() };
 
         PreferredColorScheme color_scheme { InitialValues::color_scheme() };
-        Optional<Color> accent_color {};
+        Vector<Utf16FlyString> color_schemes;
+        bool color_scheme_only { false };
+        AccentColor accent_color;
         Color webkit_text_fill_color { InitialValues::color() };
+        bool webkit_text_fill_color_is_current_color { true };
         Vector<CursorData> cursor { InitialValues::cursor() };
         ImageRendering image_rendering { InitialValues::image_rendering() };
         PointerEvents pointer_events { InitialValues::pointer_events() };
@@ -850,18 +1238,25 @@ protected:
         TextJustify text_justify { InitialValues::text_justify() };
         TextTransform text_transform { InitialValues::text_transform() };
         TextWrapMode text_wrap_mode { InitialValues::text_wrap_mode() };
+        TextWrapStyle text_wrap_style { InitialValues::text_wrap_style() };
         TextDecorationSkipInk text_decoration_skip_ink { InitialValues::text_decoration_skip_ink() };
         TextUnderlinePosition text_underline_position { InitialValues::text_underline_position() };
         Variant<CSSPixels, double> tab_size { InitialValues::tab_size() };
         TextIndentData text_indent { InitialValues::text_indent() };
-        CSSPixels text_underline_offset { InitialValues::text_underline_offset() };
+        TextUnderlineOffset text_underline_offset;
         WhiteSpaceCollapse white_space_collapse { InitialValues::white_space_collapse() };
         WordBreak word_break { InitialValues::word_break() };
+        OverflowWrap overflow_wrap { InitialValues::overflow_wrap() };
+        u64 orphans { InitialValues::orphans() };
+        u64 widows { InitialValues::widows() };
         FontVariantEmoji font_variant_emoji { InitialValues::font_variant_emoji() };
         ListStylePosition list_style_position { InitialValues::list_style_position() };
+        RefPtr<AbstractImageStyleValue const> list_style_image;
         Visibility visibility { InitialValues::visibility() };
         CSSPixels word_spacing { InitialValues::word_spacing() };
         CSSPixels letter_spacing { InitialValues::letter_spacing() };
+        RefPtr<StyleValue const> word_spacing_style_value;
+        RefPtr<StyleValue const> letter_spacing_style_value;
         ListStyleType list_style_type { InitialValues::list_style_type() };
         QuotesData quotes { InitialValues::quotes() };
         Direction direction { InitialValues::direction() };
@@ -873,6 +1268,8 @@ protected:
         Optional<SVGPaint> fill;
         Optional<SVGPaint> stroke;
         PaintOrderList paint_order { InitialValues::paint_order() };
+        u8 paint_order_serialization_length { 0 };
+        bool paint_order_is_normal { true };
         StrokeLinejoin stroke_linejoin { InitialValues::stroke_linejoin() };
         TextAnchor text_anchor { InitialValues::text_anchor() };
         ClipRule clip_rule { InitialValues::clip_rule() };
@@ -892,11 +1289,40 @@ protected:
 
     struct NonInheritedValues {
         AspectRatio aspect_ratio { InitialValues::aspect_ratio() };
+        Vector<Utf16FlyString> anchor_names;
+        AnchorScopeData anchor_scope;
+        Vector<ComputedAnimationName> animation_names { ComputedAnimationName {} };
+        Vector<AnimationComposition> animation_compositions { AnimationComposition::Replace };
+        Vector<Time> animation_delays { Time::make_seconds(0) };
+        Vector<AnimationDirection> animation_directions { AnimationDirection::Normal };
+        Vector<Optional<Time>> animation_durations { Optional<Time> {} };
+        Vector<AnimationFillMode> animation_fill_modes { AnimationFillMode::None };
+        Vector<double> animation_iteration_counts { 1 };
+        Vector<AnimationPlayState> animation_play_states { AnimationPlayState::Running };
+        Vector<AnimationTimelineData> animation_timelines { AnimationTimelineData {} };
+        Vector<EasingFunction> animation_timing_functions { EasingFunction::ease() };
+        StyleValueVector animation_timing_function_style_values;
         Float float_ { InitialValues::float_() };
         Clear clear { InitialValues::clear() };
         TextOverflow text_overflow { InitialValues::text_overflow() };
         Positioning position { InitialValues::position() };
-        Optional<Utf16FlyString> position_anchor { InitialValues::position_anchor() };
+        PositionAnchor position_anchor { InitialValues::position_anchor() };
+        PositionAreaData position_area { InitialValues::position_area() };
+        Vector<PositionTryFallbackData> position_try_fallbacks { InitialValues::position_try_fallbacks() };
+        Optional<TryOrder> position_try_order { InitialValues::position_try_order() };
+        PositionVisibilityData position_visibility { InitialValues::position_visibility() };
+        Vector<Optional<Utf16FlyString>> scroll_timeline_names { Optional<Utf16FlyString> {} };
+        Vector<Axis> scroll_timeline_axes { Axis::Block };
+        TimelineScopeData timeline_scope { InitialValues::timeline_scope() };
+        Vector<Optional<Utf16FlyString>> view_timeline_names { Optional<Utf16FlyString> {} };
+        Vector<Axis> view_timeline_axes { Axis::Block };
+        Vector<ViewTimelineInsetData> view_timeline_insets { ViewTimelineInsetData {} };
+        Vector<Optional<Utf16FlyString>> transition_properties { Optional<Utf16FlyString> { "all"_utf16_fly_string } };
+        Vector<Time> transition_durations { Time::make_seconds(0) };
+        Vector<EasingFunction> transition_timing_functions { EasingFunction::ease() };
+        StyleValueVector transition_timing_function_style_values;
+        Vector<Time> transition_delays { Time::make_seconds(0) };
+        Vector<TransitionBehavior> transition_behaviors { TransitionBehavior::Normal };
         Optional<int> z_index;
         Display display_before_box_type_transformation { InitialValues::display() };
         Clip clip { InitialValues::clip() };
@@ -917,8 +1343,14 @@ protected:
         Size min_height { InitialValues::min_height() };
         Size max_height { InitialValues::max_height() };
         LengthBox inset { InitialValues::inset() };
+        RefPtr<StyleValue const> top_anchor_inset;
+        RefPtr<StyleValue const> right_anchor_inset;
+        RefPtr<StyleValue const> bottom_anchor_inset;
+        RefPtr<StyleValue const> left_anchor_inset;
         LengthBox margin { InitialValues::margin() };
         LengthBox padding { InitialValues::padding() };
+        LengthBox scroll_margin { InitialValues::scroll_margin() };
+        LengthBox scroll_padding { InitialValues::scroll_padding() };
         OverflowClipMarginData overflow_clip_margin { InitialValues::overflow_clip_margin() };
         Filter backdrop_filter { InitialValues::backdrop_filter() };
         Filter filter { InitialValues::filter() };
@@ -926,26 +1358,46 @@ protected:
         BorderData border_top;
         BorderData border_right;
         BorderData border_bottom;
+        RefPtr<StyleValue const> border_left_color_style_value;
+        RefPtr<StyleValue const> border_top_color_style_value;
+        RefPtr<StyleValue const> border_right_color_style_value;
+        RefPtr<StyleValue const> border_bottom_color_style_value;
+        CSSPixels border_left_computed_width { 0 };
+        CSSPixels border_top_computed_width { 0 };
+        CSSPixels border_right_computed_width { 0 };
+        CSSPixels border_bottom_computed_width { 0 };
         BorderRadiusData border_bottom_left_radius;
         BorderRadiusData border_bottom_right_radius;
         BorderRadiusData border_top_left_radius;
         BorderRadiusData border_top_right_radius;
+        double corner_bottom_left_shape { 1 };
+        double corner_bottom_right_shape { 1 };
+        double corner_top_left_shape { 1 };
+        double corner_top_right_shape { 1 };
         Color background_color { InitialValues::background_color() };
-        int order { InitialValues::order() };
-        Vector<BackgroundLayerData> background_layers;
-        Vector<BackgroundLayerData> mask_layers;
-        Optional<BorderImageData> border_image;
+        RefPtr<StyleValue const> background_color_style_value;
+        i32 order { InitialValues::order() };
+        Vector<BackgroundLayerData> background_layers { BackgroundLayerData {} };
+        Vector<BackgroundLayerData> mask_layers { [] {
+            BackgroundLayerData layer;
+            layer.origin = BackgroundBox::BorderBox;
+            layer.clip = BackgroundBox::BorderBox;
+            return layer;
+        }() };
+        Vector<Position> mask_positions { Position { .offset_x = Length::make_px(0), .offset_y = Length::make_px(0) } };
+        BorderImageData border_image;
         FlexDirection flex_direction { InitialValues::flex_direction() };
         ColumnSpan column_span { InitialValues::column_span() };
         BackgroundBox background_color_clip { InitialValues::background_color_clip() };
 
         Color flood_color { InitialValues::flood_color() };
         FlexBasis flex_basis { InitialValues::flex_basis() };
-        float flex_grow { InitialValues::flex_grow() };
-        float flex_shrink { InitialValues::flex_shrink() };
+        double flex_grow { InitialValues::flex_grow() };
+        double flex_shrink { InitialValues::flex_shrink() };
         AlignItems align_items { InitialValues::align_items() };
         AlignSelf align_self { InitialValues::align_self() };
         Appearance appearance { InitialValues::appearance() };
+        Appearance computed_appearance { Appearance::None };
         JustifyContent justify_content { InitialValues::justify_content() };
         JustifyItems justify_items { InitialValues::justify_items() };
         JustifySelf justify_self { InitialValues::justify_self() };
@@ -958,6 +1410,7 @@ protected:
         Vector<NonnullRefPtr<TransformationStyleValue const>> transformations {};
         TransformOrigin transform_origin {};
         Optional<ContentData> content;
+        ComputedContentData computed_content;
         Variant<VerticalAlign, LengthPercentage> vertical_align { InitialValues::vertical_align() };
         GridTrackSizeList grid_auto_columns;
         GridTrackSizeList grid_auto_rows;
@@ -981,6 +1434,7 @@ protected:
         Color outline_color { InitialValues::outline_color() };
         CSSPixels outline_width { InitialValues::outline_width() };
         CSSPixels outline_offset { InitialValues::outline_offset() };
+        RefPtr<StyleValue const> outline_offset_style_value;
         TableLayout table_layout { InitialValues::table_layout() };
         UnicodeBidi unicode_bidi { InitialValues::unicode_bidi() };
         UserSelect user_select { InitialValues::user_select() };
@@ -995,7 +1449,12 @@ protected:
         TouchActionData touch_action;
         MaskType mask_type { InitialValues::mask_type() };
         VectorEffect vector_effect { InitialValues::vector_effect() };
+        ScrollBehavior scroll_behavior { InitialValues::scroll_behavior() };
+        ScrollbarGutter scrollbar_gutter { InitialValues::scrollbar_gutter() };
         ScrollbarWidth scrollbar_width { InitialValues::scrollbar_width() };
+        double shape_image_threshold { InitialValues::shape_image_threshold() };
+        LengthPercentage shape_margin { InitialValues::shape_margin() };
+        ShapeOutsideData shape_outside { InitialValues::shape_outside() };
         ShapeRendering shape_rendering { InitialValues::shape_rendering() };
         float flood_opacity { InitialValues::flood_opacity() };
         RefPtr<TransformationStyleValue const> rotate;
@@ -1021,234 +1480,404 @@ protected:
     };
 
     NonInheritedValues m_noninherited;
+    AK::FixedBitmap<number_of_longhand_properties> m_property_important { false };
+    AK::FixedBitmap<number_of_longhand_properties> m_property_inherited { false };
+    HashMap<PropertyID, NonnullRefPtr<StyleValue const>> m_inheritance_dependent_specified_values;
+    RefPtr<StyleValue const> m_raw_cascaded_font_size;
+    RefPtr<ComputedValues const> m_base_values;
+    RefPtr<AnimatedProperties const> m_animated_properties;
+    u64 m_pseudo_element_styles { 0 };
+    bool m_depends_on_viewport_metrics { false };
+    bool m_font_metrics_depend_on_viewport_metrics { false };
+    bool m_in_display_none_subtree { false };
 };
 
-class ImmutableComputedValues final : public ComputedValues {
-};
+class ComputedValues::Mutator final {
+private:
+    friend class Builder;
 
-class MutableComputedValues final : public ComputedValues {
+    explicit Mutator(ComputedValues& values)
+        : m_values(values)
+    {
+    }
+
 public:
     void inherit_from(ComputedValues const& other)
     {
-        m_inherited = static_cast<MutableComputedValues const&>(other).m_inherited;
+        m_values.inherit_from(other);
     }
 
-    void set_aspect_ratio(AspectRatio aspect_ratio) { m_noninherited.aspect_ratio = move(aspect_ratio); }
-    void set_caret_color(Color caret_color) { m_inherited.caret_color = caret_color; }
-    void set_font_list(NonnullRefPtr<Gfx::FontCascadeList const> font_list) { m_inherited.font_list = move(font_list); }
-    void set_font_size(CSSPixels font_size) { m_inherited.font_size = font_size; }
-    void set_font_weight(double font_weight) { m_inherited.font_weight = font_weight; }
-    void set_font_language_override(Optional<Utf16FlyString> font_language_override) { m_inherited.font_language_override = move(font_language_override); }
-    void set_font_variation_settings(HashMap<Utf16FlyString, double> value) { m_inherited.font_variation_settings = move(value); }
-    void set_line_height(CSSPixels line_height) { m_inherited.line_height = line_height; }
-    void set_border_spacing_horizontal(CSSPixels border_spacing_horizontal) { m_inherited.border_spacing_horizontal = move(border_spacing_horizontal); }
-    void set_border_spacing_vertical(CSSPixels border_spacing_vertical) { m_inherited.border_spacing_vertical = move(border_spacing_vertical); }
-    void set_caption_side(CaptionSide caption_side) { m_inherited.caption_side = caption_side; }
-    void set_color(Color color) { m_inherited.color = color; }
-    void set_color_interpolation(ColorInterpolation color_interpolation) { m_inherited.color_interpolation = color_interpolation; }
-    void set_color_interpolation_filters(ColorInterpolation color_interpolation_filters) { m_inherited.color_interpolation_filters = color_interpolation_filters; }
-    void set_color_scheme(PreferredColorScheme color_scheme) { m_inherited.color_scheme = color_scheme; }
-    void set_clip(Clip const& clip) { m_noninherited.clip = clip; }
-    void set_content(ContentData const& content) { m_noninherited.content = content; }
-    void set_content_visibility(ContentVisibility content_visibility) { m_inherited.content_visibility = content_visibility; }
-    void set_cursor(Vector<CursorData> cursor) { m_inherited.cursor = move(cursor); }
-    void set_image_rendering(ImageRendering value) { m_inherited.image_rendering = value; }
-    void set_pointer_events(PointerEvents value) { m_inherited.pointer_events = value; }
-    void set_background_color(Color color) { m_noninherited.background_color = color; }
-    void set_background_color_clip(BackgroundBox box) { m_noninherited.background_color_clip = box; }
-    void set_background_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.background_layers = move(layers); }
-    void set_mask_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.mask_layers = move(layers); }
-    void set_border_image(Optional<BorderImageData> border_image) { m_noninherited.border_image = move(border_image); }
-    void set_float(Float value) { m_noninherited.float_ = value; }
-    void set_clear(Clear value) { m_noninherited.clear = value; }
-    void set_z_index(Optional<int> value) { m_noninherited.z_index = move(value); }
-    void set_tab_size(Variant<CSSPixels, double> value) { m_inherited.tab_size = move(value); }
-    void set_text_align(TextAlign text_align) { m_inherited.text_align = text_align; }
-    void set_text_justify(TextJustify text_justify) { m_inherited.text_justify = text_justify; }
-    void set_text_decoration_line(Vector<TextDecorationLine> value) { m_noninherited.text_decoration_line = move(value); }
-    void set_text_decoration_thickness(TextDecorationThickness value) { m_noninherited.text_decoration_thickness = move(value); }
-    void set_text_decoration_skip_ink(TextDecorationSkipInk value) { m_inherited.text_decoration_skip_ink = value; }
-    void set_text_decoration_style(TextDecorationStyle value) { m_noninherited.text_decoration_style = value; }
-    void set_text_decoration_color(Color value) { m_noninherited.text_decoration_color = value; }
-    void set_text_transform(TextTransform value) { m_inherited.text_transform = value; }
-    void set_text_shadow(Vector<ShadowData>&& value) { m_inherited.text_shadow = move(value); }
-    void set_text_indent(TextIndentData value) { m_inherited.text_indent = move(value); }
-    void set_text_wrap_mode(TextWrapMode value) { m_inherited.text_wrap_mode = value; }
-    void set_text_overflow(TextOverflow value) { m_noninherited.text_overflow = value; }
-    void set_text_underline_offset(CSSPixels value) { m_inherited.text_underline_offset = value; }
-    void set_text_underline_position(TextUnderlinePosition value) { m_inherited.text_underline_position = value; }
-    void set_webkit_text_fill_color(Color value) { m_inherited.webkit_text_fill_color = value; }
-    void set_position(Positioning position) { m_noninherited.position = position; }
-    void set_position_anchor(Optional<Utf16FlyString> value) { m_noninherited.position_anchor = move(value); }
-    void set_white_space_collapse(WhiteSpaceCollapse value) { m_inherited.white_space_collapse = value; }
-    void set_white_space_trim(WhiteSpaceTrimData value) { m_noninherited.white_space_trim = value; }
-    void set_word_spacing(CSSPixels value) { m_inherited.word_spacing = value; }
-    void set_word_break(WordBreak value) { m_inherited.word_break = value; }
-    void set_font_variant_emoji(FontVariantEmoji value) { m_inherited.font_variant_emoji = value; }
-    void set_letter_spacing(CSSPixels value) { m_inherited.letter_spacing = value; }
-    void set_width(Size const& width) { m_noninherited.width = width; }
-    void set_min_width(Size const& width) { m_noninherited.min_width = width; }
-    void set_max_width(Size const& width) { m_noninherited.max_width = width; }
-    void set_height(Size const& height) { m_noninherited.height = height; }
-    void set_min_height(Size const& height) { m_noninherited.min_height = height; }
-    void set_max_height(Size const& height) { m_noninherited.max_height = height; }
-    void set_inset(LengthBox const& inset) { m_noninherited.inset = inset; }
-    void set_margin(LengthBox const& margin) { m_noninherited.margin = margin; }
-    void set_padding(LengthBox const& padding) { m_noninherited.padding = padding; }
-    void set_overflow_clip_margin(OverflowClipMarginData const& overflow_clip_margin) { m_noninherited.overflow_clip_margin = overflow_clip_margin; }
-    void set_overflow_x(Overflow value) { m_noninherited.overflow_x = value; }
-    void set_overflow_y(Overflow value) { m_noninherited.overflow_y = value; }
-    void set_list_style_type(ListStyleType value) { m_inherited.list_style_type = move(value); }
-    void set_list_style_position(ListStylePosition value) { m_inherited.list_style_position = move(value); }
-    void set_display(Display value) { m_noninherited.display = value; }
-    void set_display_before_box_type_transformation(Display value) { m_noninherited.display_before_box_type_transformation = value; }
-    void set_backdrop_filter(Filter const& backdrop_filter) { m_noninherited.backdrop_filter = backdrop_filter; }
-    void set_filter(Filter const& filter) { m_noninherited.filter = filter; }
+    void set_property_important(PropertyID property_id, bool value) { m_values.m_property_important.set(ComputedValues::property_bitmap_index(property_id), value); }
+    void set_property_inherited(PropertyID property_id, bool value) { m_values.m_property_inherited.set(ComputedValues::property_bitmap_index(property_id), value); }
+    void set_depends_on_viewport_metrics(bool value) { m_values.m_depends_on_viewport_metrics = value; }
+    void set_font_metrics_depend_on_viewport_metrics(bool value) { m_values.m_font_metrics_depend_on_viewport_metrics = value; }
+    void set_in_display_none_subtree(bool value) { m_values.m_in_display_none_subtree = value; }
+    void set_pseudo_element_styles(u64 value) { m_values.m_pseudo_element_styles = value; }
+    void set_inheritance_dependent_specified_values(HashMap<PropertyID, NonnullRefPtr<StyleValue const>> value) { m_values.m_inheritance_dependent_specified_values = move(value); }
+    void set_raw_cascaded_font_size(RefPtr<StyleValue const> value) { m_values.m_raw_cascaded_font_size = move(value); }
+    void set_base_values(NonnullRefPtr<ComputedValues const> value) { m_values.m_base_values = move(value); }
+    void set_animated_properties(AnimatedProperties const*);
+
+    void set_aspect_ratio(AspectRatio aspect_ratio) { m_values.m_noninherited.aspect_ratio = move(aspect_ratio); }
+    void set_anchor_names(Vector<Utf16FlyString> value) { m_values.m_noninherited.anchor_names = move(value); }
+    void set_anchor_scope(AnchorScopeData value) { m_values.m_noninherited.anchor_scope = move(value); }
+    void set_animation_names(Vector<ComputedAnimationName> value) { m_values.m_noninherited.animation_names = move(value); }
+    void set_animation_compositions(Vector<AnimationComposition> value) { m_values.m_noninherited.animation_compositions = move(value); }
+    void set_animation_delays(Vector<Time> value) { m_values.m_noninherited.animation_delays = move(value); }
+    void set_animation_directions(Vector<AnimationDirection> value) { m_values.m_noninherited.animation_directions = move(value); }
+    void set_animation_durations(Vector<Optional<Time>> value) { m_values.m_noninherited.animation_durations = move(value); }
+    void set_animation_fill_modes(Vector<AnimationFillMode> value) { m_values.m_noninherited.animation_fill_modes = move(value); }
+    void set_animation_iteration_counts(Vector<double> value) { m_values.m_noninherited.animation_iteration_counts = move(value); }
+    void set_animation_play_states(Vector<AnimationPlayState> value) { m_values.m_noninherited.animation_play_states = move(value); }
+    void set_animation_timelines(Vector<AnimationTimelineData> value) { m_values.m_noninherited.animation_timelines = move(value); }
+    void set_animation_timing_functions(Vector<EasingFunction> value) { m_values.m_noninherited.animation_timing_functions = move(value); }
+    void set_animation_timing_function_style_values(StyleValueVector value) { m_values.m_noninherited.animation_timing_function_style_values = move(value); }
+    void set_caret_color(Color caret_color) { m_values.m_inherited.caret_color = caret_color; }
+    void set_font_list(NonnullRefPtr<Gfx::FontCascadeList const> font_list) { m_values.m_inherited.font_list = move(font_list); }
+    void set_font_families(Vector<ComputedFontFamily> value) { m_values.m_inherited.font_families = move(value); }
+    void set_font_size(CSSPixels font_size) { m_values.m_inherited.font_size = font_size; }
+    void set_font_weight(double font_weight) { m_values.m_inherited.font_weight = font_weight; }
+    void set_font_width(Percentage font_width) { m_values.m_inherited.font_width = font_width; }
+    void set_font_style(ComputedFontStyle font_style) { m_values.m_inherited.font_style = move(font_style); }
+    void set_font_optical_sizing(FontOpticalSizing font_optical_sizing) { m_values.m_inherited.font_optical_sizing = font_optical_sizing; }
+    void set_font_feature_data(FontFeatureData font_feature_data) { m_values.m_inherited.font_feature_data = move(font_feature_data); }
+    void set_font_language_override(Optional<Utf16FlyString> font_language_override) { m_values.m_inherited.font_language_override = move(font_language_override); }
+    void set_font_variation_settings(HashMap<Utf16FlyString, double> value) { m_values.m_inherited.font_variation_settings = move(value); }
+    void set_line_height(LineHeightData line_height) { m_values.m_inherited.line_height = move(line_height); }
+    void set_border_spacing_horizontal(CSSPixels border_spacing_horizontal) { m_values.m_inherited.border_spacing_horizontal = move(border_spacing_horizontal); }
+    void set_border_spacing_vertical(CSSPixels border_spacing_vertical) { m_values.m_inherited.border_spacing_vertical = move(border_spacing_vertical); }
+    void set_caption_side(CaptionSide caption_side) { m_values.m_inherited.caption_side = caption_side; }
+    void set_color(Color color) { m_values.m_inherited.color = color; }
+    void set_color_style_value(StyleValue const* value) { m_values.m_inherited.color_style_value = value; }
+    void set_color_interpolation(ColorInterpolation color_interpolation) { m_values.m_inherited.color_interpolation = color_interpolation; }
+    void set_color_interpolation_filters(ColorInterpolation color_interpolation_filters) { m_values.m_inherited.color_interpolation_filters = color_interpolation_filters; }
+    void set_color_scheme(PreferredColorScheme color_scheme) { m_values.m_inherited.color_scheme = color_scheme; }
+    void set_color_schemes(Vector<Utf16FlyString> color_schemes, bool only)
+    {
+        m_values.m_inherited.color_schemes = move(color_schemes);
+        m_values.m_inherited.color_scheme_only = only;
+    }
+    void set_clip(Clip const& clip) { m_values.m_noninherited.clip = clip; }
+    void set_content(ContentData const& content) { m_values.m_noninherited.content = content; }
+    void set_computed_content(ComputedContentData content) { m_values.m_noninherited.computed_content = move(content); }
+    void set_content_visibility(ContentVisibility content_visibility) { m_values.m_inherited.content_visibility = content_visibility; }
+    void set_cursor(Vector<CursorData> cursor) { m_values.m_inherited.cursor = move(cursor); }
+    void set_image_rendering(ImageRendering value) { m_values.m_inherited.image_rendering = value; }
+    void set_pointer_events(PointerEvents value) { m_values.m_inherited.pointer_events = value; }
+    void set_background_color(Color color) { m_values.m_noninherited.background_color = color; }
+    void set_background_color_style_value(StyleValue const& value) { m_values.m_noninherited.background_color_style_value = value; }
+    void set_background_color_clip(BackgroundBox box) { m_values.m_noninherited.background_color_clip = box; }
+    void set_background_layers(Vector<BackgroundLayerData>&& layers) { m_values.m_noninherited.background_layers = move(layers); }
+    void set_mask_layers(Vector<BackgroundLayerData>&& layers) { m_values.m_noninherited.mask_layers = move(layers); }
+    void set_mask_positions(Vector<Position> positions) { m_values.m_noninherited.mask_positions = move(positions); }
+    void set_border_image(BorderImageData border_image) { m_values.m_noninherited.border_image = move(border_image); }
+    void set_float(Float value) { m_values.m_noninherited.float_ = value; }
+    void set_clear(Clear value) { m_values.m_noninherited.clear = value; }
+    void set_z_index(Optional<int> value) { m_values.m_noninherited.z_index = move(value); }
+    void set_tab_size(Variant<CSSPixels, double> value) { m_values.m_inherited.tab_size = move(value); }
+    void set_text_align(TextAlign text_align) { m_values.m_inherited.text_align = text_align; }
+    void set_text_justify(TextJustify text_justify) { m_values.m_inherited.text_justify = text_justify; }
+    void set_text_decoration_line(Vector<TextDecorationLine> value) { m_values.m_noninherited.text_decoration_line = move(value); }
+    void set_text_decoration_thickness(TextDecorationThickness value) { m_values.m_noninherited.text_decoration_thickness = move(value); }
+    void set_text_decoration_skip_ink(TextDecorationSkipInk value) { m_values.m_inherited.text_decoration_skip_ink = value; }
+    void set_text_decoration_style(TextDecorationStyle value) { m_values.m_noninherited.text_decoration_style = value; }
+    void set_text_decoration_color(Color value) { m_values.m_noninherited.text_decoration_color = value; }
+    void set_text_transform(TextTransform value) { m_values.m_inherited.text_transform = value; }
+    void set_text_shadow(Vector<ShadowData>&& value) { m_values.m_inherited.text_shadow = move(value); }
+    void set_text_indent(TextIndentData value) { m_values.m_inherited.text_indent = move(value); }
+    void set_text_wrap_mode(TextWrapMode value) { m_values.m_inherited.text_wrap_mode = value; }
+    void set_text_wrap_style(TextWrapStyle value) { m_values.m_inherited.text_wrap_style = value; }
+    void set_text_overflow(TextOverflow value) { m_values.m_noninherited.text_overflow = value; }
+    void set_text_underline_offset(TextUnderlineOffset value) { m_values.m_inherited.text_underline_offset = move(value); }
+    void set_text_underline_position(TextUnderlinePosition value) { m_values.m_inherited.text_underline_position = value; }
+    void set_webkit_text_fill_color(Color value, bool is_current_color)
+    {
+        m_values.m_inherited.webkit_text_fill_color = value;
+        m_values.m_inherited.webkit_text_fill_color_is_current_color = is_current_color;
+    }
+    void set_position(Positioning position) { m_values.m_noninherited.position = position; }
+    void set_position_anchor(PositionAnchor value) { m_values.m_noninherited.position_anchor = move(value); }
+    void set_position_area(PositionAreaData value) { m_values.m_noninherited.position_area = move(value); }
+    void set_position_try_fallbacks(Vector<PositionTryFallbackData> value) { m_values.m_noninherited.position_try_fallbacks = move(value); }
+    void set_position_try_order(Optional<TryOrder> value) { m_values.m_noninherited.position_try_order = value; }
+    void set_position_visibility(PositionVisibilityData value) { m_values.m_noninherited.position_visibility = value; }
+    void set_scroll_timeline_names(Vector<Optional<Utf16FlyString>> value) { m_values.m_noninherited.scroll_timeline_names = move(value); }
+    void set_scroll_timeline_axes(Vector<Axis> value) { m_values.m_noninherited.scroll_timeline_axes = move(value); }
+    void set_timeline_scope(TimelineScopeData value) { m_values.m_noninherited.timeline_scope = move(value); }
+    void set_view_timeline_names(Vector<Optional<Utf16FlyString>> value) { m_values.m_noninherited.view_timeline_names = move(value); }
+    void set_view_timeline_axes(Vector<Axis> value) { m_values.m_noninherited.view_timeline_axes = move(value); }
+    void set_view_timeline_insets(Vector<ViewTimelineInsetData> value) { m_values.m_noninherited.view_timeline_insets = move(value); }
+    void set_transition_properties(Vector<Optional<Utf16FlyString>> value) { m_values.m_noninherited.transition_properties = move(value); }
+    void set_transition_durations(Vector<Time> value) { m_values.m_noninherited.transition_durations = move(value); }
+    void set_transition_timing_functions(Vector<EasingFunction> value) { m_values.m_noninherited.transition_timing_functions = move(value); }
+    void set_transition_timing_function_style_values(StyleValueVector value) { m_values.m_noninherited.transition_timing_function_style_values = move(value); }
+    void set_transition_delays(Vector<Time> value) { m_values.m_noninherited.transition_delays = move(value); }
+    void set_transition_behaviors(Vector<TransitionBehavior> value) { m_values.m_noninherited.transition_behaviors = move(value); }
+    void set_white_space_collapse(WhiteSpaceCollapse value) { m_values.m_inherited.white_space_collapse = value; }
+    void set_white_space_trim(WhiteSpaceTrimData value) { m_values.m_noninherited.white_space_trim = value; }
+    void set_word_spacing(CSSPixels value) { m_values.m_inherited.word_spacing = value; }
+    void set_word_spacing_style_value(StyleValue const& value) { m_values.m_inherited.word_spacing_style_value = value; }
+    void set_letter_spacing_style_value(StyleValue const& value) { m_values.m_inherited.letter_spacing_style_value = value; }
+    void set_word_break(WordBreak value) { m_values.m_inherited.word_break = value; }
+    void set_overflow_wrap(OverflowWrap value) { m_values.m_inherited.overflow_wrap = value; }
+    void set_orphans(u64 value) { m_values.m_inherited.orphans = value; }
+    void set_widows(u64 value) { m_values.m_inherited.widows = value; }
+    void set_font_variant_emoji(FontVariantEmoji value) { m_values.m_inherited.font_variant_emoji = value; }
+    void set_letter_spacing(CSSPixels value) { m_values.m_inherited.letter_spacing = value; }
+    void set_width(Size const& width) { m_values.m_noninherited.width = width; }
+    void set_min_width(Size const& width) { m_values.m_noninherited.min_width = width; }
+    void set_max_width(Size const& width) { m_values.m_noninherited.max_width = width; }
+    void set_height(Size const& height) { m_values.m_noninherited.height = height; }
+    void set_min_height(Size const& height) { m_values.m_noninherited.min_height = height; }
+    void set_max_height(Size const& height) { m_values.m_noninherited.max_height = height; }
+    void set_inset(LengthBox const& inset) { m_values.m_noninherited.inset = inset; }
+    void set_anchor_inset(PropertyID property_id, RefPtr<StyleValue const> value)
+    {
+        switch (property_id) {
+        case PropertyID::Top:
+            m_values.m_noninherited.top_anchor_inset = move(value);
+            return;
+        case PropertyID::Right:
+            m_values.m_noninherited.right_anchor_inset = move(value);
+            return;
+        case PropertyID::Bottom:
+            m_values.m_noninherited.bottom_anchor_inset = move(value);
+            return;
+        case PropertyID::Left:
+            m_values.m_noninherited.left_anchor_inset = move(value);
+            return;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+    void set_margin(LengthBox const& margin) { m_values.m_noninherited.margin = margin; }
+    void set_padding(LengthBox const& padding) { m_values.m_noninherited.padding = padding; }
+    void set_scroll_margin(LengthBox const& value) { m_values.m_noninherited.scroll_margin = value; }
+    void set_scroll_padding(LengthBox const& value) { m_values.m_noninherited.scroll_padding = value; }
+    void set_overflow_clip_margin(OverflowClipMarginData const& overflow_clip_margin) { m_values.m_noninherited.overflow_clip_margin = overflow_clip_margin; }
+    void set_overflow_x(Overflow value) { m_values.m_noninherited.overflow_x = value; }
+    void set_overflow_y(Overflow value) { m_values.m_noninherited.overflow_y = value; }
+    void set_list_style_type(ListStyleType value) { m_values.m_inherited.list_style_type = move(value); }
+    void set_list_style_position(ListStylePosition value) { m_values.m_inherited.list_style_position = move(value); }
+    void set_list_style_image(RefPtr<AbstractImageStyleValue const> value) { m_values.m_inherited.list_style_image = move(value); }
+    void set_display(Display value) { m_values.m_noninherited.display = value; }
+    void set_display_before_box_type_transformation(Display value) { m_values.m_noninherited.display_before_box_type_transformation = value; }
+    void set_backdrop_filter(Filter const& backdrop_filter) { m_values.m_noninherited.backdrop_filter = backdrop_filter; }
+    void set_filter(Filter const& filter) { m_values.m_noninherited.filter = filter; }
     void set_border_bottom_left_radius(BorderRadiusData value)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (value.is_initial() && !m_values.m_noninherited.has_noninitial_border_radii)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_bottom_left_radius = move(value);
+        m_values.m_noninherited.has_noninitial_border_radii = true;
+        m_values.m_noninherited.border_bottom_left_radius = move(value);
     }
     void set_border_bottom_right_radius(BorderRadiusData value)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (value.is_initial() && !m_values.m_noninherited.has_noninitial_border_radii)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_bottom_right_radius = move(value);
+        m_values.m_noninherited.has_noninitial_border_radii = true;
+        m_values.m_noninherited.border_bottom_right_radius = move(value);
     }
     void set_border_top_left_radius(BorderRadiusData value)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (value.is_initial() && !m_values.m_noninherited.has_noninitial_border_radii)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_top_left_radius = move(value);
+        m_values.m_noninherited.has_noninitial_border_radii = true;
+        m_values.m_noninherited.border_top_left_radius = move(value);
     }
     void set_border_top_right_radius(BorderRadiusData value)
     {
-        if (value.is_initial() && !m_noninherited.has_noninitial_border_radii)
+        if (value.is_initial() && !m_values.m_noninherited.has_noninitial_border_radii)
             return;
-        m_noninherited.has_noninitial_border_radii = true;
-        m_noninherited.border_top_right_radius = move(value);
+        m_values.m_noninherited.has_noninitial_border_radii = true;
+        m_values.m_noninherited.border_top_right_radius = move(value);
     }
-    BorderData& border_left() { return m_noninherited.border_left; }
-    BorderData& border_top() { return m_noninherited.border_top; }
-    BorderData& border_right() { return m_noninherited.border_right; }
-    BorderData& border_bottom() { return m_noninherited.border_bottom; }
-    void set_flex_direction(FlexDirection value) { m_noninherited.flex_direction = value; }
-    void set_flex_wrap(FlexWrap value) { m_noninherited.flex_wrap = value; }
-    void set_flex_basis(FlexBasis value) { m_noninherited.flex_basis = move(value); }
-    void set_flex_grow(float value) { m_noninherited.flex_grow = value; }
-    void set_flex_shrink(float value) { m_noninherited.flex_shrink = value; }
-    void set_order(int value) { m_noninherited.order = value; }
-    void set_accent_color(Color value) { m_inherited.accent_color = value; }
-    void set_align_content(AlignContent value) { m_noninherited.align_content = value; }
-    void set_align_items(AlignItems value) { m_noninherited.align_items = value; }
-    void set_align_self(AlignSelf value) { m_noninherited.align_self = value; }
-    void set_appearance(Appearance value) { m_noninherited.appearance = value; }
-    void set_opacity(float value) { m_noninherited.opacity = value; }
-    void set_justify_content(JustifyContent value) { m_noninherited.justify_content = value; }
-    void set_justify_items(JustifyItems value) { m_noninherited.justify_items = value; }
-    void set_justify_self(JustifySelf value) { m_noninherited.justify_self = value; }
-    void set_box_shadow(Vector<ShadowData>&& value) { m_noninherited.box_shadow = move(value); }
-    void set_rotate(RefPtr<TransformationStyleValue const> value) { m_noninherited.rotate = move(value); }
-    void set_scale(RefPtr<TransformationStyleValue const> value) { m_noninherited.scale = move(value); }
-    void set_perspective(Optional<CSSPixels> value) { m_noninherited.perspective = move(value); }
-    void set_perspective_origin(Position value) { m_noninherited.perspective_origin = move(value); }
-    void set_transformations(Vector<NonnullRefPtr<TransformationStyleValue const>> value) { m_noninherited.transformations = move(value); }
-    void set_transform_box(TransformBox value) { m_noninherited.transform_box = value; }
-    void set_transform_origin(TransformOrigin value) { m_noninherited.transform_origin = value; }
-    void set_transform_style(TransformStyle value) { m_noninherited.transform_style = value; }
-    void set_translate(RefPtr<TransformationStyleValue const> value) { m_noninherited.translate = move(value); }
-    void set_box_sizing(BoxSizing value) { m_noninherited.box_sizing = value; }
-    void set_vertical_align(Variant<VerticalAlign, LengthPercentage> value) { m_noninherited.vertical_align = move(value); }
-    void set_visibility(Visibility value) { m_inherited.visibility = value; }
-    void set_grid_auto_columns(GridTrackSizeList value) { m_noninherited.grid_auto_columns = move(value); }
-    void set_grid_auto_rows(GridTrackSizeList value) { m_noninherited.grid_auto_rows = move(value); }
-    void set_grid_template_columns(GridTrackSizeList value) { m_noninherited.grid_template_columns = move(value); }
-    void set_grid_template_rows(GridTrackSizeList value) { m_noninherited.grid_template_rows = move(value); }
-    void set_grid_column_end(GridTrackPlacement value) { m_noninherited.grid_column_end = move(value); }
-    void set_grid_column_start(GridTrackPlacement value) { m_noninherited.grid_column_start = move(value); }
-    void set_grid_row_end(GridTrackPlacement value) { m_noninherited.grid_row_end = move(value); }
-    void set_grid_row_start(GridTrackPlacement value) { m_noninherited.grid_row_start = move(value); }
-    void set_column_count(ColumnCount value) { m_noninherited.column_count = value; }
-    void set_column_gap(Variant<LengthPercentage, NormalGap> const& column_gap) { m_noninherited.column_gap = column_gap; }
-    void set_column_span(ColumnSpan const column_span) { m_noninherited.column_span = column_span; }
-    void set_column_width(Size const& column_width) { m_noninherited.column_width = column_width; }
-    void set_column_height(Size const& column_height) { m_noninherited.column_height = column_height; }
-    void set_row_gap(Variant<LengthPercentage, NormalGap> const& row_gap) { m_noninherited.row_gap = row_gap; }
-    void set_border_collapse(BorderCollapse const border_collapse) { m_inherited.border_collapse = border_collapse; }
-    void set_empty_cells(EmptyCells const empty_cells) { m_inherited.empty_cells = empty_cells; }
-    void set_grid_template_areas(GridTemplateAreas grid_template_areas) { m_noninherited.grid_template_areas = move(grid_template_areas); }
-    void set_grid_auto_flow(GridAutoFlow grid_auto_flow) { m_noninherited.grid_auto_flow = grid_auto_flow; }
-    void set_table_layout(TableLayout value) { m_noninherited.table_layout = value; }
-    void set_quotes(QuotesData value) { m_inherited.quotes = move(value); }
-    void set_object_fit(ObjectFit value) { m_noninherited.object_fit = value; }
-    void set_object_position(Position value) { m_noninherited.object_position = move(value); }
-    void set_direction(Direction value) { m_inherited.direction = value; }
-    void set_dominant_baseline(Optional<BaselineMetric> value) { m_inherited.dominant_baseline = value; }
-    void set_unicode_bidi(UnicodeBidi value) { m_noninherited.unicode_bidi = value; }
-    void set_writing_mode(WritingMode value) { m_inherited.writing_mode = value; }
-    void set_user_select(UserSelect value) { m_noninherited.user_select = value; }
-    void set_isolation(Isolation value) { m_noninherited.isolation = value; }
-    void set_contain(Containment value) { m_noninherited.contain = move(value); }
-    void set_container_name(Vector<Utf16FlyString> value) { m_noninherited.container_name = move(value); }
-    void set_container_type(ContainerType value) { m_noninherited.container_type = move(value); }
-    void set_mix_blend_mode(MixBlendMode value) { m_noninherited.mix_blend_mode = value; }
-    void set_view_transition_name(Optional<Utf16FlyString> value) { m_noninherited.view_transition_name = move(value); }
-    void set_touch_action(TouchActionData value) { m_noninherited.touch_action = value; }
+    void set_corner_bottom_left_shape(double value) { m_values.m_noninherited.corner_bottom_left_shape = value; }
+    void set_corner_bottom_right_shape(double value) { m_values.m_noninherited.corner_bottom_right_shape = value; }
+    void set_corner_top_left_shape(double value) { m_values.m_noninherited.corner_top_left_shape = value; }
+    void set_corner_top_right_shape(double value) { m_values.m_noninherited.corner_top_right_shape = value; }
+    BorderData& border_left() { return m_values.m_noninherited.border_left; }
+    BorderData& border_top() { return m_values.m_noninherited.border_top; }
+    BorderData& border_right() { return m_values.m_noninherited.border_right; }
+    BorderData& border_bottom() { return m_values.m_noninherited.border_bottom; }
+    void set_border_left_color_style_value(StyleValue const& value) { m_values.m_noninherited.border_left_color_style_value = value; }
+    void set_border_top_color_style_value(StyleValue const& value) { m_values.m_noninherited.border_top_color_style_value = value; }
+    void set_border_right_color_style_value(StyleValue const& value) { m_values.m_noninherited.border_right_color_style_value = value; }
+    void set_border_bottom_color_style_value(StyleValue const& value) { m_values.m_noninherited.border_bottom_color_style_value = value; }
+    void set_border_left_computed_width(CSSPixels value) { m_values.m_noninherited.border_left_computed_width = value; }
+    void set_border_top_computed_width(CSSPixels value) { m_values.m_noninherited.border_top_computed_width = value; }
+    void set_border_right_computed_width(CSSPixels value) { m_values.m_noninherited.border_right_computed_width = value; }
+    void set_border_bottom_computed_width(CSSPixels value) { m_values.m_noninherited.border_bottom_computed_width = value; }
+    void set_flex_direction(FlexDirection value) { m_values.m_noninherited.flex_direction = value; }
+    void set_flex_wrap(FlexWrap value) { m_values.m_noninherited.flex_wrap = value; }
+    void set_flex_basis(FlexBasis value) { m_values.m_noninherited.flex_basis = move(value); }
+    void set_flex_grow(double value) { m_values.m_noninherited.flex_grow = value; }
+    void set_flex_shrink(double value) { m_values.m_noninherited.flex_shrink = value; }
+    void set_order(i32 value) { m_values.m_noninherited.order = value; }
+    void set_accent_color(AccentColor value) { m_values.m_inherited.accent_color = move(value); }
+    void set_align_content(AlignContent value) { m_values.m_noninherited.align_content = value; }
+    void set_align_items(AlignItems value) { m_values.m_noninherited.align_items = value; }
+    void set_align_self(AlignSelf value) { m_values.m_noninherited.align_self = value; }
+    void set_appearance(Appearance value) { m_values.m_noninherited.appearance = value; }
+    void set_computed_appearance(Appearance value) { m_values.m_noninherited.computed_appearance = value; }
+    void set_opacity(float value) { m_values.m_noninherited.opacity = value; }
+    void set_justify_content(JustifyContent value) { m_values.m_noninherited.justify_content = value; }
+    void set_justify_items(JustifyItems value) { m_values.m_noninherited.justify_items = value; }
+    void set_justify_self(JustifySelf value) { m_values.m_noninherited.justify_self = value; }
+    void set_box_shadow(Vector<ShadowData>&& value) { m_values.m_noninherited.box_shadow = move(value); }
+    void set_rotate(RefPtr<TransformationStyleValue const> value) { m_values.m_noninherited.rotate = move(value); }
+    void set_scale(RefPtr<TransformationStyleValue const> value) { m_values.m_noninherited.scale = move(value); }
+    void set_perspective(Optional<CSSPixels> value) { m_values.m_noninherited.perspective = move(value); }
+    void set_perspective_origin(Position value) { m_values.m_noninherited.perspective_origin = move(value); }
+    void set_transformations(Vector<NonnullRefPtr<TransformationStyleValue const>> value) { m_values.m_noninherited.transformations = move(value); }
+    void set_transform_box(TransformBox value) { m_values.m_noninherited.transform_box = value; }
+    void set_transform_origin(TransformOrigin value) { m_values.m_noninherited.transform_origin = value; }
+    void set_transform_style(TransformStyle value) { m_values.m_noninherited.transform_style = value; }
+    void set_translate(RefPtr<TransformationStyleValue const> value) { m_values.m_noninherited.translate = move(value); }
+    void set_box_sizing(BoxSizing value) { m_values.m_noninherited.box_sizing = value; }
+    void set_vertical_align(Variant<VerticalAlign, LengthPercentage> value) { m_values.m_noninherited.vertical_align = move(value); }
+    void set_visibility(Visibility value) { m_values.m_inherited.visibility = value; }
+    void set_grid_auto_columns(GridTrackSizeList value) { m_values.m_noninherited.grid_auto_columns = move(value); }
+    void set_grid_auto_rows(GridTrackSizeList value) { m_values.m_noninherited.grid_auto_rows = move(value); }
+    void set_grid_template_columns(GridTrackSizeList value) { m_values.m_noninherited.grid_template_columns = move(value); }
+    void set_grid_template_rows(GridTrackSizeList value) { m_values.m_noninherited.grid_template_rows = move(value); }
+    void set_grid_column_end(GridTrackPlacement value) { m_values.m_noninherited.grid_column_end = move(value); }
+    void set_grid_column_start(GridTrackPlacement value) { m_values.m_noninherited.grid_column_start = move(value); }
+    void set_grid_row_end(GridTrackPlacement value) { m_values.m_noninherited.grid_row_end = move(value); }
+    void set_grid_row_start(GridTrackPlacement value) { m_values.m_noninherited.grid_row_start = move(value); }
+    void set_column_count(ColumnCount value) { m_values.m_noninherited.column_count = value; }
+    void set_column_gap(Variant<LengthPercentage, NormalGap> const& column_gap) { m_values.m_noninherited.column_gap = column_gap; }
+    void set_column_span(ColumnSpan const column_span) { m_values.m_noninherited.column_span = column_span; }
+    void set_column_width(Size const& column_width) { m_values.m_noninherited.column_width = column_width; }
+    void set_column_height(Size const& column_height) { m_values.m_noninherited.column_height = column_height; }
+    void set_row_gap(Variant<LengthPercentage, NormalGap> const& row_gap) { m_values.m_noninherited.row_gap = row_gap; }
+    void set_border_collapse(BorderCollapse const border_collapse) { m_values.m_inherited.border_collapse = border_collapse; }
+    void set_empty_cells(EmptyCells const empty_cells) { m_values.m_inherited.empty_cells = empty_cells; }
+    void set_grid_template_areas(GridTemplateAreas grid_template_areas) { m_values.m_noninherited.grid_template_areas = move(grid_template_areas); }
+    void set_grid_auto_flow(GridAutoFlow grid_auto_flow) { m_values.m_noninherited.grid_auto_flow = grid_auto_flow; }
+    void set_table_layout(TableLayout value) { m_values.m_noninherited.table_layout = value; }
+    void set_quotes(QuotesData value) { m_values.m_inherited.quotes = move(value); }
+    void set_object_fit(ObjectFit value) { m_values.m_noninherited.object_fit = value; }
+    void set_object_position(Position value) { m_values.m_noninherited.object_position = move(value); }
+    void set_direction(Direction value) { m_values.m_inherited.direction = value; }
+    void set_dominant_baseline(Optional<BaselineMetric> value) { m_values.m_inherited.dominant_baseline = value; }
+    void set_unicode_bidi(UnicodeBidi value) { m_values.m_noninherited.unicode_bidi = value; }
+    void set_writing_mode(WritingMode value) { m_values.m_inherited.writing_mode = value; }
+    void set_user_select(UserSelect value) { m_values.m_noninherited.user_select = value; }
+    void set_isolation(Isolation value) { m_values.m_noninherited.isolation = value; }
+    void set_contain(Containment value) { m_values.m_noninherited.contain = move(value); }
+    void set_container_name(Vector<Utf16FlyString> value) { m_values.m_noninherited.container_name = move(value); }
+    void set_container_type(ContainerType value) { m_values.m_noninherited.container_type = move(value); }
+    void set_mix_blend_mode(MixBlendMode value) { m_values.m_noninherited.mix_blend_mode = value; }
+    void set_view_transition_name(Optional<Utf16FlyString> value) { m_values.m_noninherited.view_transition_name = move(value); }
+    void set_touch_action(TouchActionData value) { m_values.m_noninherited.touch_action = value; }
 
-    void set_fill(Optional<SVGPaint> value) { m_inherited.fill = move(value); }
-    void set_stroke(Optional<SVGPaint> value) { m_inherited.stroke = move(value); }
-    void set_fill_rule(FillRule value) { m_inherited.fill_rule = value; }
-    void set_fill_opacity(float value) { m_inherited.fill_opacity = value; }
-    void set_stroke_dasharray(Vector<Variant<LengthPercentage, float>> value) { m_inherited.stroke_dasharray = move(value); }
-    void set_stroke_dashoffset(LengthPercentage value) { m_inherited.stroke_dashoffset = move(value); }
-    void set_stroke_linecap(StrokeLinecap value) { m_inherited.stroke_linecap = move(value); }
-    void set_stroke_linejoin(StrokeLinejoin value) { m_inherited.stroke_linejoin = move(value); }
-    void set_vector_effect(VectorEffect value) { m_noninherited.vector_effect = value; }
-    void set_stroke_miterlimit(double value) { m_inherited.stroke_miterlimit = value; }
-    void set_stroke_opacity(float value) { m_inherited.stroke_opacity = value; }
-    void set_stroke_width(LengthPercentage value) { m_inherited.stroke_width = move(value); }
-    void set_stop_color(Color value) { m_noninherited.stop_color = value; }
-    void set_stop_opacity(float value) { m_noninherited.stop_opacity = value; }
-    void set_text_anchor(TextAnchor value) { m_inherited.text_anchor = value; }
-    void set_outline_color(Color value) { m_noninherited.outline_color = value; }
-    void set_outline_offset(CSSPixels value) { m_noninherited.outline_offset = move(value); }
-    void set_outline_style(OutlineStyle value) { m_noninherited.outline_style = value; }
-    void set_outline_width(CSSPixels value) { m_noninherited.outline_width = value; }
-    void set_mask(MaskReference value) { m_noninherited.mask = value; }
-    void set_mask_type(MaskType value) { m_noninherited.mask_type = value; }
-    void set_mask_image(AbstractImageStyleValue const& value) { m_noninherited.mask_image = value; }
-    void set_clip_path(ClipPathReference value) { m_noninherited.clip_path = move(value); }
-    void set_clip_rule(ClipRule value) { m_inherited.clip_rule = value; }
-    void set_flood_color(Color value) { m_noninherited.flood_color = value; }
-    void set_flood_opacity(float value) { m_noninherited.flood_opacity = value; }
-    void set_shape_rendering(ShapeRendering value) { m_noninherited.shape_rendering = value; }
-    void set_paint_order(PaintOrderList value) { m_inherited.paint_order = value; }
+    void set_fill(Optional<SVGPaint> value) { m_values.m_inherited.fill = move(value); }
+    void set_stroke(Optional<SVGPaint> value) { m_values.m_inherited.stroke = move(value); }
+    void set_fill_rule(FillRule value) { m_values.m_inherited.fill_rule = value; }
+    void set_fill_opacity(float value) { m_values.m_inherited.fill_opacity = value; }
+    void set_stroke_dasharray(Vector<Variant<LengthPercentage, float>> value) { m_values.m_inherited.stroke_dasharray = move(value); }
+    void set_stroke_dashoffset(LengthPercentage value) { m_values.m_inherited.stroke_dashoffset = move(value); }
+    void set_stroke_linecap(StrokeLinecap value) { m_values.m_inherited.stroke_linecap = move(value); }
+    void set_stroke_linejoin(StrokeLinejoin value) { m_values.m_inherited.stroke_linejoin = move(value); }
+    void set_vector_effect(VectorEffect value) { m_values.m_noninherited.vector_effect = value; }
+    void set_stroke_miterlimit(double value) { m_values.m_inherited.stroke_miterlimit = value; }
+    void set_stroke_opacity(float value) { m_values.m_inherited.stroke_opacity = value; }
+    void set_stroke_width(LengthPercentage value) { m_values.m_inherited.stroke_width = move(value); }
+    void set_stop_color(Color value) { m_values.m_noninherited.stop_color = value; }
+    void set_stop_opacity(float value) { m_values.m_noninherited.stop_opacity = value; }
+    void set_text_anchor(TextAnchor value) { m_values.m_inherited.text_anchor = value; }
+    void set_outline_color(Color value) { m_values.m_noninherited.outline_color = value; }
+    void set_outline_offset(CSSPixels value) { m_values.m_noninherited.outline_offset = move(value); }
+    void set_outline_offset_style_value(StyleValue const& value) { m_values.m_noninherited.outline_offset_style_value = value; }
+    void set_outline_style(OutlineStyle value) { m_values.m_noninherited.outline_style = value; }
+    void set_outline_width(CSSPixels value) { m_values.m_noninherited.outline_width = value; }
+    void set_mask(MaskReference value) { m_values.m_noninherited.mask = value; }
+    void set_mask_type(MaskType value) { m_values.m_noninherited.mask_type = value; }
+    void set_mask_image(AbstractImageStyleValue const& value) { m_values.m_noninherited.mask_image = value; }
+    void set_clip_path(ClipPathReference value) { m_values.m_noninherited.clip_path = move(value); }
+    void set_clip_rule(ClipRule value) { m_values.m_inherited.clip_rule = value; }
+    void set_flood_color(Color value) { m_values.m_noninherited.flood_color = value; }
+    void set_flood_opacity(float value) { m_values.m_noninherited.flood_opacity = value; }
+    void set_shape_rendering(ShapeRendering value) { m_values.m_noninherited.shape_rendering = value; }
+    void set_paint_order(PaintOrderList value) { m_values.m_inherited.paint_order = value; }
+    void set_paint_order_serialization(u8 length, bool is_normal)
+    {
+        m_values.m_inherited.paint_order_serialization_length = length;
+        m_values.m_inherited.paint_order_is_normal = is_normal;
+    }
 
-    void set_cx(LengthPercentage cx) { m_noninherited.cx = move(cx); }
-    void set_cy(LengthPercentage cy) { m_noninherited.cy = move(cy); }
-    void set_r(LengthPercentage r) { m_noninherited.r = move(r); }
-    void set_rx(LengthPercentageOrAuto rx) { m_noninherited.rx = move(rx); }
-    void set_ry(LengthPercentageOrAuto ry) { m_noninherited.ry = move(ry); }
-    void set_x(LengthPercentage x) { m_noninherited.x = move(x); }
-    void set_y(LengthPercentage y) { m_noninherited.y = move(y); }
+    void set_cx(LengthPercentage cx) { m_values.m_noninherited.cx = move(cx); }
+    void set_cy(LengthPercentage cy) { m_values.m_noninherited.cy = move(cy); }
+    void set_r(LengthPercentage r) { m_values.m_noninherited.r = move(r); }
+    void set_rx(LengthPercentageOrAuto rx) { m_values.m_noninherited.rx = move(rx); }
+    void set_ry(LengthPercentageOrAuto ry) { m_values.m_noninherited.ry = move(ry); }
+    void set_x(LengthPercentage x) { m_values.m_noninherited.x = move(x); }
+    void set_y(LengthPercentage y) { m_values.m_noninherited.y = move(y); }
 
-    void set_math_shift(MathShift value) { m_inherited.math_shift = value; }
-    void set_math_style(MathStyle value) { m_inherited.math_style = value; }
-    void set_math_depth(int value) { m_inherited.math_depth = value; }
+    void set_math_shift(MathShift value) { m_values.m_inherited.math_shift = value; }
+    void set_math_style(MathStyle value) { m_values.m_inherited.math_style = value; }
+    void set_math_depth(int value) { m_values.m_inherited.math_depth = value; }
 
-    void set_scrollbar_color(ScrollbarColorData value) { m_inherited.scrollbar_color = move(value); }
-    void set_scrollbar_width(ScrollbarWidth value) { m_noninherited.scrollbar_width = value; }
-    void set_resize(Resize value) { m_noninherited.resize = value; }
+    void set_scroll_behavior(ScrollBehavior value) { m_values.m_noninherited.scroll_behavior = value; }
+    void set_scrollbar_color(ScrollbarColorData value) { m_values.m_inherited.scrollbar_color = move(value); }
+    void set_scrollbar_gutter(ScrollbarGutter value) { m_values.m_noninherited.scrollbar_gutter = value; }
+    void set_scrollbar_width(ScrollbarWidth value) { m_values.m_noninherited.scrollbar_width = value; }
+    void set_resize(Resize value) { m_values.m_noninherited.resize = value; }
+    void set_shape_image_threshold(double value) { m_values.m_noninherited.shape_image_threshold = value; }
+    void set_shape_margin(LengthPercentage value) { m_values.m_noninherited.shape_margin = move(value); }
+    void set_shape_outside(ShapeOutsideData value) { m_values.m_noninherited.shape_outside = move(value); }
 
-    void set_counter_increment(Vector<CounterData> value) { m_noninherited.counter_increment = move(value); }
-    void set_counter_reset(Vector<CounterData> value) { m_noninherited.counter_reset = move(value); }
-    void set_counter_set(Vector<CounterData> value) { m_noninherited.counter_set = move(value); }
+    void set_counter_increment(Vector<CounterData> value) { m_values.m_noninherited.counter_increment = move(value); }
+    void set_counter_reset(Vector<CounterData> value) { m_values.m_noninherited.counter_reset = move(value); }
+    void set_counter_set(Vector<CounterData> value) { m_values.m_noninherited.counter_set = move(value); }
 
-    void set_will_change(WillChange value) { m_noninherited.will_change = move(value); }
+    void set_will_change(WillChange value) { m_values.m_noninherited.will_change = move(value); }
+
+private:
+    ComputedValues& m_values;
+};
+
+class ComputedValues::Builder {
+public:
+    Builder()
+        : m_values(adopt_ref(*new ComputedValues))
+        , m_mutator(*m_values)
+    {
+    }
+
+    explicit Builder(ComputedValues const& values)
+        : Builder()
+    {
+        m_values->m_inherited = values.m_inherited;
+        m_values->m_noninherited = values.m_noninherited;
+        m_values->m_property_important = values.m_property_important;
+        m_values->m_property_inherited = values.m_property_inherited;
+        m_values->m_inheritance_dependent_specified_values = values.m_inheritance_dependent_specified_values;
+        m_values->m_raw_cascaded_font_size = values.m_raw_cascaded_font_size;
+        m_values->m_base_values = values.m_base_values;
+        m_mutator.set_animated_properties(values.m_animated_properties.ptr());
+        m_values->m_pseudo_element_styles = values.m_pseudo_element_styles;
+        m_values->m_depends_on_viewport_metrics = values.m_depends_on_viewport_metrics;
+        m_values->m_font_metrics_depend_on_viewport_metrics = values.m_font_metrics_depend_on_viewport_metrics;
+        m_values->m_in_display_none_subtree = values.m_in_display_none_subtree;
+    }
+
+    static Builder create_inheriting_from(ComputedValues const& values)
+    {
+        Builder builder;
+        builder.m_values->m_inherited = values.m_inherited;
+        return builder;
+    }
+
+    Mutator* operator->() { return &m_mutator; }
+    Mutator const* operator->() const { return &m_mutator; }
+
+    NonnullRefPtr<ComputedValues const> build() && { return move(m_values); }
+
+private:
+    NonnullRefPtr<ComputedValues> m_values;
+    Mutator m_mutator;
 };
 
 }

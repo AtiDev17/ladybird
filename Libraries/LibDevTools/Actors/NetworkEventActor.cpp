@@ -12,6 +12,19 @@
 
 namespace DevTools {
 
+static i32 to_firefox_request_priority(Web::Fetch::Infrastructure::Request::Priority priority)
+{
+    switch (priority) {
+    case Web::Fetch::Infrastructure::Request::Priority::High:
+        return -10;
+    case Web::Fetch::Infrastructure::Request::Priority::Low:
+        return 10;
+    case Web::Fetch::Infrastructure::Request::Priority::Auto:
+        return 0;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 NonnullRefPtr<NetworkEventActor> NetworkEventActor::create(DevToolsServer& devtools, String name, u64 request_id)
 {
     return adopt_ref(*new NetworkEventActor(devtools, move(name), request_id));
@@ -44,6 +57,32 @@ void NetworkEventActor::set_response_start(u32 status_code, Optional<String> rea
 void NetworkEventActor::set_response_headers(Vector<HTTP::Header> response_headers)
 {
     m_response_headers = move(response_headers);
+}
+
+void NetworkEventActor::set_loaded_from_cache(bool loaded_from_cache)
+{
+    m_loaded_from_cache = loaded_from_cache;
+}
+
+void NetworkEventActor::set_browsing_context_ids(u64 browsing_context_id, u64 inner_window_id)
+{
+    m_browsing_context_id = browsing_context_id;
+    m_inner_window_id = inner_window_id;
+}
+
+void NetworkEventActor::set_referrer_policy(String referrer_policy)
+{
+    m_referrer_policy = move(referrer_policy);
+}
+
+void NetworkEventActor::set_is_navigation_request(bool is_navigation_request)
+{
+    m_is_navigation_request = is_navigation_request;
+}
+
+void NetworkEventActor::set_priority(Web::Fetch::Infrastructure::Request::Priority priority)
+{
+    m_priority = priority;
 }
 
 void NetworkEventActor::append_response_body(ByteBuffer data)
@@ -101,23 +140,20 @@ JsonObject NetworkEventActor::serialize_initial_event() const
     event.set("isXHR"sv, is_xhr);
     event.set("cause"sv, move(cause));
     event.set("private"sv, false);
-    // FIXME: Detect if response is from cache
-    event.set("fromCache"sv, false);
+    event.set("fromCache"sv, m_loaded_from_cache);
     event.set("fromServiceWorker"sv, false);
     event.set("isThirdPartyTrackingResource"sv, false);
-    // FIXME: Get actual referrer policy from request
-    event.set("referrerPolicy"sv, "strict-origin-when-cross-origin"sv);
+    if (m_referrer_policy.is_empty())
+        event.set("referrerPolicy"sv, "strict-origin-when-cross-origin"sv);
+    else
+        event.set("referrerPolicy"sv, m_referrer_policy);
     event.set("blockedReason"sv, 0);
     event.set("blockingExtension"sv, JsonValue {});
     event.set("channelId"sv, static_cast<i64>(m_request_id));
-    // FIXME: Get actual browsing context ID from the page
-    event.set("browsingContextID"sv, 1);
-    // FIXME: Get actual inner window ID
-    event.set("innerWindowId"sv, 1);
-    // FIXME: Get request priority
-    event.set("priority"sv, 0);
-    // FIXME: Detect if this is a navigation request
-    event.set("isNavigationRequest"sv, false);
+    event.set("browsingContextID"sv, m_browsing_context_id);
+    event.set("innerWindowId"sv, m_inner_window_id);
+    event.set("priority"sv, to_firefox_request_priority(m_priority));
+    event.set("isNavigationRequest"sv, m_is_navigation_request);
     event.set("chromeContext"sv, false);
 
     return event;

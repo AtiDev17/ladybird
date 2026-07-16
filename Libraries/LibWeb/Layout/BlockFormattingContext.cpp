@@ -1158,8 +1158,8 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
     auto const* list_item_box = as_if<ListItemBox>(box);
     auto is_list_item_box_without_css_content = list_item_box != nullptr;
     if (auto const* dom_node = as_if<DOM::Element>(box.dom_node()); list_item_box && dom_node) {
-        if (auto const computed_properties = dom_node->computed_properties(CSS::PseudoElement::Marker))
-            is_list_item_box_without_css_content = !computed_properties->property(CSS::PropertyID::Content).is_content();
+        if (auto const computed_values = dom_node->computed_values(CSS::PseudoElement::Marker))
+            is_list_item_box_without_css_content = !computed_values->content().has_value();
     }
 
     if (is_list_item_box_without_css_content && list_item_box->marker()) {
@@ -1472,7 +1472,7 @@ void BlockFormattingContext::resolve_horizontal_box_model_metrics(Box const& box
     box_state.padding_right = computed_values.padding().right().to_px_or_zero(width_of_containing_block);
 }
 
-BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floating_boxes(Node const& child_box, Optional<InlineFormattingContext&> inline_formatting_context, CSSPixelPoint containing_block_position_in_root)
+BlockFormattingContext::DidIntroduceClearance BlockFormattingContext::clear_floating_boxes(NodeWithStyle const& child_box, Optional<InlineFormattingContext&> inline_formatting_context, CSSPixelPoint containing_block_position_in_root)
 {
     auto const& computed_values = child_box.computed_values();
     auto result = DidIntroduceClearance::No;

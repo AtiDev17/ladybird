@@ -85,24 +85,25 @@ public:
     virtual bool forms_unconnected_subtree() const { return false; }
 
     bool has_layout_node() const { return m_layout_node; }
-    Layout::Node const& layout_node() const
+    Layout::NodeWithStyleAndBoxModelMetrics const& layout_node() const
     {
         VERIFY(m_layout_node);
         return *m_layout_node;
     }
-    Layout::Node& layout_node() { return const_cast<Layout::Node&>(const_cast<Paintable const&>(*this).layout_node()); }
+    Layout::NodeWithStyleAndBoxModelMetrics& layout_node() { return const_cast<Layout::NodeWithStyleAndBoxModelMetrics&>(const_cast<Paintable const&>(*this).layout_node()); }
 
     [[nodiscard]] GC::Ptr<DOM::Node> dom_node();
     [[nodiscard]] GC::Ptr<DOM::Node const> dom_node() const;
     void set_dom_node(GC::Ptr<DOM::Node>);
 
-    CSS::ImmutableComputedValues const& computed_values() const;
+    CSS::ComputedValues const& computed_values() const;
 
     bool visible_for_hit_testing() const;
 
     GC::Ptr<HTML::LocalNavigable> navigable() const;
 
     RefPtr<Paintable> containing_block() const;
+    Paintable const* containing_block_ptr() const { return m_containing_block; }
 
     template<typename T>
     bool fast_is() const = delete;
@@ -184,8 +185,6 @@ public:
 
     virtual Optional<CSSPixelRect> get_clip_area() const { return {}; }
     virtual Optional<DisplayListResource> calculate_clip(DisplayListRecordingContext&, CSSPixelRect const&) const { return {}; }
-
-    Layout::NodeWithStyleAndBoxModelMetrics const& layout_node_with_style_and_box_metrics() const;
 
     auto& box_model() { return m_box_model; }
     auto const& box_model() const { return m_box_model; }
@@ -433,7 +432,7 @@ public:
     [[nodiscard]] ScrollFrameIndex own_scroll_frame_index() const { return m_own_scroll_frame_index; }
 
 protected:
-    explicit Paintable(Layout::Node const&);
+    explicit Paintable(Layout::NodeWithStyleAndBoxModelMetrics const&);
     explicit Paintable(Layout::Box const&);
 
     void paint_with_inspector_overlay_context(DisplayListRecordingContext&, Function<void()> const&) const;
@@ -457,9 +456,9 @@ protected:
     CSSPixels available_scrollbar_length(ScrollDirection direction, ChromeMetrics const& chrome_metrics) const;
     Optional<CSSPixelRect> absolute_resizer_rect(ChromeMetrics const& chrome_metrics) const;
 
-    Optional<WeakPtr<Paintable>> mutable m_containing_block;
-
 private:
+    friend struct Layout::LayoutState;
+
     struct CachedPaintData;
     enum class InvalidateDescendantGeometry {
         No,
@@ -468,6 +467,7 @@ private:
 
     void detach_from_layout_node(Badge<Layout::Node>);
     void detach_chrome_widgets();
+    void set_containing_block(Paintable* containing_block);
 
     void paint_middle_button_scroll_indicator(DisplayListRecordingContext&) const;
     void acquire_cache_references_for_cached_commands(ReadonlyBytes) const;
@@ -475,7 +475,8 @@ private:
     void invalidate_absolute_geometry_cache(InvalidateDescendantGeometry);
 
     GC::Weak<DOM::Node> m_dom_node;
-    WeakPtr<Layout::Node const> m_layout_node;
+    WeakPtr<Layout::NodeWithStyleAndBoxModelMetrics const> m_layout_node;
+    Paintable* m_containing_block { nullptr };
 
     SelectionState m_selection_state { SelectionState::None };
 

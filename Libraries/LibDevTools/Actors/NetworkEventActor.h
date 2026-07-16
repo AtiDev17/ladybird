@@ -13,6 +13,7 @@
 #include <LibHTTP/Header.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 
 namespace DevTools {
 
@@ -24,10 +25,17 @@ public:
     virtual ~NetworkEventActor() override;
 
     u64 request_id() const { return m_request_id; }
+    u64 browsing_context_id() const { return m_browsing_context_id; }
+    u64 inner_window_id() const { return m_inner_window_id; }
 
     void set_request_info(String url, String method, UnixDateTime start_time, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type);
+    void set_browsing_context_ids(u64 browsing_context_id, u64 inner_window_id);
+    void set_referrer_policy(String);
+    void set_is_navigation_request(bool);
+    void set_priority(Web::Fetch::Infrastructure::Request::Priority);
     void set_response_start(u32 status_code, Optional<String> reason_phrase);
     void set_response_headers(Vector<HTTP::Header> response_headers);
+    void set_loaded_from_cache(bool);
     void append_response_body(ByteBuffer data);
     void set_request_complete(u64 body_size, Requests::RequestTimingInfo timing_info, Optional<Requests::NetworkError> network_error);
 
@@ -58,6 +66,12 @@ private:
     Optional<u32> m_status_code;
     Optional<String> m_reason_phrase;
     Vector<HTTP::Header> m_response_headers;
+    bool m_loaded_from_cache { false };
+    u64 m_browsing_context_id { 1 };
+    u64 m_inner_window_id { 1 };
+    String m_referrer_policy;
+    bool m_is_navigation_request { false };
+    Web::Fetch::Infrastructure::Request::Priority m_priority { Web::Fetch::Infrastructure::Request::Priority::Auto };
 
     ByteBuffer m_response_body;
     u64 m_body_size { 0 };

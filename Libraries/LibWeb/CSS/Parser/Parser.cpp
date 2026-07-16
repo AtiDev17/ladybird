@@ -561,6 +561,10 @@ static Optional<StyleFeature::StyleRangeValue> parse_style_range_value(ReadonlyS
         }
     }
 
+    TokenStream value_tokens { trimmed_tokens };
+    if (!Parser::parse_declaration_value_as_span(value_tokens).has_value() || !value_tokens.is_empty())
+        return {};
+
     return StyleFeature::StyleRangeValue { Vector<ComponentValue> { trimmed_tokens } };
 }
 
@@ -637,8 +641,17 @@ OwnPtr<BooleanExpression> Parser::parse_style_feature(TokenStream<ComponentValue
         m_rule_context.take_last();
         if (declaration.has_value()) {
             tokens.discard_whitespace();
-            if (tokens.has_next_token() || declaration->important == Important::Yes)
+            if (tokens.has_next_token())
                 return nullptr;
+
+            // The <style-feature-value> production matches any valid <declaration-value> as long as it doesn't contain
+            // <mf-lt>, <mf-gt> and <mf-eq> tokens.
+            if (declaration->value.contains([](ComponentValue const& value) {
+                    return value.is(Token::Type::Delim)
+                        && first_is_one_of(static_cast<char>(value.token().delim()), '<', '>', '=');
+                })) {
+                return nullptr;
+            }
 
             auto style_feature_name = parse_style_feature_name(declaration->name);
             if (!style_feature_name.has_value())
@@ -647,7 +660,7 @@ OwnPtr<BooleanExpression> Parser::parse_style_feature(TokenStream<ComponentValue
                 return nullptr;
 
             transaction.commit();
-            return StyleFeature::create_plain(style_feature_name.release_value(), move(declaration->value));
+            return StyleFeature::create_plain(style_feature_name.release_value(), move(declaration->value), move(declaration->original_value_text));
         }
     }
 
@@ -692,17 +705,57 @@ OwnPtr<BooleanExpression> Parser::parse_container_query_feature(TokenStream<Comp
         TokenStream inner_tokens { block.value };
         if (auto size_feature = parse_size_feature(inner_tokens)) {
             inner_tokens.discard_whitespace();
-            if (inner_tokens.has_next_token())
+            if (inner_tokens.has_next_token()) {
+                ErrorReporter::the().report(InvalidQueryError {
+                    .query_type = "@container"_utf16_fly_string,
+                    .value_string = tokens.dump_string(),
+                    .description = "Trailing tokens in size feature."_string });
                 return nullptr;
+            }
 
             transaction.commit();
             return size_feature;
         }
+
+        ErrorReporter::the().report(InvalidQueryError {
+            .query_type = "@container"_utf16_fly_string,
+            .value_string = tokens.dump_string(),
+            .description = "Failed to parse parenthesis block as a size feature."_string });
+        return nullptr;
     }
 
-    // FIXME: `style( <style-query> )`
+    // `style( <style-query> )`
+    if (tokens.next_token().is_function("style"sv)) {
+        auto const& function = tokens.consume_a_token().function();
+        TokenStream inner_tokens { function.value };
+        if (auto style_query = parse_style_query(inner_tokens, MatchResult::Unknown)) {
+            inner_tokens.discard_whitespace();
+            if (inner_tokens.has_next_token()) {
+                ErrorReporter::the().report(InvalidQueryError {
+                    .query_type = "@container"_utf16_fly_string,
+                    .value_string = function.to_string().to_well_formed_utf8(),
+                    .description = "Trailing tokens in style()."_string });
+                return nullptr;
+            }
+
+            transaction.commit();
+            return StyleQueryFunction::create(style_query.release_nonnull());
+        }
+
+        ErrorReporter::the().report(InvalidQueryError {
+            .query_type = "@container"_utf16_fly_string,
+            .value_string = function.to_string().to_well_formed_utf8(),
+            .description = "Failed to parse style()."_string });
+        return nullptr;
+    }
+
     // FIXME: `scroll-state( <scroll-state-query> )`
     // FIXME: `anchored( <anchored-query> )`
+
+    ErrorReporter::the().report(InvalidQueryError {
+        .query_type = "@container"_utf16_fly_string,
+        .value_string = tokens.dump_string(),
+        .description = MUST(String::formatted("Unexpected token in query feature: {}.", tokens.next_token().to_debug_string())) });
     return nullptr;
 }
 
@@ -765,13 +818,19 @@ OwnPtr<GeneralEnclosed> Parser::parse_general_enclosed(TokenStream<ComponentValu
     auto transaction = tokens.begin_transaction();
     tokens.discard_whitespace();
     auto const& first_token = tokens.consume_a_token();
+    auto serialize_general_enclosed = [](ComponentValue const& component_value) {
+        auto original_source_text = component_value.original_source_text();
+        if (!original_source_text.is_empty())
+            return Utf16String::from_utf8_without_validation(original_source_text.bytes_as_string_view());
+        return component_value.to_string();
+    };
 
     // `[ <function-token> <any-value>? ) ]`
     if (first_token.is_function()) {
         if (!contains_only_any_value(first_token.function().value, contains_only_any_value))
             return {};
         transaction.commit();
-        return GeneralEnclosed::create(first_token.to_string(), result);
+        return GeneralEnclosed::create(serialize_general_enclosed(first_token), result);
     }
 
     // `( <any-value>? )`
@@ -779,7 +838,7 @@ OwnPtr<GeneralEnclosed> Parser::parse_general_enclosed(TokenStream<ComponentValu
         if (!contains_only_any_value(first_token.block().value, contains_only_any_value))
             return {};
         transaction.commit();
-        return GeneralEnclosed::create(first_token.to_string(), result);
+        return GeneralEnclosed::create(serialize_general_enclosed(first_token), result);
     }
 
     return {};

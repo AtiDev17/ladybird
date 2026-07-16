@@ -39,27 +39,41 @@ void SyntheticPseudoElement::set_layout_node(Layout::NodeWithStyle* value)
     m_layout_node = value;
 }
 
-RefPtr<CSS::ComputedProperties const> SyntheticPseudoElement::computed_properties() const
+RefPtr<CSS::ComputedValues const> SyntheticPseudoElement::computed_values() const
 {
-    return m_computed_properties;
+    return m_computed_values;
 }
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
 {
-    if (!m_computed_properties)
+    if (!m_computed_values)
         return;
-    effect.update_computed_properties_for_style(context, abstract_element, *m_computed_properties);
+    effect.update_computed_properties_for_style(context, abstract_element);
 }
 
-void SyntheticPseudoElement::set_computed_properties(RefPtr<CSS::ComputedProperties> value)
+void SyntheticPseudoElement::set_computed_style(RefPtr<CSS::ComputedValues const> values)
 {
-    m_computed_properties = value;
+    m_computed_values = move(values);
 }
 
-void SyntheticPseudoElement::set_computed_properties_in_display_none_subtree()
+void SyntheticPseudoElement::refresh_computed_values(NonnullRefPtr<CSS::ComputedValues const> values)
 {
-    if (m_computed_properties)
-        m_computed_properties->set_in_display_none_subtree(Badge<SyntheticPseudoElement> {});
+    VERIFY(m_computed_values);
+    m_computed_values = move(values);
+}
+
+void SyntheticPseudoElement::set_computed_values_in_display_none_subtree()
+{
+    if (m_computed_values) {
+        CSS::ComputedValues::Builder builder(*m_computed_values);
+        builder->set_in_display_none_subtree(true);
+        if (m_computed_values->has_animated_values()) {
+            CSS::ComputedValues::Builder base_values_builder(m_computed_values->base_values());
+            base_values_builder->set_in_display_none_subtree(true);
+            builder->set_base_values(move(base_values_builder).build());
+        }
+        m_computed_values = move(builder).build();
+    }
 }
 
 RefPtr<CSS::CustomPropertyData const> SyntheticPseudoElement::custom_property_data() const
@@ -119,9 +133,9 @@ Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node() const
     return m_referenced_element->unsafe_layout_node();
 }
 
-RefPtr<CSS::ComputedProperties const> ElementReferencePseudoElement::computed_properties() const
+RefPtr<CSS::ComputedValues const> ElementReferencePseudoElement::computed_values() const
 {
-    return m_referenced_element->computed_properties({});
+    return m_referenced_element->computed_values({});
 }
 
 void ElementReferencePseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)

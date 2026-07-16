@@ -1767,7 +1767,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
             : child_used_values->border_box_height();
         auto const block_axis_line_height = inline_node.computed_values().line_height();
         auto const block_axis_start = [&] {
-            if (fragment.layout_node().computed_values().block_axis_is_reverse())
+            if (fragment.style_source().computed_values().block_axis_is_reverse())
                 return fragment.block_offset() + child_used_values->border_box_right() - block_axis_line_height;
             return fragment.block_offset() - (is_horizontal ? child_used_values->border_box_top() : child_used_values->border_box_left());
         }();
@@ -1802,7 +1802,8 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
         }
 
         for (auto child = node.first_child(); child; child = child->next_sibling()) {
-            if (child->is_absolutely_positioned() || child->is_floating())
+            auto const* child_with_style = as_if<NodeWithStyle>(*child);
+            if (child_with_style && (child_with_style->is_absolutely_positioned() || child_with_style->is_floating()))
                 continue;
             auto const* child_used_values = state.try_get(*child);
             auto child_offset = child_used_values ? offset + child_used_values->content_offset() : offset;
@@ -1914,7 +1915,7 @@ static bool style_value_contains_anchor(CSS::StyleValue const& value)
     return false;
 }
 
-// NB: Generated boxes for pseudo-elements are anonymous, so their computed properties live in
+// NB: Generated boxes for pseudo-elements are anonymous, so their computed values live in
 //     the generator element under the relevant pseudo-element rather than on a DOM node of
 //     their own.
 static Optional<DOM::AbstractElement> abstract_element_for_box(Box const& box)
@@ -1932,13 +1933,18 @@ bool FormattingContext::box_inset_properties_contain_anchor_functions(Box const&
     if (!abstract_element.has_value())
         return false;
 
-    auto const* computed = abstract_element->computed_properties();
+    auto const* computed = abstract_element->computed_values();
     if (!computed)
         return false;
-    return style_value_contains_anchor(computed->property(CSS::PropertyID::Top))
-        || style_value_contains_anchor(computed->property(CSS::PropertyID::Right))
-        || style_value_contains_anchor(computed->property(CSS::PropertyID::Bottom))
-        || style_value_contains_anchor(computed->property(CSS::PropertyID::Left));
+    auto top = computed->computed_style_value(CSS::PropertyID::Top);
+    auto right = computed->computed_style_value(CSS::PropertyID::Right);
+    auto bottom = computed->computed_style_value(CSS::PropertyID::Bottom);
+    auto left = computed->computed_style_value(CSS::PropertyID::Left);
+    VERIFY(top && right && bottom && left);
+    return style_value_contains_anchor(*top)
+        || style_value_contains_anchor(*right)
+        || style_value_contains_anchor(*bottom)
+        || style_value_contains_anchor(*left);
 }
 
 static Box const* nearest_scroll_container_ancestor(Box const& box)
@@ -2016,18 +2022,19 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
     if (!abstract_element.has_value())
         return;
 
-    auto const* computed = abstract_element->computed_properties();
+    auto const* computed = abstract_element->computed_values();
     if (!computed)
         return;
-    auto const& top = computed->property(CSS::PropertyID::Top);
-    auto const& right = computed->property(CSS::PropertyID::Right);
-    auto const& bottom = computed->property(CSS::PropertyID::Bottom);
-    auto const& left = computed->property(CSS::PropertyID::Left);
+    auto top = computed->computed_style_value(CSS::PropertyID::Top);
+    auto right = computed->computed_style_value(CSS::PropertyID::Right);
+    auto bottom = computed->computed_style_value(CSS::PropertyID::Bottom);
+    auto left = computed->computed_style_value(CSS::PropertyID::Left);
+    VERIFY(top && right && bottom && left);
 
-    bool top_contains_anchor = style_value_contains_anchor(top);
-    bool right_contains_anchor = style_value_contains_anchor(right);
-    bool bottom_contains_anchor = style_value_contains_anchor(bottom);
-    bool left_contains_anchor = style_value_contains_anchor(left);
+    bool top_contains_anchor = style_value_contains_anchor(*top);
+    bool right_contains_anchor = style_value_contains_anchor(*right);
+    bool bottom_contains_anchor = style_value_contains_anchor(*bottom);
+    bool left_contains_anchor = style_value_contains_anchor(*left);
     if (!top_contains_anchor && !right_contains_anchor && !bottom_contains_anchor && !left_contains_anchor)
         return;
 
@@ -2292,11 +2299,13 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
     };
 
     auto const& existing_inset = box.computed_values().inset();
-    box.mutable_computed_values().set_inset({
-        resolve_inset(top_contains_anchor, top, existing_inset.top(), CSS::PropertyID::Top, false, false),
-        resolve_inset(right_contains_anchor, right, existing_inset.right(), CSS::PropertyID::Right, true, true),
-        resolve_inset(bottom_contains_anchor, bottom, existing_inset.bottom(), CSS::PropertyID::Bottom, true, false),
-        resolve_inset(left_contains_anchor, left, existing_inset.left(), CSS::PropertyID::Left, false, true),
+    box.modify_computed_values([&](auto& values) {
+        values.set_inset({
+            resolve_inset(top_contains_anchor, *top, existing_inset.top(), CSS::PropertyID::Top, false, false),
+            resolve_inset(right_contains_anchor, *right, existing_inset.right(), CSS::PropertyID::Right, true, true),
+            resolve_inset(bottom_contains_anchor, *bottom, existing_inset.bottom(), CSS::PropertyID::Bottom, true, false),
+            resolve_inset(left_contains_anchor, *left, existing_inset.left(), CSS::PropertyID::Left, false, true),
+        });
     });
 
     if (compensates_for_scroll_in_x || compensates_for_scroll_in_y)

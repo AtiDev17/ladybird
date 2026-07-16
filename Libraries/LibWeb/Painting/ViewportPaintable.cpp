@@ -114,6 +114,7 @@ void ViewportPaintable::reset_for_relayout()
     clear_scroll_state();
     m_paintable_boxes_with_auto_content_visibility.clear();
     m_visual_context_tree.clear();
+    m_visual_context_tree_node_count_without_inspector_overlays = 0;
     m_visual_context_tree_needs_compositor_update = false;
 }
 
@@ -219,7 +220,7 @@ void ViewportPaintable::reassign_scroll_frames()
 
 void ViewportPaintable::assign_scroll_frames()
 {
-    for_each_in_inclusive_subtree_of_type<Paintable>([&](auto& paintable_box) {
+    for_each_in_inclusive_subtree([&](auto& paintable_box) {
         paintable_box.set_enclosing_scroll_frame_index({});
         paintable_box.set_own_scroll_frame_index({});
 
@@ -250,7 +251,7 @@ void ViewportPaintable::assign_scroll_frames()
         if (paintable.is_fixed_position() || paintable.is_sticky_position())
             return TraversalDecision::Continue;
 
-        for (auto block = paintable.containing_block(); block; block = block->containing_block()) {
+        for (auto const* block = paintable.containing_block_ptr(); block; block = block->containing_block_ptr()) {
             if (auto index = block->own_scroll_frame_index(); index.value()) {
                 paintable.set_enclosing_scroll_frame_index(index);
                 return TraversalDecision::Continue;
@@ -278,6 +279,7 @@ void ViewportPaintable::assign_accumulated_visual_contexts()
         document().set_needs_to_record_display_list();
     }
     m_visual_context_tree = move(visual_context_tree);
+    m_visual_context_tree_node_count_without_inspector_overlays = m_visual_context_tree->nodes().size();
     m_visual_context_tree_needs_compositor_update = true;
 }
 
@@ -301,6 +303,17 @@ void ViewportPaintable::update_visual_viewport_accumulated_visual_context()
     }
     Painting::update_visual_viewport_accumulated_visual_context(*this);
     m_visual_context_tree_needs_compositor_update = true;
+}
+
+// Painting inspector overlays appends the highlighted elements' transform/scroll ancestor contexts onto the visual
+// context tree (see Paintable::paint_with_inspector_overlay_context). Those nodes are only referenced by the display
+// list recorded alongside them — so each new recording prunes the ones appended by the previous recording before
+// appending its own; otherwise they would accumulate without bound.
+void ViewportPaintable::prune_inspector_overlay_visual_contexts()
+{
+    if (!m_visual_context_tree.has_value())
+        return;
+    m_visual_context_tree->shrink(m_visual_context_tree_node_count_without_inspector_overlays);
 }
 
 void ViewportPaintable::invalidate_all_cached_paint()

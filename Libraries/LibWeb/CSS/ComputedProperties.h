@@ -25,7 +25,6 @@
 #include <LibWeb/CSS/PseudoClassBitmap.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleProperty.h>
-#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
@@ -37,6 +36,12 @@ class StyleComputer;
 namespace Web::DOM {
 
 class Element;
+
+}
+
+namespace Web::Layout {
+
+class NodeWithStyle;
 
 }
 
@@ -55,7 +60,7 @@ enum class AnimatedPropertyResultOfTransition : u8 {
     Yes
 };
 
-class WEB_API ComputedProperties final : public RefCounted<ComputedProperties> {
+class ComputedProperties final : public RefCounted<ComputedProperties> {
 public:
     ~ComputedProperties();
 
@@ -179,7 +184,7 @@ public:
     TextUnderlinePosition text_underline_position() const;
     Vector<BackgroundLayerData> background_layers() const;
     Vector<BackgroundLayerData> mask_layers() const;
-    Optional<BorderImageData> border_image() const;
+    BorderImageData border_image() const;
     BackgroundBox background_color_clip() const;
     CSSPixels border_spacing_horizontal() const;
     CSSPixels border_spacing_vertical() const;
@@ -187,13 +192,9 @@ public:
     Clip clip() const;
     Display display() const;
     Float float_() const;
-    Color caret_color(Layout::NodeWithStyle const&) const;
+    Color caret_color(ColorResolutionContext const&) const;
     Clear clear() const;
     ColumnSpan column_span() const;
-    struct ContentDataAndQuoteNestingLevel {
-        ContentData content_data;
-        u32 final_quote_nesting_level { 0 };
-    };
     ContentDataAndQuoteNestingLevel content(DOM::AbstractElement&, u32 initial_quote_nesting_level) const;
     ContentVisibility content_visibility() const;
     Vector<CursorData> cursor() const;
@@ -210,7 +211,7 @@ public:
     TextDecorationStyle text_decoration_style() const;
     TextDecorationThickness text_decoration_thickness() const;
     TextTransform text_transform() const;
-    Vector<ShadowData> text_shadow(Layout::Node const&) const;
+    Vector<ShadowData> text_shadow(ColorResolutionContext const&) const;
     TextIndentData text_indent() const;
     TextWrapMode text_wrap_mode() const;
     ListStyleType list_style_type(StyleScope const&) const;
@@ -218,9 +219,9 @@ public:
     FlexDirection flex_direction() const;
     FlexWrap flex_wrap() const;
     FlexBasis flex_basis() const;
-    float flex_grow() const;
-    float flex_shrink() const;
-    int order() const;
+    double flex_grow() const;
+    double flex_shrink() const;
+    i32 order() const;
     Color accent_color(ColorResolutionContext const&) const;
     AlignContent align_content() const;
     AlignItems align_items() const;
@@ -236,7 +237,7 @@ public:
     JustifySelf justify_self() const;
     Overflow overflow_x() const;
     Overflow overflow_y() const;
-    Vector<ShadowData> box_shadow(Layout::Node const&) const;
+    Vector<ShadowData> box_shadow(ColorResolutionContext const&) const;
     BoxSizing box_sizing() const;
     PointerEvents pointer_events() const;
     Variant<VerticalAlign, LengthPercentage> vertical_align() const;
@@ -321,6 +322,7 @@ public:
     int math_depth() const;
     [[nodiscard]] static CSSPixels normal_line_height(Gfx::FontPixelMetrics const&);
     [[nodiscard]] CSSPixels line_height(FontComputer const&) const;
+    [[nodiscard]] LineHeightData line_height_data(FontComputer const&) const;
     [[nodiscard]] CSSPixels font_size() const;
     double font_weight() const;
     Percentage font_width() const;
@@ -335,7 +337,7 @@ public:
     QuotesData quotes() const;
     Vector<CounterData> counter_data(PropertyID) const;
 
-    ScrollbarColorData scrollbar_color(Layout::NodeWithStyle const& layout_node) const;
+    ScrollbarColorData scrollbar_color(ColorResolutionContext const&) const;
     ScrollbarWidth scrollbar_width() const;
     Resize resize() const;
 
@@ -346,6 +348,11 @@ public:
     RefPtr<StyleValue const> raw_cascaded_font_size() const { return m_data->raw_cascaded_font_size; }
 
 private:
+    friend class Layout::NodeWithStyle;
+    friend class StyleComputer;
+
+    NonnullRefPtr<ComputedProperties> copy_without_animations() const;
+
     class Data final : public RefCounted<Data> {
     public:
         Data() = default;
@@ -366,14 +373,13 @@ private:
     ComputedProperties(NonnullRefPtr<Data const>, bool depends_on_viewport_metrics, bool font_metrics_depend_on_viewport_metrics);
 
     Overflow overflow(PropertyID) const;
-    Vector<ShadowData> shadow(PropertyID, Layout::Node const&) const;
+    Vector<ShadowData> shadow(PropertyID, ColorResolutionContext const&) const;
     Position position_value(PropertyID) const;
 
     Data const& data() const { return *m_data; }
     AnimatedProperties const& animated_properties() const;
     AnimatedProperties& mutable_animated_properties();
     void set_animated_property_internal(PropertyID, NonnullRefPtr<StyleValue const>, AnimatedPropertyResultOfTransition, Inherited);
-
     NonnullRefPtr<Data const> m_data;
     RefPtr<AnimatedProperties> m_animated_properties;
     bool m_depends_on_viewport_metrics { false };
