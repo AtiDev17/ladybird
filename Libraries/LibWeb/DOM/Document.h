@@ -77,11 +77,8 @@ enum class QuirksMode {
     Yes
 };
 
-#define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X)       \
-    X(DocumentAddAnElementToTheTopLayer)                  \
-    X(DocumentRequestAnElementToBeRemovedFromTheTopLayer) \
-    X(DocumentImmediatelyRemoveElementFromTheTopLayer)    \
-    X(DocumentPendingTopLayerRemovalsProcessed)
+#define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
+    X(TopLayerElementStillRenderedAfterRemoval)
 
 enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASON(e) e,
@@ -1091,7 +1088,10 @@ public:
     void remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>);
     void process_top_layer_removals();
 
+    void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
+
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
+    bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
     // Spec issue: https://github.com/whatwg/html/issues/11007
@@ -1328,6 +1328,7 @@ private:
 
     void clear_layout_and_paintable_nodes_for_inactive_document();
     void tear_down_layout_tree();
+    void process_pending_top_layer_layout_changes();
 
     void update_active_element();
     void collect_paintable_boxes_with_auto_content_visibility();
@@ -1733,6 +1734,8 @@ private:
     // instead they generate boxes as if they were siblings of the root element.
     OrderedHashTable<GC::Ref<Element>> m_top_layer_elements;
     OrderedHashTable<GC::Ref<Element>> m_top_layer_pending_removals;
+    Vector<GC::Ref<Element>> m_elements_with_pending_top_layer_membership_change;
+    bool m_top_layer_needs_layout_zone_rebuild { false };
 
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_auto_popover_list;
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_hint_popover_list;
