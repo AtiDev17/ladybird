@@ -504,10 +504,8 @@ void LocalTraversableNavigable::reset_session_history_for_testing(GC::Ref<GC::Fu
         auto entries_for_navigation_api = get_session_history_entries_for_the_navigation_api(*this, m_current_session_history_step);
         active_window()->navigation()->initialize_the_navigation_api_entries_for_reconstructed_session_history(entries_for_navigation_api, active_entry);
 
-        if (page().client().should_report_session_history_updates()) {
-            auto session_history_snapshot = create_session_history_snapshot();
-            page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
-        }
+        auto session_history_snapshot = create_session_history_snapshot();
+        page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
 
         signal->resolve({});
         on_complete->function()();
@@ -1548,21 +1546,19 @@ void ApplyHistoryStepState::complete()
         m_traversable->m_current_session_history_step = used_target_step;
 
         // AD-HOC: Report the updated session history descriptors to the UI-process mirror.
-        if (m_traversable->page().client().should_report_session_history_updates()) {
-            auto save_active_entry_persisted_state = LocalTraversableNavigable::SaveActiveEntryPersistedState::Yes;
-            // NB: During history traversal, the active entry can point at the target
-            //     entry before the active document's queued history-step update has
-            //     restored the target entry's persisted state. Do not overwrite that
-            //     target entry with the document's pre-restoration viewport offset.
-            if (m_navigation_type == Bindings::NavigationType::Traverse) {
-                auto document = m_traversable->active_document();
-                auto active_entry = m_traversable->active_session_history_entry();
-                if (document && active_entry && document->latest_entry() != active_entry)
-                    save_active_entry_persisted_state = LocalTraversableNavigable::SaveActiveEntryPersistedState::No;
-            }
-            auto session_history_snapshot = m_traversable->create_session_history_snapshot(save_active_entry_persisted_state);
-            m_traversable->page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
+        auto save_active_entry_persisted_state = LocalTraversableNavigable::SaveActiveEntryPersistedState::Yes;
+        // NB: During history traversal, the active entry can point at the target
+        //     entry before the active document's queued history-step update has
+        //     restored the target entry's persisted state. Do not overwrite that
+        //     target entry with the document's pre-restoration viewport offset.
+        if (m_navigation_type == Bindings::NavigationType::Traverse) {
+            auto document = m_traversable->active_document();
+            auto active_entry = m_traversable->active_session_history_entry();
+            if (document && active_entry && document->latest_entry() != active_entry)
+                save_active_entry_persisted_state = LocalTraversableNavigable::SaveActiveEntryPersistedState::No;
         }
+        auto session_history_snapshot = m_traversable->create_session_history_snapshot(save_active_entry_persisted_state);
+        m_traversable->page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
 
         VERIFY(m_traversable->m_session_history_entries.size() > 0);
         m_traversable->page().client().page_did_change_url(m_traversable->current_session_history_entry()->url());
@@ -2192,78 +2188,52 @@ void LocalTraversableNavigable::traverse_the_history_by_delta(int delta, GC::Ptr
 
     // 4. Append the following session history traversal steps to traversable:
     append_session_history_traversal_steps(GC::create_function(heap(), [this, delta, source_snapshot_params, initiator_to_check, user_involvement](NonnullRefPtr<Core::Promise<Empty>> signal) {
-        // 1. Let allSteps be the result of getting all used history steps for traversable.
-        auto all_steps = get_all_used_history_steps();
+        auto apply_selected_history_step = GC::create_function(heap(), [this, source_snapshot_params, initiator_to_check, user_involvement, signal](Optional<int> target_step) {
+            if (!target_step.has_value()) {
+                signal->resolve({});
+                return;
+            }
 
-        // 2. Let currentStepIndex be the index of traversable's current session history step within allSteps.
-        auto current_step_index = *all_steps.find_first_index(current_session_history_step());
+            auto all_steps = get_all_used_history_steps();
+            if (!all_steps.contains_slow(*target_step)) {
+                page().client().page_did_request_traverse_the_history_to_step(*target_step, HistoryTraversalPrecheck::Needed);
+                signal->resolve({});
+                return;
+            }
 
-        // 3. Let targetStepIndex be currentStepIndex plus delta
-        size_t target_step_index = 0;
-        if (delta < 0) {
-            auto magnitude = static_cast<size_t>(-static_cast<i64>(delta));
-            if (magnitude > current_step_index) {
-                if (source_snapshot_params && page().client().page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed)) {
-                    signal->resolve({});
+            if (source_snapshot_params) {
+                RefPtr<SessionHistoryEntry> target_top_level_entry;
+                for (auto const& entry : session_history_entries()) {
+                    auto entry_step = entry->step_value();
+                    if (!entry_step.has_value())
+                        continue;
+                    if (*entry_step > *target_step)
+                        break;
+                    target_top_level_entry = entry;
+                }
+
+                if (target_top_level_entry && current_session_history_entry() && page().client().decide_navigation_process(current_session_history_entry()->url(), target_top_level_entry->url(), NavigationTarget::TopLevel) == NavigationProcessDecision::Remote) {
+                    run_the_history_step_prechecks(*target_step, true, source_snapshot_params, initiator_to_check, user_involvement, Bindings::NavigationType::Traverse, LocalNavigable::NavigationAPIAbortBehavior::Abort,
+                        GC::create_function(heap(), [this, target_step = *target_step, signal](HistoryStepResult result, int, LocalNavigable::NavigationAPIAbortBehavior) {
+                            if (result == HistoryStepResult::Applied)
+                                page().client().page_did_request_traverse_the_history_to_step(target_step, HistoryTraversalPrecheck::AlreadyDone);
+                            signal->resolve({});
+                        }));
                     return;
                 }
-                signal->resolve({});
-                return;
             }
-            target_step_index = current_step_index - magnitude;
-        } else {
-            auto magnitude = static_cast<size_t>(delta);
-            if (magnitude >= all_steps.size() - current_step_index) {
-                if (source_snapshot_params && page().client().page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed)) {
+
+            // 5. Apply the traverse history step allSteps[targetStepIndex] to traversable, given sourceSnapshotParams,
+            //    initiatorToCheck, and userInvolvement.
+            apply_the_traverse_history_step(*target_step, source_snapshot_params, initiator_to_check, user_involvement,
+                GC::create_function(heap(), [signal](HistoryStepResult) {
                     signal->resolve({});
-                    return;
-                }
-                signal->resolve({});
-                return;
-            }
-            target_step_index = current_step_index + magnitude;
-        }
+                }));
+        });
 
-        // 4. If allSteps[targetStepIndex] does not exist, then abort these steps.
-        if (target_step_index >= all_steps.size()) {
-            if (source_snapshot_params && page().client().page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed)) {
-                signal->resolve({});
-                return;
-            }
-            signal->resolve({});
-            return;
-        }
-
-        auto target_step = all_steps[target_step_index];
-
-        if (source_snapshot_params) {
-            RefPtr<SessionHistoryEntry> target_top_level_entry;
-            for (auto const& entry : session_history_entries()) {
-                auto entry_step = entry->step_value();
-                if (!entry_step.has_value())
-                    continue;
-                if (*entry_step > target_step)
-                    break;
-                target_top_level_entry = entry;
-            }
-
-            if (target_top_level_entry && current_session_history_entry() && page().client().decide_navigation_process(current_session_history_entry()->url(), target_top_level_entry->url(), NavigationTarget::TopLevel) == NavigationProcessDecision::Remote) {
-                run_the_history_step_prechecks(target_step, true, source_snapshot_params, initiator_to_check, user_involvement, Bindings::NavigationType::Traverse, LocalNavigable::NavigationAPIAbortBehavior::Abort,
-                    GC::create_function(heap(), [this, delta, signal](HistoryStepResult result, int, LocalNavigable::NavigationAPIAbortBehavior) {
-                        if (result == HistoryStepResult::Applied)
-                            (void)page().client().page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::AlreadyDone);
-                        signal->resolve({});
-                    }));
-                return;
-            }
-        }
-
-        // 5. Apply the traverse history step allSteps[targetStepIndex] to traversable, given sourceSnapshotParams,
-        //    initiatorToCheck, and userInvolvement.
-        apply_the_traverse_history_step(target_step, source_snapshot_params, initiator_to_check, user_involvement,
-            GC::create_function(heap(), [signal](HistoryStepResult) {
-                signal->resolve({});
-            }));
+        // AD-HOC: The UI process owns the canonical traversable session history. Ask it to perform steps 1-4 so a
+        //         WebContent process cannot select a target from an incomplete local session history slice.
+        page().client().page_did_request_history_traversal_target_by_delta(delta, apply_selected_history_step);
     }));
 }
 
@@ -2359,10 +2329,8 @@ void LocalTraversableNavigable::apply_the_reload_history_step(UserNavigationInvo
                 if (auto current_entry = current_session_history_entry(); current_entry && current_entry->document_state()->reload_pending()) {
                     current_entry->document_state()->set_reload_pending(false);
 
-                    if (page().client().should_report_session_history_updates()) {
-                        auto session_history_snapshot = create_session_history_snapshot();
-                        page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
-                    }
+                    auto session_history_snapshot = create_session_history_snapshot();
+                    page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
                 }
             }
             on_complete->function()(result);
@@ -2477,10 +2445,8 @@ bool LocalTraversableNavigable::try_to_synchronously_commit_same_document_naviga
         }
     }
 
-    if (page().client().should_report_session_history_updates()) {
-        auto session_history_snapshot = create_session_history_snapshot(SaveActiveEntryPersistedState::Yes);
-        page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
-    }
+    auto session_history_snapshot = create_session_history_snapshot(SaveActiveEntryPersistedState::Yes);
+    page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
 
     VERIFY(session_history_entries().size() > 0);
     page().client().page_did_change_url(current_session_history_entry()->url());

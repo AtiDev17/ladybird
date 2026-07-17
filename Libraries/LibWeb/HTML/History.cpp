@@ -269,6 +269,9 @@ WebIDL::ExceptionOr<void> History::set_scroll_restoration(Bindings::ScrollRestor
         break;
     }
 
+    auto navigable = this_relevant_global_object.navigable();
+    this_relevant_global_object.associated_document().page().client().page_did_update_session_history_entry_scroll_restoration_mode(navigable->id(), active_session_history_entry->navigation_api_key(), active_session_history_entry->scroll_restoration_mode());
+
     return {};
 }
 

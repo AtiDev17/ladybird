@@ -276,6 +276,22 @@ CanonicalNavigable* WebContentClient::navigable_for_page(u64 page_id)
     return nullptr;
 }
 
+Optional<CanonicalNavigable&> WebContentClient::hosted_navigable_for_page(u64 page_id, Web::HTML::CrossProcessId navigable_id)
+{
+    auto* page_host = navigable_for_page(page_id);
+    if (!page_host)
+        return {};
+
+    auto navigable = page_host->top_level_traversable().find(navigable_id);
+    if (!navigable.has_value())
+        return {};
+
+    if (&*navigable == page_host || navigable->is_hosted_by(*this, page_id))
+        return *navigable;
+
+    return {};
+}
+
 Optional<CanonicalNavigable&> WebContentClient::child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id)
 {
     auto* host = navigable_for_page(page_id);
@@ -1480,26 +1496,57 @@ void WebContentClient::did_check_if_traverse_history_step_is_canceled(
         view->did_check_if_traverse_history_step_is_canceled({}, request_id, step, result);
 }
 
-Messages::WebContentClient::DidRequestTraverseTheHistoryByDeltaResponse WebContentClient::did_request_traverse_the_history_by_delta(u64 page_id, i32 delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
+void WebContentClient::did_request_traverse_the_history_by_delta(u64 page_id, i32 delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        auto view_id = view->view_id();
-        // This request is already a synchronous IPC from WebContent, so defer
-        // the UI traversal before it possibly calls back into WebContent for
-        // cancelation checks.
-        Core::deferred_invoke([view_id, delta, history_traversal_precheck] {
-            auto view = ViewImplementation::find_view_by_id(view_id);
-            if (!view.has_value())
-                return;
-            auto check_for_cancelation = CheckForCancelation::IfWebContentCannotTraverseTarget;
-            if (history_traversal_precheck == Web::HistoryTraversalPrecheck::Needed)
-                check_for_cancelation = CheckForCancelation::Yes;
-            (void)view->traverse_the_history_by_delta(delta, check_for_cancelation);
-        });
-        return true;
+    auto* page_host = navigable_for_page(page_id);
+    if (!page_host)
+        return;
+
+    auto view = ViewImplementation::find_view_for_traversable(page_host->top_level_traversable());
+    if (!view.has_value())
+        return;
+
+    auto check_for_cancelation = history_traversal_precheck == Web::HistoryTraversalPrecheck::Needed
+        ? CheckForCancelation::Yes
+        : CheckForCancelation::IfWebContentCannotTraverseTarget;
+    (void)view->traverse_the_history_by_delta(delta, check_for_cancelation);
+}
+
+void WebContentClient::did_request_history_traversal_target_by_delta(u64 page_id, u64 request_id, i32 delta)
+{
+    Optional<i32> target_step;
+    if (auto* page_host = navigable_for_page(page_id)) {
+        auto target = page_host->top_level_traversable().session_history().traversal_target_for_delta(delta);
+        if (target.has_value())
+            target_step = target->target_step;
     }
 
-    return false;
+    async_resolve_session_history_traversal_target(page_id, request_id, target_step);
+}
+
+void WebContentClient::did_request_traverse_the_history_to_step(u64 page_id, i32 step, Web::HistoryTraversalPrecheck history_traversal_precheck)
+{
+    auto* page_host = navigable_for_page(page_id);
+    if (!page_host)
+        return;
+
+    auto view = ViewImplementation::find_view_for_traversable(page_host->top_level_traversable());
+    if (!view.has_value())
+        return;
+
+    auto check_for_cancelation = history_traversal_precheck == Web::HistoryTraversalPrecheck::Needed
+        ? CheckForCancelation::Yes
+        : CheckForCancelation::IfWebContentCannotTraverseTarget;
+    (void)view->traverse_the_history_to_step(step, check_for_cancelation);
+}
+
+void WebContentClient::did_request_navigation_api_traversal_target(u64 page_id, u64 request_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key)
+{
+    Optional<i32> target_step;
+    if (auto navigable = hosted_navigable_for_page(page_id, navigable_id); navigable.has_value())
+        target_step = navigable->top_level_traversable().navigation_api_traversal_target(*navigable, navigation_api_key);
+
+    async_resolve_session_history_traversal_target(page_id, request_id, target_step);
 }
 
 void WebContentClient::did_request_webdriver_history_traversal(u64 page_id, u64 request_id, i32 delta)
@@ -1801,6 +1848,22 @@ void WebContentClient::did_update_session_history(u64 page_id, Vector<Web::HTML:
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
         view->did_update_session_history({}, move(entries), move(used_steps), current_used_step_index);
+}
+
+void WebContentClient::did_update_session_history_entry_navigation_api_state(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state)
+{
+    auto navigable = hosted_navigable_for_page(page_id, navigable_id);
+    if (!navigable.has_value())
+        return;
+    navigable->top_level_traversable().update_session_history_entry_navigation_api_state(*navigable, navigation_api_key, move(navigation_api_state));
+}
+
+void WebContentClient::did_update_session_history_entry_scroll_restoration_mode(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode)
+{
+    auto navigable = hosted_navigable_for_page(page_id, navigable_id);
+    if (!navigable.has_value())
+        return;
+    navigable->top_level_traversable().update_session_history_entry_scroll_restoration_mode(*navigable, navigation_api_key, scroll_restoration_mode);
 }
 
 Messages::WebContentClient::DidRequestUiProcessSessionHistoryForTestingResponse WebContentClient::did_request_ui_process_session_history_for_testing(u64 page_id)

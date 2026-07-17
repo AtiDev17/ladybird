@@ -58,6 +58,18 @@ Optional<ViewImplementation&> ViewImplementation::find_view_by_id(u64 id)
     return {};
 }
 
+Optional<ViewImplementation&> ViewImplementation::find_view_for_traversable(CanonicalTraversable const& traversable)
+{
+    Optional<ViewImplementation&> result;
+    for_each_view([&](auto& view) {
+        if (&view.traversable() != &traversable)
+            return IterationDecision::Continue;
+        result = view;
+        return IterationDecision::Break;
+    });
+    return result;
+}
+
 ViewImplementation::ViewImplementation(IsPrivate is_private)
     : m_is_private(is_private)
     , m_document_cookie_version_buffer(Core::create_shared_version_buffer())
@@ -370,7 +382,19 @@ HistoryTraversalOutcome ViewImplementation::traverse_the_history_by_delta(
     CheckForCancelation check_for_cancelation,
     Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete)
 {
-    auto decision = m_top_level_traversable.traverse_the_history_by_delta(delta, check_for_cancelation, m_url, move(on_cancelation_check_complete));
+    return start_history_traversal(m_top_level_traversable.traverse_the_history_by_delta(delta, check_for_cancelation, m_url, move(on_cancelation_check_complete)));
+}
+
+HistoryTraversalOutcome ViewImplementation::traverse_the_history_to_step(
+    i32 step,
+    CheckForCancelation check_for_cancelation,
+    Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete)
+{
+    return start_history_traversal(m_top_level_traversable.traverse_the_history_to_step(step, check_for_cancelation, m_url, move(on_cancelation_check_complete)));
+}
+
+HistoryTraversalOutcome ViewImplementation::start_history_traversal(HistoryTraversalDecision decision)
+{
     if (decision.outcome.status == HistoryTraversalStatus::NoEntry) {
         dump_session_history("traverse-no-entry"sv);
         return decision.outcome;

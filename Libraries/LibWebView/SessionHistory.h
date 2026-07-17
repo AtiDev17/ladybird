@@ -10,6 +10,7 @@
 #include <AK/Vector.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/Forward.h>
 
 namespace WebView {
 
@@ -59,6 +60,10 @@ public:
     void replace_current_entry(URL::URL, Web::HTML::CrossProcessId document_state_id, Web::HTML::DocumentResource);
     void mark_current_entry_reload_pending();
     void clear_current_entry_reload_pending();
+    bool update_top_level_navigation_api_state(Utf16String const& navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state);
+    bool update_nested_navigation_api_state(Web::HTML::CrossProcessId nested_history_id, Utf16String const& navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state);
+    bool update_top_level_scroll_restoration_mode(Utf16String const& navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode);
+    bool update_nested_scroll_restoration_mode(Web::HTML::CrossProcessId nested_history_id, Utf16String const& navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode);
     UpdateResult update_from_web_content(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
     [[nodiscard]] bool did_seed_web_content_from_ui_process(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
     void did_seed_web_content_from_ui_process(size_t current_top_level_entry_index);
@@ -81,6 +86,7 @@ public:
     [[nodiscard]] bool web_content_can_traverse_to(TraversalTarget const&) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_delta(int delta) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_step(i32 step) const;
+    [[nodiscard]] Optional<Vector<Entry> const&> get_session_history_entries(CanonicalNavigable const&) const;
     [[nodiscard]] Optional<size_t> target_step_index_for_delta(int delta) const;
     [[nodiscard]] Optional<i32> step_at(size_t index) const;
     [[nodiscard]] Entry const* current_entry() const;

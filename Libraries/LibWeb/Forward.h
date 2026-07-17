@@ -215,15 +215,6 @@ class SubtleCrypto;
 
 }
 
-namespace Web::CSS::FilterOperation {
-
-struct Blur;
-struct DropShadow;
-struct HueRotate;
-struct Color;
-
-}
-
 namespace Web::CSS {
 
 class AbstractImageStyleValue;
@@ -234,6 +225,7 @@ class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BasicShapeStyleValue;
+class BlurFilterStyleValue;
 class BooleanExpression;
 class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
@@ -243,10 +235,11 @@ class CalculationNode;
 class CascadedProperties;
 class CustomPropertyData;
 class Clip;
+class ColorFilterStyleValue;
+class ColorFunctionStyleValue;
 class ColorInterpolationMethodStyleValue;
 class ColorMixStyleValue;
 class ColorSchemeStyleValue;
-class ColorFunctionStyleValue;
 class ColorStyleValue;
 class ComputedProperties;
 class ComputedValues;
@@ -323,12 +316,13 @@ class CustomIdentStyleValue;
 class DimensionStyleValue;
 class Display;
 class DisplayStyleValue;
+class DropShadowFilterStyleValue;
 class EasingStyleValue;
 class EdgeStyleValue;
 class EmptyOptionalStyleValue;
 class ExplicitGridTrack;
 class FeatureValue;
-class FilterValueListStyleValue;
+class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
 class FontComputer;
@@ -351,6 +345,7 @@ class GridTrackPlacementStyleValue;
 class GridTrackSizeList;
 class GridTrackSizeListStyleValue;
 class GuaranteedInvalidStyleValue;
+class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
 class ImageStyleValue;
 class IntegerStyleValue;
@@ -505,8 +500,6 @@ using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
 using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
-
-using FilterValue = Variant<FilterOperation::Blur, FilterOperation::DropShadow, FilterOperation::HueRotate, FilterOperation::Color, URL>;
 
 }
 

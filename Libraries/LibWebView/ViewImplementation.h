@@ -71,6 +71,7 @@ public:
 
     static void for_each_view(Function<IterationDecision(ViewImplementation&)>);
     static Optional<ViewImplementation&> find_view_by_id(u64);
+    static Optional<ViewImplementation&> find_view_for_traversable(CanonicalTraversable const&);
 
     IsPrivate is_private() const { return m_is_private; }
 
@@ -117,6 +118,10 @@ public:
     };
     [[nodiscard]] HistoryTraversalOutcome traverse_the_history_by_delta(
         int delta,
+        CheckForCancelation = CheckForCancelation::Yes,
+        Function<void(HistoryTraversalOutcome)> = nullptr);
+    [[nodiscard]] HistoryTraversalOutcome traverse_the_history_to_step(
+        i32 step,
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void(HistoryTraversalOutcome)> = nullptr);
     [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
@@ -408,6 +413,7 @@ public:
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const = 0;
 
 protected:
+    HistoryTraversalOutcome start_history_traversal(HistoryTraversalDecision);
     virtual void insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation);
     virtual Vector<Web::Clipboard::SystemClipboardRepresentation> clipboard_entries() const;
 

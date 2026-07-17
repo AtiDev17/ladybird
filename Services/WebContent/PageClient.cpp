@@ -64,7 +64,6 @@ namespace WebContent {
 
 static bool s_is_headless { false };
 static bool s_async_scrolling_enabled { false };
-static bool s_should_report_session_history_updates_in_test_mode { false };
 static constexpr size_t s_max_download_data_ipc_chunk_size = 16 * MiB;
 
 GC_DEFINE_ALLOCATOR(PageClient);
@@ -92,11 +91,6 @@ void PageClient::set_is_headless(bool is_headless)
 void PageClient::set_async_scrolling_enabled(bool enabled)
 {
     s_async_scrolling_enabled = enabled;
-}
-
-void PageClient::set_should_report_session_history_updates_in_test_mode(bool should_report)
-{
-    s_should_report_session_history_updates_in_test_mode = should_report;
 }
 
 GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
@@ -131,6 +125,8 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
         visitor.visit(controller.value);
     for (auto& reader : m_download_readers)
         visitor.visit(reader.value);
+    for (auto& callback : m_pending_session_history_traversal_target_requests)
+        visitor.visit(callback.value);
     m_pending_dom_mutations.for_each([&](auto& pending_mutation) {
         visitor.visit(pending_mutation.target);
     });
@@ -1083,14 +1079,19 @@ void PageClient::send_current_needs_beforeunload_check()
     client().async_did_change_needs_beforeunload_check(m_id, page().needs_beforeunload_check());
 }
 
-bool PageClient::should_report_session_history_updates() const
-{
-    return !Web::HTML::Window::in_test_mode() || s_should_report_session_history_updates_in_test_mode;
-}
-
 void PageClient::page_did_update_session_history(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index)
 {
     client().async_did_update_session_history(m_id, entries, used_steps, current_used_step_index);
+}
+
+void PageClient::page_did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Web::HTML::StorageSerializationRecord const& navigation_api_state)
+{
+    client().async_did_update_session_history_entry_navigation_api_state(m_id, navigable_id, navigation_api_key, navigation_api_state);
+}
+
+void PageClient::page_did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode)
+{
+    client().async_did_update_session_history_entry_scroll_restoration_mode(m_id, navigable_id, navigation_api_key, scroll_restoration_mode);
 }
 
 String PageClient::page_did_request_ui_process_session_history_for_testing()
@@ -1108,9 +1109,36 @@ String PageClient::page_did_update_session_history_and_request_ui_process_sessio
     return client().did_update_session_history_and_request_ui_process_session_history_for_testing(m_id, entries, used_steps, current_used_step_index);
 }
 
-bool PageClient::page_did_request_traverse_the_history_by_delta(int delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
+void PageClient::page_did_request_traverse_the_history_by_delta(int delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
 {
-    return client().did_request_traverse_the_history_by_delta(m_id, delta, history_traversal_precheck);
+    client().async_did_request_traverse_the_history_by_delta(m_id, delta, history_traversal_precheck);
+}
+
+void PageClient::page_did_request_history_traversal_target_by_delta(int delta, GC::Ref<GC::Function<void(Optional<int>)>> on_complete)
+{
+    auto request_id = m_next_session_history_traversal_target_request_id++;
+    m_pending_session_history_traversal_target_requests.set(request_id, on_complete);
+    client().async_did_request_history_traversal_target_by_delta(m_id, request_id, delta);
+}
+
+void PageClient::page_did_request_traverse_the_history_to_step(int step, Web::HistoryTraversalPrecheck history_traversal_precheck)
+{
+    client().async_did_request_traverse_the_history_to_step(m_id, step, history_traversal_precheck);
+}
+
+void PageClient::page_did_request_navigation_api_traversal_target(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, GC::Ref<GC::Function<void(Optional<int>)>> on_complete)
+{
+    auto request_id = m_next_session_history_traversal_target_request_id++;
+    m_pending_session_history_traversal_target_requests.set(request_id, on_complete);
+    client().async_did_request_navigation_api_traversal_target(m_id, request_id, navigable_id, navigation_api_key);
+}
+
+void PageClient::did_resolve_session_history_traversal_target(u64 request_id, Optional<i32> target_step)
+{
+    auto callback = m_pending_session_history_traversal_target_requests.take(request_id);
+    if (!callback.has_value())
+        return;
+    callback.value()->function()(target_step);
 }
 
 void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)
