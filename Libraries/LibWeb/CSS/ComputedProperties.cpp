@@ -279,12 +279,15 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
             values.append(KeywordStyleValue::create(to_keyword(axis)));
         return StyleValueList::create(move(values), StyleValueList::Separator::Comma);
     };
+    auto color_or_auto_style_value = [&](ColorOrAuto const& color_or_auto) -> NonnullRefPtr<StyleValue const> {
+        return color_or_auto.computed_value.visit(
+            [](ColorOrAuto::Auto) -> NonnullRefPtr<StyleValue const> { return KeywordStyleValue::create(Keyword::Auto); },
+            [&](Color color) -> NonnullRefPtr<StyleValue const> { return color_style_value(color); });
+    };
 
     switch (property_id) {
     case PropertyID::AccentColor:
-        return accent_color_value().computed_value.visit(
-            [](AccentColor::Auto) -> NonnullRefPtr<StyleValue const> { return KeywordStyleValue::create(Keyword::Auto); },
-            [&](Color color) -> NonnullRefPtr<StyleValue const> { return color_style_value(color); });
+        return color_or_auto_style_value(accent_color_value());
     case PropertyID::AlignContent:
         return KeywordStyleValue::create(to_keyword(align_content()));
     case PropertyID::AlignItems:
@@ -438,7 +441,7 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
             return m_noninherited.border_top_color_style_value;
         return color_style_value(border_top().color);
     case PropertyID::CaretColor:
-        return color_style_value(caret_color());
+        return color_or_auto_style_value(caret_color_value());
     case PropertyID::CaptionSide:
         return KeywordStyleValue::create(to_keyword(caption_side()));
     case PropertyID::ClipRule:

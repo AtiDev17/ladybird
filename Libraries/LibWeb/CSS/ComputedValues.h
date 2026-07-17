@@ -770,7 +770,7 @@ struct TextDecorationThickness {
     Variant<Auto, FromFont, LengthPercentage> value;
 };
 
-struct AccentColor {
+struct ColorOrAuto {
     struct Auto { };
 
     Variant<Auto, Color> computed_value { Auto {} };
@@ -884,7 +884,8 @@ public:
     CSSPixels border_spacing_horizontal() const { return m_inherited.border_spacing_horizontal; }
     CSSPixels border_spacing_vertical() const { return m_inherited.border_spacing_vertical; }
     CaptionSide caption_side() const { return m_inherited.caption_side; }
-    Color caret_color() const { return m_inherited.caret_color; }
+    ColorOrAuto const& caret_color_value() const { return m_inherited.caret_color; }
+    Color caret_color() const { return m_inherited.caret_color.used_value; }
     Clear clear() const { return m_noninherited.clear; }
     Clip clip() const { return m_noninherited.clip; }
     ColorInterpolation color_interpolation() const { return m_inherited.color_interpolation; }
@@ -957,10 +958,10 @@ public:
     double flex_grow() const { return m_noninherited.flex_grow; }
     double flex_shrink() const { return m_noninherited.flex_shrink; }
     i32 order() const { return m_noninherited.order; }
-    AccentColor const& accent_color_value() const { return m_inherited.accent_color; }
+    ColorOrAuto const& accent_color_value() const { return m_inherited.accent_color; }
     Optional<Color> accent_color() const
     {
-        if (m_inherited.accent_color.computed_value.has<AccentColor::Auto>())
+        if (m_inherited.accent_color.computed_value.has<ColorOrAuto::Auto>())
             return {};
         return m_inherited.accent_color.used_value;
     }
@@ -1202,7 +1203,7 @@ private:
     void inherit_from(ComputedValues const& other) { m_inherited = other.m_inherited; }
 
     struct InheritedValues {
-        Color caret_color { InitialValues::caret_color() };
+        ColorOrAuto caret_color;
         CSSPixels font_size { InitialValues::font_size() };
         RefPtr<Gfx::FontCascadeList const> font_list {};
         Vector<ComputedFontFamily> font_families { GenericFontFamily::Serif };
@@ -1228,7 +1229,7 @@ private:
         PreferredColorScheme color_scheme { InitialValues::color_scheme() };
         Vector<Utf16FlyString> color_schemes;
         bool color_scheme_only { false };
-        AccentColor accent_color;
+        ColorOrAuto accent_color;
         Color webkit_text_fill_color { InitialValues::color() };
         bool webkit_text_fill_color_is_current_color { true };
         Vector<CursorData> cursor { InitialValues::cursor() };
@@ -1532,7 +1533,7 @@ public:
     void set_animation_timelines(Vector<AnimationTimelineData> value) { m_values.m_noninherited.animation_timelines = move(value); }
     void set_animation_timing_functions(Vector<EasingFunction> value) { m_values.m_noninherited.animation_timing_functions = move(value); }
     void set_animation_timing_function_style_values(StyleValueVector value) { m_values.m_noninherited.animation_timing_function_style_values = move(value); }
-    void set_caret_color(Color caret_color) { m_values.m_inherited.caret_color = caret_color; }
+    void set_caret_color(ColorOrAuto caret_color) { m_values.m_inherited.caret_color = move(caret_color); }
     void set_font_list(NonnullRefPtr<Gfx::FontCascadeList const> font_list) { m_values.m_inherited.font_list = move(font_list); }
     void set_font_families(Vector<ComputedFontFamily> value) { m_values.m_inherited.font_families = move(value); }
     void set_font_size(CSSPixels font_size) { m_values.m_inherited.font_size = font_size; }
@@ -1714,7 +1715,7 @@ public:
     void set_flex_grow(double value) { m_values.m_noninherited.flex_grow = value; }
     void set_flex_shrink(double value) { m_values.m_noninherited.flex_shrink = value; }
     void set_order(i32 value) { m_values.m_noninherited.order = value; }
-    void set_accent_color(AccentColor value) { m_values.m_inherited.accent_color = move(value); }
+    void set_accent_color(ColorOrAuto value) { m_values.m_inherited.accent_color = move(value); }
     void set_align_content(AlignContent value) { m_values.m_noninherited.align_content = value; }
     void set_align_items(AlignItems value) { m_values.m_noninherited.align_items = value; }
     void set_align_self(AlignSelf value) { m_values.m_noninherited.align_self = value; }
