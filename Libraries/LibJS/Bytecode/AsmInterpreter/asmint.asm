@@ -308,7 +308,7 @@ macro boolean_result_epilogue(slow_path_func)
     mov result, BOOLEAN_FALSE
     store_operand m_dst, result
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 end
 
@@ -316,7 +316,7 @@ end
 # Defines .take_true, .take_false, and .slow labels.
 macro jump_binary_epilogue(slow_path_func)
     temp target
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 .take_true:
     load_label target, m_true_target
@@ -364,7 +364,7 @@ macro bitwise_op(op_insn, slow_path_func)
     box_int32 dst, lhs_int
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 end
 
@@ -379,7 +379,7 @@ macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
     box_int32_clean dst, int_value
     store_operand m_dst, dst
     dispatch_next
-.overflow:
+.overflow: @cold
     unbox_int32 int_value, value
     int_to_double result_dbl, int_value
     mov dst, DOUBLE_ONE
@@ -388,7 +388,7 @@ macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov dst, result_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 end
 
@@ -404,7 +404,7 @@ macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
     box_int32_clean dst, int_value
     store_operand m_src, dst
     dispatch_next
-.overflow_after_store:
+.overflow_after_store: @cold
     unbox_int32 int_value, value
     int_to_double result_dbl, int_value
     mov dst, DOUBLE_ONE
@@ -413,7 +413,7 @@ macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov dst, result_dbl
     store_operand m_src, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 end
 
@@ -432,7 +432,7 @@ macro int32_shift_op(op_insn, slow_path_func)
     box_int32 dst, lhs_int
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path slow_path_func
 end
 
@@ -688,7 +688,7 @@ handler Add
     box_int32_clean dst, lhs_int
     store_operand m_dst, dst
     dispatch_next
-.overflow:
+.overflow: @cold
     # Int32 overflow: convert both to double and redo the operation
     unbox_int32 lhs_int, lhs
     unbox_int32 rhs_int, rhs
@@ -698,7 +698,7 @@ handler Add
     fp_mov dst, lhs_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_add
 end
 
@@ -718,7 +718,7 @@ handler Sub
     box_int32_clean dst, lhs_int
     store_operand m_dst, dst
     dispatch_next
-.overflow:
+.overflow: @cold
     unbox_int32 lhs_int, lhs
     unbox_int32 rhs_int, rhs
     int_to_double lhs_dbl, lhs_int
@@ -727,7 +727,7 @@ handler Sub
     fp_mov dst, lhs_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_sub
 end
 
@@ -754,11 +754,11 @@ handler Mul
     box_int32_clean dst, lhs_int
     store_operand m_dst, dst
     dispatch_next
-.negative_zero:
+.negative_zero: @cold
     mov dst, NEGATIVE_ZERO
     store_operand m_dst, dst
     dispatch_next
-.overflow:
+.overflow: @cold
     unbox_int32 lhs_int, lhs
     unbox_int32 rhs_int, rhs
     int_to_double lhs_dbl, lhs_int
@@ -767,27 +767,27 @@ handler Mul
     fp_mov dst, lhs_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_mul
 end
 
-handler Exp
+handler Exp @cold
     call_slow_path asm_slow_path_exp
 end
 
-handler ConcatString
+handler ConcatString @cold
     call_slow_path asm_slow_path_concat_string
 end
 
-handler CopyObjectExcludingProperties
+handler CopyObjectExcludingProperties @cold
     call_slow_path asm_slow_path_copy_object_excluding_properties
 end
 
-handler ImportCall
+handler ImportCall @cold
     call_slow_path asm_slow_path_import_call
 end
 
-handler NewClass
+handler NewClass @cold
     call_slow_path asm_slow_path_new_class
 end
 
@@ -1098,15 +1098,15 @@ handler GetLexicalEnvironment
     dispatch_next
 end
 
-handler GetImportMeta
+handler GetImportMeta @cold
     call_slow_path asm_slow_path_get_import_meta
 end
 
-handler GetNewTarget
+handler GetNewTarget @cold
     call_slow_path asm_slow_path_get_new_target
 end
 
-handler GetSuperConstructor
+handler GetSuperConstructor @cold
     call_slow_path asm_slow_path_get_super_constructor
 end
 
@@ -1187,7 +1187,7 @@ handler GetBinding
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_binding
 end
 
@@ -1197,7 +1197,7 @@ handler DynamicGetBinding
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_get_binding
 end
 
@@ -1208,7 +1208,7 @@ handler GetInitializedBinding
     load_binding_value env, idx, binding_values, value
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_initialized_binding
 end
 
@@ -1218,7 +1218,7 @@ handler DynamicGetInitializedBinding
     load_binding_value env, idx, binding_values, value
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_get_initialized_binding
 end
 
@@ -1229,7 +1229,7 @@ handler InitializeLexicalBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_initialize_lexical_binding
 end
 
@@ -1239,7 +1239,7 @@ handler InitializeVariableBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_initialize_variable_binding
 end
 
@@ -1249,7 +1249,7 @@ handler DynamicInitializeLexicalBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_initialize_lexical_binding
 end
 
@@ -1259,7 +1259,7 @@ handler DynamicInitializeVariableBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_initialize_variable_binding
 end
 
@@ -1275,7 +1275,7 @@ handler SetLexicalBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_set_lexical_binding
 end
 
@@ -1290,7 +1290,7 @@ handler SetVariableBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_set_variable_binding
 end
 
@@ -1305,7 +1305,7 @@ handler DynamicSetLexicalBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_set_lexical_binding
 end
 
@@ -1320,51 +1320,51 @@ handler DynamicSetVariableBinding
     load_operand value, m_src
     store_binding_value env, idx, binding_values, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_set_variable_binding
 end
 
-handler ResolveBinding
+handler ResolveBinding @cold
     call_slow_path asm_slow_path_resolve_binding
 end
 
-handler ResolveSuperBase
+handler ResolveSuperBase @cold
     call_slow_path asm_slow_path_resolve_super_base
 end
 
-handler SetResolvedBinding
+handler SetResolvedBinding @cold
     call_slow_path asm_slow_path_set_resolved_binding
 end
 
-handler TypeofBinding
+handler TypeofBinding @cold
     call_slow_path asm_slow_path_typeof_binding
 end
 
-handler DynamicTypeofBinding
+handler DynamicTypeofBinding @cold
     call_slow_path asm_slow_path_dynamic_typeof_binding
 end
 
-handler HasPrivateId
+handler HasPrivateId @cold
     call_slow_path asm_slow_path_has_private_id
 end
 
-handler SetFunctionName
+handler SetFunctionName @cold
     call_slow_path asm_slow_path_set_function_name
 end
 
-handler NewArrayWithLength
+handler NewArrayWithLength @cold
     call_slow_path asm_slow_path_new_array_with_length
 end
 
-handler ArrayAppend
+handler ArrayAppend @cold
     call_slow_path asm_slow_path_array_append
 end
 
-handler CreateVariable
+handler CreateVariable @cold
     call_slow_path asm_slow_path_create_variable
 end
 
-handler EnterObjectEnvironment
+handler EnterObjectEnvironment @cold
     call_slow_path asm_slow_path_enter_object_environment
 end
 
@@ -1420,7 +1420,7 @@ handler Div
     canonicalize_nan dst, lhs_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_div
 end
 
@@ -1480,7 +1480,7 @@ handler UnaryPlus
 .done:
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_unary_plus
 end
 
@@ -1491,7 +1491,7 @@ handler ThrowIfTDZ
     mov empty, EMPTY_VALUE
     branch_eq value, empty, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_throw_if_tdz
 end
 
@@ -1502,7 +1502,7 @@ handler ThrowIfNotObject
     extract_tag tag, value
     branch_ne tag, OBJECT_TAG, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_throw_if_not_object
 end
 
@@ -1514,43 +1514,43 @@ handler ThrowIfNullish
     and tag, 0xFFFE
     branch_eq tag, UNDEFINED_TAG, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_throw_if_nullish
 end
 
-handler ThrowConstAssignment
+handler ThrowConstAssignment @cold
     call_slow_path asm_slow_path_throw_const_assignment
 end
 
-handler Throw
+handler Throw @cold
     call_slow_path asm_slow_path_throw
 end
 
-handler Await
+handler Await @cold
     call_slow_path asm_slow_path_await
 end
 
-handler Yield
+handler Yield @cold
     call_slow_path asm_slow_path_yield
 end
 
-handler YieldIteratorResult
+handler YieldIteratorResult @cold
     call_slow_path asm_slow_path_yield_iterator_result
 end
 
-handler ToString
+handler ToString @cold
     call_slow_path asm_slow_path_to_string
 end
 
-handler ToPrimitiveWithStringHint
+handler ToPrimitiveWithStringHint @cold
     call_slow_path asm_slow_path_to_primitive_with_string_hint
 end
 
-handler ToObject
+handler ToObject @cold
     call_slow_path asm_slow_path_to_object
 end
 
-handler ToLength
+handler ToLength @cold
     call_slow_path asm_slow_path_to_length
 end
 
@@ -1566,7 +1566,7 @@ handler BitwiseNot
     box_int32_clean dst, dst
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_bitwise_not
 end
 
@@ -1614,7 +1614,7 @@ handler UnsignedRightShift
     fp_mov dst, dst_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_unsigned_right_shift
 end
 
@@ -1638,7 +1638,7 @@ handler Mod
     box_int32 dst, rem
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_mod
 end
 
@@ -1675,7 +1675,7 @@ handler GetCalleeAndThisFromEnvironment
     mov value, UNDEFINED_SHIFTED
     store_operand m_this_value, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_callee_and_this
 end
 
@@ -1688,7 +1688,7 @@ handler DynamicGetCalleeAndThisFromEnvironment
     mov value, UNDEFINED_SHIFTED
     store_operand m_this_value, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_dynamic_get_callee_and_this
 end
 
@@ -1722,11 +1722,11 @@ handler UnaryMinus
     box_int32_clean dst, int_value
     store_operand m_dst, dst
     dispatch_next
-.negative_zero:
+.negative_zero: @cold
     mov dst, NEGATIVE_ZERO
     store_operand m_dst, dst
     dispatch_next
-.overflow:
+.overflow: @cold
     # INT32_MIN: -(-2147483648) = 2147483648.0
     int_to_double dst_dbl, int_value
     fp_mov dst, dst_dbl
@@ -1739,7 +1739,7 @@ handler UnaryMinus
     toggle_bit value, 63
     store_operand m_dst, value
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_unary_minus
 end
 
@@ -1778,7 +1778,7 @@ handler ToInt32
     box_int32_clean dst, value
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     # Slow path handles other types (string, object, nullish, etc) and uncommon cases.
     call_slow_path asm_slow_path_to_int32
 end
@@ -1837,7 +1837,7 @@ handler PutByValue
     load_operand src, m_src
     store64 [elements, index, 8], src
     dispatch_next
-.try_holey_array_slow:
+.try_holey_array_slow: @cold
     call_interp asm_try_put_by_value_holey_array, result
     branch_nonzero result, .slow
     dispatch_next
@@ -1914,11 +1914,11 @@ handler PutByValue
     caged_primitive_storage_address addr, elements, cached_offset, index, 1
     store16 [addr, 0], src_int32
     dispatch_next
-.try_typed_array_slow:
+.try_typed_array_slow: @cold
     call_interp asm_try_put_by_value_typed_array, result
     branch_nonzero result, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_put_by_value
 end
 
@@ -1968,14 +1968,13 @@ handler GetById
 .try_cache:
     # Try all cache entries via C++ helper
     call_interp asm_try_get_by_id_cache, result
-    branch_zero result, .done
-.slow:
-    call_slow_path asm_slow_path_get_by_id
-.done:
+    branch_nonzero result, .slow
     dispatch_next
+.slow: @cold
+    call_slow_path asm_slow_path_get_by_id
 end
 
-handler GetByIdWithThis
+handler GetByIdWithThis @cold
     call_slow_path asm_slow_path_get_by_id_with_this
 end
 
@@ -2009,14 +2008,13 @@ handler PutById
 .try_cache:
     # Try all cache entries via C++ helper (handles AddOwnProperty)
     call_interp asm_try_put_by_id_cache, result
-    branch_zero result, .done
-.slow:
-    call_slow_path asm_slow_path_put_by_id
-.done:
+    branch_nonzero result, .slow
     dispatch_next
+.slow: @cold
+    call_slow_path asm_slow_path_put_by_id
 end
 
-handler PutByIdWithThis
+handler PutByIdWithThis @cold
     call_slow_path asm_slow_path_put_by_id_with_this
 end
 
@@ -2140,7 +2138,7 @@ handler GetByValue
     load32 raw, [addr, 0]
     branch_bit_set raw, 31, .ta_uint32_to_double
     jmp .ta_box_int32
-.ta_uint32_to_double:
+.ta_uint32_to_double: @cold
     int_to_double slot_dbl, raw
     fp_mov dst, slot_dbl
     store_operand m_dst, dst
@@ -2149,23 +2147,23 @@ handler GetByValue
     box_int32_clean dst, raw
     store_operand m_dst, dst
     dispatch_next
-.try_typed_array_slow:
+.try_typed_array_slow: @cold
     call_interp asm_try_get_by_value_typed_array, result
     branch_nonzero result, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_by_value
 end
 
-handler GetByValueWithThis
+handler GetByValueWithThis @cold
     call_slow_path asm_slow_path_get_by_value_with_this
 end
 
-handler PutByValueWithThis
+handler PutByValueWithThis @cold
     call_slow_path asm_slow_path_put_by_value_with_this
 end
 
-handler PutBySpread
+handler PutBySpread @cold
     call_slow_path asm_slow_path_put_by_spread
 end
 
@@ -2209,24 +2207,24 @@ handler GetLength
     box_int32 dst, length
     store_operand m_dst, dst
     dispatch_next
-.length_double:
+.length_double: @cold
     int_to_double length_dbl, length
     fp_mov dst, length_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_length
 end
 
-handler GetLengthWithThis
+handler GetLengthWithThis @cold
     call_slow_path asm_slow_path_get_length_with_this
 end
 
-handler GetMethod
+handler GetMethod @cold
     call_slow_path asm_slow_path_get_method
 end
 
-handler GetIterator
+handler GetIterator @cold
     call_slow_path asm_slow_path_get_iterator
 end
 
@@ -2270,11 +2268,11 @@ handler GetGlobal
     check_binding_initialized env, idx, binding_values, value, empty, .slow
     store_operand m_dst, value
     dispatch_next
-.slow_env:
+.slow_env: @cold
     call_interp asm_try_get_global_env_binding, result
     branch_nonzero result, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_get_global
 end
 
@@ -2319,11 +2317,11 @@ handler SetGlobal
     load_operand src, m_src
     store_binding_value env, idx, binding_values, src
     dispatch_next
-.slow_env:
+.slow_env: @cold
     call_interp asm_try_set_global_env_binding, result
     branch_nonzero result, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_set_global
 end
 
@@ -2771,11 +2769,11 @@ handler Call
     load32 native_pc, [exec_ctx, EXECUTION_CONTEXT_PROGRAM_COUNTER]
     mov pc, native_pc
     goto_handler pc
-.call_exit_asm:
+.call_exit_asm: @cold
     # No JS handler caught the native exception; bail out of the asm
     # dispatch loop and let the C++ caller of run_asm() see the throw.
     exit
-.call_slow:
+.call_slow: @cold
     call_slow_path asm_slow_path_call
 end
 
@@ -2803,7 +2801,7 @@ handler CallBuiltinMathAbs
     box_int32_clean dst, int_value
     store_operand m_dst, dst
     dispatch_next
-.abs_overflow:
+.abs_overflow: @cold
     # INT32_MIN: abs(-2147483648) = 2147483648.0
     unbox_int32 int_value, arg
     neg int_value
@@ -2811,7 +2809,7 @@ handler CallBuiltinMathAbs
     fp_mov dst, arg_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_math_abs
 end
 
@@ -2826,7 +2824,7 @@ handler CallBuiltinMathFloor
     box_double_or_int32 dst, arg_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_math_floor
 end
 
@@ -2841,7 +2839,7 @@ handler CallBuiltinMathCeil
     box_double_or_int32 dst, arg_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_math_ceil
 end
 
@@ -2856,7 +2854,7 @@ handler CallBuiltinMathSqrt
     box_double_or_int32 dst, arg_dbl
     store_operand m_dst, dst
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_math_sqrt
 end
 
@@ -2870,71 +2868,71 @@ handler CallBuiltinMathExp
     call_helper asm_helper_math_exp, arg, result
     store_operand m_dst, result
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_math_exp
 end
 
-handler CallBuiltinMathLog
+handler CallBuiltinMathLog @cold
     call_slow_path asm_slow_path_call_builtin_math_log
 end
 
-handler CallBuiltinMathPow
+handler CallBuiltinMathPow @cold
     call_slow_path asm_slow_path_call_builtin_math_pow
 end
 
-handler CallBuiltinMathImul
+handler CallBuiltinMathImul @cold
     call_slow_path asm_slow_path_call_builtin_math_imul
 end
 
-handler CallBuiltinMathRandom
+handler CallBuiltinMathRandom @cold
     call_slow_path asm_slow_path_call_builtin_math_random
 end
 
-handler CallBuiltinMathRound
+handler CallBuiltinMathRound @cold
     call_slow_path asm_slow_path_call_builtin_math_round
 end
 
-handler CallBuiltinMathSin
+handler CallBuiltinMathSin @cold
     call_slow_path asm_slow_path_call_builtin_math_sin
 end
 
-handler CallBuiltinMathCos
+handler CallBuiltinMathCos @cold
     call_slow_path asm_slow_path_call_builtin_math_cos
 end
 
-handler CallBuiltinMathTan
+handler CallBuiltinMathTan @cold
     call_slow_path asm_slow_path_call_builtin_math_tan
 end
 
-handler CallBuiltinRegExpPrototypeExec
+handler CallBuiltinRegExpPrototypeExec @cold
     call_slow_path asm_slow_path_call_builtin_regexp_prototype_exec
 end
 
-handler CallBuiltinRegExpPrototypeReplace
+handler CallBuiltinRegExpPrototypeReplace @cold
     call_slow_path asm_slow_path_call_builtin_regexp_prototype_replace
 end
 
-handler CallBuiltinRegExpPrototypeSplit
+handler CallBuiltinRegExpPrototypeSplit @cold
     call_slow_path asm_slow_path_call_builtin_regexp_prototype_split
 end
 
-handler CallBuiltinOrdinaryHasInstance
+handler CallBuiltinOrdinaryHasInstance @cold
     call_slow_path asm_slow_path_call_builtin_ordinary_has_instance
 end
 
-handler CallBuiltinArrayIteratorPrototypeNext
+handler CallBuiltinArrayIteratorPrototypeNext @cold
     call_slow_path asm_slow_path_call_builtin_array_iterator_prototype_next
 end
 
-handler CallBuiltinMapIteratorPrototypeNext
+handler CallBuiltinMapIteratorPrototypeNext @cold
     call_slow_path asm_slow_path_call_builtin_map_iterator_prototype_next
 end
 
-handler CallBuiltinSetIteratorPrototypeNext
+handler CallBuiltinSetIteratorPrototypeNext @cold
     call_slow_path asm_slow_path_call_builtin_set_iterator_prototype_next
 end
 
-handler CallBuiltinStringIteratorPrototypeNext
+handler CallBuiltinStringIteratorPrototypeNext @cold
     call_slow_path asm_slow_path_call_builtin_string_iterator_prototype_next
 end
 
@@ -2961,7 +2959,7 @@ handler CallBuiltinStringFromCharCode
     store_operand m_dst, result
     dispatch_next
 
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_string_from_char_code
 end
 
@@ -2985,12 +2983,12 @@ handler CallBuiltinStringPrototypeCharCodeAt
     store_operand m_dst, dst
     dispatch_next
 
-.out_of_bounds:
+.out_of_bounds: @cold
     mov dst, CANON_NAN_BITS
     store_operand m_dst, dst
     dispatch_next
 
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_string_prototype_char_code_at
 end
 
@@ -3025,7 +3023,7 @@ handler CallBuiltinStringPrototypeCharAt
     store_operand m_dst, result
     dispatch_next
 
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_call_builtin_string_prototype_char_at
 end
 
@@ -3037,7 +3035,7 @@ end
 # because the operation is inherently complex (object allocation, prototype
 # chain walks, etc).
 
-handler GetObjectPropertyIterator
+handler GetObjectPropertyIterator @cold
     call_slow_path asm_slow_path_get_object_property_iterator
 end
 
@@ -3134,91 +3132,91 @@ handler ObjectPropertyIteratorNext
     store_operand m_dst_done, scratch
     dispatch_next
 
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_object_property_iterator_next
 end
 
-handler IteratorClose
+handler IteratorClose @cold
     call_slow_path asm_slow_path_iterator_close
 end
 
-handler IteratorNext
+handler IteratorNext @cold
     call_slow_path asm_slow_path_iterator_next
 end
 
-handler IteratorNextUnpack
+handler IteratorNextUnpack @cold
     call_slow_path asm_slow_path_iterator_next_unpack
 end
 
-handler IteratorToArray
+handler IteratorToArray @cold
     call_slow_path asm_slow_path_iterator_to_array
 end
 
-handler CallConstruct
+handler CallConstruct @cold
     call_slow_path asm_slow_path_call_construct
 end
 
-handler CallDirectEval
+handler CallDirectEval @cold
     call_slow_path asm_slow_path_call_direct_eval
 end
 
-handler CallWithArgumentArray
+handler CallWithArgumentArray @cold
     call_slow_path asm_slow_path_call_with_argument_array
 end
 
-handler CallDirectEvalWithArgumentArray
+handler CallDirectEvalWithArgumentArray @cold
     call_slow_path asm_slow_path_call_direct_eval_with_argument_array
 end
 
-handler CallConstructWithArgumentArray
+handler CallConstructWithArgumentArray @cold
     call_slow_path asm_slow_path_call_construct_with_argument_array
 end
 
-handler SuperCallWithArgumentArray
+handler SuperCallWithArgumentArray @cold
     call_slow_path asm_slow_path_super_call_with_argument_array
 end
 
-handler NewObject
+handler NewObject @cold
     call_slow_path asm_slow_path_new_object
 end
 
-handler NewObjectWithNoPrototype
+handler NewObjectWithNoPrototype @cold
     call_slow_path asm_slow_path_new_object_with_no_prototype
 end
 
-handler CacheObjectShape
+handler CacheObjectShape @cold
     call_slow_path asm_slow_path_cache_object_shape
 end
 
-handler InitObjectLiteralProperty
+handler InitObjectLiteralProperty @cold
     call_slow_path asm_slow_path_init_object_literal_property
 end
 
-handler NewArray
+handler NewArray @cold
     call_slow_path asm_slow_path_new_array
 end
 
-handler NewPrimitiveArray
+handler NewPrimitiveArray @cold
     call_slow_path asm_slow_path_new_primitive_array
 end
 
-handler NewRegExp
+handler NewRegExp @cold
     call_slow_path asm_slow_path_new_regexp
 end
 
-handler NewReferenceError
+handler NewReferenceError @cold
     call_slow_path asm_slow_path_new_reference_error
 end
 
-handler NewTypeError
+handler NewTypeError @cold
     call_slow_path asm_slow_path_new_type_error
 end
 
-handler InstanceOf
+handler InstanceOf @cold
     call_slow_path asm_slow_path_instance_of
 end
 
-handler In
+handler In @cold
     call_slow_path asm_slow_path_in
 end
 
@@ -3239,79 +3237,79 @@ handler IsCallable
     dispatch_next
 end
 
-handler IsConstructor
+handler IsConstructor @cold
     call_slow_path asm_slow_path_is_constructor
 end
 
-handler AddPrivateName
+handler AddPrivateName @cold
     call_slow_path asm_slow_path_add_private_name
 end
 
-handler CreateAsyncFromSyncIterator
+handler CreateAsyncFromSyncIterator @cold
     call_slow_path asm_slow_path_create_async_from_sync_iterator
 end
 
-handler CreateDataPropertyOrThrow
+handler CreateDataPropertyOrThrow @cold
     call_slow_path asm_slow_path_create_data_property_or_throw
 end
 
-handler CreateImmutableBinding
+handler CreateImmutableBinding @cold
     call_slow_path asm_slow_path_create_immutable_binding
 end
 
-handler CreateMutableBinding
+handler CreateMutableBinding @cold
     call_slow_path asm_slow_path_create_mutable_binding
 end
 
-handler CreateRestParams
+handler CreateRestParams @cold
     call_slow_path asm_slow_path_create_rest_params
 end
 
-handler CreateArguments
+handler CreateArguments @cold
     call_slow_path asm_slow_path_create_arguments
 end
 
-handler CreateLexicalEnvironment
+handler CreateLexicalEnvironment @cold
     call_slow_path asm_slow_path_create_lexical_environment
 end
 
-handler CreatePrivateEnvironment
+handler CreatePrivateEnvironment @cold
     call_slow_path asm_slow_path_create_private_environment
 end
 
-handler CreateVariableEnvironment
+handler CreateVariableEnvironment @cold
     call_slow_path asm_slow_path_create_variable_environment
 end
 
-handler DeleteById
+handler DeleteById @cold
     call_slow_path asm_slow_path_delete_by_id
 end
 
-handler DeleteByValue
+handler DeleteByValue @cold
     call_slow_path asm_slow_path_delete_by_value
 end
 
-handler DeleteVariable
+handler DeleteVariable @cold
     call_slow_path asm_slow_path_delete_variable
 end
 
-handler GetCompletionFields
+handler GetCompletionFields @cold
     call_slow_path asm_slow_path_get_completion_fields
 end
 
-handler SetCompletionType
+handler SetCompletionType @cold
     call_slow_path asm_slow_path_set_completion_type
 end
 
-handler GetTemplateObject
+handler GetTemplateObject @cold
     call_slow_path asm_slow_path_get_template_object
 end
 
-handler NewFunction
+handler NewFunction @cold
     call_slow_path asm_slow_path_new_function
 end
 
-handler Typeof
+handler Typeof @cold
     call_slow_path asm_slow_path_typeof
 end
 
@@ -3331,14 +3329,14 @@ handler ResolveThisBinding
     mov empty, EMPTY_VALUE
     branch_eq this_value, empty, .slow
     dispatch_next
-.slow:
+.slow: @cold
     call_slow_path asm_slow_path_resolve_this_binding
 end
 
-handler GetPrivateById
+handler GetPrivateById @cold
     call_slow_path asm_slow_path_get_private_by_id
 end
 
-handler PutPrivateById
+handler PutPrivateById @cold
     call_slow_path asm_slow_path_put_private_by_id
 end
