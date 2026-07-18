@@ -92,6 +92,8 @@ pub struct RuntimeHelpers {
     pub memory_buffer_size_offset: u32,
     pub memory_buffer_storage_offset_offset: u32,
     pub compiled_call_result_scratch_offset: u32,
+    pub value_stack_base_offset: u32,
+    pub value_stack_top_offset: u32,
 }
 
 /// Stable index assigned to each runtime helper. Embedded in cranelift `ExternalName`
@@ -169,6 +171,17 @@ pub fn compile_to_bytes(
     helpers: &RuntimeHelpers,
     outcome_return_value: u64,
     result_arity: u32,
+    num_locals: u32,
+    num_params: u32,
+    local_types: &[u8],
 ) -> Result<CompiledFunction, &'static str> {
-    CraneliftCompiler::compile_to_bytes(insns, helpers, outcome_return_value, result_arity)
+    CraneliftCompiler::compile_to_bytes(
+        insns,
+        helpers,
+        outcome_return_value,
+        result_arity,
+        num_locals,
+        num_params,
+        local_types,
+    )
 }

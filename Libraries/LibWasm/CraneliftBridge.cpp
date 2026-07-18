@@ -52,6 +52,9 @@ struct InputFunctionEntry {
     u32 insn_offset;
     u32 insn_count;
     u32 result_arity;
+    u32 num_locals;
+    u32 locals_offset;
+    u32 num_params;
 };
 
 struct OutputFunctionEntry {
@@ -92,13 +95,15 @@ struct BatchInput {
     u32 result_arity;
     u32 function_index;
     CompiledInstructions* target;
+    u32 num_locals;
+    u32 num_params;
 };
 
 // Disk-cache blob format. Stable: cached files name format_version + layout_hash so
 // any rebuild that changes those will simply miss the cache rather than try to
 // execute incompatible bytes.
 constexpr u64 cache_blob_magic = 0x4354494A4D534157ULL; // "WASMJITC" little-endian
-constexpr u32 cache_blob_format_version = 5;
+constexpr u32 cache_blob_format_version = 8;
 
 struct CacheBlobHeader {
     u64 magic;
@@ -171,6 +176,8 @@ static u64 compute_layout_hash(RuntimeHelpers const& h)
     hash = fnv1a(hash, h.memory_buffer_size_offset);
     hash = fnv1a(hash, h.memory_buffer_storage_offset_offset);
     hash = fnv1a(hash, h.compiled_call_result_scratch_offset);
+    hash = fnv1a(hash, h.value_stack_base_offset);
+    hash = fnv1a(hash, h.value_stack_top_offset);
     hash = fnv1a(hash, h.primitive_storage_cage_offset_mask);
     return hash;
 }
@@ -278,7 +285,43 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
 
 extern "C" {
 
-static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, Configuration& config, FunctionAddress address, Vector<Value, ArgumentsStaticSize>& args)
+static ALWAYS_INLINE i32 wasm_cl_run_compiled(BytecodeInterpreter& interpreter, Configuration& config, CompiledFunctionEntry const& entry, Value* callee_locals)
+{
+    BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
+    config.set_frame_lightweight(*entry.module, callee_locals, *entry.expression, entry.arity);
+    config.ip() = 0;
+
+    interpreter.clear_trap();
+    using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
+    auto const handler = bit_cast<HandlerFn>(entry.handler_ptr);
+    auto outcome = handler(interpreter, config, entry.first_insn, 0, bit_cast<Dispatch const*>(entry.dispatches_ptr), bit_cast<SourcesAndDestination const*>(entry.src_dst_ptr));
+
+    if (outcome != Outcome::Return) {
+        interpreter.set_trap("Compiled function returned unexpectedly"sv);
+        return 1;
+    }
+    if (interpreter.did_trap())
+        return 1;
+    if (entry.arity == 1)
+        config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
+    // No label pop: set_frame_lightweight doesn't push labels.
+    return 0;
+}
+
+static NEVER_INLINE COLD i32 wasm_cl_run_compiled_with_heap_locals(BytecodeInterpreter& interpreter, Configuration& config, CompiledFunctionEntry const& entry, Value const* args, size_t arg_count)
+{
+    auto total = arg_count + entry.total_local_count;
+    Vector<Value, ArgumentsStaticSize> heap_locals;
+    heap_locals.ensure_capacity(total);
+    heap_locals.resize_and_keep_capacity(total);
+    auto* callee_locals = heap_locals.data();
+    for (size_t i = 0; i < arg_count; i++)
+        callee_locals[i] = args[i];
+    // The non-argument slots are left uninitialized; the compiled entry block zeroes its own locals.
+    return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
+}
+
+static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, Configuration& config, FunctionAddress address, Value const* args, size_t arg_count)
 {
     if (interpreter.trap_if_insufficient_native_stack_space())
         return 1;
@@ -291,56 +334,42 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
 
         // Fast compiled-to-compiled call: stack-allocate locals + non-owning frame.
         auto& func = wasm_function->code().func();
-        auto arg_count = args.size();
-        auto local_count = func.total_local_count();
-        auto total = arg_count + local_count;
-        auto callee_arity = wasm_function->type().results().size();
+        auto& ci = func.body().compiled_instructions;
+        CompiledFunctionEntry const entry {
+            .handler_ptr = cranelift_entry_acquire(ci),
+            .dispatches_ptr = bit_cast<FlatPtr>(ci.dispatches.data()),
+            .src_dst_ptr = bit_cast<FlatPtr>(ci.src_dst_mappings.data()),
+            .first_insn = ci.dispatches[0].instruction,
+            .expression = &func.body(),
+            .module = &wasm_function->module(),
+            // Match the direct-call table's sizing: the JIT frame is grown by the inlined-callee
+            // locals too, so the buffer must cover them or the callee scribbles past its end.
+            .total_local_count = static_cast<u32>(func.total_local_count()) + ci.cranelift_inlined_locals,
+            .arity = static_cast<u32>(wasm_function->type().results().size()),
+            .max_call_rec_size = static_cast<u32>(ci.max_call_rec_size),
+        };
 
-        Value callee_buf[64];
-        Value* callee_locals = callee_buf;
-        Vector<Value, ArgumentsStaticSize> heap_fallback;
-        if (total > 64) [[unlikely]] {
-            heap_fallback.ensure_capacity(total);
-            heap_fallback.resize_and_keep_capacity(total);
-            callee_locals = heap_fallback.data();
-        }
+        if (arg_count + entry.total_local_count > 64) [[unlikely]]
+            return wasm_cl_run_compiled_with_heap_locals(interpreter, config, entry, args, arg_count);
+
+        // Opt out of -ftrivial-auto-var-init: only the argument slots are written below, and the
+        // compiled entry block initializes its own locals, so nothing reads the rest.
+        __attribute__((uninitialized)) Value callee_locals[64];
         for (size_t i = 0; i < arg_count; i++)
             callee_locals[i] = args[i];
-        __builtin_memset(callee_locals + arg_count, 0, local_count * sizeof(Value));
-
-        auto& ci = func.body().compiled_instructions;
-        {
-            BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-            config.set_frame_lightweight(wasm_function->module(), callee_locals, func.body(), callee_arity);
-            config.setup_call_record_for_current_frame();
-            config.ip() = 0;
-
-            interpreter.clear_trap();
-            auto const* cc = ci.dispatches.data();
-            auto const* addrs = ci.src_dst_mappings.data();
-            using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
-            auto const handler = bit_cast<HandlerFn>(cranelift_entry_acquire(ci));
-            auto outcome = handler(interpreter, config, cc[0].instruction, 0, cc, addrs);
-
-            if (outcome != Outcome::Return) {
-                interpreter.set_trap("Compiled function returned unexpectedly"sv);
-                return 1;
-            }
-            if (interpreter.did_trap())
-                return 1;
-
-            if (callee_arity == 1)
-                config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-            // No label pop: set_frame_lightweight doesn't push labels.
-        }
-        return 0;
+        return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
     }
 
+    Vector<Value, ArgumentsStaticSize> args_vec;
+    config.get_arguments_allocation_if_possible(args_vec, arg_count);
+    args_vec.ensure_capacity(arg_count);
+    for (size_t i = 0; i < arg_count; i++)
+        args_vec.unchecked_append(args[i]);
+
     // direct-threaded interpreter path:
-    // CallFrameHandle saves/zeros/restores the direct call counter automatically.
     if (auto* wasm_function = instance->get_pointer<WasmFunction>(); wasm_function && !config.should_limit_instruction_count() && wasm_function->code().func().body().compiled_instructions.direct) {
         BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-        if (auto prepare_result = config.prepare_wasm_call(*wasm_function, args); prepare_result.is_error()) {
+        if (auto prepare_result = config.prepare_wasm_call(*wasm_function, args_vec); prepare_result.is_error()) {
             interpreter.set_trap(prepare_result.release_error());
             return 1;
         }
@@ -354,8 +383,8 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
             return 1;
         if (config.frame().arity() == 1)
             config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-        if (!config.label_stack().is_empty())
-            config.label_stack().take_last();
+        if (config.label_stack().size() > config.frame().label_index())
+            config.label_stack().shrink(config.frame().label_index(), true);
         return 0;
     }
 
@@ -363,10 +392,10 @@ static ALWAYS_INLINE i32 wasm_cl_finish_call(BytecodeInterpreter& interpreter, C
     Wasm::Result result { Vector<Value> {} };
     if (instance->has<WasmFunction>()) {
         BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-        result = config.call(interpreter, address, args);
+        result = config.call(interpreter, address, args_vec);
     } else {
-        result = config.call(interpreter, address, args);
-        config.release_arguments_allocation(args);
+        result = config.call(interpreter, address, args_vec);
+        config.release_arguments_allocation(args_vec);
     }
 
     if (result.is_trap()) {
@@ -799,10 +828,12 @@ i32 wasm_cl_call_with_record(void* interp_ptr, void* config_ptr, i32 func_index)
     FunctionType const* type { nullptr };
     instance->visit([&](auto const& function) { type = &function.type(); });
 
-    Vector<Value, ArgumentsStaticSize> args;
-    config.take_call_record(args);
-    args.shrink(type->parameters().size(), true);
-    return wasm_cl_finish_call(interpreter, config, address, args);
+    return wasm_cl_finish_call(interpreter, config, address, config.call_record_base(), type->parameters().size());
+}
+
+static NEVER_INLINE COLD i32 wasm_cl_direct_call_fallback(BytecodeInterpreter& interpreter, Configuration& config, i32 func_index, Value const* args, size_t arg_count)
+{
+    return wasm_cl_finish_call(interpreter, config, config.frame().module().functions()[func_index], args, arg_count);
 }
 
 // Direct compiled-to-compiled call. Falls back to wasm_cl_finish_call for non-compiled targets.
@@ -810,14 +841,8 @@ static ALWAYS_INLINE i32 wasm_cl_direct_call_impl(BytecodeInterpreter& interpret
 {
     auto const* table = config.frame().compiled_fn_table();
     auto index = static_cast<size_t>(func_index);
-    if (!table || index >= table->size() || !(*table)[index].module) [[unlikely]] {
-        // Not Cranelift-compiled, fall back to full path.
-        Vector<Value, ArgumentsStaticSize> args_vec;
-        args_vec.ensure_capacity(arg_count);
-        for (size_t i = 0; i < arg_count; i++)
-            args_vec.unchecked_append(args[i]);
-        return wasm_cl_finish_call(interpreter, config, config.frame().module().functions()[func_index], args_vec);
-    }
+    if (!table || index >= table->size() || !(*table)[index].module) [[unlikely]]
+        return wasm_cl_direct_call_fallback(interpreter, config, func_index, args, arg_count);
 
     auto const& entry = (*table)[index];
 
@@ -826,41 +851,15 @@ static ALWAYS_INLINE i32 wasm_cl_direct_call_impl(BytecodeInterpreter& interpret
         return 1;
     }
 
-    // Stack-allocate callee locals: args + zero-initialized locals.
-    auto total = arg_count + entry.total_local_count;
-    Value callee_locals_buf[64];
-    Value* callee_locals = callee_locals_buf;
-    Vector<Value, ArgumentsStaticSize> heap_buf;
-    if (total > 64) [[unlikely]] {
-        heap_buf.ensure_capacity(total);
-        heap_buf.resize_and_keep_capacity(total);
-        callee_locals = heap_buf.data();
-    }
+    if (arg_count + entry.total_local_count > 64) [[unlikely]]
+        return wasm_cl_run_compiled_with_heap_locals(interpreter, config, entry, args, arg_count);
+
+    // Opt out of -ftrivial-auto-var-init as in wasm_cl_finish_call: only the argument slots are
+    // written, and the compiled entry block initializes its own locals.
+    __attribute__((uninitialized)) Value callee_locals[64];
     for (size_t i = 0; i < arg_count; i++)
         callee_locals[i] = args[i];
-    __builtin_memset(callee_locals + arg_count, 0, entry.total_local_count * sizeof(Value));
-
-    // Lightweight non-owning frame push + direct handler call.
-    BytecodeInterpreter::CallFrameHandle handle { interpreter, config };
-    config.set_frame_lightweight(*entry.module, callee_locals, *entry.expression, entry.arity);
-    config.setup_call_record_for_current_frame();
-    config.ip() = 0;
-
-    interpreter.clear_trap();
-    using HandlerFn = Outcome (*)(BytecodeInterpreter&, Configuration&, Instruction const*, u32, Dispatch const*, SourcesAndDestination const*);
-    auto const handler = bit_cast<HandlerFn>(entry.handler_ptr);
-    auto outcome = handler(interpreter, config, entry.first_insn, 0, bit_cast<Dispatch const*>(entry.dispatches_ptr), bit_cast<SourcesAndDestination const*>(entry.src_dst_ptr));
-
-    if (outcome != Outcome::Return) {
-        interpreter.set_trap("Compiled function returned unexpectedly"sv);
-        return 1;
-    }
-    if (interpreter.did_trap())
-        return 1;
-    if (entry.arity == 1)
-        config.compiled_call_result_scratch() = config.value_stack().unsafe_take_last();
-    // No label pop: set_frame_lightweight doesn't push labels.
-    return 0;
+    return wasm_cl_run_compiled(interpreter, config, entry, callee_locals);
 }
 
 i32 wasm_cl_direct_call_0(void* interp_ptr, void* config_ptr, i32 func_index);
@@ -980,6 +979,8 @@ static RuntimeHelpers make_runtime_helpers()
         .memory_buffer_size_offset = static_cast<u32>(MemoryBuffer::size_offset()),
         .memory_buffer_storage_offset_offset = static_cast<u32>(MemoryBuffer::storage_offset_offset()),
         .compiled_call_result_scratch_offset = static_cast<u32>(Configuration::compiled_call_result_scratch_offset()),
+        .value_stack_base_offset = static_cast<u32>(Configuration::value_stack_base_offset()),
+        .value_stack_top_offset = static_cast<u32>(Configuration::value_stack_top_offset()),
     };
 }
 
@@ -1157,12 +1158,16 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
     auto const entries_size = sizeof(InputFunctionEntry) * function_count;
 
     size_t total_insn_count = 0;
-    for (auto& entry : batch)
+    size_t total_locals_bytes = 0;
+    for (auto& entry : batch) {
         total_insn_count += entry.insns.size();
+        total_locals_bytes += entry.num_locals;
+    }
 
     auto const insn_region_offset = align_up(entries_offset + entries_size, alignof(CraneliftInsn));
     auto const insn_bytes = total_insn_count * sizeof(CraneliftInsn);
-    auto const helpers_offset = align_up(insn_region_offset + insn_bytes, alignof(RuntimeHelpers));
+    auto const locals_region_offset = insn_region_offset + insn_bytes; // u8, no alignment needed
+    auto const helpers_offset = align_up(locals_region_offset + total_locals_bytes, alignof(RuntimeHelpers));
     auto const code_region_start = align_up(helpers_offset + sizeof(RuntimeHelpers), alignof(OutputFunctionEntry));
     auto const code_region_size = max(oop_code_region_min_size, total_insn_count * oop_code_bytes_per_insn);
     auto const reloc_region_start = align_up(code_region_start + sizeof(OutputFunctionEntry) * function_count + code_region_size, alignof(HelperReloc));
@@ -1233,6 +1238,7 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
     };
 
     size_t insn_cursor = insn_region_offset;
+    size_t locals_cursor = locals_region_offset;
     for (size_t i = 0; i < function_count; ++i) {
         auto& input = batch[i];
         auto* entry = reinterpret_cast<InputFunctionEntry*>(base + entries_offset + i * sizeof(InputFunctionEntry));
@@ -1240,9 +1246,17 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
             .insn_offset = static_cast<u32>(insn_cursor),
             .insn_count = static_cast<u32>(input.insns.size()),
             .result_arity = input.result_arity,
+            .num_locals = input.num_locals,
+            .locals_offset = static_cast<u32>(locals_cursor),
+            .num_params = input.num_params,
         };
         __builtin_memcpy(base + insn_cursor, input.insns.data(), input.insns.size() * sizeof(CraneliftInsn));
         insn_cursor += input.insns.size() * sizeof(CraneliftInsn);
+
+        auto const& local_types = input.target->cranelift_local_types;
+        for (u32 l = 0; l < input.num_locals; ++l)
+            base[locals_cursor + l] = l < local_types.size() ? local_types[l] : static_cast<u8>(ValueType::I64);
+        locals_cursor += input.num_locals;
     }
 
     __builtin_memcpy(base + helpers_offset, &helpers, sizeof(helpers));
@@ -1485,7 +1499,7 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
         }
     }
 
-    cranelift_cache_state().pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled });
+    cranelift_cache_state().pending_batch.append({ move(flat), result_arity, s_active_function_index, &compiled, compiled.cranelift_local_count, compiled.cranelift_param_count });
     return false; // Not compiled yet, will be compiled in flush.
 #endif
 }

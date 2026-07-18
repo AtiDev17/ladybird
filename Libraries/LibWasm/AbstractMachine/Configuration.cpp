@@ -13,29 +13,28 @@ namespace Wasm {
 
 void Configuration::unwind_impl()
 {
-    if (m_compiled_direct_call_depth > 0) {
-        m_compiled_direct_call_depth--;
-        m_depth--;
-        return;
-    }
-    auto last_frame = m_frame_stack.take_last();
     m_depth--;
 
-    m_locals_base = m_frame_stack.is_empty() ? nullptr : m_frame_stack.last().locals_data();
+    Optional<Vector<Value, ArgumentsStaticSize>> released_locals;
+    auto const* popped_module = &m_frame_stack.last().module();
+    if (m_frame_stack.last().owns_locals())
+        released_locals = m_owned_locals_stack.take_last();
+    m_frame_stack.remove(m_frame_stack.size() - 1);
+
     if (m_frame_stack.is_empty()) {
+        m_locals_base = nullptr;
         m_default_memory = nullptr;
     } else {
-        auto const& memories = m_frame_stack.last().module().memories();
-        m_default_memory = memories.is_empty() ? nullptr : m_store.unsafe_get(memories[0]);
+        auto& caller = m_frame_stack.last();
+        m_locals_base = caller.owns_locals() ? m_owned_locals_stack.last().data() : caller.locals_data();
+        if (&caller.module() != popped_module) {
+            auto const& memories = caller.module().memories();
+            m_default_memory = memories.is_empty() ? nullptr : m_store.unsafe_get(memories[0]);
+        }
     }
 
-    if (!last_frame.owns_locals()) {
-        // Non-owning frame: just restore the caller's runtime state.
-        return;
-    }
-
-    // Owning frame: full cleanup.
-    release_arguments_allocation(last_frame.owned_locals(), m_locals_base != nullptr);
+    if (released_locals.has_value())
+        release_arguments_allocation(released_locals.value());
 }
 
 Result Configuration::call(Interpreter& interpreter, FunctionAddress address, Vector<Value, ArgumentsStaticSize>& arguments)
@@ -69,11 +68,14 @@ ErrorOr<void, Trap> Configuration::prepare_wasm_call(WasmFunction const& wasm_fu
     if (is_tailcall)
         unwind_impl();
 
-    arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count());
+    auto inlined_locals = wasm_function.code().func().body().compiled_instructions.cranelift_inlined_locals;
+    arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count() + inlined_locals);
     for (auto const& local : wasm_function.code().func().locals()) {
         for (size_t i = 0; i < local.n(); ++i)
             arguments.unchecked_append(Value(local.type()));
     }
+    for (u32 i = 0; i < inlined_locals; ++i)
+        arguments.unchecked_append(Value(ValueType { ValueType::I32 }));
 
     set_frame(
         is_tailcall ? IsTailcall::Yes : IsTailcall::No,
@@ -95,8 +97,8 @@ Result Configuration::execute(Interpreter& interpreter)
     results.reverse();
 
     // If we reached here from a tailcall -> return, we might not have a label to pop (because the return already popped it)
-    if (!label_stack().is_empty())
-        label_stack().take_last();
+    if (label_stack().size() > frame().label_index())
+        label_stack().shrink(frame().label_index(), true);
 
     return Result { move(results) };
 }

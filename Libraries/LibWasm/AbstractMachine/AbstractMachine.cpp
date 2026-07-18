@@ -143,16 +143,13 @@ void AbstractMachine::RootsProvider::for_each_conservative_range(AK::Function<vo
     };
 
     for (auto* configuration : m_store.active_configurations()) {
-        // Scan up to capacity, not just size.
-        report_values(configuration->value_stack().data(), configuration->value_stack().capacity());
+        report_values(configuration->value_stack().data(), configuration->value_stack().conservative_scan_size());
         report_values(configuration->regs.data(), configuration->regs.size());
-        report_values(configuration->m_current_call_record.data(), configuration->m_current_call_record.size());
+        report_values(configuration->m_call_record_stack.data(), configuration->m_call_record_stack.conservative_scan_size());
         for (auto& arguments : configuration->m_call_argument_freelist)
             report_values(arguments.data(), arguments.capacity());
-        for (auto& frame : configuration->m_frame_stack) {
-            if (frame.owns_locals())
-                report_values(frame.locals_data(), frame.owned_locals().size());
-        }
+        for (auto& owned_locals : configuration->m_owned_locals_stack)
+            report_values(owned_locals.data(), owned_locals.size());
     }
 
     for (auto& table : m_store.tables())
@@ -514,7 +511,7 @@ Vector<CompiledFunctionEntry> const& ModuleInstance::compiled_fn_table(Store& st
         entry.first_insn = ci.dispatches[0].instruction;
         entry.expression = &wasm_fn->code().func().body();
         entry.module = &wasm_fn->module();
-        entry.total_local_count = static_cast<u32>(wasm_fn->code().func().total_local_count());
+        entry.total_local_count = static_cast<u32>(wasm_fn->code().func().total_local_count()) + ci.cranelift_inlined_locals;
         entry.arity = static_cast<u32>(wasm_fn->type().results().size());
         entry.max_call_rec_size = static_cast<u32>(ci.max_call_rec_size);
     }
