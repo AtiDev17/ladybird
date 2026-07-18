@@ -10,7 +10,7 @@ use crate::registers::{Arch, resolve_register};
 use crate::shared::{
     HandlerState, ResolvedMemoryIndex, get_immediate_value, resolve_adjacent_memory_pair,
     resolve_field_ref, resolve_label, resolve_memory_operand, substitute_macro,
-    outline_cold_blocks, uniquify_macro_labels, w,
+    omit_jumps_to_next_label, outline_cold_blocks, uniquify_macro_labels, w,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -465,8 +465,10 @@ fn generate_handler(out: &mut String, handler: &Handler, program: &Program, abi:
     w!(out, ".p2align 4");
     w!(out, "asm_handler_{}:", handler.name);
 
-    let (hot_instructions, cold_instructions) = outline_cold_blocks(&instructions)
+    let (mut hot_instructions, mut cold_instructions) = outline_cold_blocks(&instructions)
         .unwrap_or_else(|error| panic!("invalid cold block in handler '{}': {error}", handler.name));
+    omit_jumps_to_next_label(&mut hot_instructions);
+    omit_jumps_to_next_label(&mut cold_instructions);
 
     for instruction in &hot_instructions {
         emit_instruction(out, instruction, handler, program, &mut state, abi);
@@ -889,18 +891,14 @@ fn emit_instruction(
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 let fail = resolve_label(&insn.operands[2], handler);
-                // Truncate to i64 first, check for cvttsd2si overflow sentinel
-                w!(out, "    cvttsd2si {dst}, {src}");
-                w!(out, "    mov rcx, 0x8000000000000000");
-                w!(out, "    cmp {dst}, rcx");
-                w!(out, "    je {fail}");
-                // Check it fits in i32
+                // Convert through i32 and require an exact round trip. The
+                // parity check rejects NaN, which x86 otherwise reports as
+                // equal after an unordered floating-point comparison.
+                w!(out, "    cvttsd2si {}, {src}", to_32bit_reg(&dst));
                 w!(out, "    movsxd rcx, {}", to_32bit_reg(&dst));
-                w!(out, "    cmp {dst}, rcx");
-                w!(out, "    jne {fail}");
-                // Round-trip: convert back and compare
-                w!(out, "    cvtsi2sd xmm3, {dst}");
+                w!(out, "    cvtsi2sd xmm3, rcx");
                 w!(out, "    ucomisd {src}, xmm3");
+                w!(out, "    jp {fail}");
                 w!(out, "    jne {fail}");
             }
         }
@@ -1106,14 +1104,29 @@ fn emit_instruction(
             }
         }
 
-        // mul: maps to x86 imul (2-operand: dst *= src, or 3-operand: dst = src * imm)
+        // mul: use a shift for in-place power-of-two scaling, otherwise map to x86 imul.
         "mul" => {
-            let ops: Vec<String> = insn
-                .operands
-                .iter()
-                .map(|o| resolve_op(o, handler, program))
-                .collect();
-            w!(out, "    imul {}", ops.join(", "));
+            if insn.operands.len() == 3 {
+                let dst = resolve_op(&insn.operands[0], handler, program);
+                let src = resolve_op(&insn.operands[1], handler, program);
+                if let Some(value) = get_immediate_value(&insn.operands[2], program)
+                    && value > 0
+                    && (value as u64).is_power_of_two()
+                    && dst == src
+                {
+                    w!(out, "    shl {dst}, {}", (value as u64).trailing_zeros());
+                } else {
+                    let value = resolve_op(&insn.operands[2], handler, program);
+                    w!(out, "    imul {dst}, {src}, {value}");
+                }
+            } else {
+                let ops: Vec<String> = insn
+                    .operands
+                    .iter()
+                    .map(|o| resolve_op(o, handler, program))
+                    .collect();
+                w!(out, "    imul {}", ops.join(", "));
+            }
         }
 
         "exit" => {
@@ -1540,9 +1553,10 @@ fn emit_instruction(
         "shl" | "shr" | "sar" => {
             let dst = resolve_op(&insn.operands[0], handler, program);
             if insn.operands.len() == 2 {
-                if get_immediate_value(&insn.operands[1], program).is_some() {
-                    let count = resolve_op(&insn.operands[1], handler, program);
-                    w!(out, "    {m} {dst}, {count}");
+                if let Some(count) = get_immediate_value(&insn.operands[1], program) {
+                    if count != 0 {
+                        w!(out, "    {m} {dst}, {count}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     if count != "rcx" {
@@ -1602,6 +1616,49 @@ fn emit_instruction(
                 };
                 w!(out, "    cmp {a}, {b}");
                 w!(out, "    {cc} {label}");
+            }
+        }
+
+        "branch32_memory_eq" | "branch32_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let value = to_32bit_reg(&resolve_op(&insn.operands[1], handler, program));
+                let label = resolve_label(&insn.operands[2], handler);
+                let condition = if m == "branch32_memory_eq" { "je" } else { "jne" };
+                w!(out, "    cmp DWORD PTR {memory}, {value}");
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch64_memory_eq" | "branch64_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let value = resolve_op(&insn.operands[1], handler, program);
+                let label = resolve_label(&insn.operands[2], handler);
+                let condition = if m == "branch64_memory_eq" { "je" } else { "jne" };
+                w!(out, "    cmp QWORD PTR {memory}, {value}");
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch8_eq" | "branch8_ne" | "branch8_bits_set" | "branch8_bits_clear" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let immediate = get_immediate_value(&insn.operands[1], program)
+                    .expect("branch8 immediate must resolve at code generation time");
+                let label = resolve_label(&insn.operands[2], handler);
+                let operation = if matches!(m.as_str(), "branch8_eq" | "branch8_ne") {
+                    "cmp"
+                } else {
+                    "test"
+                };
+                let condition = if matches!(m.as_str(), "branch8_eq" | "branch8_bits_clear") {
+                    "jz"
+                } else {
+                    "jnz"
+                };
+                w!(out, "    {operation} BYTE PTR {memory}, {immediate}");
+                w!(out, "    {condition} {label}");
             }
         }
 
@@ -1925,6 +1982,121 @@ mod tests {
         assert!(out.contains("bt rdx, 32"));
         assert!(out.contains("jnc .Lasm_Call.slow"));
         assert!(!out.contains("test rdx, 4294967296"));
+    }
+
+    #[test]
+    fn omits_immediate_zero_shift() {
+        let program = test_program();
+        let handler = call_handler();
+        for mnemonic in ["shl", "shr", "sar"] {
+            let instruction = AsmInstruction {
+                mnemonic: mnemonic.into(),
+                operands: vec![Operand::Register("rdx".into()), Operand::Immediate(0)],
+            };
+            let mut out = String::new();
+            let mut state = HandlerState::new();
+
+            emit_instruction(
+                &mut out,
+                &instruction,
+                &handler,
+                &program,
+                &mut state,
+                X86_64Abi::SysV,
+            );
+
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn lowers_in_place_power_of_two_multiply_to_shift() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "mul".into(),
+            operands: vec![
+                Operand::Register("rdx".into()),
+                Operand::Register("rdx".into()),
+                Operand::Immediate(64),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert_eq!(out, "    shl rdx, 6\n");
+    }
+
+    #[test]
+    fn double_to_int32_uses_exact_i32_round_trip() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "double_to_int32".into(),
+            operands: vec![
+                Operand::Register("rdx".into()),
+                Operand::Register("xmm0".into()),
+                Operand::Label(".fail".into()),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert!(out.contains("cvttsd2si edx, xmm0"));
+        assert!(out.contains("movsxd rcx, edx"));
+        assert!(out.contains("jp .Lasm_Call.fail"));
+        assert!(!out.contains("0x8000000000000000"));
+    }
+
+    #[test]
+    fn lowers_byte_memory_branch_without_a_register_load() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "branch8_bits_clear".into(),
+            operands: vec![
+                Operand::Memory {
+                    base: "rcx".into(),
+                    index: Some("4".into()),
+                    scale: None,
+                },
+                Operand::Immediate(2),
+                Operand::Label(".slow".into()),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert!(out.contains("test BYTE PTR [rcx + 4], 2"));
+        assert!(out.contains("jz .Lasm_Call.slow"));
+        assert!(!out.contains("movzx"));
     }
 
     #[test]

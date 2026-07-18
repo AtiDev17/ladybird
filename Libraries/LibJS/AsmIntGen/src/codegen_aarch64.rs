@@ -8,8 +8,9 @@ use crate::allocator::flatten_and_allocate;
 use crate::parser::{AsmInstruction, Handler, ObjectFormat, Operand, Program};
 use crate::registers::{Arch, resolve_register};
 use crate::shared::{
-    AdjacentMemoryPair, HandlerState, get_immediate_value, resolve_adjacent_memory_pair,
-    outline_cold_blocks, resolve_field_ref, resolve_label, substitute_macro, uniquify_macro_labels, w,
+    AdjacentMemoryPair, HandlerState, get_immediate_value, omit_jumps_to_next_label,
+    outline_cold_blocks, resolve_adjacent_memory_pair, resolve_field_ref, resolve_label,
+    substitute_macro, uniquify_macro_labels, w,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -531,8 +532,10 @@ fn generate_handler(
     // x21 = pb + pc is set by the dispatch sequence that branches here.
     // It is callee-saved, so it survives C++ calls within the handler.
 
-    let (hot_instructions, cold_instructions) = outline_cold_blocks(&instructions)
+    let (mut hot_instructions, mut cold_instructions) = outline_cold_blocks(&instructions)
         .unwrap_or_else(|error| panic!("invalid cold block in handler '{}': {error}", handler.name));
+    omit_jumps_to_next_label(&mut hot_instructions);
+    omit_jumps_to_next_label(&mut cold_instructions);
 
     for instruction in &hot_instructions {
         emit_instruction(out, instruction, handler, program, &mut state, pinned);
@@ -2164,8 +2167,12 @@ fn emit_instruction(
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[2], program) {
-                    emit_mov_imm(out, "x9", val);
-                    w!(out, "    mul {dst}, {src}, x9");
+                    if val > 0 && (val as u64).is_power_of_two() {
+                        w!(out, "    lsl {dst}, {src}, #{}", (val as u64).trailing_zeros());
+                    } else {
+                        emit_mov_imm(out, "x9", val);
+                        w!(out, "    mul {dst}, {src}, x9");
+                    }
                 } else {
                     let imm_reg = resolve_op(&insn.operands[2], handler, program);
                     w!(out, "    mul {dst}, {src}, {imm_reg}");
@@ -2197,7 +2204,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    lsl {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    lsl {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    lsl {dst}, {dst}, {count}");
@@ -2209,7 +2218,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    lsr {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    lsr {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    lsr {dst}, {dst}, {count}");
@@ -2221,7 +2232,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    asr {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    asr {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    asr {dst}, {dst}, {count}");
@@ -2456,6 +2469,56 @@ fn emit_instruction(
                     w!(out, "    cmp {a}, {b}");
                 }
                 w!(out, "    {cc} {label}");
+            }
+        }
+
+        "branch32_memory_eq" | "branch32_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let memory = parse_mem(&memory).expect("invalid branch32 memory operand");
+                let value = to_w_reg(&resolve_op(&insn.operands[1], handler, program));
+                let label = resolve_label(&insn.operands[2], handler);
+                emit_mem_load(out, "w9", &memory, 4, false);
+                w!(out, "    cmp w9, {value}");
+                let condition = if m == "branch32_memory_eq" { "b.eq" } else { "b.ne" };
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch64_memory_eq" | "branch64_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let memory = parse_mem(&memory).expect("invalid branch64 memory operand");
+                let value = resolve_op(&insn.operands[1], handler, program);
+                let label = resolve_label(&insn.operands[2], handler);
+                emit_mem_load(out, "x9", &memory, 8, false);
+                w!(out, "    cmp x9, {value}");
+                let condition = if m == "branch64_memory_eq" { "b.eq" } else { "b.ne" };
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch8_eq" | "branch8_ne" | "branch8_bits_set" | "branch8_bits_clear" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let immediate = get_immediate_value(&insn.operands[1], program)
+                    .expect("branch8 immediate must resolve at code generation time");
+                let label = resolve_label(&insn.operands[2], handler);
+                let memory = parse_mem(&memory).expect("invalid branch8 memory operand");
+                emit_mem_load(out, "w9", &memory, 1, false);
+                if matches!(m.as_str(), "branch8_eq" | "branch8_ne") && immediate == 0 {
+                    let operation = if m == "branch8_eq" { "cbz" } else { "cbnz" };
+                    w!(out, "    {operation} w9, {label}");
+                } else if matches!(m.as_str(), "branch8_eq" | "branch8_ne") {
+                    emit_cmp_imm(out, "x9", immediate, pinned);
+                    let condition = if m == "branch8_eq" { "b.eq" } else { "b.ne" };
+                    w!(out, "    {condition} {label}");
+                } else {
+                    emit_mov_imm(out, "x10", immediate);
+                    w!(out, "    tst x9, x10");
+                    let condition = if m == "branch8_bits_clear" { "b.eq" } else { "b.ne" };
+                    w!(out, "    {condition} {label}");
+                }
             }
         }
 
@@ -3031,6 +3094,61 @@ mod tests {
     }
 
     #[test]
+    fn omits_immediate_zero_shift() {
+        let program = coff_program(Vec::new());
+        let handler = &program.handlers[0];
+        let pinned = PinnedConstants::new(&program);
+
+        for mnemonic in ["shl", "shr", "sar"] {
+            let instruction = AsmInstruction {
+                mnemonic: mnemonic.into(),
+                operands: vec![Operand::Register("x1".into()), Operand::Immediate(0)],
+            };
+            let mut out = String::new();
+            let mut state = HandlerState::new();
+
+            emit_instruction(
+                &mut out,
+                &instruction,
+                handler,
+                &program,
+                &mut state,
+                &pinned,
+            );
+
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn lowers_power_of_two_multiply_to_shift() {
+        let program = coff_program(Vec::new());
+        let handler = &program.handlers[0];
+        let pinned = PinnedConstants::new(&program);
+        let instruction = AsmInstruction {
+            mnemonic: "mul".into(),
+            operands: vec![
+                Operand::Register("x1".into()),
+                Operand::Register("x2".into()),
+                Operand::Immediate(64),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            handler,
+            &program,
+            &mut state,
+            &pinned,
+        );
+
+        assert_eq!(out, "    lsl x1, x2, #6\n");
+    }
+
+    #[test]
     fn coff_raw_native_call_uses_windows_arm64_sret() {
         let output = generate(&coff_program(vec![AsmInstruction {
             mnemonic: "call_raw_native".into(),
@@ -3042,6 +3160,31 @@ mod tests {
         assert!(output.contains("    blr x9"));
         assert!(output.contains("    ldr x1, [sp, #120]"));
         assert!(output.contains("    ldr x0, [sp, #112]"));
+    }
+
+    #[test]
+    fn byte_memory_zero_branch_uses_cbz() {
+        let output = generate(&coff_program(vec![
+            AsmInstruction {
+                mnemonic: "branch8_eq".into(),
+                operands: vec![
+                    Operand::Memory {
+                        base: "x0".into(),
+                        index: Some("4".into()),
+                        scale: None,
+                    },
+                    Operand::Immediate(0),
+                    Operand::Label(".zero".into()),
+                ],
+            },
+            AsmInstruction {
+                mnemonic: "label".into(),
+                operands: vec![Operand::Label(".zero".into())],
+            },
+        ]));
+
+        assert!(output.contains("    ldrb w9, [x0, #4]"));
+        assert!(output.contains("    cbz w9, .Lasm_Call.zero"));
     }
 
     #[test]

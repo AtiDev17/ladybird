@@ -353,12 +353,20 @@ macro coerce_to_int32s(lhs, rhs, lhs_int, rhs_int, fail)
 .rhs_done:
 end
 
+# Load two adjacent operand indices together so paired-load architectures can
+# read both immutable bytecode fields with one instruction.
+macro load_binary_operands(lhs, rhs)
+    temp lhs_index, rhs_index
+    load_pair32 lhs_index, rhs_index, [pb, pc, m_lhs], [pb, pc, m_rhs]
+    load64 lhs, [values, lhs_index, 8]
+    load64 rhs, [values, rhs_index, 8]
+end
+
 # Fast path for bitwise binary operations on int32/boolean/double operands.
 # op_insn: the bitwise instruction to apply (xor, and, or).
 macro bitwise_op(op_insn, slow_path_func)
     temp lhs, rhs, lhs_int, rhs_int, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_int32s lhs, rhs, lhs_int, rhs_int, .slow
     op_insn lhs_int, rhs_int
     box_int32 dst, lhs_int
@@ -369,15 +377,16 @@ macro bitwise_op(op_insn, slow_path_func)
 end
 
 macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
-    temp value, tag, int_value, dst
+    temp operand_index, value, tag, int_value, dst
     ftemp result_dbl, one_dbl
-    load_operand value, m_dst
+    load32 operand_index, [pb, pc, m_dst]
+    load64 value, [values, operand_index, 8]
     extract_tag tag, value
     branch_ne tag, INT32_TAG, .slow
     unbox_int32 int_value, value
     op32_overflow int_value, 1, .overflow
     box_int32_clean dst, int_value
-    store_operand m_dst, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .overflow: @cold
     unbox_int32 int_value, value
@@ -386,23 +395,24 @@ macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov one_dbl, dst
     fp_op result_dbl, one_dbl
     fp_mov dst, result_dbl
-    store_operand m_dst, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .slow: @cold
     call_slow_path slow_path_func
 end
 
 macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
-    temp value, tag, int_value, dst
+    temp operand_index, value, tag, int_value, dst
     ftemp result_dbl, one_dbl
-    load_operand value, m_src
+    load32 operand_index, [pb, pc, m_src]
+    load64 value, [values, operand_index, 8]
     extract_tag tag, value
     branch_ne tag, INT32_TAG, .slow
     store_operand m_dst, value
     unbox_int32 int_value, value
     op32_overflow int_value, 1, .overflow_after_store
     box_int32_clean dst, int_value
-    store_operand m_src, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .overflow_after_store: @cold
     unbox_int32 int_value, value
@@ -411,7 +421,7 @@ macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov one_dbl, dst
     fp_op result_dbl, one_dbl
     fp_mov dst, result_dbl
-    store_operand m_src, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .slow: @cold
     call_slow_path slow_path_func
@@ -419,8 +429,7 @@ end
 
 macro int32_shift_op(op_insn, slow_path_func)
     temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, count, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -445,8 +454,7 @@ macro validate_callee_builtin(expected_builtin, fail)
     branch_ne scratch, OBJECT_TAG, fail
     unbox_object callee, callee
     load8 scratch, [callee, OBJECT_FLAGS]
-    and scratch, OBJECT_FLAG_IS_FUNCTION
-    branch_zero scratch, fail
+    branch_bits_clear scratch, OBJECT_FLAG_IS_FUNCTION, fail
     load8 scratch, [callee, FUNCTION_OBJECT_BUILTIN_HAS_VALUE]
     branch_zero scratch, fail
     load8 scratch, [callee, FUNCTION_OBJECT_BUILTIN_VALUE]
@@ -535,10 +543,9 @@ end
 macro walk_cached_env_chain(m_environment_field, target_env, bind_index, fail_label)
     temp exe, caches, coord_addr, hops, sentinel, flag
     load32 coord_addr, [pb, pc, m_cache]
-    mul coord_addr, coord_addr, ENVIRONMENT_COORDINATE_SIZE
     load64 exe, [exec_ctx, EXECUTION_CONTEXT_EXECUTABLE]
     load64 caches, [exe, EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA]
-    add coord_addr, caches
+    lea coord_addr, [caches, coord_addr, ENVIRONMENT_COORDINATE_SIZE]
     load_pair32 hops, bind_index, [coord_addr, ENVIRONMENT_COORDINATE_HOPS], [coord_addr, ENVIRONMENT_COORDINATE_INDEX]
     mov sentinel, ENVIRONMENT_COORDINATE_INVALID
     branch_eq hops, sentinel, fail_label
@@ -604,15 +611,11 @@ end
 macro load_property_lookup_cache(cache, fail_label)
     temp exe, caches
     load32 cache, [pb, pc, m_cache]
-    mul cache, cache, PROPERTY_LOOKUP_CACHE_SIZE
     load64 exe, [exec_ctx, EXECUTION_CONTEXT_EXECUTABLE]
     load64 caches, [exe, EXECUTABLE_PROPERTY_LOOKUP_CACHES_DATA]
-    add cache, caches
-    load64 cache, [cache, PROPERTY_LOOKUP_CACHE_DATA]
+    load64 cache, [caches, cache, PROPERTY_LOOKUP_CACHE_SIZE]
     branch_zero cache, fail_label
-    branch_bits_clear cache, PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG, .data_loaded
-    sub cache, PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG
-.data_loaded:
+    and cache, PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK
 end
 
 macro load_global_variable_cache(cache)
@@ -624,10 +627,8 @@ macro load_global_variable_cache(cache)
     add cache, caches
 end
 
-macro caged_primitive_storage_address(dst, cage_base, cached_offset, index, shift)
-    mov dst, index
-    shl dst, shift
-    add dst, cached_offset
+macro caged_primitive_storage_address(dst, cage_base, cached_offset, index, scale)
+    lea dst, [cached_offset, index, scale]
     and dst, PRIMITIVE_STORAGE_CAGE_OFFSET_MASK
     add dst, cage_base
 end
@@ -636,30 +637,28 @@ end
 # Simple data movement
 # ============================================================================
 
+macro move_operand(dst_field, src_field)
+    temp dst_index, src_index, value
+    load_pair32 dst_index, src_index, [pb, pc, dst_field], [pb, pc, src_field]
+    load64 value, [values, src_index, 8]
+    store64 [values, dst_index, 8], value
+end
+
 handler Mov
-    temp value
-    load_operand value, m_src
-    store_operand m_dst, value
+    move_operand m_dst, m_src
     dispatch_next
 end
 
 handler Mov2
-    temp v1, v2
-    load_operand v1, m_src1
-    store_operand m_dst1, v1
-    load_operand v2, m_src2
-    store_operand m_dst2, v2
+    move_operand m_dst1, m_src1
+    move_operand m_dst2, m_src2
     dispatch_next
 end
 
 handler Mov3
-    temp v1, v2, v3
-    load_operand v1, m_src1
-    store_operand m_dst1, v1
-    load_operand v2, m_src2
-    store_operand m_dst2, v2
-    load_operand v3, m_src3
-    store_operand m_dst3, v3
+    move_operand m_dst1, m_src1
+    move_operand m_dst2, m_src2
+    move_operand m_dst3, m_src3
     dispatch_next
 end
 
@@ -675,8 +674,7 @@ end
 handler Add
     temp lhs, rhs, lhs_int, rhs_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_add lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -706,8 +704,7 @@ end
 handler Sub
     temp lhs, rhs, lhs_int, rhs_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_sub lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -736,8 +733,7 @@ end
 handler Mul
     temp lhs, rhs, lhs_int, rhs_int, dst, sign_check
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_mul lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -906,64 +902,56 @@ end
 # combined with jump_binary_epilogue (provides .take_true, .take_false, .slow labels).
 handler JumpLessThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_lt_signed, branch_fp_less, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_less_than
 end
 
 handler JumpGreaterThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_gt_signed, branch_fp_greater, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_greater_than
 end
 
 handler JumpLessThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_le_signed, branch_fp_less_or_equal, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_less_than_equals
 end
 
 handler JumpGreaterThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_ge_signed, branch_fp_greater_or_equal, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_greater_than_equals
 end
 
 handler JumpLooselyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_loosely_equals
 end
 
 handler JumpLooselyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .take_false, .take_true, .slow
     jump_binary_epilogue asm_slow_path_jump_loosely_inequals
 end
 
 handler JumpStrictlyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_strictly_equals
 end
 
 handler JumpStrictlyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .take_false, .take_true, .slow
     jump_binary_epilogue asm_slow_path_jump_strictly_inequals
 end
@@ -1170,14 +1158,7 @@ macro load_binding_flags(env, idx, flags, flag)
 end
 
 macro load_environment_serial(env, serial)
-    temp rare_data
-    load64 rare_data, [env, DECLARATIVE_ENVIRONMENT_RARE_DATA]
-    branch_zero rare_data, .zero
-    load64 serial, [rare_data, DECLARATIVE_ENVIRONMENT_RARE_DATA_SERIAL]
-    jmp .done
-.zero:
-    mov serial, 0
-.done:
+    load64 serial, [env, DECLARATIVE_ENVIRONMENT_SERIAL]
 end
 
 # Inline environment chain walk + binding value load with TDZ check.
@@ -1380,8 +1361,7 @@ end
 handler Div
     temp lhs, rhs, tag, scratch_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag tag, lhs
     branch_eq tag, INT32_TAG, .lhs_is_int32
     # tag already has lhs tag
@@ -1429,32 +1409,28 @@ end
 # The boolean_result_epilogue macro provides .store_true, .store_false, .slow labels.
 handler LessThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_lt_signed, branch_fp_less, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_less_than
 end
 
 handler LessThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_le_signed, branch_fp_less_or_equal, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_less_than_equals
 end
 
 handler GreaterThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_gt_signed, branch_fp_greater, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_greater_than
 end
 
 handler GreaterThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_ge_signed, branch_fp_greater_or_equal, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_greater_than_equals
 end
@@ -1592,8 +1568,7 @@ end
 handler UnsignedRightShift
     temp lhs, rhs, lhs_tag, rhs_tag, value, count, dst
     ftemp dst_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -1622,8 +1597,7 @@ end
 # Negative dividend falls to slow path to handle -0 and INT_MIN correctly.
 handler Mod
     temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, rhs_int, quot, rem, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -1651,16 +1625,14 @@ end
 # double with NaN awareness, string pointer shortcut, bigint -> slow path).
 handler StrictlyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_strictly_equals
 end
 
 handler StrictlyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .store_false, .store_true, .slow
     boolean_result_epilogue asm_slow_path_strictly_inequals
 end
@@ -1694,16 +1666,14 @@ end
 
 handler LooselyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_loosely_equals
 end
 
 handler LooselyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .store_false, .store_true, .slow
     boolean_result_epilogue asm_slow_path_loosely_inequals
 end
@@ -1798,12 +1768,12 @@ handler PutByValue
     load_operand prop, m_property
     extract_tag base_tag, base
     branch_ne base_tag, OBJECT_TAG, .slow
-    # Check property is non-negative int32
+    # Check property is int32. Every fast path below performs an unsigned bounds
+    # check, which also rejects zero-extended negative indices.
     extract_tag prop_tag, prop
     branch_ne prop_tag, INT32_TAG, .slow
     mov index, prop
     and index, 0xFFFFFFFF
-    branch_bit_set index, 31, .slow
     unbox_object obj, base
     # Check IsTypedArray flag -- branch to typed-array path early.
     load8 flags, [obj, OBJECT_FLAGS]
@@ -1862,12 +1832,12 @@ handler PutByValue
     branch_eq kind_byte, TYPED_ARRAY_KIND_FLOAT32, .ta_store_float32
     branch_ne kind_byte, TYPED_ARRAY_KIND_FLOAT64, .try_typed_array_slow
     # Compute store address before check_is_double mangles its argument.
-    caged_primitive_storage_address addr, elements, cached_offset, index, 3
+    caged_primitive_storage_address addr, elements, cached_offset, index, 8
     check_is_double src, .try_typed_array_slow
     store64 [addr, 0], src
     dispatch_next
 .ta_store_float32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     check_is_double src, .try_typed_array_slow
     fp_mov src_dbl, src
     double_to_float src_dbl, src_dbl
@@ -1882,17 +1852,17 @@ handler PutByValue
     branch_any_eq kind_byte, TYPED_ARRAY_KIND_UINT16, TYPED_ARRAY_KIND_INT16, .ta_put_uint16
     jmp .try_typed_array_slow
 .ta_put_int32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     store32 [addr, 0], src_int32
     dispatch_next
 .ta_put_float32:
     int_to_double src_dbl, src_int32
     double_to_float src_dbl, src_dbl
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     storef32 [addr, 0], src_dbl
     dispatch_next
 .ta_put_uint8_clamped:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     branch_negative src_int32, .ta_put_uint8_clamped_zero
     mov max, 255
     branch_ge_unsigned src_int32, max, .ta_put_uint8_clamped_max
@@ -1907,11 +1877,11 @@ handler PutByValue
     store8 [addr, 0], src_int32
     dispatch_next
 .ta_put_uint8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     store8 [addr, 0], src_int32
     dispatch_next
 .ta_put_uint16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     store16 [addr, 0], src_int32
     dispatch_next
 .try_typed_array_slow: @cold
@@ -1924,7 +1894,7 @@ end
 
 # Inline cache fast path for property access (own + prototype chain).
 handler GetById
-    temp base, tag, obj, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, result
+    temp base, tag, obj, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, proto_cur_dict_gen, props, value, result
     load_operand base, m_base
     extract_tag tag, base
     branch_ne tag, OBJECT_TAG, .try_cache
@@ -1956,8 +1926,8 @@ handler GetById
     load8 tag, [prop_offset, PROTOTYPE_CHAIN_VALIDITY_VALID]
     branch_zero tag, .try_cache
     load_pair32 prop_offset, dict_gen, [plc, PROPERTY_LOOKUP_CACHE_ENTRY_PROPERTY_OFFSET], [plc, PROPERTY_LOOKUP_CACHE_ENTRY_DICTIONARY_GENERATION]
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_cache
+    load32 proto_cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne dict_gen, proto_cur_dict_gen, .try_cache
     load64 props, [cache_proto, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props
     load64 value, [props, prop_offset, 8]
@@ -2030,7 +2000,6 @@ handler GetByValue
     branch_ne prop_tag, INT32_TAG, .slow
     mov index, prop
     and index, 0xFFFFFFFF
-    branch_bit_set index, 31, .slow
     unbox_object obj, base
     load8 flags, [obj, OBJECT_FLAGS]
     branch_bits_set flags, OBJECT_FLAG_IS_TYPED_ARRAY, .try_typed_array
@@ -2077,7 +2046,11 @@ handler GetByValue
     branch_ge_unsigned index, capacity, .try_typed_array_slow
     load8 kind_byte, [obj, TYPED_ARRAY_KIND]
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT32, .ta_int32
-    branch_any_eq kind_byte, TYPED_ARRAY_KIND_UINT8, TYPED_ARRAY_KIND_UINT8_CLAMPED, .ta_uint8
+    branch_ge_unsigned kind_byte, TYPED_ARRAY_KIND_UINT16, .other_typed_array_kinds
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    load8 raw, [addr, 0]
+    jmp .ta_box_int32
+.other_typed_array_kinds:
     branch_eq kind_byte, TYPED_ARRAY_KIND_UINT16, .ta_uint16
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT8, .ta_int8
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT16, .ta_int16
@@ -2086,27 +2059,23 @@ handler GetByValue
     branch_eq kind_byte, TYPED_ARRAY_KIND_FLOAT64, .ta_float64
     jmp .try_typed_array_slow
 .ta_int32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     load32 raw, [addr, 0]
     jmp .ta_box_int32
-.ta_uint8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
-    load8 raw, [addr, 0]
-    jmp .ta_box_int32
 .ta_uint16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     load16 raw, [addr, 0]
     jmp .ta_box_int32
 .ta_int8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     load8s raw, [addr, 0]
     jmp .ta_box_int32
 .ta_int16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     load16s raw, [addr, 0]
     jmp .ta_box_int32
 .ta_float32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     loadf32 slot_dbl, [addr, 0]
     float_to_double slot_dbl, slot_dbl
     fp_mov slot, slot_dbl
@@ -2116,7 +2085,7 @@ handler GetByValue
     branch_nonzero raw, .ta_f64_as_int
     jmp .ta_f64_as_int
 .ta_float64:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 3
+    caged_primitive_storage_address addr, elements, cached_offset, index, 8
     load64 slot, [addr, 0]
     fp_mov slot_dbl, slot
     # Exclude negative zero early (slot gets clobbered by double_to_int32).
@@ -2134,7 +2103,7 @@ handler GetByValue
     store_operand m_dst, dst
     dispatch_next
 .ta_uint32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     load32 raw, [addr, 0]
     branch_bit_set raw, 31, .ta_uint32_to_double
     jmp .ta_box_int32
@@ -2170,7 +2139,7 @@ end
 # Fast path for Array.length (magical length property).
 # Also includes IC fast path for non-array objects (same as GetById).
 handler GetLength
-    temp base, tag, obj, flags, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, length, sign_check, dst
+    temp base, tag, obj, flags, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, length, dst
     ftemp length_dbl
     load_operand base, m_base
     extract_tag tag, base
@@ -2201,9 +2170,7 @@ handler GetLength
     # clear; otherwise widen to a double so the value isn't reinterpreted
     # as a negative int32.
     load32 length, [obj, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
-    mov sign_check, length
-    shr sign_check, 31
-    branch_nonzero sign_check, .length_double
+    branch_bit_set length, 31, .length_double
     box_int32 dst, length
     store_operand m_dst, dst
     dispatch_next
@@ -2237,8 +2204,8 @@ handler GetGlobal
     assert_nonzero env
     load_global_variable_cache gvc
     assert_nonzero gvc
-    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     load_environment_serial env, env_serial
+    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     branch_ne cache_serial, env_serial, .slow
     # Shape-based fast path: check entries[0].shape matches global_object.shape
     # (falls through to env binding path on shape mismatch)
@@ -2246,9 +2213,9 @@ handler GetGlobal
     assert_nonzero shape
     load64 cache_shape, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_SHAPE]
     branch_ne cache_shape, shape, .try_env_binding
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
     load_pair32 prop_offset, dict_gen, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_PROPERTY_OFFSET], [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_env_binding
+    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne cur_dict_gen, dict_gen, .try_env_binding
     # IC hit! Load property value via get_direct
     load64 props, [global_object, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props
@@ -2285,16 +2252,16 @@ handler SetGlobal
     assert_nonzero env
     load_global_variable_cache gvc
     assert_nonzero gvc
-    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     load_environment_serial env, env_serial
+    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     branch_ne cache_serial, env_serial, .slow
     load64 shape, [global_object, OBJECT_SHAPE]
     assert_nonzero shape
     load64 cache_shape, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_SHAPE]
     branch_ne cache_shape, shape, .try_env_binding
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
     load_pair32 prop_offset, dict_gen, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_PROPERTY_OFFSET], [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_env_binding
+    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne cur_dict_gen, dict_gen, .try_env_binding
     # IC hit! Load current value to check it's not an accessor.
     load64 props, [global_object, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props

@@ -78,7 +78,7 @@ int main()
     // PropertyLookupCache layout
     outln("\n# PropertyLookupCache layout");
     EMIT_OFFSET(PROPERTY_LOOKUP_CACHE_DATA, PropertyLookupCache, m_data);
-    outln("const PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG = {}", PropertyLookupCache::polymorphic_data_tag);
+    outln("const PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK = 0x{:X}", ~PropertyLookupCache::polymorphic_data_tag);
     EMIT_SIZEOF(PROPERTY_LOOKUP_CACHE_SIZE, PropertyLookupCache);
 
     // PropertyLookupCache::Entry layout
@@ -233,7 +233,7 @@ int main()
     // DeclarativeEnvironment layout
     outln("\n# DeclarativeEnvironment layout");
     EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_RARE_DATA, DeclarativeEnvironment, m_rare_data);
-    EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_RARE_DATA_SERIAL, DeclarativeEnvironment::RareData, m_environment_serial_number);
+    EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_SERIAL, DeclarativeEnvironment, m_environment_serial_number);
 
     // GlobalVariableCache layout
     outln("\n# GlobalVariableCache layout");
@@ -379,6 +379,9 @@ int main()
 
     // TypedArrayBase::Kind enum values
     outln("\n# TypedArrayBase::Kind values");
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint8Array) == 0);
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint8ClampedArray) == 1);
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint16Array) == 2);
     outln("const TYPED_ARRAY_KIND_UINT8 = {}", static_cast<u8>(TypedArrayBase::Kind::Uint8Array));
     outln("const TYPED_ARRAY_KIND_UINT8_CLAMPED = {}", static_cast<u8>(TypedArrayBase::Kind::Uint8ClampedArray));
     outln("const TYPED_ARRAY_KIND_UINT16 = {}", static_cast<u8>(TypedArrayBase::Kind::Uint16Array));
