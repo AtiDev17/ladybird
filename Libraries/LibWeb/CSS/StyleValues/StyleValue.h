@@ -29,6 +29,7 @@
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/SerializationMode.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
@@ -147,9 +148,9 @@ public:
     DimensionStyleValue const& as_dimension() const;
     DimensionStyleValue& as_dimension() { return const_cast<DimensionStyleValue&>(const_cast<StyleValue const&>(*this).as_dimension()); }
 
-    virtual bool is_color_function() const { return false; }
+    bool is_color_function() const;
 
-    virtual bool depends_on_current_color() const { return to_keyword() == Keyword::Currentcolor; }
+    bool depends_on_current_color() const;
 
 #define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) \
     bool is_##snake_case() const { return type() == Type::title_case; }                  \
@@ -168,24 +169,26 @@ public:
     bool is_unset() const { return to_keyword() == Keyword::Unset; }
 
     bool has_auto() const;
-    virtual bool has_color() const { return false; }
+    bool has_color() const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual Optional<Color> to_color(ColorResolutionContext) const { return {}; }
+    Optional<Color> to_color(ColorResolutionContext) const;
     Keyword to_keyword() const;
 
     String to_string(SerializationMode) const;
     Utf16String to_utf16_string(SerializationMode) const;
-    virtual void serialize(StringBuilder&, SerializationMode) const = 0;
-    virtual void serialize(Utf16StringBuilder&, SerializationMode) const;
-    virtual Vector<Parser::ComponentValue> tokenize() const;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
-    virtual StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
+    void serialize(StringBuilder&, SerializationMode) const;
+    void serialize(Utf16StringBuilder&, SerializationMode) const;
+    Vector<Parser::ComponentValue> tokenize() const;
+    GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
+    // The default reification, used by types without a bespoke one and by impls that fall back.
+    GC::Ref<CSSStyleValue> default_reify(JS::Realm&, Utf16FlyString const& associated_property) const;
+    StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
 
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) { }
+    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
 
-    virtual bool equals(StyleValue const& other) const = 0;
+    bool equals(StyleValue const& other) const;
 
     bool operator==(StyleValue const& other) const
     {
@@ -195,10 +198,13 @@ public:
     // https://drafts.css-houdini.org/css-properties-values-api/#computationally-independent
     // A property value is computationally independent if it can be converted into a computed value using only the value
     // of the property on the element, and "global" information that cannot be changed by CSS.
-    virtual bool is_computationally_independent() const = 0;
+    bool is_computationally_independent() const;
 
 protected:
-    explicit StyleValue(Type);
+    StyleValue(Type, StyleValueFFI::StyleValueData*);
+
+    // The single Rust-owned allocation holding this value's data.
+    RustStyleValueHandle m_value;
 
 private:
     Type m_type;
@@ -209,7 +215,7 @@ struct StyleValueWithDefaultOperators : public StyleValue {
     using StyleValue::StyleValue;
     using Base = StyleValue;
 
-    virtual bool equals(StyleValue const& other) const override
+    bool equals(StyleValue const& other) const
     {
         if (type() != other.type())
             return false;
@@ -218,9 +224,34 @@ struct StyleValueWithDefaultOperators : public StyleValue {
     }
 };
 
+// Retains one strong reference to the value (if non-null) and returns its pointer, for
+// transferring ownership into a Rust-owned style value allocation.
+inline void const* retain_style_value_for_rust(StyleValue const* value)
+{
+    if (value)
+        value->ref();
+    return value;
+}
+
+// Leaks one strong reference per (possibly null) value and returns the raw pointers, for
+// transferring ownership into a Rust-owned style value allocation.
+template<typename T>
+Vector<void const*> leak_style_value_pointers_for_rust(Vector<T>& values)
+{
+    Vector<void const*> pointers;
+    pointers.ensure_capacity(values.size());
+    for (auto& value : values) {
+        if constexpr (IsPointer<decltype(value.leak_ref())>)
+            pointers.unchecked_append(value.leak_ref());
+        else
+            pointers.unchecked_append(&value.leak_ref());
+    }
+    return pointers;
+}
+
 i32 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
 double number_from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<double> percentage_basis);
-Utf16FlyString const& string_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
+Utf16FlyString string_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
 
 }
 

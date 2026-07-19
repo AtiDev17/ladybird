@@ -20,17 +20,27 @@ public:
         ValueComparingRefPtr<StyleValue const> const& fallback_value);
     virtual ~AnchorSizeStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(AnchorSizeStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(AnchorSizeStyleValue const& other) const { return anchor_name() == other.anchor_name() && anchor_size() == other.anchor_size() && fallback_value() == other.fallback_value(); }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
-    Optional<Utf16FlyString const&> anchor_name() const { return m_properties.anchor_name; }
-    Optional<AnchorSize> anchor_size() const { return m_properties.anchor_size; }
+    Optional<Utf16FlyString> anchor_name() const
+    {
+        if (!m_value->anchor_size.has_anchor_name)
+            return {};
+        return Utf16FlyString::from_raw(m_value->anchor_size.anchor_name.raw);
+    }
+    Optional<AnchorSize> anchor_size() const
+    {
+        if (!m_value->anchor_size.has_anchor_size)
+            return {};
+        return static_cast<AnchorSize>(m_value->anchor_size.anchor_size);
+    }
     ValueComparingRefPtr<StyleValue const> fallback_value() const
     {
-        return m_properties.fallback_value;
+        return static_cast<StyleValue const*>(m_value->anchor_size.fallback_value.pointer);
     }
 
 private:
@@ -38,13 +48,6 @@ private:
         Optional<Utf16FlyString> const& anchor_name,
         Optional<AnchorSize> const& anchor_size,
         ValueComparingRefPtr<StyleValue const> const& fallback_value);
-
-    struct Properties {
-        Optional<Utf16FlyString> anchor_name;
-        Optional<AnchorSize> anchor_size;
-        ValueComparingRefPtr<StyleValue const> fallback_value;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

@@ -21,23 +21,17 @@ public:
     }
     virtual ~RepeatStyleStyleValue() override;
 
-    Repetition repeat_x() const { return m_properties.repeat_x; }
-    Repetition repeat_y() const { return m_properties.repeat_y; }
+    Repetition repeat_x() const { return static_cast<Repetition>(m_value->repeat_style.repeat_x); }
+    Repetition repeat_y() const { return static_cast<Repetition>(m_value->repeat_style.repeat_y); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(RepeatStyleStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(RepeatStyleStyleValue const& other) const { return repeat_x() == other.repeat_x() && repeat_y() == other.repeat_y(); }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     RepeatStyleStyleValue(Repetition repeat_x, Repetition repeat_y);
-
-    struct Properties {
-        Repetition repeat_x;
-        Repetition repeat_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

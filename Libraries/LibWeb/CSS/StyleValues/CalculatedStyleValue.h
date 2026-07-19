@@ -72,60 +72,57 @@ public:
         return adopt_ref(*new (nothrow) CalculatedStyleValue(move(calculation), move(resolved_type), move(context)));
     }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    virtual bool equals(StyleValue const& other) const override;
-    virtual bool is_computationally_independent() const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
+    bool equals(StyleValue const& other) const;
+    bool is_computationally_independent() const;
 
-    NonnullRefPtr<CalculationNode const> calculation() const { return m_calculation; }
+    NonnullRefPtr<CalculationNode const> calculation() const { return *static_cast<CalculationNode const*>(m_value->calculated.calculation.pointer); }
 
-    bool resolves_to_angle() const { return m_resolved_type.matches_angle(m_context.percentages_resolve_as); }
-    bool resolves_to_angle_percentage() const { return m_resolved_type.matches_angle_percentage(m_context.percentages_resolve_as); }
+    bool resolves_to_angle() const { return resolved_type().matches_angle(calculation_context().percentages_resolve_as); }
+    bool resolves_to_angle_percentage() const { return resolved_type().matches_angle_percentage(calculation_context().percentages_resolve_as); }
     Optional<Angle> resolve_angle(CalculationResolutionContext const&) const;
 
-    bool resolves_to_flex() const { return m_resolved_type.matches_flex(m_context.percentages_resolve_as); }
+    bool resolves_to_flex() const { return resolved_type().matches_flex(calculation_context().percentages_resolve_as); }
     Optional<Flex> resolve_flex(CalculationResolutionContext const&) const;
 
-    bool resolves_to_frequency() const { return m_resolved_type.matches_frequency(m_context.percentages_resolve_as); }
-    bool resolves_to_frequency_percentage() const { return m_resolved_type.matches_frequency_percentage(m_context.percentages_resolve_as); }
+    bool resolves_to_frequency() const { return resolved_type().matches_frequency(calculation_context().percentages_resolve_as); }
+    bool resolves_to_frequency_percentage() const { return resolved_type().matches_frequency_percentage(calculation_context().percentages_resolve_as); }
     Optional<Frequency> resolve_frequency(CalculationResolutionContext const&) const;
 
-    bool resolves_to_length() const { return m_resolved_type.matches_length(m_context.percentages_resolve_as); }
-    bool resolves_to_length_percentage() const { return m_resolved_type.matches_length_percentage(m_context.percentages_resolve_as); }
+    bool resolves_to_length() const { return resolved_type().matches_length(calculation_context().percentages_resolve_as); }
+    bool resolves_to_length_percentage() const { return resolved_type().matches_length_percentage(calculation_context().percentages_resolve_as); }
     Optional<Length> resolve_length(CalculationResolutionContext const&) const;
     Optional<double> resolve_raw_length(CalculationResolutionContext const&) const;
 
-    bool resolves_to_percentage() const { return m_resolved_type.matches_percentage(); }
+    bool resolves_to_percentage() const { return resolved_type().matches_percentage(); }
     Optional<Percentage> resolve_percentage(CalculationResolutionContext const&) const;
 
-    bool resolves_to_resolution() const { return m_resolved_type.matches_resolution(m_context.percentages_resolve_as); }
+    bool resolves_to_resolution() const { return resolved_type().matches_resolution(calculation_context().percentages_resolve_as); }
     Optional<Resolution> resolve_resolution(CalculationResolutionContext const&) const;
 
-    bool resolves_to_time() const { return m_resolved_type.matches_time(m_context.percentages_resolve_as); }
-    bool resolves_to_time_percentage() const { return m_resolved_type.matches_time_percentage(m_context.percentages_resolve_as); }
+    bool resolves_to_time() const { return resolved_type().matches_time(calculation_context().percentages_resolve_as); }
+    bool resolves_to_time_percentage() const { return resolved_type().matches_time_percentage(calculation_context().percentages_resolve_as); }
     Optional<Time> resolve_time(CalculationResolutionContext const&) const;
 
-    bool resolves_to_number() const { return m_resolved_type.matches_number(m_context.percentages_resolve_as); }
+    bool resolves_to_number() const { return resolved_type().matches_number(calculation_context().percentages_resolve_as); }
     Optional<double> resolve_number(CalculationResolutionContext const&) const;
     Optional<i32> resolve_integer(CalculationResolutionContext const&) const;
 
     RefPtr<StyleValue const> resolve_as_style_value(CalculationResolutionContext const&) const;
 
-    bool resolves_to_dimension() const { return m_resolved_type.matches_dimension(); }
+    bool resolves_to_dimension() const { return resolved_type().matches_dimension(); }
 
     bool contains_percentage() const;
     bool is_fully_simplified() const;
 
     String dump() const;
 
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const override;
+    GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
 
 private:
     explicit CalculatedStyleValue(NonnullRefPtr<CalculationNode const> calculation, NumericType resolved_type, CalculationContext context)
-        : StyleValue(Type::Calculated)
-        , m_resolved_type(move(resolved_type))
-        , m_calculation(move(calculation))
-        , m_context(move(context))
+        : StyleValue(Type::Calculated, make_calculated_data(calculation, resolved_type, context))
     {
     }
 
@@ -138,12 +135,14 @@ private:
     //        There are still some CalculatedStyleValues which we don't call absolutized for (i.e. sub-values of other
     //        StyleValue classes which lack their own absolutized method) which will need to be fixed beforehand.
     Optional<ResolvedValue> resolve_value(CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
+    Optional<ResolvedValue> resolve_value(CalculationContext const&, CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
 
     Optional<ValueType> percentage_resolved_type() const;
 
-    NumericType m_resolved_type;
-    NonnullRefPtr<CalculationNode const> m_calculation;
-    CalculationContext m_context;
+    static StyleValueFFI::StyleValueData* make_calculated_data(NonnullRefPtr<CalculationNode const> const&, NumericType const&, CalculationContext const&);
+
+    NumericType resolved_type() const;
+    CalculationContext calculation_context() const;
 };
 
 #define ENUMERATE_CALCULATION_NODE_TYPES(X) \

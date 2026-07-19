@@ -26,9 +26,9 @@ public:
     static ValueComparingNonnullRefPtr<ImageSetStyleValue const> create(Vector<Option>);
     virtual ~ImageSetStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual bool equals(StyleValue const& other) const override;
-    virtual bool is_computationally_independent() const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    bool equals(StyleValue const& other) const;
+    bool is_computationally_independent() const;
 
     virtual void load_any_resources(DOM::Document&) override;
 
@@ -46,12 +46,34 @@ public:
 private:
     explicit ImageSetStyleValue(Vector<Option>);
 
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    // NB: StyleValue dispatches operations by type tag, so it may call private impls.
+    friend class StyleValue;
+    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    Option const* select_option(double device_pixels_per_css_pixel) const;
+    Optional<Option> select_option(double device_pixels_per_css_pixel) const;
 
-    Vector<Option> m_options;
+    Vector<Option> options() const
+    {
+        auto const& list = m_value->image_set.options;
+        Vector<Option> options;
+        options.ensure_capacity(list.length);
+        for (size_t i = 0; i < list.length; ++i) {
+            auto const& option = list.pointer[i];
+            Optional<Utf16String> type;
+            if (option.has_type)
+                type = Utf16String::from_raw(option.type_string.raw);
+            options.unchecked_append(Option {
+                .image = *static_cast<AbstractImageStyleValue const*>(option.image.pointer),
+                .resolution = *static_cast<StyleValue const*>(option.resolution.pointer),
+                .type = move(type),
+            });
+        }
+        return options;
+    }
+
+    static StyleValueFFI::StyleValueData* make_image_set_data(Vector<Option> const&);
+
     mutable AbstractImageStyleValue const* m_selected_image { nullptr };
     mutable double m_selected_resolution { 1 };
 };

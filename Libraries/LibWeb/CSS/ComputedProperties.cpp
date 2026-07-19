@@ -231,9 +231,10 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
     auto filter_style_value = [](Filter const& filter) -> NonnullRefPtr<StyleValue const> {
         if (filter.is_none())
             return KeywordStyleValue::create(Keyword::None);
+        auto filter_values = filter.filters();
         StyleValueVector filters;
-        MUST(filters.try_ensure_capacity(filter.filters().size()));
-        for (auto const& filter_value : filter.filters())
+        MUST(filters.try_ensure_capacity(filter_values.size()));
+        for (auto const& filter_value : filter_values)
             filters.unchecked_append(filter_value);
         return StyleValueList::create(move(filters), StyleValueList::Separator::Space, StyleValueList::Collapsible::No);
     };
@@ -2119,11 +2120,12 @@ PreferredColorScheme ComputedProperties::color_scheme(PreferredColorScheme prefe
 {
     // To determine the used color scheme of an element:
     auto const& scheme_value = property(PropertyID::ColorScheme).as_color_scheme();
+    auto schemes = scheme_value.schemes();
 
     // 1. If the user’s preferred color scheme, as indicated by the prefers-color-scheme media feature,
     //    is present among the listed color schemes, and is supported by the user agent,
     //    that’s the element’s used color scheme.
-    if (preferred_scheme != PreferredColorScheme::Auto && scheme_value.schemes().contains_slow(preferred_color_scheme_to_utf16_fly_string(preferred_scheme)))
+    if (preferred_scheme != PreferredColorScheme::Auto && schemes.contains_slow(preferred_color_scheme_to_utf16_fly_string(preferred_scheme)))
         return preferred_scheme;
 
     // 2. Otherwise, if the user has indicated an overriding preference for their chosen color scheme,
@@ -2134,7 +2136,7 @@ PreferredColorScheme ComputedProperties::color_scheme(PreferredColorScheme prefe
 
     // 3. Otherwise, if the user agent supports at least one of the listed color schemes,
     //    the used color scheme is the first supported color scheme in the list.
-    auto first_supported = scheme_value.schemes().first_matching([](auto scheme) { return preferred_color_scheme_from_string(scheme) != PreferredColorScheme::Auto; });
+    auto first_supported = schemes.first_matching([](auto scheme) { return preferred_color_scheme_from_string(scheme) != PreferredColorScheme::Auto; });
     if (first_supported.has_value())
         return preferred_color_scheme_from_string(first_supported.value());
 
@@ -2515,7 +2517,7 @@ Vector<BackgroundLayerData> ComputedProperties::mask_layers() const
     auto property_values = [&](PropertyID property_id) {
         auto const& value = property(property_id);
         if (value.is_value_list())
-            return value.as_value_list().values();
+            return StyleValueVector { value.as_value_list().values() };
         return StyleValueVector { value };
     };
 
@@ -3226,7 +3228,7 @@ Vector<TextDecorationLine> ComputedProperties::text_decoration_line() const
 
     if (value.is_value_list()) {
         Vector<TextDecorationLine> lines;
-        auto& values = value.as_value_list().values();
+        auto values = value.as_value_list().values();
         for (auto const& item : values) {
             lines.append(keyword_to_text_decoration_line(item->to_keyword()).value());
         }
@@ -3824,7 +3826,7 @@ Containment ComputedProperties::contain() const
         break;
     default:
         if (value.is_value_list()) {
-            auto& values = value.as_value_list().values();
+            auto values = value.as_value_list().values();
             for (auto const& item : values) {
                 switch (item->to_keyword()) {
                 case Keyword::Size:
@@ -3862,7 +3864,7 @@ Vector<Utf16FlyString> ComputedProperties::container_name() const
     Vector<Utf16FlyString> names;
 
     if (value.is_value_list()) {
-        auto& values = value.as_value_list().values();
+        auto values = value.as_value_list().values();
         for (auto const& item : values)
             names.append(item->as_custom_ident().custom_ident());
     } else {
@@ -3882,7 +3884,7 @@ ContainerType ComputedProperties::container_type() const
         return container_type;
 
     if (value.is_value_list()) {
-        auto& values = value.as_value_list().values();
+        auto values = value.as_value_list().values();
         for (auto const& item : values) {
             switch (item->to_keyword()) {
             case Keyword::Size:
@@ -4163,7 +4165,7 @@ Vector<CounterData> ComputedProperties::counter_data(PropertyID property_id) con
     auto const& value = property(property_id);
 
     if (value.is_counter_definitions()) {
-        auto& counter_definitions = value.as_counter_definitions().counter_definitions();
+        auto counter_definitions = value.as_counter_definitions().counter_definitions();
         Vector<CounterData> result;
         for (auto& counter : counter_definitions) {
             CounterData data {

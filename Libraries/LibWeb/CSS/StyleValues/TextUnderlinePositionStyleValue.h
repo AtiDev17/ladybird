@@ -18,25 +18,20 @@ public:
     }
     virtual ~TextUnderlinePositionStyleValue() override = default;
 
-    TextUnderlinePositionHorizontal horizontal() const { return m_horizontal; }
-    TextUnderlinePositionVertical vertical() const { return m_vertical; }
+    TextUnderlinePositionHorizontal horizontal() const { return static_cast<TextUnderlinePositionHorizontal>(m_value->text_underline_position.horizontal); }
+    TextUnderlinePositionVertical vertical() const { return static_cast<TextUnderlinePositionVertical>(m_value->text_underline_position.vertical); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(TextUnderlinePositionStyleValue const& other) const { return m_horizontal == other.m_horizontal && m_vertical == other.m_vertical; }
+    bool properties_equal(TextUnderlinePositionStyleValue const& other) const { return horizontal() == other.horizontal() && vertical() == other.vertical(); }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     explicit TextUnderlinePositionStyleValue(TextUnderlinePositionHorizontal horizontal, TextUnderlinePositionVertical vertical)
-        : StyleValueWithDefaultOperators(Type::TextUnderlinePosition)
-        , m_horizontal(horizontal)
-        , m_vertical(vertical)
+        : StyleValueWithDefaultOperators(Type::TextUnderlinePosition, StyleValueFFI::rust_style_value_create_text_underline_position(to_underlying(horizontal), to_underlying(vertical)))
     {
     }
-
-    TextUnderlinePositionHorizontal m_horizontal;
-    TextUnderlinePositionVertical m_vertical;
 };
 
 }

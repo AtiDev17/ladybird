@@ -121,27 +121,35 @@ public:
     }
     virtual ~EasingStyleValue() override = default;
 
-    Function const& function() const { return m_function; }
+    Function const& function() const;
 
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_function.serialize(builder, mode); }
-    virtual void serialize(Utf16StringBuilder& builder, SerializationMode mode) const override { m_function.serialize(builder, mode); }
+    void serialize(StringBuilder& builder, SerializationMode mode) const { function().serialize(builder, mode); }
+    void serialize(Utf16StringBuilder& builder, SerializationMode mode) const { function().serialize(builder, mode); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    bool properties_equal(EasingStyleValue const& other) const { return m_function == other.m_function; }
+    bool properties_equal(EasingStyleValue const& other) const { return function() == other.function(); }
 
-    virtual bool is_computationally_independent() const override
+    bool is_computationally_independent() const
     {
-        return m_function.visit([](auto const& function) { return function.is_computationally_independent(); });
+        return function().visit([](auto const& function) { return function.is_computationally_independent(); });
     }
 
 private:
     EasingStyleValue(Function const& function)
-        : StyleValueWithDefaultOperators(Type::Easing)
+        : StyleValueWithDefaultOperators(Type::Easing, make_easing_data(function))
         , m_function(function)
     {
     }
 
+    static StyleValueFFI::StyleValueData* make_easing_data(Function const&);
+
+    // NB: The materialized function is a cache of the Rust-owned value data; it also carries the
+    //     cubic-bezier sample cache. The Rust allocation stays authoritative.
+    // NB: Eagerly materialized copy of the Rust-owned data, stored so function() can return a
+    //     stable reference; immutable after construction, so sharing across style workers is
+    //     safe (the cubic-bezier sample cache inside is only touched by main-thread animation
+    //     evaluation).
     Function m_function;
 };
 

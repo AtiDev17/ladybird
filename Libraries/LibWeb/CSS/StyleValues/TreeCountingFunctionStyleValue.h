@@ -28,27 +28,25 @@ public:
     }
     virtual ~TreeCountingFunctionStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
     size_t resolve(DOM::AbstractElement const&) const;
 
     virtual RefPtr<CalculationNode const> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual bool equals(StyleValue const& other) const override;
+    bool equals(StyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override { return false; }
+    bool is_computationally_independent() const { return false; }
 
 private:
+    TreeCountingFunction function() const { return static_cast<TreeCountingFunction>(m_value->tree_counting_function.function); }
+    ComputedType computed_type() const { return static_cast<ComputedType>(m_value->tree_counting_function.computed_type); }
+
     TreeCountingFunctionStyleValue(TreeCountingFunction function, ComputedType computed_type)
-        : AbstractNonMathCalcFunctionStyleValue(Type::TreeCountingFunction)
-        , m_function(function)
-        , m_computed_type(computed_type)
+        : AbstractNonMathCalcFunctionStyleValue(Type::TreeCountingFunction, StyleValueFFI::rust_style_value_create_tree_counting_function(to_underlying(function), to_underlying(computed_type)))
     {
     }
-
-    TreeCountingFunction m_function;
-    ComputedType m_computed_type;
 };
 
 }

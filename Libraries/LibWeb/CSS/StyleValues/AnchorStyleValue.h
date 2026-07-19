@@ -20,32 +20,30 @@ public:
         ValueComparingRefPtr<StyleValue const> const& fallback_value);
     virtual ~AnchorStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
     virtual RefPtr<CalculationNode const> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
 
-    virtual bool equals(StyleValue const& other) const override;
+    bool equals(StyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
-    Optional<Utf16FlyString const&> anchor_name() const { return m_properties.anchor_name; }
+    Optional<Utf16FlyString> anchor_name() const
+    {
+        if (!m_value->anchor.has_anchor_name)
+            return {};
+        return Utf16FlyString::from_raw(m_value->anchor.anchor_name.raw);
+    }
     ValueComparingNonnullRefPtr<StyleValue const> anchor_side() const
     {
-        return m_properties.anchor_side;
+        return *static_cast<StyleValue const*>(m_value->anchor.anchor_side.pointer);
     }
     ValueComparingRefPtr<StyleValue const> fallback_value() const
     {
-        return m_properties.fallback_value;
+        return static_cast<StyleValue const*>(m_value->anchor.fallback_value.pointer);
     }
 
 private:
     AnchorStyleValue(Optional<Utf16FlyString> const& anchor_name, ValueComparingNonnullRefPtr<StyleValue const> const& anchor_side, ValueComparingRefPtr<StyleValue const> const& fallback_value);
-
-    struct Properties {
-        Optional<Utf16FlyString> anchor_name;
-        ValueComparingNonnullRefPtr<StyleValue const> anchor_side;
-        ValueComparingRefPtr<StyleValue const> fallback_value;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

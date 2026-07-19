@@ -1309,7 +1309,7 @@ endforeach()
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
     CRATE_NAME libweb_rust
-    FFI_HEADERS RustFFI.h SelectorRustFFI.h HTML/Parser/RustFFI.h
+    FFI_HEADERS RustFFI.h SelectorRustFFI.h StyleValueRustFFI.h HTML/Parser/RustFFI.h
 )
 
 set(content_blocker_rust_features "")

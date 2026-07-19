@@ -24,24 +24,18 @@ public:
     }
     virtual ~BackgroundSizeStyleValue() override;
 
-    ValueComparingNonnullRefPtr<StyleValue const> size_x() const { return m_properties.size_x; }
-    ValueComparingNonnullRefPtr<StyleValue const> size_y() const { return m_properties.size_y; }
+    ValueComparingNonnullRefPtr<StyleValue const> size_x() const { return *static_cast<StyleValue const*>(m_value->background_size.size_x.pointer); }
+    ValueComparingNonnullRefPtr<StyleValue const> size_y() const { return *static_cast<StyleValue const*>(m_value->background_size.size_y.pointer); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    bool properties_equal(BackgroundSizeStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(BackgroundSizeStyleValue const& other) const { return size_x() == other.size_x() && size_y() == other.size_y(); }
 
-    virtual bool is_computationally_independent() const override { return m_properties.size_x->is_computationally_independent() && m_properties.size_y->is_computationally_independent(); }
+    bool is_computationally_independent() const { return size_x()->is_computationally_independent() && size_y()->is_computationally_independent(); }
 
 private:
     BackgroundSizeStyleValue(ValueComparingNonnullRefPtr<StyleValue const> size_x, ValueComparingNonnullRefPtr<StyleValue const> size_y);
-
-    struct Properties {
-        ValueComparingNonnullRefPtr<StyleValue const> size_x;
-        ValueComparingNonnullRefPtr<StyleValue const> size_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

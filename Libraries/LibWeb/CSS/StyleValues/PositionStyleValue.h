@@ -12,40 +12,34 @@
 #include <LibWeb/CSS/PercentageOr.h>
 #include <LibWeb/CSS/StyleValues/EdgeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Export.h>
 
 namespace Web::CSS {
 
-class PositionStyleValue final : public StyleValueWithDefaultOperators<PositionStyleValue> {
+class WEB_API PositionStyleValue final : public StyleValueWithDefaultOperators<PositionStyleValue> {
 public:
     static ValueComparingNonnullRefPtr<PositionStyleValue const> create(ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x, ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y);
     static ValueComparingNonnullRefPtr<PositionStyleValue const> create_center();
     static ValueComparingNonnullRefPtr<PositionStyleValue const> create_computed_center();
     virtual ~PositionStyleValue() override = default;
 
-    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x() const { return m_properties.edge_x; }
-    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y() const { return m_properties.edge_y; }
+    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x() const { return *static_cast<EdgeStyleValue const*>(m_value->position.edge_x.pointer); }
+    ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y() const { return *static_cast<EdgeStyleValue const*>(m_value->position.edge_y.pointer); }
     bool is_center(SerializationMode) const;
     CSSPixelPoint resolved(CSSPixelRect const&) const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const override;
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(PositionStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(PositionStyleValue const& other) const { return edge_x() == other.edge_x() && edge_y() == other.edge_y(); }
 
-    virtual bool is_computationally_independent() const override { return m_properties.edge_x->is_computationally_independent() && m_properties.edge_y->is_computationally_independent(); }
+    bool is_computationally_independent() const { return edge_x()->is_computationally_independent() && edge_y()->is_computationally_independent(); }
 
 private:
     PositionStyleValue(ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x, ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y)
-        : StyleValueWithDefaultOperators(Type::Position)
-        , m_properties { .edge_x = move(edge_x), .edge_y = move(edge_y) }
+        : StyleValueWithDefaultOperators(Type::Position, StyleValueFFI::rust_style_value_create_position(&edge_x.leak_ref(), &edge_y.leak_ref()))
     {
     }
-
-    struct Properties {
-        ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_x;
-        ValueComparingNonnullRefPtr<EdgeStyleValue const> edge_y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
 };
 
 }

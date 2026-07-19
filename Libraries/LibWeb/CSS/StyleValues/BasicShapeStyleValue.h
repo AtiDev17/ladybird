@@ -159,28 +159,33 @@ public:
     }
     virtual ~BasicShapeStyleValue() override;
 
-    BasicShape const& basic_shape() const { return m_basic_shape; }
+    BasicShape const& basic_shape() const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    bool properties_equal(BasicShapeStyleValue const& other) const { return m_basic_shape == other.m_basic_shape; }
+    bool properties_equal(BasicShapeStyleValue const& other) const { return basic_shape() == other.basic_shape(); }
 
-    virtual bool is_computationally_independent() const override
+    bool is_computationally_independent() const
     {
-        return m_basic_shape.visit([](auto const& shape) { return shape.is_computationally_independent(); });
+        return basic_shape().visit([](auto const& shape) { return shape.is_computationally_independent(); });
     }
 
     Gfx::Path to_path(CSSPixelRect reference_box) const;
 
 private:
     BasicShapeStyleValue(BasicShape basic_shape)
-        : StyleValueWithDefaultOperators(Type::BasicShape)
-        , m_basic_shape(move(basic_shape))
+        : StyleValueWithDefaultOperators(Type::BasicShape, make_basic_shape_data(basic_shape))
+        , m_shape(move(basic_shape))
     {
     }
 
-    BasicShape m_basic_shape;
+    static StyleValueFFI::StyleValueData* make_basic_shape_data(BasicShape const&);
+
+    // NB: Eagerly materialized copy of the Rust-owned data (rebuilding a path shape would
+    //     re-parse its serialized path data); the Rust allocation stays authoritative, and the
+    //     copy is immutable after construction, so sharing across style workers is safe.
+    BasicShape m_shape;
 };
 
 }

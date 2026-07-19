@@ -25,33 +25,32 @@ public:
     }
     virtual ~CursorStyleValue() override = default;
 
-    AbstractImageStyleValue const& image() const { return *m_properties.image; }
+    AbstractImageStyleValue const& image() const { return *static_cast<AbstractImageStyleValue const*>(m_value->cursor.image.pointer); }
 
     Optional<Gfx::ImageCursor> make_image_cursor(Layout::NodeWithStyle const&) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    bool properties_equal(CursorStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(CursorStyleValue const& other) const { return image_as_style_value().equals(other.image_as_style_value()) && x() == other.x() && y() == other.y(); }
 
-    virtual bool is_computationally_independent() const override;
+    bool is_computationally_independent() const;
 
 private:
     CursorStyleValue(ValueComparingNonnullRefPtr<AbstractImageStyleValue const> image,
         RefPtr<StyleValue const> x,
         RefPtr<StyleValue const> y)
-        : StyleValueWithDefaultOperators(Type::Cursor)
-        , m_properties { .image = move(image), .x = move(x), .y = move(y) }
+        : StyleValueWithDefaultOperators(Type::Cursor, make_cursor_data(image, x, y))
     {
     }
 
-    struct Properties {
-        ValueComparingNonnullRefPtr<AbstractImageStyleValue const> image;
-        ValueComparingRefPtr<StyleValue const> x;
-        ValueComparingRefPtr<StyleValue const> y;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    static StyleValueFFI::StyleValueData* make_cursor_data(NonnullRefPtr<AbstractImageStyleValue const> const&, RefPtr<StyleValue const> const&, RefPtr<StyleValue const> const&);
+
+    StyleValue const& image_as_style_value() const { return *static_cast<StyleValue const*>(m_value->cursor.image.pointer); }
+
+    ValueComparingRefPtr<StyleValue const> x() const { return static_cast<StyleValue const*>(m_value->cursor.x.pointer); }
+    ValueComparingRefPtr<StyleValue const> y() const { return static_cast<StyleValue const*>(m_value->cursor.y.pointer); }
 
     mutable Optional<Color> m_cached_bitmap_color;
     mutable Optional<Gfx::ShareableBitmap> m_cached_bitmap;

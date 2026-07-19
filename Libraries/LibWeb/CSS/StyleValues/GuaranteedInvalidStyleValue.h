@@ -19,19 +19,19 @@ public:
         return instance;
     }
     virtual ~GuaranteedInvalidStyleValue() override = default;
-    virtual void serialize(StringBuilder&, SerializationMode) const override { }
-    virtual Vector<Parser::ComponentValue> tokenize() const override
+    void serialize(StringBuilder&, SerializationMode) const { }
+    Vector<Parser::ComponentValue> tokenize() const
     {
         return { Parser::ComponentValue { Parser::GuaranteedInvalidValue {} } };
     }
 
     bool properties_equal(GuaranteedInvalidStyleValue const&) const { return true; }
 
-    virtual bool is_computationally_independent() const override { VERIFY_NOT_REACHED(); }
+    bool is_computationally_independent() const { VERIFY_NOT_REACHED(); }
 
 private:
     GuaranteedInvalidStyleValue()
-        : StyleValueWithDefaultOperators(Type::GuaranteedInvalid)
+        : StyleValueWithDefaultOperators(Type::GuaranteedInvalid, StyleValueFFI::rust_style_value_create_guaranteed_invalid())
     {
     }
 };

@@ -22,16 +22,16 @@ public:
 
     // NB: This style is used to represent a missing optional value, it should only appear within a StyleValueList which
     //     will skip serializing/tokenizing it and the relevant separator so it should never be serialized/tokenized.
-    virtual void serialize(StringBuilder&, SerializationMode) const override { VERIFY_NOT_REACHED(); }
-    virtual Vector<Parser::ComponentValue> tokenize() const override { VERIFY_NOT_REACHED(); }
+    void serialize(StringBuilder&, SerializationMode) const { VERIFY_NOT_REACHED(); }
+    Vector<Parser::ComponentValue> tokenize() const { VERIFY_NOT_REACHED(); }
 
     bool properties_equal(EmptyOptionalStyleValue const&) const { return true; }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     EmptyOptionalStyleValue()
-        : StyleValueWithDefaultOperators(Type::EmptyOptional)
+        : StyleValueWithDefaultOperators(Type::EmptyOptional, StyleValueFFI::rust_style_value_create_empty_optional())
     {
     }
 };

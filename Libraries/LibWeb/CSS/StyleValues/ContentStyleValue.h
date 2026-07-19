@@ -21,29 +21,24 @@ public:
     }
     virtual ~ContentStyleValue() override = default;
 
-    StyleValueList const& content() const { return *m_properties.content; }
-    StyleValueList const* alt_text() const { return m_properties.alt_text; }
+    StyleValueList const& content() const { return *static_cast<StyleValueList const*>(m_value->content.content.pointer); }
+    StyleValueList const* alt_text() const { return static_cast<StyleValueList const*>(m_value->content.alt_text.pointer); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(ContentStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(ContentStyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override;
+    bool is_computationally_independent() const;
 
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
+    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
 
 private:
     ContentStyleValue(ValueComparingNonnullRefPtr<StyleValueList const> content, ValueComparingRefPtr<StyleValueList const> alt_text)
-        : StyleValueWithDefaultOperators(Type::Content)
-        , m_properties { .content = move(content), .alt_text = move(alt_text) }
+        : StyleValueWithDefaultOperators(Type::Content, make_content_data(move(content), alt_text))
     {
     }
 
-    struct Properties {
-        ValueComparingNonnullRefPtr<StyleValueList const> content;
-        ValueComparingRefPtr<StyleValueList const> alt_text;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    static StyleValueFFI::StyleValueData* make_content_data(ValueComparingNonnullRefPtr<StyleValueList const>, ValueComparingRefPtr<StyleValueList const> const&);
 };
 
 }

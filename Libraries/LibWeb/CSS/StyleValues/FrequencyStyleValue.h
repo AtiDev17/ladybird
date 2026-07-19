@@ -22,26 +22,23 @@ public:
     }
     virtual ~FrequencyStyleValue() override = default;
 
-    Frequency const& frequency() const { return m_frequency; }
-    virtual double raw_value() const override { return m_frequency.raw_value(); }
-    virtual Utf16FlyString unit_name() const override { return m_frequency.unit_name(); }
+    Frequency frequency() const { return Frequency(m_value->frequency.value, static_cast<FrequencyUnit>(m_value->frequency.unit)); }
+    virtual double raw_value() const override { return m_value->frequency.value; }
+    virtual Utf16FlyString unit_name() const override { return frequency().unit_name(); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_frequency.serialize(builder, mode); }
+    void serialize(StringBuilder& builder, SerializationMode mode) const { frequency().serialize(builder, mode); }
 
-    bool equals(StyleValue const& other) const override;
+    bool equals(StyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     explicit FrequencyStyleValue(Frequency frequency)
-        : DimensionStyleValue(Type::Frequency)
-        , m_frequency(move(frequency))
+        : DimensionStyleValue(Type::Frequency, StyleValueFFI::rust_style_value_create_frequency(frequency.raw_value(), to_underlying(frequency.unit())))
     {
     }
-
-    Frequency m_frequency;
 };
 
 }

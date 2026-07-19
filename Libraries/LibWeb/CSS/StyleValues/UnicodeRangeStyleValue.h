@@ -19,18 +19,16 @@ public:
     }
     virtual ~UnicodeRangeStyleValue() override;
 
-    Gfx::UnicodeRange const& unicode_range() const { return m_unicode_range; }
+    Gfx::UnicodeRange unicode_range() const { return Gfx::UnicodeRange(m_value->unicode_range.min_code_point, m_value->unicode_range.max_code_point); }
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
     bool properties_equal(UnicodeRangeStyleValue const&) const;
 
-    virtual bool is_computationally_independent() const override { VERIFY_NOT_REACHED(); }
+    bool is_computationally_independent() const { VERIFY_NOT_REACHED(); }
 
 private:
     UnicodeRangeStyleValue(Gfx::UnicodeRange);
-
-    Gfx::UnicodeRange m_unicode_range;
 };
 
 }

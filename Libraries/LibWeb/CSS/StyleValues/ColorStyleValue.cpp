@@ -14,11 +14,110 @@
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ColorMixStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ContrastColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
+#include <LibWeb/CSS/StyleValues/LightDarkStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 
 namespace Web::CSS {
+
+// The base class color_type()/color_syntax() accessors read the ColorBase prefix through the
+// color_function arm without knowing which color variant they have; every color variant payload
+// must keep the prefix as its first field.
+static_assert(offsetof(StyleValueFFI::StyleValueData::ColorFunction_Body, color_base) == 0);
+static_assert(offsetof(StyleValueFFI::StyleValueData::ColorMix_Body, color_base) == 0);
+static_assert(offsetof(StyleValueFFI::StyleValueData::LightDark_Body, color_base) == 0);
+static_assert(offsetof(StyleValueFFI::StyleValueData::ContrastColor_Body, color_base) == 0);
+
+// The C++ Type is Color for every color variant, so color operations dispatch on the Rust tag.
+Optional<Color> ColorStyleValue::to_color(ColorResolutionContext color_resolution_context) const
+{
+    switch (m_value->tag) {
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return static_cast<ColorFunctionStyleValue const&>(*this).to_color(color_resolution_context);
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return static_cast<ColorMixStyleValue const&>(*this).to_color(color_resolution_context);
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return static_cast<ContrastColorStyleValue const&>(*this).to_color(color_resolution_context);
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return static_cast<LightDarkStyleValue const&>(*this).to_color(color_resolution_context);
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+ValueComparingNonnullRefPtr<StyleValue const> ColorStyleValue::absolutized(ComputationContext const& context) const
+{
+    switch (m_value->tag) {
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return static_cast<ColorFunctionStyleValue const&>(*this).absolutized(context);
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return static_cast<ColorMixStyleValue const&>(*this).absolutized(context);
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return static_cast<ContrastColorStyleValue const&>(*this).absolutized(context);
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return static_cast<LightDarkStyleValue const&>(*this).absolutized(context);
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+bool ColorStyleValue::equals(StyleValue const& other) const
+{
+    if (type() != other.type())
+        return false;
+
+    auto const& other_color = static_cast<ColorStyleValue const&>(other);
+    if (m_value->tag != other_color.m_value->tag)
+        return false;
+
+    switch (m_value->tag) {
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return static_cast<ColorFunctionStyleValue const&>(*this).equals(other);
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return static_cast<ColorMixStyleValue const&>(*this).equals(other);
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return static_cast<ContrastColorStyleValue const&>(*this).equals(other);
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return static_cast<LightDarkStyleValue const&>(*this).equals(other);
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+void ColorStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
+{
+    switch (m_value->tag) {
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return static_cast<ColorFunctionStyleValue const&>(*this).serialize(builder, mode);
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return static_cast<ColorMixStyleValue const&>(*this).serialize(builder, mode);
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return static_cast<ContrastColorStyleValue const&>(*this).serialize(builder, mode);
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return static_cast<LightDarkStyleValue const&>(*this).serialize(builder, mode);
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
+bool ColorStyleValue::is_computationally_independent() const
+{
+    switch (m_value->tag) {
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return static_cast<ColorFunctionStyleValue const&>(*this).is_computationally_independent();
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return static_cast<ColorMixStyleValue const&>(*this).is_computationally_independent();
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return static_cast<ContrastColorStyleValue const&>(*this).is_computationally_independent();
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return static_cast<LightDarkStyleValue const&>(*this).is_computationally_independent();
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
 
 ValueComparingNonnullRefPtr<ColorStyleValue const> ColorStyleValue::create_from_color(Color color, ColorSyntax color_syntax, Optional<Utf16FlyString> name)
 {

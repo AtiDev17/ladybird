@@ -20,26 +20,25 @@ public:
 
     virtual ~OpacityValueStyleValue() override = default;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    double resolved() const { return m_value->as_number().number(); }
+    double resolved() const { return value()->as_number().number(); }
 
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm& realm, Utf16FlyString const& associated_property) const override;
+    GC::Ref<CSSStyleValue> reify(JS::Realm& realm, Utf16FlyString const& associated_property) const;
 
-    bool properties_equal(OpacityValueStyleValue const& other) const { return m_value == other.m_value; }
+    bool properties_equal(OpacityValueStyleValue const& other) const { return value() == other.value(); }
 
-    virtual bool is_computationally_independent() const override { return m_value->is_computationally_independent(); }
+    bool is_computationally_independent() const { return value()->is_computationally_independent(); }
 
 private:
     OpacityValueStyleValue(NonnullRefPtr<StyleValue const>&& value)
-        : StyleValueWithDefaultOperators(Type::OpacityValue)
-        , m_value(move(value))
+        : StyleValueWithDefaultOperators(Type::OpacityValue, StyleValueFFI::rust_style_value_create_opacity_value(&value.leak_ref()))
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_value;
+    ValueComparingNonnullRefPtr<StyleValue const> value() const { return *static_cast<StyleValue const*>(m_value->opacity_value.value.pointer); }
 };
 
 }

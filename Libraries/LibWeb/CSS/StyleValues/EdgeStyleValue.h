@@ -20,30 +20,40 @@ public:
     virtual ~EdgeStyleValue() override = default;
 
     // This is nonnull as it is only called after resolving keywords
-    NonnullRefPtr<StyleValue const> offset() const { return *m_properties.offset; }
+    NonnullRefPtr<StyleValue const> offset() const { return *offset_style_value(); }
 
     bool is_center(SerializationMode) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
     ValueComparingNonnullRefPtr<EdgeStyleValue const> with_resolved_keywords() const;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const override;
-    bool properties_equal(EdgeStyleValue const& other) const { return m_properties == other.m_properties; }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const;
+    bool properties_equal(EdgeStyleValue const& other) const { return edge() == other.edge() && offset_style_value() == other.offset_style_value(); }
 
-    virtual bool is_computationally_independent() const override { return !m_properties.offset || m_properties.offset->is_computationally_independent(); }
+    bool is_computationally_independent() const { return !offset_style_value() || offset_style_value()->is_computationally_independent(); }
 
 private:
     EdgeStyleValue(Optional<PositionEdge> edge, RefPtr<StyleValue const> const& offset)
-        : StyleValueWithDefaultOperators(Type::Edge)
-        , m_properties { .edge = edge, .offset = offset }
+        : StyleValueWithDefaultOperators(Type::Edge, make_edge_data(edge, offset))
     {
     }
 
-    struct Properties {
-        Optional<PositionEdge> edge;
-        ValueComparingRefPtr<StyleValue const> offset;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    static StyleValueFFI::StyleValueData* make_edge_data(Optional<PositionEdge> edge, RefPtr<StyleValue const> const& offset)
+    {
+        // The Rust allocation takes ownership of one strong reference to the offset.
+        if (offset)
+            offset->ref();
+        return StyleValueFFI::rust_style_value_create_edge(edge.has_value(), edge.has_value() ? to_underlying(*edge) : 0, offset.ptr());
+    }
+
+    Optional<PositionEdge> edge() const
+    {
+        if (!m_value->edge.has_edge)
+            return {};
+        return static_cast<PositionEdge>(m_value->edge.edge);
+    }
+
+    ValueComparingRefPtr<StyleValue const> offset_style_value() const { return static_cast<StyleValue const*>(m_value->edge.offset.pointer); }
 };
 
 }

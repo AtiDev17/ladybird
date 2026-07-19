@@ -19,31 +19,36 @@ public:
 
     virtual ~FontStyleStyleValue() override;
 
-    FontStyleKeyword font_style() const { return m_font_style; }
-    ValueComparingRefPtr<StyleValue const> angle() const { return m_angle_value; }
+    FontStyleKeyword font_style() const { return static_cast<FontStyleKeyword>(m_value->font_style.font_style); }
+    ValueComparingRefPtr<StyleValue const> angle() const { return static_cast<StyleValue const*>(m_value->font_style.angle_value.pointer); }
 
     int to_font_slope() const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const& computation_context) const;
 
-    bool equals(StyleValue const& other) const override
+    bool equals(StyleValue const& other) const
     {
         if (type() != other.type())
             return false;
         auto const& other_font_style = other.as_font_style();
-        return m_font_style == other_font_style.m_font_style && m_angle_value == other_font_style.m_angle_value;
+        return font_style() == other_font_style.font_style() && angle() == other_font_style.angle();
     }
 
-    bool properties_equal(FontStyleStyleValue const& other) const { return m_font_style == other.m_font_style && m_angle_value == other.m_angle_value; }
+    bool properties_equal(FontStyleStyleValue const& other) const { return font_style() == other.font_style() && angle() == other.angle(); }
 
-    virtual bool is_computationally_independent() const override { return !m_angle_value || m_angle_value->is_computationally_independent(); }
+    bool is_computationally_independent() const { return !angle() || angle()->is_computationally_independent(); }
 
 private:
     FontStyleStyleValue(FontStyleKeyword, ValueComparingRefPtr<StyleValue const> angle_value);
 
-    FontStyleKeyword m_font_style;
-    ValueComparingRefPtr<StyleValue const> m_angle_value;
+    static StyleValueFFI::StyleValueData* make_font_style_data(FontStyleKeyword font_style, ValueComparingRefPtr<StyleValue const> const& angle_value)
+    {
+        // The Rust allocation takes ownership of one strong reference to the angle value.
+        if (angle_value)
+            angle_value->ref();
+        return StyleValueFFI::rust_style_value_create_font_style(to_underlying(font_style), angle_value.ptr());
+    }
 };
 
 }

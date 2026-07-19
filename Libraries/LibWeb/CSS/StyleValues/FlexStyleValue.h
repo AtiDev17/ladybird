@@ -19,30 +19,27 @@ public:
     }
     virtual ~FlexStyleValue() override = default;
 
-    Flex const& flex() const { return m_flex; }
-    virtual double raw_value() const override { return m_flex.raw_value(); }
-    virtual Utf16FlyString unit_name() const override { return m_flex.unit_name(); }
+    Flex flex() const { return Flex(m_value->flex.value, static_cast<FlexUnit>(m_value->flex.unit)); }
+    virtual double raw_value() const override { return m_value->flex.value; }
+    virtual Utf16FlyString unit_name() const override { return flex().unit_name(); }
 
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_flex.serialize(builder, mode); }
+    void serialize(StringBuilder& builder, SerializationMode mode) const { flex().serialize(builder, mode); }
 
-    bool equals(StyleValue const& other) const override
+    bool equals(StyleValue const& other) const
     {
         if (type() != other.type())
             return false;
         auto const& other_flex = other.as_flex();
-        return m_flex == other_flex.m_flex;
+        return flex() == other_flex.flex();
     }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     FlexStyleValue(Flex&& flex)
-        : DimensionStyleValue(Type::Flex)
-        , m_flex(flex)
+        : DimensionStyleValue(Type::Flex, StyleValueFFI::rust_style_value_create_flex(flex.raw_value(), to_underlying(flex.unit())))
     {
     }
-
-    Flex m_flex;
 };
 
 }

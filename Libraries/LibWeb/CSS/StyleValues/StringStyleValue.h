@@ -21,25 +21,22 @@ public:
     }
     virtual ~StringStyleValue() override = default;
 
-    Utf16FlyString const& string_value() const { return m_string; }
-    virtual void serialize(StringBuilder& builder, SerializationMode) const override { builder.append(serialize_a_string(m_string)); }
-    virtual Vector<Parser::ComponentValue> tokenize() const override
+    Utf16FlyString string_value() const { return Utf16FlyString::from_raw(m_value->string.string.raw); }
+    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(serialize_a_string(string_value())); }
+    Vector<Parser::ComponentValue> tokenize() const
     {
-        return { Parser::Token::create_string(m_string) };
+        return { Parser::Token::create_string(string_value()) };
     }
 
-    bool properties_equal(StringStyleValue const& other) const { return m_string == other.m_string; }
+    bool properties_equal(StringStyleValue const& other) const { return string_value() == other.string_value(); }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     explicit StringStyleValue(Utf16FlyString string)
-        : StyleValueWithDefaultOperators(Type::String)
-        , m_string(move(string))
+        : StyleValueWithDefaultOperators(Type::String, StyleValueFFI::rust_style_value_create_string(string.to_raw_leaked()))
     {
     }
-
-    Utf16FlyString m_string;
 };
 
 }

@@ -19,12 +19,12 @@ public:
 
     virtual double raw_value() const = 0;
     virtual Utf16FlyString unit_name() const = 0;
-    virtual Vector<Parser::ComponentValue> tokenize() const override;
-    virtual GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const override;
+    Vector<Parser::ComponentValue> tokenize() const;
+    GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
 
 protected:
-    explicit DimensionStyleValue(Type type)
-        : StyleValue(type)
+    DimensionStyleValue(Type type, StyleValueFFI::StyleValueData* value)
+        : StyleValue(type, value)
     {
     }
 };

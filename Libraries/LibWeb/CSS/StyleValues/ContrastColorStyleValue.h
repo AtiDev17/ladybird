@@ -20,24 +20,28 @@ public:
         return adopt_ref(*new (nothrow) ContrastColorStyleValue(move(color)));
     }
 
-    virtual bool equals(StyleValue const&) const override;
-    virtual Optional<Color> to_color(ColorResolutionContext) const override;
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    bool equals(StyleValue const&) const;
+    Optional<Color> to_color(ColorResolutionContext) const;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    virtual bool is_computationally_independent() const override
+    bool is_computationally_independent() const
     {
-        return m_color->is_computationally_independent();
+        return color()->is_computationally_independent();
+    }
+
+    bool depends_on_current_color() const
+    {
+        return color()->depends_on_current_color();
     }
 
 private:
     explicit ContrastColorStyleValue(ValueComparingNonnullRefPtr<StyleValue const> color)
-        : ColorStyleValue({}, ColorSyntax::Modern)
-        , m_color(move(color))
+        : ColorStyleValue(StyleValueFFI::rust_style_value_create_contrast_color(false, 0, to_underlying(ColorSyntax::Modern), &color.leak_ref()))
     {
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> m_color;
+    ValueComparingNonnullRefPtr<StyleValue const> color() const { return *static_cast<StyleValue const*>(m_value->contrast_color.color.pointer); }
 };
 
 }

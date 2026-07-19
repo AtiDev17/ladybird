@@ -22,26 +22,37 @@ public:
     }
     virtual ~ColorSchemeStyleValue() override = default;
 
-    Vector<Utf16FlyString> const& schemes() const { return m_properties.schemes; }
-    bool const& only() const { return m_properties.only; }
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    Vector<Utf16FlyString> schemes() const
+    {
+        auto const& list = m_value->color_scheme.schemes;
+        Vector<Utf16FlyString> schemes;
+        schemes.ensure_capacity(list.length);
+        for (size_t i = 0; i < list.length; ++i)
+            schemes.unchecked_append(Utf16FlyString::from_raw(list.pointer[i].raw));
+        return schemes;
+    }
+    bool only() const { return m_value->color_scheme.only; }
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(ColorSchemeStyleValue const& other) const { return m_properties == other.m_properties; }
+    bool properties_equal(ColorSchemeStyleValue const& other) const { return schemes() == other.schemes() && only() == other.only(); }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     ColorSchemeStyleValue(Vector<Utf16FlyString> schemes, bool only)
-        : StyleValueWithDefaultOperators(Type::ColorScheme)
-        , m_properties { .schemes = move(schemes), .only = only }
+        : StyleValueWithDefaultOperators(Type::ColorScheme, make_color_scheme_data(schemes, only))
     {
     }
 
-    struct Properties {
-        Vector<Utf16FlyString> schemes;
-        bool only;
-        bool operator==(Properties const&) const = default;
-    } m_properties;
+    static StyleValueFFI::StyleValueData* make_color_scheme_data(Vector<Utf16FlyString> const& schemes, bool only)
+    {
+        // The Rust allocation takes ownership of one leaked reference to each scheme name.
+        Vector<size_t> raws;
+        raws.ensure_capacity(schemes.size());
+        for (auto const& scheme : schemes)
+            raws.unchecked_append(scheme.to_raw_leaked());
+        return StyleValueFFI::rust_style_value_create_color_scheme(raws.data(), raws.size(), only);
+    }
 };
 
 }

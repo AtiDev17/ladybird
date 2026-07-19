@@ -14,9 +14,46 @@
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/Painting/BorderRadiiData.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/SVG/AttributeParser.h>
 #include <LibWeb/SVG/Path.h>
 
 namespace Web::CSS {
+
+StyleValueFFI::StyleValueData* BasicShapeStyleValue::make_basic_shape_data(BasicShape const& basic_shape)
+{
+    // The Rust allocation takes ownership of one strong reference to each non-null value.
+    return basic_shape.visit(
+        [](Inset const& inset) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(0, retain_style_value_for_rust(inset.top.ptr()), retain_style_value_for_rust(inset.right.ptr()), retain_style_value_for_rust(inset.bottom.ptr()), retain_style_value_for_rust(inset.left.ptr()), retain_style_value_for_rust(inset.border_radius.ptr()), 0, nullptr, 0, 0);
+        },
+        [](Xywh const& xywh) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(1, retain_style_value_for_rust(xywh.x.ptr()), retain_style_value_for_rust(xywh.y.ptr()), retain_style_value_for_rust(xywh.width.ptr()), retain_style_value_for_rust(xywh.height.ptr()), retain_style_value_for_rust(xywh.border_radius.ptr()), 0, nullptr, 0, 0);
+        },
+        [](Rect const& rect) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(2, retain_style_value_for_rust(rect.top.ptr()), retain_style_value_for_rust(rect.right.ptr()), retain_style_value_for_rust(rect.bottom.ptr()), retain_style_value_for_rust(rect.left.ptr()), retain_style_value_for_rust(rect.border_radius.ptr()), 0, nullptr, 0, 0);
+        },
+        [](Circle const& circle) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(3, retain_style_value_for_rust(circle.radius.ptr()), retain_style_value_for_rust(circle.position.ptr()), nullptr, nullptr, nullptr, 0, nullptr, 0, 0);
+        },
+        [](Ellipse const& ellipse) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(4, retain_style_value_for_rust(ellipse.radius.ptr()), retain_style_value_for_rust(ellipse.position.ptr()), nullptr, nullptr, nullptr, 0, nullptr, 0, 0);
+        },
+        [](Polygon const& polygon) {
+            Vector<StyleValueFFI::RetainedShapePoint> points;
+            points.ensure_capacity(polygon.points.size());
+            for (auto const& point : polygon.points)
+                points.unchecked_append({ { retain_style_value_for_rust(point.x.ptr()) }, { retain_style_value_for_rust(point.y.ptr()) } });
+            return StyleValueFFI::rust_style_value_create_basic_shape(5, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<u8>(to_underlying(polygon.fill_rule)), points.data(), points.size(), 0);
+        },
+        [](Path const& path) {
+            return StyleValueFFI::rust_style_value_create_basic_shape(6, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<u8>(to_underlying(path.fill_rule)), nullptr, 0, Utf16String::from_utf8(path.path_instructions.serialize()).to_raw_leaked());
+        });
+}
+
+BasicShape const& BasicShapeStyleValue::basic_shape() const
+{
+    return m_shape;
+}
 
 static Gfx::Path path_from_resolved_rect(float top, float right, float bottom, float left)
 {
@@ -127,7 +164,7 @@ Gfx::Path Inset::to_path(CSSPixelRect reference_box) const
 void Inset::serialize(StringBuilder& builder, SerializationMode mode) const
 {
     builder.append("inset("sv);
-    builder.append(serialize_a_positional_value_list({ top, right, bottom, left }, mode));
+    builder.append(serialize_a_positional_value_list(StyleValueVector { top, right, bottom, left }, mode));
 
     auto serialized_border_radius = border_radius->to_string(mode);
 
@@ -329,7 +366,7 @@ BasicShapeStyleValue::~BasicShapeStyleValue() = default;
 
 Gfx::Path BasicShapeStyleValue::to_path(CSSPixelRect reference_box) const
 {
-    return m_basic_shape.visit([&](auto const& shape) -> Gfx::Path {
+    return basic_shape().visit([&](auto const& shape) -> Gfx::Path {
         // NB: Xywh and Rect don't require to_path functions as we should have already converted them to their
         //     respective Inset equivalents during absolutization
         if constexpr (requires { shape.to_path(reference_box); }) {
@@ -342,7 +379,7 @@ Gfx::Path BasicShapeStyleValue::to_path(CSSPixelRect reference_box) const
 
 void BasicShapeStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
 {
-    m_basic_shape.visit([&](auto const& shape) {
+    basic_shape().visit([&](auto const& shape) {
         shape.serialize(builder, mode);
     });
 }
@@ -373,7 +410,7 @@ ValueComparingNonnullRefPtr<StyleValue const> BasicShapeStyleValue::absolutized(
         return value->absolutized(computation_context);
     };
 
-    auto absolutized_shape = m_basic_shape.visit(
+    auto absolutized_shape = basic_shape().visit(
         [&](Inset const& shape) -> BasicShape {
             auto absolutized_top = shape.top->absolutized(computation_context);
             auto absolutized_right = shape.right->absolutized(computation_context);
@@ -466,7 +503,7 @@ ValueComparingNonnullRefPtr<StyleValue const> BasicShapeStyleValue::absolutized(
             return shape;
         });
 
-    if (absolutized_shape == m_basic_shape)
+    if (absolutized_shape == basic_shape())
         return *this;
 
     return BasicShapeStyleValue::create(absolutized_shape);

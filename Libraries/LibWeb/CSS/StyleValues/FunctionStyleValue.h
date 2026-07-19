@@ -18,28 +18,23 @@ public:
         return adopt_ref(*new FunctionStyleValue(move(name), move(value)));
     }
 
-    Utf16FlyString const& name() const { return m_name; }
-    NonnullRefPtr<StyleValue const> const& value() const { return m_value; }
+    Utf16FlyString name() const { return Utf16FlyString::from_raw(m_value->function.name.raw); }
+    ValueComparingNonnullRefPtr<StyleValue const> value() const { return *static_cast<StyleValue const*>(m_value->function.value.pointer); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool properties_equal(FunctionStyleValue const& other) const { return m_name == other.m_name && m_value == other.m_value; }
+    bool properties_equal(FunctionStyleValue const& other) const { return name() == other.name() && value() == other.value(); }
 
-    virtual bool is_computationally_independent() const override { return m_value->is_computationally_independent(); }
+    bool is_computationally_independent() const { return value()->is_computationally_independent(); }
 
 private:
     FunctionStyleValue(Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
-        : StyleValueWithDefaultOperators(Type::Function)
-        , m_name(move(name))
-        , m_value(move(value))
+        : StyleValueWithDefaultOperators(Type::Function, StyleValueFFI::rust_style_value_create_function(name.to_raw_leaked(), &value.leak_ref()))
     {
     }
 
     virtual ~FunctionStyleValue() override = default;
-
-    Utf16FlyString m_name;
-    ValueComparingNonnullRefPtr<StyleValue const> m_value;
 };
 
 }

@@ -149,26 +149,25 @@ JS_DEFINE_NATIVE_FUNCTION(TypedArrayPrototype::at)
     if (Value { relative_index }.is_infinity())
         return js_undefined();
 
-    Checked<size_t> k_checked { 0 };
+    double k;
 
     // 5. If relativeIndex ≥ 0, then
     if (relative_index >= 0) {
         // a. Let k be relativeIndex.
-        k_checked += relative_index;
+        k = relative_index;
     }
     // 6. Else,
     else {
         // a. Let k be len + relativeIndex.
-        k_checked += length;
-        k_checked -= -relative_index;
+        k = length + relative_index;
     }
 
     // 7. If k < 0 or k ≥ len, return undefined.
-    if (k_checked.has_overflow() || k_checked.value() >= length)
+    if (k < 0 || k >= length)
         return js_undefined();
 
     // 8. Return ! Get(O, ! ToString(𝔽(k))).
-    return MUST(typed_array->get(k_checked.value()));
+    return MUST(typed_array->get(static_cast<size_t>(k)));
 }
 
 // 23.2.3.2 get %TypedArray%.prototype.buffer, https://tc39.es/ecma262/#sec-get-%typedarray%.prototype.buffer
@@ -935,6 +934,10 @@ JS_DEFINE_NATIVE_FUNCTION(TypedArrayPrototype::includes)
     u32 k;
     // 9. If n ≥ 0, then
     if (n >= 0) {
+        // AD-HOC: A fromIndex at or beyond len matches nothing. Return before converting it to an unsigned type.
+        if (n >= length)
+            return Value { false };
+
         // a. Let k be n.
         k = n;
     }
@@ -1004,6 +1007,10 @@ JS_DEFINE_NATIVE_FUNCTION(TypedArrayPrototype::index_of)
     u32 k;
     // 9. If n ≥ 0, then
     if (n >= 0) {
+        // AD-HOC: A fromIndex at or beyond len matches nothing. Return before converting it to an unsigned type.
+        if (n >= length)
+            return Value { -1 };
+
         // a. Let k be n.
         k = n;
     }
@@ -1470,10 +1477,10 @@ static ThrowCompletionOr<void> set_typed_array_from_typed_array(VM& vm, TypedArr
         return vm.throw_completion<RangeError>(ErrorType::TypedArrayInvalidTargetOffset, "finite");
 
     // 16. If srcLength + targetOffset > targetLength, throw a RangeError exception.
-    Checked<size_t> checked = source_length;
-
-    if (target_offset > static_cast<double>(NumericLimits<size_t>::max()))
+    if (target_offset > MAX_ARRAY_LIKE_INDEX)
         return vm.throw_completion<RangeError>(ErrorType::TypedArrayOverflowOrOutOfBounds, "target offset");
+
+    Checked<size_t> checked = source_length;
     checked += static_cast<size_t>(target_offset);
 
     if (checked.has_overflow() || checked.value() > target_length)
@@ -1582,10 +1589,10 @@ static ThrowCompletionOr<void> set_typed_array_from_array_like(VM& vm, TypedArra
         return vm.throw_completion<RangeError>(ErrorType::TypedArrayInvalidTargetOffset, "finite");
 
     // 7. If srcLength + targetOffset > targetLength, throw a RangeError exception.
-    Checked<size_t> checked = source_length;
-
-    if (target_offset > static_cast<double>(NumericLimits<size_t>::max()))
+    if (target_offset > MAX_ARRAY_LIKE_INDEX)
         return vm.throw_completion<RangeError>(ErrorType::TypedArrayOverflowOrOutOfBounds, "target offset");
+
+    Checked<size_t> checked = source_length;
     checked += static_cast<size_t>(target_offset);
 
     if (checked.has_overflow() || checked.value() > target_length)

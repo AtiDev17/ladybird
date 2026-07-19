@@ -18,34 +18,44 @@ class PercentageStyleValue final : public DimensionStyleValue {
 public:
     static ValueComparingNonnullRefPtr<PercentageStyleValue const> create(Percentage percentage)
     {
+        // The 0%, 50% and 100% values dominate real-world percentages, so they are interned.
+        if (percentage.value() == 0) {
+            static auto const& zero_instance = adopt_ref(*new (nothrow) PercentageStyleValue(Percentage(0))).leak_ref();
+            return zero_instance;
+        }
+        if (percentage.value() == 50) {
+            static auto const& fifty_instance = adopt_ref(*new (nothrow) PercentageStyleValue(Percentage(50))).leak_ref();
+            return fifty_instance;
+        }
+        if (percentage.value() == 100) {
+            static auto const& hundred_instance = adopt_ref(*new (nothrow) PercentageStyleValue(Percentage(100))).leak_ref();
+            return hundred_instance;
+        }
         return adopt_ref(*new (nothrow) PercentageStyleValue(move(percentage)));
     }
     virtual ~PercentageStyleValue() override = default;
 
-    Percentage const& percentage() const { return m_percentage; }
-    virtual double raw_value() const override { return m_percentage.value(); }
+    Percentage percentage() const { return Percentage(m_value->percentage.value); }
+    virtual double raw_value() const override { return m_value->percentage.value; }
     virtual Utf16FlyString unit_name() const override { return "percent"_utf16_fly_string; }
 
-    virtual void serialize(StringBuilder& builder, SerializationMode) const override { builder.append(m_percentage.to_string()); }
+    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(percentage().to_string()); }
 
-    bool equals(StyleValue const& other) const override
+    bool equals(StyleValue const& other) const
     {
         if (type() != other.type())
             return false;
         auto const& other_percentage = other.as_percentage();
-        return m_percentage == other_percentage.m_percentage;
+        return percentage() == other_percentage.percentage();
     }
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     PercentageStyleValue(Percentage&& percentage)
-        : DimensionStyleValue(Type::Percentage)
-        , m_percentage(percentage)
+        : DimensionStyleValue(Type::Percentage, StyleValueFFI::rust_style_value_create_percentage(percentage.value()))
     {
     }
-
-    Percentage m_percentage;
 };
 
 }

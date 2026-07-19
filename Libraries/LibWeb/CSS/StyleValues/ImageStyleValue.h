@@ -77,10 +77,10 @@ public:
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(::URL::URL const&);
     virtual ~ImageStyleValue() override;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
-    virtual bool equals(StyleValue const& other) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
+    bool equals(StyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
     virtual void load_any_resources(DOM::Document&) override;
 
@@ -111,11 +111,17 @@ private:
     Optional<::URL::URL> resolved_url(DOM::Document const&) const;
     ::URL::URL style_resource_base_url(DOM::Document const&) const;
 
-    virtual void set_style_sheet(GC::Ptr<CSSStyleSheet>) override;
+    // NB: StyleValue dispatches operations by type tag, so it may call private impls.
+    friend class StyleValue;
+    void set_style_sheet(GC::Ptr<CSSStyleSheet>);
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    URL m_url;
+    URL url_value() const;
+
+    static StyleValueFFI::StyleValueData* make_image_url_data(URL const&);
+
+    // NB: Style sheet attachment and loading state, not value data.
     Optional<::URL::URL> m_style_resource_base_url;
     Optional<bool> m_parent_style_sheet_origin_clean;
     bool m_should_absolutize_url_for_computed_value { false };

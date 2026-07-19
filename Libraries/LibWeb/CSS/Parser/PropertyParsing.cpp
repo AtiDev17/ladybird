@@ -4515,7 +4515,7 @@ RefPtr<StyleValue const> Parser::parse_transition_value(TokenStream<ComponentVal
     // <single-transition-property>, then the declaration is invalid.
     auto const& transition_properties = parsed_value->as_shorthand().longhand(PropertyID::TransitionProperty)->as_value_list().values();
 
-    if (transition_properties.size() > 1 && transition_properties.contains([](auto const& transition_property) { return transition_property->to_keyword() == Keyword::None; }))
+    if (transition_properties.size() > 1 && any_of(transition_properties, [](auto const& transition_property) { return transition_property->to_keyword() == Keyword::None; }))
         return nullptr;
 
     return parsed_value;
@@ -5090,7 +5090,7 @@ RefPtr<StyleValue const> Parser::parse_grid_shorthand_value(TokenStream<Componen
             return nullptr;
 
         auto grid_auto_rows = parse_grid_auto_track_sizes(tokens);
-        if (grid_auto_rows->as_grid_track_size_list().grid_track_size_list().is_empty())
+        if (grid_auto_rows->as_grid_track_size_list().is_empty())
             grid_auto_rows = property_initial_value(PropertyID::GridAutoRows);
 
         tokens.discard_whitespace();
@@ -5129,7 +5129,7 @@ RefPtr<StyleValue const> Parser::parse_grid_shorthand_value(TokenStream<Componen
             return nullptr;
 
         auto grid_auto_columns = parse_grid_auto_track_sizes(tokens);
-        if (grid_auto_columns->as_grid_track_size_list().grid_track_size_list().is_empty())
+        if (grid_auto_columns->as_grid_track_size_list().is_empty())
             grid_auto_columns = property_initial_value(PropertyID::GridAutoColumns);
 
         transaction.commit();

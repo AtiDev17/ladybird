@@ -22,22 +22,20 @@ public:
     }
     virtual ~AngleStyleValue() override;
 
-    Angle const& angle() const { return m_angle; }
-    virtual double raw_value() const override { return m_angle.raw_value(); }
-    virtual Utf16FlyString unit_name() const override { return m_angle.unit_name(); }
+    Angle angle() const { return Angle(m_value->angle.value, static_cast<AngleUnit>(m_value->angle.unit)); }
+    virtual double raw_value() const override { return m_value->angle.value; }
+    virtual Utf16FlyString unit_name() const override { return angle().unit_name(); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
-    bool equals(StyleValue const& other) const override;
+    bool equals(StyleValue const& other) const;
 
-    virtual bool is_computationally_independent() const override { return true; }
+    bool is_computationally_independent() const { return true; }
 
 private:
     explicit AngleStyleValue(Angle angle);
-
-    Angle m_angle;
 };
 
 }

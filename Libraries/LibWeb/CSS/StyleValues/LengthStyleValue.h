@@ -20,26 +20,23 @@ public:
     static ValueComparingNonnullRefPtr<LengthStyleValue const> create(Length const&);
     virtual ~LengthStyleValue() override = default;
 
-    Length const& length() const { return m_length; }
-    virtual double raw_value() const override { return m_length.raw_value(); }
-    virtual Utf16FlyString unit_name() const override { return m_length.unit_name(); }
+    Length length() const { return Length(m_value->length.value, static_cast<LengthUnit>(m_value->length.unit)); }
+    virtual double raw_value() const override { return m_value->length.value; }
+    virtual Utf16FlyString unit_name() const override { return length().unit_name(); }
 
-    virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_length.serialize(builder, mode); }
-    virtual void serialize(Utf16StringBuilder& builder, SerializationMode mode) const override { m_length.serialize(builder, mode); }
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    void serialize(StringBuilder& builder, SerializationMode mode) const { length().serialize(builder, mode); }
+    void serialize(Utf16StringBuilder& builder, SerializationMode mode) const { length().serialize(builder, mode); }
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual bool is_computationally_independent() const override { return m_length.is_computationally_independent(); }
+    bool is_computationally_independent() const { return length().is_computationally_independent(); }
 
-    bool equals(StyleValue const& other) const override;
+    bool equals(StyleValue const& other) const;
 
 private:
     explicit LengthStyleValue(Length const& length)
-        : DimensionStyleValue(Type::Length)
-        , m_length(length)
+        : DimensionStyleValue(Type::Length, StyleValueFFI::rust_style_value_create_length(length.raw_value(), to_underlying(length.unit())))
     {
     }
-
-    Length m_length;
 };
 
 }

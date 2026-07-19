@@ -194,16 +194,15 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::at)
     auto relative_index = TRY(vm.argument(0).to_integer_or_infinity(vm));
     if (Value(relative_index).is_infinity())
         return js_undefined();
-    Checked<size_t> index { 0 };
+    double index;
     if (relative_index >= 0) {
-        index += relative_index;
+        index = relative_index;
     } else {
-        index += length;
-        index -= -relative_index;
+        index = static_cast<double>(length) + relative_index;
     }
-    if (index.has_overflow() || index.value() >= length)
+    if (index < 0 || index >= length)
         return js_undefined();
-    return TRY(this_object->get(index.value()));
+    return TRY(this_object->get(static_cast<size_t>(index)));
 }
 
 // 23.1.3.2 Array.prototype.concat ( ...items ), https://tc39.es/ecma262/#sec-array.prototype.concat
@@ -867,6 +866,10 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::index_of)
 
     // 8. If n ≥ 0, then
     if (n >= 0) {
+        // AD-HOC: A fromIndex at or beyond len matches nothing. Return before converting it to an unsigned type.
+        if (n >= length)
+            return Value(-1);
+
         // a. Let k be n.
         k = (size_t)n;
     }
@@ -996,7 +999,11 @@ JS_DEFINE_NATIVE_FUNCTION(ArrayPrototype::last_index_of)
     // 7. Else,
     else {
         //  a. Let k be len + n.
-        k = (double)length + n;
+        auto relative_k = static_cast<double>(length) + n;
+
+        // AD-HOC: A large negative fromIndex visits nothing. Clamp k to -1 rather than converting an
+        //         out-of-range value to a signed type.
+        k = relative_k < 0 ? -1 : static_cast<ssize_t>(relative_k);
     }
 
     // 8. Repeat, while k ≥ 0,

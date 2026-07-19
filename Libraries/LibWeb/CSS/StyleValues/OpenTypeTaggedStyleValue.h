@@ -26,29 +26,23 @@ public:
     }
     virtual ~OpenTypeTaggedStyleValue() override = default;
 
-    Utf16FlyString const& tag() const { return m_tag; }
-    ValueComparingNonnullRefPtr<StyleValue const> const& value() const { return m_value; }
+    Mode mode() const { return static_cast<Mode>(m_value->open_type_tagged.mode); }
+    Utf16FlyString tag() const { return Utf16FlyString::from_raw(m_value->open_type_tagged.tag.raw); }
+    ValueComparingNonnullRefPtr<StyleValue const> value() const { return *static_cast<StyleValue const*>(m_value->open_type_tagged.value.pointer); }
 
-    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
-    virtual void serialize(StringBuilder&, SerializationMode) const override;
+    void serialize(StringBuilder&, SerializationMode) const;
 
     bool properties_equal(OpenTypeTaggedStyleValue const&) const;
 
-    virtual bool is_computationally_independent() const override { return m_value->is_computationally_independent(); }
+    bool is_computationally_independent() const { return value()->is_computationally_independent(); }
 
 private:
     explicit OpenTypeTaggedStyleValue(Mode mode, Utf16FlyString tag, ValueComparingNonnullRefPtr<StyleValue const> value)
-        : StyleValueWithDefaultOperators(Type::OpenTypeTagged)
-        , m_mode(mode)
-        , m_tag(move(tag))
-        , m_value(move(value))
+        : StyleValueWithDefaultOperators(Type::OpenTypeTagged, StyleValueFFI::rust_style_value_create_open_type_tagged(to_underlying(mode), tag.to_raw_leaked(), &value.leak_ref()))
     {
     }
-
-    Mode m_mode;
-    Utf16FlyString m_tag;
-    ValueComparingNonnullRefPtr<StyleValue const> m_value;
 };
 
 }
