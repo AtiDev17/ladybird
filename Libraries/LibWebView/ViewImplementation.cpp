@@ -767,6 +767,23 @@ void ViewImplementation::select_all()
     client().async_select_all(page_id());
 }
 
+void ViewImplementation::undo()
+{
+    client().async_undo(page_id());
+}
+
+void ViewImplementation::set_editing_history_state(Badge<WebContentClient>, bool can_undo, bool can_redo)
+{
+    m_can_undo = can_undo;
+    m_can_redo = can_redo;
+    Application::the().update_editing_history_actions();
+}
+
+void ViewImplementation::redo()
+{
+    client().async_redo(page_id());
+}
+
 void ViewImplementation::find_in_page(Utf16String const& query, CaseSensitivity case_sensitivity)
 {
     client().async_find_in_page(page_id(), query, case_sensitivity);

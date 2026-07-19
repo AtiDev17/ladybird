@@ -111,6 +111,7 @@
 #include <LibWeb/DOM/Utils.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
@@ -817,6 +818,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     if (m_hit_test_display_list)
         m_hit_test_display_list->visit_edges(visitor);
     visitor.visit(m_editing_host_manager);
+    visitor.visit(m_editing_history);
     visitor.visit(m_local_storage_holder);
     visitor.visit(m_session_storage_holder);
     visitor.visit(m_render_blocking_elements);
@@ -1623,7 +1625,11 @@ URL::URL Document::fallback_base_url() const
     // 1. If document is an iframe srcdoc document, then:
     if (HTML::url_matches_about_srcdoc(m_url)) {
         // 1. Assert: document's about base URL is non-null.
-        VERIFY(m_about_base_url.has_value());
+        // AD-HOC: Documents created by DOMParser or by cloning can have a URL that matches about:srcdoc
+        //         without an about base URL being set. Returning the document's URL in this case matches
+        //         the behavior of other engines.
+        if (!m_about_base_url.has_value())
+            return m_url;
 
         // 2. Return document's about base URL.
         return m_about_base_url.value();

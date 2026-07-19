@@ -858,7 +858,7 @@ public:
         Yes,
     };
     WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, Utf16View value);
-    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent);
+    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {});
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(Utf16FlyString const& command);
@@ -1200,6 +1200,11 @@ public:
     void reset_cursor_blink_cycle();
 
     GC::Ref<EditingHostManager> editing_host_manager() const { return *m_editing_host_manager; }
+
+    // The history of user editing actions in this document, created lazily by the first
+    // recorded editing command.
+    GC::Ptr<Editing::EditingHistory> editing_history_if_exists() const { return m_editing_history; }
+    GC::Ref<Editing::EditingHistory> editing_history();
 
     // https://w3c.github.io/editing/docs/execCommand/#default-single-line-container-name
     Utf16FlyString const& default_single_line_container_name() const { return m_default_single_line_container_name; }
@@ -1776,6 +1781,8 @@ private:
     mutable OwnPtr<Unicode::Segmenter> m_word_segmenter;
 
     GC::Ref<EditingHostManager> m_editing_host_manager;
+
+    GC::Ptr<Editing::EditingHistory> m_editing_history;
 
     bool m_inside_exec_command { false };
     bool m_preserve_selection_offsets_during_identical_character_data_replacement { false };

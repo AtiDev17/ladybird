@@ -4,18 +4,72 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/TemporaryChange.h>
 #include <LibWeb/Bindings/InputEvent.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/CommandNames.h>
 #include <LibWeb/Editing/Commands.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Editing/Internal/Algorithms.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputEvent.h>
+#include <LibWeb/UIEvents/InputTypes.h>
 
 namespace Web::DOM {
+
+GC::Ref<Editing::EditingHistory> Document::editing_history()
+{
+    if (!m_editing_history)
+        m_editing_history = Editing::EditingHistory::create(realm());
+    return *m_editing_history;
+}
+
+// INTEROP: Chromium canonicalizes caret positions for editing into the nearest equivalent text
+//          position: an element-level caret descends into the adjacent editable leaf content,
+//          preferring the end of what comes before it, then the start of what comes after it.
+//          We do the same around every editing command so that both the command itself and the
+//          selections recorded in the editing history operate on Chromium-compatible positions.
+static void canonicalize_collapsed_selection_for_editing(Selection::Selection& selection)
+{
+    auto range = selection.range();
+    if (!range || !selection.is_collapsed())
+        return;
+
+    GC::Ptr<Node> node = range->start_container();
+    auto offset = range->start_offset();
+    if (!is<Element>(*node))
+        return;
+
+    auto can_descend_into = [](Node const& candidate) {
+        if (!candidate.is_editable())
+            return false;
+        if (is<Text>(candidate))
+            return true;
+        return is<Element>(candidate) && candidate.has_children();
+    };
+
+    bool changed = false;
+    while (is<Element>(*node)) {
+        GC::Ptr<Node> before = offset > 0 ? node->child_at_index(offset - 1) : nullptr;
+        GC::Ptr<Node> after = node->child_at_index(offset);
+        if (before && can_descend_into(*before)) {
+            node = before;
+            offset = before->length();
+        } else if (after && can_descend_into(*after)) {
+            node = after;
+            offset = 0;
+        } else {
+            break;
+        }
+        changed = true;
+    }
+    if (changed)
+        MUST(selection.collapse(node, offset));
+}
 
 // https://w3c.github.io/editing/docs/execCommand/#execcommand()
 WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value)
@@ -23,7 +77,7 @@ WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, 
     return exec_command_internal(command, show_ui, value, DispatchInputEvent::Yes);
 }
 
-WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event)
+WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event, Optional<Utf16FlyString> const& user_input_type)
 {
     // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
     if (!is_html_document())
@@ -106,6 +160,42 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     auto old_dom_tree_version = dom_tree_version();
     auto old_character_data_version = character_data_version();
 
+    // NB: Canonicalize the caret before the command acts and records its starting selection, so that e.g. typing at an
+    //     element-level caret inserts into the adjacent content like Chromium does. Inline formatting commands with a
+    //     collapsed selection only set overrides, and Chromium does not move the caret for those.
+    bool command_edits_at_caret = command_definition.command.is_one_of(
+        Editing::CommandNames::delete_, Editing::CommandNames::formatBlock, Editing::CommandNames::forwardDelete,
+        Editing::CommandNames::indent, Editing::CommandNames::insertHorizontalRule, Editing::CommandNames::insertHTML,
+        Editing::CommandNames::insertImage, Editing::CommandNames::insertLineBreak,
+        Editing::CommandNames::insertOrderedList, Editing::CommandNames::insertParagraph,
+        Editing::CommandNames::insertText, Editing::CommandNames::insertUnorderedList,
+        Editing::CommandNames::justifyCenter, Editing::CommandNames::justifyFull, Editing::CommandNames::justifyLeft,
+        Editing::CommandNames::justifyRight, Editing::CommandNames::outdent);
+    if (affected_editing_host && m_selection && command_edits_at_caret)
+        canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // AD-HOC: Record the mutations performed by the command action on the editing history, so the user can undo them.
+    //         end_recording() is a no-op if the guard below already ended the recording.
+    if (affected_editing_host) {
+        auto category = Editing::UndoStep::Category::Other;
+        // INTEROP: Cut and paste are standalone undo units in Chromium: they never coalesce with typing or deletion
+        //          runs, so they categorize as Other even though they run the delete and insertText commands.
+        bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
+        if (!is_cut_or_paste) {
+            if (command_definition.command.is_one_of(Editing::CommandNames::insertText, Editing::CommandNames::insertLineBreak, Editing::CommandNames::insertParagraph))
+                category = Editing::UndoStep::Category::Insertion;
+            else if (command_definition.command == Editing::CommandNames::delete_)
+                category = Editing::UndoStep::Category::BackwardDeletion;
+            else if (command_definition.command == Editing::CommandNames::forwardDelete)
+                category = Editing::UndoStep::Category::ForwardDeletion;
+        }
+        editing_history()->begin_recording(*affected_editing_host, category);
+    }
+    ScopeGuard end_recording_guard = [&] {
+        if (auto history = editing_history_if_exists())
+            history->end_recording();
+    };
+
     // 5. Take the action for command, passing value to the instructions as an argument.
     auto command_result = command_definition.action(*this, value);
 
@@ -115,6 +205,18 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     if (!overrides.is_empty() && m_selection && m_selection->is_collapsed())
         Editing::restore_states_and_values(*this, overrides);
 
+    // NB: Canonicalize the caret the command produced before the ending selection is recorded, but only if the
+    //     command actually performed an edit; Chromium leaves the caret alone otherwise.
+    bool tree_was_modified = dom_tree_version() != old_dom_tree_version
+        || character_data_version() != old_character_data_version;
+    if (affected_editing_host && m_selection && tree_was_modified)
+        canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // NB: End the recording before dispatching the input event below, so that the undo step's ending selection is the
+    //     selection produced by the command itself, not whatever an input event handler changed it to.
+    if (auto history = editing_history_if_exists())
+        history->end_recording();
+
     // 6. If the previous step returned false, return false.
     if (!command_result)
         return false;
@@ -122,15 +224,16 @@ WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& 
     // 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
     //    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
     //    value of command, and its data attribute initialized to null.
-    bool tree_was_modified = dom_tree_version() != old_dom_tree_version
-        || character_data_version() != old_character_data_version;
     if (tree_was_modified && affected_editing_host && dispatch_input_event == DispatchInputEvent::Yes) {
         Bindings::InputEventInit event_init {};
         event_init.bubbles = true;
-        event_init.input_type = command_definition.mapped_value;
+        // INTEROP: When the command runs on behalf of a user cut or paste, the input event carries the user's input
+        //          type (deleteByCut or insertFromPaste) rather than the command's mapped value, like other browsers.
+        event_init.input_type = user_input_type.value_or(command_definition.mapped_value);
 
-        // AD-HOC: For insertText, we do what other browsers do and set data to value.
-        if (command == Editing::CommandNames::insertText)
+        // AD-HOC: For insertText, we do what other browsers do and set data to value. A paste carries null data even
+        //         though it runs the insertText command.
+        if (event_init.input_type == UIEvents::InputTypes::insertText)
             event_init.data = Utf16String::from_utf16(value);
 
         auto event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, event_init);
@@ -165,11 +268,21 @@ WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& 
     // NOTE: cut and paste are actually in the Clipboard commands section
     if (command.is_one_of_ignoring_ascii_case(
             Editing::CommandNames::defaultParagraphSeparator,
-            Editing::CommandNames::redo,
             Editing::CommandNames::styleWithCSS,
-            Editing::CommandNames::undo,
             Editing::CommandNames::useCSS))
         return true;
+
+    // INTEROP: The spec lists undo and redo among the always-enabled miscellaneous commands, but in Chromium
+    //          queryCommandEnabled("undo") is true only when there is a step to undo, and execCommand("undo") on an
+    //          empty history returns false. Redo behaves symmetrically.
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::undo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_undo();
+    }
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::redo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_redo();
+    }
 
     // AD-HOC: selectAll requires a selection object to exist.
     if (command.equals_ignoring_ascii_case(Editing::CommandNames::selectAll))

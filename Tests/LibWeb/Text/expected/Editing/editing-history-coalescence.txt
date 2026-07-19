@@ -1,0 +1,58 @@
+== a typed run coalesces into one undo unit ==
+PASS: after typing DOM
+PASS: one undo removes the whole run DOM
+PASS: one undo removes the whole run selection
+PASS: one redo restores the whole run DOM
+PASS: one redo restores the whole run selection
+== caret movement breaks typing coalescence ==
+PASS: undo removes only the second run DOM
+PASS: undo removes only the second run selection
+PASS: second undo removes the first run DOM
+== programmatic selection change breaks coalescence even at the same position ==
+PASS: undo removes only the post-collapse run DOM
+PASS: second undo removes the first run DOM
+== a backspace run coalesces and undo selects the restored text ==
+PASS: after backspaces DOM
+PASS: one undo restores all deleted text DOM
+PASS: one undo restores all deleted text selection
+PASS: one redo deletes it again DOM
+PASS: one redo deletes it again selection
+== a forward-delete run coalesces separately ==
+PASS: after forward deletes DOM
+PASS: one undo restores both characters DOM
+PASS: one undo restores both characters selection
+PASS: one redo deletes them again DOM
+PASS: one redo deletes them again selection
+== backspace starts a new unit after typing, but typing joins a delete unit ==
+PASS: after type/backspace/type DOM
+PASS: undo reverts backspace and following text as one unit DOM
+PASS: undo reverts backspace and following text as one unit selection
+PASS: second undo reverts the typed run DOM
+PASS: no third unit exists
+== paragraph insertion joins a typing run ==
+PASS: after enter and typing DOM
+PASS: one undo reverts the split and the typing DOM
+PASS: one undo reverts the split and the typing selection
+PASS: enter and typing were one unit
+== typing that removes a placeholder closes the open unit ==
+PASS: after typing into the new paragraph DOM
+PASS: undo removes only the character typed after the placeholder was removed DOM
+PASS: second undo reverts the rest DOM
+== replacing a selection then typing extends the same unit ==
+PASS: after replacing and typing DOM
+PASS: one undo restores the replaced selection DOM
+PASS: one undo restores the replaced selection selection
+PASS: one redo replays the whole unit DOM
+PASS: one redo replays the whole unit selection
+== script execCommand insertText coalesces like typing ==
+PASS: one undo removes both insertions DOM
+== formatting breaks a typing run ==
+PASS: after bold and typing DOM
+PASS: undo removes only the typed character DOM
+PASS: undo removes only the typed character selection
+PASS: second undo removes the formatting DOM
+PASS: second undo removes the formatting selection
+== script DOM mutation elsewhere does not break coalescence ==
+PASS: after typing around the script mutation DOM
+PASS: one undo reverts both characters and keeps the script node DOM
+PASS: the script mutation was not recorded

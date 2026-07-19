@@ -1,0 +1,21 @@
+== cut is a standalone undo unit ==
+PASS: after cut DOM
+PASS: cut events
+PASS: after typing DOM
+PASS: undo removes only the typed text DOM
+PASS: second undo restores the cut text DOM
+PASS: second undo restores the cut text selection
+PASS: redo cuts again DOM
+== paste is a standalone undo unit ==
+PASS: after paste DOM
+PASS: paste events
+PASS: after typing DOM
+PASS: undo removes only the typed text DOM
+PASS: second undo removes the pasted text DOM
+PASS: second undo removes the pasted text selection
+PASS: redo pastes again DOM
+== typing before a paste stays a separate unit ==
+PASS: after type/paste/type DOM
+PASS: undo removes the trailing typed run DOM
+PASS: second undo removes the paste DOM
+PASS: third undo removes the leading typed run DOM

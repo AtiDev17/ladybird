@@ -134,6 +134,7 @@
     }
 
     WebView::Application::the().update_bookmark_action_for_current_web_view();
+    WebView::Application::the().update_editing_history_actions();
 }
 
 - (Tab*)activeTab
@@ -362,12 +363,8 @@
     auto* menu = [[NSMenuItem alloc] init];
     auto* submenu = [[NSMenu alloc] initWithTitle:@"Edit"];
 
-    [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"Undo"
-                                                action:@selector(undo:)
-                                         keyEquivalent:@"z"]];
-    [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"Redo"
-                                                action:@selector(redo:)
-                                         keyEquivalent:@"y"]];
+    [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().undo_action())];
+    [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().redo_action())];
     [submenu addItem:[NSMenuItem separatorItem]];
 
     [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().cut_selection_action())];
