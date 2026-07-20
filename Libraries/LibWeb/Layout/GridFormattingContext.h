@@ -113,9 +113,9 @@ struct GridItem {
 
     AvailableSpace available_space() const
     {
-        auto available_width = used_values.has_definite_width() ? AvailableSize::make_definite(used_values.content_width()) : AvailableSize::make_indefinite();
-        auto available_height = used_values.has_definite_height() ? AvailableSize::make_definite(used_values.content_height()) : AvailableSize::make_indefinite();
-        return { available_width, available_height };
+        auto available_inline_size = used_values.has_definite_inline_size() ? AvailableSize::make_definite(used_values.content_inline_size()) : AvailableSize::make_indefinite();
+        auto available_block_size = used_values.has_definite_block_size() ? AvailableSize::make_definite(used_values.content_block_size()) : AvailableSize::make_indefinite();
+        return { available_inline_size, available_block_size };
     }
 };
 
@@ -167,8 +167,8 @@ public:
     virtual bool inhibits_floating() const override { return true; }
 
     virtual void run(LayoutInput const&) override;
-    virtual CSSPixels automatic_content_width() const override;
-    virtual CSSPixels automatic_content_height() const override;
+    virtual CSSPixels automatic_content_inline_size() const override;
+    virtual CSSPixels automatic_content_block_size() const override;
 
     Box const& grid_container() const { return context_box(); }
 
@@ -177,9 +177,9 @@ private:
 
     void resolve_items_box_metrics(GridDimension dimension);
 
-    CSSPixels m_automatic_content_height { 0 };
-    CSSPixels m_row_track_alignment_grid_container_height { 0 };
-    bool m_use_row_track_alignment_grid_container_height { false };
+    CSSPixels m_automatic_content_block_size { 0 };
+    CSSPixels m_row_track_alignment_grid_container_block_size { 0 };
+    bool m_use_row_track_alignment_grid_container_block_size { false };
 
     bool is_auto_positioned_track(CSS::GridTrackPlacement const&, CSS::GridTrackPlacement const&) const;
 
@@ -308,13 +308,13 @@ private:
     ContainingBlockConstraints grid_area_constraints_for_item(GridItem const&) const;
     ContainingBlockConstraints track_sizing_constraints_for_items() const;
     ContainingBlockConstraints container_derived_constraints() const;
-    Optional<CSSPixels> item_quirks_mode_percentage_basis_height() const;
+    Optional<CSSPixels> item_quirks_mode_percentage_basis_block_size() const;
 
     LayoutState::UsedValues& m_grid_container_used_values;
 
-    void determine_grid_container_height();
-    CSSPixels resolve_used_grid_container_height_for_second_row_layout() const;
-    void rerun_row_track_sizing_using_grid_container_height(CSSPixels);
+    void determine_grid_container_block_size();
+    CSSPixels resolve_used_grid_container_block_size_for_second_row_layout() const;
+    void rerun_row_track_sizing_using_grid_container_block_size(CSSPixels);
     void determine_intrinsic_size_of_grid_container(AvailableSpace const& available_space);
 
     virtual AbsposContainingBlockInfo resolve_abspos_containing_block_info(Box const&) override;
@@ -399,10 +399,10 @@ private:
 
     CSSPixels containing_block_size_for_item(GridItem const&, GridDimension) const;
     Box const& table_box_inside_table_wrapper(GridItem const&) const;
-    void resolve_table_wrapper_grid_item_width(GridItem&, CSSPixels containing_block_width);
-    CSSPixels non_cyclic_containing_block_width_for_table_wrapper(GridItem const&, CSSPixels containing_block_width) const;
+    void resolve_table_wrapper_grid_item_inline_size(GridItem&, CSSPixels containing_block_inline_size);
+    CSSPixels non_cyclic_containing_block_inline_size_for_table_wrapper(GridItem const&, CSSPixels containing_block_inline_size) const;
 
-    CSSPixelRect get_grid_area_rect(GridItem const&) const;
+    LogicalRect get_grid_area(GridItem const&) const;
 
     CSSPixels content_size_suggestion(GridItem const&, GridDimension) const;
     Optional<CSSPixels> specified_size_suggestion(GridItem const&, GridDimension) const;

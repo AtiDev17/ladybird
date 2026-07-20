@@ -25,19 +25,19 @@ public:
     BlockContainer const& containing_block() const { return static_cast<BlockContainer const&>(context_box()); }
 
     virtual void run(LayoutInput const&) override;
-    virtual CSSPixels automatic_content_height() const override;
-    virtual CSSPixels automatic_content_width() const override;
+    virtual CSSPixels automatic_content_block_size() const override;
+    virtual CSSPixels automatic_content_inline_size() const override;
 
     void dimension_box_on_line(Box const&, LayoutMode);
 
-    CSSPixels leftmost_inline_offset_at(CSSPixels block_offset, CSSPixels line_height) const;
-    AvailableSize available_space_for_line(CSSPixels block_offset, CSSPixels line_height) const;
+    CSSPixels leftmost_inline_offset_at(CSSPixels block_offset, CSSPixels line_block_size) const;
+    AvailableSize available_space_for_line(CSSPixels block_offset, CSSPixels line_block_size) const;
     bool any_floats_intrude_in_block_range(CSSPixels block_start, CSSPixels block_end) const;
-    bool can_fit_new_line_at_block_offset(CSSPixels block_offset, CSSPixels line_height) const;
+    bool can_fit_new_line_at_block_offset(CSSPixels block_offset, CSSPixels line_block_size) const;
     Optional<CSSPixels> next_float_band_block_start_after(CSSPixels block_offset) const;
 
-    CSSPixels vertical_float_clearance() const;
-    void set_vertical_float_clearance(CSSPixels);
+    CSSPixels block_axis_float_clearance() const;
+    void set_block_axis_float_clearance(CSSPixels);
 
 private:
     void generate_line_boxes();
@@ -54,10 +54,10 @@ private:
 
     Vector<NodeWithStyleAndBoxModelMetrics const*> m_fragmented_inlines_in_pre_order;
 
-    CSSPixels m_automatic_content_width { 0 };
-    CSSPixels m_automatic_content_height { 0 };
+    CSSPixels m_automatic_content_inline_size { 0 };
+    CSSPixels m_automatic_content_block_size { 0 };
 
-    CSSPixels m_vertical_float_clearance { 0 };
+    CSSPixels m_block_axis_float_clearance { 0 };
 };
 
 }

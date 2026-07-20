@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <LibWeb/Layout/LogicalGeometry.h>
 #include <LibWeb/PixelUnits.h>
 
 namespace Web::Layout {
@@ -36,13 +37,13 @@ enum class AbsposAxisMode {
 
 struct AbsposContainingBlockInfo {
     // Containing block rect in CB Box's content-edge coordinates.
-    CSSPixelRect rect;
-    AbsposAxisMode horizontal_axis_mode;
-    AbsposAxisMode vertical_axis_mode;
+    LogicalRect rect;
+    AbsposAxisMode inline_axis_mode;
+    AbsposAxisMode block_axis_mode;
     // Grid alignment for axes with auto CSS insets.
     // When set, the base method applies alignment-driven insets after sizing.
-    Optional<Alignment> horizontal_alignment;
-    Optional<Alignment> vertical_alignment;
+    Optional<Alignment> inline_alignment;
+    Optional<Alignment> block_alignment;
     // Whether the rect, alignments or axis modes were derived from the box's own computed
     // values (grid placement does this); a saved copy of such inputs cannot be replayed after
     // a style change on the box itself, and its axis modes must not be recomputed at replay.
@@ -57,28 +58,28 @@ struct StaticPositionRect {
         End,
     };
 
-    CSSPixelRect rect;
-    Alignment horizontal_alignment { Alignment::Start };
-    Alignment vertical_alignment { Alignment::Start };
+    LogicalRect rect;
+    Alignment inline_alignment { Alignment::Start };
+    Alignment block_alignment { Alignment::Start };
     // Whether the alignments were derived from the box's own computed values (self-alignment
     // under a flex container does this); a saved copy of such a rect cannot be replayed after
     // a style change on the box itself.
     bool alignment_derives_from_own_computed_values { false };
 
-    CSSPixelPoint aligned_position_for_box_with_size(CSSPixelSize const& size) const
+    LogicalOffset aligned_offset_for_box_with_size(LogicalSize const& size) const
     {
-        CSSPixelPoint position = rect.location();
-        if (horizontal_alignment == Alignment::Center)
-            position.set_x(position.x() + (rect.width() - size.width()) / 2);
-        else if (horizontal_alignment == Alignment::End)
-            position.set_x(position.x() + rect.width() - size.width());
+        auto offset = rect.offset;
+        if (inline_alignment == Alignment::Center)
+            offset.inline_offset += (rect.size.inline_size - size.inline_size) / 2;
+        else if (inline_alignment == Alignment::End)
+            offset.inline_offset += rect.size.inline_size - size.inline_size;
 
-        if (vertical_alignment == Alignment::Center)
-            position.set_y(position.y() + (rect.height() - size.height()) / 2);
-        else if (vertical_alignment == Alignment::End)
-            position.set_y(position.y() + rect.height() - size.height());
+        if (block_alignment == Alignment::Center)
+            offset.block_offset += (rect.size.block_size - size.block_size) / 2;
+        else if (block_alignment == Alignment::End)
+            offset.block_offset += rect.size.block_size - size.block_size;
 
-        return position;
+        return offset;
     }
 };
 

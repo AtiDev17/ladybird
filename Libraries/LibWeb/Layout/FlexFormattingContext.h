@@ -20,8 +20,8 @@ public:
     virtual bool inhibits_floating() const override { return true; }
 
     virtual void run(LayoutInput const&) override;
-    virtual CSSPixels automatic_content_width() const override;
-    virtual CSSPixels automatic_content_height() const override;
+    virtual CSSPixels automatic_content_inline_size() const override;
+    virtual CSSPixels automatic_content_block_size() const override;
 
     Box const& flex_container() const { return context_box(); }
 
@@ -158,8 +158,8 @@ private:
     CSS::Size const& computed_cross_min_size(Box const&) const;
     CSS::Size const& computed_cross_max_size(Box const&) const;
 
-    CSSPixels get_pixel_width(FlexItem const&, CSS::Size const&) const;
-    CSSPixels get_pixel_height(FlexItem const&, CSS::Size const&) const;
+    CSSPixels resolve_inner_inline_size(FlexItem const&, CSS::Size const&) const;
+    CSSPixels resolve_inner_block_size(FlexItem const&, CSS::Size const&) const;
 
     bool flex_item_is_stretched(FlexItem const&) const;
 
@@ -236,7 +236,7 @@ private:
     [[nodiscard]] CSSPixels calculate_fit_content_main_size(FlexItem const&) const;
     [[nodiscard]] CSSPixels calculate_fit_content_cross_size(FlexItem const&) const;
 
-    [[nodiscard]] CSSPixels calculate_width_to_use_when_determining_intrinsic_height_of_item(FlexItem const&) const;
+    [[nodiscard]] CSSPixels calculate_inline_size_for_intrinsic_block_size(FlexItem const&) const;
 
     virtual void parent_context_did_dimension_child_root_box() override;
 

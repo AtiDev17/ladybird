@@ -14,16 +14,16 @@ namespace Web::Layout {
 class TableGrid {
 public:
     struct GridPosition {
-        size_t x;
-        size_t y;
+        size_t column_index;
+        size_t row_index;
         inline bool operator==(GridPosition const&) const = default;
     };
 
     struct Row {
         Box const& box;
-        CSSPixels base_height { 0 };
-        CSSPixels reference_height { 0 };
-        CSSPixels final_height { 0 };
+        CSSPixels base_block_size { 0 };
+        CSSPixels reference_block_size { 0 };
+        CSSPixels final_block_size { 0 };
         CSSPixels baseline { 0 };
         CSSPixels min_size { 0 };
         CSSPixels max_size { 0 };
@@ -41,10 +41,10 @@ public:
         size_t column_span;
         size_t row_span;
         CSSPixels baseline { 0 };
-        CSSPixels outer_min_width { 0 };
-        CSSPixels outer_max_width { 0 };
-        CSSPixels outer_min_height { 0 };
-        CSSPixels outer_max_height { 0 };
+        CSSPixels outer_min_inline_size { 0 };
+        CSSPixels outer_max_inline_size { 0 };
+        CSSPixels outer_min_block_size { 0 };
+        CSSPixels outer_max_block_size { 0 };
     };
 
     // Calculate and return the grid and also rows and cells as output parameters.
@@ -109,7 +109,7 @@ template<>
 struct Traits<Web::Layout::TableGrid::GridPosition> : public DefaultTraits<Web::Layout::TableGrid::GridPosition> {
     static unsigned hash(Web::Layout::TableGrid::GridPosition const& key)
     {
-        return pair_int_hash(key.x, key.y);
+        return pair_int_hash(key.column_index, key.row_index);
     }
 };
 
