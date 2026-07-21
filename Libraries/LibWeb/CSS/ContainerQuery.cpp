@@ -276,14 +276,7 @@ static Optional<Keyword> single_css_wide_keyword(ReadonlySpan<Parser::ComponentV
     return {};
 }
 
-static NonnullRefPtr<StyleValue const> inherited_custom_property_value(DOM::AbstractElement const& element, Utf16FlyString const& name, DOM::Document const& document, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
-{
-    if (auto parent = element.element_to_inherit_style_from(); parent.has_value())
-        return StyleComputer::compute_value_of_custom_property(parent.value(), name, guarded_contexts);
-    return document.custom_property_initial_value(name);
-}
-
-static ColorResolutionContext fallback_color_resolution_context_for_style_query(DOM::AbstractElement const& element, ComputationContext const& computation_context)
+static ColorResolutionContext fallback_color_resolution_context_for_style_query(AbstractOrHypotheticalElement const& element, ComputationContext const& computation_context)
 {
     auto calculation_resolution_context = CalculationResolutionContext::from_computation_context(computation_context);
     auto color_resolution_context_for_style = [&](ComputedValues const& style) {
@@ -295,10 +288,12 @@ static ColorResolutionContext fallback_color_resolution_context_for_style_query(
         return color_resolution_context;
     };
 
-    if (auto const* style = element.computed_values())
+    auto abstract_element = element.abstract_element();
+
+    if (auto const* style = abstract_element.computed_values())
         return color_resolution_context_for_style(*style);
 
-    if (auto parent = element.element_to_inherit_style_from(); parent.has_value() && parent->computed_values())
+    if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value() && parent->computed_values())
         return color_resolution_context_for_style(*parent->computed_values());
 
     return {
@@ -416,7 +411,7 @@ static RefPtr<StyleValue const> parse_style_range_literal_value(DOM::Document co
     return {};
 }
 
-static Optional<StyleRangeComparableValue> evaluate_style_range_value(StyleFeature::StyleRangeValue const& range_value, DOM::AbstractElement const& element, DOM::Document const& document, ComputationContext const& computation_context, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts, bool* did_evaluate_attr_tainted_style_query)
+static Optional<StyleRangeComparableValue> evaluate_style_range_value(StyleFeature::StyleRangeValue const& range_value, AbstractOrHypotheticalElement const& element, DOM::Document const& document, ComputationContext const& computation_context, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts, bool* did_evaluate_attr_tainted_style_query)
 {
     return range_value.visit(
         [&](PropertyNameAndID const& property) -> Optional<StyleRangeComparableValue> {
@@ -424,11 +419,11 @@ static Optional<StyleRangeComparableValue> evaluate_style_range_value(StyleFeatu
                 return {};
 
             if (guarded_contexts.has_value()) {
-                if (guarded_contexts->mark_existing_as_cyclic({ Parser::SubstitutionContext::DependencyType::Property, property.name().to_utf16_string() }))
+                if (guarded_contexts->mark_existing_as_cyclic(Parser::SubstitutionContext { Parser::PropertySubstitutionContextDependency::create(property.name().to_utf16_string(), element) }))
                     return {};
             }
 
-            auto computed_value = StyleComputer::compute_value_of_custom_property(element, property.name(), guarded_contexts);
+            auto computed_value = document.style_computer().compute_value_of_custom_property(nullptr, element, property.name(), guarded_contexts);
             auto computed_tokens = computed_value->tokenize();
             if (did_evaluate_attr_tainted_style_query && Parser::contains_attr_tainted_value(computed_tokens))
                 *did_evaluate_attr_tainted_style_query = true;
@@ -525,7 +520,7 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
     Optional<Keyword> query_css_wide_keyword;
 
     if (guarded_contexts.has_value()) {
-        if (guarded_contexts->mark_existing_as_cyclic({ Parser::SubstitutionContext::DependencyType::Property, property.name().to_utf16_string() }))
+        if (guarded_contexts->mark_existing_as_cyclic(Parser::SubstitutionContext { Parser::PropertySubstitutionContextDependency::create(property.name().to_utf16_string(), element) }))
             return MatchResult::False;
     }
 
@@ -541,15 +536,20 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
         }
     }
 
-    auto computed_value = StyleComputer::compute_value_of_custom_property(element, property_name, guarded_contexts);
+    auto computed_value = document.style_computer().compute_value_of_custom_property(nullptr, element, property_name, guarded_contexts);
     auto computed_tokens = computed_value->tokenize();
     if (context.did_evaluate_attr_tainted_style_query) {
         if (Parser::contains_attr_tainted_value(computed_tokens))
             *context.did_evaluate_attr_tainted_style_query = true;
     }
 
-    auto registration = document.get_registered_custom_property(property_name);
+    auto registration = element.get_registered_custom_property(property_name);
+
+    // FIXME: We should use the computed style that we are currently computing rather than the fallback (i.e. the previously applied style).
     auto computation_context = element.document().style_computer().fallback_computation_context_for_custom_property(element);
+    auto const* computed_values = element.abstract_element().computed_values();
+    auto const* computed_style_for_custom_property_resolution = computed_values ? document.style_computer().reconstruct_computed_properties(*computed_values).ptr() : nullptr;
+
     auto color_resolution_context = fallback_color_resolution_context_for_style_query(element, computation_context);
     auto comparable_computed_value = computed_value;
     if (registration.has_value() && computed_value->is_unresolved() && computed_value->as_unresolved().contains_attr_tainted_values()) {
@@ -594,7 +594,7 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
     // A style feature without a value (<style-feature-boolean>) evaluates to true if the computed value is different
     // from the initial value for the given property.
     if (!value.has_value()) {
-        auto initial_value = document.custom_property_initial_value(property_name);
+        auto initial_value = initial_custom_property_value(registration, element.document());
         return as_match_result(!style_values_are_equal(*comparable_computed_value, *initial_value));
     }
 
@@ -602,17 +602,17 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
     if (query_css_wide_keyword.has_value()) {
         switch (query_css_wide_keyword.value()) {
         case Keyword::Initial: {
-            auto initial_value = document.custom_property_initial_value(property_name);
+            auto initial_value = initial_custom_property_value(registration, element.document());
             return as_match_result(style_values_are_equal(*comparable_computed_value, *initial_value));
         }
         case Keyword::Inherit: {
-            auto inherited_value = inherited_custom_property_value(element, property_name, document, guarded_contexts);
+            auto inherited_value = inherited_custom_property_value(registration, element, property_name, computed_style_for_custom_property_resolution, guarded_contexts);
             return as_match_result(style_values_are_equal(*comparable_computed_value, *inherited_value));
         }
         case Keyword::Unset: {
             auto expected_value = !registration.has_value() || registration->inherit
-                ? inherited_custom_property_value(element, property_name, document, guarded_contexts)
-                : document.custom_property_initial_value(property_name);
+                ? inherited_custom_property_value(registration, element, property_name, computed_style_for_custom_property_resolution, guarded_contexts)
+                : initial_custom_property_value(registration, element.document());
             return as_match_result(style_values_are_equal(*comparable_computed_value, *expected_value));
         }
         case Keyword::Revert:

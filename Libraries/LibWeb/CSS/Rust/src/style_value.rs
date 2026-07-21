@@ -19,7 +19,8 @@ unsafe extern "C" {
     fn ladybird_style_value_unref(style_value: *const c_void);
     fn ladybird_utf16_fly_string_unref(raw: usize);
     fn ladybird_string_unref(raw: usize);
-    fn ladybird_calculation_node_unref(node: *const c_void);
+    fn ladybird_style_value_ref(style_value: *const c_void);
+    fn ladybird_utf16_fly_string_ref(raw: usize);
 }
 
 /// A strong reference to a C++ StyleValue held from Rust-owned value data.
@@ -30,6 +31,34 @@ unsafe extern "C" {
 #[repr(C)]
 pub struct RetainedStyleValue {
     pointer: *const c_void,
+}
+
+impl RetainedStyleValue {
+    pub(crate) fn shell_pointer(&self) -> *const c_void {
+        self.pointer
+    }
+
+    /// Assumes ownership of one strong reference to the C++ StyleValue shell.
+    ///
+    /// # Safety
+    /// `pointer` must be a leaked strong StyleValue reference (or null for an absent value).
+    pub(crate) unsafe fn from_shell_pointer(pointer: *const c_void) -> Self {
+        Self { pointer }
+    }
+
+    /// Retains a new strong reference to the C++ StyleValue shell.
+    ///
+    /// # Safety
+    /// `pointer` must point at a live StyleValue shell.
+    pub(crate) unsafe fn from_borrowed_shell_pointer(pointer: *const c_void) -> Self {
+        unsafe { ladybird_style_value_ref(pointer) };
+        Self { pointer }
+    }
+
+    /// Clones the retained reference, bumping the shell's reference count.
+    pub(crate) fn clone_retained(&self) -> Self {
+        unsafe { Self::from_borrowed_shell_pointer(self.pointer) }
+    }
 }
 
 impl Drop for RetainedStyleValue {
@@ -47,6 +76,23 @@ impl Drop for RetainedStyleValue {
 #[repr(C)]
 pub struct RetainedUtf16FlyString {
     raw: usize,
+}
+
+impl RetainedUtf16FlyString {
+    /// The raw one-word representation; fly strings are interned, so equal raw
+    /// values mean equal strings.
+    pub(crate) fn raw(&self) -> usize {
+        self.raw
+    }
+
+    /// Retains a new reference to the underlying string data.
+    ///
+    /// # Safety
+    /// `raw` must be the raw representation of a live fly string.
+    pub(crate) unsafe fn from_borrowed_raw(raw: usize) -> Self {
+        unsafe { ladybird_utf16_fly_string_ref(raw) };
+        Self { raw }
+    }
 }
 
 impl Drop for RetainedUtf16FlyString {
@@ -101,6 +147,13 @@ pub struct RetainedStyleValueList {
 }
 
 impl RetainedStyleValueList {
+    pub(crate) fn as_slice(&self) -> &[RetainedStyleValue] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+
     /// Takes ownership of one strong reference to each value.
     ///
     /// # Safety
@@ -127,6 +180,15 @@ pub struct RetainedPropertyIdList {
 }
 
 retained_list!(RetainedPropertyIdList, u16);
+
+impl RetainedPropertyIdList {
+    pub(crate) fn as_slice(&self) -> &[u16] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+}
 
 /// A retained AK::String, stored as its one-word raw representation. Owns one reference to the
 /// underlying string data unless it is a short string; the C++ bridge handles both cases.
@@ -252,6 +314,68 @@ pub struct RetainedColorStopList {
 }
 
 retained_list!(RetainedColorStopList, RetainedColorStop);
+
+impl RetainedCounterDefinition {
+    pub(crate) fn value(&self) -> &RetainedStyleValue {
+        &self.value
+    }
+}
+
+impl RetainedImageSetOption {
+    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+        [&self.image, &self.resolution]
+    }
+}
+
+impl RetainedLinearEasingStop {
+    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+        [&self.output, &self.input]
+    }
+}
+
+macro_rules! retained_list_as_slice {
+    ($list:ident, $element:ty) => {
+        impl $list {
+            pub(crate) fn as_slice(&self) -> &[$element] {
+                if self.pointer.is_null() {
+                    return &[];
+                }
+                unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+            }
+        }
+    };
+}
+retained_list_as_slice!(RetainedCounterDefinitionList, RetainedCounterDefinition);
+retained_list_as_slice!(RetainedImageSetOptionList, RetainedImageSetOption);
+retained_list_as_slice!(RetainedLinearEasingStopList, RetainedLinearEasingStop);
+
+impl RetainedShapePoint {
+    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+        [&self.x, &self.y]
+    }
+}
+retained_list_as_slice!(RetainedShapePointList, RetainedShapePoint);
+
+impl RetainedColorStop {
+    /// The stop's retained values, absent ones as null retained references.
+    pub(crate) fn values(&self) -> [&RetainedStyleValue; 4] {
+        [
+            &self.transition_hint,
+            &self.color,
+            &self.position,
+            &self.second_position,
+        ]
+    }
+}
+
+impl RetainedColorStopList {
+    pub(crate) fn as_slice(&self) -> &[RetainedColorStop] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+}
 
 /// A retained named grid area: the retained area name and its grid line indices.
 #[repr(C)]
@@ -407,21 +531,6 @@ pub struct RetainedShapePointList {
 
 retained_list!(RetainedShapePointList, RetainedShapePoint);
 
-/// A strong reference to a C++ CalculationNode held from Rust-owned value data. The node tree
-/// is still C++-structured during the migration, like retained style values.
-#[repr(C)]
-pub struct RetainedCalculationNode {
-    pointer: *const c_void,
-}
-
-impl Drop for RetainedCalculationNode {
-    fn drop(&mut self) {
-        if !self.pointer.is_null() {
-            unsafe { ladybird_calculation_node_unref(self.pointer) };
-        }
-    }
-}
-
 /// An accepted numeric range for one value type (the C++ `enum class ValueType : u8`, opaque
 /// to Rust).
 #[repr(C)]
@@ -429,6 +538,17 @@ pub struct RetainedNumericRangeByType {
     value_type: u8,
     min: f64,
     max: f64,
+}
+
+#[allow(dead_code)]
+impl RetainedNumericRangeByType {
+    pub(crate) fn value_type(&self) -> u8 {
+        self.value_type
+    }
+
+    pub(crate) fn range(&self) -> (f64, f64) {
+        (self.min, self.max)
+    }
 }
 
 /// A Rust-owned array of accepted numeric ranges.
@@ -439,6 +559,16 @@ pub struct RetainedNumericRangeList {
 }
 
 retained_list!(RetainedNumericRangeList, RetainedNumericRangeByType);
+
+#[allow(dead_code)]
+impl RetainedNumericRangeList {
+    pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+}
 
 /// The shared leading fields of every color variant payload: the optional color type and the
 /// color syntax. Placing this first in each color payload lets C++ read it without knowing
@@ -496,7 +626,12 @@ pub enum StyleValueData {
     /// numeric type as its raw bytes (a trivially copyable C++ NumericType, opaque to Rust)
     /// and the parse-time calculation context.
     Calculated {
-        calculation: RetainedCalculationNode,
+        rust_calculation: crate::calc::CalcNodeHandle,
+        /// The resolve-against target, base-mapped at creation: whether one
+        /// exists, whether it is the number type, and otherwise its base type
+        /// index in the numeric type order.
+        resolve_as_is_number: bool,
+        resolve_as_base: u8,
         resolved_type: RetainedByteList,
         has_percentages_resolve_as: bool,
         percentages_resolve_as: u8,
@@ -830,6 +965,7 @@ pub enum StyleValueData {
         source_text: RetainedString,
         value_comparison_text: RetainedString,
         presence_attr: bool,
+        presence_dashed_function: bool,
         presence_env: bool,
         presence_if: bool,
         presence_inherit: bool,
@@ -1649,6 +1785,7 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
     source_text: usize,
     value_comparison_text: usize,
     presence_attr: bool,
+    presence_dashed_function: bool,
     presence_env: bool,
     presence_if: bool,
     presence_inherit: bool,
@@ -1662,6 +1799,7 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
                 raw: value_comparison_text,
             },
             presence_attr,
+            presence_dashed_function,
             presence_env,
             presence_if,
             presence_inherit,
@@ -2022,10 +2160,12 @@ pub unsafe extern "C" fn rust_style_value_create_basic_shape(
 /// are copied.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_calculated(
-    calculation: *const c_void,
+    rust_calculation: *const crate::calc::CalcNode,
     resolved_type: *const u8,
     resolved_type_length: usize,
     has_percentages_resolve_as: bool,
+    resolve_as_is_number: bool,
+    resolve_as_base: u8,
     percentages_resolve_as: u8,
     resolve_numbers_as_integers: bool,
     accepted_ranges: *const RetainedNumericRangeByType,
@@ -2033,7 +2173,9 @@ pub unsafe extern "C" fn rust_style_value_create_calculated(
 ) -> *mut StyleValueData {
     abort_on_panic(|| {
         Box::into_raw(Box::new(StyleValueData::Calculated {
-            calculation: RetainedCalculationNode { pointer: calculation },
+            rust_calculation: unsafe { crate::calc::CalcNodeHandle::from_raw(rust_calculation) },
+            resolve_as_is_number,
+            resolve_as_base,
             resolved_type: unsafe { RetainedByteList::from_raw(resolved_type, resolved_type_length) },
             has_percentages_resolve_as,
             percentages_resolve_as,
@@ -2068,4 +2210,44 @@ pub unsafe extern "C" fn rust_style_value_destroy(value: *mut StyleValueData) {
         }
         drop(unsafe { Box::from_raw(value) });
     });
+}
+
+/// Whether a value's computed color depends on the element's used currentcolor: the
+/// currentcolor keyword itself, or a color function, color-mix(), contrast-color() or
+/// light-dark() whose nested colors do. `data_of` maps a nested value's shell pointer to
+/// its Rust-owned data.
+fn value_depends_on_current_color(
+    value: &StyleValueData,
+    data_of: unsafe extern "C" fn(*const c_void) -> *const c_void,
+) -> bool {
+    let retained_depends = |retained: &RetainedStyleValue| -> bool {
+        let shell = retained.shell_pointer();
+        if shell.is_null() {
+            return false;
+        }
+        let data = unsafe { data_of(shell) };
+        value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }, data_of)
+    };
+    match value {
+        StyleValueData::Keyword { keyword } => *keyword == crate::style_compute::keyword::CURRENTCOLOR,
+        StyleValueData::ColorFunction { origin_color, .. } => retained_depends(origin_color),
+        StyleValueData::ColorMix {
+            first_color,
+            second_color,
+            ..
+        } => retained_depends(first_color) || retained_depends(second_color),
+        StyleValueData::ContrastColor { color, .. } => retained_depends(color),
+        StyleValueData::LightDark { light, dark, .. } => retained_depends(light) || retained_depends(dark),
+        _ => false,
+    }
+}
+
+/// # Safety
+/// `data` must point at a valid StyleValueData and `data_of` must be a valid callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_depends_on_current_color(
+    data: *const c_void,
+    data_of: unsafe extern "C" fn(shell: *const c_void) -> *const c_void,
+) -> bool {
+    crate::abort_on_panic(|| value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }, data_of))
 }

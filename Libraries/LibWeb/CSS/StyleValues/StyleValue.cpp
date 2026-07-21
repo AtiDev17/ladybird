@@ -90,6 +90,7 @@
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
 #include <LibWeb/CSS/StyleValues/UnicodeRangeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -97,8 +98,9 @@
 
 extern "C" void ladybird_style_value_unref(void const*);
 extern "C" void ladybird_utf16_fly_string_unref(size_t);
+extern "C" void ladybird_style_value_ref(void const*);
+extern "C" void ladybird_utf16_fly_string_ref(size_t);
 extern "C" void ladybird_string_unref(size_t);
-extern "C" void ladybird_calculation_node_unref(void const*);
 
 namespace Web::CSS {
 
@@ -162,14 +164,30 @@ void StyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
 
 bool StyleValue::is_computationally_independent() const
 {
+    // The rules for the value types whose decision has moved into the Rust style computation
+    // core; the rest still dispatch to their C++ shells.
+    auto decision = ComputedValuesFFI::rust_style_value_is_computationally_independent(
+        m_value.operator->(),
+        [](void const* shell) -> void const* { return static_cast<StyleValue const*>(shell)->rust_style_value_data(); },
+        [](void const* shell) -> bool { return static_cast<StyleValue const*>(shell)->decide_computational_independence_fallback(); });
+    if (decision.handled)
+        return decision.independent;
+
+    // The only value types deciding here are the grid track size list, which delegates to a
+    // deliberately C++-backed value type, and calc values, whose calculation trees are opaque
+    // to the core. The unresolved, guaranteed-invalid, pending-substitution, unicode-range and
+    // counter-style-system values must never be asked, which the default preserves.
+    return decide_computational_independence_fallback();
+}
+
+bool StyleValue::decide_computational_independence_fallback() const
+{
     switch (type()) {
-#define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) \
-    case Type::title_case:                                                               \
-        return static_cast<style_value_class_name const&>(*this).is_computationally_independent();
-        ENUMERATE_CSS_STYLE_VALUE_TYPES
-#undef __ENUMERATE_CSS_STYLE_VALUE_TYPE
+    case Type::GridTrackSizeList:
+        return static_cast<GridTrackSizeListStyleValue const&>(*this).is_computationally_independent();
+    default:
+        VERIFY_NOT_REACHED();
     }
-    VERIFY_NOT_REACHED();
 }
 
 void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
@@ -203,21 +221,10 @@ bool StyleValue::is_color_function() const
 
 bool StyleValue::depends_on_current_color() const
 {
-    if (type() != Type::Color)
-        return to_keyword() == Keyword::Currentcolor;
-
-    switch (m_value->tag) {
-    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
-        return static_cast<ColorFunctionStyleValue const&>(*this).depends_on_current_color();
-    case StyleValueFFI::StyleValueData::Tag::ColorMix:
-        return static_cast<ColorMixStyleValue const&>(*this).depends_on_current_color();
-    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
-        return static_cast<ContrastColorStyleValue const&>(*this).depends_on_current_color();
-    case StyleValueFFI::StyleValueData::Tag::LightDark:
-        return static_cast<LightDarkStyleValue const&>(*this).depends_on_current_color();
-    default:
-        return false;
-    }
+    // The recursion over nested colors lives in the Rust style value graph.
+    return StyleValueFFI::rust_style_value_depends_on_current_color(
+        m_value.operator->(),
+        [](void const* shell) -> void const* { return static_cast<StyleValue const*>(shell)->rust_style_value_data(); });
 }
 
 bool StyleValue::has_color() const
@@ -569,14 +576,20 @@ extern "C" void ladybird_utf16_fly_string_unref(size_t raw)
     Utf16FlyString::unref_raw(raw);
 }
 
+// Called when Rust-owned cascade data retains an additional reference to a C++ style value.
+extern "C" void ladybird_style_value_ref(void const* style_value)
+{
+    static_cast<Web::CSS::StyleValue const*>(style_value)->ref();
+}
+
+// Called when Rust-owned cascade data retains an additional reference to a Utf16FlyString.
+extern "C" void ladybird_utf16_fly_string_ref(size_t raw)
+{
+    (void)Utf16FlyString::from_raw(raw).to_raw_leaked();
+}
+
 // Called when Rust-owned style value data drops a retained String.
 extern "C" void ladybird_string_unref(size_t raw)
 {
     String::unref_raw(raw);
-}
-
-// Called when Rust-owned style value data drops a retained CalculationNode.
-extern "C" void ladybird_calculation_node_unref(void const* node)
-{
-    static_cast<Web::CSS::CalculationNode const*>(node)->unref();
 }

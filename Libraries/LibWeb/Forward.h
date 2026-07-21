@@ -218,6 +218,7 @@ class SubtleCrypto;
 namespace Web::CSS {
 
 class AbstractImageStyleValue;
+class AbstractOrHypotheticalElement;
 class AnchorStyleValue;
 class AnchorSizeStyleValue;
 class Angle;
@@ -231,7 +232,6 @@ class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
 class BorderRadiusStyleValue;
 class CalculatedStyleValue;
-class CalculationNode;
 class CascadedProperties;
 class CustomPropertyData;
 class Clip;
@@ -487,6 +487,7 @@ struct CalculationContext;
 struct CalculationResolutionContext;
 struct ComputationContext;
 struct FunctionParameterInternal;
+struct CustomPropertyRegistration;
 struct GridRepeatParams;
 struct LogicalAliasMappingContext;
 struct NormalGap;
@@ -519,6 +520,7 @@ class SyntaxNode;
 class Token;
 class Tokenizer;
 
+struct ArbitrarySubstitutionReplacementContext;
 struct AtRule;
 struct Declaration;
 struct Function;

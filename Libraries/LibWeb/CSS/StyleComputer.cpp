@@ -44,6 +44,7 @@
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/HypotheticalElement.h>
 #include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/InvalidationSet.h>
 #include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
@@ -51,6 +52,7 @@
 #include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
+#include <LibWeb/CSS/StyleComputeFFI.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -846,43 +848,31 @@ static void sort_matching_rules(Vector<StyleComputer::ScopedMatchingRule>& match
 
 void StyleComputer::for_each_property_expanding_shorthands(PropertyID property_id, StyleValue const& value, Function<void(PropertyID, StyleValue const&)> const& set_longhand_property)
 {
-    if (property_is_shorthand(property_id) && (value.is_unresolved() || value.is_pending_substitution())) {
-        // If a shorthand property contains an arbitrary substitution function in its value, the longhand properties
-        // it’s associated with must instead be filled in with a special, unobservable-to-authors pending-substitution
-        // value that indicates the shorthand contains an arbitrary substitution function, and thus the longhand’s
-        // value can’t be determined until after substituted.
-        // https://drafts.csswg.org/css-values-5/#pending-substitution-value
-        // Ensure we keep the longhand around until it can be resolved.
-        set_longhand_property(property_id, value);
-        auto pending_substitution_value = PendingSubstitutionStyleValue::create(value);
-        for (auto longhand_id : longhands_for_shorthand(property_id)) {
-            for_each_property_expanding_shorthands(longhand_id, pending_substitution_value, set_longhand_property);
-        }
-        return;
-    }
+    // The expansion recursion lives in the Rust style computation core; this wrapper provides
+    // the shell-level callbacks and pins every pending-substitution value it creates until the
+    // expansion returns.
+    struct ExpansionContext {
+        Function<void(PropertyID, StyleValue const&)> const& set_longhand_property;
+        Vector<NonnullRefPtr<StyleValue const>> pinned_values;
+    } expansion_context { set_longhand_property, {} };
 
-    if (value.is_shorthand()) {
-        auto& shorthand_value = value.as_shorthand();
-        auto properties = shorthand_value.sub_properties();
-        auto values = shorthand_value.values();
-        for (size_t i = 0; i < properties.size(); ++i)
-            for_each_property_expanding_shorthands(properties[i], values[i], set_longhand_property);
-        return;
-    }
-
-    if (property_is_shorthand(property_id)) {
-        // ShorthandStyleValue was handled already, as were unresolved shorthands.
-        // That means the only values we should see are the CSS-wide keywords, or the guaranteed-invalid value.
-        // Both should be applied to our longhand properties.
-        // We don't directly call `set_longhand_property()` because the longhands might have longhands of their own.
-        // (eg `grid` -> `grid-template` -> `grid-template-areas` & `grid-template-rows` & `grid-template-columns`)
-        VERIFY(value.is_css_wide_keyword() || value.is_guaranteed_invalid());
-        for (auto longhand : longhands_for_shorthand(property_id))
-            for_each_property_expanding_shorthands(longhand, value, set_longhand_property);
-        return;
-    }
-
-    set_longhand_property(property_id, value);
+    ComputedValuesFFI::FfiShorthandExpansionCallbacks const callbacks {
+        .context = &expansion_context,
+        .data_of = [](void*, void const* shell) -> void const* {
+            return static_cast<StyleValue const*>(shell)->rust_style_value_data();
+        },
+        .create_pending_substitution = [](void* context, void const* shell) -> void const* {
+            auto& expansion_context = *static_cast<ExpansionContext*>(context);
+            auto pending_substitution_value = PendingSubstitutionStyleValue::create(*static_cast<StyleValue const*>(shell));
+            auto const* pointer = pending_substitution_value.ptr();
+            expansion_context.pinned_values.append(move(pending_substitution_value));
+            return pointer;
+        },
+        .set_longhand_property = [](void* context, u16 property_id, void const* shell) {
+            auto& expansion_context = *static_cast<ExpansionContext*>(context);
+            expansion_context.set_longhand_property(static_cast<PropertyID>(property_id), *static_cast<StyleValue const*>(shell)); },
+    };
+    ComputedValuesFFI::rust_for_each_property_expanding_shorthands(&callbacks, to_underlying(property_id), &value, value.rust_style_value_data());
 }
 
 static bool property_is_disallowed_in_cascade(PropertyID property_id, DOM::AbstractElement const& abstract_element, StyleComputer::BypassPseudoElementPropertyWhitelist bypass_pseudo_element_property_whitelist)
@@ -908,64 +898,86 @@ void StyleComputer::apply_property_list_to_cascade(
     GC::Ptr<DOM::ShadowRoot const> source_shadow_root,
     BypassPseudoElementPropertyWhitelist bypass_pseudo_element_property_whitelist) const
 {
-    AK::FixedBitmap<to_underlying(last_property_id) + 1> seen_properties(false);
+    // The application loop lives in the Rust style computation core; this wrapper marshals
+    // the declaration list and provides the shell-level callbacks, pinning every value it
+    // creates until the application returns.
+    struct CascadeApplicationContext {
+        CascadedProperties& cascaded_properties;
+        DOM::AbstractElement& abstract_element;
+        GC::Ptr<CSSStyleDeclaration const> source;
+        GC::Ptr<DOM::ShadowRoot const> source_shadow_root;
+        BypassPseudoElementPropertyWhitelist bypass_pseudo_element_property_whitelist;
+        Vector<NonnullRefPtr<StyleValue const>> pinned_values;
+    } application_context {
+        .cascaded_properties = cascaded_properties,
+        .abstract_element = abstract_element,
+        .source = source,
+        .source_shadow_root = source_shadow_root,
+        .bypass_pseudo_element_property_whitelist = bypass_pseudo_element_property_whitelist,
+        .pinned_values = {},
+    };
+
+    Vector<ComputedValuesFFI::FfiCascadeDeclaration, 32> declarations;
+    declarations.ensure_capacity(properties.size());
     for (auto const& property : properties) {
-        if (important != property.important)
-            continue;
-
-        if (property_is_disallowed_in_cascade(property.property_id, abstract_element, bypass_pseudo_element_property_whitelist) && !property.value->is_unresolved())
-            continue;
-
-        auto property_value = property.value;
-
-        if (property_value->is_pending_substitution())
-            continue;
-
-        if (property_value->is_unresolved())
-            property_value = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { abstract_element.document() }, abstract_element, PropertyNameAndID::from_id(property.property_id), property_value->as_unresolved());
-
-        if (property_value->is_guaranteed_invalid()) {
-            // https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
-            // When substitution results in a property’s value containing the guaranteed-invalid value, this makes the
-            // declaration invalid at computed-value time. When this happens, the computed value is one of the
-            // following depending on the property’s type:
-
-            // -> The property is a non-registered custom property
-            // -> The property is a registered custom property with universal syntax
-            // FIXME: Process custom properties here?
-            if (false) {
-                // The computed value is the guaranteed-invalid value.
-            }
-            // -> Otherwise
-            else {
-                // Either the property’s inherited value or its initial value depending on whether the property is
-                // inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
-                property_value = KeywordStyleValue::create(Keyword::Unset);
-            }
-        }
-
-        for_each_property_expanding_shorthands(property.property_id, property_value, [&](PropertyID longhand_id, StyleValue const& longhand_value) {
-            if (property_is_disallowed_in_cascade(longhand_id, abstract_element, bypass_pseudo_element_property_whitelist))
-                return;
-
-            // If we're a PSV that's already been seen, that should mean that our shorthand already got
-            // resolved and gave us a value, so we don't want to overwrite it with a PSV.
-            if (seen_properties.get(to_underlying(longhand_id)) && property_value->is_pending_substitution())
-                return;
-            seen_properties.set(to_underlying(longhand_id), true);
-
-            if (longhand_value.is_revert()) {
-                cascaded_properties.revert_property(longhand_id, important, cascade_origin);
-            } else if (longhand_value.is_revert_layer()) {
-                cascaded_properties.revert_layer_property(longhand_id, important, cascade_origin, layer_name, source_shadow_root);
-            } else {
-                // Track the exact shadow-root scope that supplied this winning declaration. A constructable
-                // stylesheet can be adopted into multiple scopes at once, so the declaration object alone is
-                // not specific enough.
-                cascaded_properties.set_property(longhand_id, longhand_value, important, cascade_origin, layer_name, source, source_shadow_root);
-            }
+        declarations.unchecked_append({
+            .property_id = to_underlying(property.property_id),
+            .important = property.important == Important::Yes,
+            .shell = property.value.ptr(),
+            .data = property.value->rust_style_value_data(),
         });
     }
+
+    auto unset_value = KeywordStyleValue::create(Keyword::Unset);
+
+    ComputedValuesFFI::FfiCascadeApplicationCallbacks const callbacks {
+        .context = &application_context,
+        .is_property_disallowed = [](void* context, u16 property_id) -> bool {
+            auto& application_context = *static_cast<CascadeApplicationContext*>(context);
+            return property_is_disallowed_in_cascade(static_cast<PropertyID>(property_id), application_context.abstract_element, application_context.bypass_pseudo_element_property_whitelist);
+        },
+        .resolve_unresolved = [](void* context, u16 property_id, void const* shell) -> void const* {
+            auto& application_context = *static_cast<CascadeApplicationContext*>(context);
+            auto resolved = Parser::Parser::resolve_unresolved_style_value(
+                Parser::ParsingParams { application_context.abstract_element.document() },
+                application_context.abstract_element,
+                {},
+                PropertyNameAndID::from_id(static_cast<PropertyID>(property_id)),
+                static_cast<StyleValue const*>(shell)->as_unresolved());
+            auto const* pointer = resolved.ptr();
+            application_context.pinned_values.append(move(resolved));
+            return pointer;
+        },
+        .data_of = [](void*, void const* shell) -> void const* {
+            return static_cast<StyleValue const*>(shell)->rust_style_value_data();
+        },
+        .create_pending_substitution = [](void* context, void const* shell) -> void const* {
+            auto& application_context = *static_cast<CascadeApplicationContext*>(context);
+            auto pending_substitution_value = PendingSubstitutionStyleValue::create(*static_cast<StyleValue const*>(shell));
+            auto const* pointer = pending_substitution_value.ptr();
+            application_context.pinned_values.append(move(pending_substitution_value));
+            return pointer;
+        },
+        .assign_source_slot = [](void* context, u32 slot) {
+            auto& application_context = *static_cast<CascadeApplicationContext*>(context);
+            application_context.cascaded_properties.assign_source_slot(slot, application_context.source, application_context.source_shadow_root); },
+    };
+
+    FlatPtr layer_name_raw = layer_name.has_value() ? layer_name->to_raw_leaked() : 0;
+    ComputedValuesFFI::rust_cascaded_properties_apply_property_list(
+        cascaded_properties.rust_store(),
+        declarations.data(),
+        declarations.size(),
+        important == Important::Yes,
+        static_cast<ComputedValuesFFI::CascadeOrigin>(to_underlying(cascade_origin)),
+        layer_name.has_value(),
+        layer_name_raw,
+        bit_cast<FlatPtr>(source_shadow_root.ptr()),
+        unset_value.ptr(),
+        unset_value->rust_style_value_data(),
+        &callbacks);
+    if (layer_name.has_value())
+        Utf16FlyString::unref_raw(layer_name_raw);
 }
 
 void StyleComputer::cascade_declarations(
@@ -1033,7 +1045,7 @@ static Optional<CSS::EasingFunction> resolve_keyframe_easing(CSS::StyleValue con
 {
     RefPtr<CSS::StyleValue const> resolved = style_value;
     if (resolved->is_unresolved())
-        resolved = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { abstract_element.document() }, abstract_element, CSS::PropertyNameAndID::from_id(CSS::PropertyID::AnimationTimingFunction), resolved->as_unresolved());
+        resolved = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { abstract_element.document() }, abstract_element, {}, CSS::PropertyNameAndID::from_id(CSS::PropertyID::AnimationTimingFunction), resolved->as_unresolved());
     if (!resolved || resolved->is_guaranteed_invalid())
         return {};
     if (resolved->is_value_list()) {
@@ -1204,7 +1216,7 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
                 continue;
 
             if (style_value->is_unresolved())
-                style_value = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { abstract_element.document() }, abstract_element, PropertyNameAndID::from_id(property_id), style_value->as_unresolved());
+                style_value = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { abstract_element.document() }, abstract_element, {}, PropertyNameAndID::from_id(property_id), style_value->as_unresolved());
 
             // https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
             // When substitution results in a guaranteed-invalid value, treat it as unset
@@ -2337,7 +2349,7 @@ JsonArray StyleComputer::collect_devtools_applied_style_rules(DOM::AbstractEleme
 
 // https://www.w3.org/TR/css-cascade/#cascading
 // https://drafts.csswg.org/css-cascade-5/#layering
-NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::AbstractElement abstract_element, bool did_match_any_pseudo_element_rules, ComputeStyleMode mode, MatchingRuleSet const& matching_rule_set) const
+NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::AbstractElement abstract_element, bool did_match_any_pseudo_element_rules, ComputeStyleMode mode, MatchingRuleSet const& matching_rule_set, IncludeInlineStyle include_inline_style) const
 {
     auto cascaded_properties = CascadedProperties::create();
     if (mode == ComputeStyleMode::CreatePseudoElementStyleIfNeeded) {
@@ -2345,61 +2357,86 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
             return cascaded_properties;
     }
 
-    // Normal user agent declarations
-    cascade_declarations(*cascaded_properties, abstract_element, matching_rule_set.user_agent_rules, CascadeOrigin::UserAgent, Important::No, {}, false);
-
-    // Normal user declarations
-    cascade_declarations(*cascaded_properties, abstract_element, matching_rule_set.user_rules, CascadeOrigin::User, Important::No, {}, false);
-
-    // Author presentational hints
-    // The spec calls this a special "Author presentational hint origin":
-    // "For the purpose of cascading this author presentational hint origin is treated as an independent origin;
-    // however for the purpose of the revert keyword (but not for the revert-layer keyword) it is considered
-    // part of the author origin."
-    // https://drafts.csswg.org/css-cascade-5/#author-presentational-hint-origin
-    if (!abstract_element.pseudo_element().has_value()) {
-        auto& element = abstract_element.element();
-        Vector<StyleProperty> presentational_hint_properties;
-        element.apply_presentational_hints(presentational_hint_properties);
-        if (element.supports_dimension_attributes()) {
-            auto const& dimension_source = is<HTML::HTMLImageElement>(element)
-                ? static_cast<HTML::HTMLImageElement const&>(element).dimension_attribute_source()
-                : element;
-            collect_dimension_attribute(presentational_hint_properties, dimension_source, HTML::AttributeNames::width, CSS::PropertyID::Width);
-            collect_dimension_attribute(presentational_hint_properties, dimension_source, HTML::AttributeNames::height, CSS::PropertyID::Height);
-        }
-        if (!presentational_hint_properties.is_empty()) {
-            apply_property_list_to_cascade(*cascaded_properties, abstract_element, presentational_hint_properties,
-                CascadeOrigin::AuthorPresentationalHint, Important::No, {}, nullptr, nullptr, BypassPseudoElementPropertyWhitelist::No);
-        }
-    }
-
     auto element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.element().root());
-    auto cascade_inline_style = [&](Important important) {
-        cascade_declarations(cascaded_properties, abstract_element, {}, CascadeOrigin::Author, important, {}, true);
+
+    // The cascade origin ordering lives in the Rust style computation core; the stages below
+    // apply one origin's declarations each.
+    struct CascadeStageContext {
+        GC::Ref<StyleComputer const> style_computer;
+        CascadedProperties& cascaded_properties;
+        DOM::AbstractElement& abstract_element;
+        MatchingRuleSet const& matching_rule_set;
+        GC::Ptr<DOM::ShadowRoot const> element_context_shadow_root;
+        IncludeInlineStyle include_inline_style;
+    } stage_context {
+        .style_computer = *this,
+        .cascaded_properties = *cascaded_properties,
+        .abstract_element = abstract_element,
+        .matching_rule_set = matching_rule_set,
+        .element_context_shadow_root = element_context_shadow_root,
+        .include_inline_style = include_inline_style,
     };
 
-    // Normal author declarations, with inner contexts first so outer contexts win.
-    for (auto const& context : matching_rule_set.author_contexts.in_reverse()) {
-        for (auto const& layer : context.author_rules)
-            cascade_declarations(cascaded_properties, abstract_element, layer.rules, CascadeOrigin::Author, Important::No, layer.qualified_layer_name, false);
-        if (context.shadow_root == element_context_shadow_root)
-            cascade_inline_style(Important::No);
-    }
+    ComputedValuesFFI::FfiCascadeStageCallbacks const callbacks {
+        .context = &stage_context,
+        .cascade_user_agent_rules = [](void* context, bool important) {
+            auto& stage_context = *static_cast<CascadeStageContext*>(context);
+            stage_context.style_computer->cascade_declarations(stage_context.cascaded_properties, stage_context.abstract_element, stage_context.matching_rule_set.user_agent_rules, CascadeOrigin::UserAgent, important ? Important::Yes : Important::No, {}, false); },
+        .cascade_user_rules = [](void* context, bool important) {
+            auto& stage_context = *static_cast<CascadeStageContext*>(context);
+            stage_context.style_computer->cascade_declarations(stage_context.cascaded_properties, stage_context.abstract_element, stage_context.matching_rule_set.user_rules, CascadeOrigin::User, important ? Important::Yes : Important::No, {}, false); },
+        .cascade_presentational_hints = [](void* context) {
+            auto& stage_context = *static_cast<CascadeStageContext*>(context);
+            auto& abstract_element = stage_context.abstract_element;
 
-    // Important author declarations, with outer contexts first so inner contexts win.
-    for (auto const& context : matching_rule_set.author_contexts) {
-        for (auto const& layer : context.author_rules.in_reverse())
-            cascade_declarations(cascaded_properties, abstract_element, layer.rules, CascadeOrigin::Author, Important::Yes, {}, false);
-        if (context.shadow_root == element_context_shadow_root)
-            cascade_inline_style(Important::Yes);
-    }
-
-    // Important user declarations
-    cascade_declarations(cascaded_properties, abstract_element, matching_rule_set.user_rules, CascadeOrigin::User, Important::Yes, {}, false);
-
-    // Important user agent declarations
-    cascade_declarations(cascaded_properties, abstract_element, matching_rule_set.user_agent_rules, CascadeOrigin::UserAgent, Important::Yes, {}, false);
+            // Author presentational hints
+            // The spec calls this a special "Author presentational hint origin":
+            // "For the purpose of cascading this author presentational hint origin is treated as an independent origin;
+            // however for the purpose of the revert keyword (but not for the revert-layer keyword) it is considered
+            // part of the author origin."
+            // https://drafts.csswg.org/css-cascade-5/#author-presentational-hint-origin
+            if (abstract_element.pseudo_element().has_value())
+                return;
+            auto& element = abstract_element.element();
+            Vector<StyleProperty> presentational_hint_properties;
+            element.apply_presentational_hints(presentational_hint_properties);
+            if (element.supports_dimension_attributes()) {
+                auto const& dimension_source = is<HTML::HTMLImageElement>(element)
+                    ? static_cast<HTML::HTMLImageElement const&>(element).dimension_attribute_source()
+                    : element;
+                collect_dimension_attribute(presentational_hint_properties, dimension_source, HTML::AttributeNames::width, CSS::PropertyID::Width);
+                collect_dimension_attribute(presentational_hint_properties, dimension_source, HTML::AttributeNames::height, CSS::PropertyID::Height);
+            }
+            if (!presentational_hint_properties.is_empty()) {
+                stage_context.style_computer->apply_property_list_to_cascade(stage_context.cascaded_properties, abstract_element, presentational_hint_properties,
+                    CascadeOrigin::AuthorPresentationalHint, Important::No, {}, nullptr, nullptr, BypassPseudoElementPropertyWhitelist::No);
+            } },
+        .cascade_author_rules = [](void* context, bool important) {
+            auto& stage_context = *static_cast<CascadeStageContext*>(context);
+            auto cascade_inline_style = [&] {
+                if (stage_context.include_inline_style == IncludeInlineStyle::No)
+                    return;
+                stage_context.style_computer->cascade_declarations(stage_context.cascaded_properties, stage_context.abstract_element, {}, CascadeOrigin::Author, important ? Important::Yes : Important::No, {}, true);
+            };
+            if (!important) {
+                // Normal author declarations, with inner contexts first so outer contexts win.
+                for (auto const& author_context : stage_context.matching_rule_set.author_contexts.in_reverse()) {
+                    for (auto const& layer : author_context.author_rules)
+                        stage_context.style_computer->cascade_declarations(stage_context.cascaded_properties, stage_context.abstract_element, layer.rules, CascadeOrigin::Author, Important::No, layer.qualified_layer_name, false);
+                    if (author_context.shadow_root == stage_context.element_context_shadow_root)
+                        cascade_inline_style();
+                }
+            } else {
+                // Important author declarations, with outer contexts first so inner contexts win.
+                for (auto const& author_context : stage_context.matching_rule_set.author_contexts) {
+                    for (auto const& layer : author_context.author_rules.in_reverse())
+                        stage_context.style_computer->cascade_declarations(stage_context.cascaded_properties, stage_context.abstract_element, layer.rules, CascadeOrigin::Author, Important::Yes, {}, false);
+                    if (author_context.shadow_root == stage_context.element_context_shadow_root)
+                        cascade_inline_style();
+                }
+            } },
+    };
+    ComputedValuesFFI::rust_drive_cascade_origins(&callbacks);
 
     // Transition declarations [css-transitions-1]
     // Note that we have to do these after finishing computing the style,
@@ -2487,42 +2524,6 @@ CSSPixels StyleComputer::absolute_size_mapping(AbsoluteSize absolute_size, CSSPi
     }
 
     VERIFY_NOT_REACHED();
-}
-
-// https://drafts.csswg.org/css-fonts/#font-size-prop
-CSSPixels StyleComputer::relative_size_mapping(RelativeSize relative_size, CSSPixels inherited_font_size)
-{
-    // A <relative-size> keyword is interpreted relative to the computed font-size of the parent element and possibly
-    // the table of font sizes.
-
-    // If the parent element has a keyword font size in the absolute size keyword mapping table, larger may compute the
-    // font size to the next entry in the table, and smaller may compute the font size to the previous entry in the
-    // table. For example, if the parent element has a font size of font-size:medium, specifying a value of larger may
-    // make the font size of the child element font-size:large.
-
-    // Instead of using next and previous items in the previous keyword table, User agents may instead use a simple
-    // ratio to increase or decrease the font size relative to the parent element. The specific ratio is unspecified,
-    // but should be around 1.2–1.5. This ratio may vary across different elements.
-    switch (relative_size) {
-    case RelativeSize::Smaller:
-        return inherited_font_size * CSSPixels(4) / 5;
-    case RelativeSize::Larger:
-        return inherited_font_size * CSSPixels(5) / 4;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static bool font_size_value_depends_on_inherited_font_size(StyleValue const& value)
-{
-    return value.is_percentage()
-        || (value.is_calculated() && value.as_calculated().contains_percentage())
-        || first_is_one_of(value.to_keyword(), Keyword::Larger, Keyword::Smaller, Keyword::Math);
-}
-
-static bool line_height_value_depends_on_computed_font_size(StyleValue const& value)
-{
-    return value.is_percentage()
-        || (value.is_calculated() && value.as_calculated().contains_percentage());
 }
 
 void StyleComputer::compute_property_values(ComputedProperties::Builder& builder, Optional<DOM::AbstractElement> abstract_element) const
@@ -2695,23 +2696,14 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
 void StyleComputer::resolve_effective_overflow_values(ComputedProperties::Builder& builder) const
 {
     auto& style = builder.style();
-    // https://www.w3.org/TR/css-overflow-3/#overflow-control
-    // The visible/clip values of overflow compute to auto/hidden (respectively) if one of overflow-x or
-    // overflow-y is neither visible nor clip.
-    auto overflow_x = keyword_to_overflow(style.property(PropertyID::OverflowX).to_keyword());
-    auto overflow_y = keyword_to_overflow(style.property(PropertyID::OverflowY).to_keyword());
-    auto overflow_x_is_visible_or_clip = overflow_x == Overflow::Visible || overflow_x == Overflow::Clip;
-    auto overflow_y_is_visible_or_clip = overflow_y == Overflow::Visible || overflow_y == Overflow::Clip;
-    if (!overflow_x_is_visible_or_clip || !overflow_y_is_visible_or_clip) {
-        if (overflow_x == CSS::Overflow::Visible)
-            builder.set_property(CSS::PropertyID::OverflowX, KeywordStyleValue::create(Keyword::Auto));
-        if (overflow_x == CSS::Overflow::Clip)
-            builder.set_property(CSS::PropertyID::OverflowX, KeywordStyleValue::create(Keyword::Hidden));
-        if (overflow_y == CSS::Overflow::Visible)
-            builder.set_property(CSS::PropertyID::OverflowY, KeywordStyleValue::create(Keyword::Auto));
-        if (overflow_y == CSS::Overflow::Clip)
-            builder.set_property(CSS::PropertyID::OverflowY, KeywordStyleValue::create(Keyword::Hidden));
-    }
+    // The css-overflow-3 rule pairing the two axes lives in the Rust style computation core.
+    auto effective_overflow = ComputedValuesFFI::rust_resolve_effective_overflow_keywords(
+        to_underlying(style.property(PropertyID::OverflowX).to_keyword()),
+        to_underlying(style.property(PropertyID::OverflowY).to_keyword()));
+    if (effective_overflow.changed_x)
+        builder.set_property(PropertyID::OverflowX, KeywordStyleValue::create(static_cast<Keyword>(effective_overflow.x_keyword)));
+    if (effective_overflow.changed_y)
+        builder.set_property(PropertyID::OverflowY, KeywordStyleValue::create(static_cast<Keyword>(effective_overflow.y_keyword)));
 }
 
 static void compute_text_align(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element)
@@ -2719,73 +2711,94 @@ static void compute_text_align(ComputedProperties::Builder& builder, DOM::Abstra
     auto& style = builder.style();
     auto text_align_keyword = style.property(PropertyID::TextAlign).to_keyword();
 
-    // https://drafts.csswg.org/css-text-4/#valdef-text-align-match-parent
-    // This value behaves the same as inherit (computes to its parent’s computed value) except that an inherited
-    // value of start or end is interpreted against the parent’s direction value and results in a computed value of
-    // either left or right. Computes to start when specified on the root element.
-    if (text_align_keyword == Keyword::MatchParent) {
-        if (auto const parent = abstract_element.element_to_inherit_style_from(); parent.has_value()) {
-            auto const& parent_values = *parent->computed_values();
-            auto parent_text_align = parent_values.text_align();
-            switch (parent_text_align) {
-            case TextAlign::Start:
-                if (parent_values.direction() == Direction::Ltr) {
-                    builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Left));
-                } else {
-                    builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Right));
-                }
-                break;
+    // NB: Only these two keywords trigger an adjustment in the Rust decision below; the early
+    //     return avoids fetching the parent's computed values for every element.
+    if (text_align_keyword != Keyword::MatchParent && text_align_keyword != Keyword::LibwebInheritOrCenter)
+        return;
 
-            case TextAlign::End:
-                if (parent_values.direction() == Direction::Ltr) {
-                    builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Right));
-                } else {
-                    builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Left));
-                }
-                break;
-
-            default:
-                builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(to_keyword(parent_text_align)));
-            }
-        } else {
-            builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Start));
-        }
+    auto const parent = abstract_element.element_to_inherit_style_from();
+    bool has_parent_with_computed_values = parent.has_value() && parent->computed_values();
+    u16 parent_text_align = 0;
+    bool parent_direction_is_ltr = true;
+    if (has_parent_with_computed_values) {
+        auto const& parent_values = *parent->computed_values();
+        parent_text_align = to_underlying(to_keyword(parent_values.text_align()));
+        parent_direction_is_ltr = parent_values.direction() == Direction::Ltr;
     }
 
-    // AD-HOC: The -libweb-inherit-or-center style defaults to centering, unless the parent element has a non-initial
-    //         computed text-align value. This is used to support the ad-hoc default <th> text-align behavior.
-    if (text_align_keyword == Keyword::LibwebInheritOrCenter && abstract_element.element().local_name() == HTML::TagNames::th) {
-        auto parent_element = abstract_element.element_to_inherit_style_from();
-        if (parent_element.has_value() && parent_element->computed_values()) {
-            auto parent_text_align = parent_element->computed_values()->text_align();
-            if (parent_text_align != TextAlign::Start) {
-                builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(to_keyword(parent_text_align)), ComputedProperties::Inherited::Yes);
-                return;
-            }
-        }
-        builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(Keyword::Center));
+    // The adjustment decision lives in the Rust style computation core.
+    auto adjustment = ComputedValuesFFI::rust_compute_text_align(
+        to_underlying(text_align_keyword),
+        abstract_element.element().local_name() == HTML::TagNames::th,
+        has_parent_with_computed_values,
+        parent_text_align,
+        parent_direction_is_ltr);
+    if (adjustment.changed) {
+        builder.set_property(PropertyID::TextAlign, KeywordStyleValue::create(static_cast<Keyword>(adjustment.keyword)),
+            adjustment.inherited ? ComputedProperties::Inherited::Yes : ComputedProperties::Inherited::No);
     }
 }
 
-enum class BoxTypeTransformation {
-    None,
-    Blockify,
-    Inlinify,
-};
-
-static BoxTypeTransformation required_box_type_transformation(ComputedProperties const& style, DOM::AbstractElement abstract_element)
+static ComputedValuesFFI::FfiDisplay to_ffi_display(Display const& display)
 {
-    // NOTE: We never blockify <br> elements. They are always inline.
-    //       There is currently no way to express in CSS how a <br> element really behaves.
-    //       Spec issue: https://github.com/whatwg/html/issues/2291
-    if (!abstract_element.pseudo_element().has_value() && is<HTML::HTMLBRElement>(abstract_element.element()))
-        return BoxTypeTransformation::None;
+    // The Rust mirror uses the same tag discriminants as Display::Type.
+    static_assert(to_underlying(Display::Type::OutsideAndInside) == 0);
+    static_assert(to_underlying(Display::Type::Internal) == 1);
+    static_assert(to_underlying(Display::Type::Box) == 2);
 
-    // Absolute positioning or floating an element blockifies the box’s display type. [CSS2]
-    if (style.position() == Positioning::Absolute || style.position() == Positioning::Fixed || style.float_() != Float::None)
-        return BoxTypeTransformation::Blockify;
+    ComputedValuesFFI::FfiDisplay result {};
+    result.tag = to_underlying(display.type());
+    switch (display.type()) {
+    case Display::Type::OutsideAndInside:
+        result.outside = to_underlying(display.outside());
+        result.inside = to_underlying(display.inside());
+        result.list_item = display.is_list_item();
+        break;
+    case Display::Type::Internal:
+        result.internal = to_underlying(display.internal());
+        break;
+    case Display::Type::Box:
+        result.box_value = display.is_none() ? to_underlying(DisplayBox::None) : to_underlying(DisplayBox::Contents);
+        break;
+    }
+    return result;
+}
 
-    // FIXME: Containment in a ruby container inlinifies the box’s display type, as described in [CSS-RUBY-1].
+static Display from_ffi_display(ComputedValuesFFI::FfiDisplay const& display)
+{
+    switch (static_cast<Display::Type>(display.tag)) {
+    case Display::Type::OutsideAndInside:
+        return Display { static_cast<DisplayOutside>(display.outside), static_cast<DisplayInside>(display.inside), display.list_item ? Display::ListItem::Yes : Display::ListItem::No };
+    case Display::Type::Internal:
+        return Display { static_cast<DisplayInternal>(display.internal) };
+    case Display::Type::Box:
+    default:
+        // The transformation never produces a box-type display.
+        VERIFY_NOT_REACHED();
+    }
+}
+
+// https://drafts.csswg.org/css-display/#transformations
+void StyleComputer::transform_box_type_if_needed(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element) const
+{
+    auto& style = builder.style();
+    auto display = style.display();
+
+    builder.set_display_before_box_type_transformation(display);
+
+    // The css-display-3 transformation rules live in the Rust style computation core; this
+    // wrapper marshals the element facts they depend on and applies the result.
+    auto& element = abstract_element.element();
+    bool is_mathml_element = false;
+    bool is_mathml_mtable = false;
+    bool is_mathml_mtr = false;
+    bool is_mathml_mtd = false;
+    if (display.is_math_inside()) {
+        is_mathml_element = element.namespace_uri() == Namespace::MathML;
+        is_mathml_mtable = element.tag_name().equals_ignoring_ascii_case("mtable"sv);
+        is_mathml_mtr = element.tag_name().equals_ignoring_ascii_case("mtr"sv);
+        is_mathml_mtd = element.tag_name().equals_ignoring_ascii_case("mtd"sv);
+    }
 
     // NOTE: If we're computing style for a pseudo-element, the effective parent will be the originating element itself, not its parent.
     auto parent = abstract_element.element_to_inherit_style_from();
@@ -2794,112 +2807,27 @@ static BoxTypeTransformation required_box_type_transformation(ComputedProperties
     while (parent.has_value() && parent->computed_values() && parent->computed_values()->display().is_contents())
         parent = parent->element_to_inherit_style_from();
 
-    // A parent with a grid or flex display value blockifies the box’s display type. [CSS-GRID-1] [CSS-FLEXBOX-1]
-    if (parent.has_value() && parent->computed_values()) {
-        auto const& parent_display = parent->computed_values()->display();
-        if (parent_display.is_grid_inside() || parent_display.is_flex_inside())
-            return BoxTypeTransformation::Blockify;
-    }
+    bool has_parent_display = parent.has_value() && parent->computed_values();
 
-    return BoxTypeTransformation::None;
-}
+    ComputedValuesFFI::FfiBoxTypeTransformationInput const input {
+        .display = to_ffi_display(display),
+        .position = to_underlying(style.property(PropertyID::Position).to_keyword()),
+        .float_value = to_underlying(style.property(PropertyID::Float).to_keyword()),
+        .is_br_element = !abstract_element.pseudo_element().has_value() && is<HTML::HTMLBRElement>(element),
+        .is_document_element = element.is_document_element(),
+        .is_mathml_element = is_mathml_element,
+        .is_mathml_mtable = is_mathml_mtable,
+        .is_mathml_mtr = is_mathml_mtr,
+        .is_mathml_mtd = is_mathml_mtd,
+        .has_parent_display = has_parent_display,
+        .parent_display = has_parent_display ? to_ffi_display(parent->computed_values()->display()) : ComputedValuesFFI::FfiDisplay {},
+    };
 
-// https://drafts.csswg.org/css-display/#transformations
-void StyleComputer::transform_box_type_if_needed(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element) const
-{
-    auto& style = builder.style();
-    // 2.7. Automatic Box Type Transformations
-
-    // Some layout effects require blockification or inlinification of the box type,
-    // which sets the box’s computed outer display type to block or inline (respectively).
-    // (This has no effect on display types that generate no box at all, such as none or contents.)
-
-    auto display = style.display();
-
-    builder.set_display_before_box_type_transformation(display);
-
-    if (display.is_none() || (display.is_contents() && !abstract_element.element().is_document_element()))
-        return;
-
-    // https://drafts.csswg.org/css-display/#root
-    // The root element’s display type is always blockified, and its principal box always establishes an independent formatting context.
-    if (abstract_element.element().is_document_element() && !display.is_block_outside()) {
-        builder.set_property(PropertyID::Display, DisplayStyleValue::create(Display::from_short(Display::Short::Block)));
-        return;
-    }
-
-    auto new_display = display;
-
-    if (display.is_math_inside()) {
-        // https://w3c.github.io/mathml-core/#new-display-math-value
-        // For elements that are not MathML elements, if the specified value of display is inline math or block math
-        // then the computed value is block flow and inline flow respectively.
-        if (abstract_element.element().namespace_uri() != Namespace::MathML)
-            new_display = Display { display.outside(), DisplayInside::Flow };
-        // For the mtable element the computed value is block table and inline table respectively.
-        else if (abstract_element.element().tag_name().equals_ignoring_ascii_case("mtable"sv))
-            new_display = Display { display.outside(), DisplayInside::Table };
-        // For the mtr element, the computed value is table-row.
-        else if (abstract_element.element().tag_name().equals_ignoring_ascii_case("mtr"sv))
-            new_display = Display { DisplayInternal::TableRow };
-        // For the mtd element, the computed value is table-cell.
-        else if (abstract_element.element().tag_name().equals_ignoring_ascii_case("mtd"sv))
-            new_display = Display { DisplayInternal::TableCell };
-    }
-
-    // https://www.w3.org/TR/CSS2/visuren.html#dis-pos-flo
-    // If 'position' has the value 'absolute' or 'fixed', [...] 'float' is set to 'none'
-    if (style.position() == Positioning::Absolute || style.position() == Positioning::Fixed)
+    auto transformation = ComputedValuesFFI::rust_transform_box_type(&input);
+    if (transformation.set_float_none)
         builder.set_property(PropertyID::Float, KeywordStyleValue::create(Keyword::None));
-
-    switch (required_box_type_transformation(style, abstract_element)) {
-    case BoxTypeTransformation::None:
-        break;
-    case BoxTypeTransformation::Blockify:
-        if (display.is_block_outside())
-            return;
-        // If a layout-internal box is blockified, its inner display type converts to flow so that it becomes a block container.
-        if (display.is_internal()) {
-            new_display = Display::from_short(Display::Short::Block);
-        } else {
-            VERIFY(display.is_outside_and_inside());
-
-            // For legacy reasons, if an inline block box (inline flow-root) is blockified, it becomes a block box (losing its flow-root nature).
-            // For consistency, a run-in flow-root box also blockifies to a block box.
-            if (display.is_inline_block()) {
-                new_display = Display { DisplayOutside::Block, DisplayInside::Flow, display.list_item() };
-            } else {
-                new_display = Display { DisplayOutside::Block, display.inside(), display.list_item() };
-            }
-        }
-        break;
-    case BoxTypeTransformation::Inlinify:
-        if (display.is_inline_outside()) {
-            // FIXME: If an inline box (inline flow) is inlinified, it recursively inlinifies all of its in-flow children,
-            //        so that no block-level descendants break up the inline formatting context in which it participates.
-            if (display.is_flow_inside()) {
-                dbgln("FIXME: Inlinify inline box children recursively");
-            }
-            break;
-        }
-        if (display.is_internal()) {
-            // Inlinification has no effect on layout-internal boxes. (However, placement in such an inline context will typically cause them
-            // to be wrapped in an appropriately-typed anonymous inline-level box.)
-        } else {
-            VERIFY(display.is_outside_and_inside());
-
-            // If a block box (block flow) is inlinified, its inner display type is set to flow-root so that it remains a block container.
-            if (display.is_block_outside() && display.is_flow_inside()) {
-                new_display = Display { DisplayOutside::Inline, DisplayInside::FlowRoot, display.list_item() };
-            }
-
-            new_display = Display { DisplayOutside::Inline, display.inside(), display.list_item() };
-        }
-        break;
-    }
-
-    if (new_display != display)
-        builder.set_property(PropertyID::Display, DisplayStyleValue::create(new_display));
+    if (transformation.changed_display)
+        builder.set_property(PropertyID::Display, DisplayStyleValue::create(from_ffi_display(transformation.display)));
 }
 
 NonnullRefPtr<ComputedValues const> StyleComputer::create_document_style() const
@@ -2928,9 +2856,26 @@ NonnullRefPtr<ComputedValues const> StyleComputer::create_document_style() const
 NonnullRefPtr<ComputedValues const> StyleComputer::compute_style(DOM::AbstractElement abstract_element, Optional<bool&> did_change_custom_properties) const
 {
     auto& style_scope = abstract_element.style_scope();
-    auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::Normal, did_change_custom_properties, style_scope);
+    auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::Normal, did_change_custom_properties, style_scope, IncludeInlineStyle::Yes);
     VERIFY(computed_properties);
     return build_computed_values(*computed_properties, abstract_element, style_scope);
+}
+
+NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties_without_inline_style(DOM::AbstractElement abstract_element) const
+{
+    // Computing custom properties normally caches them on the element. Preserve the real cache while asking the
+    // cascade what this element would look like without its inline declaration.
+    auto custom_property_data = abstract_element.custom_property_data();
+    auto needs_style_update = abstract_element.element().needs_style_update();
+    ScopeGuard restore_custom_property_data = [&] {
+        abstract_element.set_custom_property_data(move(custom_property_data));
+        abstract_element.element().set_needs_style_update(needs_style_update);
+    };
+
+    auto& style_scope = abstract_element.style_scope();
+    auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::Normal, {}, style_scope, IncludeInlineStyle::No);
+    VERIFY(computed_properties);
+    return computed_properties.release_nonnull();
 }
 
 NonnullRefPtr<ComputedValues const> StyleComputer::compute_style_with_seeded_ancestors(DOM::AbstractElement abstract_element)
@@ -2956,7 +2901,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::compute_style_with_seeded_anc
 RefPtr<ComputedValues const> StyleComputer::compute_pseudo_element_style_if_needed(DOM::AbstractElement abstract_element, Optional<bool&> did_change_custom_properties) const
 {
     auto& style_scope = abstract_element.style_scope();
-    auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::CreatePseudoElementStyleIfNeeded, did_change_custom_properties, style_scope);
+    auto computed_properties = compute_style_impl(abstract_element, ComputeStyleMode::CreatePseudoElementStyleIfNeeded, did_change_custom_properties, style_scope, IncludeInlineStyle::Yes);
     if (computed_properties) {
         return build_computed_values(*computed_properties, abstract_element, style_scope);
     }
@@ -2975,16 +2920,31 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_computed_values(Compute
         .current_color_style_value = &computed_properties.property(PropertyID::Color),
         .calculation_resolution_context = { .length_resolution_context = computation_context.length_resolution_context },
     };
+    // NB: Sharing group payloads with the parent costs almost nothing for groups that already
+    //     share the leaked defaults (a pointer compare each) and lets children reference their
+    //     parent's payloads for everything they inherit unchanged, including values that can
+    //     never match the process-wide defaults, like scope-resolved counter styles.
+    auto adopt_group_payloads_from_parent = [&](ComputedValues const& style) {
+        if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value()) {
+            if (auto parent_values = parent->computed_values())
+                style.adopt_identical_group_payloads(*parent_values);
+        }
+    };
+
     auto base_properties = computed_properties.copy_without_animations();
     auto base_values = ComputedValues::create(*base_properties, document(), style_scope, color_resolution_context);
     auto animated_properties = computed_properties.animated_properties_snapshot();
-    if (!animated_properties || animated_properties->is_empty())
+    if (!animated_properties || animated_properties->is_empty()) {
+        adopt_group_payloads_from_parent(*base_values);
         return base_values;
+    }
 
     ComputedValues::Builder builder(*ComputedValues::create(computed_properties, document(), style_scope, move(color_resolution_context)));
     builder->set_base_values(move(base_values));
     builder->set_animated_properties(animated_properties.ptr());
-    return move(builder).build();
+    auto style = move(builder).build();
+    adopt_group_payloads_from_parent(*style);
+    return style;
 }
 
 NonnullRefPtr<ComputedProperties> StyleComputer::reconstruct_computed_properties(ComputedValues const& computed_values) const
@@ -3032,7 +2992,7 @@ NonnullRefPtr<ComputedProperties> StyleComputer::reconstruct_computed_properties
     return style;
 }
 
-RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElement abstract_element, ComputeStyleMode mode, Optional<bool&> did_change_custom_properties, StyleScope const& style_scope) const
+RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElement abstract_element, ComputeStyleMode mode, Optional<bool&> did_change_custom_properties, StyleScope const& style_scope, IncludeInlineStyle include_inline_style) const
 {
     style_scope.build_rule_cache_if_needed();
 
@@ -3051,7 +3011,7 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
             abstract_element_for_pseudo_element.set_inheritance_override(host_element);
 
         auto& inherited_style_scope = abstract_element_for_pseudo_element.style_scope();
-        auto inherited_pseudo_element_style = compute_style_impl(abstract_element_for_pseudo_element, ComputeStyleMode::Normal, {}, inherited_style_scope);
+        auto inherited_pseudo_element_style = compute_style_impl(abstract_element_for_pseudo_element, ComputeStyleMode::Normal, {}, inherited_style_scope, include_inline_style);
         VERIFY(inherited_pseudo_element_style);
         auto builder = ComputedProperties::create_builder_with_base_values_from(*inherited_pseudo_element_style);
 
@@ -3070,11 +3030,7 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
 
         // Some pseudo-elements are generated regardless of CSS rules, so we need to compute their styles even when no
         // rules matched.
-        auto has_implicit_style = first_is_one_of(*abstract_element.pseudo_element(),
-            PseudoElement::DetailsContent,
-            PseudoElement::FileSelectorButton,
-            PseudoElement::Marker,
-            PseudoElement::Placeholder);
+        auto has_implicit_style = ComputedValuesFFI::rust_pseudo_element_has_implicit_style(to_underlying(*abstract_element.pseudo_element()));
 
         // Bail if no pseudo-element rules matched. Clear any stale custom property data so
         // getComputedStyle() doesn't return values from a previous match.
@@ -3092,6 +3048,8 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
 
         auto element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.element().root());
         auto cascade_inline_style = [&](Important important) {
+            if (include_inline_style == IncludeInlineStyle::No)
+                return;
             cascade_custom_properties(abstract_element, {}, cascaded_all, important, true);
         };
 
@@ -3137,29 +3095,15 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
         }
     }
 
-    auto cascaded_properties = compute_cascaded_values(abstract_element, did_match_any_pseudo_element_rules, mode, matching_rule_set);
+    auto cascaded_properties = compute_cascaded_values(abstract_element, did_match_any_pseudo_element_rules, mode, matching_rule_set, include_inline_style);
 
     if (mode == ComputeStyleMode::CreatePseudoElementStyleIfNeeded) {
         // Bail if no pseudo-element would be generated due to...
         // - content: none
         // - content: normal (for ::before and ::after)
-        bool content_is_normal = false;
-        if (auto content_value = cascaded_properties->property(CSS::PropertyID::Content)) {
-            if (content_value->is_keyword()) {
-                auto content = content_value->as_keyword().keyword();
-                if (content == CSS::Keyword::None)
-                    return {};
-                content_is_normal = content == CSS::Keyword::Normal;
-            } else {
-                content_is_normal = false;
-            }
-        } else {
-            // NOTE: `normal` is the initial value, so the absence of a value is treated as `normal`.
-            content_is_normal = true;
-        }
-        if (content_is_normal && first_is_one_of(*abstract_element.pseudo_element(), CSS::PseudoElement::Before, CSS::PseudoElement::After)) {
+        auto content_value = cascaded_properties->property(CSS::PropertyID::Content);
+        if (ComputedValuesFFI::rust_pseudo_element_content_bails(content_value ? content_value->rust_style_value_data() : nullptr, to_underlying(*abstract_element.pseudo_element())))
             return {};
-        }
     }
 
     auto computed_properties = compute_properties(abstract_element, cascaded_properties, matching_rule_set.matching_pseudo_element_styles);
@@ -3180,12 +3124,9 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
 
 static bool is_monospace(StyleValue const& value)
 {
-    if (!value.is_value_list())
-        return false;
-
-    auto const& values = value.as_value_list().values();
-
-    return values.size() == 1 && values[0]->to_keyword() == Keyword::Monospace;
+    return ComputedValuesFFI::rust_font_family_is_monospace(
+        value.rust_style_value_data(),
+        [](void const* shell) -> void const* { return static_cast<StyleValue const*>(shell)->rust_style_value_data(); });
 }
 
 // HACK: This function implements time-travelling inheritance for the font-size property
@@ -3226,73 +3167,122 @@ RefPtr<StyleValue const> StyleComputer::recascade_font_size_if_needed(DOM::Abstr
 
         if (!font_size_value)
             continue;
-        if (font_size_value->is_initial() || font_size_value->is_unset()) {
-            current_size_in_px = default_monospace_font_size_in_px;
-            current_size_depends_on_viewport_metrics = false;
-            continue;
-        }
-        if (font_size_value->is_inherit()) {
-            // Do nothing.
-            continue;
+
+        // The per-value step lives in the Rust style computation core. A length value needs a
+        // resolution context, which is built lazily on request since it involves font work the
+        // other value types never need.
+        auto step = ComputedValuesFFI::rust_recascade_font_size_step(
+            font_size_value->rust_style_value_data(),
+            current_size_in_px.raw_value(),
+            current_size_depends_on_viewport_metrics,
+            default_monospace_font_size_in_px.raw_value(),
+            nullptr);
+
+        if (step.action == ComputedValuesFFI::FontSizeRecascadeAction::NeedsLengthResolution) {
+            bool inherited_font_metrics_depend_on_viewport_metrics = false;
+            auto inherited_line_height = ancestor.element_to_inherit_style_from()
+                                             .map([&](auto&& parent_element) {
+                                                 inherited_font_metrics_depend_on_viewport_metrics = parent_element.computed_values()->font_metrics_depend_on_viewport_metrics();
+                                                 return parent_element.computed_values()->line_height();
+                                             })
+                                             .value_or(InitialValues::line_height());
+
+            bool did_resolve_viewport_relative_length = false;
+            Length::ResolutionContext resolution_context {
+                .viewport_rect = viewport_rect(),
+                .font_metrics = { current_size_in_px, monospace_font.with_size(current_size_in_px * 0.75f)->pixel_metrics(), inherited_line_height },
+                .root_font_metrics = m_root_element_font_metrics,
+                .font_metrics_depend_on_viewport_metrics = current_size_depends_on_viewport_metrics || inherited_font_metrics_depend_on_viewport_metrics,
+                .root_font_metrics_depend_on_viewport_metrics = m_root_element_font_metrics_depend_on_viewport_metrics,
+                .subject_inline_axis_is_horizontal = ancestor.computed_values()->writing_mode() == WritingMode::HorizontalTb,
+                .subject_element = &ancestor.element(),
+            };
+            auto ffi_resolution_context = to_ffi_length_resolution_context(resolution_context);
+            step = ComputedValuesFFI::rust_recascade_font_size_step(
+                font_size_value->rust_style_value_data(),
+                current_size_in_px.raw_value(),
+                current_size_depends_on_viewport_metrics,
+                default_monospace_font_size_in_px.raw_value(),
+                &ffi_resolution_context);
+
+            if (step.action == ComputedValuesFFI::FontSizeRecascadeAction::NeedsLengthResolution) {
+                // A length unit the core cannot resolve; resolve it here instead.
+                VERIFY(font_size_value->is_length());
+                resolution_context.set_did_resolve_viewport_relative_length(did_resolve_viewport_relative_length);
+                current_size_in_px = font_size_value->as_length().length().to_px(resolution_context);
+                current_size_depends_on_viewport_metrics = did_resolve_viewport_relative_length;
+                continue;
+            }
         }
 
-        if (auto absolute_size = keyword_to_absolute_size(font_size_value->to_keyword()); absolute_size.has_value()) {
-            current_size_in_px = absolute_size_mapping(absolute_size.value(), default_monospace_font_size_in_px);
-            current_size_depends_on_viewport_metrics = false;
-            continue;
-        }
-
-        if (auto relative_size = keyword_to_relative_size(font_size_value->to_keyword()); relative_size.has_value()) {
-            current_size_in_px = relative_size_mapping(relative_size.value(), current_size_in_px);
-            continue;
-        }
-
-        // FIXME: Resolve `font-size: math`
-        if (font_size_value->to_keyword() == Keyword::Math) {
-            continue;
-        }
-
-        if (font_size_value->is_percentage()) {
-            current_size_in_px = CSSPixels::nearest_value_for(font_size_value->as_percentage().percentage().as_fraction() * current_size_in_px);
-            continue;
-        }
-
-        if (font_size_value->is_calculated()) {
+        switch (step.action) {
+        case ComputedValuesFFI::FontSizeRecascadeAction::Unchanged:
+            break;
+        case ComputedValuesFFI::FontSizeRecascadeAction::Set:
+            current_size_in_px = CSSPixels::from_raw(step.new_size_raw);
+            current_size_depends_on_viewport_metrics = step.depends_on_viewport_metrics;
+            break;
+        case ComputedValuesFFI::FontSizeRecascadeAction::CalcSkipped:
             dbgln("FIXME: Support calc() when time-traveling for monospace font-size");
-            continue;
+            break;
+        case ComputedValuesFFI::FontSizeRecascadeAction::NeedsLengthResolution:
+            VERIFY_NOT_REACHED();
         }
-
-        VERIFY(font_size_value->is_length());
-
-        bool inherited_font_metrics_depend_on_viewport_metrics = false;
-        auto inherited_line_height = ancestor.element_to_inherit_style_from()
-                                         .map([&](auto&& parent_element) {
-                                             inherited_font_metrics_depend_on_viewport_metrics = parent_element.computed_values()->font_metrics_depend_on_viewport_metrics();
-                                             return parent_element.computed_values()->line_height();
-                                         })
-                                         .value_or(InitialValues::line_height());
-
-        bool did_resolve_viewport_relative_length = false;
-        Length::ResolutionContext resolution_context {
-            .viewport_rect = viewport_rect(),
-            .font_metrics = { current_size_in_px, monospace_font.with_size(current_size_in_px * 0.75f)->pixel_metrics(), inherited_line_height },
-            .root_font_metrics = m_root_element_font_metrics,
-            .font_metrics_depend_on_viewport_metrics = current_size_depends_on_viewport_metrics || inherited_font_metrics_depend_on_viewport_metrics,
-            .root_font_metrics_depend_on_viewport_metrics = m_root_element_font_metrics_depend_on_viewport_metrics,
-            .subject_inline_axis_is_horizontal = ancestor.computed_values()->writing_mode() == WritingMode::HorizontalTb,
-            .subject_element = &ancestor.element(),
-        };
-        resolution_context.set_did_resolve_viewport_relative_length(did_resolve_viewport_relative_length);
-        current_size_in_px = font_size_value->as_length().length().to_px(resolution_context);
-        current_size_depends_on_viewport_metrics = did_resolve_viewport_relative_length;
     };
 
     depends_on_viewport_metrics = current_size_depends_on_viewport_metrics;
     return CSS::LengthStyleValue::create(CSS::Length::make_px(current_size_in_px));
 }
 
+void StyleComputer::ensure_style_metadata_tables_installed()
+{
+    // Marshal the generated logical-alias-to-physical mapping into the Rust style
+    // computation core as a flat table, so the core uses exactly the C++ mapping.
+    static bool const installed = [] {
+        constexpr size_t writing_mode_count = 5;
+        constexpr size_t direction_count = 2;
+        Vector<u16> table;
+        table.resize(number_of_longhand_properties * writing_mode_count * direction_count);
+        size_t index = 0;
+        for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
+            auto property_id = static_cast<PropertyID>(i);
+            for (size_t writing_mode = 0; writing_mode < writing_mode_count; ++writing_mode) {
+                for (size_t direction = 0; direction < direction_count; ++direction) {
+                    u16 physical = 0;
+                    if (property_is_logical_alias(property_id))
+                        physical = to_underlying(map_logical_alias_to_physical_property(property_id, LogicalAliasMappingContext { static_cast<WritingMode>(writing_mode), static_cast<Direction>(direction) }));
+                    table[index++] = physical;
+                }
+            }
+        }
+        ComputedValuesFFI::rust_style_metadata_set_logical_alias_table(table.data(), table.size());
+
+        Vector<u16> reverse_table;
+        reverse_table.resize(number_of_longhand_properties * writing_mode_count * direction_count);
+        index = 0;
+        for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
+            auto property_id = static_cast<PropertyID>(i);
+            for (size_t writing_mode = 0; writing_mode < writing_mode_count; ++writing_mode) {
+                for (size_t direction = 0; direction < direction_count; ++direction) {
+                    u16 logical = 0;
+                    if (!property_is_logical_alias(property_id)) {
+                        auto mapped = map_physical_property_to_logical_alias(property_id, LogicalAliasMappingContext { static_cast<WritingMode>(writing_mode), static_cast<Direction>(direction) });
+                        if (mapped != property_id)
+                            logical = to_underlying(mapped);
+                    }
+                    reverse_table[index++] = logical;
+                }
+            }
+        }
+        ComputedValuesFFI::rust_style_metadata_set_physical_to_logical_table(reverse_table.data(), reverse_table.size());
+        return true;
+    }();
+    (void)installed;
+}
+
 NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::AbstractElement abstract_element, CascadedProperties& cascaded_properties, u64 matching_pseudo_element_styles) const
 {
+    ensure_style_metadata_tables_installed();
     VERIFY(computation_context_cache_is_empty());
 
     auto builder = CSS::ComputedProperties::create_builder();
@@ -3334,124 +3324,140 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
         return *logical_alias_mapping_context;
     };
 
-    for (auto property_id : property_computation_order()) {
+    struct LonghandFlowState {
         RefPtr<StyleValue const> value;
-        bool requires_computation;
+        bool requires_computation { false };
+        // The longhand the other fields were filled for, guarding against a stage being skipped.
+        PropertyID value_for_property { PropertyID::Custom };
+    };
 
-        PropertyID cascaded_property_id = property_id;
-        PropertyID inherited_property_id = property_id;
+    // Pins the winning cascaded value for the (logically paired) property into the flow state.
+    // The driver only calls this when a winning declaration exists.
+    auto on_cascaded_value = [&](PropertyID property_id, StyleValue const& value, bool important, LonghandFlowState& state) {
+        state = {};
+        state.value_for_property = property_id;
+        if (important)
+            builder.set_property_important(property_id, Important::Yes);
+        state.value = value;
+        state.requires_computation = property_requires_computation_with_cascaded_value(property_id);
 
-        if (logical_property_group_for_property(property_id).has_value()) {
-            PropertyID counterpart_property_id;
+        // Store the raw winning cascaded font-size. This is needed to implement the time-traveling inheritance for
+        // font-size when font-family is monospace.
+        // See the recascade_font_size_if_needed() function for further details.
+        if (property_id == PropertyID::FontSize)
+            builder.set_raw_cascaded_font_size(value);
+    };
 
-            if (property_is_logical_alias(property_id)) {
-                counterpart_property_id = map_logical_alias_to_physical_property(property_id, get_logical_alias_mapping_context());
-
-                // AD-HOC: While the spec says that inheritance of logical aliases should be direct, other browsers
-                //         instead inherit from the physical counterpart - the CSSWG has resolved to update the spec to
-                //         reflect this - see https://github.com/w3c/csswg-drafts/issues/3029
-                inherited_property_id = counterpart_property_id;
-            } else {
-                counterpart_property_id = map_physical_property_to_logical_alias(property_id, get_logical_alias_mapping_context());
-            }
-
-            // https://drafts.csswg.org/css-logical/#box
-            // Within each logical property group, corresponding flow-relative and physical properties are paired using
-            // the element’s own computed writing mode. Although the specified value of each property remains distinct,
-            // paired properties share a computed value. This shared value is determined by cascading the declarations
-            // of both properties together as one; in other words, the computed value of both properties in the pair is
-            // derived from the specified value of the property declared with higher priority in the CSS cascade.
-            cascaded_property_id = cascaded_properties.property_with_higher_priority(property_id, counterpart_property_id);
+    auto fetch_inherited_value = [&](PropertyID property_id, PropertyID inherited_property_id, bool explicitly_inherits_non_inherited_property, LonghandFlowState& state) {
+        if (state.value_for_property != property_id) {
+            state = {};
+            state.value_for_property = property_id;
+        }
+        if (explicitly_inherits_non_inherited_property) {
+            if (auto* parent = abstract_element.element().parent(); parent && is<DOM::ShadowRoot>(*parent))
+                parent->set_children_may_depend_on_non_inherited_property_inheritance();
+        }
+        builder.set_property_inherited(property_id, ComputedProperties::Inherited::Yes);
+        state.value = get_non_animated_inherit_value(inherited_property_id, abstract_element);
+        state.requires_computation = property_requires_computation_with_inherited_value(property_id);
+        if (property_affects_font_metrics(inherited_property_id)) {
+            if (computed_values_to_inherit_from->font_metrics_depend_on_viewport_metrics())
+                builder.set_font_metrics_depend_on_viewport_metrics();
         }
 
-        if (auto cascaded_style_property = cascaded_properties.style_property(cascaded_property_id); cascaded_style_property.has_value()) {
-            if (cascaded_style_property->important == Important::Yes)
-                builder.set_property_important(property_id, Important::Yes);
-            value = cascaded_style_property->value;
-            requires_computation = property_requires_computation_with_cascaded_value(property_id);
-
-            // Store the raw winning cascaded font-size. This is needed to implement the time-traveling inheritance for
-            // font-size when font-family is monospace.
-            // See the recascade_font_size_if_needed() function for further details.
-            if (property_id == PropertyID::FontSize)
-                builder.set_raw_cascaded_font_size(*cascaded_style_property->value);
+        // FIXME: Do we need to recompute animated inherited values?
+        if (auto const* animated_properties = computed_values_to_inherit_from->animated_properties(); animated_properties && animated_properties->has_property(inherited_property_id)) {
+            auto animated_value = animated_properties->values().get(inherited_property_id);
+            VERIFY(animated_value.has_value());
+            computed_style.set_animated_property(
+                Badge<StyleComputer> {},
+                property_id,
+                *animated_value.value(),
+                animated_properties->is_property_result_of_transition(inherited_property_id)
+                    ? AnimatedPropertyResultOfTransition::Yes
+                    : AnimatedPropertyResultOfTransition::No,
+                ComputedProperties::Inherited::Yes);
         }
+    };
 
-        // NOTE: We've already handled font-size above.
-        if (property_id == PropertyID::FontSize && !value && new_font_size)
-            continue;
-
-        bool const explicitly_inherits_non_inherited_property = value && value->is_inherit() && !is_inherited_property(property_id);
-        bool should_inherit = (!value && is_inherited_property(property_id));
-
-        // https://www.w3.org/TR/css-cascade-4/#inherit
-        // If the cascaded value of a property is the inherit keyword, the property’s specified and computed values are the inherited value.
-        should_inherit |= value && value->is_inherit();
-
-        // https://www.w3.org/TR/css-cascade-4/#inherit-initial
-        // If the cascaded value of a property is the unset keyword, then if it is an inherited property, this is treated as inherit, and if it is not, this is treated as initial.
-        should_inherit |= value && value->is_unset() && is_inherited_property(property_id);
-
-        // https://www.w3.org/TR/css-color-4/#resolving-other-colors
-        // In the color property, the used value of currentcolor is the resolved inherited value.
-        should_inherit |= property_id == PropertyID::Color && value && value->to_keyword() == Keyword::Currentcolor;
-
-        if (should_inherit && computed_values_to_inherit_from) {
-            if (explicitly_inherits_non_inherited_property) {
-                if (auto* parent = abstract_element.element().parent(); parent && is<DOM::ShadowRoot>(*parent))
-                    parent->set_children_may_depend_on_non_inherited_property_inheritance();
-            }
-            builder.set_property_inherited(property_id, ComputedProperties::Inherited::Yes);
-            value = get_non_animated_inherit_value(inherited_property_id, abstract_element);
-            requires_computation = property_requires_computation_with_inherited_value(property_id);
-            if (property_affects_font_metrics(inherited_property_id)) {
-                if (computed_values_to_inherit_from->font_metrics_depend_on_viewport_metrics())
-                    builder.set_font_metrics_depend_on_viewport_metrics();
-            }
-
-            // FIXME: Do we need to recompute animated inherited values?
-            if (auto const* animated_properties = computed_values_to_inherit_from->animated_properties(); animated_properties && animated_properties->has_property(inherited_property_id)) {
-                auto animated_value = animated_properties->values().get(inherited_property_id);
-                VERIFY(animated_value.has_value());
-                computed_style.set_animated_property(
-                    Badge<StyleComputer> {},
-                    property_id,
-                    *animated_value.value(),
-                    animated_properties->is_property_result_of_transition(inherited_property_id)
-                        ? AnimatedPropertyResultOfTransition::Yes
-                        : AnimatedPropertyResultOfTransition::No,
-                    ComputedProperties::Inherited::Yes);
-            }
+    auto use_initial_value = [&](PropertyID property_id, LonghandFlowState& state) {
+        if (state.value_for_property != property_id) {
+            state = {};
+            state.value_for_property = property_id;
         }
+        state.value = property_initial_value(property_id);
+        state.requires_computation = property_requires_computation_with_initial_value(property_id);
+    };
 
-        if (!value || value->is_initial() || value->is_unset() || (should_inherit && !computed_values_to_inherit_from)) {
-            value = property_initial_value(property_id);
-            requires_computation = property_requires_computation_with_initial_value(property_id);
-        }
+    auto compute_and_store = [&](PropertyID property_id, PropertyID inherited_property_id, LonghandFlowState& state) {
+        VERIFY(state.value_for_property == property_id);
+        auto value = state.value.release_nonnull();
 
         // Store the resolved specified value for properties whose computation depends on inherited info, so they can
         // be re-resolved when an ancestor changes without keeping CascadedProperties alive on the element.
         bool depends_on_inherited_info = value->depends_on_current_color()
             || !value->is_computationally_independent()
-            || (property_id == PropertyID::FontWeight && first_is_one_of(value->to_keyword(), Keyword::Bolder, Keyword::Lighter))
-            || (property_id == PropertyID::FontSize && font_size_value_depends_on_inherited_font_size(*value))
-            || (property_id == PropertyID::LineHeight && line_height_value_depends_on_computed_font_size(*value));
+            || ComputedValuesFFI::rust_value_depends_on_inherited_info_for_property(value->rust_style_value_data(), to_underlying(property_id));
         if (depends_on_inherited_info)
             builder.add_inheritance_dependent_specified_value(property_id, *value);
 
         // NB: We compute using the inherited (physical) property to avoid having to add cases for all the logical
         //     alias properties in `compute_value_of_property`
         bool depends_on_viewport_metrics = false;
-        auto computed_value = requires_computation
-            ? compute_property(inherited_property_id, value.release_nonnull(), depends_on_viewport_metrics)
-            : value.release_nonnull();
+        auto computed_value = state.requires_computation
+            ? compute_property(inherited_property_id, move(value), depends_on_viewport_metrics)
+            : move(value);
         if (depends_on_viewport_metrics) {
             builder.set_depends_on_viewport_metrics();
             if (property_affects_font_metrics(inherited_property_id))
                 builder.set_font_metrics_depend_on_viewport_metrics();
         }
         builder.set_property_without_modifying_flags(property_id, move(computed_value));
-    }
+    };
+
+    // The property computation flow is driven from the Rust style computation core: it
+    // iterates the longhands in computation order, resolves logical pairing through its
+    // mapping tables, and decides between the cascaded, inherited and initial values. The
+    // flow stages above are the leaf callbacks; the flow state pins every value the
+    // callbacks hand out until the next stage runs.
+    struct LonghandLoopContext {
+        decltype(on_cascaded_value)& on_cascaded_value_callback;
+        decltype(fetch_inherited_value)& fetch_inherited_value_callback;
+        decltype(use_initial_value)& use_initial_value_callback;
+        decltype(compute_and_store)& compute_and_store_callback;
+        decltype(get_logical_alias_mapping_context)& get_logical_alias_mapping_context_callback;
+        LonghandFlowState state {};
+    } loop_context {
+        .on_cascaded_value_callback = on_cascaded_value,
+        .fetch_inherited_value_callback = fetch_inherited_value,
+        .use_initial_value_callback = use_initial_value,
+        .compute_and_store_callback = compute_and_store,
+        .get_logical_alias_mapping_context_callback = get_logical_alias_mapping_context,
+    };
+
+    ComputedValuesFFI::FfiLonghandCallbacks const callbacks {
+        .context = &loop_context,
+        .on_cascaded_value = [](void* context, u16 property_id, void const* value_shell, bool important) {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.on_cascaded_value_callback(static_cast<PropertyID>(property_id), *static_cast<StyleValue const*>(value_shell), important, loop_context.state); },
+        .fetch_inherited_value = [](void* context, u16 property_id, u16 inherited_property_id, bool explicitly_inherits_non_inherited_property) -> void const* {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.fetch_inherited_value_callback(static_cast<PropertyID>(property_id), static_cast<PropertyID>(inherited_property_id), explicitly_inherits_non_inherited_property, loop_context.state);
+            return loop_context.state.value ? loop_context.state.value->rust_style_value_data() : nullptr;
+        },
+        .use_initial_value = [](void* context, u16 property_id) {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.use_initial_value_callback(static_cast<PropertyID>(property_id), loop_context.state); },
+        .compute_and_store = [](void* context, u16 property_id, u16 inherited_property_id) {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.compute_and_store_callback(static_cast<PropertyID>(property_id), static_cast<PropertyID>(inherited_property_id), loop_context.state); },
+        .writing_mode_and_direction = [](void* context) -> u16 {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            auto mapping_context = loop_context.get_logical_alias_mapping_context_callback();
+            return static_cast<u16>(to_underlying(mapping_context.writing_mode)) | static_cast<u16>(to_underlying(mapping_context.direction)) << 8;
+        },
+    };
+    ComputedValuesFFI::rust_drive_property_computation(&callbacks, cascaded_properties.rust_store(), computed_values_to_inherit_from != nullptr, new_font_size != nullptr);
 
     if (is<HTML::HTMLHtmlElement>(abstract_element.element())) {
         m_root_element_font_metrics = calculate_root_element_font_metrics(computed_style);
@@ -3812,66 +3818,69 @@ static bool matches_subject_pseudo_class_bucket(PseudoClass pseudo_class, DOM::E
     }
 }
 
-static NonnullRefPtr<StyleValue const> compute_inherited_custom_property_value(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+static NonnullRefPtr<StyleValue const> resolve_css_wide_keyword_for_custom_property(Optional<CustomPropertyRegistration const&> registration, AbstractOrHypotheticalElement const& element, Utf16FlyString const& name, NonnullRefPtr<StyleValue const> keyword_value, ComputedProperties const* computed_style_for_custom_property_resolution, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
 {
-    auto element_to_inherit_style_from = abstract_element.element_to_inherit_style_from();
-    if (!element_to_inherit_style_from.has_value())
-        return abstract_element.document().custom_property_initial_value(name);
-    auto parent_data = inheritable_custom_property_data(element_to_inherit_style_from.value());
-    if (parent_data) {
-        auto const* parent_property = parent_data->get(name);
-        if (parent_property)
-            return parent_property->value;
+    VERIFY(keyword_value->is_css_wide_keyword());
+
+    // https://drafts.csswg.org/css-mixins/#resolve-function-styles
+    // On result, all CSS-wide keywords are left unresolved.
+    if (name == "result"_utf16_fly_string)
+        return keyword_value;
+
+    if (keyword_value->is_initial())
+        return initial_custom_property_value(registration, element.document());
+
+    if (keyword_value->is_inherit())
+        return inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution, guarded_contexts);
+
+    // NB: When resolving function styles (i.e. when we have a hypothetical element), all CSS-wide keywords other than
+    //     inherit and initial resolve to the guaranteed-invalidate value.
+    if (element.has<HypotheticalElement*>())
+        return GuaranteedInvalidStyleValue::create();
+
+    // Unset is the same as inherit for inherited properties, and by default all unregistered custom properties inherit.
+    if (keyword_value->is_unset())
+        return registration.has_value() && !registration->inherit
+            ? initial_custom_property_value(registration, element.document())
+            : inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution, guarded_contexts);
+
+    if (keyword_value->is_revert()) {
+        // FIXME: Implement reverting custom properties.
+        return keyword_value;
     }
-    return StyleComputer::compute_value_of_custom_property(element_to_inherit_style_from.value(), name, guarded_contexts);
+    if (keyword_value->is_revert_layer()) {
+        // FIXME: Implement reverting custom properties.
+        return keyword_value;
+    }
+
+    VERIFY_NOT_REACHED();
 }
 
-template<typename ComputeRegisteredValue>
-static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts, ComputedProperties const* computed_style_for_custom_property_resolution, ComputeRegisteredValue compute_registered_value)
+NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(ComputedProperties const* computed_style_for_custom_property_resolution, AbstractOrHypotheticalElement const& element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts) const
 {
     // https://drafts.csswg.org/css-variables/#propdef-
     // The computed value of a custom property is its specified value with any arbitrary-substitution functions replaced.
     // FIXME: These should probably be part of ComputedProperties.
-    auto& document = abstract_element.document();
-    auto registration = document.get_registered_custom_property(name);
+    auto& document = element.document();
+    auto registration = element.get_registered_custom_property(name);
 
-    auto value = abstract_element.get_custom_property(name);
-    if (!value || value->is_initial())
-        return document.custom_property_initial_value(name);
+    auto value = element.get_custom_property(name);
+    auto resolved_value = value ? value.release_nonnull() : initial_custom_property_value(registration, document);
 
-    if (value->is_inherit())
-        return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
-
-    // Unset is the same as inherit for inherited properties, and by default all unregistered custom properties inherit.
-    if (value->is_unset())
-        return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
-
-    if (value->is_revert()) {
-        // FIXME: Implement reverting custom properties.
-        return value.release_nonnull();
-    }
-    if (value->is_revert_layer()) {
-        // FIXME: Implement reverting custom properties.
-        return value.release_nonnull();
-    }
-
-    NonnullRefPtr<StyleValue const> resolved_value = value.release_nonnull();
+    if (resolved_value->is_css_wide_keyword())
+        resolved_value = resolve_css_wide_keyword_for_custom_property(registration, element, name, move(resolved_value), computed_style_for_custom_property_resolution, guarded_contexts);
 
     if (resolved_value->is_unresolved() && resolved_value->as_unresolved().contains_arbitrary_substitution_function()) {
         auto& unresolved = resolved_value->as_unresolved();
-        auto parsing_params = Parser::ParsingParams { document };
-        parsing_params.computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution;
-        resolved_value = Parser::Parser::resolve_unresolved_style_value(parsing_params, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+        Parser::ArbitrarySubstitutionReplacementContext arbitrary_substitution_context {
+            .computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution,
+        };
+        resolved_value = Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams { document }, element, arbitrary_substitution_context, PropertyNameAndID { {}, PropertyID::Custom, name }, unresolved, guarded_contexts);
 
         // A CSS-wide keyword produced by substitution takes on that keyword's meaning for the custom property,
         // exactly as a literally-specified one would (handled above before substitution).
-        if (resolved_value->is_initial())
-            return document.custom_property_initial_value(name);
-        if (resolved_value->is_inherit())
-            return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
-        if (resolved_value->is_unset())
-            return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
-        // FIXME: Implement reverting custom properties for is_revert() / is_revert_layer().
+        if (resolved_value->is_css_wide_keyword())
+            resolved_value = resolve_css_wide_keyword_for_custom_property(registration, element, name, move(resolved_value), computed_style_for_custom_property_resolution, guarded_contexts);
     }
 
     auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
@@ -3892,8 +3901,8 @@ static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM
             // Either the property’s inherited value or its initial value depending on whether the property is
             // inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
             if (registration->inherit)
-                return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
-            return abstract_element.document().custom_property_initial_value(name);
+                return inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution, guarded_contexts);
+            return initial_custom_property_value(registration, element.document());
         }
     };
 
@@ -3910,14 +3919,27 @@ static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM
     if (parsed_value->is_guaranteed_invalid())
         return invalid_custom_property_fallback_value(move(parsed_value));
 
-    auto computed_value = compute_registered_value(*registration, move(parsed_value));
+    auto computed_value = [&] {
+        // FIXME: At the moment we incorrectly apply ASF replacement at cascade time when we should instead be applying
+        //        it at computed-value time. This means we may not yet have a ComputedProperties for us to absolutize
+        //        against. For now we just return the parsed value as-is and rely on the consuming property to
+        //        absolutize it later.
+        if (!computed_style_for_custom_property_resolution)
+            return parsed_value;
+
+        return compute_registered_custom_property_value(registration.value(), move(parsed_value), get_computation_context_for_property(PropertyID::Custom, *computed_style_for_custom_property_resolution, element.abstract_element()));
+    }();
+
     if (resolved_value_contains_attr_tainted_values)
         return UnresolvedStyleValue::create(computed_value->tokenize(), {}, {}, UnresolvedStyleValue::SourceTextMode::Trim, true);
+
     return computed_value;
 }
 
-ComputationContext StyleComputer::fallback_computation_context_for_custom_property(DOM::AbstractElement const& abstract_element) const
+ComputationContext StyleComputer::fallback_computation_context_for_custom_property(AbstractOrHypotheticalElement const& element) const
 {
+    auto abstract_element = element.abstract_element();
+
     auto context_from_computed_values = [&](DOM::AbstractElement const& styled_element) -> ComputationContext {
         auto length_resolution_context = Length::ResolutionContext::for_element(styled_element);
         length_resolution_context.subject_element = &abstract_element.element();
@@ -3940,29 +3962,6 @@ ComputationContext StyleComputer::fallback_computation_context_for_custom_proper
         .length_resolution_context = length_resolution_context,
         .abstract_element = abstract_element,
     };
-}
-
-NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
-{
-    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, nullptr, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
-        // In the fallback path we may be resolving var() before this element's new ComputedProperties have been
-        // installed. Avoid freezing relative values against stale metrics; the consuming property can still compute
-        // them with its own context.
-        if (!parsed_value->is_computationally_independent())
-            return parsed_value;
-
-        auto const& style_computer = abstract_element.document().style_computer();
-        auto computation_context = style_computer.fallback_computation_context_for_custom_property(abstract_element);
-        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
-    });
-}
-
-NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(ComputedProperties const& computed_style, DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts) const
-{
-    auto const& computation_context = get_computation_context_for_property(PropertyID::Color, computed_style, abstract_element);
-    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, &computed_style, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
-        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
-    });
 }
 
 void StyleComputer::compute_custom_properties(ComputedProperties& computed_style, DOM::AbstractElement abstract_element) const
@@ -3992,7 +3991,9 @@ void StyleComputer::compute_custom_properties(ComputedProperties& computed_style
 
     OrderedHashMap<Utf16FlyString, StyleProperty> resolved_own;
     for (auto const& [name, style_property] : data->own_values()) {
-        auto resolved_value = compute_value_of_custom_property(computed_style, abstract_element, name);
+        // FIXME: Can we store the resolved value in `data` immediately to avoid recomputing it for any subsequent
+        //        properties that depend on it?
+        auto resolved_value = compute_value_of_custom_property(&computed_style, abstract_element, name);
         if (parent_data) {
             auto const* parent_property = parent_data->get(name);
             if (parent_property && resolved_value->equals(*parent_property->value))
@@ -4014,22 +4015,6 @@ void StyleComputer::compute_custom_properties(ComputedProperties& computed_style
     // FIXME: We should update in place so that non-recomputed children aren't left pointing at stale data
     abstract_element.set_custom_property_data(
         CustomPropertyData::create(move(resolved_own), parent_data ? move(parent_data) : data->parent()));
-}
-
-static CSSPixels line_width_keyword_to_css_pixels(Keyword keyword)
-{
-    // https://drafts.csswg.org/css-backgrounds/#typedef-line-width
-    // The thin, medium, and thick keywords are equivalent to 1px, 3px, and 5px, respectively.
-    switch (keyword) {
-    case Keyword::Thin:
-        return CSSPixels { 1 };
-    case Keyword::Medium:
-        return CSSPixels { 3 };
-    case Keyword::Thick:
-        return CSSPixels { 5 };
-    default:
-        VERIFY_NOT_REACHED();
-    }
 }
 
 // https://www.w3.org/TR/css-values-4/#snap-a-length-as-a-border-width
@@ -4120,7 +4105,7 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
         return compute_corner_shape(absolutized_value);
     case PropertyID::FontSize: {
         auto parent = inheritance_parent();
-        if (font_size_value_depends_on_inherited_font_size(*absolutized_value) && parent.has_value()) {
+        if (ComputedValuesFFI::rust_value_depends_on_inherited_info_for_property(absolutized_value->rust_style_value_data(), to_underlying(PropertyID::FontSize)) && parent.has_value()) {
             auto parent_values = parent->computed_values();
             if (parent_values && parent_values->font_metrics_depend_on_viewport_metrics())
                 computation_context.length_resolution_context.record_viewport_relative_length_resolution();
@@ -4137,10 +4122,13 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
     case PropertyID::FontVariationSettings:
         return compute_font_feature_tag_value_list(absolutized_value);
     case PropertyID::LetterSpacing:
-    case PropertyID::WordSpacing:
-        if (absolutized_value->to_keyword() == Keyword::Normal)
-            return LengthStyleValue::create(Length::make_px(0));
-        return absolutized_value;
+    case PropertyID::WordSpacing: {
+        // The normal-keyword-to-zero-length rule lives in the Rust style computation core.
+        auto result = ComputedValuesFFI::rust_compute_letter_or_word_spacing(absolutized_value->rust_style_value_data());
+        if (result.unchanged)
+            return absolutized_value;
+        return LengthStyleValue::create(Length::make_px(result.value));
+    }
     case PropertyID::LineHeight:
         return compute_line_height(absolutized_value, computation_context.length_resolution_context.font_metrics.font_size);
     case PropertyID::MathDepth:
@@ -4188,81 +4176,65 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_font_feature_tag_value_li
     if (absolutized_value->is_keyword())
         return absolutized_value;
 
-    auto const& value_list = absolutized_value->as_value_list();
-    auto values = value_list.values();
-    OrderedHashMap<Utf16FlyString, NonnullRefPtr<OpenTypeTaggedStyleValue const>> axis_tags_map;
-    for (size_t i = 0; i < values.size(); i++) {
-        auto const& axis_tag = values.at(i)->as_open_type_tagged();
-        axis_tags_map.set(axis_tag.tag(), axis_tag);
-    }
+    // The deduplication and sorting live in the Rust style computation core; it works over the
+    // entry indices and calls back for the interned-fly-string tag comparisons.
+    auto values = absolutized_value->as_value_list().values();
+    struct TagContext {
+        StyleValueVector const& values;
+    } context { values };
+
+    Vector<u32> order;
+    order.resize(values.size());
+    auto count = ComputedValuesFFI::rust_font_feature_settings_computed_order(
+        values.size(),
+        &context,
+        [](void* context, size_t i, size_t j) -> bool {
+            auto const& values = static_cast<TagContext*>(context)->values;
+            return values[i]->as_open_type_tagged().tag() == values[j]->as_open_type_tagged().tag();
+        },
+        [](void* context, size_t i, size_t j) -> bool {
+            auto const& values = static_cast<TagContext*>(context)->values;
+            return values[i]->as_open_type_tagged().tag().operator<=>(values[j]->as_open_type_tagged().tag()) < 0;
+        },
+        order.data());
 
     StyleValueVector axis_tags;
-
-    for (auto const& [key, axis_tag] : axis_tags_map)
-        axis_tags.append(axis_tag);
-
-    quick_sort(axis_tags, [](auto& a, auto& b) {
-        return a->as_open_type_tagged().tag() < b->as_open_type_tagged().tag();
-    });
+    axis_tags.ensure_capacity(count);
+    for (size_t i = 0; i < count; ++i)
+        axis_tags.unchecked_append(values[order[i]]);
 
     return StyleValueList::create(move(axis_tags), StyleValueList::Separator::Comma);
 }
 
 NonnullRefPtr<StyleValue const> StyleComputer::compute_border_or_outline_width(NonnullRefPtr<StyleValue const> const& absolutized_value, double device_pixels_per_css_pixel)
 {
-    // https://drafts.csswg.org/css-backgrounds/#border-width
-    // absolute length, snapped as a border width
-    auto const absolute_length = [&]() -> CSSPixels {
-        if (absolutized_value->is_keyword())
-            return line_width_keyword_to_css_pixels(absolutized_value->to_keyword());
+    // The line-width keywords and the border-width snapping live in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_border_or_outline_width(absolutized_value->rust_style_value_data(), device_pixels_per_css_pixel);
+    if (result.handled)
+        return LengthStyleValue::create(Length::make_px(result.value));
 
-        return Length::from_style_value(absolutized_value, {}).absolute_length_to_px();
-    }();
-
+    auto const absolute_length = Length::from_style_value(absolutized_value, {}).absolute_length_to_px();
     return LengthStyleValue::create(Length::make_px(snap_a_length_as_a_border_width(device_pixels_per_css_pixel, absolute_length)));
 }
 
 // https://drafts.csswg.org/css-borders-4/#propdef-corner-top-left-shape
 NonnullRefPtr<StyleValue const> StyleComputer::compute_corner_shape(NonnullRefPtr<StyleValue const> const& absolutized_value)
 {
-    // the corresponding superellipse() value
-
-    if (absolutized_value->is_superellipse())
+    // The keyword-to-superellipse mapping lives in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_corner_shape_parameter(absolutized_value->rust_style_value_data());
+    VERIFY(result.handled);
+    if (result.unchanged)
         return absolutized_value;
 
-    switch (absolutized_value->to_keyword()) {
-    case Keyword::Round:
-        // The corner shape is a quarter of a convex ellipse. Equivalent to superellipse(1).
-        // NB: We cache this value since 'round' is the initial value of the `corner-*-*-shape` properties
+    // NB: The round value is cached since it is the initial value of the corner-*-shape properties.
+    if (result.value == 1) {
         static auto const& cached_round_value = SuperellipseStyleValue::create(NumberStyleValue::create(1)).leak_ref();
         return cached_round_value;
-    case Keyword::Squircle:
-        // The corner shape is a quarter of a "squircle", a convex curve between round and square. Equivalent to superellipse(2).
-        return SuperellipseStyleValue::create(NumberStyleValue::create(2));
-    case Keyword::Square:
-        // The corner shape is a convex 90deg angle. Equivalent to superellipse(infinity).
-        return SuperellipseStyleValue::create(NumberStyleValue::create(AK::Infinity<double>));
-    case Keyword::Bevel:
-        // The corner shape is a straight diagonal line, neither convex nor concave. Equivalent to superellipse(0).
-        return SuperellipseStyleValue::create(NumberStyleValue::create(0));
-    case Keyword::Scoop:
-        // The corner shape is a concave quarter-ellipse. Equivalent to superellipse(-1).
-        return SuperellipseStyleValue::create(NumberStyleValue::create(-1));
-    case Keyword::Notch:
-        // The corner shape is a concave 90deg angle. Equivalent to superellipse(-infinity).
-        return SuperellipseStyleValue::create(NumberStyleValue::create(-AK::Infinity<double>));
-    default:
-        VERIFY_NOT_REACHED();
     }
-
-    VERIFY_NOT_REACHED();
+    return SuperellipseStyleValue::create(NumberStyleValue::create(result.value));
 }
-
 NonnullRefPtr<StyleValue const> StyleComputer::compute_font_size(NonnullRefPtr<StyleValue const> const& absolutized_value, int computed_math_depth, Optional<DOM::AbstractElement> const& inheritance_parent, CSSPixels initial_font_size)
 {
-    // https://drafts.csswg.org/css-fonts/#font-size-prop
-    // an absolute length
-
     auto inherited_font_size = inheritance_parent.has_value()
         ? inheritance_parent->computed_values()->font_size()
         : initial_font_size;
@@ -4271,222 +4243,92 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_font_size(NonnullRefPtr<S
         ? inheritance_parent->computed_values()->math_depth()
         : InitialValues::math_depth();
 
-    // <absolute-size>
-    if (auto absolute_size = keyword_to_absolute_size(absolutized_value->to_keyword()); absolute_size.has_value())
-        return LengthStyleValue::create(Length::make_px(absolute_size_mapping(absolute_size.value(), default_user_font_size())));
-
-    // <relative-size>
-    if (auto relative_size = keyword_to_relative_size(absolutized_value->to_keyword()); relative_size.has_value())
-        return LengthStyleValue::create(Length::make_px(relative_size_mapping(relative_size.value(), inherited_font_size)));
-
-    // <length-percentage [0,∞]>
-    // A length value specifies an absolute font size (independent of the user agent’s font table). Negative lengths are invalid.
-    if (absolutized_value->is_length())
-        return absolutized_value;
-
-    // A percentage value specifies an absolute font size relative to the parent element’s computed font-size. Negative percentages are invalid.
-    if (absolutized_value->is_percentage())
-        return LengthStyleValue::create(Length::make_px(inherited_font_size * absolutized_value->as_percentage().percentage().as_fraction()));
-
-    if (absolutized_value->is_calculated())
-        return LengthStyleValue::create(absolutized_value->as_calculated().resolve_length({ .percentage_basis = Length::make_px(inherited_font_size) }).value());
-
-    // math
-    // Special mathematical scaling rules must be applied when determining the computed value of the font-size property.
-    if (absolutized_value->to_keyword() == Keyword::Math) {
-        auto math_scaling_factor = [&]() {
-            // https://w3c.github.io/mathml-core/#the-math-script-level-property
-            // If the specified value font-size is math then the computed value of font-size is obtained by multiplying
-            // the inherited value of font-size by a nonzero scale factor calculated by the following procedure:
-            // 1. Let A be the inherited math-depth value, B the computed math-depth value, C be 0.71 and S be 1.0
-            auto size_ratio = 0.71;
-            auto scale = 1.0;
-            // 2. If A = B then return S.
-            bool invert_scale_factor = false;
-            if (inherited_math_depth == computed_math_depth) {
-                return scale;
-            }
-            //    If B < A, swap A and B and set InvertScaleFactor to true.
-            if (computed_math_depth < inherited_math_depth) {
-                AK::swap(inherited_math_depth, computed_math_depth);
-                invert_scale_factor = true;
-            }
-            //    Otherwise B > A and set InvertScaleFactor to false.
-            else {
-                invert_scale_factor = false;
-            }
-            // 3. Let E be B - A > 0.
-            double e = (computed_math_depth - inherited_math_depth) > 0;
-            // FIXME: 4. If the inherited first available font has an OpenType MATH table:
-            //    - If A ≤ 0 and B ≥ 2 then multiply S by scriptScriptPercentScaleDown and decrement E by 2.
-            //    - Otherwise if A = 1 then multiply S by scriptScriptPercentScaleDown / scriptPercentScaleDown and decrement E by 1.
-            //    - Otherwise if B = 1 then multiply S by scriptPercentScaleDown and decrement E by 1.
-            // 5. Multiply S by C^E.
-            scale *= AK::pow(size_ratio, e);
-            // 6. Return S if InvertScaleFactor is false and 1/S otherwise.
-            if (!invert_scale_factor)
-                return scale;
-            return 1.0 / scale;
-        }();
-
-        return LengthStyleValue::create(Length::make_px(inherited_font_size.scaled(math_scaling_factor)));
+    // The size keyword tables and the math scaling rules live in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_font_size(absolutized_value->rust_style_value_data(), computed_math_depth, inherited_font_size.raw_value(), inherited_math_depth, default_user_font_size().raw_value());
+    if (result.handled) {
+        if (result.unchanged)
+            return absolutized_value;
+        return LengthStyleValue::create(Length::make_px(result.value));
     }
 
-    VERIFY_NOT_REACHED();
+    VERIFY(absolutized_value->is_calculated());
+    return LengthStyleValue::create(absolutized_value->as_calculated().resolve_length({ .percentage_basis = Length::make_px(inherited_font_size) }).value());
 }
+
+// The FontStyleKeyword discriminants cross the boundary as the mapped keyword code; pin them.
+static_assert(to_underlying(FontStyleKeyword::Normal) == 0);
+static_assert(to_underlying(FontStyleKeyword::Italic) == 1);
+static_assert(to_underlying(FontStyleKeyword::Left) == 2);
+static_assert(to_underlying(FontStyleKeyword::Right) == 3);
+static_assert(to_underlying(FontStyleKeyword::Oblique) == 4);
 
 NonnullRefPtr<StyleValue const> StyleComputer::compute_font_style(NonnullRefPtr<StyleValue const> const& absolutized_value)
 {
     // https://drafts.csswg.org/css-fonts-4/#font-style-prop
     // the keyword specified, plus angle in degrees if specified
 
+    // The keyword-to-font-style-keyword mapping lives in the Rust style computation core.
     // NB: We always parse as a FontStyleStyleValue, but StylePropertyMap is able to set a KeywordStyleValue directly.
-    if (absolutized_value->is_keyword())
-        return FontStyleStyleValue::create(keyword_to_font_style_keyword(absolutized_value->to_keyword()).release_value());
+    auto computation = ComputedValuesFFI::rust_compute_font_style(absolutized_value->rust_style_value_data());
+    if (computation.is_keyword)
+        return FontStyleStyleValue::create(static_cast<FontStyleKeyword>(computation.font_style_keyword));
 
     return absolutized_value;
 }
 
 NonnullRefPtr<StyleValue const> StyleComputer::compute_font_weight(NonnullRefPtr<StyleValue const> const& absolutized_value, Optional<DOM::AbstractElement> const& inheritance_parent)
 {
-    // https://drafts.csswg.org/css-fonts-4/#font-weight-prop
-    // a number, see below
-
     auto inherited_font_weight = inheritance_parent.has_value()
         ? inheritance_parent->computed_values()->font_weight()
         : InitialValues::font_weight();
 
-    // <number [1,1000]>
-    if (absolutized_value->is_number())
-        return absolutized_value;
+    // The weight chart lives in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_font_weight(absolutized_value->rust_style_value_data(), inherited_font_weight);
+    if (result.handled) {
+        if (result.unchanged)
+            return absolutized_value;
+        return NumberStyleValue::create(result.value);
+    }
 
     // AD-HOC: Anywhere we support a numbers we should also support calcs
-    if (absolutized_value->is_calculated())
-        return NumberStyleValue::create(absolutized_value->as_calculated().resolve_number({}).value());
-
-    // normal
-    // Same as 400.
-    if (absolutized_value->to_keyword() == Keyword::Normal)
-        return NumberStyleValue::create(400);
-
-    // bold
-    // Same as 700.
-    if (absolutized_value->to_keyword() == Keyword::Bold)
-        return NumberStyleValue::create(700);
-
-    // Specified values of bolder and lighter indicate weights relative to the weight of the parent element. The
-    // computed weight is calculated based on the inherited font-weight value using the chart below.
-    //
-    // Inherited value (w)  bolder     lighter
-    // w < 100              400        No change
-    // 100 ≤ w < 350        400        100
-    // 350 ≤ w < 550        700        100
-    // 550 ≤ w < 750        900        400
-    // 750 ≤ w < 900        900        700
-    // 900 ≤ w              No change  700
-
-    // bolder
-    // Specifies a bolder weight than the inherited value. See § 2.2.1 Relative Weights.
-    if (absolutized_value->to_keyword() == Keyword::Bolder) {
-        if (inherited_font_weight < 350)
-            return NumberStyleValue::create(400);
-
-        if (inherited_font_weight < 550)
-            return NumberStyleValue::create(700);
-
-        if (inherited_font_weight < 900)
-            return NumberStyleValue::create(900);
-
-        return NumberStyleValue::create(inherited_font_weight);
-    }
-
-    // lighter
-    // Specifies a lighter weight than the inherited value. See § 2.2.1 Relative Weights.
-    if (absolutized_value->to_keyword() == Keyword::Lighter) {
-        if (inherited_font_weight < 100)
-            return NumberStyleValue::create(inherited_font_weight);
-
-        if (inherited_font_weight < 550)
-            return NumberStyleValue::create(100);
-
-        if (inherited_font_weight < 750)
-            return NumberStyleValue::create(400);
-
-        return NumberStyleValue::create(700);
-    }
-
-    VERIFY_NOT_REACHED();
+    VERIFY(absolutized_value->is_calculated());
+    return NumberStyleValue::create(absolutized_value->as_calculated().resolve_number({}).value());
 }
 
 NonnullRefPtr<StyleValue const> StyleComputer::compute_font_width(NonnullRefPtr<StyleValue const> const& absolutized_value)
 {
-    // https://drafts.csswg.org/css-fonts-4/#font-width-prop
-    // a percentage, see below
-
-    // <percentage [0,∞]>
-    if (absolutized_value->is_percentage())
-        return absolutized_value;
+    // The width keyword percentage table lives in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_font_width(absolutized_value->rust_style_value_data());
+    if (result.handled) {
+        if (result.unchanged)
+            return absolutized_value;
+        return PercentageStyleValue::create(Percentage(result.value));
+    }
 
     // AD-HOC: We support calculated percentages as well
-    if (absolutized_value->is_calculated())
-        return PercentageStyleValue::create(absolutized_value->as_calculated().resolve_percentage({}).value());
-
-    switch (absolutized_value->to_keyword()) {
-    // ultra-condensed 50%
-    case Keyword::UltraCondensed:
-        return PercentageStyleValue::create(Percentage(50));
-    // extra-condensed 62.5%
-    case Keyword::ExtraCondensed:
-        return PercentageStyleValue::create(Percentage(62.5));
-    // condensed 75%
-    case Keyword::Condensed:
-        return PercentageStyleValue::create(Percentage(75));
-    // semi-condensed 87.5%
-    case Keyword::SemiCondensed:
-        return PercentageStyleValue::create(Percentage(87.5));
-    // normal 100%
-    case Keyword::Normal:
-        return PercentageStyleValue::create(Percentage(100));
-    // semi-expanded 112.5%
-    case Keyword::SemiExpanded:
-        return PercentageStyleValue::create(Percentage(112.5));
-    // expanded 125%
-    case Keyword::Expanded:
-        return PercentageStyleValue::create(Percentage(125));
-    // extra-expanded 150%
-    case Keyword::ExtraExpanded:
-        return PercentageStyleValue::create(Percentage(150));
-    // ultra-expanded 200%
-    case Keyword::UltraExpanded:
-        return PercentageStyleValue::create(Percentage(200));
-    default:
-        VERIFY_NOT_REACHED();
-    }
+    VERIFY(absolutized_value->is_calculated());
+    return PercentageStyleValue::create(absolutized_value->as_calculated().resolve_percentage({}).value());
 }
-
 NonnullRefPtr<StyleValue const> StyleComputer::compute_line_height(NonnullRefPtr<StyleValue const> const& absolutized_value, CSSPixels computed_font_size)
 {
-    // https://drafts.csswg.org/css-inline-3/#line-height-property
-
-    // normal
-    // <length [0,∞]>
-    // <number [0,∞]>
-    if (absolutized_value->to_keyword() == Keyword::Normal || absolutized_value->is_length() || absolutized_value->is_number())
-        return absolutized_value;
+    // The line-height rules live in the Rust style computation core, including calc
+    // resolution against the computed font size.
+    auto result = ComputedValuesFFI::rust_compute_line_height(absolutized_value->rust_style_value_data(), computed_font_size.raw_value());
+    if (result.handled) {
+        if (result.unchanged)
+            return absolutized_value;
+        if (result.is_number)
+            return NumberStyleValue::create(result.value);
+        return LengthStyleValue::create(Length::make_px(result.value));
+    }
 
     // NOTE: We also support calc()'d lengths (percentages resolve to lengths so we don't have to handle them separately)
     if (absolutized_value->is_calculated() && absolutized_value->as_calculated().resolves_to_length_percentage())
         return LengthStyleValue::create(absolutized_value->as_calculated().resolve_length({ .percentage_basis = Length::make_px(computed_font_size) }).value());
 
     // NOTE: We also support calc()'d numbers
-    if (absolutized_value->is_calculated() && absolutized_value->as_calculated().resolves_to_number())
-        return NumberStyleValue::create(absolutized_value->as_calculated().resolve_number({ .percentage_basis = Length::make_px(computed_font_size) }).value());
-
-    // <percentage [0,∞]>
-    if (absolutized_value->is_percentage())
-        return LengthStyleValue::create(Length::make_px(computed_font_size * absolutized_value->as_percentage().percentage().as_fraction()));
-
-    VERIFY_NOT_REACHED();
+    VERIFY(absolutized_value->is_calculated() && absolutized_value->as_calculated().resolves_to_number());
+    return NumberStyleValue::create(absolutized_value->as_calculated().resolve_number({ .percentage_basis = Length::make_px(computed_font_size) }).value());
 }
 
 // https://drafts.csswg.org/css-anchor-position/#position-area-computed
@@ -4500,35 +4342,11 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_position_area(NonnullRefP
         return absolutized_value;
 
     auto to_short_keyword = [](NonnullRefPtr<KeywordStyleValue const> const& keyword_value) -> NonnullRefPtr<KeywordStyleValue const> {
-        switch (keyword_value->keyword()) {
-        case Keyword::BlockStart:
-        case Keyword::InlineStart:
-            return KeywordStyleValue::create(Keyword::Start);
-        case Keyword::BlockEnd:
-        case Keyword::InlineEnd:
-            return KeywordStyleValue::create(Keyword::End);
-        case Keyword::SelfBlockStart:
-        case Keyword::SelfInlineStart:
-            return KeywordStyleValue::create(Keyword::SelfStart);
-        case Keyword::SelfBlockEnd:
-        case Keyword::SelfInlineEnd:
-            return KeywordStyleValue::create(Keyword::SelfEnd);
-        case Keyword::SpanBlockStart:
-        case Keyword::SpanInlineStart:
-            return KeywordStyleValue::create(Keyword::SpanStart);
-        case Keyword::SpanBlockEnd:
-        case Keyword::SpanInlineEnd:
-            return KeywordStyleValue::create(Keyword::SpanEnd);
-        case Keyword::SpanSelfBlockStart:
-        case Keyword::SpanSelfInlineStart:
-            return KeywordStyleValue::create(Keyword::SpanSelfStart);
-        case Keyword::SpanSelfBlockEnd:
-        case Keyword::SpanSelfInlineEnd:
-            return KeywordStyleValue::create(Keyword::SpanSelfEnd);
-        default:
-            break;
-        }
-        return keyword_value;
+        // The short-form mapping lives in the Rust style computation core.
+        auto short_keyword = static_cast<Keyword>(ComputedValuesFFI::rust_position_area_short_keyword(to_underlying(keyword_value->keyword())));
+        if (short_keyword == keyword_value->keyword())
+            return keyword_value;
+        return KeywordStyleValue::create(short_keyword);
     };
 
     auto const& value_list = absolutized_value->as_value_list();
@@ -4537,50 +4355,17 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_position_area(NonnullRefP
     auto values = value_list.values();
     auto const& block_value = values.at(0);
     auto const& inline_value = values.at(1);
-    if (block_value->as_keyword().keyword() == Keyword::SpanAll) {
-        switch (inline_value->as_keyword().keyword()) {
-        case Keyword::Start:
-            return KeywordStyleValue::create(Keyword::InlineStart);
-        case Keyword::End:
-            return KeywordStyleValue::create(Keyword::InlineEnd);
-        case Keyword::SelfStart:
-            return KeywordStyleValue::create(Keyword::SelfInlineStart);
-        case Keyword::SelfEnd:
-            return KeywordStyleValue::create(Keyword::SelfInlineEnd);
-        case Keyword::SpanStart:
-            return KeywordStyleValue::create(Keyword::SpanInlineStart);
-        case Keyword::SpanEnd:
-            return KeywordStyleValue::create(Keyword::SpanInlineEnd);
-        case Keyword::SpanSelfStart:
-            return KeywordStyleValue::create(Keyword::SpanSelfInlineStart);
-        case Keyword::SpanSelfEnd:
-            return KeywordStyleValue::create(Keyword::SpanSelfInlineEnd);
-        default:
-            return absolutized_value;
-        }
+
+    // When one axis is span-all, the value computes to a single logical keyword from the
+    // other axis. The remapping decision lives in the Rust style computation core.
+    auto span_all_remap = ComputedValuesFFI::rust_position_area_span_all_remap(
+        to_underlying(block_value->as_keyword().keyword()), to_underlying(inline_value->as_keyword().keyword()));
+    if (block_value->as_keyword().keyword() == Keyword::SpanAll || inline_value->as_keyword().keyword() == Keyword::SpanAll) {
+        if (span_all_remap.remapped)
+            return KeywordStyleValue::create(static_cast<Keyword>(span_all_remap.keyword));
+        return absolutized_value;
     }
-    if (inline_value->as_keyword().keyword() == Keyword::SpanAll) {
-        switch (block_value->as_keyword().keyword()) {
-        case Keyword::Start:
-            return KeywordStyleValue::create(Keyword::BlockStart);
-        case Keyword::End:
-            return KeywordStyleValue::create(Keyword::BlockEnd);
-        case Keyword::SelfStart:
-            return KeywordStyleValue::create(Keyword::SelfBlockStart);
-        case Keyword::SelfEnd:
-            return KeywordStyleValue::create(Keyword::SelfBlockEnd);
-        case Keyword::SpanStart:
-            return KeywordStyleValue::create(Keyword::SpanBlockStart);
-        case Keyword::SpanEnd:
-            return KeywordStyleValue::create(Keyword::SpanBlockEnd);
-        case Keyword::SpanSelfStart:
-            return KeywordStyleValue::create(Keyword::SpanSelfBlockStart);
-        case Keyword::SpanSelfEnd:
-            return KeywordStyleValue::create(Keyword::SpanSelfBlockEnd);
-        default:
-            return absolutized_value;
-        }
-    }
+
     auto short_block_value = to_short_keyword(block_value->as_keyword());
     auto short_inline_value = to_short_keyword(inline_value->as_keyword());
     if (*block_value != short_block_value || *inline_value != short_inline_value)
@@ -4600,24 +4385,18 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_math_depth(NonnullRefPtr<
         ? inheritance_parent->computed_values()->math_style()
         : InitialValues::math_style();
 
-    // The computed value of the math-depth value is determined as follows:
-    // - If the specified value of math-depth is auto-add and the inherited value of math-style is compact
-    //   then the computed value of math-depth of the element is its inherited value plus one.
-    if (absolutized_value->to_keyword() == Keyword::AutoAdd && inherited_math_style == MathStyle::Compact)
-        return IntegerStyleValue::create(AK::saturating_add(inherited_math_depth, 1));
+    // The math-depth rules live in the Rust style computation core.
+    auto result = ComputedValuesFFI::rust_compute_math_depth(absolutized_value->rust_style_value_data(), inherited_math_depth, inherited_math_style == MathStyle::Compact);
+    if (result.handled)
+        return IntegerStyleValue::create(static_cast<i64>(result.value));
 
     // - If the specified value of math-depth is of the form add(<integer>) then the computed value of
     //   math-depth of the element is its inherited value plus the specified integer.
     if (absolutized_value->is_function())
         return IntegerStyleValue::create(AK::saturating_add(inherited_math_depth, int_from_style_value(absolutized_value->as_function().value())));
 
-    // - If the specified value of math-depth is of the form <integer> then the computed value of math-depth
-    //   of the element is the specified integer.
-    if (absolutized_value->is_integer() || absolutized_value->is_calculated())
-        return IntegerStyleValue::create(int_from_style_value(absolutized_value));
-
-    // - Otherwise, the computed value of math-depth of the element is the inherited one.
-    return IntegerStyleValue::create(inherited_math_depth);
+    VERIFY(absolutized_value->is_calculated());
+    return IntegerStyleValue::create(int_from_style_value(absolutized_value));
 }
 
 void StyleComputer::reset_ancestor_filter()

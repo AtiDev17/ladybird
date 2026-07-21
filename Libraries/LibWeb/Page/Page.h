@@ -109,7 +109,7 @@ public:
     HTML::LocalNavigable& focused_navigable();
     HTML::LocalNavigable const& focused_navigable() const { return const_cast<Page*>(this)->focused_navigable(); }
 
-    void set_focused_navigable(Badge<EventHandler>, HTML::LocalNavigable&);
+    void set_focused_navigable(HTML::LocalNavigable&);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
 
     void load(URL::URL const&, Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
@@ -136,6 +136,7 @@ public:
     EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
+    void set_mouse_event_tracking_navigable(Badge<EventHandler>, HTML::LocalNavigable&);
 #if defined(AK_OS_MACOS)
     bool select_word_for_dictionary_lookup(DevicePixelPoint);
 #endif
@@ -338,6 +339,9 @@ private:
     GC::Ref<PageClient> m_client;
 
     GC::Weak<HTML::LocalNavigable> m_focused_navigable;
+    // Mouse events are hit-tested independently, so a release can target an ancestor document after a press began in
+    // a child navigable. Retain the interaction owner separately from focus to clear its non-DOM input state.
+    GC::Weak<HTML::LocalNavigable> m_mouse_event_tracking_navigable;
 
     GC::Ptr<HTML::LocalTraversableNavigable> m_top_level_traversable;
 
@@ -612,7 +616,7 @@ public:
     virtual void page_did_change_theme_color(Gfx::Color) { }
     virtual void page_did_change_background_color(Gfx::Color) { }
 
-    virtual void page_did_insert_clipboard_entry(Clipboard::SystemClipboardRepresentation const&, [[maybe_unused]] StringView presentation_style) { }
+    virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style) { }
     virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id) { }
     virtual void page_did_request_primary_paste() { }
     virtual void page_did_update_primary_selection(Utf16String const&) { }

@@ -404,14 +404,17 @@ int HTMLImageElement::x() const
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementX);
+    // Scroll frames are created together with the visual context tree at the lazy resolution point,
+    // so resolve it before reading the enclosing scroll node below.
+    const_cast<DOM::Document&>(document()).update_paint_and_hit_testing_properties_if_needed();
 
     auto paintable_box = this->paintable_box();
     if (!paintable_box)
         return 0;
 
     CSSPixels scroll_offset_x = 0;
-    if (auto idx = paintable_box->enclosing_scroll_frame_index(); idx.value())
-        scroll_offset_x = paintable_box->document().paintable()->scroll_state().cumulative_offset(idx).x();
+    if (auto idx = paintable_box->enclosing_scroll_node_index(); idx.value())
+        scroll_offset_x = paintable_box->document().paintable()->cumulative_scroll_offset_for_node(idx).x();
 
     return (paintable_box->absolute_border_box_rect().x() - scroll_offset_x).to_int();
 }
@@ -423,14 +426,17 @@ int HTMLImageElement::y() const
     // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
     // to the element and its ancestors, or zero if there is no box.
     const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementY);
+    // Scroll frames are created together with the visual context tree at the lazy resolution point,
+    // so resolve it before reading the enclosing scroll node below.
+    const_cast<DOM::Document&>(document()).update_paint_and_hit_testing_properties_if_needed();
 
     auto paintable_box = this->paintable_box();
     if (!paintable_box)
         return 0;
 
     CSSPixels scroll_offset_y = 0;
-    if (auto idx = paintable_box->enclosing_scroll_frame_index(); idx.value())
-        scroll_offset_y = paintable_box->document().paintable()->scroll_state().cumulative_offset(idx).y();
+    if (auto idx = paintable_box->enclosing_scroll_node_index(); idx.value())
+        scroll_offset_y = paintable_box->document().paintable()->cumulative_scroll_offset_for_node(idx).y();
 
     return (paintable_box->absolute_border_box_rect().y() - scroll_offset_y).to_int();
 }

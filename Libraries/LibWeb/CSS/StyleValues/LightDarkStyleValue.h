@@ -24,8 +24,6 @@ public:
     Optional<Color> to_color(ColorResolutionContext) const;
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     void serialize(StringBuilder&, SerializationMode) const;
-    bool is_computationally_independent() const { return false; }
-    bool depends_on_current_color() const { return light()->depends_on_current_color() || dark()->depends_on_current_color(); }
 
 private:
     LightDarkStyleValue(ValueComparingNonnullRefPtr<StyleValue const> light, ValueComparingNonnullRefPtr<StyleValue const> dark)

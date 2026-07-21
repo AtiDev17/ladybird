@@ -87,7 +87,6 @@ Parser::Parser(ParsingParams const& context, Vector<Token> tokens)
     , m_realm(context.realm)
     , m_parsing_mode(context.mode)
     , m_is_ua_style_sheet(context.is_ua_style_sheet)
-    , m_computed_style_for_custom_property_resolution(context.computed_style_for_custom_property_resolution)
     , m_tokens(move(tokens))
     , m_token_stream(m_tokens)
     , m_value_context(move(context.value_context))
@@ -2488,6 +2487,9 @@ Parser::ParseErrorOr<void> Parser::collect_arbitrary_substitution_function_prese
             switch (arbitrary_substitution_function.value()) {
             case ArbitrarySubstitutionFunction::Attr:
                 presence.attr = true;
+                break;
+            case ArbitrarySubstitutionFunction::DashedFunction:
+                presence.dashed_function = true;
                 break;
             case ArbitrarySubstitutionFunction::Env:
                 presence.env = true;

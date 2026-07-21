@@ -1,0 +1,30 @@
+Harness status: OK
+
+Found 25 tests
+
+25 Pass
+Pass	Local with self-cycle
+Pass	Cycle reference without fallback makes result invalid
+Pass	Local with self-cycle in unused fallback
+Pass	Local shadowing cyclic property --x
+Pass	Local shadowing cyclic outer local --x
+Pass	Argument shadowing cyclic outer local --x
+Pass	Arguments shadowing cyclic properties
+Pass	Observing property cycle locally
+Pass	Using cyclic values with no fallback
+Pass	Self-cycle in non-used local variable
+Pass	Using cyclic value in unused fallback
+Pass	Using cyclic value in unused fallback (local)
+Pass	Dashed-function, self-cycle
+Pass	Cycle through other function (--g)
+Pass	Cycle through other function (--f)
+Pass	Cycle through local, self
+Pass	Cycle through unused local
+Pass	Cycle through global, self
+Pass	Cycle through local, other function
+Pass	Cycle through local, other function, fallback in function
+Pass	Cycle through various variables and other functions
+Pass	Function in a cycle with its own default
+Pass	Cyclic defaults
+Pass	Cyclic outer --b shadows custom property
+Pass	Locals are function specific

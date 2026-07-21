@@ -13,136 +13,47 @@
 
 namespace Web::CSS {
 
-CascadedProperties::CascadedProperties() = default;
+// The Rust store mirrors the CascadeOrigin discriminants; pin them.
+static_assert(to_underlying(CascadeOrigin::Author) == to_underlying(ComputedValuesFFI::CascadeOrigin::Author));
+static_assert(to_underlying(CascadeOrigin::AuthorPresentationalHint) == to_underlying(ComputedValuesFFI::CascadeOrigin::AuthorPresentationalHint));
+static_assert(to_underlying(CascadeOrigin::User) == to_underlying(ComputedValuesFFI::CascadeOrigin::User));
+static_assert(to_underlying(CascadeOrigin::UserAgent) == to_underlying(ComputedValuesFFI::CascadeOrigin::UserAgent));
+static_assert(to_underlying(CascadeOrigin::Animation) == to_underlying(ComputedValuesFFI::CascadeOrigin::Animation));
+static_assert(to_underlying(CascadeOrigin::Transition) == to_underlying(ComputedValuesFFI::CascadeOrigin::Transition));
 
-CascadedProperties::~CascadedProperties() = default;
+CascadedProperties::CascadedProperties()
+    : m_store(ComputedValuesFFI::rust_cascaded_properties_create())
+{
+}
+
+CascadedProperties::~CascadedProperties()
+{
+    ComputedValuesFFI::rust_cascaded_properties_destroy(m_store);
+}
 
 NonnullRefPtr<CascadedProperties> CascadedProperties::create()
 {
     return adopt_ref(*new CascadedProperties);
 }
 
-void CascadedProperties::revert_property(PropertyID property_id, Important important, CascadeOrigin cascade_origin)
+void CascadedProperties::assign_source_slot(u32 slot, GC::Ptr<CSSStyleDeclaration const> source, GC::Ptr<DOM::ShadowRoot const> source_shadow_root)
 {
-    auto it = m_properties.find(property_id);
-    if (it == m_properties.end())
-        return;
-    auto& entries = it->value;
-    entries.remove_all_matching([&](auto& entry) {
-        // https://drafts.csswg.org/css-cascade-5/#author-presentational-hint-origin
-        // For the purpose of cascading this author presentational hint origin is treated as an independent origin, but
-        // for the purpose of the revert keyword it is considered part of the author origin.
-        auto origin_matches = entry.origin == cascade_origin
-            || (cascade_origin == CascadeOrigin::Author && entry.origin == CascadeOrigin::AuthorPresentationalHint);
-        return entry.property.property_id == property_id
-            && entry.property.important == important
-            && origin_matches;
-    });
-    if (entries.is_empty()) {
-        m_contained_properties_cache.set(to_underlying(property_id), false);
-        m_properties.remove(it);
-    }
-}
-
-void CascadedProperties::revert_layer_property(PropertyID property_id, Important important, CascadeOrigin cascade_origin, Optional<Utf16FlyString> layer_name, GC::Ptr<DOM::ShadowRoot const> source_shadow_root)
-{
-    auto it = m_properties.find(property_id);
-    if (it == m_properties.end())
-        return;
-    auto& entries = it->value;
-    entries.remove_all_matching([&](auto& entry) {
-        return entry.property.property_id == property_id
-            && entry.property.important == important
-            && entry.origin == cascade_origin
-            && entry.source_shadow_root.ptr() == source_shadow_root
-            && layer_name == entry.layer_name;
-    });
-    if (entries.is_empty()) {
-        m_contained_properties_cache.set(to_underlying(property_id), false);
-        m_properties.remove(it);
-    }
-}
-
-void CascadedProperties::set_property(PropertyID property_id, NonnullRefPtr<StyleValue const> value, Important important, CascadeOrigin origin, Optional<Utf16FlyString> layer_name, GC::Ptr<CSS::CSSStyleDeclaration const> source, GC::Ptr<DOM::ShadowRoot const> source_shadow_root)
-{
-    m_contained_properties_cache.set(to_underlying(property_id), true);
-
-    auto& entries = m_properties.ensure(property_id);
-
-    for (auto& entry : entries.in_reverse()) {
-        if (entry.origin == origin && entry.layer_name == layer_name && entry.source_shadow_root.ptr() == source_shadow_root) {
-            if (entry.property.important == Important::Yes && important == Important::No)
-                return;
-            entry.property = StyleProperty {
-                .important = important,
-                .property_id = property_id,
-                .value = value,
-            };
-            entry.cascade_index = m_next_cascade_index++;
-            entry.source = source.ptr();
-            entry.source_shadow_root = source_shadow_root.ptr();
-            return;
-        }
-    }
-
-    entries.append(Entry {
-        .property = StyleProperty {
-            .important = important,
-            .property_id = property_id,
-            .value = value,
-        },
-        .cascade_index = m_next_cascade_index++,
-        .origin = origin,
-        .layer_name = move(layer_name),
-        .source = source.ptr(),
-        .source_shadow_root = source_shadow_root.ptr(),
-    });
+    if (slot >= m_source_slots.size())
+        m_source_slots.resize(slot + 1);
+    m_source_slots[slot] = SourcePair { source.ptr(), source_shadow_root.ptr() };
 }
 
 RefPtr<StyleValue const> CascadedProperties::property(PropertyID property_id) const
 {
-    if (!m_contained_properties_cache.get(to_underlying(property_id)))
-        return nullptr;
-
-    return m_properties.get(property_id)->last().property.value;
-}
-
-PropertyID CascadedProperties::property_with_higher_priority(PropertyID first_property_id, PropertyID second_property_id) const
-{
-    if (!m_contained_properties_cache.get(to_underlying(first_property_id)))
-        return second_property_id;
-
-    if (!m_contained_properties_cache.get(to_underlying(second_property_id)))
-        return first_property_id;
-
-    if (m_properties.get(first_property_id)->last().cascade_index >= m_properties.get(second_property_id)->last().cascade_index)
-        return first_property_id;
-
-    return second_property_id;
-}
-
-GC::Ptr<CSSStyleDeclaration const> CascadedProperties::property_source(PropertyID property_id) const
-{
-    if (!m_contained_properties_cache.get(to_underlying(property_id)))
-        return nullptr;
-
-    return m_properties.get(property_id)->last().source.ptr();
+    return static_cast<StyleValue const*>(ComputedValuesFFI::rust_cascaded_properties_property(m_store, to_underlying(property_id)));
 }
 
 GC::Ptr<DOM::ShadowRoot const> CascadedProperties::property_source_shadow_root(PropertyID property_id) const
 {
-    if (!m_contained_properties_cache.get(to_underlying(property_id)))
+    auto slot = ComputedValuesFFI::rust_cascaded_properties_source_slot(m_store, to_underlying(property_id));
+    if (slot < 0)
         return nullptr;
-
-    return m_properties.get(property_id)->last().source_shadow_root.ptr();
-}
-
-Optional<StyleProperty> CascadedProperties::style_property(PropertyID property_id) const
-{
-    if (!m_contained_properties_cache.get(to_underlying(property_id)))
-        return {};
-
-    return m_properties.get(property_id)->last().property;
+    return m_source_slots[slot].source_shadow_root.ptr();
 }
 
 }

@@ -7,20 +7,12 @@
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
 
-mod css_tokenizer;
 mod encoding_detection;
-mod selector_engine;
-mod style_value;
 
 pub use libweb_html_tokenizer as html_tokenizer;
 
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
-
-pub use css_tokenizer::CssHashType;
-pub use css_tokenizer::CssNumberType;
-pub use css_tokenizer::CssToken;
-pub use css_tokenizer::CssTokenType;
 
 fn abort_on_panic<F: FnOnce() -> R, R>(f: F) -> R {
     match catch_unwind(AssertUnwindSafe(f)) {

@@ -35,7 +35,7 @@ public:
     bool contains_arbitrary_substitution_function() const
     {
         auto const& data = m_value->unresolved;
-        return data.presence_attr || data.presence_env || data.presence_if || data.presence_inherit || data.presence_var;
+        return data.presence_attr || data.presence_dashed_function || data.presence_env || data.presence_if || data.presence_inherit || data.presence_var;
     }
     bool contains_attr_tainted_values() const { return m_value->unresolved.contains_attr_tainted_values; }
     bool includes_attr_function() const { return m_value->unresolved.presence_attr; }
@@ -46,8 +46,6 @@ public:
     bool equals(StyleValue const& other) const;
 
     GC::Ref<CSSStyleValue> reify(JS::Realm&, Utf16FlyString const& associated_property) const;
-
-    bool is_computationally_independent() const { VERIFY_NOT_REACHED(); }
 
 private:
     UnresolvedStyleValue(String source_text, String value_comparison_text, Parser::SubstitutionFunctionsPresence, bool contains_attr_tainted_values);

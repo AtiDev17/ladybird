@@ -106,6 +106,9 @@ public:
     [[nodiscard]] NonnullRefPtr<ComputedValues const> create_document_style() const;
 
     [[nodiscard]] NonnullRefPtr<ComputedValues const> compute_style(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}) const;
+    // Compute the cascade supplied by rules, presentational hints, and inheritance while excluding the element's
+    // inline declaration. Editing uses this to identify transport-only style without mutating the live element.
+    [[nodiscard]] NonnullRefPtr<ComputedProperties> compute_properties_without_inline_style(DOM::AbstractElement) const;
     [[nodiscard]] NonnullRefPtr<ComputedValues const> compute_style_with_seeded_ancestors(DOM::AbstractElement);
     [[nodiscard]] RefPtr<ComputedValues const> compute_pseudo_element_style_if_needed(DOM::AbstractElement, Optional<bool&> did_change_custom_properties) const;
     [[nodiscard]] JsonArray collect_devtools_applied_style_rules(DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
@@ -123,8 +126,8 @@ public:
     Vector<HasInvalidationMetadata> const* has_invalidation_metadata_for_property(InvalidationSet::Property const&, StyleScope const&) const;
 
     static CSSPixels default_user_font_size();
+    static void ensure_style_metadata_tables_installed();
     static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
-    static CSSPixels relative_size_mapping(RelativeSize, CSSPixels inherited_font_size);
     [[nodiscard]] RefPtr<StyleValue const> recascade_font_size_if_needed(DOM::AbstractElement, CascadedProperties&, bool& depends_on_viewport_metrics) const;
 
     void set_viewport_rect(Badge<DOM::Document>, CSSPixelRect const& viewport_rect) { m_viewport_rect = viewport_rect; }
@@ -139,9 +142,8 @@ public:
 
     [[nodiscard]] inline bool should_reject_with_ancestor_filter(Selector const&) const;
 
-    static NonnullRefPtr<StyleValue const> compute_value_of_custom_property(DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {});
-    NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedProperties const&, DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {}) const;
-    ComputationContext fallback_computation_context_for_custom_property(DOM::AbstractElement const&) const;
+    NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedProperties const*, AbstractOrHypotheticalElement const&, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> = {}) const;
+    ComputationContext fallback_computation_context_for_custom_property(AbstractOrHypotheticalElement const&) const;
 
     static NonnullRefPtr<StyleValue const> compute_value_of_property(PropertyID, NonnullRefPtr<StyleValue const> const& specified_value, Function<NonnullRefPtr<StyleValue const>(PropertyID)> const& get_property_specified_value, ComputationContext const&, double device_pixels_per_css_pixel);
     static NonnullRefPtr<StyleValue const> compute_animation_name(NonnullRefPtr<StyleValue const> const& absolutized_value);
@@ -172,6 +174,11 @@ private:
         CreatePseudoElementStyleIfNeeded,
     };
 
+    enum class IncludeInlineStyle : u8 {
+        No,
+        Yes,
+    };
+
     struct LayerMatchingRules {
         Utf16FlyString qualified_layer_name;
         Vector<ScopedMatchingRule> rules;
@@ -191,8 +198,8 @@ private:
 
     [[nodiscard]] MatchingRuleSet build_matching_rule_set(DOM::AbstractElement, bool& did_match_any_pseudo_element_rules, ComputeStyleMode) const;
 
-    [[nodiscard]] RefPtr<ComputedProperties> compute_style_impl(DOM::AbstractElement, ComputeStyleMode, Optional<bool&> did_change_custom_properties, StyleScope const&) const;
-    [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, bool did_match_any_pseudo_element_rules, ComputeStyleMode, MatchingRuleSet const&) const;
+    [[nodiscard]] RefPtr<ComputedProperties> compute_style_impl(DOM::AbstractElement, ComputeStyleMode, Optional<bool&> did_change_custom_properties, StyleScope const&, IncludeInlineStyle) const;
+    [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, bool did_match_any_pseudo_element_rules, ComputeStyleMode, MatchingRuleSet const&, IncludeInlineStyle) const;
     void collect_animation_into(DOM::AbstractElement, GC::Ref<Animations::KeyframeEffect> animation, ComputedProperties&, ComputedProperties::Builder*) const;
     void compute_custom_properties(ComputedProperties&, DOM::AbstractElement) const;
     void start_needed_transitions(ComputedValues const& old_style, ComputedProperties::Builder& new_style, DOM::AbstractElement) const;

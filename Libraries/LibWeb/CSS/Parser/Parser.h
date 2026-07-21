@@ -30,6 +30,7 @@
 #include <LibWeb/CSS/Parser/Types.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
+#include <LibWeb/CSS/StyleValues/CalcNodeRef.h>
 #include <LibWeb/CSS/StyleValues/ShadowStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/StyleValues/TreeCountingFunctionStyleValue.h>
@@ -108,7 +109,6 @@ struct WEB_API ParsingParams {
     GC::Ptr<DOM::Document const> document;
     ParsingMode mode { ParsingMode::Normal };
     IsUAStyleSheet is_ua_style_sheet { IsUAStyleSheet::No };
-    ComputedProperties const* computed_style_for_custom_property_resolution { nullptr };
 
     Vector<ValueParsingContext> value_context;
     Vector<RuleContext> rule_context;
@@ -181,12 +181,16 @@ public:
 
     Vector<ComponentValue> parse_as_list_of_component_values();
 
-    static NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(ParsingParams const&, DOM::AbstractElement, PropertyNameAndID const&, UnresolvedStyleValue const&, Optional<GuardedSubstitutionContexts&> = {});
+    static NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(ParsingParams const&, AbstractOrHypotheticalElement, ArbitrarySubstitutionReplacementContext const&, PropertyNameAndID const&, UnresolvedStyleValue const&, Optional<GuardedSubstitutionContexts&> = {});
 
     [[nodiscard]] NonnullRefPtr<StyleValue const> parse_as_sizes_attribute(DOM::Element const& element, HTML::HTMLImageElement const* img = nullptr);
 
+    enum class DisallowTopLevelCurlyBlocks : u8 {
+        No,
+        Yes,
+    };
     static Optional<Vector<ComponentValue>> parse_declaration_value(TokenStream<ComponentValue>&, Optional<Token::Type> end_token_type = {});
-    static Optional<ReadonlySpan<ComponentValue>> parse_declaration_value_as_span(TokenStream<ComponentValue>&, Optional<Token::Type> end_token_type = {});
+    static Optional<ReadonlySpan<ComponentValue>> parse_declaration_value_as_span(TokenStream<ComponentValue>&, Optional<Token::Type> end_token_type = {}, DisallowTopLevelCurlyBlocks = DisallowTopLevelCurlyBlocks::No);
 
     NonnullRefPtr<StyleValue const> parse_with_a_syntax(Vector<ComponentValue> const& input, SyntaxNode const& syntax);
 
@@ -425,8 +429,8 @@ private:
     RefPtr<CustomIdentStyleValue const> parse_dashed_ident_value(TokenStream<ComponentValue>&);
     RefPtr<RandomValueSharingStyleValue const> parse_random_value_sharing(TokenStream<ComponentValue>&);
     // NOTE: Implemented in generated code. (GenerateCSSMathFunctions.cpp)
-    RefPtr<CalculationNode const> parse_math_function(Function const&, CalculationContext const&);
-    RefPtr<CalculationNode const> parse_a_calc_function_node(Function const&, CalculationContext const&);
+    Optional<CalcNodeRef> parse_math_function(Function const&, CalculationContext const&);
+    Optional<CalcNodeRef> parse_a_calc_function_node(Function const&, CalculationContext const&);
     RefPtr<StyleValue const> parse_keyword_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_specific_keyword_value(TokenStream<ComponentValue>&, ReadonlySpan<Keyword>);
     RefPtr<StyleValue const> parse_hue_none_value(TokenStream<ComponentValue>&);
@@ -610,8 +614,8 @@ private:
     ENUMERATE_GENERATED_CSS_VALUE_TYPES
 #undef __ENUMERATE_GENERATED_CSS_VALUE_TYPE
 
-    RefPtr<CalculationNode const> convert_to_calculation_node(CalcParsing::Node const&, CalculationContext const&);
-    RefPtr<CalculationNode const> parse_a_calculation(TokenStream<ComponentValue>&, CalculationContext const&);
+    Optional<CalcNodeRef> convert_to_calculation_node(CalcParsing::Node const&, CalculationContext const&);
+    Optional<CalcNodeRef> parse_a_calculation(TokenStream<ComponentValue>&, CalculationContext const&);
 
     ParseErrorOr<NonnullRefPtr<Selector>> parse_complex_selector(TokenStream<ComponentValue>&, SelectorType);
     ParseErrorOr<Selector::CompoundSelector> parse_compound_selector(TokenStream<ComponentValue>&);
@@ -651,7 +655,7 @@ private:
     OwnPtr<BooleanExpression> parse_container_query_feature(TokenStream<ComponentValue>&);
     RefPtr<ContainerQuery> parse_container_query(TokenStream<ComponentValue>&);
 
-    NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(DOM::AbstractElement, GuardedSubstitutionContexts&, PropertyNameAndID const&, UnresolvedStyleValue const&);
+    NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(AbstractOrHypotheticalElement, GuardedSubstitutionContexts&, ArbitrarySubstitutionReplacementContext const&, PropertyNameAndID const&, UnresolvedStyleValue const&);
 
     RefPtr<StyleValue const> parse_according_to_syntax_node(TokenStream<ComponentValue>& tokens, SyntaxNode const& syntax_node);
 
@@ -669,7 +673,6 @@ private:
     GC::Ptr<JS::Realm> m_realm;
     ParsingMode m_parsing_mode { ParsingMode::Normal };
     IsUAStyleSheet m_is_ua_style_sheet { IsUAStyleSheet::No };
-    ComputedProperties const* m_computed_style_for_custom_property_resolution { nullptr };
 
     Vector<Token> m_tokens;
     TokenStream<Token> m_token_stream;

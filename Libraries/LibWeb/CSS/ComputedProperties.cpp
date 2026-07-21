@@ -69,8 +69,18 @@
 
 namespace Web::CSS {
 
-ComputedValues::ComputedValues() = default;
-ComputedValues::~ComputedValues() = default;
+ComputedValues::Statistics ComputedValues::s_statistics;
+
+ComputedValues::ComputedValues()
+{
+    ++s_statistics.live_instance_count;
+    ++s_statistics.total_instances_created;
+}
+
+ComputedValues::~ComputedValues()
+{
+    --s_statistics.live_instance_count;
+}
 
 void ComputedValues::Mutator::set_animated_properties(AnimatedProperties const* value)
 {
@@ -84,8 +94,8 @@ RefPtr<AnimatedProperties const> ComputedValues::animated_properties_snapshot() 
 
 RefPtr<StyleValue const> ComputedValues::color_style_value() const
 {
-    if (m_inherited.color_style_value)
-        return m_inherited.color_style_value;
+    if (m_inherited.text->color_style_value)
+        return m_inherited.text->color_style_value;
     return computed_style_value(PropertyID::Color);
 }
 
@@ -426,20 +436,20 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
             { length_style_value(border_spacing_horizontal()), length_style_value(border_spacing_vertical()) },
             StyleValueList::Separator::Space);
     case PropertyID::BorderBottomColor:
-        if (m_noninherited.border_bottom_color_style_value && !m_noninherited.border_bottom_color_style_value->depends_on_current_color())
-            return m_noninherited.border_bottom_color_style_value;
+        if (m_noninherited.border->border_bottom_color_style_value && !m_noninherited.border->border_bottom_color_style_value->depends_on_current_color())
+            return m_noninherited.border->border_bottom_color_style_value;
         return color_style_value(border_bottom().color);
     case PropertyID::BorderLeftColor:
-        if (m_noninherited.border_left_color_style_value && !m_noninherited.border_left_color_style_value->depends_on_current_color())
-            return m_noninherited.border_left_color_style_value;
+        if (m_noninherited.border->border_left_color_style_value && !m_noninherited.border->border_left_color_style_value->depends_on_current_color())
+            return m_noninherited.border->border_left_color_style_value;
         return color_style_value(border_left().color);
     case PropertyID::BorderRightColor:
-        if (m_noninherited.border_right_color_style_value && !m_noninherited.border_right_color_style_value->depends_on_current_color())
-            return m_noninherited.border_right_color_style_value;
+        if (m_noninherited.border->border_right_color_style_value && !m_noninherited.border->border_right_color_style_value->depends_on_current_color())
+            return m_noninherited.border->border_right_color_style_value;
         return color_style_value(border_right().color);
     case PropertyID::BorderTopColor:
-        if (m_noninherited.border_top_color_style_value && !m_noninherited.border_top_color_style_value->depends_on_current_color())
-            return m_noninherited.border_top_color_style_value;
+        if (m_noninherited.border->border_top_color_style_value && !m_noninherited.border->border_top_color_style_value->depends_on_current_color())
+            return m_noninherited.border->border_top_color_style_value;
         return color_style_value(border_top().color);
     case PropertyID::CaretColor:
         return color_or_auto_style_value(caret_color_value());
@@ -458,8 +468,8 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
     case PropertyID::ColumnWidth:
         return size_style_value(column_width());
     case PropertyID::Color:
-        if (m_inherited.color_style_value && !m_inherited.color_style_value->depends_on_current_color())
-            return m_inherited.color_style_value;
+        if (m_inherited.text->color_style_value && !m_inherited.text->color_style_value->depends_on_current_color())
+            return m_inherited.text->color_style_value;
         return color_style_value(color());
     case PropertyID::FloodColor:
         return color_style_value(flood_color());
@@ -2042,19 +2052,6 @@ LengthBox ComputedProperties::length_box(PropertyID left_id, PropertyID top_id, 
         length_box_side(bottom_id),
         length_box_side(left_id)
     };
-}
-
-void ComputedProperties::for_each_anchor_name(Function<void(Utf16FlyString const&)> callback) const
-{
-    auto const& value = property(PropertyID::AnchorName);
-    if (value.is_custom_ident()) {
-        callback(value.as_custom_ident().custom_ident());
-    } else if (value.is_value_list()) {
-        for (auto const& item : value.as_value_list().values()) {
-            if (item->is_custom_ident())
-                callback(item->as_custom_ident().custom_ident());
-        }
-    }
 }
 
 Color ComputedProperties::color(PropertyID id, ColorResolutionContext color_resolution_context) const

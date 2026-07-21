@@ -25,6 +25,7 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/Compositor/AsyncScrollTree.h>
 #include <LibWeb/Compositor/AsyncScrollingState.h>
@@ -945,6 +946,33 @@ void Internals::reset_style_invalidation_counters()
     window().associated_document().reset_style_invalidation_counters();
 }
 
+JS::Object* Internals::style_group_sharing_info(DOM::Element& element)
+{
+    auto object = JS::Object::create(realm(), nullptr);
+    auto computed_values = element.computed_values();
+    if (!computed_values)
+        return object;
+    RefPtr<CSS::ComputedValues const> parent_values;
+    if (auto parent = element.parent_element())
+        parent_values = parent->computed_values();
+    computed_values->for_each_style_group_sharing_state(parent_values.ptr(), [&](StringView name, bool shared_with_parent, bool is_default) {
+        auto group = JS::Object::create(realm(), nullptr);
+        group->define_direct_property("sharedWithParent"_utf16_fly_string, JS::Value(shared_with_parent), JS::default_attributes);
+        group->define_direct_property("isDefault"_utf16_fly_string, JS::Value(is_default), JS::default_attributes);
+        object->define_direct_property(Utf16FlyString::from_utf8(name), group, JS::default_attributes);
+    });
+    return object;
+}
+
+JS::Object* Internals::computed_values_stats()
+{
+    auto const& statistics = CSS::ComputedValues::statistics();
+    auto object = JS::Object::create(realm(), nullptr);
+    object->define_direct_property("liveComputedValues"_utf16_fly_string, JS::Value(statistics.live_instance_count), JS::default_attributes);
+    object->define_direct_property("totalComputedValuesCreated"_utf16_fly_string, JS::Value(statistics.total_instances_created), JS::default_attributes);
+    return object;
+}
+
 void Internals::update_style()
 {
     window().associated_document().update_style();
@@ -1068,9 +1096,9 @@ JS::Object* Internals::async_scrolling_state()
         auto const& scroll_node = state.scroll_nodes[i];
         auto node = JS::Object::create(realm(), nullptr);
         node->define_direct_property("documentID"_utf16_fly_string, JS::Value(static_cast<double>(scroll_node.node_id.document_id.value())), JS::default_attributes);
-        node->define_direct_property("scrollFrameIndex"_utf16_fly_string, JS::Value(scroll_node.node_id.scroll_frame_index.value()), JS::default_attributes);
+        node->define_direct_property("scrollNodeIndex"_utf16_fly_string, JS::Value(scroll_node.node_id.scroll_node_index.value()), JS::default_attributes);
         node->define_direct_property("parentDocumentID"_utf16_fly_string, JS::Value(scroll_node.parent_node_id.has_value() ? static_cast<double>(scroll_node.parent_node_id->document_id.value()) : 0), JS::default_attributes);
-        node->define_direct_property("parentScrollFrameIndex"_utf16_fly_string, JS::Value(scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->scroll_frame_index.value() : 0), JS::default_attributes);
+        node->define_direct_property("parentScrollNodeIndex"_utf16_fly_string, JS::Value(scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->scroll_node_index.value() : 0), JS::default_attributes);
         node->define_direct_property("isViewport"_utf16_fly_string, JS::Value(scroll_node.is_viewport), JS::default_attributes);
         MUST(scroll_nodes->create_data_property_or_throw(i, node));
     }
@@ -1080,8 +1108,8 @@ JS::Object* Internals::async_scrolling_state()
         auto const& sticky_area = state.sticky_areas[i];
         auto area = JS::Object::create(realm(), nullptr);
         area->define_direct_property("documentID"_utf16_fly_string, JS::Value(static_cast<double>(sticky_area.document_id.value())), JS::default_attributes);
-        area->define_direct_property("scrollFrameIndex"_utf16_fly_string, JS::Value(sticky_area.scroll_frame_index.value()), JS::default_attributes);
-        area->define_direct_property("parentScrollFrameIndex"_utf16_fly_string, JS::Value(sticky_area.parent_scroll_frame_index.value()), JS::default_attributes);
+        area->define_direct_property("scrollNodeIndex"_utf16_fly_string, JS::Value(sticky_area.scroll_node_index.value()), JS::default_attributes);
+        area->define_direct_property("parentScrollNodeIndex"_utf16_fly_string, JS::Value(sticky_area.parent_scroll_node_index.value()), JS::default_attributes);
         area->define_direct_property("nearestScrollingAncestorIndex"_utf16_fly_string, JS::Value(sticky_area.nearest_scrolling_ancestor_index.value()), JS::default_attributes);
         area->define_direct_property("hasTopInset"_utf16_fly_string, JS::Value(sticky_area.inset_top.has_value()), JS::default_attributes);
         area->define_direct_property("hasRightInset"_utf16_fly_string, JS::Value(sticky_area.inset_right.has_value()), JS::default_attributes);

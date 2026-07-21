@@ -278,17 +278,17 @@ bool property_accepts_percentage(PropertyID, Percentage const&);
 bool property_accepts_resolution(PropertyID, Resolution const&);
 bool property_accepts_time(PropertyID, Time const&);
 
-bool property_is_shorthand(PropertyID);
-Vector<PropertyID> const& longhands_for_shorthand(PropertyID);
+WEB_API bool property_is_shorthand(PropertyID);
+WEB_API Vector<PropertyID> const& longhands_for_shorthand(PropertyID);
 Vector<PropertyID> const& expanded_longhands_for_shorthand(PropertyID);
 bool property_maps_to_shorthand(PropertyID);
 Vector<PropertyID> const& shorthands_for_longhand(PropertyID);
-Vector<PropertyID> const& property_computation_order();
+WEB_API Vector<PropertyID> const& property_computation_order();
 bool property_is_positional_value_list_shorthand(PropertyID);
 
-bool property_requires_computation_with_inherited_value(PropertyID);
-bool property_requires_computation_with_initial_value(PropertyID);
-bool property_requires_computation_with_cascaded_value(PropertyID);
+WEB_API bool property_requires_computation_with_inherited_value(PropertyID);
+WEB_API bool property_requires_computation_with_initial_value(PropertyID);
+WEB_API bool property_requires_computation_with_cascaded_value(PropertyID);
 
 size_t property_maximum_value_count(PropertyID);
 
@@ -320,9 +320,9 @@ struct LogicalAliasMappingContext {{
     Direction direction;
     // TODO: text-orientation
 }};
-bool property_is_logical_alias(PropertyID);
-PropertyID map_logical_alias_to_physical_property(PropertyID logical_property_id, LogicalAliasMappingContext const&);
-PropertyID map_physical_property_to_logical_alias(PropertyID physical_property_id, LogicalAliasMappingContext const&);
+WEB_API bool property_is_logical_alias(PropertyID);
+WEB_API PropertyID map_logical_alias_to_physical_property(PropertyID logical_property_id, LogicalAliasMappingContext const&);
+WEB_API PropertyID map_physical_property_to_logical_alias(PropertyID physical_property_id, LogicalAliasMappingContext const&);
 
 enum class LogicalPropertyGroup : {logical_property_group_underlying_type} {{
 """)

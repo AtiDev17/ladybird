@@ -21,11 +21,9 @@ public:
     virtual ~AnchorStyleValue() override = default;
 
     void serialize(StringBuilder&, SerializationMode) const;
-    virtual RefPtr<CalculationNode const> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
+    virtual Optional<CalcNodeRef> resolve_to_calculation_node(CalculationContext const&, CalculationResolutionContext const&) const override;
 
     bool equals(StyleValue const& other) const;
-
-    bool is_computationally_independent() const { return true; }
 
     Optional<Utf16FlyString> anchor_name() const
     {

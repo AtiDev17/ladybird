@@ -94,6 +94,7 @@ set(SOURCES
     CSS/Clip.cpp
     CSS/ComputedProperties.cpp
     CSS/ComputedValues.cpp
+    CSS/RustStyleBridge.cpp
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
     CSS/CounterStyle.cpp
@@ -180,6 +181,7 @@ set(SOURCES
     CSS/Frequency.cpp
     CSS/GridTrackPlacement.cpp
     CSS/GridTrackSize.cpp
+    CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
     CSS/Invalidation/CustomElementInvalidator.cpp
@@ -399,10 +401,30 @@ set(SOURCES
     Dump.cpp
     Editing/CommandNames.cpp
     Editing/Commands.cpp
+    Editing/ClipboardSanitizer.cpp
+    Editing/ClipboardSerializer.cpp
     Editing/EditCommand.cpp
     Editing/EditingHistory.cpp
     Editing/ExecCommand.cpp
+    Editing/InlineInsertion.cpp
+    Editing/InsertedContent.cpp
+    Editing/InsertedNodes.cpp
+    Editing/ReplacementEndpoints.cpp
+    Editing/InterchangeWhitespace.cpp
+    Editing/LegacyFontStyle.cpp
     Editing/Internal/Algorithms.cpp
+    Editing/MutationTrackedRange.cpp
+    Editing/ParagraphIntegration.cpp
+    Editing/ParagraphOperations.cpp
+    Editing/ParagraphTransfer.cpp
+    Editing/ReplacementFragment.cpp
+    Editing/ReplacementRangeCleanup.cpp
+    Editing/ReplacementStyleCleanup.cpp
+    Editing/StyledMarkupAccumulator.cpp
+    Editing/StyledMarkupSelection.cpp
+    Editing/StyledMarkupSerializer.cpp
+    Editing/VisiblePosition.cpp
+    Editing/ReplaceSelection.cpp
     Encoding/TextDecoder.cpp
     Encoding/TextDecoderCommon.cpp
     Encoding/TextDecoderStream.cpp
@@ -914,7 +936,7 @@ set(SOURCES
     Painting/ResolvedCSSFilter.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
-    Painting/ScrollFrame.cpp
+    Painting/ScrollNodeState.cpp
     Painting/ScrollState.cpp
     Painting/ShadowPainting.cpp
     Painting/StackingContext.cpp
@@ -953,6 +975,7 @@ set(SOURCES
     ResourceTiming/PerformanceResourceTiming.cpp
     SecureContexts/AbstractOperations.cpp
     Selection/Selection.cpp
+    Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
@@ -1311,7 +1334,18 @@ endforeach()
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
     CRATE_NAME libweb_rust
-    FFI_HEADERS RustFFI.h SelectorRustFFI.h StyleValueRustFFI.h HTML/Parser/RustFFI.h
+    FFI_HEADERS HTML/Parser/RustFFI.h
+)
+
+set(css_rust_features "")
+if (NOT BUILD_SHARED_LIBS)
+    set(css_rust_features FEATURES allocator)
+endif()
+import_rust_crate(
+    MANIFEST_PATH CSS/Rust/Cargo.toml
+    CRATE_NAME libweb_css_rust
+    ${css_rust_features}
+    FFI_HEADERS RustFFI.h SelectorRustFFI.h StyleValueRustFFI.h ComputedValuesRustFFI.h
 )
 
 set(content_blocker_rust_features "")
@@ -1319,8 +1353,9 @@ if (NOT BUILD_SHARED_LIBS)
     set(content_blocker_rust_features FEATURES allocator)
 endif()
 import_rust_crate(MANIFEST_PATH ContentBlocker/Rust/Cargo.toml CRATE_NAME libweb_content_blocker_rust ${content_blocker_rust_features} FFI_HEADER ContentBlockerRustFFI.h)
-target_link_libraries(LibWeb PRIVATE libweb_rust libweb_content_blocker_rust)
+target_link_libraries(LibWeb PRIVATE libweb_rust libweb_css_rust libweb_content_blocker_rust)
 get_target_property(_libweb_rust_lib libweb_rust IMPORTED_LOCATION)
+get_target_property(_libweb_css_rust_lib libweb_css_rust IMPORTED_LOCATION)
 get_target_property(_libweb_content_blocker_rust_lib libweb_content_blocker_rust IMPORTED_LOCATION)
 set_property(SOURCE HTML/Parser/HTMLTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
 set_property(SOURCE HTML/Parser/HTMLParser.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
@@ -1332,6 +1367,7 @@ endif()
 if(NOT BUILD_SHARED_LIBS)
     add_custom_command(TARGET LibWeb POST_BUILD
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_rust>
+        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_css_rust>
         COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libweb_content_blocker_rust>
         COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibWeb> *.o
         COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibWeb>
@@ -1346,7 +1382,7 @@ if(NOT BUILD_SHARED_LIBS)
     # stale Rust objects. Force the C++ FFI bridge files to depend on the
     # Rust archives: when they change, LibWeb re-archives, and POST_BUILD
     # re-merges the fresh Rust objects.
-    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_css_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Loader/ContentBlocker.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_content_blocker_rust_lib})
 endif()

@@ -59,7 +59,7 @@ public:
 
     EventResult handle_drag_and_drop_event(DragEvent::Type, CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(CSSPixelPoint, unsigned modifiers, double scale_delta);
-    EventResult handle_paste(Utf16View text);
+    EventResult handle_paste(Utf16View plain_text, Optional<Utf16View> html);
     void handle_sdl_input_events();
 
     void process_auto_scroll();
@@ -71,6 +71,7 @@ public:
         Paragraph,
     };
     bool is_handling_mouse_selection() const { return m_selection_mode != SelectionMode::None; }
+    void reset_mouse_input_tracking(Badge<Page>);
 
     Optional<MiddleButtonScrollHandler&> middle_button_scroll_handler() const
     {

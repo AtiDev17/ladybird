@@ -7,6 +7,7 @@
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
+#include <LibWeb/CSS/StyleValues/CalcNodeRef.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
@@ -1929,24 +1930,12 @@ AbsposContainingBlockInfo FormattingContext::resolve_abspos_containing_block_inf
     return { rect, inline_axis_mode, block_axis_mode, {}, {} };
 }
 
-static bool calculation_tree_contains_anchor(CSS::CalculationNode const& root)
-{
-    if (root.type() == CSS::CalculationNode::Type::NonMathFunction && as<CSS::NonMathFunctionCalculationNode>(root).function()->is_anchor())
-        return true;
-
-    for (auto const& child : root.children()) {
-        if (calculation_tree_contains_anchor(child))
-            return true;
-    }
-    return false;
-}
-
 static bool style_value_contains_anchor(CSS::StyleValue const& value)
 {
     if (value.is_anchor())
         return true;
     if (value.is_calculated())
-        return calculation_tree_contains_anchor(value.as_calculated().calculation());
+        return value.as_calculated().contains_anchor_function();
     return false;
 }
 
@@ -2333,8 +2322,8 @@ void FormattingContext::resolve_anchor_insets(Box& box) const
         // A bare anchor() inset is wrapped in a calculation so it resolves through the same path as calc(anchor()).
         if (value.is_anchor()) {
             auto calculation_context = CSS::CalculationContext::for_property(CSS::PropertyNameAndID::from_id(property_id));
-            auto calculation_node = CSS::NonMathFunctionCalculationNode::create(value.as_anchor(), CSS::NumericType { CSS::NumericType::BaseType::Length, 1 });
-            auto calculated_value = CSS::CalculatedStyleValue::create(calculation_node, CSS::NumericType { CSS::NumericType::BaseType::Length, 1 }, calculation_context);
+            auto calculation_node = CSS::CalcNodeRef::non_math_function(value.as_anchor(), CSS::NumericType { CSS::NumericType::BaseType::Length, 1 });
+            auto calculated_value = CSS::CalculatedStyleValue::create(move(calculation_node), CSS::NumericType { CSS::NumericType::BaseType::Length, 1 }, calculation_context);
             return to_inset(calculated_value->resolve_length(resolution_context));
         }
 
@@ -2713,7 +2702,7 @@ void FormattingContext::compute_inset(NodeWithStyleAndBoxModelMetrics const& box
     //     passed as const& through the compute_inset() call chain.
     if (auto const* anchored_box = as_if<Box>(box)) {
         auto inset_contains_anchor = [](CSS::LengthPercentageOrAuto const& value) {
-            return value.is_calculated() && calculation_tree_contains_anchor(value.calculated()->calculation());
+            return value.is_calculated() && value.calculated()->contains_anchor_function();
         };
         auto const& inset = anchored_box->computed_values().inset();
         if (inset_contains_anchor(inset.top()) || inset_contains_anchor(inset.right())
