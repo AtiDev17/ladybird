@@ -23,7 +23,6 @@ include!(concat!(env!("OUT_DIR"), "/dimension_units_generated.rs"));
 /// dimensions, mirroring CalculationResult::Value. Units cross as the same
 /// opaque codes the style value data uses.
 #[derive(Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum CalcNumericValue {
     /// The number type mirrors the C++ Number::Type discriminants
     /// (number, integer with explicit sign, integer), pinned C++-side.
@@ -74,7 +73,6 @@ pub struct CalcNumericType {
     pub percent_hint: Option<u8>,
 }
 
-#[allow(dead_code)]
 impl CalcNumericType {
     fn contains_all_the_non_zero_entries_of_other_with_the_same_value(&self, other: &CalcNumericType) -> bool {
         for i in 0..BASE_TYPE_COUNT {
@@ -288,51 +286,20 @@ impl CalcNumericType {
 }
 
 /// The result of evaluating a calculation: the numeric value in canonical
-/// units and the numeric type it carries, mirroring the C++ CalculationResult.
+/// units and the numeric type it carries.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[allow(dead_code)]
 pub(crate) struct CalcResult {
     pub value: f64,
     pub numeric_type: Option<CalcNumericType>,
 }
 
-#[allow(dead_code)]
 impl CalcResult {
-    pub(crate) fn add(&mut self, other: &CalcResult) {
-        self.value += other.value;
-        self.numeric_type = match (&self.numeric_type, &other.numeric_type) {
-            (Some(first), Some(second)) => first.added_to(second),
-            _ => None,
-        };
-    }
-
-    pub(crate) fn subtract(&mut self, other: &CalcResult) {
-        self.value -= other.value;
-        self.numeric_type = match (&self.numeric_type, &other.numeric_type) {
-            (Some(first), Some(second)) => first.added_to(second),
-            _ => None,
-        };
-    }
-
     pub(crate) fn multiply_by(&mut self, other: &CalcResult) {
         self.value *= other.value;
         self.numeric_type = match (&self.numeric_type, &other.numeric_type) {
             (Some(first), Some(second)) => first.multiplied_by(second),
             _ => None,
         };
-    }
-
-    pub(crate) fn divide_by(&mut self, other: &CalcResult) {
-        // FIXME: Correctly handle division by zero.
-        self.value *= 1.0 / other.value;
-        self.numeric_type = match (&self.numeric_type, &other.numeric_type) {
-            (Some(first), Some(second)) => first.multiplied_by(&second.inverted()),
-            _ => None,
-        };
-    }
-
-    pub(crate) fn negate(&mut self) {
-        self.value = 0.0 - self.value;
     }
 
     pub(crate) fn invert(&mut self) {
@@ -344,7 +311,6 @@ impl CalcResult {
     }
 }
 
-#[allow(dead_code)]
 /// Resolves a length not handled by the shared resolver (container-relative
 /// units, which need the per-element query container lookup), to pixels.
 pub(crate) type LengthFallbackResolver<'a> = dyn Fn(f64, u8) -> Option<f64> + 'a;
@@ -454,6 +420,7 @@ pub unsafe extern "C" fn rust_numeric_type_operate(
     first: *const FfiNumericType,
     second: *const FfiNumericType,
 ) -> FfiNumericType {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     crate::abort_on_panic(|| {
         let first = unsafe { &*first }.to_calc();
         let second = unsafe { &*second }.to_calc();
@@ -475,7 +442,6 @@ pub type CalcRoundingStrategy = u8;
 /// One node of a calculation tree. Child nodes are shared immutably.
 ///
 /// https://www.w3.org/TR/css-values-4/#calculation-tree
-#[allow(dead_code)]
 pub enum CalcNode {
     /// A numeric leaf value.
     Numeric(CalcNumericValue),
@@ -553,7 +519,6 @@ pub enum CalcNode {
     },
 }
 
-#[allow(dead_code)]
 impl CalcNode {
     /// The node's children, for the traversals that do not care about the
     /// node kind.
@@ -625,7 +590,6 @@ impl CalcNode {
     /// The type of the calculation, mirroring the types the C++ nodes compute
     /// at creation. `percentage_leaf_type` is the type a percentage leaf takes
     /// in the surrounding context.
-    #[allow(dead_code)]
     pub(crate) fn numeric_type(&self, percentage_leaf_type: &CalcNumericType) -> Option<CalcNumericType> {
         let single = |base: usize| {
             let mut result = CalcNumericType::default();
@@ -803,7 +767,6 @@ pub struct CalcNodeHandle {
     node: *const CalcNode,
 }
 
-#[allow(dead_code)]
 impl CalcNodeHandle {
     /// # Safety
     /// `raw` must be a handle from one of the construction functions below.
@@ -856,6 +819,7 @@ unsafe fn children_from_raw(children: *const *const CalcNode, count: usize) -> V
 /// order number, angle, flex, frequency, length, percentage, resolution, time.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, unit: u8) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         let numeric = match kind {
             0 => CalcNumericValue::Number {
@@ -877,6 +841,7 @@ pub extern "C" fn rust_calc_node_create_numeric_dimension(kind: u8, value: f64, 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_calc_node_create_channel_keyword(channel: u8) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| handle(CalcNode::ChannelKeyword(channel)))
 }
 
@@ -891,6 +856,7 @@ pub unsafe extern "C" fn rust_calc_node_create_variadic(
     children: *const *const CalcNode,
     count: usize,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         let children = unsafe { children_from_raw(children, count) };
         let node = match kind {
@@ -913,6 +879,7 @@ pub unsafe extern "C" fn rust_calc_node_create_variadic(
 /// `child` must be a valid transferred handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_create_unary(kind: u8, child: *const CalcNode) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         let child = unsafe { Arc::from_raw(child) };
         let node = match kind {
@@ -945,6 +912,7 @@ pub unsafe extern "C" fn rust_calc_node_create_binary(
     first: *const CalcNode,
     second: *const CalcNode,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         let first = unsafe { Arc::from_raw(first) };
         let second = unsafe { Arc::from_raw(second) };
@@ -980,6 +948,7 @@ pub unsafe extern "C" fn rust_calc_node_create_clamp(
     center: *const CalcNode,
     max: *const CalcNode,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         handle(CalcNode::Clamp {
             min: unsafe { Arc::from_raw(min) },
@@ -998,6 +967,7 @@ pub unsafe extern "C" fn rust_calc_node_create_progress(
     from: *const CalcNode,
     to: *const CalcNode,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         handle(CalcNode::Progress {
             no_clamp,
@@ -1016,6 +986,7 @@ pub unsafe extern "C" fn rust_calc_node_create_round(
     value: *const CalcNode,
     interval: *const CalcNode,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         handle(CalcNode::Round {
             strategy,
@@ -1035,6 +1006,7 @@ pub unsafe extern "C" fn rust_calc_node_create_random(
     step: *const CalcNode,
     sharing: *const std::ffi::c_void,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         handle(CalcNode::Random {
             min: unsafe { Arc::from_raw(min) },
@@ -1056,6 +1028,7 @@ pub unsafe extern "C" fn rust_calc_node_create_non_math_function(
     value: *const std::ffi::c_void,
     numeric_type: *const FfiNumericType,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeBuildEntry);
     crate::abort_on_panic(|| {
         handle(CalcNode::NonMathFunction {
             value: unsafe { RetainedStyleValue::from_shell_pointer(value) },
@@ -1068,6 +1041,7 @@ pub unsafe extern "C" fn rust_calc_node_create_non_math_function(
 /// `node` must be a valid transferred handle; this releases it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeRetainReleaseEntry);
     crate::abort_on_panic(|| drop(unsafe { Arc::from_raw(node) }));
 }
 
@@ -1078,6 +1052,7 @@ pub unsafe extern "C" fn rust_calc_node_release(node: *const CalcNode) {
 /// `node` must be a valid calculation node pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_retain(node: *const CalcNode) {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeRetainReleaseEntry);
     crate::abort_on_panic(|| unsafe { Arc::increment_strong_count(node) });
 }
 
@@ -1095,6 +1070,7 @@ pub unsafe extern "C" fn rust_calc_node_determine_type(
     resolve_as_is_number: bool,
     resolve_as_base: u8,
 ) -> FfiNumericType {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| {
         let resolve_as = resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base);
         let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
@@ -1108,12 +1084,12 @@ pub unsafe extern "C" fn rust_calc_node_determine_type(
 /// `node` must be a valid calculation node pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_contains_percentage(node: *const CalcNode) -> bool {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| unsafe { &*node }.contains_percentage())
 }
 
 /// What percentages resolve against in the surrounding context.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ResolveAs {
     Number,
     /// A base type index, in the numeric type order.
@@ -1121,7 +1097,6 @@ pub(crate) enum ResolveAs {
 }
 
 /// The inputs a calculation evaluation takes from the surrounding context.
-#[allow(dead_code)]
 pub(crate) struct CalcEvaluationContext<'a> {
     /// The type a percentage leaf takes in this context.
     pub percentage_leaf_type: &'a CalcNumericType,
@@ -1141,7 +1116,6 @@ pub(crate) type RandomBaseValueResolver<'a> = &'a dyn Fn(&RetainedStyleValue) ->
 
 /// The C++ seams the simplification needs: resolving a non-math function to a
 /// calculation subtree, and looking up a relative-color channel value.
-#[allow(dead_code)]
 pub(crate) struct CalcSimplifyCallbacks<'a> {
     pub resolve_non_math_function: &'a dyn Fn(&RetainedStyleValue) -> Option<Arc<CalcNode>>,
     pub resolve_channel_keyword: &'a dyn Fn(u8) -> Option<f64>,
@@ -1166,7 +1140,6 @@ fn is_canonical_unit(value: CalcNumericValue) -> bool {
     }
 }
 
-#[allow(dead_code)]
 impl CalcNode {
     /// Mirrors try_get_value_with_canonical_unit: a numeric child in its
     /// canonical unit whose percentages are resolved, as an evaluation result.
@@ -1664,7 +1637,6 @@ impl CalcNode {
     }
 }
 
-#[allow(dead_code)]
 impl CalcNumericType {
     /// https://drafts.css-houdini.org/css-typed-om-1/#cssnumericvalue-match
     /// The single base type whose entry is 1 while all other entries are 0.
@@ -1737,7 +1709,6 @@ fn canonical_unit_code(ratios: &[f64]) -> u8 {
         .expect("dimension has a canonical unit") as u8
 }
 
-#[allow(dead_code)]
 fn make_calc_result_node(result: &CalcResult, resolve_as: Option<ResolveAs>) -> Option<CalcNode> {
     // Mirrors make_calculation_node: express the result in its type's
     // canonical unit, or fail when the type matches nothing expressible.
@@ -1785,7 +1756,6 @@ fn make_calc_result_node(result: &CalcResult, resolve_as: Option<ResolveAs>) -> 
 
 /// Whether two numeric leaves are expressed in the same unit, so they can be
 /// merged or compared directly.
-#[allow(dead_code)]
 fn same_unit(a: CalcNumericValue, b: CalcNumericValue) -> bool {
     match (a, b) {
         (CalcNumericValue::Number { .. }, CalcNumericValue::Number { .. }) => true,
@@ -1800,7 +1770,6 @@ fn same_unit(a: CalcNumericValue, b: CalcNumericValue) -> bool {
     }
 }
 
-#[allow(dead_code)]
 impl CalcNumericValue {
     fn raw(self) -> f64 {
         match self {
@@ -1885,7 +1854,6 @@ impl CalcNumericValue {
     }
 }
 
-#[allow(dead_code)]
 impl CalcNode {
     /// https://drafts.csswg.org/css-values-4/#calc-simplification
     /// Simplifies a calculation tree, mirroring the C++ driver: leaves resolve
@@ -2720,6 +2688,7 @@ pub unsafe extern "C" fn rust_calc_resolve(
     context: *const FfiCalcResolutionContext,
     apply_censoring_and_clamping: bool,
 ) -> FfiResolvedCalc {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     use crate::style_value::StyleValueData;
     crate::abort_on_panic(|| {
         let StyleValueData::Calculated {
@@ -2783,7 +2752,6 @@ pub struct FfiCalcSerializationCallbacks {
     pub append_channel_name: unsafe extern "C" fn(context: *mut std::ffi::c_void, channel: u8),
 }
 
-#[allow(dead_code)]
 impl CalcNumericValue {
     fn leaf_parts(self) -> (u8, f64, u8) {
         match self {
@@ -2812,23 +2780,22 @@ impl CalcNumericValue {
     }
 }
 
-#[allow(dead_code)]
 struct CalcSerializer<'a> {
     callbacks: &'a FfiCalcSerializationCallbacks,
     resolved_mode: bool,
-    resolve_as: Option<ResolveAs>,
     resolve_numbers_as_integers: bool,
     accepted_ranges: &'a [crate::style_value::RetainedNumericRangeByType],
 }
 
-#[allow(dead_code)]
 impl CalcSerializer<'_> {
     fn literal(&self, text: &str) {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcSerializationCallback);
         unsafe { (self.callbacks.append_literal)(self.callbacks.context, text.as_ptr(), text.len()) };
     }
 
     fn leaf(&self, value: CalcNumericValue) {
         let (kind, raw, unit) = value.leaf_parts();
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcSerializationCallback);
         unsafe { (self.callbacks.append_numeric_leaf)(self.callbacks.context, kind, raw, unit, self.resolved_mode) };
     }
 
@@ -2960,6 +2927,7 @@ impl CalcSerializer<'_> {
         } = &**node
         {
             self.literal("random(");
+            crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcSerializationCallback);
             let appended =
                 unsafe { (self.callbacks.append_style_value)(self.callbacks.context, sharing.shell_pointer()) };
             if appended {
@@ -3103,11 +3071,13 @@ impl CalcSerializer<'_> {
             //    rules for it and return the result.
             CalcNode::Numeric(value) => self.leaf(*value),
             CalcNode::NonMathFunction { value, .. } => {
+                crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcSerializationCallback);
                 unsafe { (self.callbacks.append_style_value)(self.callbacks.context, value.shell_pointer()) };
             }
             // AD-HOC: ChannelKeyword nodes, used for relative-color syntax, serialize directly as
             //         the keyword name.
             CalcNode::ChannelKeyword(channel) => unsafe {
+                crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcSerializationCallback);
                 (self.callbacks.append_channel_name)(self.callbacks.context, *channel);
             },
             // 4. If root is a Negate node, let s be a string initially containing "(-1 * ".
@@ -3223,13 +3193,11 @@ pub unsafe extern "C" fn rust_calc_serialize(
     callbacks: *const FfiCalcSerializationCallbacks,
     resolved_mode: bool,
 ) {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     use crate::style_value::StyleValueData;
     crate::abort_on_panic(|| {
         let StyleValueData::Calculated {
             rust_calculation,
-            has_percentages_resolve_as,
-            resolve_as_is_number,
-            resolve_as_base,
             resolve_numbers_as_integers,
             accepted_ranges,
             ..
@@ -3238,17 +3206,9 @@ pub unsafe extern "C" fn rust_calc_serialize(
             unreachable!("rust_calc_serialize requires calculated value data");
         };
         let root = rust_calculation.node_arc();
-        let resolve_as = if !has_percentages_resolve_as {
-            None
-        } else if *resolve_as_is_number {
-            Some(ResolveAs::Number)
-        } else {
-            Some(ResolveAs::Base(*resolve_as_base))
-        };
         let serializer = CalcSerializer {
             callbacks: unsafe { &*callbacks },
             resolved_mode,
-            resolve_as,
             resolve_numbers_as_integers: *resolve_numbers_as_integers,
             accepted_ranges: accepted_ranges.as_slice(),
         };
@@ -3256,7 +3216,6 @@ pub unsafe extern "C" fn rust_calc_serialize(
     });
 }
 
-#[allow(dead_code)]
 impl CalcNode {
     /// Structural equality over two calculation trees, mirroring the C++ node
     /// equals implementations: kinds, leaf values and child structures must
@@ -3446,6 +3405,7 @@ pub unsafe extern "C" fn rust_calc_equals(
         b: *const std::ffi::c_void,
     ) -> bool,
 ) -> bool {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     use crate::style_value::StyleValueData;
     crate::abort_on_panic(|| {
         let tree_of = |data: *const std::ffi::c_void| {
@@ -3465,7 +3425,6 @@ pub unsafe extern "C" fn rust_calc_equals(
 
 /// The node kind codes exposed to the C++ read API, in a stable documented
 /// order for the reification walk.
-#[allow(dead_code)]
 fn node_kind_code(node: &CalcNode) -> u8 {
     match node {
         CalcNode::Numeric(..) => 0,
@@ -3504,6 +3463,7 @@ fn node_kind_code(node: &CalcNode) -> u8 {
 /// `node` must be a valid calculation node pointer for all read functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_kind(node: *const CalcNode) -> u8 {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| node_kind_code(unsafe { &*node }))
 }
 
@@ -3518,6 +3478,7 @@ pub unsafe extern "C" fn rust_calc_node_children(
     out_children: *mut *const CalcNode,
     capacity: usize,
 ) -> usize {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| {
         let mut count = 0;
         unsafe { &*node }.for_each_child(&mut |child| {
@@ -3541,6 +3502,7 @@ pub unsafe extern "C" fn rust_calc_node_numeric_leaf(
     out_value: *mut f64,
     out_unit: *mut u8,
 ) -> bool {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| {
         let CalcNode::Numeric(value) = (unsafe { &*node }) else {
             return false;
@@ -3562,6 +3524,7 @@ pub unsafe extern "C" fn rust_calc_node_numeric_leaf(
 /// `node` must be a valid calculation node pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_calc_node_style_value(node: *const CalcNode) -> *const std::ffi::c_void {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     crate::abort_on_panic(|| match unsafe { &*node } {
         CalcNode::Random { sharing, .. } => sharing.shell_pointer(),
         CalcNode::NonMathFunction { value, .. } => value.shell_pointer(),
@@ -3579,6 +3542,7 @@ pub unsafe extern "C" fn rust_calc_node_numeric_type(
     calculated: *const std::ffi::c_void,
     node: *const CalcNode,
 ) -> FfiNumericType {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcNodeQueryEntry);
     use crate::style_value::StyleValueData;
     crate::abort_on_panic(|| {
         let StyleValueData::Calculated {
@@ -3619,6 +3583,7 @@ pub unsafe extern "C" fn rust_calc_simplify_tree(
     resolve_as_is_number: bool,
     resolve_as_base: u8,
 ) -> *const CalcNode {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     crate::abort_on_panic(|| {
         let context = unsafe { &*context };
         unsafe { Arc::increment_strong_count(root) };
@@ -3652,6 +3617,7 @@ pub unsafe extern "C" fn rust_calc_absolutize(
     calculated: *const std::ffi::c_void,
     context: *const FfiCalcResolutionContext,
 ) -> FfiAbsolutizedCalc {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CalcOperationEntry);
     use crate::style_value::StyleValueData;
     crate::abort_on_panic(|| {
         let StyleValueData::Calculated {

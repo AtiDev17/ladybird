@@ -305,6 +305,80 @@ TEST_CASE(www_and_bare_hosts_share_a_diversity_family)
     EXPECT_EQ(results[3].text, "https://third.example/example"sv);
 }
 
+TEST_CASE(equivalent_origin_presentations_do_not_crowd_out_deep_pages)
+{
+    auto results = WebView::mux_autocomplete_suggestions(
+        "frag"sv,
+        search("frag"sv, 900, true),
+        {
+            history("https://www.fragrantica.com/"sv, 1484),
+            history("https://fragnado.com/"sv, 1009),
+            history("https://fragonard.com/"sv, 1005),
+            history("https://fragrantica.com/"sv, 934),
+            history("https://www.fragrantica.com/perfume/Indult/Manakara-4345.html"sv, 746),
+        },
+        { search("fragrantica perfume"sv, 700) },
+        8);
+
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://www.fragrantica.com/"sv;
+    }));
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://www.fragrantica.com/perfume/Indult/Manakara-4345.html"sv;
+    }));
+    EXPECT(!results.contains([](auto const& result) {
+        return result.text == "https://fragrantica.com/"sv;
+    }));
+}
+
+TEST_CASE(untitled_origin_presentation_does_not_bridge_distinct_titles)
+{
+    auto first_titled = history("https://example.com/"sv, 1000);
+    first_titled.title = "First title"_string;
+    auto untitled = history("https://www.example.com/"sv, 1100);
+    auto second_titled = history("https://user@example.com/"sv, 900);
+    second_titled.title = "Second title"_string;
+
+    auto results = WebView::mux_autocomplete_suggestions(
+        "example"sv,
+        {},
+        { move(first_titled), move(untitled), move(second_titled) },
+        {},
+        8);
+
+    EXPECT_EQ(results.size(), 2u);
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://www.example.com/"sv;
+    }));
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://user@example.com/"sv;
+    }));
+}
+
+TEST_CASE(untitled_origin_group_adopts_a_later_title)
+{
+    auto untitled = history("https://www.example.com/"sv, 1100);
+    auto first_titled = history("https://example.com/"sv, 1000);
+    first_titled.title = "First title"_string;
+    auto second_titled = history("https://user@example.com/"sv, 900);
+    second_titled.title = "Second title"_string;
+
+    auto results = WebView::mux_autocomplete_suggestions(
+        "example"sv,
+        {},
+        { move(untitled), move(first_titled), move(second_titled) },
+        {},
+        8);
+
+    EXPECT_EQ(results.size(), 2u);
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://www.example.com/"sv;
+    }));
+    EXPECT(results.contains([](auto const& result) {
+        return result.text == "https://user@example.com/"sv;
+    }));
+}
+
 TEST_CASE(a_scheme_does_not_disable_origin_diversity)
 {
     auto results = WebView::mux_autocomplete_suggestions(

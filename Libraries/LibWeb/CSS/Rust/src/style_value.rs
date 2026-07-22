@@ -51,6 +51,7 @@ impl RetainedStyleValue {
     /// # Safety
     /// `pointer` must point at a live StyleValue shell.
     pub(crate) unsafe fn from_borrowed_shell_pointer(pointer: *const c_void) -> Self {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellRetainCallback);
         unsafe { ladybird_style_value_ref(pointer) };
         Self { pointer }
     }
@@ -61,10 +62,19 @@ impl RetainedStyleValue {
     }
 }
 
+/// Retains one strong reference to a C++ StyleValue shell for a reference
+/// slot poked into a style group payload.
+pub(crate) fn retain_shell_pointer(pointer: *const c_void) {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellRetainCallback);
+    // SAFETY: The caller guarantees a live shell.
+    unsafe { ladybird_style_value_ref(pointer) };
+}
+
 impl Drop for RetainedStyleValue {
     fn drop(&mut self) {
         // A null pointer represents an absent optional reference.
         if !self.pointer.is_null() {
+            crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellReleaseCallback);
             unsafe { ladybird_style_value_unref(self.pointer) };
         }
     }
@@ -90,6 +100,7 @@ impl RetainedUtf16FlyString {
     /// # Safety
     /// `raw` must be the raw representation of a live fly string.
     pub(crate) unsafe fn from_borrowed_raw(raw: usize) -> Self {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StringRetainReleaseCallback);
         unsafe { ladybird_utf16_fly_string_ref(raw) };
         Self { raw }
     }
@@ -97,6 +108,7 @@ impl RetainedUtf16FlyString {
 
 impl Drop for RetainedUtf16FlyString {
     fn drop(&mut self) {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StringRetainReleaseCallback);
         unsafe { ladybird_utf16_fly_string_unref(self.raw) };
     }
 }
@@ -199,6 +211,7 @@ pub struct RetainedString {
 
 impl Drop for RetainedString {
     fn drop(&mut self) {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StringRetainReleaseCallback);
         unsafe { ladybird_string_unref(self.raw) };
     }
 }
@@ -540,7 +553,6 @@ pub struct RetainedNumericRangeByType {
     max: f64,
 }
 
-#[allow(dead_code)]
 impl RetainedNumericRangeByType {
     pub(crate) fn value_type(&self) -> u8 {
         self.value_type
@@ -560,7 +572,6 @@ pub struct RetainedNumericRangeList {
 
 retained_list!(RetainedNumericRangeList, RetainedNumericRangeByType);
 
-#[allow(dead_code)]
 impl RetainedNumericRangeList {
     pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
         if self.pointer.is_null() {
@@ -2204,6 +2215,7 @@ pub unsafe extern "C" fn rust_style_value_create_image(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_destroy(value: *mut StyleValueData) {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueDestroyEntry);
     abort_on_panic(|| {
         if value.is_null() {
             return;
@@ -2216,7 +2228,7 @@ pub unsafe extern "C" fn rust_style_value_destroy(value: *mut StyleValueData) {
 /// currentcolor keyword itself, or a color function, color-mix(), contrast-color() or
 /// light-dark() whose nested colors do. `data_of` maps a nested value's shell pointer to
 /// its Rust-owned data.
-fn value_depends_on_current_color(
+pub(crate) fn value_depends_on_current_color(
     value: &StyleValueData,
     data_of: unsafe extern "C" fn(*const c_void) -> *const c_void,
 ) -> bool {
@@ -2249,5 +2261,6 @@ pub unsafe extern "C" fn rust_style_value_depends_on_current_color(
     data: *const c_void,
     data_of: unsafe extern "C" fn(shell: *const c_void) -> *const c_void,
 ) -> bool {
+    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueQueryEntry);
     crate::abort_on_panic(|| value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }, data_of))
 }

@@ -1418,6 +1418,12 @@ void Document::tear_down_layout_tree()
     m_needs_full_layout_tree_update = true;
 }
 
+void Document::tear_down_layout_tree_for_svg_image_document(Badge<SVG::SVGDecodedImageData>)
+{
+    clear_layout_and_paintable_nodes_for_inactive_document();
+    tear_down_layout_tree();
+}
+
 void Document::clear_layout_and_paintable_nodes_for_inactive_document()
 {
     for_each_in_inclusive_subtree([&](auto& node) {
@@ -8799,10 +8805,6 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     bool const line_box_border_overlays_replace_cacheable_content = config.should_show_line_box_borders;
     if (line_box_border_overlays_replace_cacheable_content)
         cache_mode = Painting::PaintCommandCacheMode::ReadOnly;
-
-    // Drop the inspector-overlay context nodes appended by the previous recording; this appends its own. Safe because
-    // the pruned tree only reaches the compositor together with (or after) the display list recorded against it here.
-    paintable()->prune_inspector_overlay_visual_contexts();
 
     auto display_list = Painting::DisplayList::create(paintable()->visual_context_tree());
     Painting::DisplayListRecorder display_list_recorder(display_list, paintable()->visual_context_tree(), resource_storage);

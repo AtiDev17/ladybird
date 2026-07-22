@@ -960,7 +960,7 @@ public:
         Yes,
     };
 
-    static NonnullRefPtr<ComputedValues const> create(ComputedProperties const&, DOM::Document const&, StyleScope const&, ColorResolutionContext);
+    static NonnullRefPtr<ComputedValues const> create(ComputedProperties const&, DOM::Document const&, StyleScope const&, ColorResolutionContext, ComputedValues const* inherit_parent = nullptr);
 
     RefPtr<StyleValue const> computed_style_value(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
     RefPtr<StyleValue const> computed_style_value_for_inheritance(PropertyID, WithAnimationsApplied = WithAnimationsApplied::Yes) const;
@@ -1655,7 +1655,8 @@ public:
 
     struct TextResetValues {
         static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::TextResetValues);
-        Vector<TextDecorationLine> text_decoration_line { InitialValues::text_decoration_line() };
+        // NB: A computed text-decoration-line of none is the empty list.
+        Vector<TextDecorationLine> text_decoration_line {};
         TextDecorationThickness text_decoration_thickness { TextDecorationThickness::Auto {} };
         TextDecorationStyle text_decoration_style { InitialValues::text_decoration_style() };
         Color text_decoration_color { InitialValues::color() };
@@ -1891,6 +1892,31 @@ public:
     void set_raw_cascaded_font_size(RefPtr<StyleValue const> value) { m_values.m_raw_cascaded_font_size = move(value); }
     void set_base_values(NonnullRefPtr<ComputedValues const> value) { m_values.m_base_values = move(value); }
     void set_animated_properties(AnimatedProperties const*);
+
+    // Adopts Rust-built group payloads, which arrive already carrying this
+    // reference.
+    void adopt_inherited_box_group(void* payload) { m_values.m_inherited.box.adopt(payload); }
+    void adopt_inherited_table_group(void* payload) { m_values.m_inherited.table.adopt(payload); }
+    void adopt_alignment_group(void* payload) { m_values.m_noninherited.alignment.adopt(payload); }
+    void adopt_text_reset_group(void* payload) { m_values.m_noninherited.text_reset.adopt(payload); }
+    void adopt_effects_group(void* payload) { m_values.m_noninherited.effects.adopt(payload); }
+    void adopt_misc_reset_group(void* payload) { m_values.m_noninherited.misc.adopt(payload); }
+    void adopt_inherited_text_group(void* payload) { m_values.m_inherited.text.adopt(payload); }
+    void adopt_inherited_ui_group(void* payload) { m_values.m_inherited.ui.adopt(payload); }
+    void adopt_sizing_group(void* payload) { m_values.m_noninherited.sizing.adopt(payload); }
+    void adopt_transform_group(void* payload) { m_values.m_noninherited.transform.adopt(payload); }
+    void adopt_mask_group(void* payload) { m_values.m_noninherited.mask_data.adopt(payload); }
+    void adopt_grid_group(void* payload) { m_values.m_noninherited.grid.adopt(payload); }
+    void adopt_animation_group(void* payload) { m_values.m_noninherited.animation.adopt(payload); }
+    void adopt_svg_reset_group(void* payload) { m_values.m_noninherited.svg_reset.adopt(payload); }
+    void adopt_inherited_svg_group(void* payload) { m_values.m_inherited.svg.adopt(payload); }
+    void adopt_inherited_list_group(void* payload) { m_values.m_inherited.list.adopt(payload); }
+    void adopt_content_group(void* payload) { m_values.m_noninherited.content_data.adopt(payload); }
+    void adopt_anchor_group(void* payload) { m_values.m_noninherited.anchor.adopt(payload); }
+    void adopt_box_group(void* payload) { m_values.m_noninherited.box.adopt(payload); }
+    void adopt_surround_group(void* payload) { m_values.m_noninherited.surround.adopt(payload); }
+    void adopt_border_group(void* payload) { m_values.m_noninherited.border.adopt(payload); }
+    void adopt_background_group(void* payload) { m_values.m_noninherited.background.adopt(payload); }
 
     void set_aspect_ratio(AspectRatio aspect_ratio)
     {
