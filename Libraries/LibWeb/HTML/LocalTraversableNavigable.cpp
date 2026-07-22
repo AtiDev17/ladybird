@@ -10,6 +10,7 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
+#include <LibGC/RootVector.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SkiaBackendContext.h>
@@ -53,8 +54,8 @@ LocalTraversableNavigable::~LocalTraversableNavigable() = default;
 void LocalTraversableNavigable::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    if (m_emulated_position_data.has<GC::Ref<Geolocation::GeolocationCoordinates>>())
-        visitor.visit(m_emulated_position_data.get<GC::Ref<Geolocation::GeolocationCoordinates>>());
+    visitor.visit(m_emulated_position_data);
+    visitor.visit(m_emulated_position_data_observers);
     visitor.visit(m_session_history_traversal_queue);
     visitor.visit(m_storage_shed);
     visitor.visit(m_apply_history_step_state);
@@ -150,23 +151,9 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_fresh_top
     auto traversable = create_a_new_top_level_traversable(page, nullptr, {});
     page->set_top_level_traversable(traversable);
 
-    // AD-HOC: Set the default top-level emulated position data for the traversable, which points to Market St. SF.
-    // FIXME: We should not emulate by default, but ask the user what to do. E.g. disable Geolocation, set an emulated
-    //        position, or allow Ladybird to engage with the system's geolocation services. This is completely separate
-    //        from the permission model for "powerful features" such as Geolocation.
-    auto& realm = traversable->active_document()->realm();
-    auto emulated_position_coordinates = realm.create<Geolocation::GeolocationCoordinates>(
-        realm,
-        Geolocation::CoordinatesData {
-            .accuracy = 100.0,
-            .latitude = 37.7647658,
-            .longitude = -122.4345892,
-            .altitude = 60.0,
-            .altitude_accuracy = 10.0,
-            .heading = 0.0,
-            .speed = 0.0,
-        });
-    traversable->set_emulated_position_data(emulated_position_coordinates);
+    // AD-HOC: Deny geolocation until the UI process sends the browser-wide setting via IPC. This prevents a request
+    //         from observing the test position during the short window before the initial settings IPC arrives.
+    traversable->set_emulated_position_data(Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied);
 
     // AD-HOC: Mark the about:blank document as finished parsing if we're only going to about:blank
     //         Skip the initial navigation as well. This matches the behavior of the window open steps.
@@ -2637,6 +2624,34 @@ void LocalTraversableNavigable::set_emulated_position_data(Geolocation::Emulated
 {
     VERIFY(is_top_level_traversable());
     m_emulated_position_data = data;
+
+    GC::RootVector<GC::Ref<GC::Function<void()>>> observers;
+    for (auto& observer : m_emulated_position_data_observers)
+        observers.append(observer.value);
+    for (auto& observer : observers)
+        observer->function()();
+}
+
+void LocalTraversableNavigable::set_emulated_position_data(Geolocation::CoordinatesData coordinates_data)
+{
+    VERIFY(is_top_level_traversable());
+    auto& realm = active_document()->realm();
+    auto coords = realm.create<Geolocation::GeolocationCoordinates>(realm, move(coordinates_data));
+    set_emulated_position_data(coords);
+}
+
+u64 LocalTraversableNavigable::register_emulated_position_data_observer(GC::Ref<GC::Function<void()>> observer)
+{
+    VERIFY(is_top_level_traversable());
+    auto observer_id = m_next_emulated_position_data_observer_id++;
+    m_emulated_position_data_observers.set(observer_id, observer);
+    return observer_id;
+}
+
+void LocalTraversableNavigable::unregister_emulated_position_data_observer(u64 observer_id)
+{
+    VERIFY(is_top_level_traversable());
+    m_emulated_position_data_observers.remove(observer_id);
 }
 
 void LocalTraversableNavigable::process_screenshot_requests()
