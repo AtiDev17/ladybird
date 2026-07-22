@@ -152,14 +152,13 @@ private:
         output.namespace_ = store_string(qualified_name.namespace_);
         output.name = store_string(qualified_name.name.name);
         output.lowercase_name = store_string(qualified_name.name.lowercase_name);
+        output.interned_name = reinterpret_cast<uintptr_t const*>(&qualified_name.name.name);
+        output.interned_lowercase_name = reinterpret_cast<uintptr_t const*>(&qualified_name.name.lowercase_name);
     }
 
     SelectorFFI::SimpleSelector compile_simple_selector(Selector::SimpleSelector const& simple_selector)
     {
         SelectorFFI::SimpleSelector output {};
-        // NB: The C++ simple selector outlives the compiled Rust selector, so matching callbacks
-        //     can use this pointer to compare interned strings without copying them.
-        output.cxx_simple_selector = &simple_selector;
 
         switch (simple_selector.type) {
         case Selector::SimpleSelector::Type::Universal:
@@ -173,10 +172,12 @@ private:
         case Selector::SimpleSelector::Type::Id:
             output.selector_type = SelectorFFI::SimpleSelectorType::Id;
             output.name = store_string(simple_selector.id_name());
+            output.interned_name = reinterpret_cast<uintptr_t const*>(&simple_selector.id_name());
             break;
         case Selector::SimpleSelector::Type::Class:
             output.selector_type = SelectorFFI::SimpleSelectorType::Class;
             output.name = store_string(simple_selector.class_name());
+            output.interned_name = reinterpret_cast<uintptr_t const*>(&simple_selector.class_name());
             break;
         case Selector::SimpleSelector::Type::Attribute: {
             output.selector_type = SelectorFFI::SimpleSelectorType::Attribute;
@@ -230,6 +231,7 @@ private:
 
         if (pseudo_class.ident.has_value()) {
             output.identifier = store_string(pseudo_class.ident->string_value);
+            output.interned_name = reinterpret_cast<uintptr_t const*>(&pseudo_class.ident->string_value);
             if (pseudo_class.ident->keyword == Keyword::Ltr)
                 output.direction = SelectorFFI::Direction::LeftToRight;
             else if (pseudo_class.ident->keyword == Keyword::Rtl)

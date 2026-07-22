@@ -65,16 +65,17 @@ pub struct QualifiedName {
     pub namespace: SelectorString,
     pub name: SelectorString,
     pub lowercase_name: SelectorString,
-    /// Pointer to the C++ simple selector this was compiled from, so that matching callbacks can
-    /// compare its interned strings without copying. Null in unit tests.
-    cxx_simple_selector: RetainedCxxPointer,
+    interned_name: Option<usize>,
+    interned_lowercase_name: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NameSelector {
     pub name: SelectorString,
-    /// See [`QualifiedName::cxx_simple_selector`].
-    cxx_simple_selector: RetainedCxxPointer,
+    /// The one-word identity of the C++ `Utf16FlyString` backing `name`. This is present for
+    /// selectors compiled from C++ and allows the live DOM wrapper to compare interned names
+    /// without crossing the FFI.
+    interned_name: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,9 +150,8 @@ pub struct PseudoClassSelector {
     pub languages: Box<[SelectorString]>,
     pub direction: Option<Direction>,
     pub identifier: Option<SelectorString>,
+    pub identifier_identity: Option<usize>,
     pub levels: Box<[i64]>,
-    /// See [`QualifiedName::cxx_simple_selector`].
-    cxx_simple_selector: RetainedCxxPointer,
 }
 
 impl PseudoClassSelector {
@@ -164,8 +164,8 @@ impl PseudoClassSelector {
             languages: Box::new([]),
             direction: None,
             identifier: None,
+            identifier_identity: None,
             levels: Box::new([]),
-            cxx_simple_selector: RetainedCxxPointer::default(),
         }
     }
 }
@@ -1479,6 +1479,37 @@ pub enum FfiDirection {
     Other,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+// NB: Constructed by C++ through the FFI.
+#[allow(dead_code)]
+pub enum FfiMeterValueState {
+    NotMeter,
+    EvenLessGood,
+    Suboptimal,
+    Optimal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+// NB: Constructed by C++ through the FFI.
+#[allow(dead_code)]
+pub enum FfiRequiredState {
+    NotApplicable,
+    Optional,
+    Required,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+// NB: Constructed by C++ through the FFI.
+#[allow(dead_code)]
+pub enum FfiValidityState {
+    NotApplicable,
+    Invalid,
+    Valid,
+}
+
 #[derive(Clone, Copy)]
 #[repr(u8)]
 // NB: Constructed by C++ through the FFI.
@@ -1511,7 +1542,8 @@ pub struct FfiStringView {
 #[repr(C)]
 pub struct FfiSimpleSelector {
     pub selector_type: FfiSimpleSelectorType,
-    pub cxx_simple_selector: *const c_void,
+    pub interned_name: *const usize,
+    pub interned_lowercase_name: *const usize,
     pub namespace_type: NamespaceType,
     pub namespace: FfiStringView,
     pub name: FfiStringView,
@@ -1559,6 +1591,466 @@ pub struct RustSelector {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+/// A DOM element borrowed for one selector-matching call.
+///
+/// This handle contains no DOM-derived state. All facts are read from C++ on demand so mutations
+/// observed by later matching calls cannot be hidden by retained data.
+pub struct FfiElement {
+    pub pointer: *const c_void,
+}
+
+impl FfiElement {
+    fn qualified_name(self) -> FfiElementQualifiedName {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_qualified_name(self.pointer) }
+    }
+
+    fn id(self) -> Option<usize> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element. A non-null result points at its
+        // current pinned `Utf16FlyString` storage for this matching call.
+        unsafe { selector_ffi_element_id(self.pointer).as_ref().copied() }
+    }
+
+    unsafe fn id_value<'a>(self) -> DomStringView<'a> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element. C++ returns its current ID with
+        // backing storage owned by the element for this matching call.
+        DomStringView {
+            // SAFETY: C++ guarantees that the returned string view remains valid for matching.
+            view: unsafe { selector_ffi_element_id_value(self.pointer) },
+            marker: PhantomData,
+        }
+    }
+
+    fn id_and_class_names_are_case_insensitive(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_id_and_class_names_are_case_insensitive(self.pointer) }
+    }
+
+    fn namespace_is_null(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_namespace_is_null(self.pointer) }
+    }
+
+    fn is_html_element_in_html_document(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_html_element_in_html_document(self.pointer) }
+    }
+
+    fn is_document_root(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_document_root(self.pointer) }
+    }
+
+    fn is_link(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_link(self.pointer) }
+    }
+
+    fn is_fullscreen(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_fullscreen(self.pointer) }
+    }
+
+    fn heading_level(self) -> Option<i64> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        match unsafe { selector_ffi_element_heading_level(self.pointer) } {
+            0 => None,
+            level => Some(level),
+        }
+    }
+
+    fn has_popover_attribute(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_has_popover_attribute(self.pointer) }
+    }
+
+    fn popover_is_showing(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_popover_is_showing(self.pointer) }
+    }
+
+    fn direction(self) -> Direction {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        match unsafe { selector_ffi_element_direction(self.pointer) } {
+            FfiDirection::LeftToRight => Direction::LeftToRight,
+            FfiDirection::RightToLeft => Direction::RightToLeft,
+            FfiDirection::None | FfiDirection::Other => unreachable!(),
+        }
+    }
+
+    fn has_custom_state(self, state: usize) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element and `state` is the copied identity of
+        // an interned selector identifier.
+        unsafe { selector_ffi_element_has_custom_state(self.pointer, state) }
+    }
+
+    unsafe fn language<'a>(self) -> Option<DomStringView<'a>> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element. C++ returns its current language with
+        // backing storage owned by the element for this matching call.
+        let view = unsafe { selector_ffi_element_language(self.pointer) };
+        (view.length != 0).then_some(DomStringView {
+            view,
+            marker: PhantomData,
+        })
+    }
+
+    fn is_focused(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_focused(self.pointer) }
+    }
+
+    fn should_indicate_focus(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_should_indicate_focus(self.pointer) }
+    }
+
+    fn has_focus_within(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_has_focus_within(self.pointer) }
+    }
+
+    fn is_active(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_active(self.pointer) }
+    }
+
+    fn is_checked(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_checked(self.pointer) }
+    }
+
+    fn is_defined(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_defined(self.pointer) }
+    }
+
+    fn is_disabled(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_disabled(self.pointer) }
+    }
+
+    fn is_enabled(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_enabled(self.pointer) }
+    }
+
+    fn is_local_link(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_local_link(self.pointer) }
+    }
+
+    fn is_placeholder_shown(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_placeholder_shown(self.pointer) }
+    }
+
+    fn is_target(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_target(self.pointer) }
+    }
+
+    fn is_unchecked(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_unchecked(self.pointer) }
+    }
+
+    fn is_media_element(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_media_element(self.pointer) }
+    }
+
+    fn media_is_blocked(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_media_is_blocked(self.pointer) }
+    }
+
+    fn media_is_muted(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_media_is_muted(self.pointer) }
+    }
+
+    fn media_is_paused(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_media_is_paused(self.pointer) }
+    }
+
+    fn media_is_seeking(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_media_is_seeking(self.pointer) }
+    }
+
+    fn media_is_stalled(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_media_is_stalled(self.pointer) }
+    }
+
+    fn is_default(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_default(self.pointer) }
+    }
+
+    fn meter_value_state(self) -> FfiMeterValueState {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_meter_value_state(self.pointer) }
+    }
+
+    fn meter_value_is_high(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_meter_value_is_high(self.pointer) }
+    }
+
+    fn meter_value_is_low(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_meter_value_is_low(self.pointer) }
+    }
+
+    fn is_hovered(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_hovered(self.pointer) }
+    }
+
+    fn is_indeterminate(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_indeterminate(self.pointer) }
+    }
+
+    fn validity_state(self) -> FfiValidityState {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_validity_state(self.pointer) }
+    }
+
+    fn is_modal(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_modal(self.pointer) }
+    }
+
+    fn is_open(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_open(self.pointer) }
+    }
+
+    fn required_state(self) -> FfiRequiredState {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_required_state(self.pointer) }
+    }
+
+    fn is_read_write(self) -> bool {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_is_read_write(self.pointer) }
+    }
+
+    fn user_validity_state(self) -> FfiValidityState {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_user_validity_state(self.pointer) }
+    }
+
+    unsafe fn local_name<'a>(self) -> DomStringView<'a> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element. C++ returns a string view borrowed
+        // from its current local name for this matching call.
+        DomStringView {
+            // SAFETY: C++ guarantees that the returned string view remains valid for matching.
+            view: unsafe { selector_ffi_element_local_name(self.pointer) },
+            marker: PhantomData,
+        }
+    }
+
+    unsafe fn class_name<'a>(self, index: usize) -> DomStringView<'a> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element and `index` identifies one of its
+        // current classes. C++ returns a view borrowed for this matching call.
+        DomStringView {
+            // SAFETY: The caller guarantees that `index` is within the current class list.
+            view: unsafe { selector_ffi_element_class_name(self.pointer, index) },
+            marker: PhantomData,
+        }
+    }
+
+    fn attribute_count(self) -> usize {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element for the duration of matching.
+        unsafe { selector_ffi_element_attribute_count(self.pointer) }
+    }
+
+    unsafe fn attribute<'a>(self, index: usize) -> DomAttribute<'a> {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element and `index` identifies one of its
+        // current attributes. C++ returns its facts and a value view borrowed for matching.
+        DomAttribute {
+            // SAFETY: The caller guarantees that `index` is within the current attribute list.
+            attribute: unsafe { selector_ffi_element_attribute(self.pointer, index) },
+            marker: PhantomData,
+        }
+    }
+
+    unsafe fn classes<'a>(self) -> &'a [usize] {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The handle identifies a live DOM element. C++ returns its current class storage,
+        // borrowed for this matching call.
+        let classes = unsafe { selector_ffi_element_classes(self.pointer) };
+        if classes.count == 0 {
+            return &[];
+        }
+        assert!(!classes.data.is_null());
+        // SAFETY: C++ guarantees that `Utf16FlyString` has the size and alignment of `usize` and
+        // that the element's class vector cannot mutate during this matching call.
+        unsafe { std::slice::from_raw_parts(classes.data, classes.count) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiElementQualifiedName {
+    pub local_name: *const usize,
+    pub namespace_: *const usize,
+}
+
+impl FfiElementQualifiedName {
+    fn local_name(self) -> Option<usize> {
+        // SAFETY: C++ points at the live element's pinned `Utf16FlyString` storage.
+        unsafe { self.local_name.as_ref().copied() }
+    }
+
+    fn namespace(self) -> Option<usize> {
+        // SAFETY: C++ points at the live element's pinned `Utf16FlyString` storage.
+        unsafe { self.namespace_.as_ref().copied() }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiInternedStringList {
+    pub data: *const usize,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiDomStringView {
+    pub data: *const c_void,
+    pub length: usize,
+    pub is_ascii: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiDomAttribute {
+    pub local_name: usize,
+    pub namespace_: usize,
+    pub has_namespace: bool,
+    pub value: FfiDomStringView,
+}
+
+#[derive(Clone, Copy)]
+struct DomAttribute<'a> {
+    attribute: FfiDomAttribute,
+    marker: PhantomData<&'a FfiCallScope>,
+}
+
+impl<'a> DomAttribute<'a> {
+    fn local_name(self) -> usize {
+        self.attribute.local_name
+    }
+
+    fn namespace(self) -> Option<usize> {
+        self.attribute.has_namespace.then_some(self.attribute.namespace_)
+    }
+
+    fn value(self) -> DomStringView<'a> {
+        DomStringView {
+            view: self.attribute.value,
+            marker: PhantomData,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DomStringView<'a> {
+    view: FfiDomStringView,
+    marker: PhantomData<&'a FfiCallScope>,
+}
+
+impl DomStringView<'_> {
+    fn len(self) -> usize {
+        self.view.length
+    }
+
+    fn code_unit_at(self, index: usize) -> u16 {
+        assert!(index < self.len());
+        assert!(!self.view.data.is_null());
+        if self.view.is_ascii {
+            // SAFETY: C++ guarantees that an ASCII view points at `length` bytes.
+            return u16::from(unsafe { *(self.view.data.cast::<u8>().add(index)) });
+        }
+        // SAFETY: C++ guarantees that a UTF-16 view points at `length` aligned code units.
+        unsafe { *(self.view.data.cast::<u16>().add(index)) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+// NB: Constructed by C++ through the FFI.
+#[allow(dead_code)]
+pub enum FfiResolvedNamespaceType {
+    Missing,
+    Null,
+    Named,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiResolvedNamespace {
+    pub namespace_type: FfiResolvedNamespaceType,
+    pub namespace_: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FfiNodeKind {
     Element,
     Scope,
@@ -1588,50 +2080,126 @@ impl FfiNode<'_> {
         assert_eq!(self.kind, FfiNodeKind::Element);
         self.pointer
     }
+
+    fn as_element(self) -> FfiElement {
+        assert_eq!(self.kind, FfiNodeKind::Element);
+        FfiElement { pointer: self.pointer }
+    }
+}
+
+impl<'a> FfiNode<'a> {
+    fn id_value(self) -> DomStringView<'a> {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current ID storage.
+        unsafe { self.as_element().id_value() }
+    }
+
+    fn classes(self) -> &'a [usize] {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current class storage.
+        unsafe { self.as_element().classes() }
+    }
+
+    fn local_name(self) -> DomStringView<'a> {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current local-name storage.
+        unsafe { self.as_element().local_name() }
+    }
+
+    fn class_name(self, index: usize) -> DomStringView<'a> {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current class-name storage. Callers obtain `index` from the same live class list.
+        unsafe { self.as_element().class_name(index) }
+    }
+
+    fn attribute_count(self) -> usize {
+        self.as_element().attribute_count()
+    }
+
+    fn attribute(self, index: usize) -> DomAttribute<'a> {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current attribute storage. Callers obtain `index` from the live attribute count.
+        unsafe { self.as_element().attribute(index) }
+    }
+
+    fn language(self) -> Option<DomStringView<'a>> {
+        // SAFETY: `FfiNode` cannot outlive the call scope which pins the C++ element and its
+        // current language storage.
+        unsafe { self.as_element().language() }
+    }
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiElementAndShadowHost {
-    pub element: *const c_void,
-    pub shadow_host: *const c_void,
+    pub element: FfiElement,
+    pub shadow_host: FfiElement,
 }
 
 unsafe extern "C" {
-    fn selector_ffi_matches_universal(
-        context: *mut c_void,
-        element: *const c_void,
-        cxx_simple_selector: *const c_void,
-    ) -> bool;
-    fn selector_ffi_matches_tag_name(
-        context: *mut c_void,
-        element: *const c_void,
-        cxx_simple_selector: *const c_void,
-        matching_mode: TagNameMatchingMode,
-    ) -> bool;
-    fn selector_ffi_matches_id(element: *const c_void, cxx_simple_selector: *const c_void) -> bool;
-    fn selector_ffi_matches_class(element: *const c_void, cxx_simple_selector: *const c_void) -> bool;
-    fn selector_ffi_matches_attribute(
-        context: *mut c_void,
-        element: *const c_void,
-        cxx_simple_selector: *const c_void,
-    ) -> bool;
-    fn selector_ffi_matches_pseudo_class(element: *const c_void, pseudo_class: u8) -> bool;
-    fn selector_ffi_matches_language(element: *const c_void, language: FfiStringView) -> bool;
-    fn selector_ffi_matches_direction(element: *const c_void, direction: FfiDirection) -> bool;
-    fn selector_ffi_matches_state(element: *const c_void, cxx_simple_selector: *const c_void) -> bool;
-    fn selector_ffi_matches_heading(element: *const c_void, levels: *const i64, level_count: usize) -> bool;
+    fn selector_ffi_element_qualified_name(element: *const c_void) -> FfiElementQualifiedName;
+    fn selector_ffi_element_id(element: *const c_void) -> *const usize;
+    fn selector_ffi_element_id_value(element: *const c_void) -> FfiDomStringView;
+    fn selector_ffi_element_classes(element: *const c_void) -> FfiInternedStringList;
+    fn selector_ffi_element_id_and_class_names_are_case_insensitive(element: *const c_void) -> bool;
+    fn selector_ffi_element_namespace_is_null(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_html_element_in_html_document(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_document_root(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_link(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_fullscreen(element: *const c_void) -> bool;
+    fn selector_ffi_element_heading_level(element: *const c_void) -> i64;
+    fn selector_ffi_element_has_popover_attribute(element: *const c_void) -> bool;
+    fn selector_ffi_element_popover_is_showing(element: *const c_void) -> bool;
+    fn selector_ffi_element_direction(element: *const c_void) -> FfiDirection;
+    fn selector_ffi_element_has_custom_state(element: *const c_void, state: usize) -> bool;
+    fn selector_ffi_element_language(element: *const c_void) -> FfiDomStringView;
+    fn selector_ffi_element_is_focused(element: *const c_void) -> bool;
+    fn selector_ffi_element_should_indicate_focus(element: *const c_void) -> bool;
+    fn selector_ffi_element_has_focus_within(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_active(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_checked(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_defined(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_disabled(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_enabled(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_local_link(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_placeholder_shown(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_target(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_unchecked(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_media_element(element: *const c_void) -> bool;
+    fn selector_ffi_element_media_is_blocked(element: *const c_void) -> bool;
+    fn selector_ffi_element_media_is_muted(element: *const c_void) -> bool;
+    fn selector_ffi_element_media_is_paused(element: *const c_void) -> bool;
+    fn selector_ffi_element_media_is_seeking(element: *const c_void) -> bool;
+    fn selector_ffi_element_media_is_stalled(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_default(element: *const c_void) -> bool;
+    fn selector_ffi_element_meter_value_state(element: *const c_void) -> FfiMeterValueState;
+    fn selector_ffi_element_meter_value_is_high(element: *const c_void) -> bool;
+    fn selector_ffi_element_meter_value_is_low(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_hovered(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_indeterminate(element: *const c_void) -> bool;
+    fn selector_ffi_element_validity_state(element: *const c_void) -> FfiValidityState;
+    fn selector_ffi_element_is_modal(element: *const c_void) -> bool;
+    fn selector_ffi_element_is_open(element: *const c_void) -> bool;
+    fn selector_ffi_element_required_state(element: *const c_void) -> FfiRequiredState;
+    fn selector_ffi_element_is_read_write(element: *const c_void) -> bool;
+    fn selector_ffi_element_user_validity_state(element: *const c_void) -> FfiValidityState;
+    fn selector_ffi_element_local_name(element: *const c_void) -> FfiDomStringView;
+    fn selector_ffi_element_class_name(element: *const c_void, index: usize) -> FfiDomStringView;
+    fn selector_ffi_element_attribute_count(element: *const c_void) -> usize;
+    fn selector_ffi_element_attribute(element: *const c_void, index: usize) -> FfiDomAttribute;
 
-    fn selector_ffi_parent_element(element: *const c_void, shadow_host: *const c_void) -> *const c_void;
-    fn selector_ffi_parent_element_in_light_tree(element: *const c_void) -> *const c_void;
-    fn selector_ffi_previous_element_sibling(element: *const c_void) -> *const c_void;
-    fn selector_ffi_next_element_sibling(element: *const c_void) -> *const c_void;
-    fn selector_ffi_first_element_child(element: *const c_void) -> *const c_void;
-    fn selector_ffi_first_element_descendant(element: *const c_void) -> *const c_void;
-    fn selector_ffi_next_element_descendant(element: *const c_void, root: *const c_void) -> *const c_void;
-    fn selector_ffi_has_no_element_or_nonempty_text_children(element: *const c_void) -> bool;
-    fn selector_ffi_has_same_type(first: *const c_void, second: *const c_void) -> bool;
-    fn selector_ffi_is_document_root(element: *const c_void) -> bool;
+    fn selector_ffi_default_namespace(context: *mut c_void) -> FfiResolvedNamespace;
+    fn selector_ffi_resolve_namespace(context: *mut c_void, prefix: FfiStringView) -> FfiResolvedNamespace;
+
+    fn selector_ffi_parent_element(element: *const c_void, shadow_host: *const c_void) -> FfiElement;
+    fn selector_ffi_parent_element_in_light_tree(element: *const c_void) -> FfiElement;
+    fn selector_ffi_previous_element_sibling(element: *const c_void) -> FfiElement;
+    fn selector_ffi_next_element_sibling(element: *const c_void) -> FfiElement;
+    fn selector_ffi_first_element_child(element: *const c_void) -> FfiElement;
+    fn selector_ffi_first_element_descendant(element: *const c_void) -> FfiElement;
+    fn selector_ffi_next_element_descendant(element: *const c_void, root: *const c_void) -> FfiElement;
+    fn selector_ffi_element_has_element_child(element: *const c_void) -> bool;
+    fn selector_ffi_element_has_nonempty_text_child(element: *const c_void) -> bool;
 
     fn selector_ffi_is_shadow_tree_slot(element: *const c_void) -> bool;
     fn selector_ffi_slotted_parent(context: *mut c_void, element: *const c_void) -> FfiElementAndShadowHost;
@@ -1672,6 +2240,343 @@ fn ffi_string_view(string: &[u16]) -> FfiStringView {
     }
 }
 
+fn ascii_lowercase(code_unit: u16) -> u16 {
+    if (u16::from(b'A')..=u16::from(b'Z')).contains(&code_unit) {
+        code_unit + u16::from(b'a' - b'A')
+    } else {
+        code_unit
+    }
+}
+
+fn utf16_equals_ignoring_ascii_case(first: DomStringView<'_>, second: &[u16]) -> bool {
+    first.len() == second.len()
+        && second
+            .iter()
+            .enumerate()
+            .all(|(index, &second)| ascii_lowercase(first.code_unit_at(index)) == ascii_lowercase(second))
+}
+
+fn utf16_equals(first: DomStringView<'_>, second: &[u16]) -> bool {
+    first.len() == second.len()
+        && second
+            .iter()
+            .enumerate()
+            .all(|(index, &second)| first.code_unit_at(index) == second)
+}
+
+struct SelectorSubtags<'a> {
+    value: &'a [u16],
+    position: usize,
+    finished: bool,
+}
+
+impl<'a> SelectorSubtags<'a> {
+    fn new(value: &'a [u16]) -> Self {
+        Self {
+            value,
+            position: 0,
+            finished: false,
+        }
+    }
+}
+
+impl Iterator for SelectorSubtags<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let start = self.position;
+        while self.position < self.value.len() && self.value[self.position] != u16::from(b'-') {
+            self.position += 1;
+        }
+        let end = self.position;
+        if self.position < self.value.len() {
+            self.position += 1;
+        } else {
+            self.finished = true;
+        }
+        Some(start..end)
+    }
+}
+
+struct DomSubtags<'a> {
+    value: DomStringView<'a>,
+    position: usize,
+    finished: bool,
+}
+
+impl<'a> DomSubtags<'a> {
+    fn new(value: DomStringView<'a>) -> Self {
+        Self {
+            value,
+            position: 0,
+            finished: false,
+        }
+    }
+}
+
+impl Iterator for DomSubtags<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let start = self.position;
+        while self.position < self.value.len() && self.value.code_unit_at(self.position) != u16::from(b'-') {
+            self.position += 1;
+        }
+        let end = self.position;
+        if self.position < self.value.len() {
+            self.position += 1;
+        } else {
+            self.finished = true;
+        }
+        Some(start..end)
+    }
+}
+
+fn language_subtags_match(
+    language_range: &[u16],
+    range_subtag: &std::ops::Range<usize>,
+    language_tag: DomStringView<'_>,
+    tag_subtag: &std::ops::Range<usize>,
+) -> bool {
+    if range_subtag.len() == 1 && language_range[range_subtag.start] == u16::from(b'*') {
+        return true;
+    }
+    range_subtag.len() == tag_subtag.len()
+        && (0..range_subtag.len()).all(|offset| {
+            ascii_lowercase(language_range[range_subtag.start + offset])
+                == ascii_lowercase(language_tag.code_unit_at(tag_subtag.start + offset))
+        })
+}
+
+fn is_ascii_alphanumeric(code_unit: u16) -> bool {
+    (u16::from(b'0')..=u16::from(b'9')).contains(&code_unit)
+        || (u16::from(b'A')..=u16::from(b'Z')).contains(&code_unit)
+        || (u16::from(b'a')..=u16::from(b'z')).contains(&code_unit)
+}
+
+// https://www.rfc-editor.org/rfc/rfc4647#section-3.3.2
+fn language_range_matches_tag(language_range: &[u16], language_tag: DomStringView<'_>) -> bool {
+    // 1. Split both the extended language range and the language tag being compared into a list
+    //    of subtags by dividing on the hyphen (%x2D) character.
+    let mut range_subtags = SelectorSubtags::new(language_range);
+    let mut tag_subtags = DomSubtags::new(language_tag);
+
+    //    Two subtags match if either they are the same when compared case-insensitively or the
+    //    language range's subtag is the wildcard '*'.
+
+    // 2. Begin with the first subtag in each list. If the first subtag in the range does not match
+    //    the first subtag in the tag, the overall match fails. Otherwise, move to the next subtag
+    //    in both the range and the tag.
+    let first_range_subtag = range_subtags.next().unwrap();
+    let first_tag_subtag = tag_subtags.next().unwrap();
+    if !language_subtags_match(language_range, &first_range_subtag, language_tag, &first_tag_subtag) {
+        return false;
+    }
+
+    let mut tag_subtag = tag_subtags.next();
+
+    // 3. While there are more subtags left in the language range's list:
+    for range_subtag in range_subtags {
+        // A. If the subtag currently being examined in the range is the wildcard ('*'), move to
+        //    the next subtag in the range and continue with the loop.
+        if range_subtag.len() == 1 && language_range[range_subtag.start] == u16::from(b'*') {
+            continue;
+        }
+
+        // B. Else, if there are no more subtags in the language tag's list, the match fails.
+        loop {
+            let Some(current_tag_subtag) = tag_subtag else {
+                return false;
+            };
+
+            // C. Else, if the current subtag in the range's list matches the current subtag in the
+            //    language tag's list, move to the next subtag in both lists and continue with the
+            //    loop.
+            if language_subtags_match(language_range, &range_subtag, language_tag, &current_tag_subtag) {
+                tag_subtag = tag_subtags.next();
+                break;
+            }
+
+            // D. Else, if the language tag's subtag is a "singleton" (a single letter or digit,
+            //    which includes the private-use subtag 'x') the match fails.
+            if current_tag_subtag.len() == 1
+                && is_ascii_alphanumeric(language_tag.code_unit_at(current_tag_subtag.start))
+            {
+                return false;
+            }
+
+            // E. Else, move to the next subtag in the language tag's list and continue with the
+            //    loop.
+            tag_subtag = tag_subtags.next();
+        }
+    }
+
+    // 4. When the language range's list has no more subtags, the match succeeds.
+    true
+}
+
+#[derive(Clone, Copy)]
+enum StringCaseSensitivity {
+    Sensitive,
+    AsciiInsensitive,
+}
+
+fn code_units_equal(first: u16, second: u16, case_sensitivity: StringCaseSensitivity) -> bool {
+    match case_sensitivity {
+        StringCaseSensitivity::Sensitive => first == second,
+        StringCaseSensitivity::AsciiInsensitive => ascii_lowercase(first) == ascii_lowercase(second),
+    }
+}
+
+fn dom_string_matches_at(
+    value: DomStringView<'_>,
+    start: usize,
+    selector_value: &[u16],
+    case_sensitivity: StringCaseSensitivity,
+) -> bool {
+    start
+        .checked_add(selector_value.len())
+        .is_some_and(|end| end <= value.len())
+        && selector_value
+            .iter()
+            .enumerate()
+            .all(|(index, &selector)| code_units_equal(value.code_unit_at(start + index), selector, case_sensitivity))
+}
+
+fn dom_string_equals(
+    value: DomStringView<'_>,
+    selector_value: &[u16],
+    case_sensitivity: StringCaseSensitivity,
+) -> bool {
+    value.len() == selector_value.len() && dom_string_matches_at(value, 0, selector_value, case_sensitivity)
+}
+
+fn matches_attribute_value(
+    match_type: AttributeMatchType,
+    selector_value: &[u16],
+    attribute_value: DomStringView<'_>,
+    case_sensitivity: StringCaseSensitivity,
+) -> bool {
+    match match_type {
+        AttributeMatchType::HasAttribute => true,
+        AttributeMatchType::ExactValue => dom_string_equals(attribute_value, selector_value, case_sensitivity),
+        AttributeMatchType::ContainsWord => {
+            if selector_value.is_empty()
+                || selector_value.contains(&u16::from(b' '))
+                || selector_value.len() > attribute_value.len()
+            {
+                return false;
+            }
+            (0..=attribute_value.len() - selector_value.len()).any(|start| {
+                (start == 0 || attribute_value.code_unit_at(start - 1) == u16::from(b' '))
+                    && (start + selector_value.len() == attribute_value.len()
+                        || attribute_value.code_unit_at(start + selector_value.len()) == u16::from(b' '))
+                    && dom_string_matches_at(attribute_value, start, selector_value, case_sensitivity)
+            })
+        }
+        AttributeMatchType::ContainsString => {
+            if selector_value.is_empty() || selector_value.len() > attribute_value.len() {
+                return false;
+            }
+            (0..=attribute_value.len() - selector_value.len())
+                .any(|start| dom_string_matches_at(attribute_value, start, selector_value, case_sensitivity))
+        }
+        AttributeMatchType::StartsWithSegment => {
+            if attribute_value.len() == 0 {
+                return selector_value.is_empty();
+            }
+            if selector_value.is_empty() || selector_value.len() > attribute_value.len() {
+                return false;
+            }
+            dom_string_matches_at(attribute_value, 0, selector_value, case_sensitivity)
+                && (selector_value.len() == attribute_value.len()
+                    || attribute_value.code_unit_at(selector_value.len()) == u16::from(b'-'))
+        }
+        AttributeMatchType::StartsWithString => {
+            !selector_value.is_empty() && dom_string_matches_at(attribute_value, 0, selector_value, case_sensitivity)
+        }
+        AttributeMatchType::EndsWithString => {
+            !selector_value.is_empty()
+                && selector_value.len() <= attribute_value.len()
+                && dom_string_matches_at(
+                    attribute_value,
+                    attribute_value.len() - selector_value.len(),
+                    selector_value,
+                    case_sensitivity,
+                )
+        }
+    }
+}
+
+fn utf16_equals_ascii(value: &[u16], ascii: &[u8]) -> bool {
+    value.len() == ascii.len()
+        && value
+            .iter()
+            .zip(ascii)
+            .all(|(&code_unit, &byte)| code_unit == u16::from(byte))
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+// Attribute selectors on an HTML element in an HTML document must treat the values of attributes
+// with the following names as ASCII case-insensitive:
+fn is_ascii_case_insensitive_html_attribute(name: &[u16]) -> bool {
+    const NAMES: &[&[u8]] = &[
+        b"accept",
+        b"accept-charset",
+        b"align",
+        b"alink",
+        b"axis",
+        b"bgcolor",
+        b"charset",
+        b"checked",
+        b"clear",
+        b"codetype",
+        b"color",
+        b"compact",
+        b"declare",
+        b"defer",
+        b"dir",
+        b"direction",
+        b"disabled",
+        b"enctype",
+        b"face",
+        b"frame",
+        b"hreflang",
+        b"http-equiv",
+        b"lang",
+        b"language",
+        b"link",
+        b"media",
+        b"method",
+        b"multiple",
+        b"nohref",
+        b"noresize",
+        b"noshade",
+        b"nowrap",
+        b"readonly",
+        b"rel",
+        b"rev",
+        b"rules",
+        b"scope",
+        b"scrolling",
+        b"selected",
+        b"shape",
+        b"target",
+        b"text",
+        b"type",
+        b"valign",
+        b"valuetype",
+        b"vlink",
+    ];
+    NAMES.iter().any(|candidate| utf16_equals_ascii(name, candidate))
+}
+
 struct FfiCallScope;
 
 struct FfiDom<'a> {
@@ -1705,9 +2610,9 @@ impl<'a> FfiDom<'a> {
         })
     }
 
-    unsafe fn element(&self, element: *const c_void) -> Option<FfiNode<'a>> {
+    unsafe fn element(&self, element: FfiElement) -> Option<FfiNode<'a>> {
         // SAFETY: The caller guarantees that a non-null pointer identifies a live DOM element.
-        unsafe { self.node(element, FfiNodeKind::Element) }
+        unsafe { self.node(element.pointer, FfiNodeKind::Element) }
     }
 
     unsafe fn scope(&self, scope: *const c_void) -> Option<FfiNode<'a>> {
@@ -1725,21 +2630,47 @@ impl<'a> FfiDom<'a> {
             self.element(value.shadow_host)
         }))
     }
+
+    fn default_namespace(&self) -> FfiResolvedNamespace {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The matching context remains live for this matching call.
+        unsafe { selector_ffi_default_namespace(self.context) }
+    }
+
+    fn resolve_namespace(&self, prefix: &[u16]) -> FfiResolvedNamespace {
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: The matching context remains live, and the prefix view is borrowed for this
+        // accessor call only.
+        unsafe { selector_ffi_resolve_namespace(self.context, ffi_string_view(prefix)) }
+    }
+
+    fn matches_resolved_namespace(&self, element: FfiNode<'a>, namespace: FfiResolvedNamespace) -> bool {
+        match namespace.namespace_type {
+            FfiResolvedNamespaceType::Missing => false,
+            FfiResolvedNamespaceType::Null => element.as_element().namespace_is_null(),
+            FfiResolvedNamespaceType::Named => {
+                element.as_element().qualified_name().namespace() == Some(namespace.namespace_)
+            }
+        }
+    }
 }
 
 impl<'a> SelectorDom for FfiDom<'a> {
     type Element = FfiNode<'a>;
 
     fn matches_universal_selector(&mut self, element: FfiNode<'a>, name: &QualifiedName) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-        // SAFETY: `FfiDom` guarantees that the context, element, and retained simple selector
-        // remain valid for the duration of matching.
-        unsafe {
-            selector_ffi_matches_universal(
-                self.context,
-                element.as_element_pointer(),
-                name.cxx_simple_selector.as_ptr(),
-            )
+        match name.namespace_type {
+            NamespaceType::Default => {
+                let namespace = self.default_namespace();
+                namespace.namespace_type == FfiResolvedNamespaceType::Missing
+                    || self.matches_resolved_namespace(element, namespace)
+            }
+            NamespaceType::None => element.as_element().namespace_is_null(),
+            NamespaceType::Any => true,
+            NamespaceType::Named => {
+                let namespace = self.resolve_namespace(&name.namespace);
+                self.matches_resolved_namespace(element, namespace)
+            }
         }
     }
 
@@ -1749,104 +2680,214 @@ impl<'a> SelectorDom for FfiDom<'a> {
         name: &QualifiedName,
         mode: TagNameMatchingMode,
     ) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-        // SAFETY: `FfiDom` guarantees that the context, element, and retained simple selector
-        // remain valid for the duration of matching.
-        unsafe {
-            selector_ffi_matches_tag_name(
-                self.context,
-                element.as_element_pointer(),
-                name.cxx_simple_selector.as_ptr(),
-                mode,
-            )
+        // https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+        // The same selector when compared to other elements must be compared according to its
+        // original case. In both cases, to match, the values must be identical to each other (and
+        // therefore the comparison is case sensitive).
+        let ffi_element = element.as_element();
+        let is_html_element_in_html_document = ffi_element.is_html_element_in_html_document();
+        let name_matches = if is_html_element_in_html_document || mode == TagNameMatchingMode::Fast {
+            let interned_name = if is_html_element_in_html_document {
+                name.interned_lowercase_name
+            } else {
+                name.interned_name
+            };
+            interned_name.is_some_and(|name| ffi_element.qualified_name().local_name() == Some(name))
+        } else {
+            utf16_equals(element.local_name(), &name.name)
+        };
+        if !name_matches {
+            return false;
         }
+        self.matches_universal_selector(element, name)
     }
 
     fn matches_id_selector(&mut self, element: FfiNode<'a>, id: &NameSelector) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-        // SAFETY: `FfiDom` guarantees that the element and retained simple selector remain valid
-        // for the duration of matching.
-        unsafe { selector_ffi_matches_id(element.as_element_pointer(), id.cxx_simple_selector.as_ptr()) }
+        let ffi_element = element.as_element();
+        if ffi_element.id_and_class_names_are_case_insensitive() {
+            return utf16_equals_ignoring_ascii_case(element.id_value(), &id.name);
+        }
+        id.interned_name.is_some_and(|id| ffi_element.id() == Some(id))
     }
 
     fn matches_class_selector(&mut self, element: FfiNode<'a>, class_name: &NameSelector) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-        // SAFETY: `FfiDom` guarantees that the element and retained simple selector remain valid
-        // for the duration of matching.
-        unsafe { selector_ffi_matches_class(element.as_element_pointer(), class_name.cxx_simple_selector.as_ptr()) }
+        let ffi_element = element.as_element();
+        if ffi_element.id_and_class_names_are_case_insensitive() {
+            return (0..element.classes().len())
+                .any(|index| utf16_equals_ignoring_ascii_case(element.class_name(index), &class_name.name));
+        }
+        class_name
+            .interned_name
+            .is_some_and(|class_name| element.classes().contains(&class_name))
     }
 
     fn matches_attribute_selector(&mut self, element: FfiNode<'a>, attribute: &AttributeSelector) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-        // SAFETY: `FfiDom` guarantees that the context, element, and retained simple selector
-        // remain valid for the duration of matching.
-        unsafe {
-            selector_ffi_matches_attribute(
-                self.context,
-                element.as_element_pointer(),
-                attribute.qualified_name.cxx_simple_selector.as_ptr(),
-            )
-        }
+        let qualified_name = &attribute.qualified_name;
+        let is_html_element_in_html_document = element.as_element().is_html_element_in_html_document();
+        let use_lowercase_name =
+            is_html_element_in_html_document && qualified_name.namespace_type != NamespaceType::Named;
+        let name_to_match = if use_lowercase_name {
+            qualified_name.interned_lowercase_name
+        } else {
+            qualified_name.interned_name
+        };
+        let Some(name_to_match) = name_to_match else {
+            return false;
+        };
+
+        let resolved_namespace = if qualified_name.namespace_type == NamespaceType::Named {
+            let namespace = self.resolve_namespace(&qualified_name.namespace);
+            if namespace.namespace_type == FfiResolvedNamespaceType::Missing {
+                return false;
+            }
+            Some(namespace)
+        } else {
+            None
+        };
+
+        let case_sensitivity = match attribute.case_type {
+            AttributeCaseType::Sensitive => StringCaseSensitivity::Sensitive,
+            AttributeCaseType::Insensitive => StringCaseSensitivity::AsciiInsensitive,
+            AttributeCaseType::Default => {
+                if is_html_element_in_html_document
+                    && qualified_name.namespace_type == NamespaceType::Default
+                    && is_ascii_case_insensitive_html_attribute(&qualified_name.name)
+                {
+                    StringCaseSensitivity::AsciiInsensitive
+                } else {
+                    StringCaseSensitivity::Sensitive
+                }
+            }
+        };
+
+        (0..element.attribute_count()).any(|index| {
+            let dom_attribute = element.attribute(index);
+            if dom_attribute.local_name() != name_to_match {
+                return false;
+            }
+            let namespace_matches = match qualified_name.namespace_type {
+                // https://www.w3.org/TR/selectors-4/#attrnmsp
+                // In keeping with the Namespaces in the XML recommendation, default namespaces do
+                // not apply to attributes, therefore attribute selectors without a namespace
+                // component apply only to attributes that have no namespace (equivalent to
+                // "|attr").
+                NamespaceType::Default | NamespaceType::None => dom_attribute.namespace().is_none(),
+                NamespaceType::Any => true,
+                NamespaceType::Named => {
+                    let resolved_namespace = resolved_namespace.unwrap();
+                    match resolved_namespace.namespace_type {
+                        FfiResolvedNamespaceType::Missing => false,
+                        FfiResolvedNamespaceType::Null => dom_attribute.namespace().is_none(),
+                        FfiResolvedNamespaceType::Named => {
+                            dom_attribute.namespace() == Some(resolved_namespace.namespace_)
+                        }
+                    }
+                }
+            };
+            namespace_matches
+                && matches_attribute_value(
+                    attribute.match_type,
+                    &attribute.value,
+                    dom_attribute.value(),
+                    case_sensitivity,
+                )
+        })
     }
 
     fn matches_pseudo_class_state(&mut self, element: FfiNode<'a>, pseudo_class: &PseudoClassSelector) -> bool {
         match pseudo_class.pseudo_class {
-            PseudoClassType::Lang => pseudo_class.languages.iter().any(|language| {
-                crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                // SAFETY: `FfiDom` guarantees that the element remains valid, and the string
-                // view is borrowed from `language` for this callback only.
-                unsafe { selector_ffi_matches_language(element.as_element_pointer(), ffi_string_view(language)) }
+            PseudoClassType::AnyLink | PseudoClassType::Link => element.as_element().is_link(),
+            PseudoClassType::Active => element.as_element().is_active(),
+            PseudoClassType::Checked => element.as_element().is_checked(),
+            PseudoClassType::Defined => element.as_element().is_defined(),
+            PseudoClassType::Disabled => element.as_element().is_disabled(),
+            PseudoClassType::Enabled => element.as_element().is_enabled(),
+            PseudoClassType::LocalLink => element.as_element().is_local_link(),
+            PseudoClassType::PlaceholderShown => element.as_element().is_placeholder_shown(),
+            PseudoClassType::Target => element.as_element().is_target(),
+            PseudoClassType::Unchecked => element.as_element().is_unchecked(),
+            PseudoClassType::Buffering => element.as_element().media_is_blocked(),
+            PseudoClassType::Muted => element.as_element().media_is_muted(),
+            PseudoClassType::Paused => element.as_element().media_is_paused(),
+            PseudoClassType::Playing => {
+                let element = element.as_element();
+                element.is_media_element() && !element.media_is_paused()
+            }
+            PseudoClassType::Seeking => element.as_element().media_is_seeking(),
+            PseudoClassType::Stalled => element.as_element().media_is_stalled(),
+            PseudoClassType::Default => element.as_element().is_default(),
+            PseudoClassType::EvenLessGoodValue => {
+                element.as_element().meter_value_state() == FfiMeterValueState::EvenLessGood
+            }
+            PseudoClassType::HighValue => element.as_element().meter_value_is_high(),
+            PseudoClassType::Hover => element.as_element().is_hovered(),
+            PseudoClassType::Indeterminate => element.as_element().is_indeterminate(),
+            PseudoClassType::Invalid => element.as_element().validity_state() == FfiValidityState::Invalid,
+            PseudoClassType::LowValue => element.as_element().meter_value_is_low(),
+            PseudoClassType::Modal => element.as_element().is_modal(),
+            PseudoClassType::Open => element.as_element().is_open(),
+            PseudoClassType::OptimalValue => element.as_element().meter_value_state() == FfiMeterValueState::Optimal,
+            PseudoClassType::Optional => element.as_element().required_state() == FfiRequiredState::Optional,
+            PseudoClassType::ReadOnly => !element.as_element().is_read_write(),
+            PseudoClassType::ReadWrite => element.as_element().is_read_write(),
+            PseudoClassType::Required => element.as_element().required_state() == FfiRequiredState::Required,
+            PseudoClassType::SuboptimalValue => {
+                element.as_element().meter_value_state() == FfiMeterValueState::Suboptimal
+            }
+            PseudoClassType::UserInvalid => element.as_element().user_validity_state() == FfiValidityState::Invalid,
+            PseudoClassType::UserValid => element.as_element().user_validity_state() == FfiValidityState::Valid,
+            PseudoClassType::Valid => element.as_element().validity_state() == FfiValidityState::Valid,
+            PseudoClassType::Fullscreen => element.as_element().is_fullscreen(),
+            PseudoClassType::Focus => element.as_element().is_focused(),
+            PseudoClassType::FocusVisible => {
+                element.as_element().is_focused() && element.as_element().should_indicate_focus()
+            }
+            PseudoClassType::FocusWithin => element.as_element().has_focus_within(),
+            PseudoClassType::Autofill => {
+                // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-autofill
+                // FIXME: The :autofill and :-webkit-autofill pseudo-classes must match input
+                //        elements which have been autofilled by user agent. These pseudo-classes
+                //        must stop matching if the user edits the autofilled field.
+                // NB: We don't support autofilling inputs yet, so this is always false.
+                false
+            }
+            PseudoClassType::Visited => {
+                // https://drafts.csswg.org/selectors/#visited-pseudo
+                // FIXME: For simplicity we currently have :visited never match. We may want to
+                //        rethink this in the future.
+                false
+            }
+            PseudoClassType::VolumeLocked => {
+                // FIXME: Currently we don't allow the user to specify an override volume, so this
+                //        is always false. Once we do, implement this!
+                false
+            }
+            PseudoClassType::Lang => element.language().is_some_and(|language_tag| {
+                pseudo_class
+                    .languages
+                    .iter()
+                    .any(|language_range| language_range_matches_tag(language_range, language_tag))
             }),
-            PseudoClassType::Dir => match pseudo_class.direction {
-                Some(Direction::LeftToRight) => {
-                    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                    // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
-                    unsafe { selector_ffi_matches_direction(element.as_element_pointer(), FfiDirection::LeftToRight) }
-                }
-                Some(Direction::RightToLeft) => {
-                    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                    // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
-                    unsafe { selector_ffi_matches_direction(element.as_element_pointer(), FfiDirection::RightToLeft) }
-                }
-                _ => false,
-            },
-            PseudoClassType::State => {
-                pseudo_class.identifier.is_some() && {
-                    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                    // SAFETY: `FfiDom` guarantees that the element and retained simple selector
-                    // remain valid for the duration of matching.
-                    unsafe {
-                        selector_ffi_matches_state(
-                            element.as_element_pointer(),
-                            pseudo_class.cxx_simple_selector.as_ptr(),
-                        )
-                    }
-                }
+            PseudoClassType::Dir => pseudo_class
+                .direction
+                .is_some_and(|direction| direction == element.as_element().direction()),
+            PseudoClassType::State => pseudo_class
+                .identifier_identity
+                .is_some_and(|state| element.as_element().has_custom_state(state)),
+            PseudoClassType::Heading => element
+                .as_element()
+                .heading_level()
+                .is_some_and(|level| pseudo_class.levels.is_empty() || pseudo_class.levels.contains(&level)),
+            // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-popover-open
+            PseudoClassType::PopoverOpen => {
+                element.as_element().has_popover_attribute() && element.as_element().popover_is_showing()
             }
-            PseudoClassType::Heading => {
-                crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                // SAFETY: `FfiDom` guarantees that the element remains valid, and the levels array
-                // remains valid for this callback.
-                unsafe {
-                    selector_ffi_matches_heading(
-                        element.as_element_pointer(),
-                        pseudo_class.levels.as_ptr(),
-                        pseudo_class.levels.len(),
-                    )
-                }
-            }
-            _ => {
-                crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorSimpleSelectorCallback);
-                // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
-                unsafe {
-                    selector_ffi_matches_pseudo_class(element.as_element_pointer(), pseudo_class.pseudo_class as u8)
-                }
-            }
+            _ => unreachable!("structural pseudo-class reached state matching"),
         }
     }
 
     fn parent_element(&mut self, element: FfiNode<'a>, shadow_host: Option<FfiNode<'a>>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input handles remain valid. The callback returns
         // either null or another live element borrowed for the same lifetime.
         unsafe {
@@ -1858,42 +2899,42 @@ impl<'a> SelectorDom for FfiDom<'a> {
     }
 
     fn parent_element_in_light_tree(&mut self, element: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input remains valid. The callback returns either
         // null or another live element borrowed for the same lifetime.
         unsafe { self.element(selector_ffi_parent_element_in_light_tree(element.as_element_pointer())) }
     }
 
     fn previous_element_sibling(&mut self, element: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input remains valid. The callback returns either
         // null or another live element borrowed for the same lifetime.
         unsafe { self.element(selector_ffi_previous_element_sibling(element.as_element_pointer())) }
     }
 
     fn next_element_sibling(&mut self, element: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input remains valid. The callback returns either
         // null or another live element borrowed for the same lifetime.
         unsafe { self.element(selector_ffi_next_element_sibling(element.as_element_pointer())) }
     }
 
     fn first_element_child(&mut self, element: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input remains valid. The callback returns either
         // null or another live element borrowed for the same lifetime.
         unsafe { self.element(selector_ffi_first_element_child(element.as_element_pointer())) }
     }
 
     fn first_element_descendant(&mut self, element: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the input remains valid. The callback returns either
         // null or another live element borrowed for the same lifetime.
         unsafe { self.element(selector_ffi_first_element_descendant(element.as_element_pointer())) }
     }
 
     fn next_element_descendant(&mut self, element: FfiNode<'a>, root: FfiNode<'a>) -> Option<FfiNode<'a>> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that both element handles remain valid for this call. The
         // callback returns either null or another live element borrowed for the same lifetime.
         unsafe {
@@ -1905,31 +2946,34 @@ impl<'a> SelectorDom for FfiDom<'a> {
     }
 
     fn has_no_element_or_nonempty_text_children(&mut self, element: FfiNode<'a>) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
-        unsafe { selector_ffi_has_no_element_or_nonempty_text_children(element.as_element_pointer()) }
+        if unsafe { selector_ffi_element_has_element_child(element.as_element_pointer()) } {
+            return false;
+        }
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
+        // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
+        !unsafe { selector_ffi_element_has_nonempty_text_child(element.as_element_pointer()) }
     }
 
     fn has_same_type(&mut self, first: FfiNode<'a>, second: FfiNode<'a>) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
-        // SAFETY: `FfiDom` guarantees that both elements remain valid for matching.
-        unsafe { selector_ffi_has_same_type(first.as_element_pointer(), second.as_element_pointer()) }
+        let first = first.as_element().qualified_name();
+        let second = second.as_element().qualified_name();
+        first.local_name() == second.local_name() && first.namespace() == second.namespace()
     }
 
     fn is_document_root(&mut self, element: FfiNode<'a>) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
-        // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
-        unsafe { selector_ffi_is_document_root(element.as_element_pointer()) }
+        element.as_element().is_document_root()
     }
 
     fn is_shadow_tree_slot(&mut self, element: FfiNode<'a>) -> bool {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the element remains valid for matching.
         unsafe { selector_ffi_is_shadow_tree_slot(element.as_element_pointer()) }
     }
 
     fn slotted_parent(&mut self, element: FfiNode<'a>) -> Option<(FfiNode<'a>, Option<FfiNode<'a>>)> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: `FfiDom` guarantees that the context and element remain valid. The callback
         // returns null or live elements borrowed for the same lifetime.
         unsafe { self.element_and_shadow_host(selector_ffi_slotted_parent(self.context, element.as_element_pointer())) }
@@ -1942,7 +2986,7 @@ impl<'a> SelectorDom for FfiDom<'a> {
         allow_same_shadow_root_scope: bool,
         shadow_host: Option<FfiNode<'a>>,
     ) -> Option<(FfiNode<'a>, Option<FfiNode<'a>>)> {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorTreeNavigationCallback);
+        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         let identifiers = identifiers
             .iter()
             .map(|identifier| ffi_string_view(identifier))
@@ -2100,6 +3144,12 @@ unsafe fn string_from_ffi(value: FfiStringView) -> SelectorString {
     unsafe { copy_ffi_slice(value.data, value.length) }
 }
 
+unsafe fn interned_name_from_ffi(selector: &FfiSimpleSelector) -> Option<usize> {
+    // SAFETY: The caller guarantees that a non-null pointer identifies the one-word storage of a
+    // live C++ `Utf16FlyString` for the duration of selector compilation.
+    unsafe { selector.interned_name.as_ref().copied() }
+}
+
 unsafe fn qualified_name_from_ffi(selector: &FfiSimpleSelector) -> QualifiedName {
     QualifiedName {
         namespace_type: selector.namespace_type,
@@ -2109,7 +3159,11 @@ unsafe fn qualified_name_from_ffi(selector: &FfiSimpleSelector) -> QualifiedName
         name: unsafe { string_from_ffi(selector.name) },
         // SAFETY: The caller guarantees that every string view in `selector` is valid.
         lowercase_name: unsafe { string_from_ffi(selector.lowercase_name) },
-        cxx_simple_selector: RetainedCxxPointer::new(selector.cxx_simple_selector),
+        // SAFETY: The caller guarantees that all retained C++ selector data is valid.
+        interned_name: unsafe { interned_name_from_ffi(selector) },
+        // SAFETY: The caller guarantees that a non-null pointer identifies retained C++ selector
+        // data for the duration of selector compilation.
+        interned_lowercase_name: unsafe { selector.interned_lowercase_name.as_ref().copied() },
     }
 }
 
@@ -2132,12 +3186,14 @@ unsafe fn simple_selector_from_ffi(selector: &FfiSimpleSelector) -> SimpleSelect
         FfiSimpleSelectorType::Id => SimpleSelector::Id(NameSelector {
             // SAFETY: The caller guarantees that every string view in `selector` is valid.
             name: unsafe { string_from_ffi(selector.name) },
-            cxx_simple_selector: RetainedCxxPointer::new(selector.cxx_simple_selector),
+            // SAFETY: The caller guarantees that all retained C++ selector data is valid.
+            interned_name: unsafe { interned_name_from_ffi(selector) },
         }),
         FfiSimpleSelectorType::Class => SimpleSelector::Class(NameSelector {
             // SAFETY: The caller guarantees that every string view in `selector` is valid.
             name: unsafe { string_from_ffi(selector.name) },
-            cxx_simple_selector: RetainedCxxPointer::new(selector.cxx_simple_selector),
+            // SAFETY: The caller guarantees that all retained C++ selector data is valid.
+            interned_name: unsafe { interned_name_from_ffi(selector) },
         }),
         FfiSimpleSelectorType::Attribute => SimpleSelector::Attribute(AttributeSelector {
             match_type: selector.attribute_match_type,
@@ -2176,6 +3232,9 @@ unsafe fn simple_selector_from_ffi(selector: &FfiSimpleSelector) -> SimpleSelect
                 // SAFETY: The caller guarantees that every string view in `selector` is valid.
                 unsafe { string_from_ffi(selector.identifier) }
             });
+            // SAFETY: The caller guarantees that a non-null pointer identifies a live C++
+            // `Utf16FlyString` for the duration of selector compilation.
+            let identifier_identity = unsafe { interned_name_from_ffi(selector) };
             // SAFETY: The caller guarantees that the levels array is valid.
             let levels = unsafe { copy_ffi_slice(selector.levels, selector.level_count) };
 
@@ -2189,8 +3248,8 @@ unsafe fn simple_selector_from_ffi(selector: &FfiSimpleSelector) -> SimpleSelect
                 languages,
                 direction,
                 identifier,
+                identifier_identity,
                 levels,
-                cxx_simple_selector: RetainedCxxPointer::new(selector.cxx_simple_selector),
             })
         }
         FfiSimpleSelectorType::PseudoElement => {
@@ -2255,12 +3314,10 @@ unsafe fn compiled_selector_from_ffi(selector: &FfiSelector) -> Rc<CompiledSelec
 }
 
 unsafe fn with_ffi_dom<R>(
-    element: *const c_void,
-    shadow_host: *const c_void,
-    context: *mut c_void,
+    element: FfiElement,
+    shadow_host: FfiElement,
     scope: *const c_void,
-    collects_selector_involvement_metadata: bool,
-    inside_has_argument: bool,
+    configuration: FfiDomConfiguration,
     callback: impl for<'a> FnOnce(FfiNode<'a>, Option<FfiNode<'a>>, Option<FfiNode<'a>>, &mut FfiDom<'a>) -> R,
 ) -> R {
     let mut call_scope = FfiCallScope;
@@ -2268,19 +3325,26 @@ unsafe fn with_ffi_dom<R>(
     // callback. Borrowing `call_scope` prevents the DOM wrapper and its nodes from escaping it.
     let mut dom = unsafe {
         FfiDom::new(
-            context,
+            configuration.context,
             &mut call_scope,
-            collects_selector_involvement_metadata,
-            inside_has_argument,
+            configuration.collects_selector_involvement_metadata,
+            configuration.inside_has_argument,
         )
     };
-    // SAFETY: The caller guarantees that `element` points to a DOM element.
+    // SAFETY: The caller guarantees that `element` wraps a live DOM element.
     let element = unsafe { dom.element(element) }.unwrap();
-    // SAFETY: The caller guarantees that a non-null `shadow_host` points to a DOM element.
+    // SAFETY: The caller guarantees that a non-null `shadow_host` wraps a live DOM element.
     let shadow_host = unsafe { dom.element(shadow_host) };
     // SAFETY: The caller guarantees that a non-null `scope` points to a DOM parent node.
     let scope = unsafe { dom.scope(scope) };
     callback(element, shadow_host, scope, &mut dom)
+}
+
+#[derive(Clone, Copy)]
+struct FfiDomConfiguration {
+    context: *mut c_void,
+    collects_selector_involvement_metadata: bool,
+    inside_has_argument: bool,
 }
 
 /// # Safety
@@ -2289,9 +3353,8 @@ unsafe fn with_ffi_dom<R>(
 /// properly aligned and valid for reads for the duration of this call. Every enum field must
 /// contain a valid discriminant.
 ///
-/// `FfiSelector::cxx_selector` and every `FfiSimpleSelector::cxx_simple_selector` must remain valid
-/// until the returned handle is passed to `rust_selector_destroy`. The returned handle must be
-/// destroyed exactly once.
+/// `FfiSelector::cxx_selector` must remain valid until the returned handle is passed to
+/// `rust_selector_destroy`. The returned handle must be destroyed exactly once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_selector_create(selector: *const FfiSelector) -> *mut RustSelector {
     abort_on_panic(|| {
@@ -2330,15 +3393,15 @@ pub unsafe extern "C" fn rust_selector_target_pseudo_element(selector: *const Ru
 
 /// # Safety
 /// The `selector` handle must have been returned by `rust_selector_create`. `element` and a
-/// non-null `shadow_host` must point to C++ DOM elements, a non-null `scope` must point to a C++
+/// non-null `shadow_host` must wrap live C++ DOM elements, a non-null `scope` must point to a C++
 /// DOM parent node, and `context` must point to a C++ Rust matching context. All referenced objects
 /// must remain valid for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_selector_matches(
     selector: *const RustSelector,
-    element: *const c_void,
+    element: FfiElement,
     pseudo_element: u8,
-    shadow_host: *const c_void,
+    shadow_host: FfiElement,
     context: *mut c_void,
     scope: *const c_void,
     collects_selector_involvement_metadata: bool,
@@ -2347,7 +3410,7 @@ pub unsafe extern "C" fn rust_selector_matches(
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorMatchEntry);
     abort_on_panic(|| {
         assert!(!selector.is_null());
-        assert!(!element.is_null());
+        assert!(!element.pointer.is_null());
         assert!(!context.is_null());
         // SAFETY: The caller guarantees that the selector handle remains valid for this call.
         let selector = unsafe { &(*selector).selector };
@@ -2357,10 +3420,12 @@ pub unsafe extern "C" fn rust_selector_matches(
             with_ffi_dom(
                 element,
                 shadow_host,
-                context,
                 scope,
-                collects_selector_involvement_metadata,
-                inside_has_argument,
+                FfiDomConfiguration {
+                    context,
+                    collects_selector_involvement_metadata,
+                    inside_has_argument,
+                },
                 |element, shadow_host, scope, dom| {
                     let target = MatchTarget {
                         element,
@@ -2378,15 +3443,15 @@ pub unsafe extern "C" fn rust_selector_matches(
 
 /// # Safety
 /// The `selector` handle must have been returned by `rust_selector_create`. `element` and a
-/// non-null `shadow_host` must point to C++ DOM elements, a non-null `scope` must point to a C++
+/// non-null `shadow_host` must wrap live C++ DOM elements, a non-null `scope` must point to a C++
 /// DOM parent node, and `context` must point to a C++ Rust matching context. All referenced objects
 /// must remain valid for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_selector_matches_originating_element(
     selector: *const RustSelector,
     pseudo_element: u8,
-    element: *const c_void,
-    shadow_host: *const c_void,
+    element: FfiElement,
+    shadow_host: FfiElement,
     context: *mut c_void,
     scope: *const c_void,
     collects_selector_involvement_metadata: bool,
@@ -2395,7 +3460,7 @@ pub unsafe extern "C" fn rust_selector_matches_originating_element(
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorMatchEntry);
     abort_on_panic(|| {
         assert!(!selector.is_null());
-        assert!(!element.is_null());
+        assert!(!element.pointer.is_null());
         assert!(!context.is_null());
         // SAFETY: The caller guarantees that the selector handle remains valid for this call.
         let selector = unsafe { &(*selector).selector };
@@ -2405,10 +3470,12 @@ pub unsafe extern "C" fn rust_selector_matches_originating_element(
             with_ffi_dom(
                 element,
                 shadow_host,
-                context,
                 scope,
-                collects_selector_involvement_metadata,
-                inside_has_argument,
+                FfiDomConfiguration {
+                    context,
+                    collects_selector_involvement_metadata,
+                    inside_has_argument,
+                },
                 |element, shadow_host, scope, dom| {
                     matches_originating_element_for_pseudo_element(
                         selector,
@@ -2658,7 +3725,7 @@ mod tests {
     fn class(name: &str) -> SimpleSelector {
         SimpleSelector::Class(NameSelector {
             name: name.encode_utf16().collect(),
-            cxx_simple_selector: RetainedCxxPointer::default(),
+            interned_name: None,
         })
     }
 
@@ -2712,7 +3779,7 @@ mod tests {
                 combinator: *combinator,
                 simple_selectors: vec![SimpleSelector::Id(NameSelector {
                     name: Box::from([b'x' as u16]),
-                    cxx_simple_selector: RetainedCxxPointer::default(),
+                    interned_name: None,
                 })]
                 .into_boxed_slice(),
             })
@@ -2872,8 +3939,8 @@ mod tests {
             languages: Box::new([]),
             direction: None,
             identifier: None,
+            identifier_identity: None,
             levels: Box::new([]),
-            cxx_simple_selector: RetainedCxxPointer::default(),
         });
         let selector = selector(vec![compound(Combinator::None, vec![class("anchor"), has])]);
         let mut dom = test_tree();
@@ -2914,8 +3981,8 @@ mod tests {
             languages: Box::new([]),
             direction: None,
             identifier: None,
+            identifier_identity: None,
             levels: Box::new([]),
-            cxx_simple_selector: RetainedCxxPointer::default(),
         });
         let selector = selector(vec![compound(Combinator::None, vec![nth_child])]);
         let mut dom = test_tree();

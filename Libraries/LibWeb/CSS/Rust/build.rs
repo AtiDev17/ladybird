@@ -562,6 +562,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("FfiSimpleSelector", "SimpleSelector"),
         ("FfiCompoundSelector", "CompoundSelector"),
         ("FfiSelector", "Selector"),
+        ("FfiElement", "Element"),
+        ("FfiElementQualifiedName", "ElementQualifiedName"),
+        ("FfiInternedStringList", "InternedStringList"),
+        ("FfiDomStringView", "DomStringView"),
+        ("FfiDomAttribute", "DomAttribute"),
+        ("FfiResolvedNamespaceType", "ResolvedNamespaceType"),
+        ("FfiResolvedNamespace", "ResolvedNamespace"),
         ("FfiElementAndShadowHost", "ElementAndShadowHost"),
     ] {
         selector_config

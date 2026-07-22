@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NumericLimits.h>
 #include <LibWeb/CSS/AncestorFilter.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/PseudoClass.h>
@@ -36,17 +37,6 @@
 #include <LibWeb/SelectorRustFFI.h>
 
 namespace Web::SelectorMatching {
-
-static bool fly_string_equals_utf16(Utf16FlyString const& fly_string, Utf16View utf16_string)
-{
-    return utf16_string == fly_string.view();
-}
-
-template<typename... Names>
-static bool fly_string_is_one_of_utf16(Utf16View utf16_string, Names const&... names)
-{
-    return (fly_string_equals_utf16(names, utf16_string) || ...);
-}
 
 static u32 salted_tag_name_hash(Utf16FlyString const& tag_name)
 {
@@ -245,65 +235,6 @@ static bool should_reject_with_has_fast_reject_filter(CSS::Selector const& selec
     return false;
 }
 
-static bool language_range_matches_tag(Utf16View language_range, Utf16View language_tag)
-{
-    // 1. Split both the extended language range and the language tag being compared into a list of subtags by
-    //    dividing on the hyphen (%x2D) character.
-    auto range_subtags = language_range.split_view('-', SplitBehavior::KeepEmpty);
-    auto tag_subtags = language_tag.split_view('-', SplitBehavior::KeepEmpty);
-
-    //    Two subtags match if either they are the same when compared case-insensitively or the language range's subtag
-    //    is the wildcard '*'.
-    auto subtags_match = [](Utf16View language_range_subtag, Utf16View language_subtag) {
-        return language_range_subtag == u"*"sv
-            || language_range_subtag.equals_ignoring_ascii_case(language_subtag);
-    };
-
-    // 2. Begin with the first subtag in each list. If the first subtag in the range does not match the first
-    //    subtag in the tag, the overall match fails. Otherwise, move to the next subtag in both the range and the
-    //    tag.
-    auto tag_subtag = tag_subtags.begin();
-    auto range_subtag = range_subtags.begin();
-    if (!subtags_match(*range_subtag, *tag_subtag))
-        return false;
-    ++tag_subtag;
-    ++range_subtag;
-
-    // 3. While there are more subtags left in the language range's list:
-    while (!range_subtag.is_end()) {
-        // A. If the subtag currently being examined in the range is the wildcard ('*'), move to the next subtag in
-        //    the range and continue with the loop.
-        if (*range_subtag == u"*"sv) {
-            ++range_subtag;
-            continue;
-        }
-
-        // B. Else, if there are no more subtags in the language tag's list, the match fails.
-        if (tag_subtag.is_end())
-            return false;
-
-        // C. Else, if the current subtag in the range's list matches the current subtag in the language tag's
-        //    list, move to the next subtag in both lists and continue with the loop.
-        if (subtags_match(*range_subtag, *tag_subtag)) {
-            ++range_subtag;
-            ++tag_subtag;
-            continue;
-        }
-
-        // D. Else, if the language tag's subtag is a "singleton" (a single letter or digit, which includes the
-        //    private-use subtag 'x') the match fails.
-        if (tag_subtag->length_in_code_units() == 1 && is_ascii_alphanumeric(tag_subtag->code_unit_at(0))) {
-            return false;
-        }
-
-        // E. Else, move to the next subtag in the language tag's list and continue with the loop.
-        ++tag_subtag;
-    }
-
-    // 4. When the language range's list has no more subtags, the match succeeds.
-    return true;
-}
-
 static bool matches_hover_pseudo_class(DOM::Element const& element)
 {
     auto* hovered_node = element.document().hovered_node();
@@ -354,7 +285,7 @@ static bool matches_read_write_pseudo_class(DOM::Element const& element)
 }
 
 // https://drafts.csswg.org/selectors-4/#open-state
-static bool matches_open_state_pseudo_class(DOM::Element const& element, bool open)
+static bool matches_open_state_pseudo_class(DOM::Element const& element)
 {
     // The :open pseudo-class represents an element that has both “open” and “closed” states,
     // and which is currently in the “open” state.
@@ -364,293 +295,25 @@ static bool matches_open_state_pseudo_class(DOM::Element const& element, bool op
     // - details elements that have an open attribute
     // - dialog elements that have an open attribute
     if (is<HTML::HTMLDetailsElement>(element) || is<HTML::HTMLDialogElement>(element))
-        return open == element.has_attribute(HTML::AttributeNames::open);
+        return element.has_attribute(HTML::AttributeNames::open);
     // - select elements that are a drop-down box and whose drop-down boxes are open
     if (auto const* select = as_if<HTML::HTMLSelectElement>(element))
-        return open == select->is_open();
+        return select->is_open();
     // - input elements that support a picker and whose pickers are open
     if (auto const* input = as_if<HTML::HTMLInputElement>(element))
-        return open == (input->supports_a_picker() && input->is_open());
+        return input->supports_a_picker() && input->is_open();
 
     return false;
 }
 
-static bool matches_optimal_value_pseudo_class(DOM::Element const& element, HTML::HTMLMeterElement::ValueState desired_state)
+static CSS::SelectorFFI::Element element_to_ffi(DOM::Element const* element)
 {
-    if (auto* meter = as_if<HTML::HTMLMeterElement>(element))
-        return meter->value_state() == desired_state;
-    return false;
-}
+    if (!element)
+        return {};
 
-static bool matches_pseudo_class_state(CSS::PseudoClass pseudo_class, DOM::Element const& element)
-{
-    switch (pseudo_class) {
-    case CSS::PseudoClass::Active:
-        return element.is_being_activated();
-    case CSS::PseudoClass::AnyLink:
-    case CSS::PseudoClass::Link:
-        // NOTE: AnyLink should match whether the link is visited or not, so if we ever start matching
-        //       :visited, we'll need to handle these differently.
-        return element.matches_link_pseudo_class();
-    case CSS::PseudoClass::Autofill:
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-autofill
-        // FIXME: The :autofill and :-webkit-autofill pseudo-classes must match input elements which have been autofilled by
-        //        user agent. These pseudo-classes must stop matching if the user edits the autofilled field.
-        // NB: We don't support autofilling inputs yet, so this is always false.
-        return false;
-    case CSS::PseudoClass::Buffering:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return media_element->blocked();
-        return false;
-    case CSS::PseudoClass::Checked:
-        return element.matches_checked_pseudo_class();
-    case CSS::PseudoClass::Default: {
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-default
-        if (auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(element)) {
-            if (form_associated_element->is_submit_button() && form_associated_element->form() && form_associated_element->form()->default_button() == form_associated_element)
-                return true;
-            if (auto const* input_element = as_if<HTML::HTMLInputElement>(form_associated_element)) {
-                if (input_element->checked_applies() && input_element->has_attribute(HTML::AttributeNames::checked))
-                    return true;
-            }
-            if (auto const* option_element = as_if<HTML::HTMLOptionElement>(form_associated_element)) {
-                if (option_element->has_attribute(HTML::AttributeNames::selected))
-                    return true;
-            }
-        }
-        return false;
-    }
-    case CSS::PseudoClass::Defined:
-        return element.is_defined();
-    case CSS::PseudoClass::Disabled:
-        return element.matches_disabled_pseudo_class();
-    case CSS::PseudoClass::Enabled:
-        return element.matches_enabled_pseudo_class();
-    case CSS::PseudoClass::EvenLessGoodValue:
-        return matches_optimal_value_pseudo_class(element, HTML::HTMLMeterElement::ValueState::EvenLessGood);
-    case CSS::PseudoClass::Focus:
-        return element.is_focused();
-    case CSS::PseudoClass::FocusVisible:
-        return element.is_focused() && element.should_indicate_focus();
-    case CSS::PseudoClass::FocusWithin:
-        return element.matches_focus_within_pseudo_class();
-    case CSS::PseudoClass::Fullscreen:
-        return element.is_fullscreen_element();
-    case CSS::PseudoClass::HighValue:
-        if (auto const* meter = as_if<HTML::HTMLMeterElement>(element))
-            return meter->value() > meter->high();
-        return false;
-    case CSS::PseudoClass::Hover:
-        return matches_hover_pseudo_class(element);
-    case CSS::PseudoClass::Indeterminate:
-        return matches_indeterminate_pseudo_class(element);
-    case CSS::PseudoClass::Invalid: {
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-invalid
-        if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(element)) {
-            if (form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints())
-                return true;
-        }
-
-        if (auto form_element = as_if<HTML::HTMLFormElement>(element)) {
-            bool has_invalid_elements = false;
-            element.for_each_in_subtree([&](auto& node) {
-                if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(&node)) {
-                    if (form_associated_element->form() == form_element && form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
-                        has_invalid_elements = true;
-                        return TraversalDecision::Break;
-                    }
-                }
-                return TraversalDecision::Continue;
-            });
-            if (has_invalid_elements)
-                return true;
-        }
-
-        if (is<HTML::HTMLFieldSetElement>(element)) {
-            bool has_invalid_children = false;
-            element.for_each_in_subtree([&](auto& node) {
-                if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(&node)) {
-                    if (form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
-                        has_invalid_children = true;
-                        return TraversalDecision::Break;
-                    }
-                }
-                return TraversalDecision::Continue;
-            });
-            if (has_invalid_children)
-                return true;
-        }
-        return false;
-    }
-    case CSS::PseudoClass::LocalLink:
-        return element.matches_local_link_pseudo_class();
-    case CSS::PseudoClass::LowValue:
-        if (auto const* meter = as_if<HTML::HTMLMeterElement>(element))
-            return meter->value() < meter->low();
-        return false;
-    case CSS::PseudoClass::Modal:
-        // https://drafts.csswg.org/selectors/#modal-state
-        if (auto const* dialog_element = as_if<HTML::HTMLDialogElement>(element))
-            return dialog_element->is_modal();
-        // FIXME: fullscreen elements are also modal.
-        return false;
-    case CSS::PseudoClass::Muted:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return media_element->muted();
-        return false;
-    case CSS::PseudoClass::Open:
-        return matches_open_state_pseudo_class(element, true);
-    case CSS::PseudoClass::OptimalValue:
-        return matches_optimal_value_pseudo_class(element, HTML::HTMLMeterElement::ValueState::Optimal);
-    case CSS::PseudoClass::Optional:
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-optional
-        if (auto const* input_element = as_if<HTML::HTMLInputElement>(element)) {
-            if (input_element->required_applies() && !input_element->has_attribute(HTML::AttributeNames::required))
-                return true;
-            // AD-HOC: Chromium and Webkit also match for hidden inputs (and WPT expects this)
-            // See: https://github.com/whatwg/html/issues/11273
-            return input_element->type_state() == HTML::HTMLInputElement::TypeAttributeState::Hidden;
-        }
-        if (auto const* select_element = as_if<HTML::HTMLSelectElement>(element))
-            return !select_element->has_attribute(HTML::AttributeNames::required);
-        if (auto const* textarea_element = as_if<HTML::HTMLTextAreaElement>(element))
-            return !textarea_element->has_attribute(HTML::AttributeNames::required);
-        return false;
-    case CSS::PseudoClass::Paused:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return media_element->paused();
-        return false;
-    case CSS::PseudoClass::PlaceholderShown:
-        return element.matches_placeholder_shown_pseudo_class();
-    case CSS::PseudoClass::Playing:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return !media_element->paused();
-        return false;
-    case CSS::PseudoClass::PopoverOpen:
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-popover-open
-        if (auto const* html_element = as_if<HTML::HTMLElement>(element);
-            html_element && html_element->has_attribute(HTML::AttributeNames::popover)) {
-            return html_element->popover_visibility_state() == HTML::HTMLElement::PopoverVisibilityState::Showing;
-        }
-        return false;
-    case CSS::PseudoClass::ReadOnly:
-        return !matches_read_write_pseudo_class(element);
-    case CSS::PseudoClass::ReadWrite:
-        return matches_read_write_pseudo_class(element);
-    case CSS::PseudoClass::Required:
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required
-        if (auto const* input_element = as_if<HTML::HTMLInputElement>(element))
-            return input_element->required_applies() && input_element->has_attribute(HTML::AttributeNames::required);
-        if (auto const* select_element = as_if<HTML::HTMLSelectElement>(element))
-            return select_element->has_attribute(HTML::AttributeNames::required);
-        if (auto const* textarea_element = as_if<HTML::HTMLTextAreaElement>(element))
-            return textarea_element->has_attribute(HTML::AttributeNames::required);
-        return false;
-    case CSS::PseudoClass::Seeking:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return media_element->seeking();
-        return false;
-    case CSS::PseudoClass::Stalled:
-        if (auto const* media_element = as_if<HTML::HTMLMediaElement>(element))
-            return media_element->stalled();
-        return false;
-    case CSS::PseudoClass::SuboptimalValue:
-        return matches_optimal_value_pseudo_class(element, HTML::HTMLMeterElement::ValueState::Suboptimal);
-    case CSS::PseudoClass::Target:
-        return element.is_target();
-    case CSS::PseudoClass::Unchecked:
-        return element.matches_unchecked_pseudo_class();
-    case CSS::PseudoClass::UserInvalid:
-    case CSS::PseudoClass::UserValid: {
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-user-valid
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-user-invalid
-        bool user_validity = false;
-        if (auto const* input_element = as_if<HTML::HTMLInputElement>(element))
-            user_validity = input_element->user_validity();
-        else if (auto const* select_element = as_if<HTML::HTMLSelectElement>(element))
-            user_validity = select_element->user_validity();
-        else if (auto const* text_area_element = as_if<HTML::HTMLTextAreaElement>(element))
-            user_validity = text_area_element->user_validity();
-        if (!user_validity)
-            return false;
-
-        auto const& form_associated_element = as<HTML::FormAssociatedElement>(element);
-        if (!form_associated_element.is_candidate_for_constraint_validation())
-            return false;
-        return pseudo_class == CSS::PseudoClass::UserValid
-            ? form_associated_element.satisfies_its_constraints()
-            : !form_associated_element.satisfies_its_constraints();
-    }
-    case CSS::PseudoClass::Valid: {
-        // https://html.spec.whatwg.org/multipage/semantics-other.html#selector-valid
-        if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(element)) {
-            if (form_associated_element->is_candidate_for_constraint_validation() && form_associated_element->satisfies_its_constraints())
-                return true;
-        }
-
-        if (auto form_element = as_if<HTML::HTMLFormElement>(element)) {
-            bool has_invalid_elements = false;
-            element.for_each_in_subtree([&](auto& node) {
-                if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(&node)) {
-                    if (form_associated_element->form() == form_element && form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
-                        has_invalid_elements = true;
-                        return TraversalDecision::Break;
-                    }
-                }
-                return TraversalDecision::Continue;
-            });
-            if (!has_invalid_elements)
-                return true;
-        }
-
-        if (is<HTML::HTMLFieldSetElement>(element)) {
-            bool has_invalid_children = false;
-            element.for_each_in_subtree([&](auto& node) {
-                if (auto form_associated_element = as_if<HTML::FormAssociatedElement>(&node)) {
-                    if (form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
-                        has_invalid_children = true;
-                        return TraversalDecision::Break;
-                    }
-                }
-                return TraversalDecision::Continue;
-            });
-            if (!has_invalid_children)
-                return true;
-        }
-        return false;
-    }
-    case CSS::PseudoClass::Visited:
-        return element.matches_visited_pseudo_class();
-    case CSS::PseudoClass::VolumeLocked:
-        // FIXME: Currently we don't allow the user to specify an override volume, so this is always false.
-        //        Once we do, implement this!
-        return false;
-    case CSS::PseudoClass::__Count:
-    case CSS::PseudoClass::Dir:
-    case CSS::PseudoClass::Empty:
-    case CSS::PseudoClass::FirstChild:
-    case CSS::PseudoClass::FirstOfType:
-    case CSS::PseudoClass::Has:
-    case CSS::PseudoClass::Heading:
-    case CSS::PseudoClass::Host:
-    case CSS::PseudoClass::Is:
-    case CSS::PseudoClass::Lang:
-    case CSS::PseudoClass::LastChild:
-    case CSS::PseudoClass::LastOfType:
-    case CSS::PseudoClass::Not:
-    case CSS::PseudoClass::NthChild:
-    case CSS::PseudoClass::NthLastChild:
-    case CSS::PseudoClass::NthLastOfType:
-    case CSS::PseudoClass::NthOfType:
-    case CSS::PseudoClass::OnlyChild:
-    case CSS::PseudoClass::OnlyOfType:
-    case CSS::PseudoClass::Root:
-    case CSS::PseudoClass::Scope:
-    case CSS::PseudoClass::State:
-    case CSS::PseudoClass::Where:
-        VERIFY_NOT_REACHED();
-    }
-    VERIFY_NOT_REACHED();
+    return {
+        .pointer = element,
+    };
 }
 
 bool matches(CSS::Selector const& selector, DOM::AbstractElement const& target, GC::Ptr<DOM::Element const> shadow_host,
@@ -658,9 +321,9 @@ bool matches(CSS::Selector const& selector, DOM::AbstractElement const& target, 
 {
     return CSS::SelectorFFI::rust_selector_matches(
         &selector.rust_selector(),
-        &target.element(),
+        element_to_ffi(&target.element()),
         CSS::pseudo_element_to_ffi(target.pseudo_element()),
-        shadow_host.ptr(),
+        element_to_ffi(shadow_host.ptr()),
         &context,
         scope.ptr(),
         context.collect_per_element_selector_involvement_metadata,
@@ -674,8 +337,8 @@ bool matches_originating_element_for_pseudo_element(CSS::Selector const& selecto
     return CSS::SelectorFFI::rust_selector_matches_originating_element(
         &selector.rust_selector(),
         CSS::pseudo_element_to_ffi(pseudo_element),
-        &target.element(),
-        shadow_host.ptr(),
+        element_to_ffi(&target.element()),
+        element_to_ffi(shadow_host.ptr()),
         &context,
         scope.ptr(),
         context.collect_per_element_selector_involvement_metadata,
@@ -703,79 +366,72 @@ static Utf16View ffi_string_view(CSS::SelectorFFI::StringView string)
     return { reinterpret_cast<char16_t const*>(string.data), string.length };
 }
 
-static CSS::Selector::SimpleSelector const& ffi_simple_selector(void const* simple_selector)
-{
-    VERIFY(simple_selector);
-    return *static_cast<CSS::Selector::SimpleSelector const*>(simple_selector);
-}
-
 static bool is_in_null_namespace(DOM::Element const& element)
 {
     return !element.namespace_uri().has_value() || element.namespace_uri()->is_empty();
 }
 
-static bool matches_namespace(CSS::Selector::SimpleSelector::QualifiedName const& qualified_name, DOM::Element const& element, GC::Ptr<CSS::CSSStyleSheet const> style_sheet_for_rule)
-{
-    switch (qualified_name.namespace_type) {
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Default:
-        // "if no default namespace has been declared for selectors, this is equivalent to *|E."
-        if (!style_sheet_for_rule || !style_sheet_for_rule->default_namespace_rule())
-            return true;
-        // "Otherwise it is equivalent to ns|E where ns is the default namespace."
-        if (style_sheet_for_rule->default_namespace_rule()->namespace_uri().is_empty())
-            return is_in_null_namespace(element);
-
-        return element.namespace_uri().has_value()
-            && style_sheet_for_rule->default_namespace_rule()->namespace_uri() == element.namespace_uri()->view();
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::None:
-        // "elements with name E without a namespace"
-        return is_in_null_namespace(element);
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Any:
-        // "elements with name E in any namespace, including those without a namespace"
-        return true;
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Named: {
-        // "elements with name E in namespace ns"
-        // Unrecognized namespace prefixes are invalid, so don't match.
-        // (We can't detect this at parse time, since a namespace rule may be inserted later.)
-        // So, if we don't have a context to look up namespaces from, we fail to match.
-        if (!style_sheet_for_rule)
-            return false;
-        auto selector_namespace = style_sheet_for_rule->namespace_uri(qualified_name.namespace_);
-        // https://www.w3.org/TR/css-namespaces-3/#terminology
-        // In CSS Namespaces a namespace name consisting of the empty string is taken to represent the null namespace
-        // or lack of a namespace.
-        if (selector_namespace.has_value() && selector_namespace->is_empty())
-            return is_in_null_namespace(element);
-        return selector_namespace.has_value()
-            && element.namespace_uri().has_value()
-            && *selector_namespace == element.namespace_uri()->view();
-    }
-    }
-    VERIFY_NOT_REACHED();
-}
-
-using CSS::SelectorFFI::AttributeCaseType;
-using CSS::SelectorFFI::AttributeMatchType;
 using CSS::SelectorFFI::Combinator;
 using CSS::SelectorFFI::Direction;
 using CSS::SelectorFFI::HasCacheResult;
 using CSS::SelectorFFI::NamespaceType;
 using CSS::SelectorFFI::StringView;
-using CSS::SelectorFFI::TagNameMatchingMode;
 
 #define DECLARE_SELECTOR_FFI_CALLBACK(function) \
     extern "C" decltype(CSS::SelectorFFI::function) function
 
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_universal);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_tag_name);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_id);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_class);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_attribute);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_pseudo_class);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_language);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_direction);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_state);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_matches_heading);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_qualified_name);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_id);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_id_value);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_classes);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_id_and_class_names_are_case_insensitive);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_namespace_is_null);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_html_element_in_html_document);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_document_root);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_link);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_fullscreen);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_heading_level);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_has_popover_attribute);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_popover_is_showing);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_direction);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_has_custom_state);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_language);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_focused);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_should_indicate_focus);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_has_focus_within);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_active);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_checked);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_defined);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_disabled);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_enabled);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_local_link);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_placeholder_shown);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_target);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_unchecked);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_media_element);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_media_is_blocked);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_media_is_muted);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_media_is_paused);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_media_is_seeking);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_media_is_stalled);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_default);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_meter_value_state);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_meter_value_is_high);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_meter_value_is_low);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_hovered);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_indeterminate);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_validity_state);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_modal);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_open);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_required_state);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_is_read_write);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_user_validity_state);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_local_name);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_class_name);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_attribute_count);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_attribute);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_default_namespace);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_resolve_namespace);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_parent_element);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_parent_element_in_light_tree);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_previous_element_sibling);
@@ -783,9 +439,8 @@ DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_next_element_sibling);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_first_element_child);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_first_element_descendant);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_next_element_descendant);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_has_no_element_or_nonempty_text_children);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_has_same_type);
-DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_is_document_root);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_has_element_child);
+DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_element_has_nonempty_text_child);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_is_shadow_tree_slot);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_slotted_parent);
 DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_part_parent);
@@ -802,326 +457,543 @@ DECLARE_SELECTOR_FFI_CALLBACK(selector_ffi_should_reject_has_argument);
 
 #undef DECLARE_SELECTOR_FFI_CALLBACK
 
-extern "C" bool selector_ffi_matches_universal(void* context, void const* element, void const* cxx_simple_selector)
+// `Utf16FlyString` is its interned one-word representation. The accessors below expose pointers
+// to live words only for the duration of the synchronous selector-matching call.
+static_assert(sizeof(Utf16FlyString) == sizeof(uintptr_t));
+static_assert(alignof(Utf16FlyString) == alignof(uintptr_t));
+
+static uintptr_t interned_string_identity(Utf16FlyString const& string)
 {
-    auto& match_context = rust_match_context(context);
-    auto const& qualified_name = ffi_simple_selector(cxx_simple_selector).qualified_name();
-    return matches_namespace(qualified_name, ffi_element(element), match_context.style_sheet_for_rule);
+    uintptr_t identity;
+    __builtin_memcpy(&identity, &string, sizeof(identity));
+    return identity;
 }
 
-extern "C" bool selector_ffi_matches_tag_name(void* context, void const* element, void const* cxx_simple_selector, TagNameMatchingMode matching_mode)
+static CSS::SelectorFFI::DomStringView dom_string_view(Utf16View string)
 {
-    auto& match_context = rust_match_context(context);
+    if (string.has_ascii_storage()) {
+        auto storage = string.ascii_span();
+        return {
+            .data = storage.data(),
+            .length = storage.size(),
+            .is_ascii = true,
+        };
+    }
+    auto storage = string.utf16_span();
+    return {
+        .data = storage.data(),
+        .length = storage.size(),
+        .is_ascii = false,
+    };
+}
+
+extern "C" CSS::SelectorFFI::ElementQualifiedName selector_ffi_element_qualified_name(void const* element)
+{
     auto const& target = ffi_element(element);
-    auto const& qualified_name = ffi_simple_selector(cxx_simple_selector).qualified_name();
-    bool const is_html_element_in_html_document = target.namespace_uri() == Namespace::HTML
+    return {
+        .local_name = reinterpret_cast<uintptr_t const*>(&target.local_name()),
+        .namespace_ = target.namespace_uri().has_value() ? reinterpret_cast<uintptr_t const*>(&target.namespace_uri().value()) : nullptr,
+    };
+}
+
+extern "C" uintptr_t const* selector_ffi_element_id(void const* element)
+{
+    auto const& id = ffi_element(element).id();
+    return id.has_value() ? reinterpret_cast<uintptr_t const*>(&id.value()) : nullptr;
+}
+
+extern "C" CSS::SelectorFFI::DomStringView selector_ffi_element_id_value(void const* element)
+{
+    auto const& id = ffi_element(element).id();
+    return id.has_value() ? dom_string_view(id.value()) : CSS::SelectorFFI::DomStringView {};
+}
+
+extern "C" CSS::SelectorFFI::InternedStringList selector_ffi_element_classes(void const* element)
+{
+    auto const& classes = ffi_element(element).class_names();
+    return {
+        .data = reinterpret_cast<uintptr_t const*>(classes.data()),
+        .count = classes.size(),
+    };
+}
+
+extern "C" bool selector_ffi_element_id_and_class_names_are_case_insensitive(void const* element)
+{
+    return ffi_element(element).document().in_quirks_mode();
+}
+
+extern "C" bool selector_ffi_element_namespace_is_null(void const* element)
+{
+    return is_in_null_namespace(ffi_element(element));
+}
+
+extern "C" bool selector_ffi_element_is_html_element_in_html_document(void const* element)
+{
+    auto const& target = ffi_element(element);
+    return target.namespace_uri() == Namespace::HTML
         && target.document().document_type() == DOM::Document::Type::HTML;
-    auto const& name_to_match = is_html_element_in_html_document ? qualified_name.name.lowercase_name : qualified_name.name.name;
-    bool name_matches;
-    if (is_html_element_in_html_document || matching_mode == TagNameMatchingMode::Fast)
-        name_matches = target.local_name() == name_to_match;
-    else
-        name_matches = target.local_name().equals_ignoring_ascii_case(name_to_match);
-    return name_matches
-        && matches_namespace(qualified_name, target, match_context.style_sheet_for_rule);
 }
 
-extern "C" bool selector_ffi_matches_id(void const* element, void const* cxx_simple_selector)
+extern "C" bool selector_ffi_element_is_document_root(void const* element)
 {
-    return ffi_element(element).id() == ffi_simple_selector(cxx_simple_selector).id_name();
+    return is<HTML::HTMLHtmlElement>(ffi_element(element));
 }
 
-extern "C" bool selector_ffi_matches_class(void const* element, void const* cxx_simple_selector)
+extern "C" bool selector_ffi_element_is_link(void const* element)
 {
-    auto const& target = ffi_element(element);
-    auto case_sensitivity = target.document().in_quirks_mode() ? CaseSensitivity::CaseInsensitive : CaseSensitivity::CaseSensitive;
-    return target.has_class(ffi_simple_selector(cxx_simple_selector).class_name(), case_sensitivity);
+    return ffi_element(element).matches_link_pseudo_class();
 }
 
-static bool matches_attribute_value(CSS::Selector::SimpleSelector::Attribute::MatchType match_type, Utf16View selector_value, Utf16View element_value, CaseSensitivity case_sensitivity)
+extern "C" bool selector_ffi_element_is_fullscreen(void const* element)
 {
-    bool const case_insensitive = case_sensitivity == CaseSensitivity::CaseInsensitive;
-    auto values_equal = [&](Utf16View first, Utf16View second) {
-        return case_insensitive ? first.equals_ignoring_ascii_case(second) : first == second;
-    };
-
-    switch (match_type) {
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::HasAttribute:
-        return true;
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::ExactValueMatch:
-        return values_equal(element_value, selector_value);
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::ContainsWord:
-        if (selector_value.is_empty())
-            return false;
-        return element_value.split_view(' ', SplitBehavior::Nothing).contains([&](auto value) { return values_equal(value, selector_value); });
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::ContainsString:
-        return !selector_value.is_empty()
-            && (case_insensitive ? element_value.find_code_unit_offset_ignoring_case(selector_value).has_value() : element_value.contains(selector_value));
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::StartsWithSegment:
-        if (element_value.is_empty())
-            return selector_value.is_empty();
-        if (selector_value.is_empty() || element_value.length_in_code_units() < selector_value.length_in_code_units())
-            return false;
-        if (element_value.length_in_code_units() == selector_value.length_in_code_units())
-            return values_equal(element_value, selector_value);
-        return values_equal(element_value.substring_view(0, selector_value.length_in_code_units()), selector_value)
-            && element_value.code_unit_at(selector_value.length_in_code_units()) == '-';
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::StartsWithString:
-        return !selector_value.is_empty()
-            && selector_value.length_in_code_units() <= element_value.length_in_code_units()
-            && values_equal(element_value.substring_view(0, selector_value.length_in_code_units()), selector_value);
-    case CSS::Selector::SimpleSelector::Attribute::MatchType::EndsWithString:
-        return !selector_value.is_empty()
-            && selector_value.length_in_code_units() <= element_value.length_in_code_units()
-            && values_equal(element_value.substring_view(element_value.length_in_code_units() - selector_value.length_in_code_units()), selector_value);
-    }
-    VERIFY_NOT_REACHED();
+    return ffi_element(element).is_fullscreen_element();
 }
 
-extern "C" bool selector_ffi_matches_attribute(void* context, void const* element, void const* cxx_simple_selector)
+extern "C" i64 selector_ffi_element_heading_level(void const* element)
 {
-    auto& match_context = rust_match_context(context);
-    auto const& target = ffi_element(element);
-    auto const& attribute_selector = ffi_simple_selector(cxx_simple_selector).attribute();
-    auto const& qualified_name = attribute_selector.qualified_name;
-    auto const& attribute_name = qualified_name.name.name;
-    auto const& lowercase_attribute_name = qualified_name.name.lowercase_name;
-    auto const selector_value = attribute_selector.value.utf16_view();
-    auto const match_type = attribute_selector.match_type;
-
-    CaseSensitivity case_sensitivity;
-    switch (attribute_selector.case_type) {
-    case CSS::Selector::SimpleSelector::Attribute::CaseType::CaseSensitiveMatch:
-        case_sensitivity = CaseSensitivity::CaseSensitive;
-        break;
-    case CSS::Selector::SimpleSelector::Attribute::CaseType::CaseInsensitiveMatch:
-        case_sensitivity = CaseSensitivity::CaseInsensitive;
-        break;
-    case CSS::Selector::SimpleSelector::Attribute::CaseType::DefaultMatch:
-        case_sensitivity = target.document().is_html_document()
-                && target.namespace_uri() == Namespace::HTML
-                && qualified_name.namespace_type == CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Default
-                && fly_string_is_one_of_utf16(
-                    attribute_name,
-                    HTML::AttributeNames::accept, HTML::AttributeNames::accept_charset, HTML::AttributeNames::align,
-                    HTML::AttributeNames::alink, HTML::AttributeNames::axis, HTML::AttributeNames::bgcolor, HTML::AttributeNames::charset,
-                    HTML::AttributeNames::checked, HTML::AttributeNames::clear, HTML::AttributeNames::codetype, HTML::AttributeNames::color,
-                    HTML::AttributeNames::compact, HTML::AttributeNames::declare, HTML::AttributeNames::defer, HTML::AttributeNames::dir,
-                    HTML::AttributeNames::direction, HTML::AttributeNames::disabled, HTML::AttributeNames::enctype, HTML::AttributeNames::face,
-                    HTML::AttributeNames::frame, HTML::AttributeNames::hreflang, HTML::AttributeNames::http_equiv, HTML::AttributeNames::lang,
-                    HTML::AttributeNames::language, HTML::AttributeNames::link, HTML::AttributeNames::media, HTML::AttributeNames::method,
-                    HTML::AttributeNames::multiple, HTML::AttributeNames::nohref, HTML::AttributeNames::noresize, HTML::AttributeNames::noshade,
-                    HTML::AttributeNames::nowrap, HTML::AttributeNames::readonly, HTML::AttributeNames::rel, HTML::AttributeNames::rev,
-                    HTML::AttributeNames::rules, HTML::AttributeNames::scope, HTML::AttributeNames::scrolling, HTML::AttributeNames::selected,
-                    HTML::AttributeNames::shape, HTML::AttributeNames::target, HTML::AttributeNames::text, HTML::AttributeNames::type,
-                    HTML::AttributeNames::valign, HTML::AttributeNames::valuetype, HTML::AttributeNames::vlink)
-            ? CaseSensitivity::CaseInsensitive
-            : CaseSensitivity::CaseSensitive;
-        break;
-    }
-
-    auto attribute_matches = [&](DOM::Attr const& attribute) {
-        return matches_attribute_value(match_type, selector_value, attribute.value().utf16_view(), case_sensitivity);
-    };
-
-    switch (qualified_name.namespace_type) {
-    // "In keeping with the Namespaces in the XML recommendation, default namespaces do not apply to attributes,
-    //  therefore attribute selectors without a namespace component apply only to attributes that have no namespace (equivalent to "|attr")"
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Default:
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::None: {
-        auto const& name_to_match = target.document().is_html_document() && target.namespace_uri() == Namespace::HTML
-            ? lowercase_attribute_name
-            : attribute_name;
-        for (u32 i = 0; i < target.attributes()->length(); ++i) {
-            auto const* attribute = target.attributes()->item(i);
-            if (!attribute->namespace_uri().has_value() && attribute->local_name() == name_to_match)
-                return attribute_matches(*attribute);
-        }
-        return false;
-    }
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Any: {
-        bool const use_lowercase_name = target.document().is_html_document() && target.namespace_uri() == Namespace::HTML;
-        auto const& name_to_match = use_lowercase_name ? lowercase_attribute_name : attribute_name;
-        for (u32 i = 0; i < target.attributes()->length(); ++i) {
-            auto const* attribute = target.attributes()->item(i);
-            if (attribute->local_name() == name_to_match && attribute_matches(*attribute))
-                return true;
-        }
-        return false;
-    }
-    case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Named: {
-        if (!match_context.style_sheet_for_rule)
-            return false;
-        auto selector_namespace = match_context.style_sheet_for_rule->namespace_uri(qualified_name.namespace_);
-        if (!selector_namespace.has_value())
-            return false;
-        for (u32 i = 0; i < target.attributes()->length(); ++i) {
-            auto const* attribute = target.attributes()->item(i);
-            if (attribute->namespace_uri().has_value()
-                && *selector_namespace == attribute->namespace_uri()->view()
-                && attribute->local_name() == attribute_name)
-                return attribute_matches(*attribute);
-        }
-        return false;
-    }
-    }
-    VERIFY_NOT_REACHED();
+    auto const* heading = as_if<HTML::HTMLHeadingElement>(ffi_element(element));
+    return heading ? heading->heading_level() : 0;
 }
 
-static bool is_rust_structural_or_functional_pseudo_class(CSS::PseudoClass pseudo_class)
+extern "C" bool selector_ffi_element_has_popover_attribute(void const* element)
 {
-    return first_is_one_of(
-        pseudo_class,
-        CSS::PseudoClass::Empty,
-        CSS::PseudoClass::FirstChild,
-        CSS::PseudoClass::FirstOfType,
-        CSS::PseudoClass::Has,
-        CSS::PseudoClass::Host,
-        CSS::PseudoClass::Is,
-        CSS::PseudoClass::LastChild,
-        CSS::PseudoClass::LastOfType,
-        CSS::PseudoClass::Not,
-        CSS::PseudoClass::NthChild,
-        CSS::PseudoClass::NthLastChild,
-        CSS::PseudoClass::NthLastOfType,
-        CSS::PseudoClass::NthOfType,
-        CSS::PseudoClass::OnlyChild,
-        CSS::PseudoClass::OnlyOfType,
-        CSS::PseudoClass::Root,
-        CSS::PseudoClass::Scope,
-        CSS::PseudoClass::Where,
-        CSS::PseudoClass::Dir,
-        CSS::PseudoClass::Heading,
-        CSS::PseudoClass::Lang,
-        CSS::PseudoClass::State);
+    return ffi_element(element).has_attribute(HTML::AttributeNames::popover);
 }
 
-extern "C" bool selector_ffi_matches_pseudo_class(void const* element, u8 pseudo_class_value)
+extern "C" bool selector_ffi_element_popover_is_showing(void const* element)
 {
-    auto pseudo_class = static_cast<CSS::PseudoClass>(pseudo_class_value);
-    VERIFY(pseudo_class < CSS::PseudoClass::__Count);
-    VERIFY(!is_rust_structural_or_functional_pseudo_class(pseudo_class));
-    return matches_pseudo_class_state(pseudo_class, ffi_element(element));
+    auto const* html_element = as_if<HTML::HTMLElement>(ffi_element(element));
+    return html_element
+        && html_element->popover_visibility_state() == HTML::HTMLElement::PopoverVisibilityState::Showing;
 }
 
-extern "C" bool selector_ffi_matches_language(void const* element, StringView language)
-{
-    auto element_language = ffi_element(element).lang();
-    return element_language.has_value()
-        && language_range_matches_tag(ffi_string_view(language), *element_language);
-}
-
-extern "C" bool selector_ffi_matches_direction(void const* element, Direction direction)
+extern "C" Direction selector_ffi_element_direction(void const* element)
 {
     switch (ffi_element(element).directionality()) {
     case DOM::Element::Directionality::Ltr:
-        return direction == Direction::LeftToRight;
+        return Direction::LeftToRight;
     case DOM::Element::Directionality::Rtl:
-        return direction == Direction::RightToLeft;
+        return Direction::RightToLeft;
     }
     VERIFY_NOT_REACHED();
 }
 
-extern "C" bool selector_ffi_matches_state(void const* element, void const* cxx_simple_selector)
+extern "C" bool selector_ffi_element_has_custom_state(void const* element, uintptr_t state)
 {
     auto const& target = ffi_element(element);
     if (!target.is_custom())
         return false;
     if (auto custom_state_set = target.custom_state_set())
-        return custom_state_set->has_state(ffi_simple_selector(cxx_simple_selector).pseudo_class().ident->string_value);
+        return custom_state_set->has_state(*reinterpret_cast<Utf16FlyString const*>(&state));
     return false;
 }
 
-extern "C" bool selector_ffi_matches_heading(void const* element, i64 const* levels, size_t level_count)
+extern "C" CSS::SelectorFFI::DomStringView selector_ffi_element_language(void const* element)
 {
-    auto const* heading = as_if<HTML::HTMLHeadingElement>(ffi_element(element));
-    if (!heading)
-        return false;
-    if (level_count == 0)
-        return true;
-    VERIFY(levels);
-    return ReadonlySpan<i64> { levels, level_count }.contains_slow(heading->heading_level());
+    auto language = ffi_element(element).lang_view();
+    return language.has_value() ? dom_string_view(*language) : CSS::SelectorFFI::DomStringView {};
 }
 
-extern "C" void const* selector_ffi_parent_element(void const* element, void const* shadow_host)
+extern "C" bool selector_ffi_element_is_focused(void const* element)
+{
+    return ffi_element(element).is_focused();
+}
+
+extern "C" bool selector_ffi_element_should_indicate_focus(void const* element)
+{
+    return ffi_element(element).should_indicate_focus();
+}
+
+extern "C" bool selector_ffi_element_has_focus_within(void const* element)
+{
+    return ffi_element(element).matches_focus_within_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_active(void const* element)
+{
+    return ffi_element(element).is_being_activated();
+}
+
+extern "C" bool selector_ffi_element_is_checked(void const* element)
+{
+    return ffi_element(element).matches_checked_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_defined(void const* element)
+{
+    return ffi_element(element).is_defined();
+}
+
+extern "C" bool selector_ffi_element_is_disabled(void const* element)
+{
+    return ffi_element(element).matches_disabled_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_enabled(void const* element)
+{
+    return ffi_element(element).matches_enabled_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_local_link(void const* element)
+{
+    return ffi_element(element).matches_local_link_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_placeholder_shown(void const* element)
+{
+    return ffi_element(element).matches_placeholder_shown_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_target(void const* element)
+{
+    return ffi_element(element).is_target();
+}
+
+extern "C" bool selector_ffi_element_is_unchecked(void const* element)
+{
+    return ffi_element(element).matches_unchecked_pseudo_class();
+}
+
+extern "C" bool selector_ffi_element_is_media_element(void const* element)
+{
+    return is<HTML::HTMLMediaElement>(ffi_element(element));
+}
+
+extern "C" bool selector_ffi_element_media_is_blocked(void const* element)
+{
+    auto const* media_element = as_if<HTML::HTMLMediaElement>(ffi_element(element));
+    return media_element && media_element->blocked();
+}
+
+extern "C" bool selector_ffi_element_media_is_muted(void const* element)
+{
+    auto const* media_element = as_if<HTML::HTMLMediaElement>(ffi_element(element));
+    return media_element && media_element->muted();
+}
+
+extern "C" bool selector_ffi_element_media_is_paused(void const* element)
+{
+    auto const* media_element = as_if<HTML::HTMLMediaElement>(ffi_element(element));
+    return media_element && media_element->paused();
+}
+
+extern "C" bool selector_ffi_element_media_is_seeking(void const* element)
+{
+    auto const* media_element = as_if<HTML::HTMLMediaElement>(ffi_element(element));
+    return media_element && media_element->seeking();
+}
+
+extern "C" bool selector_ffi_element_media_is_stalled(void const* element)
+{
+    auto const* media_element = as_if<HTML::HTMLMediaElement>(ffi_element(element));
+    return media_element && media_element->stalled();
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-default
+extern "C" bool selector_ffi_element_is_default(void const* element)
+{
+    auto const& target = ffi_element(element);
+    auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(target);
+    if (!form_associated_element)
+        return false;
+    if (form_associated_element->is_submit_button() && form_associated_element->form() && form_associated_element->form()->default_button() == form_associated_element)
+        return true;
+    if (auto const* input_element = as_if<HTML::HTMLInputElement>(form_associated_element))
+        return input_element->checked_applies() && input_element->has_attribute(HTML::AttributeNames::checked);
+    if (auto const* option_element = as_if<HTML::HTMLOptionElement>(form_associated_element))
+        return option_element->has_attribute(HTML::AttributeNames::selected);
+    return false;
+}
+
+extern "C" CSS::SelectorFFI::FfiMeterValueState selector_ffi_element_meter_value_state(void const* element)
+{
+    auto const* meter = as_if<HTML::HTMLMeterElement>(ffi_element(element));
+    if (!meter)
+        return CSS::SelectorFFI::FfiMeterValueState::NotMeter;
+    switch (meter->value_state()) {
+    case HTML::HTMLMeterElement::ValueState::EvenLessGood:
+        return CSS::SelectorFFI::FfiMeterValueState::EvenLessGood;
+    case HTML::HTMLMeterElement::ValueState::Suboptimal:
+        return CSS::SelectorFFI::FfiMeterValueState::Suboptimal;
+    case HTML::HTMLMeterElement::ValueState::Optimal:
+        return CSS::SelectorFFI::FfiMeterValueState::Optimal;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+extern "C" bool selector_ffi_element_meter_value_is_high(void const* element)
+{
+    auto const* meter = as_if<HTML::HTMLMeterElement>(ffi_element(element));
+    return meter && meter->value() > meter->high();
+}
+
+extern "C" bool selector_ffi_element_meter_value_is_low(void const* element)
+{
+    auto const* meter = as_if<HTML::HTMLMeterElement>(ffi_element(element));
+    return meter && meter->value() < meter->low();
+}
+
+extern "C" bool selector_ffi_element_is_hovered(void const* element)
+{
+    return matches_hover_pseudo_class(ffi_element(element));
+}
+
+extern "C" bool selector_ffi_element_is_indeterminate(void const* element)
+{
+    return matches_indeterminate_pseudo_class(ffi_element(element));
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-invalid
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-valid
+extern "C" CSS::SelectorFFI::FfiValidityState selector_ffi_element_validity_state(void const* element)
+{
+    auto const& target = ffi_element(element);
+    if (auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(target)) {
+        if (form_associated_element->is_candidate_for_constraint_validation()) {
+            return form_associated_element->satisfies_its_constraints()
+                ? CSS::SelectorFFI::FfiValidityState::Valid
+                : CSS::SelectorFFI::FfiValidityState::Invalid;
+        }
+    }
+
+    auto const* form_element = as_if<HTML::HTMLFormElement>(target);
+    if (!form_element && !is<HTML::HTMLFieldSetElement>(target))
+        return CSS::SelectorFFI::FfiValidityState::NotApplicable;
+
+    bool has_invalid_elements = false;
+    target.for_each_in_subtree([&](auto& node) {
+        auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(&node);
+        if (!form_associated_element)
+            return TraversalDecision::Continue;
+        if (form_element && form_associated_element->form() != form_element)
+            return TraversalDecision::Continue;
+        if (form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
+            has_invalid_elements = true;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    return has_invalid_elements
+        ? CSS::SelectorFFI::FfiValidityState::Invalid
+        : CSS::SelectorFFI::FfiValidityState::Valid;
+}
+
+// https://drafts.csswg.org/selectors/#modal-state
+extern "C" bool selector_ffi_element_is_modal(void const* element)
+{
+    auto const* dialog_element = as_if<HTML::HTMLDialogElement>(ffi_element(element));
+    // FIXME: Fullscreen elements are also modal.
+    return dialog_element && dialog_element->is_modal();
+}
+
+extern "C" bool selector_ffi_element_is_open(void const* element)
+{
+    return matches_open_state_pseudo_class(ffi_element(element));
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-optional
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-required
+extern "C" CSS::SelectorFFI::FfiRequiredState selector_ffi_element_required_state(void const* element)
+{
+    auto const& target = ffi_element(element);
+    if (auto const* input_element = as_if<HTML::HTMLInputElement>(target)) {
+        if (input_element->required_applies())
+            return input_element->has_attribute(HTML::AttributeNames::required)
+                ? CSS::SelectorFFI::FfiRequiredState::Required
+                : CSS::SelectorFFI::FfiRequiredState::Optional;
+        // AD-HOC: Chromium and WebKit also match :optional for hidden inputs.
+        return input_element->type_state() == HTML::HTMLInputElement::TypeAttributeState::Hidden
+            ? CSS::SelectorFFI::FfiRequiredState::Optional
+            : CSS::SelectorFFI::FfiRequiredState::NotApplicable;
+    }
+    if (is<HTML::HTMLSelectElement>(target) || is<HTML::HTMLTextAreaElement>(target))
+        return target.has_attribute(HTML::AttributeNames::required)
+            ? CSS::SelectorFFI::FfiRequiredState::Required
+            : CSS::SelectorFFI::FfiRequiredState::Optional;
+    return CSS::SelectorFFI::FfiRequiredState::NotApplicable;
+}
+
+extern "C" bool selector_ffi_element_is_read_write(void const* element)
+{
+    return matches_read_write_pseudo_class(ffi_element(element));
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-user-valid
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-user-invalid
+extern "C" CSS::SelectorFFI::FfiValidityState selector_ffi_element_user_validity_state(void const* element)
+{
+    auto const& target = ffi_element(element);
+    bool user_validity = false;
+    if (auto const* input_element = as_if<HTML::HTMLInputElement>(target))
+        user_validity = input_element->user_validity();
+    else if (auto const* select_element = as_if<HTML::HTMLSelectElement>(target))
+        user_validity = select_element->user_validity();
+    else if (auto const* text_area_element = as_if<HTML::HTMLTextAreaElement>(target))
+        user_validity = text_area_element->user_validity();
+    else
+        return CSS::SelectorFFI::FfiValidityState::NotApplicable;
+    if (!user_validity)
+        return CSS::SelectorFFI::FfiValidityState::NotApplicable;
+
+    auto const& form_associated_element = as<HTML::FormAssociatedElement>(target);
+    if (!form_associated_element.is_candidate_for_constraint_validation())
+        return CSS::SelectorFFI::FfiValidityState::NotApplicable;
+    return form_associated_element.satisfies_its_constraints()
+        ? CSS::SelectorFFI::FfiValidityState::Valid
+        : CSS::SelectorFFI::FfiValidityState::Invalid;
+}
+
+extern "C" CSS::SelectorFFI::DomStringView selector_ffi_element_local_name(void const* element)
+{
+    return dom_string_view(ffi_element(element).local_name());
+}
+
+extern "C" CSS::SelectorFFI::DomStringView selector_ffi_element_class_name(void const* element, size_t index)
+{
+    auto const& classes = ffi_element(element).class_names();
+    VERIFY(index < classes.size());
+    return dom_string_view(classes[index]);
+}
+
+extern "C" size_t selector_ffi_element_attribute_count(void const* element)
+{
+    auto count = ffi_element(element).attribute_list_size();
+    VERIFY(count <= NumericLimits<u32>::max());
+    return count;
+}
+
+extern "C" CSS::SelectorFFI::DomAttribute selector_ffi_element_attribute(void const* element, size_t index)
+{
+    auto const& target = ffi_element(element);
+    VERIFY(index < target.attribute_list_size());
+    auto const* attribute = target.attributes()->item(static_cast<u32>(index));
+    VERIFY(attribute);
+    return {
+        .local_name = interned_string_identity(attribute->local_name()),
+        .namespace_ = attribute->namespace_uri().has_value() ? interned_string_identity(*attribute->namespace_uri()) : 0,
+        .has_namespace = attribute->namespace_uri().has_value(),
+        .value = dom_string_view(attribute->value()),
+    };
+}
+
+extern "C" CSS::SelectorFFI::ResolvedNamespace selector_ffi_default_namespace(void* context)
+{
+    auto& match_context = rust_match_context(context);
+    if (!match_context.style_sheet_for_rule || !match_context.style_sheet_for_rule->default_namespace_rule()) {
+        return {
+            .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Missing,
+            .namespace_ = 0,
+        };
+    }
+
+    auto const& namespace_ = match_context.style_sheet_for_rule->default_namespace_rule()->namespace_uri();
+    if (namespace_.is_empty()) {
+        return {
+            .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Null,
+            .namespace_ = 0,
+        };
+    }
+    return {
+        .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Named,
+        .namespace_ = interned_string_identity(namespace_),
+    };
+}
+
+extern "C" CSS::SelectorFFI::ResolvedNamespace selector_ffi_resolve_namespace(void* context, StringView prefix)
+{
+    auto& match_context = rust_match_context(context);
+    if (!match_context.style_sheet_for_rule) {
+        return {
+            .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Missing,
+            .namespace_ = 0,
+        };
+    }
+
+    auto namespace_ = match_context.style_sheet_for_rule->namespace_uri(ffi_string_view(prefix));
+    if (!namespace_.has_value()) {
+        return {
+            .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Missing,
+            .namespace_ = 0,
+        };
+    }
+    if (namespace_->is_empty()) {
+        return {
+            .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Null,
+            .namespace_ = 0,
+        };
+    }
+    return {
+        .namespace_type = CSS::SelectorFFI::ResolvedNamespaceType::Named,
+        .namespace_ = interned_string_identity(*namespace_),
+    };
+}
+
+extern "C" CSS::SelectorFFI::Element selector_ffi_parent_element(void const* element, void const* shadow_host)
 {
     auto const& target = ffi_element(element);
     if (!shadow_host)
-        return target.parent_element();
+        return element_to_ffi(target.parent_element());
     if (element == shadow_host)
-        return nullptr;
-    return target.parent_or_shadow_host_element();
+        return {};
+    return element_to_ffi(target.parent_or_shadow_host_element());
 }
 
-extern "C" void const* selector_ffi_parent_element_in_light_tree(void const* element)
+extern "C" CSS::SelectorFFI::Element selector_ffi_parent_element_in_light_tree(void const* element)
 {
-    return ffi_element(element).parent_element();
+    return element_to_ffi(ffi_element(element).parent_element());
 }
 
-extern "C" void const* selector_ffi_previous_element_sibling(void const* element)
+extern "C" CSS::SelectorFFI::Element selector_ffi_previous_element_sibling(void const* element)
 {
-    return ffi_element(element).previous_element_sibling();
+    return element_to_ffi(ffi_element(element).previous_element_sibling());
 }
 
-extern "C" void const* selector_ffi_next_element_sibling(void const* element)
+extern "C" CSS::SelectorFFI::Element selector_ffi_next_element_sibling(void const* element)
 {
-    return ffi_element(element).next_element_sibling();
+    return element_to_ffi(ffi_element(element).next_element_sibling());
 }
 
-extern "C" void const* selector_ffi_first_element_child(void const* element)
+extern "C" CSS::SelectorFFI::Element selector_ffi_first_element_child(void const* element)
 {
-    return ffi_element(element).first_child_of_type<DOM::Element>();
+    return element_to_ffi(ffi_element(element).first_child_of_type<DOM::Element>());
 }
 
-extern "C" void const* selector_ffi_first_element_descendant(void const* element)
+extern "C" CSS::SelectorFFI::Element selector_ffi_first_element_descendant(void const* element)
 {
     auto const& root = ffi_element(element);
     for (auto const* node = root.first_child(); node; node = node->next_in_pre_order(&root)) {
         if (node->is_element())
-            return static_cast<DOM::Element const*>(node);
+            return element_to_ffi(static_cast<DOM::Element const*>(node));
     }
-    return nullptr;
+    return {};
 }
 
-extern "C" void const* selector_ffi_next_element_descendant(void const* element, void const* root)
+extern "C" CSS::SelectorFFI::Element selector_ffi_next_element_descendant(void const* element, void const* root)
 {
     auto const& root_element = ffi_element(root);
     for (auto const* node = static_cast<DOM::Node const*>(&ffi_element(element))->next_in_pre_order(&root_element); node; node = node->next_in_pre_order(&root_element)) {
         if (node->is_element())
-            return static_cast<DOM::Element const*>(node);
+            return element_to_ffi(static_cast<DOM::Element const*>(node));
     }
-    return nullptr;
+    return {};
 }
 
-extern "C" bool selector_ffi_has_no_element_or_nonempty_text_children(void const* element)
+extern "C" bool selector_ffi_element_has_element_child(void const* element)
 {
-    auto const& target = ffi_element(element);
-    if (!target.has_children())
-        return true;
-    if (target.first_child_of_type<DOM::Element>())
-        return false;
+    return ffi_element(element).first_child_of_type<DOM::Element>();
+}
+
+extern "C" bool selector_ffi_element_has_nonempty_text_child(void const* element)
+{
     bool has_nonempty_text_child = false;
-    target.for_each_child_of_type<DOM::Text>([&](auto const& text) {
+    ffi_element(element).for_each_child_of_type<DOM::Text>([&](auto const& text) {
         if (!text.data().is_empty()) {
             has_nonempty_text_child = true;
             return IterationDecision::Break;
         }
         return IterationDecision::Continue;
     });
-    return !has_nonempty_text_child;
-}
-
-extern "C" bool selector_ffi_has_same_type(void const* first, void const* second)
-{
-    auto const& first_element = ffi_element(first);
-    auto const& second_element = ffi_element(second);
-    return first_element.local_name() == second_element.local_name()
-        && first_element.namespace_uri() == second_element.namespace_uri();
-}
-
-extern "C" bool selector_ffi_is_document_root(void const* element)
-{
-    return is<HTML::HTMLHtmlElement>(ffi_element(element));
+    return has_nonempty_text_child;
 }
 
 extern "C" bool selector_ffi_is_shadow_tree_slot(void const* element)
@@ -1139,8 +1011,8 @@ extern "C" CSS::SelectorFFI::ElementAndShadowHost selector_ffi_slotted_parent(vo
         if (slot_shadow_root != match_context.rule_shadow_root)
             continue;
         return {
-            .element = slot,
-            .shadow_host = slot_shadow_root ? slot_shadow_root->host() : nullptr,
+            .element = element_to_ffi(slot),
+            .shadow_host = element_to_ffi(slot_shadow_root ? slot_shadow_root->host() : nullptr),
         };
     }
     return {};
@@ -1182,7 +1054,7 @@ extern "C" CSS::SelectorFFI::ElementAndShadowHost selector_ffi_part_parent(void*
             else
                 next_shadow_host = nullptr;
         }
-        return { .element = &host, .shadow_host = next_shadow_host };
+        return { .element = element_to_ffi(&host), .shadow_host = element_to_ffi(next_shadow_host) };
     }
     return {};
 }
