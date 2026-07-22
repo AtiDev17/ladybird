@@ -33,6 +33,7 @@ set(SOURCES
     Compositor/AsyncScrollTree.cpp
     Compositor/AsyncScrollingState.cpp
     Compositor/CompositorHost.cpp
+    Compositor/SmoothScrollAnimation.cpp
     Compositor/Types.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
@@ -671,6 +672,7 @@ set(SOURCES
     HTML/NavigationCurrentEntryChangeEvent.cpp
     HTML/NavigationDestination.cpp
     HTML/NavigationHistoryEntry.cpp
+    HTML/NavigationSourceSnapshot.cpp
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
     HTML/NavigationTransition.cpp

@@ -103,13 +103,18 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
     paintable.record_hit_test_items(context, phase);
 
     auto& recorder = context.display_list_recorder();
+    auto const* cache_source_display_list = context.paint_command_cache_source_display_list();
+    // NB: Some commands embed visual context indices in their payloads. Those
+    //     indices can change when the visual context tree is rebuilt, so commands
+    //     from an incompatible tree must be recorded and cached against the new tree.
+    bool const cache_reads_enabled = cache_source_display_list
+        && cache_source_display_list->compatible_visual_context_tree_version() == recorder.visual_context_tree().version();
     bool const skip_cache = paintable.fixed_background_visual_context().has_value();
     bool const cache_writes_enabled = context.paint_command_cache_mode() == PaintCommandCacheMode::ReadWrite;
-    auto const* cache_source_display_list = context.paint_command_cache_source_display_list();
     auto const phase_context_index = recorder.accumulated_visual_context();
     bool const phase_has_empty_effective_clip = recorder.visual_context_tree().has_empty_effective_clip(phase_context_index);
 
-    auto cached_commands = !skip_cache && cache_source_display_list
+    auto cached_commands = !skip_cache && cache_reads_enabled
         ? paintable.valid_cached_commands(phase, cache_source_display_list->id(), phase_has_empty_effective_clip)
         : Optional<Paintable::CachedCommandRange> {};
 
@@ -120,14 +125,18 @@ static void paint_node(Paintable const& paintable, DisplayListRecordingContext& 
         if (cache_writes_enabled)
             paintable.set_cached_commands(phase, recorder.display_list().id(), destination_range, phase_context_index, phase_has_empty_effective_clip);
     } else {
-        auto capture = !skip_cache && cache_writes_enabled
-            ? Optional<DisplayListRecorder::CommandCapture>(recorder.begin_command_capture())
-            : Optional<DisplayListRecorder::CommandCapture> {};
+        auto const command_range_start = recorder.display_list().command_byte_size();
         if (phase == PaintPhase::Background)
             paintable.record_async_scrolling_metadata(context);
         paintable.paint(context, phase);
-        if (capture.has_value())
-            paintable.set_cached_commands(phase, recorder.display_list().id(), capture->take(), phase_context_index, phase_has_empty_effective_clip);
+        if (!skip_cache && cache_writes_enabled) {
+            auto const command_range_end = recorder.display_list().command_byte_size();
+            DisplayListCommandRange command_range {
+                static_cast<u32>(command_range_start),
+                static_cast<u32>(command_range_end - command_range_start),
+            };
+            paintable.set_cached_commands(phase, recorder.display_list().id(), command_range, phase_context_index, phase_has_empty_effective_clip);
+        }
     }
 
     context.display_list_recorder().set_accumulated_visual_context(VISUAL_VIEWPORT_NODE_INDEX);

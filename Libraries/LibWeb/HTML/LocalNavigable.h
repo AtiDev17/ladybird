@@ -15,7 +15,9 @@
 #include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibWeb/Bindings/Navigation.h>
+#include <LibWeb/Bindings/Window.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/SmoothScrollAnimation.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -26,6 +28,7 @@
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
+#include <LibWeb/HTML/NavigationSourceSnapshot.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
@@ -175,6 +178,7 @@ public:
         Fetch::Infrastructure::Request::ReferrerType request_referrer,
         ReferrerPolicy::ReferrerPolicy request_referrer_policy,
         Optional<URL::Origin> initiator_origin,
+        Optional<URL::Origin> cross_process_initiator_origin,
         Optional<URL::Origin> origin,
         Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
         Optional<URL::URL> about_base_url,
@@ -204,6 +208,10 @@ public:
         UserNavigationInvolvement user_involvement = UserNavigationInvolvement::None;
         GC::Ptr<DOM::Element> source_element = nullptr;
         InitialInsertion initial_insertion = InitialInsertion::No;
+        // AD-HOC: Set when this navigation was started in another WebContent process and handed off to this one. The
+        //         source document only exists in the process where the navigation started, so this carries the state
+        //         the navigate algorithm would otherwise snapshot from it.
+        Optional<NavigationSourceSnapshot> cross_process_source_snapshot = {};
 
         void visit_edges(Cell::Visitor& visitor);
     };
@@ -230,6 +238,7 @@ public:
     void set_viewport_size(CSSPixelSize, InvalidateDisplayList = InvalidateDisplayList::No);
     void perform_scroll_of_viewport_scrolling_box(CSSPixelPoint position);
     void adopt_pending_async_scroll_offsets();
+    void process_main_thread_smooth_scrolls();
     void wait_for_async_scroll_operation(Compositor::AsyncScrollOperationID, GC::Ref<WebIDL::Promise>);
     void clamp_viewport_scroll_offset();
 
@@ -307,7 +316,8 @@ public:
     bool fast_is() const = delete;
 
     GC::Ref<WebIDL::Promise> scroll_viewport_by_delta(CSSPixelPoint delta);
-    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_an_element(DOM::Element&, CSSPixelPoint position, Bindings::ScrollBehavior);
     void reset_zoom();
 
 protected:
@@ -343,6 +353,11 @@ private:
     void inform_the_navigation_api_about_aborting_navigation();
     void resolve_async_scroll_operation(Compositor::AsyncScrollOperationID);
     void resolve_all_pending_async_scroll_operations();
+    void resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeStableID);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_a_scrolling_box(Compositor::AsyncScrollNodeStableID, CSSPixelPoint position, Bindings::ScrollBehavior, GC::Ptr<DOM::Element> associated_element);
+    Optional<CSSPixelPoint> scroll_offset_for(Compositor::AsyncScrollNodeStableID) const;
+    bool set_scroll_offset_for(Compositor::AsyncScrollNodeStableID, CSSPixelPoint);
+    void queue_scrollend_event(Compositor::AsyncScrollNodeStableID);
     void schedule_hover_update_after_async_scroll();
     void update_hover_after_async_scroll_stops();
     void cancel_hover_update_after_async_scroll();
@@ -411,8 +426,20 @@ private:
     struct PendingAsyncScrollOperation {
         Compositor::AsyncScrollOperationID operation_id { 0 };
         GC::Ref<WebIDL::Promise> promise;
+        Optional<Compositor::AsyncScrollNodeStableID> stable_node_id;
+        Optional<CSSPixelPoint> initial_scroll_offset;
     };
     Vector<PendingAsyncScrollOperation> m_pending_async_scroll_operations;
+
+    struct MainThreadSmoothScroll {
+        Compositor::AsyncScrollNodeStableID stable_node_id;
+        Compositor::SmoothScrollAnimation animation;
+        MonotonicTime last_tick;
+        AK::Duration elapsed;
+        CSSPixelPoint initial_scroll_offset;
+        GC::Ref<WebIDL::Promise> promise;
+    };
+    Vector<MainThreadSmoothScroll> m_main_thread_smooth_scrolls;
 };
 
 struct PopulateSessionHistoryEntryDocumentOutput final : public JS::Cell {
