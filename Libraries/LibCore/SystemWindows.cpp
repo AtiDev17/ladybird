@@ -269,7 +269,31 @@ ErrorOr<Array<int, 2>> pipe2(int flags)
 
 ErrorOr<bool> isatty(int handle)
 {
-    return GetFileType(to_handle(handle)) == FILE_TYPE_CHAR;
+    // GetFileType() cannot answer this: it reports FILE_TYPE_CHAR for every character device, including NUL.
+    // Only real consoles have a console mode.
+    DWORD mode = 0;
+    return GetConsoleMode(to_handle(handle), &mode) != 0;
+}
+
+ErrorOr<TerminalSize> terminal_size(int fd)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info {};
+    if (!GetConsoleScreenBufferInfo(to_handle(fd), &info))
+        return Error::from_windows_error();
+    return TerminalSize {
+        static_cast<size_t>(info.srWindow.Right - info.srWindow.Left + 1),
+        static_cast<size_t>(info.srWindow.Bottom - info.srWindow.Top + 1),
+    };
+}
+
+ErrorOr<void> enable_ansi_escape_sequence_processing(int fd)
+{
+    DWORD mode = 0;
+    if (!GetConsoleMode(to_handle(fd), &mode))
+        return Error::from_windows_error();
+    if (!SetConsoleMode(to_handle(fd), mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        return Error::from_windows_error();
+    return {};
 }
 
 ErrorOr<int> socket(int domain, int type, int protocol)

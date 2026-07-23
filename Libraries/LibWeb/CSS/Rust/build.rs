@@ -579,7 +579,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     generate_ffi_header(
         selector_config,
-        &[manifest_dir.join("src/selector_engine.rs")],
+        &[
+            manifest_dir.join("src/selector_engine.rs"),
+            manifest_dir.join("src/ffi_support.rs"),
+        ],
         &out_dir,
         &ffi_out_dir,
         Path::new("SelectorRustFFI.h"),
@@ -625,6 +628,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/computed_values.rs"),
             manifest_dir.join("src/property_metadata.rs"),
             manifest_dir.join("src/style_compute.rs"),
+            manifest_dir.join("src/display.rs"),
             manifest_dir.join("src/css_pixels.rs"),
             manifest_dir.join("src/cascaded_properties.rs"),
             manifest_dir.join("src/custom_properties.rs"),

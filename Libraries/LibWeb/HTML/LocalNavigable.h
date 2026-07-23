@@ -156,6 +156,10 @@ public:
 
     GC::Ptr<LocalNavigable> find_a_navigable_by_target_name(Utf16View name);
 
+    void handle_as_a_download(GC::Ref<Fetch::Infrastructure::Response>, URL::URL const& fallback_url, GC::Ptr<Fetch::Infrastructure::FetchController>, Optional<ByteString> proposed_filename, Optional<URL::Origin> interface_origin);
+
+    void inform_the_navigation_api_about_aborting_navigation();
+
     enum class Traversal {
         Tag
     };
@@ -315,9 +319,18 @@ public:
     template<typename T>
     bool fast_is() const = delete;
 
-    GC::Ref<WebIDL::Promise> scroll_viewport_by_delta(CSSPixelPoint delta);
-    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto);
+    enum class ScrollTrigger {
+        Programmatic,
+        UserInput,
+    };
+
+    GC::Ref<WebIDL::Promise> scroll_viewport_by_delta(CSSPixelPoint delta, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Instant);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior = Bindings::ScrollBehavior::Auto, ScrollTrigger = ScrollTrigger::Programmatic);
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_an_element(DOM::Element&, CSSPixelPoint position, Bindings::ScrollBehavior);
+    void queue_scrollend_event_after_user_scroll(GC::Ref<DOM::EventTarget>);
+    void defer_user_scroll_settlement();
+    void begin_user_scroll_gesture_hold(Badge<UserScrollGestureHold>);
+    void end_user_scroll_gesture_hold(Badge<UserScrollGestureHold>);
     void reset_zoom();
 
 protected:
@@ -350,14 +363,20 @@ private:
     void clear_parent_compositor_context();
     void destroy_compositor_context();
 
-    void inform_the_navigation_api_about_aborting_navigation();
+    void start_download_for_response(GC::Ref<Fetch::Infrastructure::Response>, URL::URL const& download_url, ByteString suggested_filename, GC::Ptr<Fetch::Infrastructure::FetchController>);
+
     void resolve_async_scroll_operation(Compositor::AsyncScrollOperationID);
     void resolve_all_pending_async_scroll_operations();
     void resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeStableID);
-    GC::Ref<WebIDL::Promise> perform_a_scroll_of_a_scrolling_box(Compositor::AsyncScrollNodeStableID, CSSPixelPoint position, Bindings::ScrollBehavior, GC::Ptr<DOM::Element> associated_element);
+    GC::Ref<WebIDL::Promise> perform_a_scroll_of_a_scrolling_box(Compositor::AsyncScrollNodeStableID, CSSPixelPoint position, Bindings::ScrollBehavior, GC::Ptr<DOM::Element> associated_element, ScrollTrigger);
     Optional<CSSPixelPoint> scroll_offset_for(Compositor::AsyncScrollNodeStableID) const;
     bool set_scroll_offset_for(Compositor::AsyncScrollNodeStableID, CSSPixelPoint);
-    void queue_scrollend_event(Compositor::AsyncScrollNodeStableID);
+    void queue_scrollend_event(Compositor::AsyncScrollNodeStableID, ScrollTrigger);
+    void queue_scrollend_event(DOM::Document&, GC::Ref<DOM::EventTarget>, ScrollTrigger);
+    void queue_scrollend_event_for_finished_scroll(Compositor::AsyncScrollNodeStableID, ScrollTrigger);
+    bool has_in_flight_user_scroll_operation() const;
+    void user_scroll_did_settle();
+    void cancel_user_scroll_settlement();
     void schedule_hover_update_after_async_scroll();
     void update_hover_after_async_scroll_stops();
     void cancel_hover_update_after_async_scroll();
@@ -422,12 +441,16 @@ private:
     Painting::DisplayListResourceSet m_compositor_display_list_resources;
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
+    Vector<GC::Ref<DOM::EventTarget>> m_pending_user_scrollend_targets;
+    RefPtr<Core::Timer> m_user_scroll_settle_timer;
+    size_t m_user_scroll_gesture_hold_count { 0 };
 
     struct PendingAsyncScrollOperation {
         Compositor::AsyncScrollOperationID operation_id { 0 };
         GC::Ref<WebIDL::Promise> promise;
         Optional<Compositor::AsyncScrollNodeStableID> stable_node_id;
         Optional<CSSPixelPoint> initial_scroll_offset;
+        ScrollTrigger trigger { ScrollTrigger::Programmatic };
     };
     Vector<PendingAsyncScrollOperation> m_pending_async_scroll_operations;
 
@@ -438,8 +461,21 @@ private:
         AK::Duration elapsed;
         CSSPixelPoint initial_scroll_offset;
         GC::Ref<WebIDL::Promise> promise;
+        ScrollTrigger trigger { ScrollTrigger::Programmatic };
     };
     Vector<MainThreadSmoothScroll> m_main_thread_smooth_scrolls;
+};
+
+class WEB_API UserScrollGestureHold {
+    AK_MAKE_NONCOPYABLE(UserScrollGestureHold);
+    AK_MAKE_NONMOVABLE(UserScrollGestureHold);
+
+public:
+    explicit UserScrollGestureHold(LocalNavigable&);
+    ~UserScrollGestureHold();
+
+private:
+    GC::Weak<LocalNavigable> m_navigable;
 };
 
 struct PopulateSessionHistoryEntryDocumentOutput final : public JS::Cell {

@@ -116,16 +116,9 @@ public:
     void restore();
 
     void paint_nested_display_list(DisplayListResource const&, Gfx::IntRect rect);
+    void register_mask_display_list(ReadonlySpan<VisualContextIndex> context_indices, DisplayListResource const&);
 
     void add_rounded_rect_clip(Gfx::CornerRadii corner_radii, Gfx::IntRect border_rect, Gfx::CornerClip corner_clip);
-
-    struct MaskInfo {
-        DisplayListResource display_list;
-        Gfx::IntRect rect;
-        Gfx::MaskKind kind;
-    };
-    void begin_masks(ReadonlySpan<MaskInfo>);
-    void end_masks(ReadonlySpan<MaskInfo>);
 
     void apply_backdrop_filter(Gfx::IntRect const& backdrop_region, Gfx::CornerRadii const& corner_radii, Gfx::Filter const& backdrop_filter);
 
@@ -148,7 +141,7 @@ public:
     void compositor_viewport_scrollbar(CompositorViewportScrollbar const&);
     void compositor_blocking_wheel_event_region(CompositorBlockingWheelEventRegion const&);
 
-    void apply_effects(float opacity = 1.0f, Gfx::CompositingAndBlendingOperator = Gfx::CompositingAndBlendingOperator::Normal, Optional<Gfx::Filter> filter = {}, Optional<Gfx::MaskKind> mask_kind = {});
+    void apply_effects(Gfx::CompositingAndBlendingOperator);
 
     DisplayListRecorder(DisplayList&, AccumulatedVisualContextTree const&, DisplayListResourceStorage&);
     ~DisplayListRecorder();

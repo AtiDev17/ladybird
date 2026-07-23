@@ -334,6 +334,7 @@ void Internals::send_key(HTML::HTMLElement& target, Utf16String const& key_name,
     target.focus();
 
     page().handle_keydown(key_code, modifiers, 0, false, false);
+    page().handle_keyup(key_code, modifiers, 0, false);
 }
 
 void Internals::paste(HTML::HTMLElement& target, Utf16String const& text)
@@ -430,6 +431,11 @@ void Internals::pinch(double x, double y, double scale_delta, WebIDL::UnsignedSh
     auto& page = this->page();
     auto position = page.css_to_device_point({ x, y });
     page.handle_pinch_event(position, modifiers, scale_delta);
+}
+
+void Internals::reset_zoom()
+{
+    page().top_level_traversable()->reset_zoom();
 }
 
 Utf16String Internals::current_cursor()
@@ -955,6 +961,16 @@ JS::Object* Internals::get_style_invalidation_counters()
 void Internals::reset_style_invalidation_counters()
 {
     window().associated_document().reset_style_invalidation_counters();
+}
+
+JS::Object* Internals::layout_tree_build_stats()
+{
+    auto object = JS::Object::create(realm(), nullptr);
+    auto const& stats = window().associated_document().layout_tree_build_stats();
+    object->define_direct_property("builds"_utf16_fly_string, JS::Value(stats.builds), JS::default_attributes);
+    object->define_direct_property("lastBuildRebuiltSubtreeRoots"_utf16_fly_string, JS::Value(stats.last_build_rebuilt_subtree_roots), JS::default_attributes);
+    object->define_direct_property("lastBuildEscapedRebuildRoots"_utf16_fly_string, JS::Value(stats.last_build_escaped_rebuild_roots), JS::default_attributes);
+    return object;
 }
 
 JS::Object* Internals::style_ffi_counters()

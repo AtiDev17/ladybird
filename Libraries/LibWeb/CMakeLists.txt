@@ -858,6 +858,7 @@ set(SOURCES
     Layout/VideoBox.cpp
     Layout/Viewport.cpp
     Loader/ContentBlocker.cpp
+    Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
     Loader/ProxyMappings.cpp

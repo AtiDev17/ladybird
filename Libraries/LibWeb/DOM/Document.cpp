@@ -636,6 +636,13 @@ void Document::reset_style_invalidation_counters() const
     m_style_invalidations_since_last_counter_dump = 0;
 }
 
+void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots)
+{
+    ++m_layout_tree_build_stats.builds;
+    m_layout_tree_build_stats.last_build_rebuilt_subtree_roots = rebuilt_subtree_root_count;
+    m_layout_tree_build_stats.last_build_escaped_rebuild_roots = escaped_rebuild_roots;
+}
+
 void Document::record_style_invalidation() const
 {
     ++m_style_invalidation_counters.style_invalidations;
@@ -2006,6 +2013,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
         Layout::TreeBuilder tree_builder;
         m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+        record_layout_tree_build(tree_builder.rebuilt_subtree_roots().size(), tree_builder.layout_tree_update_escaped_rebuild_roots());
         needs_layout_tree_rebuild = false;
         layout_tree_was_built_in_partial_branch = true;
         pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
@@ -2173,6 +2181,7 @@ void Document::update_layout(UpdateLayoutReason reason)
         if (needs_layout_tree_rebuild) {
             Layout::TreeBuilder tree_builder;
             m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+            record_layout_tree_build(tree_builder.rebuilt_subtree_roots().size(), tree_builder.layout_tree_update_escaped_rebuild_roots());
 
             // NB: Called during layout update.
             if (document_element && document_element->unsafe_layout_node())
@@ -4694,6 +4703,14 @@ void Document::run_the_resize_steps()
             visual_viewport.dispatch_event(visual_viewport_resize_event);
         }
     }
+}
+
+bool Document::append_pending_scroll_event(PendingScrollEvent event)
+{
+    if (m_pending_scroll_events.contains_slow(event))
+        return false;
+    m_pending_scroll_events.append(move(event));
+    return true;
 }
 
 // https://drafts.csswg.org/cssom-view-1/#document-run-the-scroll-steps
@@ -8880,8 +8897,11 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         display_list_recorder.fill_rect(bitmap_rect, CSS::SystemColor::canvas(color_scheme));
 
     auto background_color = this->background_color();
-    if (navigable()->is_top_level_traversable())
-        page().client().page_did_change_background_color(canvas_background_color());
+    if (navigable()->is_top_level_traversable()) {
+        auto canvas_background_color = this->canvas_background_color();
+        display_list->set_surface_clear_color(canvas_background_color);
+        page().client().page_did_change_background_color(canvas_background_color);
+    }
 
     display_list_recorder.fill_rect(bitmap_rect, background_color);
 
@@ -9501,6 +9521,16 @@ Utf16String Document::dump_display_list()
                 if (nesting_change > 0)
                     indent += nesting_change;
             });
+
+            auto mask_context_indices = list.mask_display_lists().keys();
+            insertion_sort(mask_context_indices);
+            for (auto context_index : mask_context_indices) {
+                builder.append_repeated(' ', base_indent * 2);
+                builder.appendff("MaskDisplayList for context {}:\n", context_index.value());
+                auto display_list_id = list.mask_display_list_id(context_index).release_value();
+                auto& mask_display_list = resource_storage.display_list(display_list_id);
+                dump_commands(mask_display_list, base_indent + 1);
+            }
         };
 
     dump_commands(*display_list, 0);

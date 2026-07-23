@@ -65,6 +65,7 @@ public:
     void click_and_hold(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
     GC::Ref<WebIDL::Promise> wheel(double x, double y, double delta_x, double delta_y);
     void pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers);
+    void reset_zoom();
 
     Utf16String current_cursor();
 
@@ -147,6 +148,7 @@ public:
 
     JS::Object* get_style_invalidation_counters();
     void reset_style_invalidation_counters();
+    JS::Object* layout_tree_build_stats();
     JS::Object* computed_values_stats();
     JS::Object* style_ffi_counters();
     void reset_style_ffi_counters();

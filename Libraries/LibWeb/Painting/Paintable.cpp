@@ -101,6 +101,69 @@ CSS::ComputedValues const& Paintable::computed_values() const
     return layout_node().computed_values();
 }
 
+Vector<MaskLayerPresence, 3> Paintable::mask_layer_presence(MaskLayerSet mask_layer_set) const
+{
+    Vector<MaskLayerPresence, 3> presence;
+
+    if (mask_layer_set == MaskLayerSet::CssAndSvg
+        && any_of(computed_values().mask_layers(), [](auto const& layer) { return layer.background_image != nullptr; })
+        && is<Layout::Box>(layout_node())
+        && layout_node().establishes_stacking_context()) {
+        presence.append({
+            MaskLayerOrigin::CssMaskLayers,
+            absolute_border_box_rect(),
+            Gfx::MaskKind::Alpha,
+        });
+    }
+
+    if (auto mask_area = get_mask_area(); mask_area.has_value()) {
+        presence.append({
+            MaskLayerOrigin::SvgMask,
+            *mask_area,
+            get_mask_type().value_or(Gfx::MaskKind::Alpha),
+        });
+    }
+
+    if (auto clip_area = get_clip_area(); clip_area.has_value()) {
+        presence.append({
+            MaskLayerOrigin::SvgClip,
+            *clip_area,
+            Gfx::MaskKind::Alpha,
+        });
+    }
+
+    return presence;
+}
+
+void register_mask_display_lists(DisplayListRecordingContext& context, Paintable const& paintable, ReadonlySpan<MaskLayerDisplayList> mask_display_lists)
+{
+    if (mask_display_lists.is_empty())
+        return;
+
+    auto const& visual_context_tree = context.display_list_recorder().visual_context_tree();
+
+    Vector<VisualContextIndex, 9> mask_node_indices;
+    if (auto const& nested_assignments = context.nested_mask_node_assignments(); nested_assignments.has_value()) {
+        if (auto assignment = nested_assignments->find(&paintable); assignment != nested_assignments->end())
+            mask_node_indices.extend(assignment->value);
+    } else {
+        for (size_t index = paintable.visual_context_nodes_begin(); index < paintable.visual_context_nodes_end(); ++index) {
+            if (visual_context_tree.node_at(VisualContextIndex { index }).data.has<MaskData>())
+                mask_node_indices.append(VisualContextIndex { index });
+        }
+    }
+
+    for (auto const& mask_display_list : mask_display_lists) {
+        Vector<VisualContextIndex, 3> node_indices_for_origin;
+        for (auto node_index : mask_node_indices) {
+            if (visual_context_tree.node_at(node_index).data.get<MaskData>().origin == mask_display_list.origin)
+                node_indices_for_origin.append(node_index);
+        }
+        VERIFY(!node_indices_for_origin.is_empty());
+        context.display_list_recorder().register_mask_display_list(node_indices_for_origin, mask_display_list.resource);
+    }
+}
+
 bool Paintable::visible_for_hit_testing() const
 {
     if (auto node = dom_node(); node && node->is_inert())
@@ -1068,21 +1131,14 @@ Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
     //           the element’s eventual snap target in the block axis as newBlockTarget and the element’s eventual snap
     //           target in the inline axis as newInlineTarget.
 
-    GC::Ptr<DOM::EventTarget> event_target;
-    if (auto pseudo_element = node.generated_for_pseudo_element(); pseudo_element.has_value())
-        event_target = node.pseudo_element_generator();
-    else
-        event_target = dom_node();
-
+    auto event_target = scroll_event_target();
     if (!event_target)
         return ScrollHandled::Yes;
 
     // 3. If (element, "scroll") is already in doc’s pending scroll events, abort these steps.
-    if (document.pending_scroll_events().contains_slow(DOM::Document::PendingScrollEvent { *event_target, HTML::EventNames::scroll }))
-        return ScrollHandled::Yes;
-
     // 4. Append (element, "scroll") to doc’s pending scroll events.
-    document.pending_scroll_events().append({ *event_target, HTML::EventNames::scroll });
+    if (!document.append_pending_scroll_event({ *event_target, HTML::EventNames::scroll }))
+        return ScrollHandled::Yes;
 
     set_needs_repaint(InvalidateDisplayList::No);
     return ScrollHandled::Yes;
@@ -1090,7 +1146,32 @@ Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
 
 Paintable::ScrollHandled Paintable::scroll_by(double delta_x, double delta_y)
 {
-    return set_scroll_offset(scroll_offset().translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)));
+    return set_scroll_offset_from_user_input(scroll_offset().translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)));
+}
+
+Paintable::ScrollHandled Paintable::set_scroll_offset_from_user_input(CSSPixelPoint offset)
+{
+    auto scroll_handled = set_scroll_offset(offset);
+    auto navigable = document().navigable();
+    if (!navigable)
+        return scroll_handled;
+
+    if (scroll_handled == ScrollHandled::Yes) {
+        if (auto event_target = scroll_event_target())
+            navigable->queue_scrollend_event_after_user_scroll(*event_target);
+    } else {
+        // User input keeps the scroll gesture in progress even when it does not move the scrolling box.
+        navigable->defer_user_scroll_settlement();
+    }
+    return scroll_handled;
+}
+
+GC::Ptr<DOM::EventTarget> Paintable::scroll_event_target()
+{
+    auto& node = layout_node();
+    if (node.generated_for_pseudo_element().has_value())
+        return node.pseudo_element_generator();
+    return dom_node();
 }
 
 void Paintable::scroll_into_view(CSSPixelRect rect)
@@ -2579,8 +2660,7 @@ bool Paintable::handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigned, 
     if (wheel_delta_x == 0 && wheel_delta_y == 0)
         return false;
 
-    auto scroll_handled = scroll_by(wheel_delta_x, wheel_delta_y);
-    return scroll_handled == ScrollHandled::Yes;
+    return scroll_by(wheel_delta_x, wheel_delta_y) == ScrollHandled::Yes;
 }
 
 bool Paintable::resizer_contains(CSSPixelPoint adjusted_position, ChromeMetrics const& metrics) const
@@ -2715,23 +2795,6 @@ Optional<BordersData> Paintable::outline_data() const
 CSSPixels Paintable::outline_offset() const
 {
     return computed_values().outline_offset();
-}
-
-VisualContextIndex Paintable::nearest_scroll_node_index() const
-{
-    if (is_fixed_position())
-        return {};
-    auto const* paintable = containing_block_ptr();
-    while (paintable) {
-        if (paintable->own_scroll_node_index().value())
-            return paintable->own_scroll_node_index();
-        // Sticky elements need to find a scroll container even through fixed-position ancestors,
-        // because they must reference a scrollport for their sticky offset computation.
-        if (paintable->is_fixed_position() && !is_sticky_position())
-            return {};
-        paintable = paintable->containing_block_ptr();
-    }
-    return {};
 }
 
 RefPtr<Paintable const> Paintable::nearest_scrollable_ancestor() const

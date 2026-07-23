@@ -72,6 +72,7 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Loader/DownloadFilename.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/DisplayListDamage.h>
@@ -329,35 +330,108 @@ static ContentDispositionInfo parse_content_disposition(HTTP::HeaderList const& 
     return info;
 }
 
-static ByteString sanitize_suggested_download_filename(ByteString filename)
+// https://html.spec.whatwg.org/multipage/links.html#getting-the-suggested-filename
+static ByteString suggested_download_filename(URL::URL const& url, HTTP::HeaderList const& headers, Optional<ByteString> const& proposed_filename, Optional<URL::Origin> const& interface_origin)
 {
-    filename = LexicalPath::basename(move(filename));
+    // 1. Let filename be the undefined value.
+    Optional<ByteString> filename;
 
-    StringBuilder builder;
-    for (auto byte : filename.bytes()) {
-        if (byte == '\0' || byte == '/' || byte == '\\')
-            builder.append('_');
-        else
-            builder.append(static_cast<char>(byte));
+    // 2. If response has a `Content-Disposition` header, that header specifies the attachment disposition type,
+    //    and the header includes filename information, then let filename have the value specified by the header,
+    //    and jump to the step labeled sanitize below.
+    auto content_disposition = parse_content_disposition(headers);
+    if (content_disposition.is_attachment && content_disposition.filename.has_value()) {
+        filename = content_disposition.filename.value();
+        goto sanitize;
     }
 
-    auto sanitized = builder.to_byte_string();
-    if (sanitized.is_empty() || sanitized == "."sv || sanitized == ".."sv)
-        return "download";
-    return sanitized;
-}
+    // NB: Steps 3 to 10 are enclosed in a scope, so the jumps below may bypass the variables declared here.
+    {
+        // 3. Let interface origin be the origin of the Document in which the download or navigate action resulting
+        //    in the download was initiated, if any.
+        // NB: The interface origin is provided by the caller.
 
-static ByteString suggested_download_filename(URL::URL const& url, HTTP::HeaderList const& headers)
-{
-    // https://html.spec.whatwg.org/multipage/links.html#getting-the-suggested-filename
-    // FIXME: This is a partial implementation. We do not yet model the
-    //        hyperlink download attribute, trusted operation, or extension
-    //        adjustment steps.
-    auto content_disposition = parse_content_disposition(headers);
-    if (content_disposition.is_attachment && content_disposition.filename.has_value())
-        return sanitize_suggested_download_filename(content_disposition.filename.release_value());
+        // 4. Let response origin be the origin of the URL of response, unless that URL's scheme component is data,
+        //    in which case let response origin be the same as the interface origin, if any.
+        Optional<URL::Origin> response_origin = url.scheme() == "data"sv ? interface_origin : url.origin();
 
-    return sanitize_suggested_download_filename(url.basename());
+        // 5. If there is no interface origin, then let trusted operation be true. Otherwise, let trusted operation
+        //    be true if response origin is the same origin as interface origin, and false otherwise.
+        auto trusted_operation = !interface_origin.has_value() || response_origin->is_same_origin(*interface_origin);
+
+        // 6. If trusted operation is true and response has a `Content-Disposition` header and that header includes
+        //    filename information, then let filename have the value specified by the header, and jump to the step
+        //    labeled sanitize below.
+        if (trusted_operation && content_disposition.filename.has_value()) {
+            filename = content_disposition.filename.value();
+            goto sanitize;
+        }
+
+        // 7. If the download was not initiated from a hyperlink created by an a or area element, or if the element
+        //    of the hyperlink from which it was initiated did not have a download attribute when the download was
+        //    initiated, or if there was such an attribute but its value when the download was initiated was the
+        //    empty string, then jump to the step labeled no proposed filename.
+        if (!proposed_filename.has_value() || proposed_filename->is_empty())
+            goto no_proposed_filename;
+
+        // 8. Let proposed filename have the value of the download attribute of the element of the hyperlink that
+        //    initiated the download at the time the download was initiated.
+        // NB: The proposed filename is provided by the caller.
+
+        // 9. If trusted operation is true, let filename have the value of proposed filename, and jump to the step
+        //    labeled sanitize below.
+        if (trusted_operation) {
+            filename = proposed_filename.value();
+            goto sanitize;
+        }
+
+        // 10. If response has a `Content-Disposition` header and that header specifies the attachment disposition
+        //     type, let filename have the value of proposed filename, and jump to the step labeled sanitize below.
+        if (content_disposition.is_attachment) {
+            filename = proposed_filename.value();
+            goto sanitize;
+        }
+    }
+
+    // 11. No proposed filename: If trusted operation is true, or if the user indicated a preference for having the
+    //     response in question downloaded, let filename have a value derived from the URL of response in an
+    //     implementation-defined manner, and jump to the step labeled sanitize below.
+no_proposed_filename:
+    // 12. Let filename be set to the user's preferred filename or to a filename selected by the user agent, and
+    //     jump to the step labeled sanitize below.
+    // NB: In both cases the filename is derived from the URL of the response. URLs with an opaque path, such as
+    //     data: URLs, do not contain a usable filename, so the default filename is used instead.
+    if (!url.has_an_opaque_path())
+        filename = url.basename();
+
+    // 13. Sanitize: Optionally, allow the user to influence filename. For example, a user agent could prompt the
+    //     user for a filename, potentially providing the value of filename as determined above as a default value.
+sanitize:
+
+    // 14. Adjust filename to be suitable for the local file system.
+    filename = sanitize_suggested_download_filename(filename.value_or({}));
+
+    // FIXME: 15. If the platform conventions do not in any way use extensions to determine the types of file on
+    //        the file system, then return filename as the filename.
+
+    // FIXME: 16. Let claimed type be the type given by response's Content-Type metadata, if any is known. Let
+    //        named type be the type given by filename's extension, if any is known. For the purposes of this step, a
+    //        type is a mapping of a MIME type to an extension.
+
+    // FIXME: 17. If named type is consistent with the user's preferences (e.g., because the value of filename was
+    //        determined by prompting the user), then return filename as the filename.
+
+    // FIXME: 18. If claimed type and named type are the same type (i.e., the type given by response's Content-Type
+    //        metadata is consistent with the type given by filename's extension), then return filename as the filename.
+
+    // FIXME: 19. If the claimed type is known, then alter filename to add an extension corresponding to claimed
+    //        type. Otherwise, if named type is known to be potentially dangerous (e.g. it will be treated by the
+    //        platform conventions as a native executable, shell script, HTML application, or
+    //        executable-macro-capable document), then optionally alter filename to add a known-safe extension
+    //        (e.g. ".txt").
+
+    // 20. Return filename as the filename.
+    return filename.release_value();
 }
 
 static Optional<u64> response_content_length(HTTP::HeaderList const& headers)
@@ -368,8 +442,65 @@ static Optional<u64> response_content_length(HTTP::HeaderList const& headers)
     return {};
 }
 
+void LocalNavigable::start_download_for_response(GC::Ref<Fetch::Infrastructure::Response> response, URL::URL const& download_url, ByteString suggested_filename, GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller)
+{
+    auto active_window = this->active_window();
+    if (!active_window) {
+        response->release_request_for_transfer();
+        return;
+    }
+    auto& realm = active_window->realm();
+
+    auto download_id = page().client().page_did_start_download(download_url, suggested_filename, response_content_length(*response->header_list()));
+    if (!download_id.has_value()) {
+        if (fetch_controller)
+            fetch_controller->stop_fetch();
+        return;
+    }
+
+    if (fetch_controller)
+        page().client().page_did_register_download_controller(*download_id, *fetch_controller);
+
+    auto process_body_chunk = GC::create_function(realm.heap(), [navigable = GC::Ref { *this }, download_id = *download_id](ByteBuffer data) {
+        if (navigable->page().client().page_is_download_canceled(download_id))
+            return;
+
+        navigable->page().client().page_did_receive_download_data(download_id, move(data));
+    });
+
+    auto process_end_of_body = GC::create_function(realm.heap(), [navigable = GC::Ref { *this }, download_id = *download_id]() {
+        if (navigable->page().client().page_is_download_canceled(download_id))
+            return;
+
+        navigable->page().client().page_did_finish_download(download_id);
+    });
+
+    auto process_body_error = GC::create_function(realm.heap(), [navigable = GC::Ref { *this }, download_id = *download_id](JS::Value) {
+        if (navigable->page().client().page_is_download_canceled(download_id))
+            return;
+
+        navigable->page().client().page_did_fail_download(download_id, "Unable to read downloaded file"_string);
+    });
+
+    // https://fetch.spec.whatwg.org/#body-incrementally-read
+    auto reader = response->body()->incrementally_read(process_body_chunk, process_end_of_body, process_body_error, GC::Ref { realm.global_object() });
+    page().client().page_did_register_download_reader(*download_id, reader);
+    response->resume_body_delivery();
+}
+
 // https://html.spec.whatwg.org/multipage/links.html#handle-as-a-download
-static bool handle_navigation_response_as_download(JS::Realm& realm, GC::Ref<NavigationParams> navigation_params, GC::Ref<SourceSnapshotParams> source_snapshot_params, Optional<ReadonlyBytes> initial_data = {})
+void LocalNavigable::handle_as_a_download(GC::Ref<Fetch::Infrastructure::Response> response, URL::URL const& fallback_url, GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller, Optional<ByteString> proposed_filename, Optional<URL::Origin> interface_origin)
+{
+    if (!response->body())
+        return;
+
+    auto download_url = response->url().value_or(fallback_url);
+    auto suggested_filename = suggested_download_filename(download_url, *response->header_list(), proposed_filename, interface_origin);
+
+    start_download_for_response(response, download_url, move(suggested_filename), fetch_controller);
+}
+
+static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> navigation_params, GC::Ref<SourceSnapshotParams> source_snapshot_params, Optional<ReadonlyBytes> initial_data = {})
 {
     auto response = navigation_params->response;
     if (!response || !response->body())
@@ -395,8 +526,8 @@ static bool handle_navigation_response_as_download(JS::Realm& realm, GC::Ref<Nav
     }
 
     auto download_url = response->url().value_or(navigation_params->request ? navigation_params->request->current_url() : URL::about_blank());
-    auto suggested_filename = suggested_download_filename(download_url, *response->header_list());
     if (auto const& request_server_request = response->request_server_request(); request_server_request.has_value()) {
+        auto suggested_filename = suggested_download_filename(download_url, *response->header_list(), {}, source_snapshot_params->fetch_client->origin());
         auto response_body_will_be_transferred_in_full = request_server_request->request && request_server_request->request->has_file_backed_response_body();
         ByteBuffer initial_data_buffer;
         if (initial_data.has_value() && !initial_data->is_empty() && !response_body_will_be_transferred_in_full)
@@ -415,42 +546,7 @@ static bool handle_navigation_response_as_download(JS::Realm& realm, GC::Ref<Nav
         return true;
     }
 
-    auto download_id = navigation_params->navigable->page().client().page_did_start_download(download_url, suggested_filename, response_content_length(*response->header_list()));
-    if (!download_id.has_value()) {
-        if (navigation_params->fetch_controller)
-            navigation_params->fetch_controller->stop_fetch();
-        return true;
-    }
-
-    if (navigation_params->fetch_controller)
-        navigation_params->navigable->page().client().page_did_register_download_controller(*download_id, *navigation_params->fetch_controller);
-
-    auto process_body_chunk = GC::create_function(realm.heap(), [navigable = navigation_params->navigable, download_id = *download_id](ByteBuffer data) {
-        if (navigable->page().client().page_is_download_canceled(download_id))
-            return;
-
-        navigable->page().client().page_did_receive_download_data(download_id, move(data));
-    });
-
-    auto process_end_of_body = GC::create_function(realm.heap(), [navigable = navigation_params->navigable, download_id = *download_id]() {
-        if (navigable->page().client().page_is_download_canceled(download_id))
-            return;
-
-        navigable->page().client().page_did_finish_download(download_id);
-    });
-
-    auto process_body_error = GC::create_function(realm.heap(), [navigable = navigation_params->navigable, download_id = *download_id](JS::Value) {
-        if (navigable->page().client().page_is_download_canceled(download_id))
-            return;
-
-        navigable->page().client().page_did_fail_download(download_id, "Unable to read downloaded file"_string);
-    });
-
-    // https://fetch.spec.whatwg.org/#body-incrementally-read
-    auto reader = response->body()->incrementally_read(process_body_chunk, process_end_of_body, process_body_error, GC::Ref { realm.global_object() });
-    navigation_params->navigable->page().client().page_did_register_download_reader(*download_id, reader);
-    response->resume_body_delivery();
-
+    navigation_params->navigable->handle_as_a_download(*response, download_url, navigation_params->fetch_controller, {}, source_snapshot_params->fetch_client->origin());
     return true;
 }
 
@@ -642,6 +738,7 @@ void LocalNavigable::set_has_been_destroyed()
     destroy_compositor_context();
     m_has_been_destroyed = true;
     resolve_all_pending_async_scroll_operations();
+    cancel_user_scroll_settlement();
 }
 
 void LocalNavigable::remove_from_all_local_navigables()
@@ -649,6 +746,7 @@ void LocalNavigable::remove_from_all_local_navigables()
     cancel_hover_update_after_async_scroll();
     destroy_compositor_context();
     resolve_all_pending_async_scroll_operations();
+    cancel_user_scroll_settlement();
 
     if (m_active_document)
         m_active_document->set_navigable(nullptr);
@@ -658,6 +756,7 @@ void LocalNavigable::remove_from_all_local_navigables()
 void LocalNavigable::finalize()
 {
     cancel_hover_update_after_async_scroll();
+    cancel_user_scroll_settlement();
     destroy_compositor_context();
     all_local_navigables().remove(*this);
     Base::finalize();
@@ -680,6 +779,8 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
         visitor.visit(async_scroll_operation.promise);
     for (auto& smooth_scroll : m_main_thread_smooth_scrolls)
         visitor.visit(smooth_scroll.promise);
+    for (auto& target : m_pending_user_scrollend_targets)
+        visitor.visit(target);
 }
 
 void LocalNavigable::NavigateParams::visit_edges(Cell::Visitor& visitor)
@@ -850,8 +951,9 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
     // 4. Set navigable's active session history entry to entry.
     m_active_session_history_entry = entry;
     if (m_active_document && m_active_document != new_document) {
-        // The pending post-scroll hover refresh belongs to the outgoing document; drop it.
+        // The pending post-scroll hover refresh and scrollend settlement belong to the outgoing document; drop them.
         cancel_hover_update_after_async_scroll();
+        cancel_user_scroll_settlement();
         m_active_document->set_navigable(nullptr);
     }
     m_active_document = new_document;
@@ -974,8 +1076,9 @@ Optional<UniqueNodeID> LocalNavigable::active_document_id() const
 void LocalNavigable::set_active_document(GC::Ptr<DOM::Document> document)
 {
     if (m_active_document && m_active_document != document) {
-        // The pending post-scroll hover refresh belongs to the outgoing document; drop it.
+        // The pending post-scroll hover refresh and scrollend settlement belong to the outgoing document; drop them.
         cancel_hover_update_after_async_scroll();
+        cancel_user_scroll_settlement();
         m_active_document->set_navigable(nullptr);
     }
     m_active_document = document;
@@ -2178,7 +2281,7 @@ void LocalNavigable::populate_session_history_entry_document(
             //    disposition type, then:
             else if (auto nav_params = navigation_params.get<GC::Ref<NavigationParams>>();
                 parse_content_disposition(*nav_params->response->header_list()).is_attachment) {
-                output->download_handled = handle_navigation_response_as_download(active_window()->realm(), nav_params, source_snapshot_params);
+                output->download_handled = handle_navigation_response_as_download(nav_params, source_snapshot_params);
                 output->save_extra_document_state = false;
             }
 
@@ -2201,7 +2304,7 @@ void LocalNavigable::populate_session_history_entry_document(
                             if (nav_params->navigable->active_browsing_context()) {
                                 output->document = load_document(nav_params, sniff_bytes);
                                 if (!output->document) {
-                                    output->download_handled = handle_navigation_response_as_download(nav_params->navigable->active_window()->realm(), nav_params, source_snapshot_params, sniff_bytes);
+                                    output->download_handled = handle_navigation_response_as_download(nav_params, source_snapshot_params, sniff_bytes);
                                     output->save_extra_document_state = false;
                                 } else {
                                     nav_params->response->resume_body_delivery();
@@ -2219,7 +2322,7 @@ void LocalNavigable::populate_session_history_entry_document(
                 // Sync path: bytes available immediately
                 output->document = load_document(nav_params, sniff_bytes.value());
                 if (!output->document) {
-                    output->download_handled = handle_navigation_response_as_download(active_window()->realm(), nav_params, source_snapshot_params, sniff_bytes.value());
+                    output->download_handled = handle_navigation_response_as_download(nav_params, source_snapshot_params, sniff_bytes.value());
                     output->save_extra_document_state = false;
                 } else {
                     nav_params->response->resume_body_delivery();
@@ -3613,11 +3716,8 @@ void LocalNavigable::scroll_offset_did_change()
     //    newInlineTarget.
 
     // 3. If (doc, "scroll") is already in doc’s pending scroll events, abort these steps.
-    if (doc->pending_scroll_events().contains_slow(DOM::Document::PendingScrollEvent { *doc, EventNames::scroll }))
-        return;
-
     // 4. Append (doc, "scroll") to doc’s pending scroll events.
-    doc->pending_scroll_events().append({ *doc, EventNames::scroll });
+    doc->append_pending_scroll_event({ *doc, EventNames::scroll });
 }
 
 CSSPixelRect LocalNavigable::to_top_level_rect(CSSPixelRect const& a_rect)
@@ -3748,39 +3848,38 @@ static DOM::Element* element_for_async_scroll_node_stable_id(DOM::Document& docu
     return element;
 }
 
-static bool adopt_async_element_scroll_delta(DOM::Document& document, Compositor::AsyncScrollNodeStableID const& stable_id, CSSPixelPoint scroll_delta)
+static GC::Ptr<DOM::Element> adopt_async_element_scroll_delta(DOM::Document& document, Compositor::AsyncScrollNodeStableID const& stable_id, CSSPixelPoint scroll_delta)
 {
     auto* element = element_for_async_scroll_node_stable_id(document, stable_id);
     if (!element)
-        return false;
+        return {};
 
     Optional<CSS::PseudoElement> pseudo_element;
     switch (stable_id.kind) {
     case Compositor::AsyncScrollNodeKind::Viewport:
-        return false;
+        return {};
     case Compositor::AsyncScrollNodeKind::Element:
         break;
     case Compositor::AsyncScrollNodeKind::PseudoElement:
         pseudo_element = pseudo_element_from_async_scroll_node_stable_id(stable_id);
         if (!pseudo_element.has_value())
-            return false;
+            return {};
         if (!element->get_pseudo_element(*pseudo_element).has_value())
-            return false;
+            return {};
         break;
     }
 
     auto scroll_offset = element->scroll_offset(pseudo_element);
     scroll_offset.translate_by(scroll_delta);
     if (element->scroll_offset(pseudo_element) == scroll_offset)
-        return false;
+        return {};
 
     element->set_scroll_offset(pseudo_element, scroll_offset);
 
     document.set_needs_to_refresh_scroll_state(true);
-    if (!document.pending_scroll_events().contains_slow(DOM::Document::PendingScrollEvent { *element, EventNames::scroll }))
-        document.pending_scroll_events().append({ *element, EventNames::scroll });
+    document.append_pending_scroll_event({ *element, EventNames::scroll });
     element->set_needs_repaint(InvalidateDisplayList::No);
-    return true;
+    return element;
 }
 
 static void queue_async_scroll_operation_promise_resolution(GC::Ref<WebIDL::Promise> promise)
@@ -3820,7 +3919,7 @@ void LocalNavigable::resolve_async_scroll_operation(Compositor::AsyncScrollOpera
         if (pending.stable_node_id.has_value() && pending.initial_scroll_offset.has_value()) {
             auto final_scroll_offset = scroll_offset_for(*pending.stable_node_id);
             if (final_scroll_offset.has_value() && *final_scroll_offset != *pending.initial_scroll_offset)
-                queue_scrollend_event(*pending.stable_node_id);
+                queue_scrollend_event_for_finished_scroll(*pending.stable_node_id, pending.trigger);
         }
         queue_async_scroll_operation_promise_resolution(pending.promise);
         return true;
@@ -3834,7 +3933,7 @@ void LocalNavigable::resolve_all_pending_async_scroll_operations()
         if (pending.stable_node_id.has_value() && pending.initial_scroll_offset.has_value()) {
             auto final_scroll_offset = scroll_offset_for(*pending.stable_node_id);
             if (final_scroll_offset.has_value() && *final_scroll_offset != *pending.initial_scroll_offset)
-                queue_scrollend_event(*pending.stable_node_id);
+                queue_scrollend_event_for_finished_scroll(*pending.stable_node_id, pending.trigger);
         }
         queue_async_scroll_operation_promise_resolution(pending.promise);
     }
@@ -3843,7 +3942,7 @@ void LocalNavigable::resolve_all_pending_async_scroll_operations()
         auto smooth_scroll = m_main_thread_smooth_scrolls.take_last();
         auto final_scroll_offset = scroll_offset_for(smooth_scroll.stable_node_id);
         if (final_scroll_offset.has_value() && *final_scroll_offset != smooth_scroll.initial_scroll_offset)
-            queue_scrollend_event(smooth_scroll.stable_node_id);
+            queue_scrollend_event_for_finished_scroll(smooth_scroll.stable_node_id, smooth_scroll.trigger);
         queue_async_scroll_operation_promise_resolution(smooth_scroll.promise);
     }
 }
@@ -3899,26 +3998,157 @@ bool LocalNavigable::set_scroll_offset_for(Compositor::AsyncScrollNodeStableID s
     return paintable->set_scroll_offset(scroll_offset) == Painting::Paintable::ScrollHandled::Yes;
 }
 
-void LocalNavigable::queue_scrollend_event(Compositor::AsyncScrollNodeStableID stable_node_id)
+static GC::Ptr<DOM::EventTarget> scroll_event_target_for_async_scroll_node(DOM::Document& document, Compositor::AsyncScrollNodeStableID stable_node_id)
+{
+    if (stable_node_id.kind == Compositor::AsyncScrollNodeKind::Viewport) {
+        if (stable_node_id.node_id != document.unique_id())
+            return {};
+        return document;
+    }
+    return element_for_async_scroll_node_stable_id(document, stable_node_id);
+}
+
+void LocalNavigable::queue_scrollend_event(Compositor::AsyncScrollNodeStableID stable_node_id, ScrollTrigger trigger)
 {
     auto document = active_document();
     if (!document)
         return;
 
-    GC::Ptr<DOM::EventTarget> target;
-    if (stable_node_id.kind == Compositor::AsyncScrollNodeKind::Viewport) {
-        if (stable_node_id.node_id != document->unique_id())
-            return;
-        target = document;
-    } else {
-        target = element_for_async_scroll_node_stable_id(*document, stable_node_id);
-    }
+    auto target = scroll_event_target_for_async_scroll_node(*document, stable_node_id);
     if (!target)
         return;
 
-    DOM::Document::PendingScrollEvent pending_event { *target, EventNames::scrollend };
-    if (!document->pending_scroll_events().contains_slow(pending_event))
-        document->pending_scroll_events().append(pending_event);
+    queue_scrollend_event(*document, *target, trigger);
+}
+
+void LocalNavigable::queue_scrollend_event(DOM::Document& document, GC::Ref<DOM::EventTarget> target, ScrollTrigger trigger)
+{
+    if (trigger == ScrollTrigger::UserInput)
+        queue_scrollend_event_after_user_scroll(target);
+    else
+        document.append_pending_scroll_event({ target, EventNames::scrollend });
+}
+
+void LocalNavigable::queue_scrollend_event_for_finished_scroll(Compositor::AsyncScrollNodeStableID stable_node_id, ScrollTrigger trigger)
+{
+    // Position updates for the scrolling box are finished, so once no held input remains, both completion conditions
+    // for the scroll are met and its scrollend event is queued immediately.
+    if (trigger == ScrollTrigger::UserInput && m_user_scroll_gesture_hold_count == 0) {
+        auto document = active_document();
+        if (!document)
+            return;
+        auto target = scroll_event_target_for_async_scroll_node(*document, stable_node_id);
+        if (!target)
+            return;
+        m_pending_user_scrollend_targets.remove_first_matching([&](auto const& pending_target) { return pending_target.ptr() == target.ptr(); });
+        if (m_pending_user_scrollend_targets.is_empty()) {
+            if (m_user_scroll_settle_timer)
+                m_user_scroll_settle_timer->stop();
+        } else if (m_user_scroll_settle_timer && !m_user_scroll_settle_timer->is_active()) {
+            m_user_scroll_settle_timer->restart();
+        }
+        document->append_pending_scroll_event({ *target, EventNames::scrollend });
+        return;
+    }
+    queue_scrollend_event(stable_node_id, trigger);
+}
+
+void LocalNavigable::queue_scrollend_event_after_user_scroll(GC::Ref<DOM::EventTarget> target)
+{
+    // AD-HOC: Wheel events carry no gesture phase information, so a scroll gesture is considered finished once no
+    //         user scrolling has moved this navigable's scrolling boxes for 500 milliseconds.
+    static constexpr int user_scroll_settle_delay_ms = 500;
+
+    if (!m_pending_user_scrollend_targets.contains_slow(target))
+        m_pending_user_scrollend_targets.append(target);
+
+    if (!m_user_scroll_settle_timer) {
+        m_user_scroll_settle_timer = Core::Timer::create_single_shot(user_scroll_settle_delay_ms, [this] {
+            user_scroll_did_settle();
+        });
+    }
+    m_user_scroll_settle_timer->restart();
+}
+
+void LocalNavigable::defer_user_scroll_settlement()
+{
+    // User input activity postpones settlement of already latched targets, but never latches new ones, so scrolling
+    // boxes that do not move still receive no scrollend event.
+    if (m_pending_user_scrollend_targets.is_empty())
+        return;
+    m_user_scroll_settle_timer->restart();
+}
+
+void LocalNavigable::cancel_user_scroll_settlement()
+{
+    if (m_user_scroll_settle_timer)
+        m_user_scroll_settle_timer->stop();
+    m_pending_user_scrollend_targets.clear();
+}
+
+void LocalNavigable::begin_user_scroll_gesture_hold(Badge<UserScrollGestureHold>)
+{
+    ++m_user_scroll_gesture_hold_count;
+}
+
+void LocalNavigable::end_user_scroll_gesture_hold(Badge<UserScrollGestureHold>)
+{
+    VERIFY(m_user_scroll_gesture_hold_count > 0);
+    if (--m_user_scroll_gesture_hold_count > 0)
+        return;
+    if (m_pending_user_scrollend_targets.is_empty())
+        return;
+
+    if (has_in_flight_user_scroll_operation())
+        return;
+
+    // The release of the last held input completes the scroll gesture.
+    m_user_scroll_settle_timer->stop();
+    user_scroll_did_settle();
+}
+
+bool LocalNavigable::has_in_flight_user_scroll_operation() const
+{
+    for (auto const& pending : m_pending_async_scroll_operations) {
+        if (pending.trigger == ScrollTrigger::UserInput)
+            return true;
+    }
+    for (auto const& smooth_scroll : m_main_thread_smooth_scrolls) {
+        if (smooth_scroll.trigger == ScrollTrigger::UserInput)
+            return true;
+    }
+    return false;
+}
+
+void LocalNavigable::user_scroll_did_settle()
+{
+    if (has_been_destroyed())
+        return;
+
+    // A held input keeps the scroll gesture in progress; its release completes the settlement instead.
+    if (m_user_scroll_gesture_hold_count > 0)
+        return;
+
+    auto targets = move(m_pending_user_scrollend_targets);
+    auto document = active_document();
+    if (!document)
+        return;
+
+    bool queued_any_scrollend_event = false;
+    for (auto const& target : targets) {
+        if (auto* element = as_if<DOM::Element>(*target)) {
+            if (&element->document() != document.ptr() || !element->is_connected())
+                continue;
+        } else if (target.ptr() != document.ptr() && target.ptr() != document->visual_viewport().ptr()) {
+            continue;
+        }
+
+        if (document->append_pending_scroll_event({ target, EventNames::scrollend }))
+            queued_any_scrollend_event = true;
+    }
+
+    if (queued_any_scrollend_event)
+        main_thread_event_loop().queue_task_to_update_the_rendering();
 }
 
 void LocalNavigable::resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeStableID stable_node_id)
@@ -3932,7 +4162,7 @@ void LocalNavigable::resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeS
         if (pending.initial_scroll_offset.has_value()) {
             auto final_scroll_offset = scroll_offset_for(stable_node_id);
             if (final_scroll_offset.has_value() && *final_scroll_offset != *pending.initial_scroll_offset)
-                queue_scrollend_event(stable_node_id);
+                queue_scrollend_event_for_finished_scroll(stable_node_id, pending.trigger);
         }
         queue_async_scroll_operation_promise_resolution(pending.promise);
         m_pending_async_scroll_operations.remove(index);
@@ -3946,7 +4176,7 @@ void LocalNavigable::resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeS
         }
         auto final_scroll_offset = scroll_offset_for(stable_node_id);
         if (final_scroll_offset.has_value() && *final_scroll_offset != smooth_scroll.initial_scroll_offset)
-            queue_scrollend_event(stable_node_id);
+            queue_scrollend_event_for_finished_scroll(stable_node_id, smooth_scroll.trigger);
         queue_async_scroll_operation_promise_resolution(smooth_scroll.promise);
         m_main_thread_smooth_scrolls.remove(index);
     }
@@ -3972,7 +4202,7 @@ void LocalNavigable::process_main_thread_smooth_scrolls()
         if (sample.complete) {
             auto final_scroll_offset = scroll_offset_for(smooth_scroll.stable_node_id);
             if (final_scroll_offset.has_value() && *final_scroll_offset != smooth_scroll.initial_scroll_offset)
-                queue_scrollend_event(smooth_scroll.stable_node_id);
+                queue_scrollend_event_for_finished_scroll(smooth_scroll.stable_node_id, smooth_scroll.trigger);
             queue_async_scroll_operation_promise_resolution(smooth_scroll.promise);
             m_main_thread_smooth_scrolls.remove(index);
         } else {
@@ -4054,8 +4284,9 @@ void LocalNavigable::adopt_pending_async_scroll_offsets()
             continue;
         }
 
-        if (adopt_async_element_scroll_delta(*document, async_scroll_offset.stable_node_id, css_scroll_delta)) {
+        if (auto element = adopt_async_element_scroll_delta(*document, async_scroll_offset.stable_node_id, css_scroll_delta)) {
             adopted_any_scroll_offset = true;
+            queue_scrollend_event_after_user_scroll(*element);
             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread adopting async element delta {},{}",
                 async_scroll_offset.unadopted_scroll_delta.x(), async_scroll_offset.unadopted_scroll_delta.y());
         }
@@ -4646,7 +4877,7 @@ void LocalNavigable::render_screenshot(Gfx::PaintingSurface& painting_surface, P
     compositor_context().request_screenshot(painting_surface, move(callback));
 }
 
-GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Compositor::AsyncScrollNodeStableID stable_node_id, CSSPixelPoint position, Bindings::ScrollBehavior behavior, GC::Ptr<DOM::Element> associated_element)
+GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Compositor::AsyncScrollNodeStableID stable_node_id, CSSPixelPoint position, Bindings::ScrollBehavior behavior, GC::Ptr<DOM::Element> associated_element, ScrollTrigger trigger)
 {
     auto document = active_document();
     VERIFY(document);
@@ -4677,7 +4908,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Com
     if (!should_scroll_smoothly) {
         auto did_scroll = set_scroll_offset_for(stable_node_id, position);
         if (did_scroll)
-            queue_scrollend_event(stable_node_id);
+            queue_scrollend_event(stable_node_id, trigger);
         WebIDL::resolve_promise(document->realm(), scroll_promise);
         return scroll_promise;
     }
@@ -4701,6 +4932,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Com
                 .promise = scroll_promise,
                 .stable_node_id = stable_node_id,
                 .initial_scroll_offset = *initial_scroll_offset,
+                .trigger = trigger,
             });
             return scroll_promise;
         }
@@ -4730,6 +4962,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Com
         .elapsed = AK::Duration::zero(),
         .initial_scroll_offset = *initial_scroll_offset,
         .promise = scroll_promise,
+        .trigger = trigger,
     });
     main_thread_event_loop().queue_task_to_update_the_rendering();
     return scroll_promise;
@@ -4741,19 +4974,24 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_an_element(DOM::Ele
                                                    .node_id = element.unique_id(),
                                                    .kind = Compositor::AsyncScrollNodeKind::Element,
                                                },
-        position, behavior, element);
+        position, behavior, element, ScrollTrigger::Programmatic);
 }
 
-GC::Ref<WebIDL::Promise> LocalNavigable::scroll_viewport_by_delta(CSSPixelPoint delta)
+GC::Ref<WebIDL::Promise> LocalNavigable::scroll_viewport_by_delta(CSSPixelPoint delta, Bindings::ScrollBehavior behavior)
 {
     auto vv = active_document()->visual_viewport();
     CSSPixelPoint page_position { CSSPixels(vv->page_left()), CSSPixels(vv->page_top()) };
-    return perform_a_scroll_of_the_viewport(page_position + delta, Bindings::ScrollBehavior::Instant);
+    return perform_a_scroll_of_the_viewport(page_position + delta, behavior, ScrollTrigger::UserInput);
 }
 
 // https://drafts.csswg.org/cssom-view/#viewport-perform-a-scroll
-GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior behavior)
+GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPixelPoint position, Bindings::ScrollBehavior behavior, ScrollTrigger trigger)
 {
+    // AD-HOC: User input keeps the scroll gesture in progress even when this scroll does not move the viewport, such
+    //         as when a held scroll key repeats at the scroll extent.
+    if (trigger == ScrollTrigger::UserInput)
+        defer_user_scroll_settlement();
+
     // 1. Let doc be the viewport’s associated Document.
     auto doc = active_document();
 
@@ -4799,6 +5037,19 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPix
     //     Promise returned from this step.
     TemporaryExecutionContext temporary_execution_context { doc->realm() };
 
+    // 15. Perform a scroll of vv’s scrolling box to its current scroll position + (visual dx, visual dy) with element
+    //     as the associated element, and behavior as the scroll behavior. Let scrollPromise2 be the Promise returned
+    //     from this step.
+    // FIXME: Get a Promise from this.
+    // AD-HOC: Step 15 is performed before step 14 so that the visual viewport's scroll and scrollend events are
+    //         dispatched before the window's.
+    CSSPixelPoint visual_delta { visual_dx, visual_dy };
+    vv->scroll_by(visual_delta);
+    if (visual_delta.is_zero())
+        doc->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::No);
+    else
+        queue_scrollend_event(*doc, *vv, trigger);
+
     // NB: Must update layout before accessing paintables.
     doc->update_layout(DOM::UpdateLayoutReason::NavigableViewportScroll);
 
@@ -4812,15 +5063,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPix
                                                                   .node_id = doc->unique_id(),
                                                                   .kind = Compositor::AsyncScrollNodeKind::Viewport,
                                                               },
-        new_viewport_scroll_offset.to_type<CSSPixels>(), behavior, doc->document_element());
-
-    // 15. Perform a scroll of vv’s scrolling box to its current scroll position + (visual dx, visual dy) with element
-    //     as the associated element, and behavior as the scroll behavior. Let scrollPromise2 be the Promise returned
-    //     from this step.
-    // FIXME: Get a Promise from this.
-    vv->scroll_by({ visual_dx, visual_dy });
-    if (visual_dx == 0.0 && visual_dy == 0.0)
-        doc->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::No);
+        new_viewport_scroll_offset.to_type<CSSPixels>(), behavior, doc->document_element(), trigger);
 
     // 17. Return scrollPromise, and run the remaining steps in parallel.
     // 18. Resolve scrollPromise when both scrollPromise1 and scrollPromise2 have settled.
@@ -4849,6 +5092,18 @@ bool LocalNavigable::has_inclusive_ancestor_with_visibility_hidden() const
         }
     }
     return false;
+}
+
+UserScrollGestureHold::UserScrollGestureHold(LocalNavigable& navigable)
+    : m_navigable(navigable)
+{
+    m_navigable->begin_user_scroll_gesture_hold({});
+}
+
+UserScrollGestureHold::~UserScrollGestureHold()
+{
+    if (m_navigable)
+        m_navigable->end_user_scroll_gesture_hold({});
 }
 
 }
