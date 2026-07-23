@@ -1,0 +1,7 @@
+Harness status: OK
+
+Found 2 tests
+
+2 Pass
+Pass	name, cssRules, appendRule, findRule, deleteRule
+Pass	indexed getter, length

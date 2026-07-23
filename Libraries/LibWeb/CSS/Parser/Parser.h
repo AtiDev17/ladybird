@@ -149,6 +149,8 @@ public:
     Vector<DevToolsStyleDeclaration> parse_as_devtools_property_declaration_block();
     Vector<Descriptor> parse_as_descriptor_declaration_block(AtRuleID);
     CSSRule* parse_as_css_rule(bool nested = false);
+    GC::Ptr<CSSKeyframeRule> parse_as_keyframe_rule();
+    Vector<Percentage> parse_as_keyframe_selectors();
     Optional<StyleProperty> parse_as_supports_condition();
     GC::RootVector<GC::Ref<CSSRule>> parse_as_stylesheet_contents();
 
@@ -326,6 +328,8 @@ private:
     bool is_valid_in_the_current_context(AtRule const&) const;
     bool is_valid_in_the_current_context(QualifiedRule const&) const;
 
+    Vector<Percentage> parse_keyframe_selectors(TokenStream<ComponentValue>&);
+
     template<typename NestedDeclarationsRule>
     GC::Ptr<CSSRule> convert_to_rule(Rule const&, Nested);
     GC::Ptr<CSSStyleRule> convert_to_style_rule(QualifiedRule const&, Nested);
@@ -335,6 +339,7 @@ private:
     GC::Ptr<CSSFontFaceRule> convert_to_font_face_rule(AtRule const&);
     GC::Ptr<CSSFontFeatureValuesRule> convert_to_font_feature_values_rule(AtRule const&);
     GC::Ptr<CSSFunctionRule> convert_to_function_rule(AtRule const&);
+    GC::Ptr<CSSKeyframeRule> convert_to_keyframe_rule(QualifiedRule const&);
     GC::Ptr<CSSKeyframesRule> convert_to_keyframes_rule(AtRule const&);
     GC::Ptr<CSSImportRule> convert_to_import_rule(AtRule const&);
 
@@ -714,6 +719,9 @@ private:
 
     Vector<PseudoClass> m_pseudo_class_context; // Stack of pseudo-class functions we're currently inside
 };
+
+GC::Ptr<CSSKeyframeRule> parse_keyframe_rule(ParsingParams const&, Utf16View);
+Vector<Percentage> parse_keyframe_selectors(ParsingParams const&, Utf16View);
 
 }
 

@@ -39,14 +39,14 @@ void SVGElement::initialize(JS::Realm& realm)
 }
 
 struct NamedPropertyID {
-    NamedPropertyID(CSS::PropertyID property_id, Utf16FlyString name, Vector<Utf16FlyString> supported_elements = {})
+    NamedPropertyID(CSS::PropertyID property_id, Utf16FlyString name, std::initializer_list<Utf16FlyString> supported_elements = {})
         : id(property_id)
         , name(move(name))
-        , supported_elements(move(supported_elements))
+        , supported_elements(supported_elements)
     {
     }
-    NamedPropertyID(CSS::PropertyID property_id, Vector<Utf16FlyString> supported_elements = {})
-        : NamedPropertyID(property_id, CSS::string_from_property_id(property_id).to_utf16_string(), move(supported_elements))
+    NamedPropertyID(CSS::PropertyID property_id, std::initializer_list<Utf16FlyString> supported_elements = {})
+        : NamedPropertyID(property_id, CSS::string_from_property_id(property_id).to_utf16_string(), supported_elements)
     {
     }
 
@@ -127,32 +127,37 @@ static ReadonlySpan<NamedPropertyID> attribute_style_properties()
     return properties;
 }
 
+static Optional<CSS::PropertyID> property_id_for_presentational_attribute(Utf16FlyString const& name, Utf16FlyString const& tag_name)
+{
+    for (auto const& property : attribute_style_properties()) {
+        if (!property.name.equals_ignoring_ascii_case(name))
+            continue;
+
+        if (!property.supported_elements.is_empty() && !property.supported_elements.contains_slow(tag_name))
+            continue;
+
+        return property.id;
+    }
+
+    return {};
+}
+
 bool SVGElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
 
-    return any_of(attribute_style_properties(), [&](auto& property) { return property.name.equals_ignoring_ascii_case(name); });
+    return property_id_for_presentational_attribute(name, local_name()).has_value();
 }
 
 void SVGElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
     CSS::Parser::ParsingParams parsing_context { document(), CSS::Parser::ParsingMode::SVGPresentationAttribute };
-    for_each_attribute([&](Utf16FlyString const& name, Utf16View value) {
-        for (auto& property : attribute_style_properties()) {
-            if (!property.name.equals_ignoring_ascii_case(name.view()))
-                continue;
-            if (!property.supported_elements.is_empty() && !property.supported_elements.contains_slow(local_name()))
-                continue;
-            if (property.id == CSS::PropertyID::Mask) {
-                if (auto style_value = parse_css_value(parsing_context, value, CSS::PropertyID::Mask))
-                    properties.append({ .property_id = CSS::PropertyID::Mask, .value = style_value.release_nonnull() });
-            } else {
-                if (auto style_value = parse_css_value(parsing_context, value, property.id))
-                    properties.append({ .property_id = property.id, .value = style_value.release_nonnull() });
-            }
-            break;
+    for_each_attribute([&](Utf16FlyString const& name, Utf16View const& value) {
+        if (auto property_id = property_id_for_presentational_attribute(name, local_name()); property_id.has_value()) {
+            if (auto style_value = parse_css_value(parsing_context, value, property_id.value()))
+                properties.append({ .property_id = property_id.value(), .value = style_value.release_nonnull() });
         }
     });
 }

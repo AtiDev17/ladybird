@@ -127,6 +127,10 @@ public:
 
     static WEB_API AccumulatedVisualContextTree create();
     static WEB_API AccumulatedVisualContextTree create(TransformData visual_viewport_transform);
+    // For nested display list trees (masks, patterns, background tiles) whose content is recorded
+    // in outer coordinates but replayed into a list-local surface: the offset becomes the root
+    // transform, keeping the tree the single source of coordinate truth for the list.
+    static WEB_API AccumulatedVisualContextTree create_with_content_offset(Gfx::IntPoint content_offset);
 
     AccumulatedVisualContextTree(AccumulatedVisualContextTree const&) = default;
     AccumulatedVisualContextTree& operator=(AccumulatedVisualContextTree const&) = default;
@@ -145,7 +149,6 @@ public:
     AccumulatedVisualContextNode& node_at(VisualContextIndex index) { return m_nodes[index.value()]; }
     ReadonlySpan<AccumulatedVisualContextNode> nodes() const { return m_nodes.span(); }
 
-    VisualContextIndex find_common_ancestor(VisualContextIndex a, VisualContextIndex b) const;
     Optional<Gfx::FloatPoint> transform_point_for_hit_test(VisualContextIndex, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
     Gfx::FloatPoint inverse_transform_point(VisualContextIndex, Gfx::FloatPoint) const;
     Gfx::FloatRect transform_rect_to_viewport(VisualContextIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;

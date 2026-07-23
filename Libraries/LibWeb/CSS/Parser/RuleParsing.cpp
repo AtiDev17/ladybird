@@ -613,6 +613,106 @@ GC::Ptr<CSSRule> Parser::convert_to_layer_rule(AtRule const& rule, Nested nested
     return CSSLayerStatementRule::create(realm(), move(layer_names));
 }
 
+Vector<Percentage> Parser::parse_keyframe_selectors(TokenStream<ComponentValue>& tokens)
+{
+    // https://drafts.csswg.org/css-animations-1/#typedef-keyframe-block
+    // <keyframe-selector>#
+    // <keyframe-selector> = <keyframe-selector> = from | to | <percentage [0,100]> | <timeline-range-name> <percentage>
+    // FIXME: Support named timeline ranges
+
+    Vector<Percentage> selectors;
+
+    while (tokens.has_next_token()) {
+        tokens.discard_whitespace();
+        if (!tokens.has_next_token())
+            break;
+        auto& next_token = tokens.next_token();
+        if (!next_token.is_token()) {
+            ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
+                .rule_name = "keyframe"_utf16_fly_string,
+                .prelude = tokens.dump_string(),
+                .description = "Invalid selector."_string,
+            });
+            return {};
+        }
+        auto read_a_selector = false;
+        if (next_token.is_ident("from"_utf16)) {
+            tokens.discard_a_token(); // from
+            selectors.append(Percentage(0));
+            read_a_selector = true;
+        } else if (next_token.is_ident("to"_utf16)) {
+            tokens.discard_a_token(); // to
+            selectors.append(Percentage(100));
+            read_a_selector = true;
+        } else if (next_token.is(Token::Type::Percentage)) {
+            auto percentage_value = next_token.token().percentage();
+
+            if (percentage_value >= 0 && percentage_value <= 100) {
+                tokens.discard_a_token(); // <percentage>
+                selectors.append(Percentage(percentage_value));
+                read_a_selector = true;
+            }
+        }
+
+        if (read_a_selector) {
+            tokens.discard_whitespace();
+            if (tokens.next_token().is(Token::Type::Comma)) {
+                tokens.discard_a_token(); // ,
+                tokens.discard_whitespace();
+                if (!tokens.has_next_token())
+                    return {};
+                continue;
+            }
+
+            if (!tokens.has_next_token())
+                break;
+        }
+
+        return {};
+    }
+
+    return selectors;
+}
+
+GC::Ptr<CSSKeyframeRule> Parser::convert_to_keyframe_rule(QualifiedRule const& rule)
+{
+    if (!rule.child_rules.is_empty()) {
+        for (auto const& child_rule : rule.child_rules) {
+            ErrorReporter::the().report(InvalidRuleLocationError {
+                .outer_rule_name = "@keyframes"_utf16_fly_string,
+                .inner_rule_name = child_rule.visit(
+                    [](Rule const& rule) {
+                        return rule.visit(
+                            [](AtRule const& at_rule) { return Utf16String::formatted("@{}", at_rule.name); },
+                            [](QualifiedRule const&) { return Utf16String { "qualified-rule"_utf16_fly_string }; });
+                    },
+                    [](auto&) {
+                        return Utf16String { "list-of-declarations"_utf16_fly_string };
+                    }),
+            });
+        }
+    }
+
+    TokenStream child_tokens { rule.prelude };
+    auto selectors = parse_keyframe_selectors(child_tokens);
+
+    if (selectors.is_empty())
+        return nullptr;
+
+    PropertiesAndCustomProperties properties;
+    rule.for_each_as_declaration_list("keyframe"_utf16_fly_string, [&](auto const& declaration) {
+        // https://drafts.csswg.org/css-animations-1/#keyframes
+        // None of the properties [in the <keyframe-block>'s <declaration-list>] interact with the cascade (so
+        // using !important on them is invalid and will cause the property to be ignored).
+        if (declaration.important == Important::Yes)
+            return;
+        extract_property(declaration, properties);
+    });
+    auto style = CSSStyleProperties::create(realm(), move(properties.properties), move(properties.custom_properties));
+
+    return CSSKeyframeRule::create(realm(), move(selectors), *style);
+}
+
 GC::Ptr<CSSKeyframesRule> Parser::convert_to_keyframes_rule(AtRule const& rule)
 {
     m_rule_context.append(RuleContext::AtKeyframes);
@@ -692,78 +792,8 @@ GC::Ptr<CSSKeyframesRule> Parser::convert_to_keyframes_rule(AtRule const& rule)
 
     GC::RootVector<GC::Ref<CSSRule>> keyframes;
     rule.for_each_as_qualified_rule_list([&](auto& qualified_rule) {
-        if (!qualified_rule.child_rules.is_empty()) {
-            for (auto const& child_rule : qualified_rule.child_rules) {
-                ErrorReporter::the().report(InvalidRuleLocationError {
-                    .outer_rule_name = "@keyframes"_utf16_fly_string,
-                    .inner_rule_name = child_rule.visit(
-                        [](Rule const& rule) {
-                            return rule.visit(
-                                [](AtRule const& at_rule) { return Utf16String::formatted("@{}", at_rule.name); },
-                                [](QualifiedRule const&) { return Utf16String { "qualified-rule"_utf16_fly_string }; });
-                        },
-                        [](auto&) {
-                            return Utf16String { "list-of-declarations"_utf16_fly_string };
-                        }),
-                });
-            }
-        }
-
-        auto selectors = Vector<Percentage> {};
-        TokenStream child_tokens { qualified_rule.prelude };
-        while (child_tokens.has_next_token()) {
-            child_tokens.discard_whitespace();
-            if (!child_tokens.has_next_token())
-                break;
-            auto& next_token = child_tokens.next_token();
-            if (!next_token.is_token()) {
-                ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
-                    .rule_name = "keyframe"_utf16_fly_string,
-                    .prelude = child_tokens.dump_string(),
-                    .description = "Invalid selector."_string,
-                });
-                break;
-            }
-            auto read_a_selector = false;
-            if (next_token.is_ident("from"_utf16)) {
-                child_tokens.discard_a_token(); // from
-                selectors.append(Percentage(0));
-                read_a_selector = true;
-            } else if (next_token.is_ident("to"_utf16)) {
-                child_tokens.discard_a_token(); // to
-                selectors.append(Percentage(100));
-                read_a_selector = true;
-            } else if (next_token.is(Token::Type::Percentage)) {
-                child_tokens.discard_a_token(); // <percentage>
-                selectors.append(Percentage(next_token.token().percentage()));
-                read_a_selector = true;
-            }
-
-            if (read_a_selector) {
-                child_tokens.discard_whitespace();
-                if (child_tokens.next_token().is(Token::Type::Comma)) {
-                    child_tokens.discard_a_token(); // ,
-                    continue;
-                }
-            }
-
-            break;
-        }
-
-        PropertiesAndCustomProperties properties;
-        qualified_rule.for_each_as_declaration_list("keyframe"_utf16_fly_string, [&](auto const& declaration) {
-            // https://drafts.csswg.org/css-animations-1/#keyframes
-            // None of the properties [in the <keyframe-block>'s <declaration-list>] interact with the cascade (so
-            // using !important on them is invalid and will cause the property to be ignored).
-            if (declaration.important == Important::Yes)
-                return;
-            extract_property(declaration, properties);
-        });
-        auto style = CSSStyleProperties::create(realm(), move(properties.properties), move(properties.custom_properties));
-        for (auto& selector : selectors) {
-            auto keyframe_rule = CSSKeyframeRule::create(realm(), selector, *style);
-            keyframes.append(keyframe_rule);
-        }
+        if (auto keyframe_rule = convert_to_keyframe_rule(qualified_rule))
+            keyframes.append(*keyframe_rule);
     });
 
     return CSSKeyframesRule::create(realm(), name, CSSRuleList::create(realm(), keyframes));
@@ -1238,7 +1268,7 @@ GC::Ptr<CSSContainerRule> Parser::convert_to_container_rule(AtRule const& rule, 
                     child_rules.append(*converted_rule);
             },
             [&](Vector<Declaration> const& declarations) {
-                child_rules.append(CSSNestedDeclarations::create(realm(), *convert_to_style_declaration(declarations)));
+                child_rules.append(NestedDeclarationsRule::create(realm(), *this, declarations));
             });
     }
 
@@ -1652,9 +1682,9 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
             parameter_tokens.discard_a_token(); // :
             parameter_tokens.discard_whitespace();
 
-            auto maybe_default_value = parse_declaration_value(parameter_tokens);
+            auto maybe_default_value = parse_css_value(PropertyID::Custom, parameter_tokens);
 
-            if (!maybe_default_value.has_value()) {
+            if (maybe_default_value.is_error()) {
                 ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
                     .rule_name = "@function"_utf16_fly_string,
                     .prelude = parameter_tokens.dump_string(),
@@ -1663,16 +1693,26 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
                 return {};
             }
 
+            auto unparsed_default_value = maybe_default_value.release_value();
+
+            VERIFY(unparsed_default_value->is_css_wide_keyword() || unparsed_default_value->is_unresolved());
+
             // If a default value and a parameter type are both provided, then the default value must parse successfully
             // according to that parameter type’s syntax. Otherwise, the @function rule is invalid.
-            // FIXME: Chrome allows ASFs regardless of the parameter's type
-            TokenStream default_value_token_stream { maybe_default_value.value() };
-            auto parsed_value = parse_according_to_syntax_node(default_value_token_stream, *type);
-            default_value_token_stream.discard_whitespace();
-            if (!parsed_value || !default_value_token_stream.is_empty())
-                return {};
 
-            default_value = parsed_value;
+            // NB: CSS-wide keywords and ASF containing productions are allowed for all syntaxes
+            if (unparsed_default_value->is_css_wide_keyword() || unparsed_default_value->as_unresolved().contains_arbitrary_substitution_function()) {
+                default_value = unparsed_default_value;
+            } else {
+                auto tokens = unparsed_default_value->as_unresolved().values();
+                TokenStream default_value_token_stream { tokens };
+                auto parsed_value = parse_according_to_syntax_node(default_value_token_stream, *type);
+                default_value_token_stream.discard_whitespace();
+                if (!parsed_value || !default_value_token_stream.is_empty())
+                    return {};
+
+                default_value = parsed_value;
+            }
         }
 
         parameter_tokens.discard_whitespace();

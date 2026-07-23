@@ -709,7 +709,6 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                 auto const& keyframe = as<CSSKeyframeRule>(*keyframe_rule);
                 Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame resolved_keyframe;
 
-                auto key = static_cast<u64>(keyframe.key().value() * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
                 auto const& keyframe_style = *keyframe.style();
                 for (auto const& it : keyframe_style.properties()) {
                     if (it.property_id == PropertyID::AnimationTimingFunction) {
@@ -749,15 +748,19 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                     });
                 }
 
-                if (auto* existing_keyframe = keyframe_set->keyframes_by_key.find(key)) {
-                    for (auto& [property_id, value] : resolved_keyframe.properties)
-                        existing_keyframe->properties.set(property_id, move(value));
-                    if (resolved_keyframe.composite != Bindings::CompositeOperationOrAuto::Auto)
-                        existing_keyframe->composite = resolved_keyframe.composite;
-                    if (!resolved_keyframe.easing.has<Empty>())
-                        existing_keyframe->easing = move(resolved_keyframe.easing);
-                } else {
-                    keyframe_set->keyframes_by_key.insert(key, resolved_keyframe);
+                for (auto const& key : keyframe.keys()) {
+                    auto resolved_key = static_cast<u64>(key.value() * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
+
+                    if (auto* existing_keyframe = keyframe_set->keyframes_by_key.find(resolved_key)) {
+                        for (auto& [property_id, value] : resolved_keyframe.properties)
+                            existing_keyframe->properties.set(property_id, value);
+                        if (resolved_keyframe.composite != Bindings::CompositeOperationOrAuto::Auto)
+                            existing_keyframe->composite = resolved_keyframe.composite;
+                        if (!resolved_keyframe.easing.has<Empty>())
+                            existing_keyframe->easing = resolved_keyframe.easing;
+                    } else {
+                        keyframe_set->keyframes_by_key.insert(resolved_key, resolved_keyframe);
+                    }
                 }
             }
 
@@ -1456,9 +1459,9 @@ RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Utf16Fl
         .value_or(nullptr);
 }
 
-GC::Ptr<CSSFunctionRule const> StyleScope::get_function_definition(Utf16FlyString const& name) const
+Optional<StyleScope::FunctionDefinitionAndScope> StyleScope::get_function_definition(Utf16FlyString const& name) const
 {
-    return dereference_global_tree_scoped_reference<CSSFunctionRule const*>([&](StyleScope const& scope) {
+    return dereference_global_tree_scoped_reference<FunctionDefinitionAndScope>([&](StyleScope const& scope) -> Optional<FunctionDefinitionAndScope> {
         auto const get_function_definition_for_cascade_origin = [&](CSS::CascadeOrigin cascade_origin) {
             CSSFunctionRule const* cascade_origin_result = nullptr;
 
@@ -1490,7 +1493,7 @@ GC::Ptr<CSSFunctionRule const> StyleScope::get_function_definition(Utf16FlyStrin
             return cascade_origin_result;
         };
 
-        Optional<CSSFunctionRule const*> result;
+        CSSFunctionRule const* result = nullptr;
 
         if (scope.m_node->is_document()) {
             if (auto const* user_agent_result = get_function_definition_for_cascade_origin(CSS::CascadeOrigin::UserAgent))
@@ -1503,9 +1506,11 @@ GC::Ptr<CSSFunctionRule const> StyleScope::get_function_definition(Utf16FlyStrin
         if (auto const* author_result = get_function_definition_for_cascade_origin(CSS::CascadeOrigin::Author))
             result = author_result;
 
-        return result;
-    })
-        .value_or(nullptr);
+        if (!result)
+            return OptionalNone {};
+
+        return FunctionDefinitionAndScope { .function = *result, .scope = scope };
+    });
 }
 
 template<typename T>

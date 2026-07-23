@@ -816,10 +816,8 @@ Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_
             auto const contains_style_feature = rule.container_rule->contains_style_feature();
 
             if (contains_size_feature || contains_style_feature) {
-                if (contains_size_feature)
-                    abstract_element.element().set_style_depends_on_size_container_query();
-                if (contains_style_feature)
-                    abstract_element.element().set_style_depends_on_style_container_query();
+                rule.container_rule->mark_element_style_dependencies(abstract_element);
+
                 if (!rule.container_rule->matches(abstract_element))
                     continue;
             }
@@ -4073,8 +4071,9 @@ static NonnullRefPtr<StyleValue const> resolve_css_wide_keyword_for_custom_prope
     if (keyword_value->is_inherit())
         return inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution, guarded_contexts);
 
+    // https://drafts.csswg.org/css-mixins/#resolve-function-styles
     // NB: When resolving function styles (i.e. when we have a hypothetical element), all CSS-wide keywords other than
-    //     inherit and initial resolve to the guaranteed-invalidate value.
+    //     inherit and initial resolve to the guaranteed-invalid value.
     if (element.has<HypotheticalElement*>())
         return GuaranteedInvalidStyleValue::create();
 
@@ -4123,7 +4122,7 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(
             resolved_value = resolve_css_wide_keyword_for_custom_property(registration, element, name, move(resolved_value), computed_style_for_custom_property_resolution, guarded_contexts);
     }
 
-    auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
+    auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) -> NonnullRefPtr<StyleValue const> {
         // https://drafts.csswg.org/css-values-5/#invalid-substitution
         // When property replacement results in a property’s value containing the guaranteed-invalid value, this makes
         // the declaration invalid at computed-value time. When this happens, the computed value is one of the
@@ -4140,6 +4139,13 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(
         {
             // Either the property’s inherited value or its initial value depending on whether the property is
             // inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
+
+            // https://drafts.csswg.org/css-mixins/#resolve-function-styles
+            // NB: When resolving function styles (i.e. when we have a hypothetical element), all CSS-wide keywords other than
+            //     inherit and initial (including unset) resolve to the guaranteed-invalid value.
+            if (element.has<HypotheticalElement*>())
+                return invalid_value;
+
             if (registration->inherit)
                 return inherited_custom_property_value(registration, element, name, computed_style_for_custom_property_resolution, guarded_contexts);
             return initial_custom_property_value(registration, element.document());

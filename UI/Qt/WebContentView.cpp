@@ -86,6 +86,14 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
     m_client_state.page_index = page_index;
 
     setAttribute(Qt::WA_InputMethodEnabled, true);
+
+    // Push-based IME state (ViewImplementation::set_input_method_state) must nudge Qt to re-query inputMethodQuery().
+    // Without that, the platform IME keeps the stale first-keystroke caret and surrounding text — and composition stops
+    // after one character.
+    on_input_method_state_change = [this] {
+        updateMicroFocus();
+    };
+
     setMouseTracking(true);
     setAcceptDrops(true);
 
@@ -1295,7 +1303,8 @@ bool WebContentView::handle_vulkan_window_event(QEvent* event)
         mouseReleaseEvent(static_cast<QMouseEvent*>(event));
         return true;
     case QEvent::MouseButtonDblClick:
-        mouseDoubleClickEvent(static_cast<QMouseEvent*>(event));
+        // QWindow sends a MouseButtonPress before MouseButtonDblClick for the second click, so the press has already
+        // been forwarded and included in the click count.
         return true;
     case QEvent::Wheel:
         wheelEvent(static_cast<QWheelEvent*>(event));

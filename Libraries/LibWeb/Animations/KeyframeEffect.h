@@ -95,6 +95,8 @@ public:
     Optional<CSS::PseudoElement> pseudo_element_type() const;
     void set_pseudo_element(Optional<CSS::Selector::PseudoElementSelector> pseudo_element) { m_target_pseudo_selector = pseudo_element; }
 
+    Bindings::CompositeOperation composite_for_bindings() const;
+    void set_composite_for_bindings(Bindings::CompositeOperation value) { set_composite(value); }
     Bindings::CompositeOperation composite() const { return m_composite; }
     void set_composite(Bindings::CompositeOperation value);
 
@@ -131,7 +133,7 @@ private:
     Vector<BaseKeyframe> m_keyframes {};
 
     // A cached version of m_keyframes suitable for returning from get_keyframes()
-    Vector<GC::Ref<JS::Object>> m_keyframe_objects {};
+    Vector<GC::Ref<JS::Object>> m_keyframe_objects_cache {};
 
     RefPtr<KeyFrameSet const> m_key_frame_set {};
 };
