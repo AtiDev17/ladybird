@@ -1814,7 +1814,7 @@ pub struct FfiComputedStoreEntry {
     pub property_id: u16,
     pub inherited_property_id: u16,
     /// The selected specified value; also the stored value unless a computed
-    /// pixel length replaces it.
+    /// pixel length or keyword replaces it.
     pub shell: *const c_void,
     pub inheritance_dependent: bool,
     pub inherited: bool,
@@ -1844,6 +1844,10 @@ pub const COMPUTED_KIND_FONT_STYLE: u8 = 6;
 /// the reads later computations make, since those reads only happen inside
 /// callbacks the driver invokes after flushing.
 pub const COMPUTED_KIND_COMPUTE_IN_CPP: u8 = 7;
+/// A keyword whose numeric code is carried in `value`.
+pub const COMPUTED_KIND_KEYWORD: u8 = 8;
+/// A display value encoded as tag | first << 8 | second << 16 | third << 24.
+pub const COMPUTED_KIND_DISPLAY: u8 = 9;
 
 /// The leaf callbacks the C++ side provides to the property computation
 /// driver. The driver selects each longhand's cascaded, inherited or initial
@@ -1862,6 +1866,22 @@ pub struct FfiLonghandCallbacks {
     /// are pinned by the snapshot or the fetch below.
     pub store_computed_batch:
         unsafe extern "C" fn(context: *mut c_void, entries: *const FfiComputedStoreEntry, count: usize),
+    /// Stores the used color scheme resolved from the computed color-scheme
+    /// value and document preferences.
+    pub store_effective_color_scheme: unsafe extern "C" fn(context: *mut c_void, color_scheme: u8),
+    /// Stores the original adjusted properties for possible animation
+    /// restoration, records the pre-transformation display, and returns the
+    /// font measurements needed for the input line-height decision.
+    pub prepare_post_compute_adjustments: unsafe extern "C" fn(
+        context: *mut c_void,
+        display_before: *const FfiDisplay,
+        float_before: u16,
+        overflow_x_before: u16,
+        overflow_y_before: u16,
+        text_align_before: u16,
+        position_before: u16,
+        check_input_line_height: bool,
+    ) -> FfiInputLineHeightMetrics,
     /// Rare: fetches the parent's computed value for an explicit `inherit` of
     /// a non-inherited property, which the parent snapshot does not carry.
     /// The C++ side pins the returned shell until the end of the drive, so
@@ -1882,6 +1902,36 @@ pub struct FfiLonghandCallbacks {
     /// first, since building a context reads stored values.
     pub length_resolution_context:
         unsafe extern "C" fn(context: *mut c_void, property_id: u16, out: *mut FfiLengthResolutionContext),
+}
+
+/// Document-level inputs to used color-scheme resolution. Scheme values use
+/// the C++ PreferredColorScheme discriminants: auto, dark, and light.
+#[repr(C)]
+pub struct FfiEffectiveColorSchemeInput {
+    pub preferred_color_scheme: u8,
+    pub has_document_supported_schemes: bool,
+    pub document_supported_scheme_codes: *const u8,
+    pub document_supported_scheme_count: usize,
+}
+
+impl FfiEffectiveColorSchemeInput {
+    /// # Safety
+    /// The document-supported scheme storage must be valid for the returned
+    /// slice's lifetime.
+    unsafe fn document_supported_schemes(&self) -> Option<&[u8]> {
+        self.has_document_supported_schemes.then(|| {
+            if self.document_supported_scheme_count == 0 {
+                &[][..]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        self.document_supported_scheme_codes,
+                        self.document_supported_scheme_count,
+                    )
+                }
+            }
+        })
+    }
 }
 
 /// The computation-context kind a property's lengths resolve against,
@@ -2034,6 +2084,12 @@ fn set_longhand_bit(words: &mut [u64], property_id: u16) {
     words[index / 64] |= 1 << (index % 64);
 }
 
+fn clear_longhand_bit(words: &mut [u64], property_id: u16) {
+    use crate::property_metadata::FIRST_LONGHAND_PROPERTY_ID;
+    let index = (property_id - FIRST_LONGHAND_PROPERTY_ID) as usize;
+    words[index / 64] &= !(1 << (index % 64));
+}
+
 /// Drives the property computation loop: iterates every longhand in
 /// computation order, resolves logical pairing, reads the winning cascaded
 /// declarations straight from the store, selects between the cascaded,
@@ -2045,7 +2101,8 @@ fn set_longhand_bit(words: &mut [u64], property_id: u16) {
 /// # Safety
 /// `callbacks` must point at a valid callback table, `store` at a valid
 /// cascaded property store, `parent_snapshot` at a valid snapshot or null,
-/// and `results` at a results block whose bitmap storage covers every
+/// `box_type_input` and `color_scheme_input` at valid element and document
+/// facts, and `results` at a results block whose bitmap storage covers every
 /// longhand; the callbacks must not mutate the store for the duration of the
 /// call.
 #[unsafe(no_mangle)]
@@ -2053,6 +2110,9 @@ pub unsafe extern "C" fn rust_drive_property_computation(
     callbacks: *const FfiLonghandCallbacks,
     store: *const CascadedPropertyStore,
     parent_snapshot: *const FfiParentSnapshot,
+    box_type_input: *const FfiBoxTypeTransformationInput,
+    color_scheme_input: *const FfiEffectiveColorSchemeInput,
+    is_th_element: bool,
     has_new_font_size: bool,
     device_pixels_per_css_pixel: f64,
     initial_font_size_raw: i32,
@@ -2063,8 +2123,8 @@ pub unsafe extern "C" fn rust_drive_property_computation(
     abort_on_panic(|| {
         use crate::property_metadata::{
             FIRST_INHERITED_PROPERTY_ID, NUMBER_OF_LONGHAND_PROPERTIES, REQUIRES_COMPUTATION_ALWAYS,
-            REQUIRES_COMPUTATION_CASCADED, REQUIRES_COMPUTATION_NON_INHERITED, property_is_inherited,
-            property_requires_computation_level,
+            REQUIRES_COMPUTATION_CASCADED, REQUIRES_COMPUTATION_NON_INHERITED, property_id as prop,
+            property_is_inherited, property_requires_computation_level,
         };
 
         let callbacks = unsafe { &*callbacks };
@@ -2076,6 +2136,7 @@ pub unsafe extern "C" fn rust_drive_property_computation(
             Some(unsafe { &*parent_snapshot })
         };
         let has_inheritance_parent = snapshot.is_some();
+        let color_scheme_input = unsafe { &*color_scheme_input };
         let results = unsafe { &mut *results };
         assert!(results.word_count * 64 >= NUMBER_OF_LONGHAND_PROPERTIES);
         let important_words = unsafe { std::slice::from_raw_parts_mut(results.important_words, results.word_count) };
@@ -2143,6 +2204,13 @@ pub unsafe extern "C" fn rust_drive_property_computation(
         // both properties only take keywords, whose computed value is the specified one.
         let mut computed_writing_mode: Option<u8> = None;
         let mut computed_direction: Option<u8> = None;
+        let mut computed_overflow_x: Option<u16> = None;
+        let mut computed_overflow_y: Option<u16> = None;
+        let mut computed_text_align_before_adjustment: Option<u16> = None;
+        let mut computed_text_align: Option<u16> = None;
+        let mut computed_display: Option<FfiDisplay> = None;
+        let mut computed_float: Option<u16> = None;
+        let mut computed_position: Option<u16> = None;
 
         for &property_id in crate::property_metadata::property_computation_order() {
             let mut cascaded_property_id = property_id;
@@ -2624,9 +2692,209 @@ pub unsafe extern "C" fn rust_drive_property_computation(
                     value: 0.0,
                 });
             }
+
+            if property_id == prop::OVERFLOW_X {
+                if let StyleValueData::Keyword { keyword } = value_data {
+                    computed_overflow_x = Some(*keyword);
+                }
+            } else if property_id == prop::OVERFLOW_Y
+                && let (Some(overflow_x), StyleValueData::Keyword { keyword: overflow_y }) =
+                    (computed_overflow_x, value_data)
+            {
+                computed_overflow_y = Some(*overflow_y);
+                let effective_overflow = resolve_effective_overflow_keywords(overflow_x, *overflow_y);
+                for entry in pending_stores.iter_mut().rev() {
+                    if entry.property_id == prop::OVERFLOW_X && effective_overflow.changed_x {
+                        debug_assert_eq!(entry.computed_kind, COMPUTED_KIND_SHELL);
+                        entry.computed_kind = COMPUTED_KIND_KEYWORD;
+                        entry.value = effective_overflow.x_keyword as f64;
+                        clear_longhand_bit(important_words, prop::OVERFLOW_X);
+                        clear_longhand_bit(inherited_words, prop::OVERFLOW_X);
+                    } else if entry.property_id == prop::OVERFLOW_Y && effective_overflow.changed_y {
+                        debug_assert_eq!(entry.computed_kind, COMPUTED_KIND_SHELL);
+                        entry.computed_kind = COMPUTED_KIND_KEYWORD;
+                        entry.value = effective_overflow.y_keyword as f64;
+                        clear_longhand_bit(important_words, prop::OVERFLOW_Y);
+                        clear_longhand_bit(inherited_words, prop::OVERFLOW_Y);
+                    }
+                    if entry.property_id == prop::OVERFLOW_X {
+                        break;
+                    }
+                }
+            } else if property_id == prop::TEXT_ALIGN
+                && let StyleValueData::Keyword { keyword: text_align } = value_data
+            {
+                computed_text_align_before_adjustment = Some(*text_align);
+                let (has_parent_with_computed_values, parent_text_align, parent_direction_is_ltr) =
+                    if let Some(snapshot) = snapshot {
+                        let parent_text_align = match snapshot_entry_data(snapshot, prop::TEXT_ALIGN) {
+                            Some(StyleValueData::Keyword { keyword }) => *keyword,
+                            _ => unreachable!("parent text-align must be a keyword"),
+                        };
+                        let parent_direction_is_ltr = match snapshot_entry_data(snapshot, prop::DIRECTION) {
+                            Some(StyleValueData::Keyword {
+                                keyword: parent_direction,
+                            }) => *parent_direction == keyword::LTR,
+                            _ => unreachable!("parent direction must be a keyword"),
+                        };
+                        (true, parent_text_align, parent_direction_is_ltr)
+                    } else {
+                        (false, 0, true)
+                    };
+                let adjustment = compute_text_align_adjustment(
+                    *text_align,
+                    is_th_element,
+                    has_parent_with_computed_values,
+                    parent_text_align,
+                    parent_direction_is_ltr,
+                );
+                if adjustment.changed {
+                    let entry = pending_stores.last_mut().unwrap();
+                    debug_assert_eq!(entry.property_id, prop::TEXT_ALIGN);
+                    debug_assert_eq!(entry.computed_kind, COMPUTED_KIND_SHELL);
+                    entry.computed_kind = COMPUTED_KIND_KEYWORD;
+                    entry.value = adjustment.keyword as f64;
+                    clear_longhand_bit(important_words, property_id);
+                    clear_longhand_bit(inherited_words, property_id);
+                    if adjustment.inherited {
+                        set_longhand_bit(inherited_words, property_id);
+                    }
+                }
+                computed_text_align = Some(if adjustment.changed {
+                    adjustment.keyword
+                } else {
+                    *text_align
+                });
+            } else if property_id == prop::COLOR_SCHEME
+                && let StyleValueData::ColorScheme { scheme_codes, .. } = value_data
+            {
+                let color_scheme = resolve_effective_color_scheme(
+                    scheme_codes.as_slice(),
+                    color_scheme_input.preferred_color_scheme,
+                    unsafe { color_scheme_input.document_supported_schemes() },
+                );
+                unsafe { (callbacks.store_effective_color_scheme)(context, color_scheme) };
+            }
+
+            match (property_id, value_data) {
+                (prop::DISPLAY, StyleValueData::Display { raw }) => {
+                    computed_display = Some(FfiDisplay::from_raw(*raw));
+                }
+                (prop::FLOAT, StyleValueData::Keyword { keyword }) => {
+                    computed_float = Some(*keyword);
+                }
+                (prop::POSITION, StyleValueData::Keyword { keyword }) => {
+                    computed_position = Some(*keyword);
+                }
+                _ => {}
+            }
         }
 
         flush_pending_stores(callbacks, context, &mut pending_stores);
+        let display_before = computed_display.expect("display must be computed by the longhand driver");
+        let mut box_type_input = unsafe { *box_type_input };
+        box_type_input.display = display_before;
+        let float_before = computed_float.expect("float must be computed by the longhand driver");
+        box_type_input.float_value = float_before;
+        box_type_input.position = computed_position.expect("position must be computed by the longhand driver");
+        let transformation = transform_box_type(&box_type_input);
+        let display_after_box_type_transformation = if transformation.changed_display {
+            transformation.display
+        } else {
+            display_before
+        };
+        let text_align = computed_text_align.expect("text-align must be computed by the longhand driver");
+        let element_adjustment =
+            adjust_element_style(&box_type_input, display_after_box_type_transformation, text_align);
+        if transformation.set_float_none {
+            clear_longhand_bit(important_words, prop::FLOAT);
+            clear_longhand_bit(inherited_words, prop::FLOAT);
+        }
+        if transformation.changed_display {
+            clear_longhand_bit(important_words, prop::DISPLAY);
+            clear_longhand_bit(inherited_words, prop::DISPLAY);
+        }
+        if element_adjustment.changed_display {
+            clear_longhand_bit(important_words, prop::DISPLAY);
+            clear_longhand_bit(inherited_words, prop::DISPLAY);
+        }
+        if element_adjustment.set_position_static {
+            clear_longhand_bit(important_words, prop::POSITION);
+            clear_longhand_bit(inherited_words, prop::POSITION);
+        }
+        if element_adjustment.changed_text_align {
+            clear_longhand_bit(important_words, prop::TEXT_ALIGN);
+            clear_longhand_bit(inherited_words, prop::TEXT_ALIGN);
+        }
+        let input_line_height_metrics = unsafe {
+            (callbacks.prepare_post_compute_adjustments)(
+                context,
+                &raw const display_before,
+                float_before,
+                computed_overflow_x.expect("overflow-x must be computed by the longhand driver"),
+                computed_overflow_y.expect("overflow-y must be computed by the longhand driver"),
+                computed_text_align_before_adjustment.expect("text-align must be computed by the longhand driver"),
+                box_type_input.position,
+                element_adjustment.check_input_line_height,
+            )
+        };
+        let clamp_input_line_height = should_clamp_input_line_height(&element_adjustment, &input_line_height_metrics);
+
+        let adjusted_display = if element_adjustment.changed_display {
+            element_adjustment.display
+        } else {
+            display_after_box_type_transformation
+        };
+        let adjusted_entry = |property_id, computed_kind, value| FfiComputedStoreEntry {
+            property_id,
+            inherited_property_id: property_id,
+            shell: initial_value(property_id).shell,
+            inheritance_dependent: false,
+            inherited: false,
+            computed_kind,
+            value,
+        };
+        let mut adjustments = Vec::new();
+        if transformation.set_float_none {
+            adjustments.push(adjusted_entry(prop::FLOAT, COMPUTED_KIND_KEYWORD, keyword::NONE as f64));
+        }
+        if adjusted_display != display_before {
+            adjustments.push(adjusted_entry(
+                prop::DISPLAY,
+                COMPUTED_KIND_DISPLAY,
+                adjusted_display.encoded() as f64,
+            ));
+        }
+        let line_height_changed = element_adjustment.set_line_height_normal || clamp_input_line_height;
+        if line_height_changed {
+            adjustments.push(adjusted_entry(
+                prop::LINE_HEIGHT,
+                COMPUTED_KIND_KEYWORD,
+                keyword::NORMAL as f64,
+            ));
+        }
+        if element_adjustment.set_position_static {
+            adjustments.push(adjusted_entry(
+                prop::POSITION,
+                COMPUTED_KIND_KEYWORD,
+                keyword::STATIC as f64,
+            ));
+        }
+        if element_adjustment.changed_text_align {
+            adjustments.push(adjusted_entry(
+                prop::TEXT_ALIGN,
+                COMPUTED_KIND_KEYWORD,
+                element_adjustment.text_align as f64,
+            ));
+        }
+        if !adjustments.is_empty() {
+            crate::ffi_stats::bump(crate::ffi_stats::FfiOp::LonghandStoreBatchCallback);
+            unsafe { (callbacks.store_computed_batch)(context, adjustments.as_ptr(), adjustments.len()) };
+        }
+        if line_height_changed {
+            clear_longhand_bit(important_words, prop::LINE_HEIGHT);
+            clear_longhand_bit(inherited_words, prop::LINE_HEIGHT);
+        }
     });
 }
 
@@ -2803,6 +3071,23 @@ const DISPLAY_TAG_INTERNAL: u8 = 1;
 const DISPLAY_TAG_BOX: u8 = 2;
 
 impl FfiDisplay {
+    fn from_raw(raw: u32) -> Self {
+        let [tag, first, second, third] = raw.to_ne_bytes();
+        match tag {
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE => Self::outside_and_inside(first, second, third != 0),
+            DISPLAY_TAG_INTERNAL => Self::internal(first),
+            DISPLAY_TAG_BOX => Self {
+                tag,
+                outside: 0,
+                inside: 0,
+                list_item: false,
+                internal: 0,
+                box_value: first,
+            },
+            _ => unreachable!("invalid display tag"),
+        }
+    }
+
     fn outside_and_inside(outside: u8, inside: u8, list_item: bool) -> Self {
         Self {
             tag: DISPLAY_TAG_OUTSIDE_AND_INSIDE,
@@ -2827,6 +3112,39 @@ impl FfiDisplay {
 
     fn block() -> Self {
         Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, false)
+    }
+
+    fn inline() -> Self {
+        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW, false)
+    }
+
+    fn inline_block() -> Self {
+        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW_ROOT, false)
+    }
+
+    fn flow_root() -> Self {
+        Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW_ROOT, false)
+    }
+
+    fn encoded(&self) -> u32 {
+        let (first, second, third) = match self.tag {
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE => (self.outside, self.inside, self.list_item as u8),
+            DISPLAY_TAG_INTERNAL => (self.internal, 0, 0),
+            DISPLAY_TAG_BOX => (self.box_value, 0, 0),
+            _ => unreachable!("invalid display tag"),
+        };
+        self.tag as u32 | (first as u32) << 8 | (second as u32) << 16 | (third as u32) << 24
+    }
+
+    fn none() -> Self {
+        Self {
+            tag: DISPLAY_TAG_BOX,
+            outside: 0,
+            inside: 0,
+            list_item: false,
+            internal: 0,
+            box_value: display_box::NONE,
+        }
     }
 
     fn is_outside_and_inside(&self) -> bool {
@@ -2873,6 +3191,7 @@ impl FfiDisplay {
 /// The element facts the box type transformation needs, marshalled by the C++
 /// side. The parent display is the first non-`display: contents` ancestor's.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct FfiBoxTypeTransformationInput {
     pub display: FfiDisplay,
     /// Computed position and float keywords.
@@ -2886,15 +3205,112 @@ pub struct FfiBoxTypeTransformationInput {
     pub is_mathml_mtd: bool,
     pub has_parent_display: bool,
     pub parent_display: FfiDisplay,
+    pub is_wbr_element: bool,
+    pub disallow_display_contents: bool,
+    pub rewrite_inline_flow: bool,
+    pub is_button_element: bool,
+    pub force_line_height_normal: bool,
+    pub check_input_line_height: bool,
+    pub hide_audio_without_controls: bool,
+    pub is_table_element: bool,
+    pub force_position_static: bool,
+    pub force_symbol_display_inline: bool,
 }
 
 /// Result of the box type transformation: whether float must be reset to none,
 /// and the possibly replaced display.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct FfiBoxTypeTransformation {
     pub set_float_none: bool,
     pub changed_display: bool,
     pub display: FfiDisplay,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiElementStyleAdjustment {
+    pub changed_display: bool,
+    pub display: FfiDisplay,
+    pub set_line_height_normal: bool,
+    pub check_input_line_height: bool,
+    pub set_position_static: bool,
+    pub changed_text_align: bool,
+    pub text_align: u16,
+}
+
+#[repr(C)]
+pub struct FfiInputLineHeightMetrics {
+    pub current_line_height: f64,
+    pub minimum_line_height: f64,
+}
+
+fn should_clamp_input_line_height(adjustment: &FfiElementStyleAdjustment, metrics: &FfiInputLineHeightMetrics) -> bool {
+    adjustment.check_input_line_height && metrics.current_line_height < metrics.minimum_line_height
+}
+
+fn adjust_element_style(
+    input: &FfiBoxTypeTransformationInput,
+    display: FfiDisplay,
+    text_align: u16,
+) -> FfiElementStyleAdjustment {
+    let mut new_display = display;
+    if input.is_wbr_element && display.is_contents() {
+        new_display = FfiDisplay::none();
+    }
+    if input.disallow_display_contents && new_display.is_contents() {
+        new_display = FfiDisplay::none();
+    }
+    if input.rewrite_inline_flow && new_display.is_inline_outside() && new_display.inside == display_inside::FLOW {
+        new_display = FfiDisplay::inline_block();
+    }
+    if input.is_button_element
+        && !(new_display.is_flex_inside()
+            || new_display.is_grid_inside()
+            || new_display.is_none()
+            || new_display.is_contents())
+    {
+        new_display = if new_display.is_inline_outside() {
+            FfiDisplay::inline_block()
+        } else {
+            FfiDisplay::flow_root()
+        };
+    }
+    if input.is_br_element {
+        new_display = if new_display.is_contents() {
+            FfiDisplay::none()
+        } else if new_display.is_none() {
+            new_display
+        } else {
+            FfiDisplay::inline()
+        };
+    }
+    if input.hide_audio_without_controls {
+        new_display = FfiDisplay::none();
+    }
+    if input.force_symbol_display_inline {
+        new_display = FfiDisplay::inline();
+    }
+
+    let new_text_align = if input.is_table_element
+        && matches!(
+            text_align,
+            keyword::_LIBWEB_LEFT | keyword::_LIBWEB_CENTER | keyword::_LIBWEB_RIGHT
+        ) {
+        keyword::START
+    } else {
+        text_align
+    };
+
+    FfiElementStyleAdjustment {
+        changed_display: new_display != display,
+        display: new_display,
+        set_line_height_normal: input.force_line_height_normal,
+        check_input_line_height: input.check_input_line_height,
+        set_position_static: input.force_position_static,
+        changed_text_align: new_text_align != text_align,
+        text_align: new_text_align,
+    }
 }
 
 // NB: css-display-3 also defines inlinification, but nothing triggers it yet (the only
@@ -2931,7 +3347,90 @@ fn required_box_type_transformation(input: &FfiBoxTypeTransformationInput) -> Bo
 
 /// https://drafts.csswg.org/css-display/#transformations
 /// 2.7. Automatic Box Type Transformations
-///
+fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBoxTypeTransformation {
+    let display = input.display;
+    let unchanged = |set_float_none: bool| FfiBoxTypeTransformation {
+        set_float_none,
+        changed_display: false,
+        display,
+    };
+
+    // Some layout effects require blockification or inlinification of the box type,
+    // which sets the box's computed outer display type to block or inline (respectively).
+    // (This has no effect on display types that generate no box at all, such as none or contents.)
+    if display.is_none() || (display.is_contents() && !input.is_document_element) {
+        return unchanged(false);
+    }
+
+    // https://drafts.csswg.org/css-display/#root
+    // The root element's display type is always blockified, and its principal box always establishes an independent formatting context.
+    if input.is_document_element && !display.is_block_outside() {
+        return FfiBoxTypeTransformation {
+            set_float_none: false,
+            changed_display: true,
+            display: FfiDisplay::block(),
+        };
+    }
+
+    let mut new_display = display;
+
+    if display.is_math_inside() {
+        // https://w3c.github.io/mathml-core/#new-display-math-value
+        // For elements that are not MathML elements, if the specified value of display is inline math or block math
+        // then the computed value is block flow and inline flow respectively.
+        if !input.is_mathml_element {
+            new_display = FfiDisplay::outside_and_inside(display.outside, display_inside::FLOW, display.list_item);
+        }
+        // For the mtable element the computed value is block table and inline table respectively.
+        else if input.is_mathml_mtable {
+            new_display = FfiDisplay::outside_and_inside(display.outside, display_inside::TABLE, display.list_item);
+        }
+        // For the mtr element, the computed value is table-row.
+        else if input.is_mathml_mtr {
+            new_display = FfiDisplay::internal(display_internal::TABLE_ROW);
+        }
+        // For the mtd element, the computed value is table-cell.
+        else if input.is_mathml_mtd {
+            new_display = FfiDisplay::internal(display_internal::TABLE_CELL);
+        }
+    }
+
+    // https://www.w3.org/TR/CSS2/visuren.html#dis-pos-flo
+    // If 'position' has the value 'absolute' or 'fixed', [...] 'float' is set to 'none'
+    let set_float_none = input.position == keyword::ABSOLUTE || input.position == keyword::FIXED;
+
+    match required_box_type_transformation(input) {
+        BoxTypeTransformation::None => {}
+        BoxTypeTransformation::Blockify => {
+            if display.is_block_outside() {
+                return unchanged(set_float_none);
+            }
+            // If a layout-internal box is blockified, its inner display type converts to flow so that it becomes a block container.
+            if display.is_internal() {
+                new_display = FfiDisplay::block();
+            } else {
+                assert!(display.is_outside_and_inside());
+
+                // For legacy reasons, if an inline block box (inline flow-root) is blockified, it becomes a block box (losing its flow-root nature).
+                // For consistency, a run-in flow-root box also blockifies to a block box.
+                if display.is_inline_block() {
+                    new_display =
+                        FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, display.list_item);
+                } else {
+                    new_display =
+                        FfiDisplay::outside_and_inside(display_outside::BLOCK, display.inside, display.list_item);
+                }
+            }
+        }
+    }
+
+    FfiBoxTypeTransformation {
+        set_float_none,
+        changed_display: new_display != display,
+        display: new_display,
+    }
+}
+
 /// # Safety
 /// `input` must be a valid pointer.
 #[unsafe(no_mangle)]
@@ -2939,93 +3438,7 @@ pub unsafe extern "C" fn rust_transform_box_type(
     input: *const FfiBoxTypeTransformationInput,
 ) -> FfiBoxTypeTransformation {
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::NestedPropertyComputeEntry);
-    abort_on_panic(|| {
-        let input = unsafe { &*input };
-        let display = input.display;
-        let unchanged = |set_float_none: bool| FfiBoxTypeTransformation {
-            set_float_none,
-            changed_display: false,
-            display,
-        };
-
-        // Some layout effects require blockification or inlinification of the box type,
-        // which sets the box's computed outer display type to block or inline (respectively).
-        // (This has no effect on display types that generate no box at all, such as none or contents.)
-        if display.is_none() || (display.is_contents() && !input.is_document_element) {
-            return unchanged(false);
-        }
-
-        // https://drafts.csswg.org/css-display/#root
-        // The root element's display type is always blockified, and its principal box always establishes an independent formatting context.
-        if input.is_document_element && !display.is_block_outside() {
-            return FfiBoxTypeTransformation {
-                set_float_none: false,
-                changed_display: true,
-                display: FfiDisplay::block(),
-            };
-        }
-
-        let mut new_display = display;
-
-        if display.is_math_inside() {
-            // https://w3c.github.io/mathml-core/#new-display-math-value
-            // For elements that are not MathML elements, if the specified value of display is inline math or block math
-            // then the computed value is block flow and inline flow respectively.
-            if !input.is_mathml_element {
-                new_display = FfiDisplay::outside_and_inside(display.outside, display_inside::FLOW, display.list_item);
-            }
-            // For the mtable element the computed value is block table and inline table respectively.
-            else if input.is_mathml_mtable {
-                new_display = FfiDisplay::outside_and_inside(display.outside, display_inside::TABLE, display.list_item);
-            }
-            // For the mtr element, the computed value is table-row.
-            else if input.is_mathml_mtr {
-                new_display = FfiDisplay::internal(display_internal::TABLE_ROW);
-            }
-            // For the mtd element, the computed value is table-cell.
-            else if input.is_mathml_mtd {
-                new_display = FfiDisplay::internal(display_internal::TABLE_CELL);
-            }
-        }
-
-        // https://www.w3.org/TR/CSS2/visuren.html#dis-pos-flo
-        // If 'position' has the value 'absolute' or 'fixed', [...] 'float' is set to 'none'
-        let set_float_none = input.position == keyword::ABSOLUTE || input.position == keyword::FIXED;
-
-        match required_box_type_transformation(input) {
-            BoxTypeTransformation::None => {}
-            BoxTypeTransformation::Blockify => {
-                if display.is_block_outside() {
-                    return unchanged(set_float_none);
-                }
-                // If a layout-internal box is blockified, its inner display type converts to flow so that it becomes a block container.
-                if display.is_internal() {
-                    new_display = FfiDisplay::block();
-                } else {
-                    assert!(display.is_outside_and_inside());
-
-                    // For legacy reasons, if an inline block box (inline flow-root) is blockified, it becomes a block box (losing its flow-root nature).
-                    // For consistency, a run-in flow-root box also blockifies to a block box.
-                    if display.is_inline_block() {
-                        new_display = FfiDisplay::outside_and_inside(
-                            display_outside::BLOCK,
-                            display_inside::FLOW,
-                            display.list_item,
-                        );
-                    } else {
-                        new_display =
-                            FfiDisplay::outside_and_inside(display_outside::BLOCK, display.inside, display.list_item);
-                    }
-                }
-            }
-        }
-
-        FfiBoxTypeTransformation {
-            set_float_none,
-            changed_display: new_display != display,
-            display: new_display,
-        }
-    })
+    abort_on_panic(|| transform_box_type(unsafe { &*input }))
 }
 
 /// Result of resolving the effective overflow pair: each axis' possibly
@@ -3041,36 +3454,103 @@ pub struct FfiEffectiveOverflow {
 /// https://www.w3.org/TR/css-overflow-3/#overflow-control
 /// The visible/clip values of overflow compute to auto/hidden (respectively) if one of overflow-x or
 /// overflow-y is neither visible nor clip.
+fn resolve_effective_overflow_keywords(overflow_x: u16, overflow_y: u16) -> FfiEffectiveOverflow {
+    let is_visible_or_clip = |keyword: u16| keyword == keyword::VISIBLE || keyword == keyword::CLIP;
+    let mut result = FfiEffectiveOverflow {
+        changed_x: false,
+        x_keyword: overflow_x,
+        changed_y: false,
+        y_keyword: overflow_y,
+    };
+    if !is_visible_or_clip(overflow_x) || !is_visible_or_clip(overflow_y) {
+        if overflow_x == keyword::VISIBLE {
+            result.changed_x = true;
+            result.x_keyword = keyword::AUTO;
+        }
+        if overflow_x == keyword::CLIP {
+            result.changed_x = true;
+            result.x_keyword = keyword::HIDDEN;
+        }
+        if overflow_y == keyword::VISIBLE {
+            result.changed_y = true;
+            result.y_keyword = keyword::AUTO;
+        }
+        if overflow_y == keyword::CLIP {
+            result.changed_y = true;
+            result.y_keyword = keyword::HIDDEN;
+        }
+    }
+    result
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_resolve_effective_overflow_keywords(overflow_x: u16, overflow_y: u16) -> FfiEffectiveOverflow {
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::NestedPropertyComputeEntry);
-    abort_on_panic(|| {
-        let is_visible_or_clip = |keyword: u16| keyword == keyword::VISIBLE || keyword == keyword::CLIP;
-        let mut result = FfiEffectiveOverflow {
-            changed_x: false,
-            x_keyword: overflow_x,
-            changed_y: false,
-            y_keyword: overflow_y,
-        };
-        if !is_visible_or_clip(overflow_x) || !is_visible_or_clip(overflow_y) {
-            if overflow_x == keyword::VISIBLE {
-                result.changed_x = true;
-                result.x_keyword = keyword::AUTO;
-            }
-            if overflow_x == keyword::CLIP {
-                result.changed_x = true;
-                result.x_keyword = keyword::HIDDEN;
-            }
-            if overflow_y == keyword::VISIBLE {
-                result.changed_y = true;
-                result.y_keyword = keyword::AUTO;
-            }
-            if overflow_y == keyword::CLIP {
-                result.changed_y = true;
-                result.y_keyword = keyword::HIDDEN;
-            }
+    abort_on_panic(|| resolve_effective_overflow_keywords(overflow_x, overflow_y))
+}
+
+// https://drafts.csswg.org/css-color-adjust-1/#determine-the-used-color-scheme
+fn resolve_effective_color_scheme(
+    schemes: &[u8],
+    preferred_scheme: u8,
+    document_supported_schemes: Option<&[u8]>,
+) -> u8 {
+    const AUTO: u8 = 0;
+    const LIGHT: u8 = 2;
+
+    // To determine the used color scheme of an element:
+
+    // 1. If the user’s preferred color scheme, as indicated by the prefers-color-scheme media feature,
+    //    is present among the listed color schemes, and is supported by the user agent,
+    //    that’s the element’s used color scheme.
+    if preferred_scheme != AUTO && schemes.contains(&preferred_scheme) {
+        return preferred_scheme;
+    }
+
+    // 2. Otherwise, if the user has indicated an overriding preference for their chosen color scheme,
+    //    and the only keyword is not present in color-scheme for the element,
+    //    the user agent must override the color scheme with the user’s preferred color scheme.
+    //    See § 2.3 Overriding the Color Scheme.
+    // FIXME: We don't currently support setting an "overriding preference" for color schemes.
+
+    // 3. Otherwise, if the user agent supports at least one of the listed color schemes,
+    //    the used color scheme is the first supported color scheme in the list.
+    if let Some(first_supported) = schemes.iter().find(|scheme| **scheme != AUTO) {
+        return *first_supported;
+    }
+
+    // 4. Otherwise, the used color scheme is the browser default. (Same as normal.)
+    // `normal` indicates that the element supports the page’s supported color schemes, if they are set
+    if let Some(document_supported_schemes) = document_supported_schemes {
+        if preferred_scheme != AUTO && document_supported_schemes.contains(&preferred_scheme) {
+            return preferred_scheme;
         }
-        result
+        if let Some(first_supported) = document_supported_schemes.iter().find(|scheme| **scheme != AUTO) {
+            return *first_supported;
+        }
+    }
+
+    LIGHT
+}
+
+/// Resolves the used color scheme for a value that required C++ computation.
+///
+/// # Safety
+/// `value` must point at valid ColorScheme StyleValueData and `input` at valid
+/// document inputs for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_resolve_effective_color_scheme(
+    value: *const c_void,
+    input: *const FfiEffectiveColorSchemeInput,
+) -> u8 {
+    abort_on_panic(|| {
+        let StyleValueData::ColorScheme { scheme_codes, .. } = (unsafe { &*(value as *const StyleValueData) }) else {
+            unreachable!("computed color-scheme must have color-scheme data");
+        };
+        let input = unsafe { &*input };
+        resolve_effective_color_scheme(scheme_codes.as_slice(), input.preferred_color_scheme, unsafe {
+            input.document_supported_schemes()
+        })
     })
 }
 
@@ -3085,6 +3565,58 @@ pub struct FfiTextAlignAdjustment {
 
 /// Decides the text-align adjustments applied after computation. The parent
 /// arguments are only read when `has_parent_with_computed_values` is set.
+fn compute_text_align_adjustment(
+    text_align: u16,
+    is_th_element: bool,
+    has_parent_with_computed_values: bool,
+    parent_text_align: u16,
+    parent_direction_is_ltr: bool,
+) -> FfiTextAlignAdjustment {
+    let unchanged = FfiTextAlignAdjustment {
+        changed: false,
+        keyword: text_align,
+        inherited: false,
+    };
+    let replace = |keyword: u16| FfiTextAlignAdjustment {
+        changed: true,
+        keyword,
+        inherited: false,
+    };
+
+    // https://drafts.csswg.org/css-text-4/#valdef-text-align-match-parent
+    // This value behaves the same as inherit (computes to its parent's computed value) except that an inherited
+    // value of start or end is interpreted against the parent's direction value and results in a computed value of
+    // either left or right. Computes to start when specified on the root element.
+    if text_align == keyword::MATCH_PARENT {
+        if !has_parent_with_computed_values {
+            return replace(keyword::START);
+        }
+        return match parent_text_align {
+            keyword::START if parent_direction_is_ltr => replace(keyword::LEFT),
+            keyword::START => replace(keyword::RIGHT),
+            keyword::END if parent_direction_is_ltr => replace(keyword::RIGHT),
+            keyword::END => replace(keyword::LEFT),
+            _ => replace(parent_text_align),
+        };
+    }
+
+    // AD-HOC: The -libweb-inherit-or-center style defaults to centering, unless the parent element has a
+    //         non-initial computed text-align value. This is used to support the ad-hoc default <th>
+    //         text-align behavior.
+    if text_align == keyword::_LIBWEB_INHERIT_OR_CENTER && is_th_element {
+        if has_parent_with_computed_values && parent_text_align != keyword::START {
+            return FfiTextAlignAdjustment {
+                changed: true,
+                keyword: parent_text_align,
+                inherited: true,
+            };
+        }
+        return replace(keyword::CENTER);
+    }
+
+    unchanged
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_compute_text_align(
     text_align: u16,
@@ -3095,49 +3627,13 @@ pub extern "C" fn rust_compute_text_align(
 ) -> FfiTextAlignAdjustment {
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::NestedPropertyComputeEntry);
     abort_on_panic(|| {
-        let unchanged = FfiTextAlignAdjustment {
-            changed: false,
-            keyword: text_align,
-            inherited: false,
-        };
-        let replace = |keyword: u16| FfiTextAlignAdjustment {
-            changed: true,
-            keyword,
-            inherited: false,
-        };
-
-        // https://drafts.csswg.org/css-text-4/#valdef-text-align-match-parent
-        // This value behaves the same as inherit (computes to its parent's computed value) except that an inherited
-        // value of start or end is interpreted against the parent's direction value and results in a computed value of
-        // either left or right. Computes to start when specified on the root element.
-        if text_align == keyword::MATCH_PARENT {
-            if !has_parent_with_computed_values {
-                return replace(keyword::START);
-            }
-            return match parent_text_align {
-                keyword::START if parent_direction_is_ltr => replace(keyword::LEFT),
-                keyword::START => replace(keyword::RIGHT),
-                keyword::END if parent_direction_is_ltr => replace(keyword::RIGHT),
-                keyword::END => replace(keyword::LEFT),
-                _ => replace(parent_text_align),
-            };
-        }
-
-        // AD-HOC: The -libweb-inherit-or-center style defaults to centering, unless the parent element has a
-        //         non-initial computed text-align value. This is used to support the ad-hoc default <th>
-        //         text-align behavior.
-        if text_align == keyword::_LIBWEB_INHERIT_OR_CENTER && is_th_element {
-            if has_parent_with_computed_values && parent_text_align != keyword::START {
-                return FfiTextAlignAdjustment {
-                    changed: true,
-                    keyword: parent_text_align,
-                    inherited: true,
-                };
-            }
-            return replace(keyword::CENTER);
-        }
-
-        unchanged
+        compute_text_align_adjustment(
+            text_align,
+            is_th_element,
+            has_parent_with_computed_values,
+            parent_text_align,
+            parent_direction_is_ltr,
+        )
     })
 }
 
@@ -3183,6 +3679,170 @@ mod ffi_test_stubs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_overflow_keywords_compute_together() {
+        let result = resolve_effective_overflow_keywords(keyword::VISIBLE, keyword::AUTO);
+        assert!(result.changed_x);
+        assert_eq!(result.x_keyword, keyword::AUTO);
+        assert!(!result.changed_y);
+        assert_eq!(result.y_keyword, keyword::AUTO);
+
+        let result = resolve_effective_overflow_keywords(keyword::CLIP, keyword::SCROLL);
+        assert!(result.changed_x);
+        assert_eq!(result.x_keyword, keyword::HIDDEN);
+        assert!(!result.changed_y);
+        assert_eq!(result.y_keyword, keyword::SCROLL);
+
+        let result = resolve_effective_overflow_keywords(keyword::VISIBLE, keyword::CLIP);
+        assert!(!result.changed_x);
+        assert!(!result.changed_y);
+    }
+
+    #[test]
+    fn effective_color_scheme_follows_element_and_document_preferences() {
+        const AUTO: u8 = 0;
+        const DARK: u8 = 1;
+        const LIGHT: u8 = 2;
+
+        assert_eq!(resolve_effective_color_scheme(&[LIGHT, DARK], DARK, None), DARK);
+        assert_eq!(resolve_effective_color_scheme(&[DARK, LIGHT], LIGHT, None), LIGHT);
+        assert_eq!(resolve_effective_color_scheme(&[DARK, LIGHT], AUTO, None), DARK);
+        assert_eq!(
+            resolve_effective_color_scheme(&[AUTO], DARK, Some(&[LIGHT, DARK])),
+            DARK
+        );
+        assert_eq!(resolve_effective_color_scheme(&[], AUTO, Some(&[DARK])), DARK);
+        assert_eq!(resolve_effective_color_scheme(&[], AUTO, None), LIGHT);
+    }
+
+    #[test]
+    fn text_align_adjusts_match_parent_and_table_header_defaults() {
+        let result = compute_text_align_adjustment(keyword::MATCH_PARENT, false, true, keyword::START, false);
+        assert!(result.changed);
+        assert_eq!(result.keyword, keyword::RIGHT);
+        assert!(!result.inherited);
+
+        let result =
+            compute_text_align_adjustment(keyword::_LIBWEB_INHERIT_OR_CENTER, true, true, keyword::JUSTIFY, true);
+        assert!(result.changed);
+        assert_eq!(result.keyword, keyword::JUSTIFY);
+        assert!(result.inherited);
+
+        let result = compute_text_align_adjustment(keyword::_LIBWEB_INHERIT_OR_CENTER, true, false, 0, true);
+        assert!(result.changed);
+        assert_eq!(result.keyword, keyword::CENTER);
+        assert!(!result.inherited);
+    }
+
+    #[test]
+    fn display_raw_value_decodes_for_box_type_transformation() {
+        let inline_flex = FfiDisplay::from_raw(u32::from_ne_bytes([
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE,
+            display_outside::INLINE,
+            display_inside::FLEX,
+            0,
+        ]));
+        assert!(inline_flex.is_inline_outside());
+        assert!(inline_flex.is_flex_inside());
+
+        let none = FfiDisplay::from_raw(u32::from_ne_bytes([DISPLAY_TAG_BOX, display_box::NONE, 0, 0]));
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn display_encodes_for_adjustment_store() {
+        let list_item = FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, true);
+        assert_eq!(
+            list_item.encoded(),
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE as u32
+                | (display_outside::BLOCK as u32) << 8
+                | (display_inside::FLOW as u32) << 16
+                | 1 << 24
+        );
+
+        assert_eq!(
+            FfiDisplay::internal(display_internal::TABLE_ROW).encoded(),
+            DISPLAY_TAG_INTERNAL as u32 | (display_internal::TABLE_ROW as u32) << 8
+        );
+        assert_eq!(
+            FfiDisplay::none().encoded(),
+            DISPLAY_TAG_BOX as u32 | (display_box::NONE as u32) << 8
+        );
+    }
+
+    fn element_adjustment_input() -> FfiBoxTypeTransformationInput {
+        FfiBoxTypeTransformationInput {
+            display: FfiDisplay::inline(),
+            position: keyword::STATIC,
+            float_value: keyword::NONE,
+            is_br_element: false,
+            is_document_element: false,
+            is_mathml_element: false,
+            is_mathml_mtable: false,
+            is_mathml_mtr: false,
+            is_mathml_mtd: false,
+            has_parent_display: false,
+            parent_display: FfiDisplay::block(),
+            is_wbr_element: false,
+            disallow_display_contents: false,
+            rewrite_inline_flow: false,
+            is_button_element: false,
+            force_line_height_normal: false,
+            check_input_line_height: false,
+            hide_audio_without_controls: false,
+            is_table_element: false,
+            force_position_static: false,
+            force_symbol_display_inline: false,
+        }
+    }
+
+    #[test]
+    fn element_styles_adjust_from_marshaled_facts() {
+        let mut input = element_adjustment_input();
+        input.disallow_display_contents = true;
+        let contents = FfiDisplay {
+            tag: DISPLAY_TAG_BOX,
+            outside: 0,
+            inside: 0,
+            list_item: false,
+            internal: 0,
+            box_value: display_box::CONTENTS,
+        };
+        let adjustment = adjust_element_style(&input, contents, keyword::LEFT);
+        assert!(adjustment.changed_display);
+        assert!(adjustment.display.is_none());
+
+        input = element_adjustment_input();
+        input.is_button_element = true;
+        let adjustment = adjust_element_style(&input, FfiDisplay::inline(), keyword::LEFT);
+        assert!(adjustment.changed_display);
+        assert!(adjustment.display.is_inline_block());
+
+        input = element_adjustment_input();
+        input.is_table_element = true;
+        let adjustment = adjust_element_style(&input, FfiDisplay::block(), keyword::_LIBWEB_CENTER);
+        assert!(adjustment.changed_text_align);
+        assert_eq!(adjustment.text_align, keyword::START);
+
+        input = element_adjustment_input();
+        input.check_input_line_height = true;
+        let adjustment = adjust_element_style(&input, FfiDisplay::inline(), keyword::LEFT);
+        assert!(should_clamp_input_line_height(
+            &adjustment,
+            &FfiInputLineHeightMetrics {
+                current_line_height: 12.0,
+                minimum_line_height: 16.0,
+            }
+        ));
+        assert!(!should_clamp_input_line_height(
+            &adjustment,
+            &FfiInputLineHeightMetrics {
+                current_line_height: 18.0,
+                minimum_line_height: 16.0,
+            }
+        ));
+    }
 
     fn test_context() -> FfiLengthResolutionContext {
         FfiLengthResolutionContext {

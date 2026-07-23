@@ -328,6 +328,16 @@ pub struct FfiCascadeDeclaration {
     pub data: *const c_void,
 }
 
+/// A custom-property declaration in an `FfiCascadeBlock`. Names cross as retained raw
+/// `Utf16FlyString` identities, which are also sufficient for string equality.
+#[repr(C)]
+pub struct FfiCustomPropertyDeclaration {
+    pub name_raw: usize,
+    pub important: bool,
+    pub is_revert_layer: bool,
+    pub shell: *const c_void,
+}
+
 /// Applies one declaration block to the cascade: filters by importance and applicability,
 /// resolves arbitrary-substitution values through the parser callback, downgrades
 /// invalid-at-computed-value-time declarations to unset, expands shorthands, and routes
@@ -344,7 +354,10 @@ fn apply_declaration_block(
     unset_shell: *const c_void,
     unset_data: *const c_void,
     is_property_disallowed: &dyn Fn(u16) -> bool,
-    resolve_unresolved: &dyn Fn(u16, *const c_void) -> *const c_void,
+    resolve_unresolved: &dyn Fn(u16, *const c_void) -> FfiResolvedStyleValue,
+    parse_substituted: &dyn Fn(u16, &[u8]) -> FfiResolvedStyleValue,
+    custom_property_store: *const c_void,
+    custom_property_registry: *const c_void,
     data_of: &dyn Fn(*const c_void) -> *const c_void,
     create_pending_substitution: &dyn Fn(*const c_void) -> *const c_void,
     mut assign_source_slot: impl FnMut(u32),
@@ -371,8 +384,26 @@ fn apply_declaration_block(
         let mut data = declaration.data;
 
         if declared_is_unresolved {
-            shell = resolve_unresolved(declaration.property_id, shell);
-            data = data_of(shell);
+            let native_resolution = unsafe {
+                crate::custom_properties::resolve_vars(custom_property_store, custom_property_registry, data)
+            };
+            match native_resolution {
+                crate::custom_properties::NativeVarResolution::Resolved(source) => {
+                    let resolved = parse_substituted(declaration.property_id, &source);
+                    shell = resolved.shell;
+                    data = resolved.data;
+                }
+                crate::custom_properties::NativeVarResolution::Invalid => {
+                    let resolved = parse_substituted(declaration.property_id, &[]);
+                    shell = resolved.shell;
+                    data = resolved.data;
+                }
+                crate::custom_properties::NativeVarResolution::NotHandled => {
+                    let resolved = resolve_unresolved(declaration.property_id, shell);
+                    shell = resolved.shell;
+                    data = resolved.data;
+                }
+            }
         }
 
         if matches!(
@@ -486,6 +517,8 @@ pub struct FfiCascadeBlock {
     pub source_id: u32,
     pub declarations: *const FfiCascadeDeclaration,
     pub declaration_count: usize,
+    pub custom_property_declarations: *const FfiCustomPropertyDeclaration,
+    pub custom_property_declaration_count: usize,
 }
 
 /// One winning store slot and the block source that supplied it, reported in
@@ -496,15 +529,30 @@ pub struct FfiSourceSlotAssignment {
     pub source_id: u32,
 }
 
+/// One winning custom-property declaration, reported in first-declaration order.
+#[repr(C)]
+pub struct FfiCascadedCustomProperty {
+    pub name_raw: usize,
+    pub important: bool,
+    pub shell: *const c_void,
+}
+
 /// Callbacks for the bulk cascade. Values cross as opaque C++ style value
 /// shells; the C++ side pins every value it creates until the cascade
 /// returns.
 #[repr(C)]
 pub struct FfiBulkCascadeCallbacks {
     pub context: *mut c_void,
-    /// Resolves an unresolved (arbitrary-substitution) value; returns the pinned resolved shell.
+    /// Resolves an unresolved value and returns its pinned shell and Rust-owned data.
     pub resolve_unresolved:
-        unsafe extern "C" fn(context: *mut c_void, property_id: u16, shell: *const c_void) -> *const c_void,
+        unsafe extern "C" fn(context: *mut c_void, property_id: u16, shell: *const c_void) -> FfiResolvedStyleValue,
+    /// Parses a substituted token stream and returns its pinned shell and Rust-owned data.
+    pub parse_substituted: unsafe extern "C" fn(
+        context: *mut c_void,
+        property_id: u16,
+        source: *const u8,
+        source_length: usize,
+    ) -> FfiResolvedStyleValue,
     /// Returns the Rust-owned data of a C++ style value shell.
     pub data_of: unsafe extern "C" fn(context: *mut c_void, shell: *const c_void) -> *const c_void,
     /// Creates and pins a pending-substitution value wrapping the given value; returns its shell.
@@ -515,6 +563,18 @@ pub struct FfiBulkCascadeCallbacks {
     /// Receives every winning slot's source assignment in one batch.
     pub assign_source_slots:
         unsafe extern "C" fn(context: *mut c_void, assignments: *const FfiSourceSlotAssignment, count: usize),
+    /// Installs the complete custom-property cascade before unresolved longhands are resolved.
+    pub set_custom_properties: unsafe extern "C" fn(
+        context: *mut c_void,
+        properties: *const FfiCascadedCustomProperty,
+        count: usize,
+    ) -> *const c_void,
+}
+
+#[repr(C)]
+pub struct FfiResolvedStyleValue {
+    pub shell: *const c_void,
+    pub data: *const c_void,
 }
 
 /// Runs the whole cascade for one element in css-cascade-5 origin order over
@@ -541,6 +601,8 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
     block_count: usize,
     author_context_count: u32,
     has_pseudo_element: bool,
+    cascade_custom_properties: bool,
+    custom_property_registry: *const c_void,
     unset_shell: *const c_void,
     unset_data: *const c_void,
     callbacks: *const FfiBulkCascadeCallbacks,
@@ -580,6 +642,100 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
             }
         }
 
+        let mut application_order: Vec<(usize, bool, bool)> = Vec::new();
+
+        // Normal user agent, user, and presentational hint declarations.
+        for &index in &user_agent_blocks {
+            application_order.push((index, false, false));
+        }
+        for &index in &user_blocks {
+            application_order.push((index, false, false));
+        }
+        for &index in &presentational_hint_blocks {
+            application_order.push((index, false, false));
+        }
+
+        // Normal author declarations, with inner contexts first so outer contexts win,
+        // layers in declaration order, and inline style after its context's layers.
+        for context_index in (0..author_context_count as usize).rev() {
+            for &index in &author_layer_blocks[context_index] {
+                application_order.push((index, false, true));
+            }
+            if let Some(index) = author_inline_blocks[context_index] {
+                application_order.push((index, false, false));
+            }
+        }
+
+        // Important author declarations, with outer contexts first so inner contexts
+        // win and layers reversed; layer names do not apply in the important pass.
+        for context_index in 0..author_context_count as usize {
+            let layer_blocks = &author_layer_blocks[context_index];
+            let mut boundaries: Vec<(u32, usize, usize)> = Vec::new();
+            for (position, &index) in layer_blocks.iter().enumerate() {
+                let layer = blocks[index].layer_index;
+                match boundaries.last_mut() {
+                    Some((last_layer, _, end)) if *last_layer == layer => *end = position + 1,
+                    _ => boundaries.push((layer, position, position + 1)),
+                }
+            }
+            for &(_, start, end) in boundaries.iter().rev() {
+                for &index in &layer_blocks[start..end] {
+                    application_order.push((index, true, false));
+                }
+            }
+            if let Some(index) = author_inline_blocks[context_index] {
+                application_order.push((index, true, false));
+            }
+        }
+
+        // Important user and user agent declarations.
+        for &index in &user_blocks {
+            application_order.push((index, true, false));
+        }
+        for &index in &user_agent_blocks {
+            application_order.push((index, true, false));
+        }
+
+        let mut custom_property_store = std::ptr::null();
+        if cascade_custom_properties {
+            let mut custom_property_indices = HashMap::new();
+            let mut custom_properties: Vec<FfiCascadedCustomProperty> = Vec::new();
+            for &(block_index, important, _) in &application_order {
+                let block = &blocks[block_index];
+                let declarations = if block.custom_property_declaration_count == 0 {
+                    &[]
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            block.custom_property_declarations,
+                            block.custom_property_declaration_count,
+                        )
+                    }
+                };
+                for declaration in declarations {
+                    if declaration.important != important || declaration.is_revert_layer {
+                        continue;
+                    }
+                    let property = FfiCascadedCustomProperty {
+                        name_raw: declaration.name_raw,
+                        important,
+                        shell: declaration.shell,
+                    };
+                    if let Some(index) = custom_property_indices.get(&declaration.name_raw) {
+                        custom_properties[*index] = property;
+                    } else {
+                        custom_property_indices.insert(declaration.name_raw, custom_properties.len());
+                        custom_properties.push(property);
+                    }
+                }
+            }
+            crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CascadeCustomPropertyBatchCallback);
+            unsafe {
+                custom_property_store =
+                    (callbacks.set_custom_properties)(context, custom_properties.as_ptr(), custom_properties.len());
+            }
+        }
+
         let mut source_slot_assignments: Vec<FfiSourceSlotAssignment> = Vec::new();
 
         let mut apply = |block_index: usize, important: bool, use_layer_name: bool| {
@@ -611,6 +767,12 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
                     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CascadeResolveUnresolvedCallback);
                     unsafe { (callbacks.resolve_unresolved)(context, property_id, shell) }
                 },
+                &|property_id, source| {
+                    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CascadeParseSubstitutedCallback);
+                    unsafe { (callbacks.parse_substituted)(context, property_id, source.as_ptr(), source.len()) }
+                },
+                custom_property_store,
+                custom_property_registry,
                 &|shell| {
                     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::CascadeDataOfCallback);
                     unsafe { (callbacks.data_of)(context, shell) }
@@ -628,56 +790,8 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
             );
         };
 
-        // Normal user agent, user, and presentational hint declarations.
-        for &index in &user_agent_blocks {
-            apply(index, false, false);
-        }
-        for &index in &user_blocks {
-            apply(index, false, false);
-        }
-        for &index in &presentational_hint_blocks {
-            apply(index, false, false);
-        }
-
-        // Normal author declarations, with inner contexts first so outer contexts win,
-        // layers in declaration order, and inline style after its context's layers.
-        for context_index in (0..author_context_count as usize).rev() {
-            for &index in &author_layer_blocks[context_index] {
-                apply(index, false, true);
-            }
-            if let Some(index) = author_inline_blocks[context_index] {
-                apply(index, false, false);
-            }
-        }
-
-        // Important author declarations, with outer contexts first so inner contexts
-        // win and layers reversed; layer names do not apply in the important pass.
-        for context_index in 0..author_context_count as usize {
-            let layer_blocks = &author_layer_blocks[context_index];
-            let mut boundaries: Vec<(u32, usize, usize)> = Vec::new();
-            for (position, &index) in layer_blocks.iter().enumerate() {
-                let layer = blocks[index].layer_index;
-                match boundaries.last_mut() {
-                    Some((last_layer, _, end)) if *last_layer == layer => *end = position + 1,
-                    _ => boundaries.push((layer, position, position + 1)),
-                }
-            }
-            for &(_, start, end) in boundaries.iter().rev() {
-                for &index in &layer_blocks[start..end] {
-                    apply(index, true, false);
-                }
-            }
-            if let Some(index) = author_inline_blocks[context_index] {
-                apply(index, true, false);
-            }
-        }
-
-        // Important user and user agent declarations.
-        for &index in &user_blocks {
-            apply(index, true, false);
-        }
-        for &index in &user_agent_blocks {
-            apply(index, true, false);
+        for &(block_index, important, use_layer_name) in &application_order {
+            apply(block_index, important, use_layer_name);
         }
 
         if !source_slot_assignments.is_empty() {

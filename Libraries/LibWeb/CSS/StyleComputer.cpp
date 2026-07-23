@@ -96,6 +96,7 @@
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
+#include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/Layout/Node.h>
@@ -874,39 +875,6 @@ void StyleComputer::for_each_property_expanding_shorthands(PropertyID property_i
             expansion_context.set_longhand_property(static_cast<PropertyID>(property_id), *static_cast<StyleValue const*>(shell)); },
     };
     ComputedValuesFFI::rust_for_each_property_expanding_shorthands(&callbacks, to_underlying(property_id), &value, value.rust_style_value_data());
-}
-
-static void cascade_custom_properties(DOM::AbstractElement abstract_element, Vector<StyleComputer::ScopedMatchingRule> const& matching_rules, OrderedHashMap<Utf16FlyString, StyleProperty>& custom_properties, Important important, bool include_inline_style)
-{
-    size_t needed_capacity = 0;
-    for (auto const& matching_rule : matching_rules)
-        needed_capacity += matching_rule.rule->declaration().custom_properties().size();
-
-    auto const inline_style = abstract_element.inline_style();
-    if (include_inline_style && inline_style)
-        needed_capacity += inline_style->custom_properties().size();
-
-    custom_properties.ensure_capacity(custom_properties.size() + needed_capacity);
-
-    for (auto const& matching_rule : matching_rules) {
-        for (auto const& it : matching_rule.rule->declaration().custom_properties()) {
-            if (it.value.important != important)
-                continue;
-            auto style_value = it.value.value;
-            if (style_value->is_revert_layer())
-                continue;
-
-            custom_properties.set(it.key, it.value);
-        }
-    }
-
-    if (include_inline_style && inline_style) {
-        for (auto const& it : inline_style->custom_properties()) {
-            if (it.value.important != important)
-                continue;
-            custom_properties.set(it.key, it.value);
-        }
-    }
 }
 
 static RefPtr<CustomPropertyData const> inheritable_custom_property_data(DOM::AbstractElement abstract_element)
@@ -2228,13 +2196,9 @@ JsonArray StyleComputer::collect_devtools_applied_style_rules(DOM::AbstractEleme
 
 // https://www.w3.org/TR/css-cascade/#cascading
 // https://drafts.csswg.org/css-cascade-5/#layering
-NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::AbstractElement abstract_element, bool did_match_any_pseudo_element_rules, ComputeStyleMode mode, MatchingRuleSet const& matching_rule_set, IncludeInlineStyle include_inline_style) const
+NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::AbstractElement abstract_element, MatchingRuleSet const& matching_rule_set, IncludeInlineStyle include_inline_style) const
 {
     auto cascaded_properties = CascadedProperties::create();
-    if (mode == ComputeStyleMode::CreatePseudoElementStyleIfNeeded) {
-        if (!did_match_any_pseudo_element_rules)
-            return cascaded_properties;
-    }
 
     auto element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.element().root());
 
@@ -2247,15 +2211,18 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
         GC::Ptr<DOM::ShadowRoot const> source_shadow_root;
     };
     Vector<ComputedValuesFFI::FfiCascadeDeclaration> all_declarations;
+    Vector<ComputedValuesFFI::FfiCustomPropertyDeclaration> all_custom_property_declarations;
     struct PendingBlock {
         ComputedValuesFFI::FfiCascadeBlock block;
         size_t declarations_offset { 0 };
+        size_t custom_property_declarations_offset { 0 };
     };
     Vector<PendingBlock> pending_blocks;
     Vector<BlockSource> block_sources;
     Vector<FlatPtr> leaked_layer_names;
+    Vector<FlatPtr> leaked_custom_property_names;
 
-    auto add_block = [&](ReadonlySpan<StyleProperty> properties, CascadeOrigin origin, u32 author_context_index, u32 layer_index, bool is_inline_style, bool bypass_pseudo_element_property_whitelist, Optional<Utf16FlyString> const& layer_name, GC::Ptr<CSSStyleDeclaration const> source, GC::Ptr<DOM::ShadowRoot const> source_shadow_root) {
+    auto add_block = [&](ReadonlySpan<StyleProperty> properties, OrderedHashMap<Utf16FlyString, StyleProperty> const* custom_properties, CascadeOrigin origin, u32 author_context_index, u32 layer_index, bool is_inline_style, bool bypass_pseudo_element_property_whitelist, Optional<Utf16FlyString> const& layer_name, GC::Ptr<CSSStyleDeclaration const> source, GC::Ptr<DOM::ShadowRoot const> source_shadow_root) {
         auto declarations_offset = all_declarations.size();
         all_declarations.ensure_capacity(all_declarations.size() + properties.size());
         for (auto const& property : properties) {
@@ -2265,6 +2232,20 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
                 .shell = property.value.ptr(),
                 .data = property.value->rust_style_value_data(),
             });
+        }
+        auto custom_property_declarations_offset = all_custom_property_declarations.size();
+        if (custom_properties) {
+            all_custom_property_declarations.ensure_capacity(all_custom_property_declarations.size() + custom_properties->size());
+            for (auto const& [name, property] : *custom_properties) {
+                auto name_raw = name.to_raw_leaked();
+                leaked_custom_property_names.append(name_raw);
+                all_custom_property_declarations.unchecked_append({
+                    .name_raw = name_raw,
+                    .important = property.important == Important::Yes,
+                    .is_revert_layer = property.value->is_revert_layer(),
+                    .shell = property.value.ptr(),
+                });
+            }
         }
         FlatPtr layer_name_raw = 0;
         if (layer_name.has_value()) {
@@ -2284,19 +2265,22 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
                 .source_id = static_cast<u32>(block_sources.size()),
                 .declarations = nullptr,
                 .declaration_count = properties.size(),
+                .custom_property_declarations = nullptr,
+                .custom_property_declaration_count = custom_properties ? custom_properties->size() : 0,
             },
             .declarations_offset = declarations_offset,
+            .custom_property_declarations_offset = custom_property_declarations_offset,
         });
         block_sources.append({ source, source_shadow_root });
     };
 
     for (auto const& match : matching_rule_set.user_agent_rules) {
         auto const& declaration = match.rule->declaration();
-        add_block(declaration.properties(), CascadeOrigin::UserAgent, 0, 0, false, false, {}, &declaration, match.shadow_root);
+        add_block(declaration.properties(), nullptr, CascadeOrigin::UserAgent, 0, 0, false, false, {}, &declaration, match.shadow_root);
     }
     for (auto const& match : matching_rule_set.user_rules) {
         auto const& declaration = match.rule->declaration();
-        add_block(declaration.properties(), CascadeOrigin::User, 0, 0, false, false, {}, &declaration, match.shadow_root);
+        add_block(declaration.properties(), nullptr, CascadeOrigin::User, 0, 0, false, false, {}, &declaration, match.shadow_root);
     }
 
     // Author presentational hints
@@ -2317,7 +2301,7 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
             collect_dimension_attribute(presentational_hint_properties, dimension_source, HTML::AttributeNames::height, CSS::PropertyID::Height);
         }
         if (!presentational_hint_properties.is_empty())
-            add_block(presentational_hint_properties, CascadeOrigin::AuthorPresentationalHint, 0, 0, false, false, {}, nullptr, nullptr);
+            add_block(presentational_hint_properties, nullptr, CascadeOrigin::AuthorPresentationalHint, 0, 0, false, false, {}, nullptr, nullptr);
     }
 
     for (u32 context_index = 0; context_index < matching_rule_set.author_contexts.size(); ++context_index) {
@@ -2329,7 +2313,7 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
                 Optional<Utf16FlyString> layer_name;
                 if (!layer.qualified_layer_name.is_empty())
                     layer_name = layer.qualified_layer_name;
-                add_block(declaration.properties(), CascadeOrigin::Author, context_index, layer_index, false, false, layer_name, &declaration, match.shadow_root);
+                add_block(declaration.properties(), &declaration.custom_properties(), CascadeOrigin::Author, context_index, layer_index, false, false, layer_name, &declaration, match.shadow_root);
             }
         }
         if (include_inline_style == IncludeInlineStyle::Yes && author_context.shadow_root == element_context_shadow_root) {
@@ -2338,7 +2322,7 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
             //     properties (e.g. input::placeholder has height set); authors can't set inline style on
             //     pseudo-elements so this doesn't cause any spec compliance issues.
             if (auto const inline_style = abstract_element.inline_style())
-                add_block(inline_style->properties(), CascadeOrigin::Author, context_index, 0, true, true, {}, inline_style, nullptr);
+                add_block(inline_style->properties(), &inline_style->custom_properties(), CascadeOrigin::Author, context_index, 0, true, true, {}, inline_style, nullptr);
         }
     }
 
@@ -2346,6 +2330,8 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
     blocks.ensure_capacity(pending_blocks.size());
     for (auto& pending : pending_blocks) {
         pending.block.declarations = all_declarations.data() + pending.declarations_offset;
+        if (pending.block.custom_property_declaration_count > 0)
+            pending.block.custom_property_declarations = all_custom_property_declarations.data() + pending.custom_property_declarations_offset;
         blocks.unchecked_append(pending.block);
     }
 
@@ -2365,7 +2351,7 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
 
     ComputedValuesFFI::FfiBulkCascadeCallbacks const callbacks {
         .context = &bulk_context,
-        .resolve_unresolved = [](void* context, u16 property_id, void const* shell) -> void const* {
+        .resolve_unresolved = [](void* context, u16 property_id, void const* shell) -> ComputedValuesFFI::FfiResolvedStyleValue {
             auto& bulk_context = *static_cast<BulkCascadeContext*>(context);
             auto resolved = Parser::Parser::resolve_unresolved_style_value(
                 Parser::ParsingParams { bulk_context.abstract_element.document() },
@@ -2373,9 +2359,29 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
                 {},
                 PropertyNameAndID::from_id(static_cast<PropertyID>(property_id)),
                 static_cast<StyleValue const*>(shell)->as_unresolved());
-            auto const* pointer = resolved.ptr();
+            ComputedValuesFFI::FfiResolvedStyleValue result {
+                .shell = resolved.ptr(),
+                .data = resolved->rust_style_value_data(),
+            };
             bulk_context.pinned_values.append(move(resolved));
-            return pointer;
+            return result;
+        },
+        .parse_substituted = [](void* context, u16 property_id, u8 const* source, size_t source_length) -> ComputedValuesFFI::FfiResolvedStyleValue {
+            auto& bulk_context = *static_cast<BulkCascadeContext*>(context);
+            bulk_context.abstract_element.element().set_style_uses_var_css_function();
+            auto parsed = parse_css_value(
+                Parser::ParsingParams { bulk_context.abstract_element.document() },
+                StringView { reinterpret_cast<char const*>(source), source_length },
+                static_cast<PropertyID>(property_id));
+            NonnullRefPtr<StyleValue const> resolved = parsed
+                ? parsed.release_nonnull()
+                : GuaranteedInvalidStyleValue::create();
+            ComputedValuesFFI::FfiResolvedStyleValue result {
+                .shell = resolved.ptr(),
+                .data = resolved->rust_style_value_data(),
+            };
+            bulk_context.pinned_values.append(move(resolved));
+            return result;
         },
         .data_of = [](void*, void const* shell) -> void const* {
             return static_cast<StyleValue const*>(shell)->rust_style_value_data();
@@ -2397,7 +2403,52 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
                 auto const& source = bulk_context.block_sources[assignments[i].source_id];
                 bulk_context.cascaded_properties.assign_source_slot(assignments[i].slot, source.source, source.source_shadow_root);
             } },
+        .set_custom_properties = [](void* context, ComputedValuesFFI::FfiCascadedCustomProperty const* properties, size_t count) -> void const* {
+            auto& bulk_context = *static_cast<BulkCascadeContext*>(context);
+            OrderedHashMap<Utf16FlyString, StyleProperty> cascaded_all;
+            cascaded_all.ensure_capacity(count);
+            for (size_t i = 0; i < count; ++i) {
+                auto const& property = properties[i];
+                cascaded_all.set(
+                    Utf16FlyString::from_raw(property.name_raw),
+                    StyleProperty {
+                        .important = property.important ? Important::Yes : Important::No,
+                        .property_id = PropertyID::Custom,
+                        .value = *static_cast<StyleValue const*>(property.shell),
+                    });
+            }
+
+            RefPtr<CustomPropertyData const> parent_data;
+            auto inherit_from = bulk_context.abstract_element.element_to_inherit_style_from();
+            if (inherit_from.has_value())
+                parent_data = inheritable_custom_property_data(*inherit_from);
+
+            OrderedHashMap<Utf16FlyString, StyleProperty> cascaded_own;
+            for (auto& [name, property] : cascaded_all) {
+                if (parent_data) {
+                    auto const* parent_property = parent_data->get(name);
+                    if (parent_property && parent_property->value.ptr() == property.value.ptr())
+                        continue;
+                }
+                cascaded_own.set(name, move(property));
+            }
+
+            if (cascaded_own.is_empty() && parent_data) {
+                bulk_context.abstract_element.set_custom_property_data(parent_data);
+            } else if (cascaded_own.is_empty()) {
+                bulk_context.abstract_element.set_custom_property_data(nullptr);
+            } else {
+                bulk_context.abstract_element.set_custom_property_data(
+                    CustomPropertyData::create(move(cascaded_own), move(parent_data)));
+            }
+
+            auto custom_property_data = bulk_context.abstract_element.custom_property_data();
+            return custom_property_data ? custom_property_data->rust_store() : nullptr;
+        },
     };
+
+    auto cascade_custom_properties = !abstract_element.pseudo_element().has_value()
+        || pseudo_element_supports_property(*abstract_element.pseudo_element(), PropertyID::Custom);
 
     ComputedValuesFFI::rust_cascade_matched_blocks(
         cascaded_properties->rust_store(),
@@ -2405,12 +2456,16 @@ NonnullRefPtr<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::Ab
         blocks.size(),
         static_cast<u32>(matching_rule_set.author_contexts.size()),
         abstract_element.pseudo_element().has_value(),
+        cascade_custom_properties,
+        abstract_element.document().rust_custom_property_registry(),
         unset_value.ptr(),
         unset_value->rust_style_value_data(),
         &callbacks);
 
     for (auto layer_name_raw : leaked_layer_names)
         Utf16FlyString::unref_raw(layer_name_raw);
+    for (auto custom_property_name_raw : leaked_custom_property_names)
+        Utf16FlyString::unref_raw(custom_property_name_raw);
 
     // Transition declarations [css-transitions-1]
     // Note that we have to do these after finishing computing the style,
@@ -2746,33 +2801,38 @@ static Display from_ffi_display(ComputedValuesFFI::FfiDisplay const& display)
     case Display::Type::Internal:
         return Display { static_cast<DisplayInternal>(display.internal) };
     case Display::Type::Box:
-    default:
-        // The transformation never produces a box-type display.
-        VERIFY_NOT_REACHED();
+        return Display { static_cast<DisplayBox>(display.box_value) };
     }
+    VERIFY_NOT_REACHED();
 }
 
-// https://drafts.csswg.org/css-display/#transformations
-void StyleComputer::transform_box_type_if_needed(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element) const
+static ComputedValuesFFI::FfiDisplay decode_ffi_display(u32 encoded)
 {
-    auto& style = builder.style();
-    auto display = style.display();
-
-    builder.set_display_before_box_type_transformation(display);
-
-    // The css-display-3 transformation rules live in the Rust style computation core; this
-    // wrapper marshals the element facts they depend on and applies the result.
-    auto& element = abstract_element.element();
-    bool is_mathml_element = false;
-    bool is_mathml_mtable = false;
-    bool is_mathml_mtr = false;
-    bool is_mathml_mtd = false;
-    if (display.is_math_inside()) {
-        is_mathml_element = element.namespace_uri() == Namespace::MathML;
-        is_mathml_mtable = element.tag_name().equals_ignoring_ascii_case("mtable"sv);
-        is_mathml_mtr = element.tag_name().equals_ignoring_ascii_case("mtr"sv);
-        is_mathml_mtd = element.tag_name().equals_ignoring_ascii_case("mtd"sv);
+    ComputedValuesFFI::FfiDisplay display {};
+    display.tag = encoded & 0xff;
+    auto first = static_cast<u8>((encoded >> 8) & 0xff);
+    auto second = static_cast<u8>((encoded >> 16) & 0xff);
+    auto third = static_cast<u8>((encoded >> 24) & 0xff);
+    switch (static_cast<Display::Type>(display.tag)) {
+    case Display::Type::OutsideAndInside:
+        display.outside = first;
+        display.inside = second;
+        display.list_item = third != 0;
+        break;
+    case Display::Type::Internal:
+        display.internal = first;
+        break;
+    case Display::Type::Box:
+        display.box_value = first;
+        break;
     }
+    return display;
+}
+
+static ComputedValuesFFI::FfiBoxTypeTransformationInput make_box_type_transformation_input(
+    DOM::AbstractElement abstract_element, Display display, Keyword position, Keyword float_value)
+{
+    auto& element = abstract_element.element();
 
     // NOTE: If we're computing style for a pseudo-element, the effective parent will be the originating element itself, not its parent.
     auto parent = abstract_element.element_to_inherit_style_from();
@@ -2782,26 +2842,105 @@ void StyleComputer::transform_box_type_if_needed(ComputedProperties::Builder& bu
         parent = parent->element_to_inherit_style_from();
 
     bool has_parent_display = parent.has_value() && parent->computed_values();
+    bool is_html_element = element.namespace_uri() == Namespace::HTML;
+    bool should_adjust_element = !abstract_element.pseudo_element().has_value();
+    auto local_name = element.local_name();
 
-    ComputedValuesFFI::FfiBoxTypeTransformationInput const input {
+    bool input_allows_adjustment = false;
+    bool input_is_single_line = false;
+    if (is<HTML::HTMLInputElement>(element)) {
+        auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
+        input_allows_adjustment = !first_is_one_of(
+            input.type_state(),
+            HTML::HTMLInputElement::TypeAttributeState::Hidden,
+            HTML::HTMLInputElement::TypeAttributeState::SubmitButton,
+            HTML::HTMLInputElement::TypeAttributeState::Button,
+            HTML::HTMLInputElement::TypeAttributeState::ResetButton,
+            HTML::HTMLInputElement::TypeAttributeState::ImageButton,
+            HTML::HTMLInputElement::TypeAttributeState::Checkbox,
+            HTML::HTMLInputElement::TypeAttributeState::RadioButton);
+        input_is_single_line = input_allows_adjustment && input.is_single_line();
+    }
+
+    bool force_position_static = false;
+    if (element.namespace_uri() == Namespace::SVG) {
+        force_position_static = true;
+        if (local_name == "svg"sv) {
+            force_position_static = false;
+            for (auto ancestor = element.parent_element(); ancestor; ancestor = ancestor->parent_element()) {
+                if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "foreignObject"sv)
+                    break;
+                if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "svg"sv) {
+                    force_position_static = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    bool force_symbol_display_inline = false;
+    if (element.namespace_uri() == Namespace::SVG && local_name == "symbol"sv) {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(element.parent())) {
+            auto* host = shadow_root->host();
+            force_symbol_display_inline = host->namespace_uri() == Namespace::SVG && host->local_name() == "use"sv;
+        }
+    }
+
+    return {
         .display = to_ffi_display(display),
-        .position = to_underlying(style.property(PropertyID::Position).to_keyword()),
-        .float_value = to_underlying(style.property(PropertyID::Float).to_keyword()),
+        .position = to_underlying(position),
+        .float_value = to_underlying(float_value),
         .is_br_element = !abstract_element.pseudo_element().has_value() && is<HTML::HTMLBRElement>(element),
         .is_document_element = element.is_document_element(),
-        .is_mathml_element = is_mathml_element,
-        .is_mathml_mtable = is_mathml_mtable,
-        .is_mathml_mtr = is_mathml_mtr,
-        .is_mathml_mtd = is_mathml_mtd,
+        .is_mathml_element = element.namespace_uri() == Namespace::MathML,
+        .is_mathml_mtable = element.tag_name().equals_ignoring_ascii_case("mtable"sv),
+        .is_mathml_mtr = element.tag_name().equals_ignoring_ascii_case("mtr"sv),
+        .is_mathml_mtd = element.tag_name().equals_ignoring_ascii_case("mtd"sv),
         .has_parent_display = has_parent_display,
         .parent_display = has_parent_display ? to_ffi_display(parent->computed_values()->display()) : ComputedValuesFFI::FfiDisplay {},
+        .is_wbr_element = should_adjust_element && is_html_element && local_name == HTML::TagNames::wbr,
+        .disallow_display_contents = should_adjust_element && (input_allows_adjustment || (is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::canvas, HTML::TagNames::object, HTML::TagNames::iframe, HTML::TagNames::progress, HTML::TagNames::embed, HTML::TagNames::frame, HTML::TagNames::meter, HTML::TagNames::frameset, HTML::TagNames::img))),
+        .rewrite_inline_flow = should_adjust_element && (input_allows_adjustment || (is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::select))),
+        .is_button_element = should_adjust_element && is_html_element && local_name == HTML::TagNames::button,
+        .force_line_height_normal = should_adjust_element && is_html_element && local_name == HTML::TagNames::select,
+        .check_input_line_height = should_adjust_element && input_is_single_line,
+        .hide_audio_without_controls = should_adjust_element && is_html_element && local_name == HTML::TagNames::audio && !element.has_attribute(HTML::AttributeNames::controls),
+        .is_table_element = should_adjust_element && is_html_element && local_name == HTML::TagNames::table,
+        .force_position_static = should_adjust_element && force_position_static,
+        .force_symbol_display_inline = should_adjust_element && force_symbol_display_inline,
     };
+}
 
-    auto transformation = ComputedValuesFFI::rust_transform_box_type(&input);
+static void apply_box_type_transformation(ComputedProperties::Builder& builder, ComputedValuesFFI::FfiDisplay const& display_before, ComputedValuesFFI::FfiBoxTypeTransformation const& transformation)
+{
+    builder.set_display_before_box_type_transformation(from_ffi_display(display_before));
     if (transformation.set_float_none)
         builder.set_property(PropertyID::Float, KeywordStyleValue::create(Keyword::None));
     if (transformation.changed_display)
         builder.set_property(PropertyID::Display, DisplayStyleValue::create(from_ffi_display(transformation.display)));
+}
+
+static ComputedValuesFFI::FfiInputLineHeightMetrics input_line_height_metrics(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element, bool should_measure)
+{
+    ComputedValuesFFI::FfiInputLineHeightMetrics line_height_metrics {};
+    if (should_measure) {
+        line_height_metrics.current_line_height = builder.line_height(abstract_element.element().document().font_computer()).to_double();
+        line_height_metrics.minimum_line_height = ComputedProperties::normal_line_height(builder.first_available_computed_font(abstract_element.element().document().font_computer())->pixel_metrics()).to_double();
+    }
+    return line_height_metrics;
+}
+
+// https://drafts.csswg.org/css-display/#transformations
+void StyleComputer::transform_box_type_if_needed(ComputedProperties::Builder& builder, DOM::AbstractElement abstract_element) const
+{
+    auto& style = builder.style();
+    auto input = make_box_type_transformation_input(
+        abstract_element,
+        style.display(),
+        style.property(PropertyID::Position).to_keyword(),
+        style.property(PropertyID::Float).to_keyword());
+    auto transformation = ComputedValuesFFI::rust_transform_box_type(&input);
+    apply_box_type_transformation(builder, input.display, transformation);
 }
 
 NonnullRefPtr<ComputedValues const> StyleComputer::create_document_style() const
@@ -3019,60 +3158,7 @@ RefPtr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractElemen
 
     auto old_custom_property_data = abstract_element.custom_property_data();
 
-    // Resolve all the CSS custom properties ("variables") for this element:
-    if (!abstract_element.pseudo_element().has_value() || pseudo_element_supports_property(*abstract_element.pseudo_element(), PropertyID::Custom)) {
-        OrderedHashMap<Utf16FlyString, StyleProperty> cascaded_all;
-
-        auto element_context_shadow_root = as_if<DOM::ShadowRoot>(abstract_element.element().root());
-        auto cascade_inline_style = [&](Important important) {
-            if (include_inline_style == IncludeInlineStyle::No)
-                return;
-            cascade_custom_properties(abstract_element, {}, cascaded_all, important, true);
-        };
-
-        for (auto const& context : matching_rule_set.author_contexts.in_reverse()) {
-            for (auto const& layer : context.author_rules)
-                cascade_custom_properties(abstract_element, layer.rules, cascaded_all, Important::No, false);
-            if (context.shadow_root == element_context_shadow_root)
-                cascade_inline_style(Important::No);
-        }
-
-        for (auto const& context : matching_rule_set.author_contexts) {
-            for (auto const& layer : context.author_rules.in_reverse())
-                cascade_custom_properties(abstract_element, layer.rules, cascaded_all, Important::Yes, false);
-            if (context.shadow_root == element_context_shadow_root)
-                cascade_inline_style(Important::Yes);
-        }
-
-        RefPtr<CustomPropertyData const> parent_data;
-        auto inherit_from = abstract_element.element_to_inherit_style_from();
-        if (inherit_from.has_value())
-            parent_data = inheritable_custom_property_data(*inherit_from);
-
-        // Build own_values with only properties that differ from the parent.
-        // We build a fresh map instead of removing from cascaded_all,
-        // because removing entries doesn't shrink the bucket array.
-        OrderedHashMap<Utf16FlyString, StyleProperty> cascaded_own;
-        for (auto& [name, property] : cascaded_all) {
-            if (parent_data) {
-                auto const* parent_property = parent_data->get(name);
-                if (parent_property && parent_property->value.ptr() == property.value.ptr())
-                    continue;
-            }
-            cascaded_own.set(name, move(property));
-        }
-
-        if (cascaded_own.is_empty() && parent_data) {
-            abstract_element.set_custom_property_data(parent_data);
-        } else if (cascaded_own.is_empty() && !parent_data) {
-            abstract_element.set_custom_property_data(nullptr);
-        } else {
-            abstract_element.set_custom_property_data(
-                CustomPropertyData::create(move(cascaded_own), move(parent_data)));
-        }
-    }
-
-    auto cascaded_properties = compute_cascaded_values(abstract_element, did_match_any_pseudo_element_rules, mode, matching_rule_set, include_inline_style);
+    auto cascaded_properties = compute_cascaded_values(abstract_element, matching_rule_set, include_inline_style);
 
     if (mode == ComputeStyleMode::CreatePseudoElementStyleIfNeeded) {
         // Bail if no pseudo-element would be generated due to...
@@ -3307,6 +3393,21 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
 
     auto const device_pixels_per_css_pixel = m_document->page().client().device_pixels_per_css_pixel();
 
+    Vector<u8> document_supported_color_scheme_codes;
+    auto document_supported_color_schemes = document().supported_color_schemes();
+    if (document_supported_color_schemes.has_value()) {
+        document_supported_color_scheme_codes.ensure_capacity(document_supported_color_schemes->size());
+        for (auto const& scheme : *document_supported_color_schemes)
+            document_supported_color_scheme_codes.unchecked_append(to_underlying(preferred_color_scheme_from_string(scheme)));
+    }
+    ComputedValuesFFI::FfiEffectiveColorSchemeInput const effective_color_scheme_input {
+        .preferred_color_scheme = static_cast<u8>(to_underlying(document().page().preferred_color_scheme())),
+        .has_document_supported_schemes = document_supported_color_schemes.has_value(),
+        .document_supported_scheme_codes = document_supported_color_scheme_codes.data(),
+        .document_supported_scheme_count = document_supported_color_scheme_codes.size(),
+    };
+    builder.clear_effective_color_scheme();
+
     auto const compute_property = [&](PropertyID property_id, NonnullRefPtr<StyleValue const> const& style_value, bool& depends_on_viewport_metrics) {
         auto const& computation_context = get_computation_context_for_property(property_id, computed_style, abstract_element);
         computation_context.reset_viewport_metric_dependency_tracking();
@@ -3345,6 +3446,8 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
         };
     }
 
+    bool animation_values_applied = false;
+
     // Copies the parent's animated value when a longhand inherits, as its store is
     // applied, so later properties' computation contexts observe the animated value.
     // FIXME: Do we need to recompute animated inherited values?
@@ -3360,6 +3463,7 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
                     ? AnimatedPropertyResultOfTransition::Yes
                     : AnimatedPropertyResultOfTransition::No,
                 ComputedProperties::Inherited::Yes);
+            animation_values_applied = true;
         }
     };
 
@@ -3416,6 +3520,12 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
             case ComputedValuesFFI::COMPUTED_KIND_FONT_STYLE:
                 builder.set_property_without_modifying_flags(property_id, FontStyleStyleValue::create(static_cast<FontStyleKeyword>(entry.value)));
                 break;
+            case ComputedValuesFFI::COMPUTED_KIND_KEYWORD:
+                builder.set_property_without_modifying_flags(property_id, KeywordStyleValue::create(static_cast<Keyword>(static_cast<u16>(entry.value))));
+                break;
+            case ComputedValuesFFI::COMPUTED_KIND_DISPLAY:
+                builder.set_property_without_modifying_flags(property_id, DisplayStyleValue::create(from_ffi_display(decode_ffi_display(static_cast<u32>(entry.value)))));
+                break;
             case ComputedValuesFFI::COMPUTED_KIND_SUPERELLIPSE: {
                 // NB: The round value is cached since it is the initial value of the corner-*-shape properties.
                 if (entry.value == 1) {
@@ -3430,6 +3540,10 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
                 builder.set_property_without_modifying_flags(property_id, value);
                 break;
             }
+            if (property_id == PropertyID::ColorScheme && !builder.has_effective_color_scheme()) {
+                auto effective_color_scheme = ComputedValuesFFI::rust_resolve_effective_color_scheme(builder.property(PropertyID::ColorScheme).rust_style_value_data(), &effective_color_scheme_input);
+                builder.set_effective_color_scheme(static_cast<PreferredColorScheme>(effective_color_scheme));
+            }
         }
     };
 
@@ -3437,18 +3551,34 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
     // iterates the longhands in computation order, resolves logical pairing through its
     // mapping tables, and selects the cascaded, inherited or initial value natively.
     struct LonghandLoopContext {
+        ComputedProperties::Builder& builder;
         decltype(store_computed_batch)& store_computed_batch_callback;
         decltype(fetch_length_resolution_context)& fetch_length_resolution_context_callback;
         decltype(get_logical_alias_mapping_context)& get_logical_alias_mapping_context_callback;
         DOM::AbstractElement abstract_element;
+        Optional<ComputedValuesFFI::FfiDisplay> display_before_adjustments;
+        Optional<Keyword> float_before_adjustments;
+        Optional<Keyword> overflow_x_before_adjustments;
+        Optional<Keyword> overflow_y_before_adjustments;
+        Optional<Keyword> text_align_before_adjustments;
+        Optional<Keyword> position_before_adjustments;
+        RefPtr<StyleValue const> line_height_before_adjustments;
         // Pins every parent value handed out by the explicit-inherit fetch until the end
         // of the drive; the driver may queue the shells in deferred store batches.
         Vector<NonnullRefPtr<StyleValue const>> pinned_parent_values;
     } loop_context {
+        .builder = builder,
         .store_computed_batch_callback = store_computed_batch,
         .fetch_length_resolution_context_callback = fetch_length_resolution_context,
         .get_logical_alias_mapping_context_callback = get_logical_alias_mapping_context,
         .abstract_element = abstract_element,
+        .display_before_adjustments = {},
+        .float_before_adjustments = {},
+        .overflow_x_before_adjustments = {},
+        .overflow_y_before_adjustments = {},
+        .text_align_before_adjustments = {},
+        .position_before_adjustments = {},
+        .line_height_before_adjustments = {},
         .pinned_parent_values = {},
     };
 
@@ -3457,6 +3587,20 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
         .store_computed_batch = [](void* context, ComputedValuesFFI::FfiComputedStoreEntry const* entries, size_t count) {
             auto& loop_context = *static_cast<LonghandLoopContext*>(context);
             loop_context.store_computed_batch_callback(entries, count); },
+        .store_effective_color_scheme = [](void* context, u8 color_scheme) {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.builder.set_effective_color_scheme(static_cast<PreferredColorScheme>(color_scheme)); },
+        .prepare_post_compute_adjustments = [](void* context, ComputedValuesFFI::FfiDisplay const* display_before, u16 float_before, u16 overflow_x_before, u16 overflow_y_before, u16 text_align_before, u16 position_before, bool check_input_line_height) -> ComputedValuesFFI::FfiInputLineHeightMetrics {
+            auto& loop_context = *static_cast<LonghandLoopContext*>(context);
+            loop_context.display_before_adjustments = *display_before;
+            loop_context.float_before_adjustments = static_cast<Keyword>(float_before);
+            loop_context.overflow_x_before_adjustments = static_cast<Keyword>(overflow_x_before);
+            loop_context.overflow_y_before_adjustments = static_cast<Keyword>(overflow_y_before);
+            loop_context.text_align_before_adjustments = static_cast<Keyword>(text_align_before);
+            loop_context.position_before_adjustments = static_cast<Keyword>(position_before);
+            loop_context.line_height_before_adjustments = loop_context.builder.style().property(PropertyID::LineHeight);
+            loop_context.builder.set_display_before_box_type_transformation(from_ffi_display(*display_before));
+            return input_line_height_metrics(loop_context.builder, loop_context.abstract_element, check_input_line_height); },
         .fetch_non_inherited_parent_value = [](void* context, u16 inherited_property_id) -> ComputedValuesFFI::FfiShellAndData {
             auto& loop_context = *static_cast<LonghandLoopContext*>(context);
             auto value = get_non_animated_inherit_value(static_cast<PropertyID>(inherited_property_id), loop_context.abstract_element);
@@ -3488,7 +3632,9 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
         .font_metrics_depend_on_viewport_metrics = false,
         .explicitly_inherited_non_inherited_property = false,
     };
-    ComputedValuesFFI::rust_drive_property_computation(&callbacks, cascaded_properties.rust_store(), parent_snapshot.has_value() ? &*parent_snapshot : nullptr, new_font_size != nullptr, device_pixels_per_css_pixel, InitialValues::font_size().raw_value(), default_user_font_size().raw_value(), &driver_results);
+    auto box_type_input = make_box_type_transformation_input(
+        abstract_element, InitialValues::display(), Keyword::Static, Keyword::None);
+    ComputedValuesFFI::rust_drive_property_computation(&callbacks, cascaded_properties.rust_store(), parent_snapshot.has_value() ? &*parent_snapshot : nullptr, &box_type_input, &effective_color_scheme_input, abstract_element.element().local_name() == HTML::TagNames::th, new_font_size != nullptr, device_pixels_per_css_pixel, InitialValues::font_size().raw_value(), default_user_font_size().raw_value(), &driver_results);
 
     // Apply the driver's bulk results.
     auto longhand_bit_is_set = [](Array<u64, longhand_bitmap_words> const& words, size_t index) {
@@ -3528,6 +3674,25 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
     // Add or modify CSS-defined animations
     process_animation_definitions(computed_style, cascaded_properties, abstract_element);
 
+    auto restore_values_before_post_compute_adjustments = [&] {
+        VERIFY(loop_context.display_before_adjustments.has_value());
+        VERIFY(loop_context.float_before_adjustments.has_value());
+        VERIFY(loop_context.overflow_x_before_adjustments.has_value());
+        VERIFY(loop_context.overflow_y_before_adjustments.has_value());
+        VERIFY(loop_context.text_align_before_adjustments.has_value());
+        VERIFY(loop_context.position_before_adjustments.has_value());
+        VERIFY(loop_context.line_height_before_adjustments);
+        builder.set_property_without_modifying_flags(PropertyID::Display, DisplayStyleValue::create(from_ffi_display(*loop_context.display_before_adjustments)));
+        builder.set_property_without_modifying_flags(PropertyID::Float, KeywordStyleValue::create(*loop_context.float_before_adjustments));
+        builder.set_property_without_modifying_flags(PropertyID::OverflowX, KeywordStyleValue::create(*loop_context.overflow_x_before_adjustments));
+        builder.set_property_without_modifying_flags(PropertyID::OverflowY, KeywordStyleValue::create(*loop_context.overflow_y_before_adjustments));
+        builder.set_property_without_modifying_flags(PropertyID::TextAlign, KeywordStyleValue::create(*loop_context.text_align_before_adjustments));
+        builder.set_property_without_modifying_flags(PropertyID::Position, KeywordStyleValue::create(*loop_context.position_before_adjustments));
+        builder.set_property_without_modifying_flags(PropertyID::LineHeight, *loop_context.line_height_before_adjustments);
+    };
+    if (animation_values_applied)
+        restore_values_before_post_compute_adjustments();
+
     auto animations = abstract_element.element().get_animations_internal(
         Animations::Animatable::GetAnimationsSorted::Yes,
         Bindings::GetAnimationsOptions { .subtree = false });
@@ -3537,21 +3702,40 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
         for (auto& animation : animations.value()) {
             if (auto effect = animation->effect(); effect && effect->is_keyframe_effect()) {
                 auto& keyframe_effect = *static_cast<Animations::KeyframeEffect*>(effect.ptr());
-                if (keyframe_effect.pseudo_element_type() == abstract_element.pseudo_element())
+                if (keyframe_effect.pseudo_element_type() == abstract_element.pseudo_element()) {
+                    if (!animation_values_applied)
+                        restore_values_before_post_compute_adjustments();
+                    animation_values_applied = true;
                     collect_animation_into(abstract_element, keyframe_effect, builder);
+                }
             }
         }
     }
 
-    // Run automatic box type transformations
-    transform_box_type_if_needed(builder, abstract_element);
+    bool parent_text_align_input_is_animated = false;
+    if (computed_values_to_inherit_from) {
+        if (auto const* animated_properties = computed_values_to_inherit_from->animated_properties()) {
+            parent_text_align_input_is_animated = animated_properties->has_property(PropertyID::TextAlign)
+                || animated_properties->has_property(PropertyID::Direction);
+        }
+    }
+    if (parent_text_align_input_is_animated && !animation_values_applied) {
+        VERIFY(loop_context.text_align_before_adjustments.has_value());
+        builder.set_property_without_modifying_flags(PropertyID::TextAlign, KeywordStyleValue::create(*loop_context.text_align_before_adjustments));
+    }
+
+    // Run automatic box type transformations again after animations have been applied.
+    if (animation_values_applied)
+        transform_box_type_if_needed(builder, abstract_element);
 
     // Apply any property-specific computed value logic
-    resolve_effective_overflow_values(builder);
-    compute_text_align(builder, abstract_element);
+    if (animation_values_applied)
+        resolve_effective_overflow_values(builder);
+    if (animation_values_applied || parent_text_align_input_is_animated)
+        compute_text_align(builder, abstract_element);
 
     // Let the element adjust computed style
-    if (!abstract_element.pseudo_element().has_value())
+    if (animation_values_applied && !abstract_element.pseudo_element().has_value())
         abstract_element.element().adjust_computed_style(builder);
 
     bool parent_style_in_display_none_subtree = false;
