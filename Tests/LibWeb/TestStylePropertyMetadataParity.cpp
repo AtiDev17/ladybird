@@ -9,6 +9,7 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/RustStyleBridge.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/ValueType.h>
 
 // The Rust style computation core generates its property metadata tables from
 // Properties.json independently of the C++ generator. These tests compare
@@ -97,10 +98,9 @@ TEST_CASE(initial_value_table_matches)
 {
     StyleComputer::ensure_style_metadata_tables_installed();
     for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
-        auto entry = invoke_rust_style_metadata_initial_value(i);
+        auto const* data = invoke_rust_style_metadata_initial_value(i);
         auto initial_value = property_initial_value(static_cast<PropertyID>(i));
-        EXPECT_EQ(entry.shell, static_cast<void const*>(initial_value.ptr()));
-        EXPECT_EQ(entry.data, static_cast<void const*>(initial_value->rust_style_value_data()));
+        EXPECT_EQ(data, initial_value->rust_style_value_data());
     }
 }
 
@@ -112,6 +112,44 @@ TEST_CASE(requires_computation_levels_match)
         EXPECT_EQ(level >= 1, property_requires_computation_with_cascaded_value(property_id));
         EXPECT_EQ(level >= 2, property_requires_computation_with_initial_value(property_id));
         EXPECT_EQ(level >= 3, property_requires_computation_with_inherited_value(property_id));
+    }
+}
+
+TEST_CASE(animation_types_match)
+{
+    for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
+        auto property_id = static_cast<PropertyID>(i);
+        EXPECT_EQ(invoke_rust_property_metadata_animation_type(i), to_underlying(animation_type_from_longhand_property(property_id)));
+    }
+}
+
+TEST_CASE(accepted_numeric_ranges_match)
+{
+    for (auto i = to_underlying(first_longhand_property_id); i <= to_underlying(last_longhand_property_id); ++i) {
+        auto property_id = static_cast<PropertyID>(i);
+        auto expected_ranges = property_accepted_ranges_by_value_type(property_id);
+        size_t length = 0;
+        auto const* ranges = invoke_rust_property_metadata_numeric_ranges(i, &length);
+        EXPECT_EQ(length, expected_ranges.size());
+        for (size_t j = 0; j < length; ++j) {
+            auto expected = expected_ranges.get(static_cast<ValueType>(ranges[j].value_type));
+            EXPECT(expected.has_value());
+            if (!expected.has_value())
+                continue;
+            EXPECT_EQ(ranges[j].min, expected->min);
+            EXPECT_EQ(ranges[j].max, expected->max);
+        }
+    }
+}
+
+TEST_CASE(animation_keyframe_conflict_preference_matches)
+{
+    for (auto a = to_underlying(first_property_id); a <= to_underlying(last_property_id); ++a) {
+        for (auto b = to_underlying(first_property_id); b <= to_underlying(last_property_id); ++b) {
+            EXPECT_EQ(
+                invoke_rust_animation_property_is_preferred(a, b),
+                invoke_cpp_animation_property_is_preferred(a, b));
+        }
     }
 }
 

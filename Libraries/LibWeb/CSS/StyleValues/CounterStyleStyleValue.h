@@ -46,12 +46,19 @@ public:
     bool properties_equal(CounterStyleStyleValue const& other) const { return value() == other.value(); }
 
 private:
+    friend class StyleValue;
+
+    explicit CounterStyleStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::CounterStyle, data)
+    {
+    }
+
     explicit CounterStyleStyleValue(Variant<Utf16FlyString, SymbolsFunction> value)
         : StyleValueWithDefaultOperators(Type::CounterStyle, make_counter_style_data(value))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_counter_style_data(Variant<Utf16FlyString, SymbolsFunction> const& value)
+    static StyleValueFFI::StyleValueData const* make_counter_style_data(Variant<Utf16FlyString, SymbolsFunction> const& value)
     {
         // The Rust allocation takes ownership of one leaked reference to each retained string.
         return value.visit(

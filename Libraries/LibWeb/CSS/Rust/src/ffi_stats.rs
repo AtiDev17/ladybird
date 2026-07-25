@@ -54,27 +54,21 @@ define_ffi_ops! {
     StyleValueQueryEntry => "styleValueQueryEntries",
     StyleGroupCloneEntry => "styleGroupCloneEntries",
     StyleGroupFreeEntry => "styleGroupFreeEntries",
+    AnimationEvaluationEntry => "animationEvaluationEntries",
+    TransitionDecisionEntry => "transitionDecisionEntries",
     // Callbacks: Rust -> C++.
     SelectorDomReadCallback => "selectorDomReadCallbacks",
     SelectorMetadataCallback => "selectorMetadataCallbacks",
-    CascadePropertyDisallowedCallback => "cascadePropertyDisallowedCallbacks",
     CascadeResolveUnresolvedCallback => "cascadeResolveUnresolvedCallbacks",
     CascadeParseSubstitutedCallback => "cascadeParseSubstitutedCallbacks",
-    CascadeDataOfCallback => "cascadeDataOfCallbacks",
-    CascadePendingSubstitutionCallback => "cascadePendingSubstitutionCallbacks",
     CascadeSourceSlotCallback => "cascadeSourceSlotCallbacks",
     CascadeCustomPropertyBatchCallback => "cascadeCustomPropertyBatchCallbacks",
     ShorthandSetLonghandCallback => "shorthandSetLonghandCallbacks",
     LonghandStoreBatchCallback => "longhandStoreBatchCallbacks",
     LonghandCppComputeFallback => "longhandCppComputeFallbacks",
-    LonghandContextFetchCallback => "longhandContextFetchCallbacks",
     LonghandParentValueFetchCallback => "longhandParentValueFetchCallbacks",
-    LonghandIndependenceFallbackCallback => "longhandIndependenceFallbackCallbacks",
-    LonghandWritingModeCallback => "longhandWritingModeCallbacks",
-    CalcSerializationCallback => "calcSerializationCallbacks",
-    StyleValueShellRetainCallback => "styleValueShellRetainCallbacks",
-    StyleValueShellReleaseCallback => "styleValueShellReleaseCallbacks",
     StringRetainReleaseCallback => "stringRetainReleaseCallbacks",
+    AnimationComputeBatchCallback => "animationComputeBatchCallbacks",
 }
 
 static COUNTERS: [AtomicU64; FFI_OP_COUNT] = [const { AtomicU64::new(0) }; FFI_OP_COUNT];
@@ -115,4 +109,14 @@ pub extern "C" fn rust_style_ffi_counters_reset() {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_ffi_note_style_value_created() {
     bump(FfiOp::StyleValueCreateEntry);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_ffi_note_animation_evaluation() {
+    bump(FfiOp::AnimationEvaluationEntry);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_ffi_note_transition_decision() {
+    bump(FfiOp::TransitionDecisionEntry);
 }

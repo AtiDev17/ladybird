@@ -96,9 +96,7 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Node.h>
 
-extern "C" void ladybird_style_value_unref(void const*);
 extern "C" void ladybird_utf16_fly_string_unref(size_t);
-extern "C" void ladybird_style_value_ref(void const*);
 extern "C" void ladybird_utf16_fly_string_ref(size_t);
 extern "C" void ladybird_string_unref(size_t);
 
@@ -137,14 +135,183 @@ ColorResolutionContext ColorResolutionContext::for_layout_node_with_style(Layout
     };
 }
 
-StyleValue::StyleValue(Type type, StyleValueFFI::StyleValueData* value)
+StyleValue::StyleValue(Type type, StyleValueFFI::StyleValueData const* value)
     : m_value(value)
     , m_type(type)
 {
 }
 
+ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value_data(StyleValueFFI::StyleValueData const* data)
+{
+    VERIFY(data);
+    switch (data->tag) {
+    case StyleValueFFI::StyleValueData::Tag::Anchor:
+        return adopt_ref(*new (nothrow) AnchorStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::AnchorSize:
+        return adopt_ref(*new (nothrow) AnchorSizeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::BackgroundSize:
+        return adopt_ref(*new (nothrow) BackgroundSizeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::BasicShape:
+        return adopt_ref(*new (nothrow) BasicShapeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::BorderRadius:
+        return adopt_ref(*new (nothrow) BorderRadiusStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::BorderRadiusRect:
+        return adopt_ref(*new (nothrow) BorderRadiusRectStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::BorderImageSlice:
+        return adopt_ref(*new (nothrow) BorderImageSliceStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Calculated:
+        return adopt_ref(*new (nothrow) CalculatedStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
+        return adopt_ref(*new (nothrow) ColorFunctionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ColorInterpolationMethod:
+        return adopt_ref(*new (nothrow) ColorInterpolationMethodStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ColorMix:
+        return adopt_ref(*new (nothrow) ColorMixStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ColorScheme:
+        return adopt_ref(*new (nothrow) ColorSchemeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ConicGradient:
+        return adopt_ref(*new (nothrow) ConicGradientStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::CustomIdent:
+        return adopt_ref(*new (nothrow) CustomIdentStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Display:
+        return adopt_ref(*new (nothrow) DisplayStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Cursor:
+        return adopt_ref(*new (nothrow) CursorStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::CounterStyle:
+        return adopt_ref(*new (nothrow) CounterStyleStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::CounterStyleSystem:
+        return adopt_ref(*new (nothrow) CounterStyleSystemStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::CounterDefinitions:
+        return adopt_ref(*new (nothrow) CounterDefinitionsStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Counter:
+        return adopt_ref(*new (nothrow) CounterStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
+        return adopt_ref(*new (nothrow) ContrastColorStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Content:
+        return adopt_ref(*new (nothrow) ContentStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Edge:
+        return adopt_ref(*new (nothrow) EdgeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::EmptyOptional:
+        return adopt_ref(*new (nothrow) EmptyOptionalStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Easing:
+        return adopt_ref(*new (nothrow) EasingStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Keyword:
+        return adopt_ref(*new (nothrow) KeywordStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Number:
+        return adopt_ref(*new (nothrow) NumberStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Integer:
+        return adopt_ref(*new (nothrow) IntegerStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Image:
+        return adopt_ref(*new (nothrow) ImageStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ImageSet:
+        return adopt_ref(*new (nothrow) ImageSetStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::LightDark:
+        return adopt_ref(*new (nothrow) LightDarkStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::LinearGradient:
+        return adopt_ref(*new (nothrow) LinearGradientStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Angle:
+        return adopt_ref(*new (nothrow) AngleStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Flex:
+        return adopt_ref(*new (nothrow) FlexStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Filter:
+        switch (static_cast<FilterStyleValue::Kind>(data->filter.kind)) {
+        case FilterStyleValue::Kind::Blur:
+            return adopt_ref(*new (nothrow) BlurFilterStyleValue(data));
+        case FilterStyleValue::Kind::DropShadow:
+            return adopt_ref(*new (nothrow) DropShadowFilterStyleValue(data));
+        case FilterStyleValue::Kind::HueRotate:
+            return adopt_ref(*new (nothrow) HueRotateFilterStyleValue(data));
+        case FilterStyleValue::Kind::Color:
+            return adopt_ref(*new (nothrow) ColorFilterStyleValue(data));
+        }
+        VERIFY_NOT_REACHED();
+    case StyleValueFFI::StyleValueData::Tag::FontSource:
+        return adopt_ref(*new (nothrow) FontSourceStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::FontStyle:
+        return adopt_ref(*new (nothrow) FontStyleStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Frequency:
+        return adopt_ref(*new (nothrow) FrequencyStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Function:
+        return adopt_ref(*new (nothrow) FunctionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::GridAutoFlow:
+        return adopt_ref(*new (nothrow) GridAutoFlowStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::GridTemplateArea:
+        return adopt_ref(*new (nothrow) GridTemplateAreaStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::GridTrackPlacement:
+        return adopt_ref(*new (nothrow) GridTrackPlacementStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::GridTrackSizeList:
+        return adopt_ref(*new (nothrow) GridTrackSizeListStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::GuaranteedInvalid:
+        return adopt_ref(*new (nothrow) GuaranteedInvalidStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Length:
+        return adopt_ref(*new (nothrow) LengthStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Percentage:
+        return adopt_ref(*new (nothrow) PercentageStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Resolution:
+        return adopt_ref(*new (nothrow) ResolutionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Time:
+        return adopt_ref(*new (nothrow) TimeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::OpacityValue:
+        return adopt_ref(*new (nothrow) OpacityValueStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::PendingSubstitution:
+        return adopt_ref(*new (nothrow) PendingSubstitutionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::OpenTypeTagged:
+        return adopt_ref(*new (nothrow) OpenTypeTaggedStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::OverflowClipMargin:
+        return adopt_ref(*new (nothrow) OverflowClipMarginStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Position:
+        return adopt_ref(*new (nothrow) PositionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Ratio:
+        return adopt_ref(*new (nothrow) RatioStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Rect:
+        return adopt_ref(*new (nothrow) RectStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::RepeatStyle:
+        return adopt_ref(*new (nothrow) RepeatStyleStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::RandomValueSharing:
+        return adopt_ref(*new (nothrow) RandomValueSharingStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::RadialSize:
+        return adopt_ref(*new (nothrow) RadialSizeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::RadialGradient:
+        return adopt_ref(*new (nothrow) RadialGradientStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ScrollbarColor:
+        return adopt_ref(*new (nothrow) ScrollbarColorStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ScrollbarGutter:
+        return adopt_ref(*new (nothrow) ScrollbarGutterStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Shadow:
+        return adopt_ref(*new (nothrow) ShadowStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Shorthand:
+        return adopt_ref(*new (nothrow) ShorthandStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::String:
+        return adopt_ref(*new (nothrow) StringStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Superellipse:
+        return adopt_ref(*new (nothrow) SuperellipseStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::TextIndent:
+        return adopt_ref(*new (nothrow) TextIndentStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::TextUnderlinePosition:
+        return adopt_ref(*new (nothrow) TextUnderlinePositionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::TreeCountingFunction:
+        return adopt_ref(*new (nothrow) TreeCountingFunctionStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Transformation:
+        return adopt_ref(*new (nothrow) TransformationStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::ValueList:
+        return adopt_ref(*new (nothrow) StyleValueList(data));
+    case StyleValueFFI::StyleValueData::Tag::Tuple:
+        return adopt_ref(*new (nothrow) TupleStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::UnicodeRange:
+        return adopt_ref(*new (nothrow) UnicodeRangeStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Unresolved:
+        return adopt_ref(*new (nothrow) UnresolvedStyleValue(data));
+    case StyleValueFFI::StyleValueData::Tag::Url:
+        return adopt_ref(*new (nothrow) URLStyleValue(data));
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
 void StyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
 {
+    m_has_style_sheet_context = style_sheet;
+
     // Only the types holding nested values with document-associated state care.
     switch (type()) {
     case Type::Content:
@@ -164,30 +331,7 @@ void StyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
 
 bool StyleValue::is_computationally_independent() const
 {
-    // The rules for the value types whose decision has moved into the Rust style computation
-    // core; the rest still dispatch to their C++ shells.
-    auto decision = ComputedValuesFFI::rust_style_value_is_computationally_independent(
-        m_value.operator->(),
-        [](void const* shell) -> void const* { return static_cast<StyleValue const*>(shell)->rust_style_value_data(); },
-        [](void const* shell) -> bool { return static_cast<StyleValue const*>(shell)->decide_computational_independence_fallback(); });
-    if (decision.handled)
-        return decision.independent;
-
-    // The only value types deciding here are the grid track size list, which delegates to a
-    // deliberately C++-backed value type, and calc values, whose calculation trees are opaque
-    // to the core. The unresolved, guaranteed-invalid, pending-substitution, unicode-range and
-    // counter-style-system values must never be asked, which the default preserves.
-    return decide_computational_independence_fallback();
-}
-
-bool StyleValue::decide_computational_independence_fallback() const
-{
-    switch (type()) {
-    case Type::GridTrackSizeList:
-        return static_cast<GridTrackSizeListStyleValue const&>(*this).is_computationally_independent();
-    default:
-        VERIFY_NOT_REACHED();
-    }
+    return ComputedValuesFFI::rust_style_value_is_computationally_independent(m_value.operator->());
 }
 
 void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
@@ -222,9 +366,7 @@ bool StyleValue::is_color_function() const
 bool StyleValue::depends_on_current_color() const
 {
     // The recursion over nested colors lives in the Rust style value graph.
-    return StyleValueFFI::rust_style_value_depends_on_current_color(
-        m_value.operator->(),
-        [](void const* shell) -> void const* { return static_cast<StyleValue const*>(shell)->rust_style_value_data(); });
+    return StyleValueFFI::rust_style_value_depends_on_current_color(m_value.operator->());
 }
 
 bool StyleValue::has_color() const
@@ -564,22 +706,10 @@ Keyword StyleValue::to_keyword() const
 
 }
 
-// Called when Rust-owned style value data drops a reference to a C++ style value it retained.
-extern "C" void ladybird_style_value_unref(void const* style_value)
-{
-    static_cast<Web::CSS::StyleValue const*>(style_value)->unref();
-}
-
 // Called when Rust-owned style value data drops a retained Utf16FlyString.
 extern "C" void ladybird_utf16_fly_string_unref(size_t raw)
 {
     Utf16FlyString::unref_raw(raw);
-}
-
-// Called when Rust-owned cascade data retains an additional reference to a C++ style value.
-extern "C" void ladybird_style_value_ref(void const* style_value)
-{
-    static_cast<Web::CSS::StyleValue const*>(style_value)->ref();
 }
 
 // Called when Rust-owned cascade data retains an additional reference to a Utf16FlyString.

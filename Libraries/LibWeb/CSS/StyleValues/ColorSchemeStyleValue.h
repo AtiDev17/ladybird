@@ -38,12 +38,19 @@ public:
     bool properties_equal(ColorSchemeStyleValue const& other) const { return schemes() == other.schemes() && only() == other.only(); }
 
 private:
+    friend class StyleValue;
+
+    explicit ColorSchemeStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::ColorScheme, data)
+    {
+    }
+
     ColorSchemeStyleValue(Vector<Utf16FlyString> schemes, bool only)
         : StyleValueWithDefaultOperators(Type::ColorScheme, make_color_scheme_data(schemes, only))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_color_scheme_data(Vector<Utf16FlyString> const& schemes, bool only)
+    static StyleValueFFI::StyleValueData const* make_color_scheme_data(Vector<Utf16FlyString> const& schemes, bool only)
     {
         // The Rust allocation takes ownership of one leaked reference to each scheme name.
         Vector<size_t> raws;

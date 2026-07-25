@@ -834,9 +834,14 @@ Optional<DOM::AbstractElement> KeyframeEffect::target_abstract_element() const
     return {};
 }
 
-void KeyframeEffect::set_target(DOM::AbstractElement abstract_element)
+void KeyframeEffect::set_target(DOM::AbstractElement abstract_element, InvalidateEffect invalidate)
 {
-    set_target(&abstract_element.element());
+    if (invalidate == InvalidateEffect::Yes) {
+        set_target(&abstract_element.element());
+    } else {
+        VERIFY(!associated_animation());
+        m_target_element = &abstract_element.element();
+    }
     m_target_pseudo_selector = abstract_element.pseudo_element().map([](auto it) { return CSS::Selector::PseudoElementSelector { it }; });
 }
 
@@ -995,7 +1000,7 @@ void KeyframeEffect::update_computed_properties_for_style(AnimationUpdateContext
     });
 
     VERIFY(element_data.target_style);
-    style_computer.collect_animation_into(abstract_element, *this, *element_data.target_style);
+    element_data.effects.append(*this);
 }
 
 Bindings::CompositeOperation css_animation_composition_to_bindings_composite_operation(CSS::AnimationComposition composition)

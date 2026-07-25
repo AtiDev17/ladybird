@@ -179,6 +179,9 @@ public:
     // The Rust-owned data of this value, for handing to the Rust style computation core.
     StyleValueFFI::StyleValueData const* rust_style_value_data() const { return m_value.operator->(); }
 
+    // Wrap a transferred strong Rust reference in its corresponding typed C++ facade.
+    static ValueComparingNonnullRefPtr<StyleValue const> adopt_rust_style_value_data(StyleValueFFI::StyleValueData const*);
+
     String to_string(SerializationMode) const;
     Utf16String to_utf16_string(SerializationMode) const;
     void serialize(StringBuilder&, SerializationMode) const;
@@ -190,6 +193,7 @@ public:
     StyleValueVector subdivide_into_iterations(PropertyNameAndID const&) const;
 
     void set_style_sheet(GC::Ptr<CSSStyleSheet>);
+    bool has_style_sheet_context() const { return m_has_style_sheet_context; }
 
     bool equals(StyleValue const& other) const;
 
@@ -202,18 +206,16 @@ public:
     // A property value is computationally independent if it can be converted into a computed value using only the value
     // of the property on the element, and "global" information that cannot be changed by CSS.
     bool is_computationally_independent() const;
-    // The C++ decision for the value types the Rust core cannot decide (called for such
-    // values at any depth of a value tree).
-    bool decide_computational_independence_fallback() const;
 
 protected:
-    StyleValue(Type, StyleValueFFI::StyleValueData*);
+    StyleValue(Type, StyleValueFFI::StyleValueData const*);
 
-    // The single Rust-owned allocation holding this value's data.
+    // The shared Rust-owned allocation holding this value's data.
     RustStyleValueHandle m_value;
 
 private:
     Type m_type;
+    bool m_has_style_sheet_context { false };
 };
 
 template<typename T>
@@ -229,31 +231,6 @@ struct StyleValueWithDefaultOperators : public StyleValue {
         return static_cast<T const&>(*this).properties_equal(typed_other);
     }
 };
-
-// Retains one strong reference to the value (if non-null) and returns its pointer, for
-// transferring ownership into a Rust-owned style value allocation.
-inline void const* retain_style_value_for_rust(StyleValue const* value)
-{
-    if (value)
-        value->ref();
-    return value;
-}
-
-// Leaks one strong reference per (possibly null) value and returns the raw pointers, for
-// transferring ownership into a Rust-owned style value allocation.
-template<typename T>
-Vector<void const*> leak_style_value_pointers_for_rust(Vector<T>& values)
-{
-    Vector<void const*> pointers;
-    pointers.ensure_capacity(values.size());
-    for (auto& value : values) {
-        if constexpr (IsPointer<decltype(value.leak_ref())>)
-            pointers.unchecked_append(value.leak_ref());
-        else
-            pointers.unchecked_append(&value.leak_ref());
-    }
-    return pointers;
-}
 
 i32 int_from_style_value(NonnullRefPtr<StyleValue const> const& style_value);
 double number_from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<double> percentage_basis);

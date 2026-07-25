@@ -33,15 +33,20 @@ public:
 
     bool properties_equal(GridTrackSizeListStyleValue const& other) const { return grid_track_size_list() == other.grid_track_size_list(); }
 
-    bool is_computationally_independent() const { return grid_track_size_list().is_computationally_independent(); }
-
 private:
+    friend class StyleValue;
+
     explicit GridTrackSizeListStyleValue(CSS::GridTrackSizeList grid_track_size_list)
         : StyleValueWithDefaultOperators(Type::GridTrackSizeList, make_grid_track_size_list_data(grid_track_size_list))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_grid_track_size_list_data(CSS::GridTrackSizeList const&);
+    explicit GridTrackSizeListStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::GridTrackSizeList, data)
+    {
+    }
+
+    static StyleValueFFI::StyleValueData const* make_grid_track_size_list_data(CSS::GridTrackSizeList const&);
 };
 
 }

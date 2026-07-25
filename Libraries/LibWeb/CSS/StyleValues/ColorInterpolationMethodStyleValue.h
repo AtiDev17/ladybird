@@ -44,12 +44,19 @@ public:
     bool properties_equal(ColorInterpolationMethodStyleValue const& other) const { return color_interpolation_method() == other.color_interpolation_method(); }
 
 private:
+    friend class StyleValue;
+
     explicit ColorInterpolationMethodStyleValue(ColorInterpolationMethod color_space)
         : StyleValueWithDefaultOperators(Type::ColorInterpolationMethod, make_color_interpolation_method_data(color_space))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_color_interpolation_method_data(ColorInterpolationMethod const& color_interpolation_method)
+    explicit ColorInterpolationMethodStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::ColorInterpolationMethod, data)
+    {
+    }
+
+    static StyleValueFFI::StyleValueData const* make_color_interpolation_method_data(ColorInterpolationMethod const& color_interpolation_method)
     {
         return color_interpolation_method.visit(
             [](RectangularColorSpace const& color_space) {

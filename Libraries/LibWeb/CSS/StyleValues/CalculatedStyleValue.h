@@ -90,6 +90,13 @@ public:
     bool contains_anchor_function() const;
 
 private:
+    friend class StyleValue;
+
+    explicit CalculatedStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValue(Type::Calculated, data)
+    {
+    }
+
     // Takes ownership of a transferred Rust calculation root.
     explicit CalculatedStyleValue(StyleValueFFI::CalcNode const* rust_root, NumericType resolved_type, CalculationContext context)
         : StyleValue(Type::Calculated, make_calculated_data_from_rust_root(rust_root, resolved_type, context))
@@ -107,7 +114,7 @@ private:
     Optional<ResolvedValue> resolve_value(CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
     Optional<ResolvedValue> resolve_value(CalculationContext const&, CalculationResolutionContext const&, bool apply_censoring_and_clamping = true) const;
 
-    static StyleValueFFI::StyleValueData* make_calculated_data_from_rust_root(StyleValueFFI::CalcNode const*, NumericType const&, CalculationContext const&);
+    static StyleValueFFI::StyleValueData const* make_calculated_data_from_rust_root(StyleValueFFI::CalcNode const*, NumericType const&, CalculationContext const&);
 
     NumericType resolved_type() const;
 };

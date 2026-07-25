@@ -116,13 +116,17 @@ public:
     bool properties_equal(EasingStyleValue const& other) const { return function() == other.function(); }
 
 private:
+    friend class StyleValue;
+
     EasingStyleValue(Function const& function)
         : StyleValueWithDefaultOperators(Type::Easing, make_easing_data(function))
         , m_function(function)
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_easing_data(Function const&);
+    explicit EasingStyleValue(StyleValueFFI::StyleValueData const*);
+
+    static StyleValueFFI::StyleValueData const* make_easing_data(Function const&);
 
     // NB: The materialized function is a cache of the Rust-owned value data; it also carries the
     //     cubic-bezier sample cache. The Rust allocation stays authoritative.

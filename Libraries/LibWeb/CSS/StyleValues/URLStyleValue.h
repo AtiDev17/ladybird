@@ -71,16 +71,25 @@ public:
     void serialize(StringBuilder& builder, SerializationMode) const { builder.append(url().to_string()); }
 
 private:
+    friend class StyleValue;
+
+    explicit URLStyleValue(StyleValueFFI::StyleValueData const* data)
+        : StyleValueWithDefaultOperators(Type::URL, data)
+    {
+    }
+
     URLStyleValue(URL const& url)
         : StyleValueWithDefaultOperators(Type::URL, make_url_data(url))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_url_data(URL const& url)
+    static StyleValueFFI::StyleValueData const* make_url_data(URL const& url)
     {
         // The Rust allocation takes ownership of one leaked reference to each retained string.
         auto modifiers = retain_url_modifiers_for_rust(url);
-        return StyleValueFFI::rust_style_value_create_url(url.url().to_raw_leaked(), to_underlying(url.type()), modifiers.data(), modifiers.size());
+        auto url_string = url.url();
+        auto url_bytes = url_string.bytes();
+        return StyleValueFFI::rust_style_value_create_url(url_string.to_raw_leaked(), url_bytes.data(), url_bytes.size(), to_underlying(url.type()), modifiers.data(), modifiers.size());
     }
 };
 

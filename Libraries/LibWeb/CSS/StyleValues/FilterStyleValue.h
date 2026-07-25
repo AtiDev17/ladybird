@@ -30,20 +30,29 @@ public:
     void serialize(StringBuilder&, SerializationMode) const;
     bool equals(StyleValue const& other) const;
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-    virtual bool contains_url() const { return false; }
-    static ValueComparingNonnullRefPtr<FilterStyleValue const> initial_value_for(FilterStyleValue const&, bool use_transparent_drop_shadow_color);
 
 protected:
-    explicit FilterStyleValue(StyleValueFFI::StyleValueData* data)
+    explicit FilterStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValue(Type::Filter, data)
+        , m_filter_value(StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(data->filter.value.pointer))))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_filter_data(Kind kind, u8 color_operation, StyleValue const* value)
+    FilterStyleValue(StyleValueFFI::StyleValueData const* data, ValueComparingNonnullRefPtr<StyleValue const> value)
+        : StyleValue(Type::Filter, data)
+        , m_filter_value(move(value))
     {
-        // The Rust allocation takes ownership of one strong reference to the value.
-        return StyleValueFFI::rust_style_value_create_filter(to_underlying(kind), color_operation, retain_style_value_for_rust(value));
     }
+
+    ValueComparingNonnullRefPtr<StyleValue const> filter_value() const { return m_filter_value; }
+
+    static StyleValueFFI::StyleValueData const* make_filter_data(Kind kind, u8 color_operation, StyleValue const* value)
+    {
+        return StyleValueFFI::rust_style_value_create_filter(to_underlying(kind), color_operation, StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()));
+    }
+
+private:
+    ValueComparingNonnullRefPtr<StyleValue const> m_filter_value;
 };
 
 // https://drafts.csswg.org/filter-effects-1/#funcdef-filter-blur
@@ -54,7 +63,7 @@ public:
         return adopt_ref(*new (nothrow) BlurFilterStyleValue(move(radius)));
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> radius() const { return *static_cast<StyleValue const*>(m_value->filter.value.pointer); }
+    ValueComparingNonnullRefPtr<StyleValue const> radius() const { return filter_value(); }
     float resolved_radius() const;
 
     void serialize(StringBuilder&, SerializationMode) const;
@@ -62,8 +71,15 @@ public:
     bool equals(StyleValue const&) const;
 
 private:
+    friend class StyleValue;
+
     explicit BlurFilterStyleValue(ValueComparingNonnullRefPtr<StyleValue const> radius)
-        : FilterStyleValue(make_filter_data(Kind::Blur, 0, radius.ptr()))
+        : FilterStyleValue(make_filter_data(Kind::Blur, 0, radius.ptr()), radius)
+    {
+    }
+
+    explicit BlurFilterStyleValue(StyleValueFFI::StyleValueData const* data)
+        : FilterStyleValue(data)
     {
     }
 };
@@ -93,7 +109,7 @@ public:
     }
 
     ValueComparingNonnullRefPtr<ShadowStyleValue const> shadow_style_value() const { return shadow(); }
-    ShadowStyleValue const& shadow() const { return *static_cast<ShadowStyleValue const*>(m_value->filter.value.pointer); }
+    ShadowStyleValue const& shadow() const { return filter_value()->as_shadow(); }
     ValueComparingNonnullRefPtr<StyleValue const> offset_x() const { return shadow().offset_x(); }
     ValueComparingNonnullRefPtr<StyleValue const> offset_y() const { return shadow().offset_y(); }
     ValueComparingRefPtr<StyleValue const> radius() const { return shadow().blur_radius_or_null(); }
@@ -104,8 +120,15 @@ public:
     bool equals(StyleValue const&) const;
 
 private:
+    friend class StyleValue;
+
     explicit DropShadowFilterStyleValue(ValueComparingNonnullRefPtr<ShadowStyleValue const> shadow)
-        : FilterStyleValue(make_filter_data(Kind::DropShadow, 0, shadow.ptr()))
+        : FilterStyleValue(make_filter_data(Kind::DropShadow, 0, shadow.ptr()), shadow)
+    {
+    }
+
+    explicit DropShadowFilterStyleValue(StyleValueFFI::StyleValueData const* data)
+        : FilterStyleValue(data)
     {
     }
 };
@@ -118,7 +141,7 @@ public:
         return adopt_ref(*new (nothrow) HueRotateFilterStyleValue(move(angle)));
     }
 
-    ValueComparingNonnullRefPtr<StyleValue const> angle() const { return *static_cast<StyleValue const*>(m_value->filter.value.pointer); }
+    ValueComparingNonnullRefPtr<StyleValue const> angle() const { return filter_value(); }
     float angle_degrees() const;
 
     void serialize(StringBuilder&, SerializationMode) const;
@@ -126,8 +149,15 @@ public:
     bool equals(StyleValue const&) const;
 
 private:
+    friend class StyleValue;
+
     explicit HueRotateFilterStyleValue(ValueComparingNonnullRefPtr<StyleValue const> angle)
-        : FilterStyleValue(make_filter_data(Kind::HueRotate, 0, angle.ptr()))
+        : FilterStyleValue(make_filter_data(Kind::HueRotate, 0, angle.ptr()), angle)
+    {
+    }
+
+    explicit HueRotateFilterStyleValue(StyleValueFFI::StyleValueData const* data)
+        : FilterStyleValue(data)
     {
     }
 };
@@ -142,7 +172,7 @@ public:
     }
 
     Gfx::ColorFilterType operation() const { return static_cast<Gfx::ColorFilterType>(m_value->filter.color_operation); }
-    ValueComparingNonnullRefPtr<StyleValue const> amount() const { return *static_cast<StyleValue const*>(m_value->filter.value.pointer); }
+    ValueComparingNonnullRefPtr<StyleValue const> amount() const { return filter_value(); }
     float resolved_amount() const;
 
     void serialize(StringBuilder&, SerializationMode) const;
@@ -150,8 +180,15 @@ public:
     bool equals(StyleValue const&) const;
 
 private:
+    friend class StyleValue;
+
     ColorFilterStyleValue(Gfx::ColorFilterType operation, ValueComparingNonnullRefPtr<StyleValue const> amount)
-        : FilterStyleValue(make_filter_data(Kind::Color, static_cast<u8>(to_underlying(operation)), amount.ptr()))
+        : FilterStyleValue(make_filter_data(Kind::Color, static_cast<u8>(to_underlying(operation)), amount.ptr()), amount)
+    {
+    }
+
+    explicit ColorFilterStyleValue(StyleValueFFI::StyleValueData const* data)
+        : FilterStyleValue(data)
     {
     }
 };

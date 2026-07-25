@@ -22,6 +22,53 @@ fn title_casify(dashy_name: &str) -> String {
         .collect()
 }
 
+fn ordered_pseudo_element_names(
+    pseudo_elements: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut synthetic = Vec::new();
+    let mut element_reference = Vec::new();
+    let mut functional = Vec::new();
+    for (name, value) in pseudo_elements {
+        let object = value.as_object().unwrap();
+        if object.contains_key("alias-for") {
+            continue;
+        }
+        if object.get("type").and_then(|value| value.as_str()) == Some("function") {
+            functional.push(name.clone());
+            continue;
+        }
+        match object.get("implementation").and_then(|value| value.as_str()) {
+            Some("synthetic") => synthetic.push(name.clone()),
+            Some("element-reference") => element_reference.push(name.clone()),
+            other => return Err(format!("invalid or missing implementation type for ::{name}: {other:?}").into()),
+        }
+    }
+    synthetic.extend(element_reference);
+    synthetic.extend(functional);
+    Ok(synthetic)
+}
+
+fn load_property_groups(path: &Path) -> Result<std::collections::HashMap<String, Vec<String>>, Box<dyn Error>> {
+    let mut groups = std::collections::HashMap::new();
+    let mut current_group = None;
+    for raw_line in std::fs::read_to_string(path)?.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(group) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
+            groups.insert(format!("#{group}"), Vec::new());
+            current_group = Some(format!("#{group}"));
+            continue;
+        }
+        let Some(group) = current_group.as_ref() else {
+            return Err(format!("property outside a pseudo-element property group: {line}").into());
+        };
+        groups.get_mut(group).unwrap().push(line.to_string());
+    }
+    Ok(groups)
+}
+
 fn write_enum_and_from_ffi(output: &mut String, enum_name: &str, variants: &[String]) {
     writeln!(output, "#[derive(Clone, Copy, Debug, PartialEq, Eq)]").unwrap();
     writeln!(output, "#[repr(u8)]").unwrap();
@@ -71,27 +118,11 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
         .map(|(name, _)| title_casify(name))
         .collect::<Vec<_>>();
 
-    let mut synthetic_pseudo_elements = Vec::new();
-    let mut element_reference_pseudo_elements = Vec::new();
-    let mut functional_pseudo_elements = Vec::new();
-    for (name, value) in &parse_object(&pseudo_elements_path)? {
-        let object = value.as_object().unwrap();
-        if object.contains_key("alias-for") {
-            continue;
-        }
-        if object.get("type").and_then(|value| value.as_str()) == Some("function") {
-            functional_pseudo_elements.push(title_casify(name));
-            continue;
-        }
-        match object.get("implementation").and_then(|value| value.as_str()) {
-            Some("synthetic") => synthetic_pseudo_elements.push(title_casify(name)),
-            Some("element-reference") => element_reference_pseudo_elements.push(title_casify(name)),
-            other => return Err(format!("invalid or missing implementation type for ::{name}: {other:?}").into()),
-        }
-    }
-    let mut pseudo_element_names = synthetic_pseudo_elements;
-    pseudo_element_names.extend(element_reference_pseudo_elements);
-    pseudo_element_names.extend(functional_pseudo_elements);
+    let pseudo_elements = parse_object(&pseudo_elements_path)?;
+    let mut pseudo_element_names = ordered_pseudo_element_names(&pseudo_elements)?
+        .iter()
+        .map(|name| title_casify(name))
+        .collect::<Vec<_>>();
     // NB: The C++ generator emits UnknownWebKit after KnownPseudoElementCount, so its FFI value is
     //     the number of known pseudo-elements.
     pseudo_element_names.push("UnknownWebKit".to_string());
@@ -178,6 +209,66 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     let first_inherited = ids[&inherited_longhands[0]];
     let last_inherited = ids[inherited_longhands.last().unwrap()];
 
+    let pseudo_elements_path = manifest_dir.parent().unwrap().join("PseudoElements.json");
+    let property_groups_path = manifest_dir.parent().unwrap().join("PseudoElementPropertyGroups.txt");
+    println!("cargo:rerun-if-changed={}", pseudo_elements_path.display());
+    println!("cargo:rerun-if-changed={}", property_groups_path.display());
+    let pseudo_elements_value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pseudo_elements_path)?)?;
+    let serde_json::Value::Object(pseudo_elements) = pseudo_elements_value else {
+        return Err("PseudoElements.json does not contain a JSON object".into());
+    };
+    let property_groups = load_property_groups(&property_groups_path)?;
+    let property_id = |name: &str| -> Result<u16, Box<dyn Error>> {
+        if name == "custom" {
+            return Ok(0);
+        }
+        ids.get(name)
+            .copied()
+            .ok_or_else(|| format!("unknown pseudo-element property '{name}'").into())
+    };
+    let property_ids = |entries: &[String]| -> Result<Vec<u16>, Box<dyn Error>> {
+        let mut result = std::collections::BTreeSet::new();
+        for entry in entries {
+            if entry.starts_with("FIXME:") {
+                continue;
+            }
+            if let Some(properties) = property_groups.get(entry) {
+                for property in properties {
+                    result.insert(property_id(property)?);
+                }
+            } else if entry.starts_with('#') {
+                return Err(format!("unknown pseudo-element property group '{entry}'").into());
+            } else {
+                result.insert(property_id(entry)?);
+            }
+        }
+        Ok(result.into_iter().collect())
+    };
+    let always_allowed_pseudo_properties = property_ids(
+        property_groups
+            .get("#always-allowed-properties")
+            .ok_or("missing always-allowed pseudo-element property group")?,
+    )?;
+    let mut pseudo_property_whitelist_rows = Vec::new();
+    for name in ordered_pseudo_element_names(&pseudo_elements)? {
+        let object = pseudo_elements[&name].as_object().unwrap();
+        let Some(whitelist) = object.get("property-whitelist") else {
+            pseudo_property_whitelist_rows.push("    None,".to_string());
+            continue;
+        };
+        let entries = whitelist
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let whitelist = property_ids(&entries)?;
+        pseudo_property_whitelist_rows.push(format!("    Some(&{whitelist:?}),"));
+    }
+    // UnknownWebKit follows the known pseudo-elements and accepts all properties.
+    pseudo_property_whitelist_rows.push("    None,".to_string());
+
     // NB: Must match manually_specified_computation_order in
     //     Meta/Generators/generate_libweb_css_property_id.py; the parity test enforces it.
     let manual_order = [
@@ -222,7 +313,57 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
     }
 
     let mut levels = vec![0u8; (last_longhand - first_longhand + 1) as usize];
+    let mut animation_types = vec![0u8; levels.len()];
+    let mut numeric_range_rows = vec![String::new(); levels.len()];
+    let value_types = [
+        "anchor",
+        "anchor-size",
+        "angle",
+        "angle-percentage",
+        "background-position",
+        "basic-shape",
+        "color",
+        "corner-shape",
+        "counter",
+        "counter-style",
+        "custom-ident",
+        "dashed-ident",
+        "easing-function",
+        "filter-value-list",
+        "fit-content",
+        "flex",
+        "font-style",
+        "font-variant-alternates",
+        "font-variant-east-asian",
+        "font-variant-ligatures",
+        "font-variant-numeric",
+        "frequency",
+        "frequency-percentage",
+        "image",
+        "integer",
+        "length",
+        "length-percentage",
+        "number",
+        "opacity-value",
+        "opentype-tag",
+        "paint",
+        "percentage",
+        "position",
+        "ratio",
+        "rect",
+        "resolution",
+        "scroll-function",
+        "string",
+        "time",
+        "time-percentage",
+        "transform-function",
+        "transform-list",
+        "url",
+        "view-function",
+        "view-timeline-inset",
+    ];
     for name in inherited_longhands.iter().chain(&noninherited_longhands) {
+        let index = (ids[name] - first_longhand) as usize;
         let requires_computation = property_field(name, "requires-computation").unwrap();
         let level = match requires_computation.as_str().unwrap() {
             "never" => 0u8,
@@ -231,11 +372,57 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             "always" => 3,
             other => return Err(format!("unknown requires-computation '{other}' for {name}").into()),
         };
-        levels[(ids[name] - first_longhand) as usize] = level;
+        levels[index] = level;
+
+        animation_types[index] = match property_field(name, "animation-type").unwrap().as_str().unwrap() {
+            "discrete" => 0,
+            "by-computed-value" => 1,
+            "repeatable-list" => 2,
+            "custom" => 3,
+            "none" => 4,
+            other => return Err(format!("unknown animation-type '{other}' for {name}").into()),
+        };
+
+        let mut ranges = Vec::new();
+        if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
+            for valid_type in valid_types {
+                let valid_type = valid_type.as_str().unwrap();
+                let Some((type_name, range)) = valid_type.split_once(' ') else {
+                    continue;
+                };
+                if !range.starts_with('[') || !range.ends_with(']') || !range.contains(',') {
+                    continue;
+                }
+                if type_name == "custom-ident" {
+                    continue;
+                }
+                let value_type = value_types
+                    .iter()
+                    .position(|candidate| *candidate == type_name)
+                    .ok_or_else(|| format!("unknown ranged value type '{type_name}' for {name}"))?;
+                let (min, max) = range[1..range.len() - 1]
+                    .split_once(',')
+                    .ok_or_else(|| format!("bad numeric range '{range}' for {name}"))?;
+                let format_bound = |bound: &str| match (type_name, bound) {
+                    ("integer", "-∞") => "i32::MIN as f64".to_string(),
+                    ("integer", "∞") => "i32::MAX as f64".to_string(),
+                    (_, "-∞") => "f32::MIN as f64".to_string(),
+                    (_, "∞") => "f32::MAX as f64".to_string(),
+                    _ if bound.contains('.') => bound.to_string(),
+                    _ => format!("{bound}.0"),
+                };
+                ranges.push(format!(
+                    "FfiPropertyNumericRange {{ value_type: {value_type}, min: {}, max: {} }}",
+                    format_bound(min),
+                    format_bound(max)
+                ));
+            }
+        }
+        numeric_range_rows[index] = ranges.join(", ");
     }
 
     let mut output = String::new();
-    output.push_str("// Generated by build.rs from Properties.json. Do not edit.\n\n");
+    output.push_str("// Generated by build.rs from CSS metadata. Do not edit.\n\n");
     // Shorthand expansion tables for the cascade. The "all" shorthand expands to every
     // longhand except direction and unicode-bidi, mirroring the C++ generator.
     let mut shorthand_rows = Vec::new();
@@ -268,6 +455,88 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static SHORTHAND_EXPANSIONS: [&[u16]; {}] = [\n{}\n];\n\n",
         shorthand_rows.len(),
         shorthand_rows.join("\n")
+    ));
+    let property_names: Vec<&str> = shorthands
+        .iter()
+        .chain(&inherited_longhands)
+        .chain(&noninherited_longhands)
+        .map(String::as_str)
+        .collect();
+    fn expanded_longhands(
+        name: &str,
+        properties: &serde_json::Map<String, serde_json::Value>,
+        all_longhands: &[String],
+        result: &mut Vec<String>,
+    ) {
+        if name == "all" {
+            result.extend_from_slice(all_longhands);
+            return;
+        }
+        let Some(longhands) = properties[name].get("longhands").and_then(|value| value.as_array()) else {
+            result.push(name.to_string());
+            return;
+        };
+        for longhand in longhands {
+            expanded_longhands(longhand.as_str().unwrap(), properties, all_longhands, result);
+        }
+    }
+    let all_longhands: Vec<String> = inherited_longhands
+        .iter()
+        .chain(&noninherited_longhands)
+        .filter(|name| name.as_str() != "direction" && name.as_str() != "unicode-bidi")
+        .cloned()
+        .collect();
+    let expanded_shorthand_longhands: Vec<Vec<String>> = shorthands
+        .iter()
+        .map(|name| {
+            let mut result = Vec::new();
+            expanded_longhands(name, &properties, &all_longhands, &mut result);
+            result
+        })
+        .collect();
+    let camel_case_property_name = |name: &str| {
+        let mut parts = name.split('-').filter(|part| !part.is_empty());
+        let mut result = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            let mut characters = part.chars();
+            if let Some(first) = characters.next() {
+                result.extend(first.to_uppercase());
+                result.extend(characters);
+            }
+        }
+        result
+    };
+    let idl_names: Vec<String> = property_names
+        .iter()
+        .map(|name| camel_case_property_name(name))
+        .collect();
+    let logical_aliases: Vec<bool> = property_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let name: &str = if index < shorthands.len() {
+                expanded_shorthand_longhands[index][0].as_str()
+            } else {
+                name
+            };
+            properties[name].as_object().unwrap().contains_key("logical-alias-for")
+        })
+        .collect();
+    let expanded_longhand_counts: Vec<usize> = expanded_shorthand_longhands.iter().map(Vec::len).collect();
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_IDL_NAMES: [&str; {}] = {:?};\n",
+        idl_names.len(),
+        idl_names
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_IS_LOGICAL_ALIAS: [bool; {}] = {:?};\n\n",
+        logical_aliases.len(),
+        logical_aliases
+    ));
+    output.push_str(&format!(
+        "pub(crate) static SHORTHAND_EXPANDED_LONGHAND_COUNTS: [usize; {}] = {:?};\n\n",
+        expanded_longhand_counts.len(),
+        expanded_longhand_counts
     ));
     output.push_str(&format!(
         "pub const FIRST_SHORTHAND_PROPERTY_ID: u16 = {};\n",
@@ -309,6 +578,28 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static REQUIRES_COMPUTATION_LEVELS: [u8; {}] = {:?};\n",
         levels.len(),
         levels
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_ANIMATION_TYPES: [u8; {}] = {:?};\n",
+        animation_types.len(),
+        animation_types
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_NUMERIC_RANGES: [&[FfiPropertyNumericRange]; {}] = [\n{}\n];\n",
+        numeric_range_rows.len(),
+        numeric_range_rows
+            .iter()
+            .map(|ranges| format!("    &[{ranges}],"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    output.push_str(&format!(
+        "\npub(crate) static PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES: &[u16] = &{always_allowed_pseudo_properties:?};\n"
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PSEUDO_ELEMENT_PROPERTY_WHITELISTS: [Option<&[u16]>; {}] = [\n{}\n];\n",
+        pseudo_property_whitelist_rows.len(),
+        pseudo_property_whitelist_rows.join("\n")
     ));
     std::fs::write(out_dir.join("property_metadata_generated.rs"), output)?;
     Ok(())
@@ -599,6 +890,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         style_value_config,
         &[
             manifest_dir.join("src/style_value.rs"),
+            manifest_dir.join("src/color_interpolation.rs"),
+            manifest_dir.join("src/animation.rs"),
+            manifest_dir.join("src/transition.rs"),
             manifest_dir.join("src/calc.rs"),
             manifest_dir.join("src/ffi_stats.rs"),
         ],

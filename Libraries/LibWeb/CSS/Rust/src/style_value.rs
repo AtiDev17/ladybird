@@ -4,79 +4,139 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+// Style value identities are shared across the FFI boundary, but remain confined to the thread
+// owning the C++ style objects they may currently retain.
+#![allow(clippy::arc_with_non_send_sync)]
+
 //! Rust-owned CSS style value data.
 //!
-//! The C++ StyleValue subclasses keep their data in a Rust-owned [`StyleValueData`] allocation
-//! instead of C++ member variables. Each subclass owns its allocation uniquely and destroys it
-//! with [`rust_style_value_destroy`]. The layout of [`StyleValueData`] is exposed to C++
+//! The C++ StyleValue subclasses keep their data in a Rust-owned, reference-counted
+//! [`StyleValueData`] allocation instead of C++ member variables. The layout of
+//! [`StyleValueData`] is exposed to C++
 //! through cbindgen so that hot accessors compile to inline field reads with no FFI call.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::abort_on_panic;
 
 unsafe extern "C" {
-    fn ladybird_style_value_unref(style_value: *const c_void);
     fn ladybird_utf16_fly_string_unref(raw: usize);
     fn ladybird_string_unref(raw: usize);
-    fn ladybird_style_value_ref(style_value: *const c_void);
     fn ladybird_utf16_fly_string_ref(raw: usize);
 }
 
-/// A strong reference to a C++ StyleValue held from Rust-owned value data.
-///
-/// Nested values still point at the C++ shell objects; dropping the Rust allocation releases
-/// the reference. Once the shells are collapsed into a single handle type these become
-/// references between Rust allocations instead.
+/// A strong reference to immutable Rust-owned style value data.
 #[repr(C)]
-pub struct RetainedStyleValue {
+pub struct RetainedStyleValueData {
     pointer: *const c_void,
 }
 
-impl RetainedStyleValue {
-    pub(crate) fn shell_pointer(&self) -> *const c_void {
-        self.pointer
-    }
-
-    /// Assumes ownership of one strong reference to the C++ StyleValue shell.
-    ///
-    /// # Safety
-    /// `pointer` must be a leaked strong StyleValue reference (or null for an absent value).
-    pub(crate) unsafe fn from_shell_pointer(pointer: *const c_void) -> Self {
-        Self { pointer }
-    }
-
-    /// Retains a new strong reference to the C++ StyleValue shell.
-    ///
-    /// # Safety
-    /// `pointer` must point at a live StyleValue shell.
-    pub(crate) unsafe fn from_borrowed_shell_pointer(pointer: *const c_void) -> Self {
-        crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellRetainCallback);
-        unsafe { ladybird_style_value_ref(pointer) };
-        Self { pointer }
-    }
-
-    /// Clones the retained reference, bumping the shell's reference count.
-    pub(crate) fn clone_retained(&self) -> Self {
-        unsafe { Self::from_borrowed_shell_pointer(self.pointer) }
-    }
-}
-
-/// Retains one strong reference to a C++ StyleValue shell for a reference
-/// slot poked into a style group payload.
-pub(crate) fn retain_shell_pointer(pointer: *const c_void) {
-    crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellRetainCallback);
-    // SAFETY: The caller guarantees a live shell.
-    unsafe { ladybird_style_value_ref(pointer) };
-}
-
-impl Drop for RetainedStyleValue {
-    fn drop(&mut self) {
-        // A null pointer represents an absent optional reference.
-        if !self.pointer.is_null() {
-            crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueShellReleaseCallback);
-            unsafe { ladybird_style_value_unref(self.pointer) };
+impl PartialEq for RetainedStyleValueData {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.optional_data(), other.optional_data()) {
+            (Some(first), Some(second)) => std::ptr::eq(first, second) || first == second,
+            (None, None) => true,
+            _ => false,
         }
+    }
+}
+
+impl RetainedStyleValueData {
+    pub(crate) fn pointer(&self) -> *const StyleValueData {
+        self.pointer.cast()
+    }
+
+    pub(crate) fn data(&self) -> &StyleValueData {
+        unsafe { &*self.pointer.cast::<StyleValueData>() }
+    }
+
+    pub(crate) fn optional_data(&self) -> Option<&StyleValueData> {
+        unsafe { self.pointer.cast::<StyleValueData>().as_ref() }
+    }
+
+    /// Assumes ownership of one strong reference to Rust-owned style value data.
+    ///
+    /// # Safety
+    /// `pointer` must be a strong reference returned by `rust_style_value_retain`.
+    pub(crate) unsafe fn from_retained_pointer(pointer: *const StyleValueData) -> Self {
+        debug_assert!(!pointer.is_null());
+        Self {
+            pointer: pointer.cast(),
+        }
+    }
+
+    /// Assumes ownership of one strong reference when `pointer` is non-null.
+    ///
+    /// # Safety
+    /// `pointer` must be null or a strong reference returned by `rust_style_value_retain`.
+    pub(crate) unsafe fn from_retained_optional_pointer(pointer: *const StyleValueData) -> Self {
+        Self {
+            pointer: pointer.cast(),
+        }
+    }
+
+    pub(crate) fn clone_retained(&self) -> Self {
+        let pointer = unsafe { rust_style_value_retain(self.pointer.cast()) };
+        unsafe { Self::from_retained_optional_pointer(pointer) }
+    }
+}
+
+impl Drop for RetainedStyleValueData {
+    fn drop(&mut self) {
+        unsafe { rust_style_value_release(self.pointer.cast()) };
+    }
+}
+
+/// A retained, Rust-owned array of shared style value data references.
+#[repr(C)]
+pub struct RetainedStyleValueDataList {
+    pointer: *mut RetainedStyleValueData,
+    length: usize,
+}
+
+impl RetainedStyleValueDataList {
+    pub(crate) fn as_slice(&self) -> &[RetainedStyleValueData] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+
+    pub(crate) fn from_retained_values(values: Vec<RetainedStyleValueData>) -> Self {
+        let slice = values.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
+        Self { pointer, length }
+    }
+
+    /// Takes ownership of one strong reference to each value.
+    ///
+    /// # Safety
+    /// `values` must point to `length` strong references returned by `rust_style_value_retain`.
+    unsafe fn from_retained_pointers(values: *const *const StyleValueData, length: usize) -> Self {
+        let slice: Box<[RetainedStyleValueData]> = (0..length)
+            .map(|i| unsafe { RetainedStyleValueData::from_retained_pointer(*values.add(i)) })
+            .collect();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
+        Self { pointer, length }
+    }
+
+    /// Takes ownership of one strong reference to each non-null value.
+    ///
+    /// # Safety
+    /// Every non-null entry in `values` must be a strong reference returned by
+    /// `rust_style_value_retain`.
+    unsafe fn from_retained_optional_pointers(values: *const *const StyleValueData, length: usize) -> Self {
+        let slice: Box<[RetainedStyleValueData]> = (0..length)
+            .map(|i| RetainedStyleValueData {
+                pointer: unsafe { *values.add(i) }.cast(),
+            })
+            .collect();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
+        Self { pointer, length }
     }
 }
 
@@ -84,6 +144,7 @@ impl Drop for RetainedStyleValue {
 /// to the underlying string data unless it is a short string, which needs none; the C++ bridge
 /// handles both cases.
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedUtf16FlyString {
     raw: usize,
 }
@@ -132,6 +193,8 @@ macro_rules! retained_list_drop {
     };
 }
 
+retained_list_drop!(RetainedStyleValueDataList);
+
 /// Implements the shared behavior for a `Retained*List` struct whose `from_raw` input is an
 /// array of its own element type: `from_raw` copies `length` elements into a Rust-owned boxed
 /// slice, assuming ownership of the elements' retained references, and `Drop` releases them.
@@ -156,39 +219,6 @@ macro_rules! retained_list {
     };
 }
 
-/// A retained, Rust-owned array of style value references.
-#[repr(C)]
-pub struct RetainedStyleValueList {
-    pointer: *mut RetainedStyleValue,
-    length: usize,
-}
-
-impl RetainedStyleValueList {
-    pub(crate) fn as_slice(&self) -> &[RetainedStyleValue] {
-        if self.pointer.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
-    }
-
-    /// Takes ownership of one strong reference to each value.
-    ///
-    /// # Safety
-    /// `values` must point to `length` valid style value pointers.
-    unsafe fn from_raw(values: *const *const c_void, length: usize) -> Self {
-        let slice: Box<[RetainedStyleValue]> = (0..length)
-            .map(|i| RetainedStyleValue {
-                pointer: unsafe { *values.add(i) },
-            })
-            .collect();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedStyleValue;
-        Self { pointer, length }
-    }
-}
-
-retained_list_drop!(RetainedStyleValueList);
-
 /// A Rust-owned array of C++ PropertyID values (`enum class PropertyID : u16`, opaque to Rust).
 #[repr(C)]
 pub struct RetainedPropertyIdList {
@@ -212,12 +242,47 @@ impl RetainedPropertyIdList {
 #[repr(C)]
 pub struct RetainedString {
     raw: usize,
+    bytes: *mut u8,
+    length: usize,
+}
+
+impl RetainedString {
+    /// Takes ownership of a leaked AK::String reference and copies its bytes.
+    ///
+    /// # Safety
+    /// `bytes` must point at `length` readable bytes.
+    unsafe fn from_raw(raw: usize, bytes: *const u8, length: usize) -> Self {
+        let readable = unsafe { RetainedReadableString::from_raw(raw, bytes, length) };
+        let result = Self {
+            raw: readable.raw,
+            bytes: readable.bytes,
+            length: readable.length,
+        };
+        std::mem::forget(readable);
+        result
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        if self.bytes.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.bytes, self.length) }
+    }
+}
+
+impl PartialEq for RetainedString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
 }
 
 impl Drop for RetainedString {
     fn drop(&mut self) {
         crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StringRetainReleaseCallback);
         unsafe { ladybird_string_unref(self.raw) };
+        if !self.bytes.is_null() {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.bytes, self.length)) });
+        }
     }
 }
 
@@ -258,6 +323,12 @@ impl RetainedReadableString {
     }
 }
 
+impl PartialEq for RetainedReadableString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
 impl Drop for RetainedReadableString {
     fn drop(&mut self) {
         crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StringRetainReleaseCallback);
@@ -272,6 +343,7 @@ impl Drop for RetainedReadableString {
 /// string value (raw 0 when the value is an enum). All enums are C++ `enum class ... : u8`
 /// values, opaque to Rust.
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedRequestUrlModifier {
     modifier_type: u8,
     enum_value: u8,
@@ -304,6 +376,13 @@ pub struct RetainedUtf16FlyStringList {
 }
 
 impl RetainedUtf16FlyStringList {
+    pub(crate) fn from_retained_strings(strings: Vec<RetainedUtf16FlyString>) -> Self {
+        let slice = strings.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedUtf16FlyString;
+        Self { pointer, length }
+    }
+
     /// Takes ownership of one leaked reference to each string.
     ///
     /// # Safety
@@ -317,6 +396,22 @@ impl RetainedUtf16FlyStringList {
         let length = slice.len();
         let pointer = Box::into_raw(slice) as *mut RetainedUtf16FlyString;
         Self { pointer, length }
+    }
+
+    pub(crate) fn clone_retained(&self) -> Self {
+        Self::from_retained_strings(
+            self.as_slice()
+                .iter()
+                .map(|string| unsafe { RetainedUtf16FlyString::from_borrowed_raw(string.raw()) })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn as_slice(&self) -> &[RetainedUtf16FlyString] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -334,10 +429,11 @@ impl RetainedByteList {
 /// A retained counter definition: the counter name, the reversed flag and an optional retained
 /// value (null when absent).
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedCounterDefinition {
     name: RetainedUtf16FlyString,
     is_reversed: bool,
-    value: RetainedStyleValue,
+    value: RetainedStyleValueData,
 }
 
 /// A Rust-owned array of retained counter definitions.
@@ -353,9 +449,10 @@ retained_list!(RetainedCounterDefinitionList, RetainedCounterDefinition);
 /// retained AK::Utf16String raw, 0 when absent, released through the same bridge as fly
 /// strings).
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedImageSetOption {
-    image: RetainedStyleValue,
-    resolution: RetainedStyleValue,
+    image: RetainedStyleValueData,
+    resolution: RetainedStyleValueData,
     has_type: bool,
     type_string: RetainedUtf16FlyString,
 }
@@ -370,14 +467,14 @@ pub struct RetainedImageSetOptionList {
 retained_list!(RetainedImageSetOptionList, RetainedImageSetOption);
 
 /// A retained gradient color stop: an optional transition hint, then an optional color,
-/// position and second position (each null when absent). The layout matches the C++
-/// ColorStopListElement, which is four reference pointers, so C++ views these in place.
+/// position and second position (each null when absent).
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedColorStop {
-    transition_hint: RetainedStyleValue,
-    color: RetainedStyleValue,
-    position: RetainedStyleValue,
-    second_position: RetainedStyleValue,
+    transition_hint: RetainedStyleValueData,
+    color: RetainedStyleValueData,
+    position: RetainedStyleValueData,
+    second_position: RetainedStyleValueData,
 }
 
 /// A Rust-owned array of retained gradient color stops.
@@ -390,19 +487,19 @@ pub struct RetainedColorStopList {
 retained_list!(RetainedColorStopList, RetainedColorStop);
 
 impl RetainedCounterDefinition {
-    pub(crate) fn value(&self) -> &RetainedStyleValue {
+    pub(crate) fn value(&self) -> &RetainedStyleValueData {
         &self.value
     }
 }
 
 impl RetainedImageSetOption {
-    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+    pub(crate) fn values(&self) -> [&RetainedStyleValueData; 2] {
         [&self.image, &self.resolution]
     }
 }
 
 impl RetainedLinearEasingStop {
-    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+    pub(crate) fn values(&self) -> [&RetainedStyleValueData; 2] {
         [&self.output, &self.input]
     }
 }
@@ -424,15 +521,28 @@ retained_list_as_slice!(RetainedImageSetOptionList, RetainedImageSetOption);
 retained_list_as_slice!(RetainedLinearEasingStopList, RetainedLinearEasingStop);
 
 impl RetainedShapePoint {
-    pub(crate) fn values(&self) -> [&RetainedStyleValue; 2] {
+    pub(crate) fn values(&self) -> [&RetainedStyleValueData; 2] {
         [&self.x, &self.y]
+    }
+
+    pub(crate) fn from_retained_values(x: RetainedStyleValueData, y: RetainedStyleValueData) -> Self {
+        Self { x, y }
     }
 }
 retained_list_as_slice!(RetainedShapePointList, RetainedShapePoint);
 
+impl RetainedShapePointList {
+    pub(crate) fn from_retained_points(points: Vec<RetainedShapePoint>) -> Self {
+        let slice = points.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedShapePoint;
+        Self { pointer, length }
+    }
+}
+
 impl RetainedColorStop {
     /// The stop's retained values, absent ones as null retained references.
-    pub(crate) fn values(&self) -> [&RetainedStyleValue; 4] {
+    pub(crate) fn values(&self) -> [&RetainedStyleValueData; 4] {
         [
             &self.transition_hint,
             &self.color,
@@ -453,6 +563,7 @@ impl RetainedColorStopList {
 
 /// A retained named grid area: the retained area name and its grid line indices.
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedGridArea {
     name: RetainedUtf16FlyString,
     row_start: usize,
@@ -472,9 +583,10 @@ retained_list!(RetainedGridAreaList, RetainedGridArea);
 
 /// A retained linear() easing stop: the output value and an optional input (null when absent).
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedLinearEasingStop {
-    output: RetainedStyleValue,
-    input: RetainedStyleValue,
+    output: RetainedStyleValueData,
+    input: RetainedStyleValueData,
 }
 
 /// A Rust-owned array of retained linear() easing stops.
@@ -486,19 +598,30 @@ pub struct RetainedLinearEasingStopList {
 
 retained_list!(RetainedLinearEasingStopList, RetainedLinearEasingStop);
 
+/// The kind of one grid track list entry.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+// The C++ constructor supplies every variant through the FFI input.
+#[allow(dead_code)]
+pub enum GridTrackEntryKind {
+    LineNames,
+    Size,
+    MinMax,
+    Repeat,
+}
+
 /// Borrowed input description of one grid track list entry, used when creating a grid track
-/// size list. Kinds: 0 = line names, 1 = a single size, 2 = minmax, 3 = repeat with a nested
-/// entry list.
+/// size list.
 #[repr(C)]
 pub struct GridTrackEntryInput {
-    kind: u8,
+    kind: GridTrackEntryKind,
     names: *const usize,
     name_count: usize,
-    size_value: *const c_void,
-    min_value: *const c_void,
-    max_value: *const c_void,
+    size_value: *const StyleValueData,
+    min_value: *const StyleValueData,
+    max_value: *const StyleValueData,
     repeat_type: u8,
-    repeat_count: *const c_void,
+    repeat_count: *const StyleValueData,
     repeat_is_subgrid: bool,
     repeat_preserve_line_name_sets: bool,
     repeat_entries: *const GridTrackEntryInput,
@@ -515,17 +638,17 @@ pub struct RetainedGridTrackEntryList {
 /// A retained, Rust-owned grid track list entry (see [`GridTrackEntryInput`] for the kinds).
 #[repr(C)]
 pub struct RetainedGridTrackEntry {
-    kind: u8,
-    names: RetainedUtf16FlyStringList,
-    size_value: RetainedStyleValue,
-    min_value: RetainedStyleValue,
-    max_value: RetainedStyleValue,
-    repeat_type: u8,
-    repeat_count: RetainedStyleValue,
-    repeat_is_subgrid: bool,
-    repeat_preserve_line_name_sets: bool,
-    repeat_entries_pointer: *mut RetainedGridTrackEntry,
-    repeat_entries_length: usize,
+    pub(crate) kind: GridTrackEntryKind,
+    pub(crate) names: RetainedUtf16FlyStringList,
+    pub(crate) size_value: RetainedStyleValueData,
+    pub(crate) min_value: RetainedStyleValueData,
+    pub(crate) max_value: RetainedStyleValueData,
+    pub(crate) repeat_type: u8,
+    pub(crate) repeat_count: RetainedStyleValueData,
+    pub(crate) repeat_is_subgrid: bool,
+    pub(crate) repeat_preserve_line_name_sets: bool,
+    pub(crate) repeat_entries_pointer: *mut RetainedGridTrackEntry,
+    pub(crate) repeat_entries_length: usize,
 }
 
 impl Drop for RetainedGridTrackEntry {
@@ -541,7 +664,43 @@ impl Drop for RetainedGridTrackEntry {
     }
 }
 
+impl PartialEq for RetainedGridTrackEntry {
+    fn eq(&self, other: &Self) -> bool {
+        let repeat_entries = |entry: &Self| {
+            if entry.repeat_entries_pointer.is_null() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(entry.repeat_entries_pointer, entry.repeat_entries_length) }
+            }
+        };
+        self.kind == other.kind
+            && self.names == other.names
+            && self.size_value == other.size_value
+            && self.min_value == other.min_value
+            && self.max_value == other.max_value
+            && self.repeat_type == other.repeat_type
+            && self.repeat_count == other.repeat_count
+            && self.repeat_is_subgrid == other.repeat_is_subgrid
+            && self.repeat_preserve_line_name_sets == other.repeat_preserve_line_name_sets
+            && repeat_entries(self) == repeat_entries(other)
+    }
+}
+
 impl RetainedGridTrackEntryList {
+    pub(crate) fn as_slice(&self) -> &[RetainedGridTrackEntry] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+    }
+
+    pub(crate) fn from_retained_entries(entries: Vec<RetainedGridTrackEntry>) -> Self {
+        let slice = entries.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedGridTrackEntry;
+        Self { pointer, length }
+    }
+
     /// Takes ownership of the entries' retained values and names, recursively for nested
     /// repeat lists.
     ///
@@ -554,19 +713,11 @@ impl RetainedGridTrackEntryList {
                 RetainedGridTrackEntry {
                     kind: input.kind,
                     names: unsafe { RetainedUtf16FlyStringList::from_raw(input.names, input.name_count) },
-                    size_value: RetainedStyleValue {
-                        pointer: input.size_value,
-                    },
-                    min_value: RetainedStyleValue {
-                        pointer: input.min_value,
-                    },
-                    max_value: RetainedStyleValue {
-                        pointer: input.max_value,
-                    },
+                    size_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(input.size_value) },
+                    min_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(input.min_value) },
+                    max_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(input.max_value) },
                     repeat_type: input.repeat_type,
-                    repeat_count: RetainedStyleValue {
-                        pointer: input.repeat_count,
-                    },
+                    repeat_count: unsafe { RetainedStyleValueData::from_retained_optional_pointer(input.repeat_count) },
                     repeat_is_subgrid: input.repeat_is_subgrid,
                     repeat_preserve_line_name_sets: input.repeat_preserve_line_name_sets,
                     repeat_entries_pointer: {
@@ -587,13 +738,23 @@ impl RetainedGridTrackEntryList {
     }
 }
 
+impl RetainedGridTrackEntry {
+    pub(crate) fn repeat_entries(&self) -> &[RetainedGridTrackEntry] {
+        if self.repeat_entries_pointer.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.repeat_entries_pointer, self.repeat_entries_length) }
+    }
+}
+
 retained_list_drop!(RetainedGridTrackEntryList);
 
 /// A retained polygon point: the x and y style values.
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedShapePoint {
-    x: RetainedStyleValue,
-    y: RetainedStyleValue,
+    x: RetainedStyleValueData,
+    y: RetainedStyleValueData,
 }
 
 /// A Rust-owned array of retained polygon points.
@@ -608,6 +769,7 @@ retained_list!(RetainedShapePointList, RetainedShapePoint);
 /// An accepted numeric range for one value type (the C++ `enum class ValueType : u8`, opaque
 /// to Rust).
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct RetainedNumericRangeByType {
     value_type: u8,
     min: f64,
@@ -634,22 +796,77 @@ pub struct RetainedNumericRangeList {
 retained_list!(RetainedNumericRangeList, RetainedNumericRangeByType);
 
 impl RetainedNumericRangeList {
+    pub(crate) fn empty() -> Self {
+        Self {
+            pointer: std::ptr::null_mut(),
+            length: 0,
+        }
+    }
+
     pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
         if self.pointer.is_null() {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
     }
+
+    pub(crate) fn clone_owned(&self) -> Self {
+        let ranges = self
+            .as_slice()
+            .iter()
+            .map(|range| RetainedNumericRangeByType {
+                value_type: range.value_type,
+                min: range.min,
+                max: range.max,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let length = ranges.len();
+        let pointer = Box::into_raw(ranges) as *mut RetainedNumericRangeByType;
+        Self { pointer, length }
+    }
 }
+
+macro_rules! retained_list_partial_eq {
+    ($list:ty, $element:ty) => {
+        impl PartialEq for $list {
+            fn eq(&self, other: &Self) -> bool {
+                let as_slice = |list: &Self| -> &[$element] {
+                    if list.pointer.is_null() {
+                        &[]
+                    } else {
+                        unsafe { std::slice::from_raw_parts(list.pointer, list.length) }
+                    }
+                };
+                as_slice(self) == as_slice(other)
+            }
+        }
+    };
+}
+
+retained_list_partial_eq!(RetainedStyleValueDataList, RetainedStyleValueData);
+retained_list_partial_eq!(RetainedPropertyIdList, u16);
+retained_list_partial_eq!(RetainedRequestUrlModifierList, RetainedRequestUrlModifier);
+retained_list_partial_eq!(RetainedByteList, u8);
+retained_list_partial_eq!(RetainedUtf16FlyStringList, RetainedUtf16FlyString);
+retained_list_partial_eq!(RetainedCounterDefinitionList, RetainedCounterDefinition);
+retained_list_partial_eq!(RetainedImageSetOptionList, RetainedImageSetOption);
+retained_list_partial_eq!(RetainedColorStopList, RetainedColorStop);
+retained_list_partial_eq!(RetainedGridAreaList, RetainedGridArea);
+retained_list_partial_eq!(RetainedLinearEasingStopList, RetainedLinearEasingStop);
+retained_list_partial_eq!(RetainedGridTrackEntryList, RetainedGridTrackEntry);
+retained_list_partial_eq!(RetainedShapePointList, RetainedShapePoint);
+retained_list_partial_eq!(RetainedNumericRangeList, RetainedNumericRangeByType);
 
 /// The shared leading fields of every color variant payload: the optional color type and the
 /// color syntax. Placing this first in each color payload lets C++ read it without knowing
 /// which color variant it has.
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct ColorBase {
-    has_color_type: bool,
-    color_type: u8,
-    color_syntax: u8,
+    pub(crate) has_color_type: bool,
+    pub(crate) color_type: u8,
+    pub(crate) color_syntax: u8,
 }
 
 /// The data of a single immutable CSS style value.
@@ -659,6 +876,7 @@ pub struct ColorBase {
 #[repr(C, u8)]
 // NB: Variant payload fields are only read by C++ through the exposed layout.
 #[allow(dead_code)]
+#[derive(PartialEq)]
 pub enum StyleValueData {
     /// A CSS keyword. The value is the generated C++ `enum class Keyword : u16`, opaque to Rust.
     Keyword { keyword: u16 },
@@ -685,18 +903,17 @@ pub enum StyleValueData {
     /// uses the fill rule and the retained serialized path data string.
     BasicShape {
         kind: u8,
-        v0: RetainedStyleValue,
-        v1: RetainedStyleValue,
-        v2: RetainedStyleValue,
-        v3: RetainedStyleValue,
-        v4: RetainedStyleValue,
+        v0: RetainedStyleValueData,
+        v1: RetainedStyleValueData,
+        v2: RetainedStyleValueData,
+        v3: RetainedStyleValueData,
+        v4: RetainedStyleValueData,
         fill_rule: u8,
         points: RetainedShapePointList,
         path_string: RetainedUtf16FlyString,
     },
-    /// A calc() or other math function: the retained calculation node tree root, the resolved
-    /// numeric type as its raw bytes (a trivially copyable C++ NumericType, opaque to Rust)
-    /// and the parse-time calculation context.
+    /// A calc() or other math function: the retained calculation node tree root, its resolved
+    /// numeric type, and the parse-time calculation context.
     Calculated {
         rust_calculation: crate::calc::CalcNodeHandle,
         /// The resolve-against target, base-mapped at creation: whether one
@@ -704,7 +921,7 @@ pub enum StyleValueData {
         /// index in the numeric type order.
         resolve_as_is_number: bool,
         resolve_as_base: u8,
-        resolved_type: RetainedByteList,
+        resolved_type: crate::calc::FfiNumericType,
         has_percentages_resolve_as: bool,
         percentages_resolve_as: u8,
         resolve_numbers_as_integers: bool,
@@ -712,19 +929,19 @@ pub enum StyleValueData {
     },
     /// A CSS `<ratio>`, e.g. `16 / 9`. The numerator and denominator are style values.
     Ratio {
-        numerator: RetainedStyleValue,
-        denominator: RetainedStyleValue,
+        numerator: RetainedStyleValueData,
+        denominator: RetainedStyleValueData,
     },
     /// A unicode-range, e.g. `U+0025-00FF`.
     UnicodeRange { min_code_point: u32, max_code_point: u32 },
     /// A CSS `<opacity-value>`: a number, percentage or calculated style value.
-    OpacityValue { value: RetainedStyleValue },
+    OpacityValue { value: RetainedStyleValueData },
     /// One edge of a CSS `<position>`: an optional edge keyword (the C++ `enum class
     /// PositionEdge : u8`, opaque to Rust) and an optional offset style value (null when absent).
     Edge {
         has_edge: bool,
         edge: u8,
-        offset: RetainedStyleValue,
+        offset: RetainedStyleValueData,
     },
     /// The guaranteed-invalid value: https://drafts.csswg.org/css-variables/#guaranteed-invalid-value
     GuaranteedInvalid,
@@ -737,49 +954,50 @@ pub enum StyleValueData {
     /// contrast-color() with its retained color style value.
     ContrastColor {
         color_base: ColorBase,
-        color: RetainedStyleValue,
+        color: RetainedStyleValueData,
     },
     /// superellipse() with its retained parameter style value.
-    Superellipse { parameter: RetainedStyleValue },
+    Superellipse { parameter: RetainedStyleValueData },
     /// A pending-substitution value retaining the shorthand value it came from.
     PendingSubstitution {
-        original_shorthand_value: RetainedStyleValue,
+        original_shorthand_value: RetainedStyleValueData,
     },
     /// scrollbar-color with retained thumb and track color values.
     ScrollbarColor {
-        thumb_color: RetainedStyleValue,
-        track_color: RetainedStyleValue,
+        thumb_color: RetainedStyleValueData,
+        track_color: RetainedStyleValueData,
     },
     /// rect() with four retained edge style values.
     Rect {
-        top: RetainedStyleValue,
-        right: RetainedStyleValue,
-        bottom: RetainedStyleValue,
-        left: RetainedStyleValue,
+        top: RetainedStyleValueData,
+        right: RetainedStyleValueData,
+        bottom: RetainedStyleValueData,
+        left: RetainedStyleValueData,
     },
     /// A CSS `<string>`.
     String { string: RetainedUtf16FlyString },
     /// An unrecognized CSS function, kept as its name and argument value.
     Function {
         name: RetainedUtf16FlyString,
-        value: RetainedStyleValue,
+        value: RetainedStyleValueData,
     },
     /// An OpenType tag with its value, from font-feature-settings or font-variation-settings.
     /// The mode is the C++ OpenTypeTaggedStyleValue::Mode, opaque to Rust.
     OpenTypeTagged {
         mode: u8,
         tag: RetainedUtf16FlyString,
-        value: RetainedStyleValue,
+        packed_tag: u32,
+        value: RetainedStyleValueData,
     },
     /// font-style: a keyword (the C++ `enum class FontStyleKeyword : u8`, opaque to Rust) and
     /// an optional oblique angle style value (null when absent).
     FontStyle {
         font_style: u8,
-        angle_value: RetainedStyleValue,
+        angle_value: RetainedStyleValueData,
     },
     /// text-indent: a length-percentage style value plus the hanging and each-line flags.
     TextIndent {
-        length_percentage: RetainedStyleValue,
+        length_percentage: RetainedStyleValueData,
         hanging: bool,
         each_line: bool,
     },
@@ -788,25 +1006,25 @@ pub enum StyleValueData {
     OverflowClipMargin {
         has_visual_box: bool,
         visual_box: u8,
-        offset: RetainedStyleValue,
+        offset: RetainedStyleValueData,
     },
     /// sibling-count() or sibling-index(). Both fields are C++ `enum class ... : u8` values,
     /// opaque to Rust.
     TreeCountingFunction { function: u8, computed_type: u8 },
     /// background-size with its two retained size style values.
     BackgroundSize {
-        size_x: RetainedStyleValue,
-        size_y: RetainedStyleValue,
+        size_x: RetainedStyleValueData,
+        size_y: RetainedStyleValueData,
     },
     /// A background repeat-style. Both fields are the C++ `enum class Repetition : u8`, opaque
     /// to Rust.
     RepeatStyle { repeat_x: u8, repeat_y: u8 },
-    /// border-image-slice: four retained offset style values and the fill keyword.
+    /// border-image-slice: four retained offset data allocations and the fill keyword.
     BorderImageSlice {
-        top: RetainedStyleValue,
-        right: RetainedStyleValue,
-        bottom: RetainedStyleValue,
-        left: RetainedStyleValue,
+        top: RetainedStyleValueData,
+        right: RetainedStyleValueData,
+        bottom: RetainedStyleValueData,
+        left: RetainedStyleValueData,
         fill: bool,
     },
     /// anchor-size(): an optional anchor name, an optional size keyword (the C++ `enum class
@@ -816,36 +1034,36 @@ pub enum StyleValueData {
         anchor_name: RetainedUtf16FlyString,
         has_anchor_size: bool,
         anchor_size: u8,
-        fallback_value: RetainedStyleValue,
+        fallback_value: RetainedStyleValueData,
     },
     /// anchor(): an optional anchor name, the retained side style value and an optional
     /// retained fallback value.
     Anchor {
         has_anchor_name: bool,
         anchor_name: RetainedUtf16FlyString,
-        anchor_side: RetainedStyleValue,
-        fallback_value: RetainedStyleValue,
+        anchor_side: RetainedStyleValueData,
+        fallback_value: RetainedStyleValueData,
     },
     /// A CSS `<position>` with its two retained edge style values.
     Position {
-        edge_x: RetainedStyleValue,
-        edge_y: RetainedStyleValue,
+        edge_x: RetainedStyleValueData,
+        edge_y: RetainedStyleValueData,
     },
     /// A shadow. The type and placement are C++ enums, opaque to Rust; the color, blur radius
     /// and spread distance are optional retained style values (null when absent).
     Shadow {
         shadow_type: u8,
-        color: RetainedStyleValue,
-        offset_x: RetainedStyleValue,
-        offset_y: RetainedStyleValue,
-        blur_radius: RetainedStyleValue,
-        spread_distance: RetainedStyleValue,
+        color: RetainedStyleValueData,
+        offset_x: RetainedStyleValueData,
+        offset_y: RetainedStyleValueData,
+        blur_radius: RetainedStyleValueData,
+        spread_distance: RetainedStyleValueData,
         placement: u8,
     },
     /// content with its retained content list and optional alt-text list (null when absent).
     Content {
-        content: RetainedStyleValue,
-        alt_text: RetainedStyleValue,
+        content: RetainedStyleValueData,
+        alt_text: RetainedStyleValueData,
     },
     /// A @counter-style system descriptor: a plain system keyword (kind 0, the C++ `enum class
     /// CounterStyleSystem : u8`, opaque to Rust), fixed with an optional retained first symbol
@@ -853,7 +1071,7 @@ pub enum StyleValueData {
     CounterStyleSystem {
         kind: u8,
         system: u8,
-        first_symbol: RetainedStyleValue,
+        first_symbol: RetainedStyleValueData,
         name: RetainedUtf16FlyString,
     },
     /// A counter style reference: either a retained counter style name, or a symbols() function
@@ -870,23 +1088,23 @@ pub enum StyleValueData {
     /// color syntax.
     ColorFunction {
         color_base: ColorBase,
-        channel_0: RetainedStyleValue,
-        channel_1: RetainedStyleValue,
-        channel_2: RetainedStyleValue,
-        alpha: RetainedStyleValue,
+        channel_0: RetainedStyleValueData,
+        channel_1: RetainedStyleValueData,
+        channel_2: RetainedStyleValueData,
+        alpha: RetainedStyleValueData,
         has_name: bool,
         name: RetainedUtf16FlyString,
-        origin_color: RetainedStyleValue,
+        origin_color: RetainedStyleValueData,
     },
     /// color-mix() with its optional retained interpolation method value and two components,
     /// each a retained color with an optional retained percentage.
     ColorMix {
         color_base: ColorBase,
-        color_interpolation_method: RetainedStyleValue,
-        first_color: RetainedStyleValue,
-        first_percentage: RetainedStyleValue,
-        second_color: RetainedStyleValue,
-        second_percentage: RetainedStyleValue,
+        color_interpolation_method: RetainedStyleValueData,
+        first_color: RetainedStyleValueData,
+        first_percentage: RetainedStyleValueData,
+        second_color: RetainedStyleValueData,
+        second_percentage: RetainedStyleValueData,
     },
     /// The shared data of every color style value: an optional color type and the color syntax
     /// (both C++ enums on ColorStyleValue, opaque to Rust).
@@ -895,23 +1113,23 @@ pub enum StyleValueData {
     /// retained interpolation method and the color syntax. Enums are C++ types, opaque to Rust.
     LinearGradient {
         has_direction_value: bool,
-        direction_value: RetainedStyleValue,
+        direction_value: RetainedStyleValueData,
         side_or_corner: u8,
         color_stop_list: RetainedColorStopList,
         gradient_type: u8,
         repeating: bool,
-        color_interpolation_method: RetainedStyleValue,
+        color_interpolation_method: RetainedStyleValueData,
         color_syntax: u8,
     },
     /// conic-gradient(): an optional retained from-angle, the retained position, the retained
     /// color stops, the repeating flag, an optional retained interpolation method and the color
     /// syntax (a C++ enum, opaque to Rust).
     ConicGradient {
-        from_angle: RetainedStyleValue,
-        position: RetainedStyleValue,
+        from_angle: RetainedStyleValueData,
+        position: RetainedStyleValueData,
         color_stop_list: RetainedColorStopList,
         repeating: bool,
-        color_interpolation_method: RetainedStyleValue,
+        color_interpolation_method: RetainedStyleValueData,
         color_syntax: u8,
     },
     /// radial-gradient(): the ending shape (a C++ enum, opaque to Rust), the retained size and
@@ -919,11 +1137,11 @@ pub enum StyleValueData {
     /// interpolation method and the color syntax.
     RadialGradient {
         ending_shape: u8,
-        size: RetainedStyleValue,
-        position: RetainedStyleValue,
+        size: RetainedStyleValueData,
+        position: RetainedStyleValueData,
         color_stop_list: RetainedColorStopList,
         repeating: bool,
-        color_interpolation_method: RetainedStyleValue,
+        color_interpolation_method: RetainedStyleValueData,
         color_syntax: u8,
     },
     /// A url() image. Only the CSS URL is immutable value data; the style sheet attachment and
@@ -941,19 +1159,19 @@ pub enum StyleValueData {
     Easing {
         kind: u8,
         linear_stops: RetainedLinearEasingStopList,
-        x1: RetainedStyleValue,
-        y1: RetainedStyleValue,
-        x2: RetainedStyleValue,
-        y2: RetainedStyleValue,
-        number_of_intervals: RetainedStyleValue,
+        x1: RetainedStyleValueData,
+        y1: RetainedStyleValueData,
+        x2: RetainedStyleValueData,
+        y2: RetainedStyleValueData,
+        number_of_intervals: RetainedStyleValueData,
         step_position: u8,
     },
     /// A cursor with its retained image value and optional retained hotspot coordinates (both
     /// null or both non-null).
     Cursor {
-        image: RetainedStyleValue,
-        x: RetainedStyleValue,
-        y: RetainedStyleValue,
+        image: RetainedStyleValueData,
+        x: RetainedStyleValueData,
+        y: RetainedStyleValueData,
     },
     /// A grid track size list: the subgrid and preserve-line-name-sets flags and the retained
     /// track entries.
@@ -976,7 +1194,7 @@ pub enum StyleValueData {
     /// optional retained line value and an optional retained name.
     GridTrackPlacement {
         kind: u8,
-        value: RetainedStyleValue,
+        value: RetainedStyleValueData,
         has_name: bool,
         name: RetainedUtf16FlyString,
     },
@@ -985,19 +1203,19 @@ pub enum StyleValueData {
     Counter {
         function: u8,
         counter_name: RetainedUtf16FlyString,
-        counter_style: RetainedStyleValue,
+        counter_style: RetainedStyleValueData,
         join_string: RetainedUtf16FlyString,
     },
     /// light-dark() with its two retained color style values.
     LightDark {
         color_base: ColorBase,
-        light: RetainedStyleValue,
-        dark: RetainedStyleValue,
+        light: RetainedStyleValueData,
+        dark: RetainedStyleValueData,
     },
     /// random-value-sharing: an optional retained fixed value (null when absent), the auto flag,
     /// an optional name and the element-shared flag.
     RandomValueSharing {
-        fixed_value: RetainedStyleValue,
+        fixed_value: RetainedStyleValueData,
         is_auto: bool,
         has_name: bool,
         name: RetainedUtf16FlyString,
@@ -1016,12 +1234,12 @@ pub enum StyleValueData {
     /// A list of style values. The separator and collapsible flag come from the C++
     /// StyleValueList enums, opaque to Rust.
     ValueList {
-        values: RetainedStyleValueList,
+        values: RetainedStyleValueDataList,
         separator: u8,
         collapsible: bool,
     },
     /// A tuple of optional style values (null entries represent absent optionals).
-    Tuple { values: RetainedStyleValueList },
+    Tuple { values: RetainedStyleValueDataList },
     /// A display value: the raw bytes of the C++ Display value type (a tag plus a union of
     /// packed u8 enums), opaque to Rust.
     Display { raw: u32 },
@@ -1033,7 +1251,8 @@ pub enum StyleValueData {
     },
     /// An unresolved value containing arbitrary substitution functions, kept as its retained
     /// source text, an optional normalized comparison text (empty when absent), the presence
-    /// flags of each substitution function and the attr-taint flag.
+    /// flags of each substitution function, the attr-taint flag, and an optional parsed value
+    /// cached for an attr()-tainted registered custom property.
     Unresolved {
         source_text: RetainedReadableString,
         value_comparison_text: RetainedReadableString,
@@ -1044,6 +1263,7 @@ pub enum StyleValueData {
         presence_inherit: bool,
         presence_var: bool,
         contains_attr_tainted_values: bool,
+        parsed_value: RetainedStyleValueData,
     },
     /// A CSS url() or src() with its retained URL string, type (the C++ URL::Type, opaque to
     /// Rust) and request URL modifiers.
@@ -1057,7 +1277,7 @@ pub enum StyleValueData {
     /// technologies (C++ `enum class FontTech : u8`, opaque to Rust).
     FontSource {
         is_local: bool,
-        local_name: RetainedStyleValue,
+        local_name: RetainedStyleValueData,
         url: RetainedString,
         url_type: u8,
         url_modifiers: RetainedRequestUrlModifierList,
@@ -1071,39 +1291,39 @@ pub enum StyleValueData {
         component_count: u8,
         is_extent_0: bool,
         extent_0: u8,
-        value_0: RetainedStyleValue,
+        value_0: RetainedStyleValueData,
         is_extent_1: bool,
         extent_1: u8,
-        value_1: RetainedStyleValue,
+        value_1: RetainedStyleValueData,
     },
     /// A transform function with its argument values. The property (PropertyID : u16) and
     /// function are C++ enums, opaque to Rust.
     Transformation {
         property: u16,
         transform_function: u8,
-        values: RetainedStyleValueList,
+        values: RetainedStyleValueDataList,
     },
     /// A shorthand property value: the shorthand id, its longhand ids (both C++
     /// `enum class PropertyID : u16`, opaque to Rust) and their values.
     Shorthand {
         shorthand_property: u16,
         sub_properties: RetainedPropertyIdList,
-        values: RetainedStyleValueList,
+        values: RetainedStyleValueDataList,
     },
     /// A CSS `<custom-ident>`.
     CustomIdent { custom_ident: RetainedUtf16FlyString },
-    /// A border-radius rect of four retained corner radius style values.
+    /// A border-radius rect of four retained corner radius data allocations.
     BorderRadiusRect {
-        top_left: RetainedStyleValue,
-        top_right: RetainedStyleValue,
-        bottom_right: RetainedStyleValue,
-        bottom_left: RetainedStyleValue,
+        top_left: RetainedStyleValueData,
+        top_right: RetainedStyleValueData,
+        bottom_right: RetainedStyleValueData,
+        bottom_left: RetainedStyleValueData,
     },
     /// A single corner radius: the horizontal and vertical radii and whether they differ.
     BorderRadius {
         is_elliptical: bool,
-        horizontal_radius: RetainedStyleValue,
-        vertical_radius: RetainedStyleValue,
+        horizontal_radius: RetainedStyleValueData,
+        vertical_radius: RetainedStyleValueData,
     },
     /// A filter function. Kinds: blur (0, value = radius), drop-shadow (1, value = shadow),
     /// hue-rotate (2, value = angle), color (3, value = amount, with the color operation).
@@ -1111,7 +1331,7 @@ pub enum StyleValueData {
     Filter {
         kind: u8,
         color_operation: u8,
-        value: RetainedStyleValue,
+        value: RetainedStyleValueData,
     },
 }
 
@@ -1160,65 +1380,65 @@ impl StyleValueData {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_keyword(keyword: u16) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Keyword { keyword })))
+pub extern "C" fn rust_style_value_create_keyword(keyword: u16) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Keyword { keyword })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_number(value: f64) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Number { value })))
+pub extern "C" fn rust_style_value_create_number(value: f64) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Number { value })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_integer(value: i32) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Integer { value })))
+pub extern "C" fn rust_style_value_create_integer(value: i32) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Integer { value })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_angle(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Angle { value, unit })))
+pub extern "C" fn rust_style_value_create_angle(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Angle { value, unit })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_flex(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Flex { value, unit })))
+pub extern "C" fn rust_style_value_create_flex(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Flex { value, unit })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_frequency(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Frequency { value, unit })))
+pub extern "C" fn rust_style_value_create_frequency(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Frequency { value, unit })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_length(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Length { value, unit })))
+pub extern "C" fn rust_style_value_create_length(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Length { value, unit })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_percentage(value: f64) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Percentage { value })))
+pub extern "C" fn rust_style_value_create_percentage(value: f64) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Percentage { value })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_resolution(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Resolution { value, unit })))
+pub extern "C" fn rust_style_value_create_resolution(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Resolution { value, unit })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_time(value: f64, unit: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Time { value, unit })))
+pub extern "C" fn rust_style_value_create_time(value: f64, unit: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Time { value, unit })))
 }
 
 /// Takes ownership of one strong reference to each of the numerator and denominator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_ratio(
-    numerator: *const c_void,
-    denominator: *const c_void,
-) -> *mut StyleValueData {
+    numerator: *const StyleValueData,
+    denominator: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Ratio {
-            numerator: RetainedStyleValue { pointer: numerator },
-            denominator: RetainedStyleValue { pointer: denominator },
+        Arc::into_raw(Arc::new(StyleValueData::Ratio {
+            numerator: unsafe { RetainedStyleValueData::from_retained_pointer(numerator) },
+            denominator: unsafe { RetainedStyleValueData::from_retained_pointer(denominator) },
         }))
     })
 }
@@ -1227,9 +1447,9 @@ pub unsafe extern "C" fn rust_style_value_create_ratio(
 pub extern "C" fn rust_style_value_create_unicode_range(
     min_code_point: u32,
     max_code_point: u32,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::UnicodeRange {
+        Arc::into_raw(Arc::new(StyleValueData::UnicodeRange {
             min_code_point,
             max_code_point,
         }))
@@ -1238,48 +1458,51 @@ pub extern "C" fn rust_style_value_create_unicode_range(
 
 /// Takes ownership of one strong reference to the value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const c_void) -> *mut StyleValueData {
+pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const StyleValueData) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::OpacityValue {
-            value: RetainedStyleValue { pointer: value },
+        Arc::into_raw(Arc::new(StyleValueData::OpacityValue {
+            value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to the offset if it is non-null.
+/// Takes ownership of one strong reference to the offset data if it is non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_edge(
     has_edge: bool,
     edge: u8,
-    offset: *const c_void,
-) -> *mut StyleValueData {
+    offset: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Edge {
+        Arc::into_raw(Arc::new(StyleValueData::Edge {
             has_edge,
             edge,
-            offset: RetainedStyleValue { pointer: offset },
+            offset: unsafe { RetainedStyleValueData::from_retained_optional_pointer(offset) },
         }))
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_guaranteed_invalid() -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::GuaranteedInvalid)))
+pub extern "C" fn rust_style_value_create_guaranteed_invalid() -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::GuaranteedInvalid)))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_empty_optional() -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::EmptyOptional)))
+pub extern "C" fn rust_style_value_create_empty_optional() -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::EmptyOptional)))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_grid_auto_flow(row: bool, dense: bool) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::GridAutoFlow { row, dense })))
+pub extern "C" fn rust_style_value_create_grid_auto_flow(row: bool, dense: bool) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::GridAutoFlow { row, dense })))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_text_underline_position(horizontal: u8, vertical: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::TextUnderlinePosition { horizontal, vertical })))
+pub extern "C" fn rust_style_value_create_text_underline_position(
+    horizontal: u8,
+    vertical: u8,
+) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::TextUnderlinePosition { horizontal, vertical })))
 }
 
 /// Takes ownership of one strong reference to the color.
@@ -1288,26 +1511,28 @@ pub unsafe extern "C" fn rust_style_value_create_contrast_color(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    color: *const c_void,
-) -> *mut StyleValueData {
+    color: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ContrastColor {
+        Arc::into_raw(Arc::new(StyleValueData::ContrastColor {
             color_base: ColorBase {
                 has_color_type,
                 color_type,
                 color_syntax,
             },
-            color: RetainedStyleValue { pointer: color },
+            color: unsafe { RetainedStyleValueData::from_retained_pointer(color) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to the parameter.
+/// Takes ownership of one strong reference to the parameter data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_superellipse(parameter: *const c_void) -> *mut StyleValueData {
+pub unsafe extern "C" fn rust_style_value_create_superellipse(
+    parameter: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Superellipse {
-            parameter: RetainedStyleValue { pointer: parameter },
+        Arc::into_raw(Arc::new(StyleValueData::Superellipse {
+            parameter: unsafe { RetainedStyleValueData::from_retained_pointer(parameter) },
         }))
     })
 }
@@ -1315,12 +1540,12 @@ pub unsafe extern "C" fn rust_style_value_create_superellipse(parameter: *const 
 /// Takes ownership of one strong reference to the original shorthand value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_pending_substitution(
-    original_shorthand_value: *const c_void,
-) -> *mut StyleValueData {
+    original_shorthand_value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::PendingSubstitution {
-            original_shorthand_value: RetainedStyleValue {
-                pointer: original_shorthand_value,
+        Arc::into_raw(Arc::new(StyleValueData::PendingSubstitution {
+            original_shorthand_value: unsafe {
+                RetainedStyleValueData::from_retained_pointer(original_shorthand_value)
             },
         }))
     })
@@ -1329,31 +1554,31 @@ pub unsafe extern "C" fn rust_style_value_create_pending_substitution(
 /// Takes ownership of one strong reference to each color.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_scrollbar_color(
-    thumb_color: *const c_void,
-    track_color: *const c_void,
-) -> *mut StyleValueData {
+    thumb_color: *const StyleValueData,
+    track_color: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ScrollbarColor {
-            thumb_color: RetainedStyleValue { pointer: thumb_color },
-            track_color: RetainedStyleValue { pointer: track_color },
+        Arc::into_raw(Arc::new(StyleValueData::ScrollbarColor {
+            thumb_color: unsafe { RetainedStyleValueData::from_retained_pointer(thumb_color) },
+            track_color: unsafe { RetainedStyleValueData::from_retained_pointer(track_color) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to each edge.
+/// Takes ownership of one strong reference to each edge data allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_rect(
-    top: *const c_void,
-    right: *const c_void,
-    bottom: *const c_void,
-    left: *const c_void,
-) -> *mut StyleValueData {
+    top: *const StyleValueData,
+    right: *const StyleValueData,
+    bottom: *const StyleValueData,
+    left: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Rect {
-            top: RetainedStyleValue { pointer: top },
-            right: RetainedStyleValue { pointer: right },
-            bottom: RetainedStyleValue { pointer: bottom },
-            left: RetainedStyleValue { pointer: left },
+        Arc::into_raw(Arc::new(StyleValueData::Rect {
+            top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
+            right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
+            bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
+            left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
         }))
     })
 }
@@ -1363,60 +1588,56 @@ pub unsafe extern "C" fn rust_style_value_create_rect(
 pub unsafe extern "C" fn rust_style_value_create_filter(
     kind: u8,
     color_operation: u8,
-    value: *const c_void,
-) -> *mut StyleValueData {
+    value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Filter {
+        Arc::into_raw(Arc::new(StyleValueData::Filter {
             kind,
             color_operation,
-            value: RetainedStyleValue { pointer: value },
+            value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to each radius.
+/// Takes ownership of one strong reference to each radius data allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_border_radius(
     is_elliptical: bool,
-    horizontal_radius: *const c_void,
-    vertical_radius: *const c_void,
-) -> *mut StyleValueData {
+    horizontal_radius: *const StyleValueData,
+    vertical_radius: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::BorderRadius {
+        Arc::into_raw(Arc::new(StyleValueData::BorderRadius {
             is_elliptical,
-            horizontal_radius: RetainedStyleValue {
-                pointer: horizontal_radius,
-            },
-            vertical_radius: RetainedStyleValue {
-                pointer: vertical_radius,
-            },
+            horizontal_radius: unsafe { RetainedStyleValueData::from_retained_pointer(horizontal_radius) },
+            vertical_radius: unsafe { RetainedStyleValueData::from_retained_pointer(vertical_radius) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to each corner radius.
+/// Takes ownership of one strong reference to each corner radius data allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_border_radius_rect(
-    top_left: *const c_void,
-    top_right: *const c_void,
-    bottom_right: *const c_void,
-    bottom_left: *const c_void,
-) -> *mut StyleValueData {
+    top_left: *const StyleValueData,
+    top_right: *const StyleValueData,
+    bottom_right: *const StyleValueData,
+    bottom_left: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::BorderRadiusRect {
-            top_left: RetainedStyleValue { pointer: top_left },
-            top_right: RetainedStyleValue { pointer: top_right },
-            bottom_right: RetainedStyleValue { pointer: bottom_right },
-            bottom_left: RetainedStyleValue { pointer: bottom_left },
+        Arc::into_raw(Arc::new(StyleValueData::BorderRadiusRect {
+            top_left: unsafe { RetainedStyleValueData::from_retained_pointer(top_left) },
+            top_right: unsafe { RetainedStyleValueData::from_retained_pointer(top_right) },
+            bottom_right: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_right) },
+            bottom_left: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_left) },
         }))
     })
 }
 
 /// Takes ownership of one leaked reference to the string.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_string(string: usize) -> *mut StyleValueData {
+pub extern "C" fn rust_style_value_create_string(string: usize) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::String {
+        Arc::into_raw(Arc::new(StyleValueData::String {
             string: RetainedUtf16FlyString { raw: string },
         }))
     })
@@ -1424,51 +1645,56 @@ pub extern "C" fn rust_style_value_create_string(string: usize) -> *mut StyleVal
 
 /// Takes ownership of one leaked reference to the string.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_custom_ident(custom_ident: usize) -> *mut StyleValueData {
+pub extern "C" fn rust_style_value_create_custom_ident(custom_ident: usize) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::CustomIdent {
+        Arc::into_raw(Arc::new(StyleValueData::CustomIdent {
             custom_ident: RetainedUtf16FlyString { raw: custom_ident },
         }))
     })
 }
 
-/// Takes ownership of one leaked reference to the name and one strong reference to the value.
+/// Takes ownership of one leaked reference to the name and one strong reference to the value data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_function(name: usize, value: *const c_void) -> *mut StyleValueData {
+pub unsafe extern "C" fn rust_style_value_create_function(
+    name: usize,
+    value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Function {
+        Arc::into_raw(Arc::new(StyleValueData::Function {
             name: RetainedUtf16FlyString { raw: name },
-            value: RetainedStyleValue { pointer: value },
+            value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
         }))
     })
 }
 
-/// Takes ownership of one leaked reference to the tag and one strong reference to the value.
+/// Takes ownership of one leaked reference to the tag and one strong reference to the value data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_open_type_tagged(
     mode: u8,
     tag: usize,
-    value: *const c_void,
-) -> *mut StyleValueData {
+    packed_tag: u32,
+    value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::OpenTypeTagged {
+        Arc::into_raw(Arc::new(StyleValueData::OpenTypeTagged {
             mode,
             tag: RetainedUtf16FlyString { raw: tag },
-            value: RetainedStyleValue { pointer: value },
+            packed_tag,
+            value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to the angle value if it is non-null.
+/// Takes ownership of one strong reference to the angle value data if it is non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_font_style(
     font_style: u8,
-    angle_value: *const c_void,
-) -> *mut StyleValueData {
+    angle_value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::FontStyle {
+        Arc::into_raw(Arc::new(StyleValueData::FontStyle {
             font_style,
-            angle_value: RetainedStyleValue { pointer: angle_value },
+            angle_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(angle_value) },
         }))
     })
 }
@@ -1476,33 +1702,31 @@ pub unsafe extern "C" fn rust_style_value_create_font_style(
 /// Takes ownership of one strong reference to the length-percentage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_text_indent(
-    length_percentage: *const c_void,
+    length_percentage: *const StyleValueData,
     hanging: bool,
     each_line: bool,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::TextIndent {
-            length_percentage: RetainedStyleValue {
-                pointer: length_percentage,
-            },
+        Arc::into_raw(Arc::new(StyleValueData::TextIndent {
+            length_percentage: unsafe { RetainedStyleValueData::from_retained_pointer(length_percentage) },
             hanging,
             each_line,
         }))
     })
 }
 
-/// Takes ownership of one strong reference to the offset.
+/// Takes ownership of one strong reference to the offset data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_overflow_clip_margin(
     has_visual_box: bool,
     visual_box: u8,
-    offset: *const c_void,
-) -> *mut StyleValueData {
+    offset: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::OverflowClipMargin {
+        Arc::into_raw(Arc::new(StyleValueData::OverflowClipMargin {
             has_visual_box,
             visual_box,
-            offset: RetainedStyleValue { pointer: offset },
+            offset: unsafe { RetainedStyleValueData::from_retained_pointer(offset) },
         }))
     })
 }
@@ -1511,9 +1735,9 @@ pub unsafe extern "C" fn rust_style_value_create_overflow_clip_margin(
 pub extern "C" fn rust_style_value_create_tree_counting_function(
     function: u8,
     computed_type: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::TreeCountingFunction {
+        Arc::into_raw(Arc::new(StyleValueData::TreeCountingFunction {
             function,
             computed_type,
         }))
@@ -1523,37 +1747,37 @@ pub extern "C" fn rust_style_value_create_tree_counting_function(
 /// Takes ownership of one strong reference to each size.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_background_size(
-    size_x: *const c_void,
-    size_y: *const c_void,
-) -> *mut StyleValueData {
+    size_x: *const StyleValueData,
+    size_y: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::BackgroundSize {
-            size_x: RetainedStyleValue { pointer: size_x },
-            size_y: RetainedStyleValue { pointer: size_y },
+        Arc::into_raw(Arc::new(StyleValueData::BackgroundSize {
+            size_x: unsafe { RetainedStyleValueData::from_retained_pointer(size_x) },
+            size_y: unsafe { RetainedStyleValueData::from_retained_pointer(size_y) },
         }))
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_repeat_style(repeat_x: u8, repeat_y: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::RepeatStyle { repeat_x, repeat_y })))
+pub extern "C" fn rust_style_value_create_repeat_style(repeat_x: u8, repeat_y: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::RepeatStyle { repeat_x, repeat_y })))
 }
 
-/// Takes ownership of one strong reference to each offset.
+/// Takes ownership of one strong reference to each offset data allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_border_image_slice(
-    top: *const c_void,
-    right: *const c_void,
-    bottom: *const c_void,
-    left: *const c_void,
+    top: *const StyleValueData,
+    right: *const StyleValueData,
+    bottom: *const StyleValueData,
+    left: *const StyleValueData,
     fill: bool,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::BorderImageSlice {
-            top: RetainedStyleValue { pointer: top },
-            right: RetainedStyleValue { pointer: right },
-            bottom: RetainedStyleValue { pointer: bottom },
-            left: RetainedStyleValue { pointer: left },
+        Arc::into_raw(Arc::new(StyleValueData::BorderImageSlice {
+            top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
+            right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
+            bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
+            left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
             fill,
         }))
     })
@@ -1567,17 +1791,15 @@ pub unsafe extern "C" fn rust_style_value_create_anchor_size(
     anchor_name: usize,
     has_anchor_size: bool,
     anchor_size: u8,
-    fallback_value: *const c_void,
-) -> *mut StyleValueData {
+    fallback_value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::AnchorSize {
+        Arc::into_raw(Arc::new(StyleValueData::AnchorSize {
             has_anchor_name,
             anchor_name: RetainedUtf16FlyString { raw: anchor_name },
             has_anchor_size,
             anchor_size,
-            fallback_value: RetainedStyleValue {
-                pointer: fallback_value,
-            },
+            fallback_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(fallback_value) },
         }))
     })
 }
@@ -1588,31 +1810,29 @@ pub unsafe extern "C" fn rust_style_value_create_anchor_size(
 pub unsafe extern "C" fn rust_style_value_create_anchor(
     has_anchor_name: bool,
     anchor_name: usize,
-    anchor_side: *const c_void,
-    fallback_value: *const c_void,
-) -> *mut StyleValueData {
+    anchor_side: *const StyleValueData,
+    fallback_value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Anchor {
+        Arc::into_raw(Arc::new(StyleValueData::Anchor {
             has_anchor_name,
             anchor_name: RetainedUtf16FlyString { raw: anchor_name },
-            anchor_side: RetainedStyleValue { pointer: anchor_side },
-            fallback_value: RetainedStyleValue {
-                pointer: fallback_value,
-            },
+            anchor_side: unsafe { RetainedStyleValueData::from_retained_pointer(anchor_side) },
+            fallback_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(fallback_value) },
         }))
     })
 }
 
-/// Takes ownership of one strong reference to each edge.
+/// Takes ownership of one strong reference to each edge data allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_position(
-    edge_x: *const c_void,
-    edge_y: *const c_void,
-) -> *mut StyleValueData {
+    edge_x: *const StyleValueData,
+    edge_y: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Position {
-            edge_x: RetainedStyleValue { pointer: edge_x },
-            edge_y: RetainedStyleValue { pointer: edge_y },
+        Arc::into_raw(Arc::new(StyleValueData::Position {
+            edge_x: unsafe { RetainedStyleValueData::from_retained_pointer(edge_x) },
+            edge_y: unsafe { RetainedStyleValueData::from_retained_pointer(edge_y) },
         }))
     })
 }
@@ -1621,23 +1841,21 @@ pub unsafe extern "C" fn rust_style_value_create_position(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_shadow(
     shadow_type: u8,
-    color: *const c_void,
-    offset_x: *const c_void,
-    offset_y: *const c_void,
-    blur_radius: *const c_void,
-    spread_distance: *const c_void,
+    color: *const StyleValueData,
+    offset_x: *const StyleValueData,
+    offset_y: *const StyleValueData,
+    blur_radius: *const StyleValueData,
+    spread_distance: *const StyleValueData,
     placement: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Shadow {
+        Arc::into_raw(Arc::new(StyleValueData::Shadow {
             shadow_type,
-            color: RetainedStyleValue { pointer: color },
-            offset_x: RetainedStyleValue { pointer: offset_x },
-            offset_y: RetainedStyleValue { pointer: offset_y },
-            blur_radius: RetainedStyleValue { pointer: blur_radius },
-            spread_distance: RetainedStyleValue {
-                pointer: spread_distance,
-            },
+            color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(color) },
+            offset_x: unsafe { RetainedStyleValueData::from_retained_pointer(offset_x) },
+            offset_y: unsafe { RetainedStyleValueData::from_retained_pointer(offset_y) },
+            blur_radius: unsafe { RetainedStyleValueData::from_retained_optional_pointer(blur_radius) },
+            spread_distance: unsafe { RetainedStyleValueData::from_retained_optional_pointer(spread_distance) },
             placement,
         }))
     })
@@ -1647,13 +1865,13 @@ pub unsafe extern "C" fn rust_style_value_create_shadow(
 /// alt-text list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_content(
-    content: *const c_void,
-    alt_text: *const c_void,
-) -> *mut StyleValueData {
+    content: *const StyleValueData,
+    alt_text: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Content {
-            content: RetainedStyleValue { pointer: content },
-            alt_text: RetainedStyleValue { pointer: alt_text },
+        Arc::into_raw(Arc::new(StyleValueData::Content {
+            content: unsafe { RetainedStyleValueData::from_retained_pointer(content) },
+            alt_text: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alt_text) },
         }))
     })
 }
@@ -1664,14 +1882,14 @@ pub unsafe extern "C" fn rust_style_value_create_content(
 pub unsafe extern "C" fn rust_style_value_create_counter(
     function: u8,
     counter_name: usize,
-    counter_style: *const c_void,
+    counter_style: *const StyleValueData,
     join_string: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Counter {
+        Arc::into_raw(Arc::new(StyleValueData::Counter {
             function,
             counter_name: RetainedUtf16FlyString { raw: counter_name },
-            counter_style: RetainedStyleValue { pointer: counter_style },
+            counter_style: unsafe { RetainedStyleValueData::from_retained_pointer(counter_style) },
             join_string: RetainedUtf16FlyString { raw: join_string },
         }))
     })
@@ -1683,18 +1901,18 @@ pub unsafe extern "C" fn rust_style_value_create_light_dark(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    light: *const c_void,
-    dark: *const c_void,
-) -> *mut StyleValueData {
+    light: *const StyleValueData,
+    dark: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::LightDark {
+        Arc::into_raw(Arc::new(StyleValueData::LightDark {
             color_base: ColorBase {
                 has_color_type,
                 color_type,
                 color_syntax,
             },
-            light: RetainedStyleValue { pointer: light },
-            dark: RetainedStyleValue { pointer: dark },
+            light: unsafe { RetainedStyleValueData::from_retained_pointer(light) },
+            dark: unsafe { RetainedStyleValueData::from_retained_pointer(dark) },
         }))
     })
 }
@@ -1703,15 +1921,15 @@ pub unsafe extern "C" fn rust_style_value_create_light_dark(
 /// name when they are present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_random_value_sharing(
-    fixed_value: *const c_void,
+    fixed_value: *const StyleValueData,
     is_auto: bool,
     has_name: bool,
     name: usize,
     element_shared: bool,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::RandomValueSharing {
-            fixed_value: RetainedStyleValue { pointer: fixed_value },
+        Arc::into_raw(Arc::new(StyleValueData::RandomValueSharing {
+            fixed_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(fixed_value) },
             is_auto,
             has_name,
             name: RetainedUtf16FlyString { raw: name },
@@ -1721,8 +1939,8 @@ pub unsafe extern "C" fn rust_style_value_create_random_value_sharing(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_scrollbar_gutter(value: u8) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::ScrollbarGutter { value })))
+pub extern "C" fn rust_style_value_create_scrollbar_gutter(value: u8) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::ScrollbarGutter { value })))
 }
 
 #[unsafe(no_mangle)]
@@ -1730,9 +1948,9 @@ pub extern "C" fn rust_style_value_create_color_interpolation_method(
     is_polar: bool,
     color_space: u8,
     hue_interpolation_method: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ColorInterpolationMethod {
+        Arc::into_raw(Arc::new(StyleValueData::ColorInterpolationMethod {
             is_polar,
             color_space,
             hue_interpolation_method,
@@ -1743,14 +1961,14 @@ pub extern "C" fn rust_style_value_create_color_interpolation_method(
 /// Takes ownership of one strong reference to each of the `length` values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_value_list(
-    values: *const *const c_void,
+    values: *const *const StyleValueData,
     length: usize,
     separator: u8,
     collapsible: bool,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ValueList {
-            values: unsafe { RetainedStyleValueList::from_raw(values, length) },
+        Arc::into_raw(Arc::new(StyleValueData::ValueList {
+            values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
             separator,
             collapsible,
         }))
@@ -1760,12 +1978,12 @@ pub unsafe extern "C" fn rust_style_value_create_value_list(
 /// Takes ownership of one strong reference to each non-null value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_tuple(
-    values: *const *const c_void,
+    values: *const *const StyleValueData,
     length: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Tuple {
-            values: unsafe { RetainedStyleValueList::from_raw(values, length) },
+        Arc::into_raw(Arc::new(StyleValueData::Tuple {
+            values: unsafe { RetainedStyleValueDataList::from_retained_optional_pointers(values, length) },
         }))
     })
 }
@@ -1775,14 +1993,14 @@ pub unsafe extern "C" fn rust_style_value_create_tuple(
 pub unsafe extern "C" fn rust_style_value_create_transformation(
     property: u16,
     transform_function: u8,
-    values: *const *const c_void,
+    values: *const *const StyleValueData,
     length: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Transformation {
+        Arc::into_raw(Arc::new(StyleValueData::Transformation {
             property,
             transform_function,
-            values: unsafe { RetainedStyleValueList::from_raw(values, length) },
+            values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
         }))
     })
 }
@@ -1793,21 +2011,21 @@ pub unsafe extern "C" fn rust_style_value_create_shorthand(
     shorthand_property: u16,
     sub_properties: *const u16,
     sub_property_count: usize,
-    values: *const *const c_void,
+    values: *const *const StyleValueData,
     value_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Shorthand {
+        Arc::into_raw(Arc::new(StyleValueData::Shorthand {
             shorthand_property,
             sub_properties: unsafe { RetainedPropertyIdList::from_raw(sub_properties, sub_property_count) },
-            values: unsafe { RetainedStyleValueList::from_raw(values, value_count) },
+            values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, value_count) },
         }))
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_display(raw: u32) -> *mut StyleValueData {
-    abort_on_panic(|| Box::into_raw(Box::new(StyleValueData::Display { raw })))
+pub extern "C" fn rust_style_value_create_display(raw: u32) -> *const StyleValueData {
+    abort_on_panic(|| Arc::into_raw(Arc::new(StyleValueData::Display { raw })))
 }
 
 /// Takes ownership of one strong reference to each non-null component value.
@@ -1816,20 +2034,20 @@ pub unsafe extern "C" fn rust_style_value_create_radial_size(
     component_count: u8,
     is_extent_0: bool,
     extent_0: u8,
-    value_0: *const c_void,
+    value_0: *const StyleValueData,
     is_extent_1: bool,
     extent_1: u8,
-    value_1: *const c_void,
-) -> *mut StyleValueData {
+    value_1: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::RadialSize {
+        Arc::into_raw(Arc::new(StyleValueData::RadialSize {
             component_count,
             is_extent_0,
             extent_0,
-            value_0: RetainedStyleValue { pointer: value_0 },
+            value_0: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_0) },
             is_extent_1,
             extent_1,
-            value_1: RetainedStyleValue { pointer: value_1 },
+            value_1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_1) },
         }))
     })
 }
@@ -1839,13 +2057,15 @@ pub unsafe extern "C" fn rust_style_value_create_radial_size(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_url(
     url: usize,
+    url_bytes: *const u8,
+    url_length: usize,
     url_type: u8,
     modifiers: *const RetainedRequestUrlModifier,
     modifier_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Url {
-            url: RetainedString { raw: url },
+        Arc::into_raw(Arc::new(StyleValueData::Url {
+            url: unsafe { RetainedString::from_raw(url, url_bytes, url_length) },
             url_type,
             modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(modifiers, modifier_count) },
         }))
@@ -1857,8 +2077,10 @@ pub unsafe extern "C" fn rust_style_value_create_url(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_font_source(
     is_local: bool,
-    local_name: *const c_void,
+    local_name: *const StyleValueData,
     url: usize,
+    url_bytes: *const u8,
+    url_length: usize,
     url_type: u8,
     url_modifiers: *const RetainedRequestUrlModifier,
     url_modifier_count: usize,
@@ -1866,12 +2088,12 @@ pub unsafe extern "C" fn rust_style_value_create_font_source(
     format: usize,
     tech: *const u8,
     tech_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::FontSource {
+        Arc::into_raw(Arc::new(StyleValueData::FontSource {
             is_local,
-            local_name: RetainedStyleValue { pointer: local_name },
-            url: RetainedString { raw: url },
+            local_name: unsafe { RetainedStyleValueData::from_retained_optional_pointer(local_name) },
+            url: unsafe { RetainedString::from_raw(url, url_bytes, url_length) },
             url_type,
             url_modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(url_modifiers, url_modifier_count) },
             has_format,
@@ -1888,9 +2110,9 @@ pub unsafe extern "C" fn rust_style_value_create_color_scheme(
     scheme_codes: *const u8,
     scheme_count: usize,
     only: bool,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ColorScheme {
+        Arc::into_raw(Arc::new(StyleValueData::ColorScheme {
             schemes: unsafe { RetainedUtf16FlyStringList::from_raw(schemes, scheme_count) },
             scheme_codes: unsafe { RetainedByteList::from_raw(scheme_codes, scheme_count) },
             only,
@@ -1914,9 +2136,10 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
     presence_inherit: bool,
     presence_var: bool,
     contains_attr_tainted_values: bool,
-) -> *mut StyleValueData {
+    parsed_value: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Unresolved {
+        Arc::into_raw(Arc::new(StyleValueData::Unresolved {
             source_text: unsafe {
                 RetainedReadableString::from_raw(source_text, source_text_bytes, source_text_length)
             },
@@ -1934,6 +2157,7 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
             presence_inherit,
             presence_var,
             contains_attr_tainted_values,
+            parsed_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(parsed_value) },
         }))
     })
 }
@@ -1943,9 +2167,9 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
 pub unsafe extern "C" fn rust_style_value_create_counter_definitions(
     definitions: *const RetainedCounterDefinition,
     length: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::CounterDefinitions {
+        Arc::into_raw(Arc::new(StyleValueData::CounterDefinitions {
             counter_definitions: unsafe { RetainedCounterDefinitionList::from_raw(definitions, length) },
         }))
     })
@@ -1956,14 +2180,14 @@ pub unsafe extern "C" fn rust_style_value_create_counter_definitions(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_grid_track_placement(
     kind: u8,
-    value: *const c_void,
+    value: *const StyleValueData,
     has_name: bool,
     name: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::GridTrackPlacement {
+        Arc::into_raw(Arc::new(StyleValueData::GridTrackPlacement {
             kind,
-            value: RetainedStyleValue { pointer: value },
+            value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value) },
             has_name,
             name: RetainedUtf16FlyString { raw: name },
         }))
@@ -1976,14 +2200,14 @@ pub unsafe extern "C" fn rust_style_value_create_grid_track_placement(
 pub unsafe extern "C" fn rust_style_value_create_counter_style_system(
     kind: u8,
     system: u8,
-    first_symbol: *const c_void,
+    first_symbol: *const StyleValueData,
     name: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::CounterStyleSystem {
+        Arc::into_raw(Arc::new(StyleValueData::CounterStyleSystem {
             kind,
             system,
-            first_symbol: RetainedStyleValue { pointer: first_symbol },
+            first_symbol: unsafe { RetainedStyleValueData::from_retained_optional_pointer(first_symbol) },
             name: RetainedUtf16FlyString { raw: name },
         }))
     })
@@ -1998,9 +2222,9 @@ pub unsafe extern "C" fn rust_style_value_create_counter_style(
     symbols_type: u8,
     symbols: *const usize,
     symbol_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::CounterStyle {
+        Arc::into_raw(Arc::new(StyleValueData::CounterStyle {
             is_symbols,
             name: RetainedUtf16FlyString { raw: name },
             symbols_type,
@@ -2012,15 +2236,15 @@ pub unsafe extern "C" fn rust_style_value_create_counter_style(
 /// Takes ownership of one strong reference to the image and to each non-null coordinate.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_cursor(
-    image: *const c_void,
-    x: *const c_void,
-    y: *const c_void,
-) -> *mut StyleValueData {
+    image: *const StyleValueData,
+    x: *const StyleValueData,
+    y: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Cursor {
-            image: RetainedStyleValue { pointer: image },
-            x: RetainedStyleValue { pointer: x },
-            y: RetainedStyleValue { pointer: y },
+        Arc::into_raw(Arc::new(StyleValueData::Cursor {
+            image: unsafe { RetainedStyleValueData::from_retained_pointer(image) },
+            x: unsafe { RetainedStyleValueData::from_retained_optional_pointer(x) },
+            y: unsafe { RetainedStyleValueData::from_retained_optional_pointer(y) },
         }))
     })
 }
@@ -2032,28 +2256,28 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    channel_0: *const c_void,
-    channel_1: *const c_void,
-    channel_2: *const c_void,
-    alpha: *const c_void,
+    channel_0: *const StyleValueData,
+    channel_1: *const StyleValueData,
+    channel_2: *const StyleValueData,
+    alpha: *const StyleValueData,
     has_name: bool,
     name: usize,
-    origin_color: *const c_void,
-) -> *mut StyleValueData {
+    origin_color: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ColorFunction {
+        Arc::into_raw(Arc::new(StyleValueData::ColorFunction {
             color_base: ColorBase {
                 has_color_type,
                 color_type,
                 color_syntax,
             },
-            channel_0: RetainedStyleValue { pointer: channel_0 },
-            channel_1: RetainedStyleValue { pointer: channel_1 },
-            channel_2: RetainedStyleValue { pointer: channel_2 },
-            alpha: RetainedStyleValue { pointer: alpha },
+            channel_0: unsafe { RetainedStyleValueData::from_retained_pointer(channel_0) },
+            channel_1: unsafe { RetainedStyleValueData::from_retained_pointer(channel_1) },
+            channel_2: unsafe { RetainedStyleValueData::from_retained_pointer(channel_2) },
+            alpha: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alpha) },
             has_name,
             name: RetainedUtf16FlyString { raw: name },
-            origin_color: RetainedStyleValue { pointer: origin_color },
+            origin_color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(origin_color) },
         }))
     })
 }
@@ -2064,30 +2288,26 @@ pub unsafe extern "C" fn rust_style_value_create_color_mix(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    color_interpolation_method: *const c_void,
-    first_color: *const c_void,
-    first_percentage: *const c_void,
-    second_color: *const c_void,
-    second_percentage: *const c_void,
-) -> *mut StyleValueData {
+    color_interpolation_method: *const StyleValueData,
+    first_color: *const StyleValueData,
+    first_percentage: *const StyleValueData,
+    second_color: *const StyleValueData,
+    second_percentage: *const StyleValueData,
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ColorMix {
+        Arc::into_raw(Arc::new(StyleValueData::ColorMix {
             color_base: ColorBase {
                 has_color_type,
                 color_type,
                 color_syntax,
             },
-            color_interpolation_method: RetainedStyleValue {
-                pointer: color_interpolation_method,
+            color_interpolation_method: unsafe {
+                RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
             },
-            first_color: RetainedStyleValue { pointer: first_color },
-            first_percentage: RetainedStyleValue {
-                pointer: first_percentage,
-            },
-            second_color: RetainedStyleValue { pointer: second_color },
-            second_percentage: RetainedStyleValue {
-                pointer: second_percentage,
-            },
+            first_color: unsafe { RetainedStyleValueData::from_retained_pointer(first_color) },
+            first_percentage: unsafe { RetainedStyleValueData::from_retained_optional_pointer(first_percentage) },
+            second_color: unsafe { RetainedStyleValueData::from_retained_pointer(second_color) },
+            second_percentage: unsafe { RetainedStyleValueData::from_retained_optional_pointer(second_percentage) },
         }))
     })
 }
@@ -2097,9 +2317,9 @@ pub unsafe extern "C" fn rust_style_value_create_color_mix(
 pub unsafe extern "C" fn rust_style_value_create_image_set(
     options: *const RetainedImageSetOption,
     length: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ImageSet {
+        Arc::into_raw(Arc::new(StyleValueData::ImageSet {
             options: unsafe { RetainedImageSetOptionList::from_raw(options, length) },
         }))
     })
@@ -2110,27 +2330,25 @@ pub unsafe extern "C" fn rust_style_value_create_image_set(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_linear_gradient(
     has_direction_value: bool,
-    direction_value: *const c_void,
+    direction_value: *const StyleValueData,
     side_or_corner: u8,
     stops: *const RetainedColorStop,
     stop_count: usize,
     gradient_type: u8,
     repeating: bool,
-    color_interpolation_method: *const c_void,
+    color_interpolation_method: *const StyleValueData,
     color_syntax: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::LinearGradient {
+        Arc::into_raw(Arc::new(StyleValueData::LinearGradient {
             has_direction_value,
-            direction_value: RetainedStyleValue {
-                pointer: direction_value,
-            },
+            direction_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(direction_value) },
             side_or_corner,
             color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
             gradient_type,
             repeating,
-            color_interpolation_method: RetainedStyleValue {
-                pointer: color_interpolation_method,
+            color_interpolation_method: unsafe {
+                RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
             },
             color_syntax,
         }))
@@ -2141,22 +2359,22 @@ pub unsafe extern "C" fn rust_style_value_create_linear_gradient(
 /// values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_conic_gradient(
-    from_angle: *const c_void,
-    position: *const c_void,
+    from_angle: *const StyleValueData,
+    position: *const StyleValueData,
     stops: *const RetainedColorStop,
     stop_count: usize,
     repeating: bool,
-    color_interpolation_method: *const c_void,
+    color_interpolation_method: *const StyleValueData,
     color_syntax: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::ConicGradient {
-            from_angle: RetainedStyleValue { pointer: from_angle },
-            position: RetainedStyleValue { pointer: position },
+        Arc::into_raw(Arc::new(StyleValueData::ConicGradient {
+            from_angle: unsafe { RetainedStyleValueData::from_retained_optional_pointer(from_angle) },
+            position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
             color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
             repeating,
-            color_interpolation_method: RetainedStyleValue {
-                pointer: color_interpolation_method,
+            color_interpolation_method: unsafe {
+                RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
             },
             color_syntax,
         }))
@@ -2168,23 +2386,23 @@ pub unsafe extern "C" fn rust_style_value_create_conic_gradient(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_radial_gradient(
     ending_shape: u8,
-    size: *const c_void,
-    position: *const c_void,
+    size: *const StyleValueData,
+    position: *const StyleValueData,
     stops: *const RetainedColorStop,
     stop_count: usize,
     repeating: bool,
-    color_interpolation_method: *const c_void,
+    color_interpolation_method: *const StyleValueData,
     color_syntax: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::RadialGradient {
+        Arc::into_raw(Arc::new(StyleValueData::RadialGradient {
             ending_shape,
-            size: RetainedStyleValue { pointer: size },
-            position: RetainedStyleValue { pointer: position },
+            size: unsafe { RetainedStyleValueData::from_retained_pointer(size) },
+            position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
             color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
             repeating,
-            color_interpolation_method: RetainedStyleValue {
-                pointer: color_interpolation_method,
+            color_interpolation_method: unsafe {
+                RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
             },
             color_syntax,
         }))
@@ -2198,9 +2416,9 @@ pub unsafe extern "C" fn rust_style_value_create_grid_template_area(
     area_count: usize,
     row_count: usize,
     column_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::GridTemplateArea {
+        Arc::into_raw(Arc::new(StyleValueData::GridTemplateArea {
             grid_areas: unsafe { RetainedGridAreaList::from_raw(areas, area_count) },
             row_count,
             column_count,
@@ -2215,24 +2433,22 @@ pub unsafe extern "C" fn rust_style_value_create_easing(
     kind: u8,
     linear_stops: *const RetainedLinearEasingStop,
     linear_stop_count: usize,
-    x1: *const c_void,
-    y1: *const c_void,
-    x2: *const c_void,
-    y2: *const c_void,
-    number_of_intervals: *const c_void,
+    x1: *const StyleValueData,
+    y1: *const StyleValueData,
+    x2: *const StyleValueData,
+    y2: *const StyleValueData,
+    number_of_intervals: *const StyleValueData,
     step_position: u8,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Easing {
+        Arc::into_raw(Arc::new(StyleValueData::Easing {
             kind,
             linear_stops: unsafe { RetainedLinearEasingStopList::from_raw(linear_stops, linear_stop_count) },
-            x1: RetainedStyleValue { pointer: x1 },
-            y1: RetainedStyleValue { pointer: y1 },
-            x2: RetainedStyleValue { pointer: x2 },
-            y2: RetainedStyleValue { pointer: y2 },
-            number_of_intervals: RetainedStyleValue {
-                pointer: number_of_intervals,
-            },
+            x1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(x1) },
+            y1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(y1) },
+            x2: unsafe { RetainedStyleValueData::from_retained_optional_pointer(x2) },
+            y2: unsafe { RetainedStyleValueData::from_retained_optional_pointer(y2) },
+            number_of_intervals: unsafe { RetainedStyleValueData::from_retained_optional_pointer(number_of_intervals) },
             step_position,
         }))
     })
@@ -2245,9 +2461,9 @@ pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
     preserve_line_name_sets: bool,
     entries: *const GridTrackEntryInput,
     entry_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::GridTrackSizeList {
+        Arc::into_raw(Arc::new(StyleValueData::GridTrackSizeList {
             is_subgrid,
             preserve_line_name_sets,
             entries: unsafe { RetainedGridTrackEntryList::from_raw(entries, entry_count) },
@@ -2260,24 +2476,24 @@ pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_basic_shape(
     kind: u8,
-    v0: *const c_void,
-    v1: *const c_void,
-    v2: *const c_void,
-    v3: *const c_void,
-    v4: *const c_void,
+    v0: *const StyleValueData,
+    v1: *const StyleValueData,
+    v2: *const StyleValueData,
+    v3: *const StyleValueData,
+    v4: *const StyleValueData,
     fill_rule: u8,
     points: *const RetainedShapePoint,
     point_count: usize,
     path_string: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::BasicShape {
+        Arc::into_raw(Arc::new(StyleValueData::BasicShape {
             kind,
-            v0: RetainedStyleValue { pointer: v0 },
-            v1: RetainedStyleValue { pointer: v1 },
-            v2: RetainedStyleValue { pointer: v2 },
-            v3: RetainedStyleValue { pointer: v3 },
-            v4: RetainedStyleValue { pointer: v4 },
+            v0: unsafe { RetainedStyleValueData::from_retained_optional_pointer(v0) },
+            v1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(v1) },
+            v2: unsafe { RetainedStyleValueData::from_retained_optional_pointer(v2) },
+            v3: unsafe { RetainedStyleValueData::from_retained_optional_pointer(v3) },
+            v4: unsafe { RetainedStyleValueData::from_retained_optional_pointer(v4) },
             fill_rule,
             points: unsafe { RetainedShapePointList::from_raw(points, point_count) },
             path_string: RetainedUtf16FlyString { raw: path_string },
@@ -2290,8 +2506,7 @@ pub unsafe extern "C" fn rust_style_value_create_basic_shape(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_calculated(
     rust_calculation: *const crate::calc::CalcNode,
-    resolved_type: *const u8,
-    resolved_type_length: usize,
+    resolved_type: crate::calc::FfiNumericType,
     has_percentages_resolve_as: bool,
     resolve_as_is_number: bool,
     resolve_as_base: u8,
@@ -2299,13 +2514,13 @@ pub unsafe extern "C" fn rust_style_value_create_calculated(
     resolve_numbers_as_integers: bool,
     accepted_ranges: *const RetainedNumericRangeByType,
     accepted_range_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Calculated {
+        Arc::into_raw(Arc::new(StyleValueData::Calculated {
             rust_calculation: unsafe { crate::calc::CalcNodeHandle::from_raw(rust_calculation) },
             resolve_as_is_number,
             resolve_as_base,
-            resolved_type: unsafe { RetainedByteList::from_raw(resolved_type, resolved_type_length) },
+            resolved_type,
             has_percentages_resolve_as,
             percentages_resolve_as,
             resolve_numbers_as_integers,
@@ -2318,13 +2533,15 @@ pub unsafe extern "C" fn rust_style_value_create_calculated(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_image(
     url: usize,
+    url_bytes: *const u8,
+    url_length: usize,
     url_type: u8,
     url_modifiers: *const RetainedRequestUrlModifier,
     url_modifier_count: usize,
-) -> *mut StyleValueData {
+) -> *const StyleValueData {
     abort_on_panic(|| {
-        Box::into_raw(Box::new(StyleValueData::Image {
-            url: RetainedString { raw: url },
+        Arc::into_raw(Arc::new(StyleValueData::Image {
+            url: unsafe { RetainedString::from_raw(url, url_bytes, url_length) },
             url_type,
             url_modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(url_modifiers, url_modifier_count) },
         }))
@@ -2332,53 +2549,56 @@ pub unsafe extern "C" fn rust_style_value_create_image(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_destroy(value: *mut StyleValueData) {
+pub unsafe extern "C" fn rust_style_value_release(value: *const StyleValueData) {
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueDestroyEntry);
     abort_on_panic(|| {
         if value.is_null() {
             return;
         }
-        drop(unsafe { Box::from_raw(value) });
+        unsafe { Arc::decrement_strong_count(value) };
     });
+}
+
+/// Retains one reference to a shared style value allocation.
+///
+/// # Safety
+/// `value` must be null or point at a live `StyleValueData` allocated by this module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_retain(value: *const StyleValueData) -> *const StyleValueData {
+    abort_on_panic(|| {
+        if !value.is_null() {
+            unsafe { Arc::increment_strong_count(value) };
+        }
+        value
+    })
 }
 
 /// Whether a value's computed color depends on the element's used currentcolor: the
 /// currentcolor keyword itself, or a color function, color-mix(), contrast-color() or
-/// light-dark() whose nested colors do. `data_of` maps a nested value's shell pointer to
-/// its Rust-owned data.
-pub(crate) fn value_depends_on_current_color(
-    value: &StyleValueData,
-    data_of: unsafe extern "C" fn(*const c_void) -> *const c_void,
-) -> bool {
-    let retained_depends = |retained: &RetainedStyleValue| -> bool {
-        let shell = retained.shell_pointer();
-        if shell.is_null() {
-            return false;
-        }
-        let data = unsafe { data_of(shell) };
-        value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }, data_of)
-    };
+/// light-dark() whose nested colors do.
+pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
+    let retained_data_depends =
+        |retained: &RetainedStyleValueData| -> bool { value_depends_on_current_color(retained.data()) };
     match value {
         StyleValueData::Keyword { keyword } => *keyword == crate::style_compute::keyword::CURRENTCOLOR,
-        StyleValueData::ColorFunction { origin_color, .. } => retained_depends(origin_color),
+        StyleValueData::ColorFunction { origin_color, .. } => {
+            origin_color.optional_data().is_some_and(value_depends_on_current_color)
+        }
         StyleValueData::ColorMix {
             first_color,
             second_color,
             ..
-        } => retained_depends(first_color) || retained_depends(second_color),
-        StyleValueData::ContrastColor { color, .. } => retained_depends(color),
-        StyleValueData::LightDark { light, dark, .. } => retained_depends(light) || retained_depends(dark),
+        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
+        StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
         _ => false,
     }
 }
 
 /// # Safety
-/// `data` must point at a valid StyleValueData and `data_of` must be a valid callback.
+/// `data` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_depends_on_current_color(
-    data: *const c_void,
-    data_of: unsafe extern "C" fn(shell: *const c_void) -> *const c_void,
-) -> bool {
+pub unsafe extern "C" fn rust_style_value_depends_on_current_color(data: *const c_void) -> bool {
     crate::ffi_stats::bump(crate::ffi_stats::FfiOp::StyleValueQueryEntry);
-    crate::abort_on_panic(|| value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }, data_of))
+    crate::abort_on_panic(|| value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) }))
 }

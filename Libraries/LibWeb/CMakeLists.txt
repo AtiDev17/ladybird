@@ -163,7 +163,6 @@ set(SOURCES
     CSS/CSSUnparsedValue.cpp
     CSS/CSSVariableReferenceValue.cpp
     CSS/ColorFunctionDescriptor.cpp
-    CSS/ColorInterpolation.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
     CSS/Display.cpp
@@ -201,7 +200,6 @@ set(SOURCES
     CSS/Invalidation/SlotInvalidator.cpp
     CSS/Invalidation/StyleInvalidator.cpp
     CSS/Invalidation/StructuralMutationInvalidator.cpp
-    CSS/Interpolation.cpp
     CSS/InvalidationSet.cpp
     CSS/Length.cpp
     CSS/LengthBox.cpp
@@ -234,8 +232,6 @@ set(SOURCES
     CSS/Parser/ValueParsing.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
-    CSS/PreferredContrast.cpp
-    CSS/PreferredMotion.cpp
     CSS/Ratio.cpp
     CSS/Resolution.cpp
     CSS/Screen.cpp
@@ -244,7 +240,6 @@ set(SOURCES
     CSS/SelectorRustBridge.cpp
     CSS/SelectorMatching.cpp
     CSS/Serialize.cpp
-    CSS/Size.cpp
     CSS/Sizing.cpp
     CSS/StyleComputer.cpp
     CSS/StyleInvalidation.cpp

@@ -100,6 +100,7 @@ private:
     friend class Client;
     friend class CSSStyleSheet;
     ImageStyleValue(URL const&, Optional<::URL::URL> style_resource_base_url = {});
+    explicit ImageStyleValue(StyleValueFFI::StyleValueData const*);
 
     void register_client(Client&) const;
     void unregister_client(Client&) const;
@@ -117,7 +118,7 @@ private:
 
     URL url_value() const;
 
-    static StyleValueFFI::StyleValueData* make_image_url_data(URL const&);
+    static StyleValueFFI::StyleValueData const* make_image_url_data(URL const&);
 
     // NB: Style sheet attachment and loading state, not value data.
     Optional<::URL::URL> m_style_resource_base_url;

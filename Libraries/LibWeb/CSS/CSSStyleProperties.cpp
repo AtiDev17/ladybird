@@ -525,7 +525,7 @@ Optional<StyleProperty> CSSStyleProperties::get_property_internal(PropertyNameAn
                 auto const& original_shorthand_value = list.first()->as_pending_substitution().original_shorthand_value();
                 auto all_from_same_original = all_of(list, [&](auto const& value) {
                     return value->is_pending_substitution()
-                        && &value->as_pending_substitution().original_shorthand_value() == &original_shorthand_value;
+                        && value->as_pending_substitution().original_shorthand_value().rust_style_value_data() == original_shorthand_value.rust_style_value_data();
                 });
                 if (all_from_same_original) {
                     return StyleProperty {
@@ -973,27 +973,27 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
         //    none or contents, and the property is not over-constrained, then the resolved value is the used value.
         //    Otherwise the resolved value is the computed value.
     case PropertyID::Bottom: {
-        auto& inset = layout_node.computed_values().inset();
+        auto inset = layout_node.computed_values().inset();
         if (auto maybe_used_value = used_value_for_inset(inset.bottom(), inset.top(), [](auto const& paintable_box) { return paintable_box.box_model().inset.bottom; }); maybe_used_value.has_value())
             return LengthStyleValue::create(Length::make_px(maybe_used_value.release_value()));
 
         return style_value_for_length_percentage_or_auto(inset.bottom());
     }
     case PropertyID::Left: {
-        auto& inset = layout_node.computed_values().inset();
+        auto inset = layout_node.computed_values().inset();
         if (auto maybe_used_value = used_value_for_inset(inset.left(), inset.right(), [](auto const& paintable_box) { return paintable_box.box_model().inset.left; }); maybe_used_value.has_value())
             return LengthStyleValue::create(Length::make_px(maybe_used_value.release_value()));
         return style_value_for_length_percentage_or_auto(inset.left());
     }
     case PropertyID::Right: {
-        auto& inset = layout_node.computed_values().inset();
+        auto inset = layout_node.computed_values().inset();
         if (auto maybe_used_value = used_value_for_inset(inset.right(), inset.left(), [](auto const& paintable_box) { return paintable_box.box_model().inset.right; }); maybe_used_value.has_value())
             return LengthStyleValue::create(Length::make_px(maybe_used_value.release_value()));
 
         return style_value_for_length_percentage_or_auto(inset.right());
     }
     case PropertyID::Top: {
-        auto& inset = layout_node.computed_values().inset();
+        auto inset = layout_node.computed_values().inset();
         if (auto maybe_used_value = used_value_for_inset(inset.top(), inset.bottom(), [](auto const& paintable_box) { return paintable_box.box_model().inset.top; }); maybe_used_value.has_value())
             return LengthStyleValue::create(Length::make_px(maybe_used_value.release_value()));
 

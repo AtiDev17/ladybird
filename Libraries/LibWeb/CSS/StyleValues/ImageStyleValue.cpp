@@ -27,11 +27,13 @@
 
 namespace Web::CSS {
 
-StyleValueFFI::StyleValueData* ImageStyleValue::make_image_url_data(URL const& url)
+StyleValueFFI::StyleValueData const* ImageStyleValue::make_image_url_data(URL const& url)
 {
     // The Rust allocation takes ownership of one leaked reference to each retained string.
     auto modifiers = retain_url_modifiers_for_rust(url);
-    return StyleValueFFI::rust_style_value_create_image(url.url().to_raw_leaked(), to_underlying(url.type()), modifiers.data(), modifiers.size());
+    auto url_string = url.url();
+    auto url_bytes = url_string.bytes();
+    return StyleValueFFI::rust_style_value_create_image(url_string.to_raw_leaked(), url_bytes.data(), url_bytes.size(), to_underlying(url.type()), modifiers.data(), modifiers.size());
 }
 
 URL ImageStyleValue::url_value() const
@@ -114,6 +116,11 @@ ValueComparingNonnullRefPtr<ImageStyleValue const> ImageStyleValue::create(::URL
 ImageStyleValue::ImageStyleValue(URL const& url, Optional<::URL::URL> style_resource_base_url)
     : AbstractImageStyleValue(Type::Image, make_image_url_data(url))
     , m_style_resource_base_url(move(style_resource_base_url))
+{
+}
+
+ImageStyleValue::ImageStyleValue(StyleValueFFI::StyleValueData const* data)
+    : AbstractImageStyleValue(Type::Image, data)
 {
 }
 

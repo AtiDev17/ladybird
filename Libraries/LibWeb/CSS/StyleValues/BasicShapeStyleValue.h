@@ -123,13 +123,17 @@ public:
     Gfx::Path to_path(CSSPixelRect reference_box) const;
 
 private:
+    friend class StyleValue;
+
     BasicShapeStyleValue(BasicShape basic_shape)
         : StyleValueWithDefaultOperators(Type::BasicShape, make_basic_shape_data(basic_shape))
         , m_shape(move(basic_shape))
     {
     }
 
-    static StyleValueFFI::StyleValueData* make_basic_shape_data(BasicShape const&);
+    explicit BasicShapeStyleValue(StyleValueFFI::StyleValueData const*);
+
+    static StyleValueFFI::StyleValueData const* make_basic_shape_data(BasicShape const&);
 
     // NB: Eagerly materialized copy of the Rust-owned data (rebuilding a path shape would
     //     re-parse its serialized path data); the Rust allocation stays authoritative, and the
