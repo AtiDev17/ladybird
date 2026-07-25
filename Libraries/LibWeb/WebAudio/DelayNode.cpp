@@ -6,8 +6,10 @@
 
 #include <LibWeb/Bindings/DelayNode.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/WebAudio/AudioParam.h>
 #include <LibWeb/WebAudio/BaseAudioContext.h>
 #include <LibWeb/WebAudio/DelayNode.h>
+#include <LibWeb/WebAudio/Rendering/RenderNodes.h>
 
 namespace Web::WebAudio {
 
@@ -15,7 +17,7 @@ GC_DEFINE_ALLOCATOR(DelayNode);
 
 DelayNode::DelayNode(JS::Realm& realm, GC::Ref<BaseAudioContext> context, Bindings::DelayOptions const& options)
     : AudioNode(realm, context)
-    , m_delay_time(AudioParam::create(realm, context, options.delay_time, 0, options.max_delay_time, Bindings::AutomationRate::ARate))
+    , m_delay_time(AudioParam::create(realm, context, this, options.delay_time, 0, options.max_delay_time, Bindings::AutomationRate::ARate))
 {
 }
 
@@ -45,6 +47,8 @@ WebIDL::ExceptionOr<GC::Ref<DelayNode>> DelayNode::construct_impl(JS::Realm& rea
     // FIXME: Set tail-time to yes
 
     TRY(node->initialize_audio_node_options(options, default_options));
+
+    node->queue_render_node_creation(make<Rendering::DelayRenderNode>(node->node_id(), BaseAudioContext::render_quantum_size(), node->m_delay_time->render_param(), options.max_delay_time));
 
     return node;
 }

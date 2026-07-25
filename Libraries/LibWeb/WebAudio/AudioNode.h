@@ -7,11 +7,13 @@
 
 #pragma once
 
+#include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/AudioNode.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/WebAudio/Rendering/RenderNode.h>
 #include <LibWeb/WebAudio/Types.h>
 #include <LibWeb/WebIDL/Types.h>
 
@@ -44,6 +46,8 @@ class AudioNode : public DOM::EventTarget {
     GC_DECLARE_ALLOCATOR(AudioNode);
 
 public:
+    static constexpr bool OVERRIDES_FINALIZE = true;
+
     virtual ~AudioNode() override;
 
     WebIDL::ExceptionOr<GC::Ref<AudioNode>> connect(GC::Ref<AudioNode> destination_node, WebIDL::UnsignedLong output = 0, WebIDL::UnsignedLong input = 0);
@@ -85,16 +89,19 @@ public:
 protected:
     AudioNode(JS::Realm&, GC::Ref<BaseAudioContext>, WebIDL::UnsignedLong channel_count = 2);
 
+    void queue_render_node_creation(NonnullOwnPtr<Rendering::RenderNode>);
+    void queue_connection_update();
+    void queue_channel_config_update();
+
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual void finalize() override;
 
 private:
     GC::Ref<BaseAudioContext> m_context;
     WebIDL::UnsignedLong m_channel_count { 2 };
     Bindings::ChannelCountMode m_channel_count_mode { Bindings::ChannelCountMode::Max };
     Bindings::ChannelInterpretation m_channel_interpretation { Bindings::ChannelInterpretation::Speakers };
-    // Connections from other AudioNode outputs into this node's inputs.
-    Vector<AudioNodeConnection> m_input_connections;
     // Connections from this node's outputs into other AudioNode inputs.
     Vector<AudioNodeConnection> m_output_connections;
     // Connections from this node's outputs into AudioParams.

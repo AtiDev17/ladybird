@@ -1146,6 +1146,7 @@ set(SOURCES
     WebAssembly/WebAssembly.cpp
     WebAssembly/WebAssemblyModule.cpp
     WebAudio/AnalyserNode.cpp
+    WebAudio/AudioArray.cpp
     WebAudio/AudioBuffer.cpp
     WebAudio/AudioBufferSourceNode.cpp
     WebAudio/AudioContext.cpp
@@ -1153,6 +1154,7 @@ set(SOURCES
     WebAudio/AudioListener.cpp
     WebAudio/AudioNode.cpp
     WebAudio/AudioParam.cpp
+    WebAudio/AudioParamTimeline.cpp
     WebAudio/AudioScheduledSourceNode.cpp
     WebAudio/BaseAudioContext.cpp
     WebAudio/BiquadFilterNode.cpp
@@ -1169,6 +1171,13 @@ set(SOURCES
     WebAudio/OscillatorNode.cpp
     WebAudio/PannerNode.cpp
     WebAudio/PeriodicWave.cpp
+    WebAudio/Rendering/AudioBus.cpp
+    WebAudio/Rendering/BiquadCoefficients.cpp
+    WebAudio/Rendering/OfflineAudioRenderer.cpp
+    WebAudio/Rendering/RealtimeAudioRenderer.cpp
+    WebAudio/Rendering/RenderGraph.cpp
+    WebAudio/Rendering/RenderNode.cpp
+    WebAudio/Rendering/RenderNodes.cpp
     WebAudio/ScriptProcessorNode.cpp
     WebAudio/StereoPannerNode.cpp
     WebDriver/Actions.cpp

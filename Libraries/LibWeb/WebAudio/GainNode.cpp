@@ -9,6 +9,7 @@
 #include <LibWeb/WebAudio/AudioParam.h>
 #include <LibWeb/WebAudio/BaseAudioContext.h>
 #include <LibWeb/WebAudio/GainNode.h>
+#include <LibWeb/WebAudio/Rendering/RenderNodes.h>
 
 namespace Web::WebAudio {
 
@@ -36,12 +37,15 @@ WebIDL::ExceptionOr<GC::Ref<GainNode>> GainNode::construct_impl(JS::Realm& realm
     // FIXME: Set tail-time to no
 
     TRY(node->initialize_audio_node_options(options, default_options));
+
+    node->queue_render_node_creation(make<Rendering::GainRenderNode>(node->node_id(), BaseAudioContext::render_quantum_size(), node->m_gain->render_param()));
+
     return node;
 }
 
 GainNode::GainNode(JS::Realm& realm, GC::Ref<BaseAudioContext> context, Bindings::GainOptions const& options)
     : AudioNode(realm, context)
-    , m_gain(AudioParam::create(realm, context, options.gain, NumericLimits<float>::lowest(), NumericLimits<float>::max(), Bindings::AutomationRate::ARate))
+    , m_gain(AudioParam::create(realm, context, this, options.gain, NumericLimits<float>::lowest(), NumericLimits<float>::max(), Bindings::AutomationRate::ARate))
 {
 }
 
