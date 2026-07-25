@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "81de6771512413aaf89ea77add5ad1fda126b9d0",
+  "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",
   "dependencies": [
     {
       "name": "angle",
@@ -257,11 +257,11 @@
     },
     {
       "name": "curl",
-      "version": "8.20.0#2"
+      "version": "8.21.0#1"
     },
     {
       "name": "dav1d",
-      "version": "1.5.1#0"
+      "version": "1.5.3#0"
     },
     {
       "name": "dbus",
@@ -273,7 +273,7 @@
     },
     {
       "name": "fast-float",
-      "version": "8.1.0#0"
+      "version": "8.2.10#1"
     },
     {
       "name": "ffmpeg",
@@ -281,7 +281,7 @@
     },
     {
       "name": "fmt",
-      "version": "12.1.0#0"
+      "version": "12.2.0#1"
     },
     {
       "name": "fontconfig",
@@ -305,11 +305,11 @@
     },
     {
       "name": "libavif",
-      "version": "1.3.0#1"
+      "version": "1.4.2#1"
     },
     {
       "name": "libdwarf",
-      "version": "2.3.0#0"
+      "version": "2.3.1#0"
     },
     {
       "name": "libedit",
@@ -317,15 +317,15 @@
     },
     {
       "name": "libjpeg-turbo",
-      "version": "3.1.1#0"
+      "version": "3.2.0#0"
     },
     {
       "name": "libjxl",
-      "version": "0.11.1#3"
+      "version": "0.11.2#0"
     },
     {
       "name": "libpng",
-      "version": "1.6.50#0"
+      "version": "1.6.58#0"
     },
     {
       "name": "libproxy",
@@ -345,7 +345,7 @@
     },
     {
       "name": "libxml2",
-      "version": "2.13.8#1"
+      "version": "2.15.3#0"
     },
     {
       "name": "mimalloc",
@@ -357,11 +357,11 @@
     },
     {
       "name": "nghttp2",
-      "version": "1.68.0#1"
+      "version": "1.69.0#0"
     },
     {
       "name": "openssl",
-      "version": "3.5.3#0"
+      "version": "3.6.3#0"
     },
     {
       "name": "pdfjs",
@@ -377,11 +377,11 @@
     },
     {
       "name": "sdl3",
-      "version": "3.2.28#0"
+      "version": "3.4.12#0"
     },
     {
       "name": "simdjson",
-      "version": "4.2.4#0"
+      "version": "4.6.4#0"
     },
     {
       "name": "simdutf",
@@ -393,11 +393,11 @@
     },
     {
       "name": "sqlite3",
-      "version": "3.52.0#0"
+      "version": "3.53.3#1"
     },
     {
       "name": "tiff",
-      "version": "4.7.1#0"
+      "version": "4.7.2#0"
     },
     {
       "name": "vulkan",
@@ -405,11 +405,11 @@
     },
     {
       "name": "vulkan-headers",
-      "version": "1.4.335.0#0"
+      "version": "1.4.350.1#0"
     },
     {
       "name": "vulkan-memory-allocator",
-      "version": "3.3.0#0"
+      "version": "3.4.0#0"
     },
     {
       "name": "woff2",

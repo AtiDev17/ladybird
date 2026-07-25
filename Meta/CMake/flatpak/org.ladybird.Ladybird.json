@@ -37,7 +37,7 @@
         {
           "type": "git",
           "url": "https://github.com/simdjson/simdjson.git",
-          "tag": "v4.2.4"
+          "tag": "v4.6.4"
         }
       ],
       "config-opts": [
@@ -76,18 +76,18 @@
         {
           "type": "git",
           "url": "https://github.com/pnggroup/libpng.git",
-          "tag": "v1.6.50"
+          "tag": "v1.6.58"
         },
         {
           "type": "file",
-          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.49/libpng-1.6.49-apng.patch.gz",
-          "sha512": "d3a7121f892049f5488f32b5de29fb8892f2b329ee1df956b129918601946ab86a542a4412587ee5f660c581484812aaf101f953bcc187c993d98ba9d8d63a00"
+          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.58/libpng-1.6.58-apng.patch.gz",
+          "sha512": "95a6f5bb7148b5c48dccd73811d7bcf9752a631a7bb4f4856670a7da12a7159581ac1bce1749318343794e0f5cb86972711ba2ec0f523c168f0991fa940687d5"
         },
         {
           "type": "shell",
           "commands": [
-            "gunzip -k libpng-1.6.49-apng.patch.gz",
-            "patch -p1 -i libpng-1.6.49-apng.patch"
+            "gunzip -k libpng-1.6.58-apng.patch.gz",
+            "patch -p1 -i libpng-1.6.58-apng.patch"
           ]
         }
       ],
@@ -195,7 +195,7 @@
         {
           "type": "git",
           "url": "https://github.com/fmtlib/fmt.git",
-          "tag": "12.1.0"
+          "tag": "12.2.0"
         }
       ],
       "config-opts": [
@@ -270,7 +270,7 @@
         {
           "type": "git",
           "url": "https://github.com/GNOME/libxml2.git",
-          "tag": "v2.13.8"
+          "tag": "v2.15.3"
         }
       ],
       "config-opts": [
@@ -318,7 +318,7 @@
         {
           "type": "git",
           "url": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git",
-          "tag": "v3.3.0"
+          "tag": "v3.4.0"
         }
       ],
       "config-opts": [
@@ -373,7 +373,7 @@
         {
           "type": "git",
           "url": "https://code.videolan.org/videolan/dav1d.git",
-          "tag": "1.5.1"
+          "tag": "1.5.3"
         }
       ],
       "config-opts": [
@@ -410,7 +410,7 @@
         {
           "type": "git",
           "url": "https://github.com/AOMediaCodec/libavif.git",
-          "tag": "v1.3.0"
+          "tag": "v1.4.2"
         }
       ],
       "config-opts": [
@@ -482,7 +482,7 @@
           {
             "type": "git",
             "url": "https://github.com/libjxl/libjxl.git",
-            "tag": "v0.11.1",
+            "tag": "v0.11.2",
             "disable-submodules": true
           }
         ],
@@ -580,7 +580,7 @@
           {
             "type": "git",
             "url": "https://github.com/fastfloat/fast_float.git",
-            "tag": "v8.1.0"
+            "tag": "v8.2.10"
           }
         ],
         "config-opts": [
@@ -596,7 +596,7 @@
         {
           "type": "git",
           "url": "https://github.com/libsdl-org/SDL.git",
-          "tag": "release-3.2.28"
+          "tag": "release-3.4.12"
         }
       ],
       "config-opts": [
@@ -612,7 +612,7 @@
         {
           "type": "git",
           "url": "https://github.com/davea42/libdwarf-code.git",
-          "tag": "v2.3.0"
+          "tag": "v2.3.1"
         }
       ],
       "config-opts": [
@@ -672,8 +672,8 @@
         {
           "type": "git",
           "url": "https://github.com/openssl/openssl.git",
-          "commit": "c4da9ac23de497ce039a102e6715381047899447",
-          "tag": "openssl-3.5.3"
+          "commit": "aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f",
+          "tag": "openssl-3.6.3"
         }
       ]
     },
