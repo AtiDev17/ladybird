@@ -482,7 +482,8 @@
     "flex",
     "grid",
     "ruby",
-    "math"
+    "math",
+    "-webkit-box"
   ],
   "display-internal": [
     "table-row-group",
@@ -502,7 +503,10 @@
     "inline-block",
     "inline-table",
     "inline-flex",
-    "inline-grid"
+    "inline-grid",
+    "-webkit-flex",
+    "-webkit-inline-box",
+    "-webkit-inline-flex"
   ],
   "display-outside": [
     "block",
@@ -1103,7 +1107,8 @@
     "pan-right",
     "pan-up",
     "pan-x",
-    "pan-y"
+    "pan-y",
+    "pinch-zoom"
   ],
   "transform-box": [
     "content-box",

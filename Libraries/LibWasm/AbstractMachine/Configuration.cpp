@@ -23,13 +23,14 @@ void Configuration::unwind_impl()
 
     if (m_frame_stack.is_empty()) {
         m_locals_base = nullptr;
-        m_default_memory = nullptr;
+        m_memory_instances = nullptr;
+        m_global_instances = nullptr;
     } else {
         auto& caller = m_frame_stack.last();
         m_locals_base = caller.owns_locals() ? m_owned_locals_stack.last().data() : caller.locals_data();
         if (&caller.module() != popped_module) {
-            auto const& memories = caller.module().memories();
-            m_default_memory = memories.is_empty() ? nullptr : m_store.unsafe_get(memories[0]);
+            m_memory_instances = caller.module().resolved_memories(m_store);
+            m_global_instances = caller.module().resolved_globals(m_store);
         }
     }
 
