@@ -19,5 +19,8 @@ parse_deps = false
 [parse.expand]
 all_features = false
 
+[export]
+include = ["FfiNodeKindFacts", "FfiTableDisplay", "NodeAllocation", "NodeData", "NodeDisplayFlag", "NodeFlag", "NodeKind", "NodeSlotId"]
+
 [export.mangle]
 rename_types = "PascalCase"
