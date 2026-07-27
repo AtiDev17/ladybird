@@ -7,8 +7,10 @@
 //! Explicit dependencies between effectful SSA operations.
 
 use super::analysis::{ControlFlowGraph, DominatorTree, InstructionLayout};
-use super::{AggregateOperation, BlockId, Effects, Function, InstructionId, Intrinsic, MemoryEffect, OperandOperation, Operation, Terminator, ValueDefinition, ValueId};
-use std::collections::BTreeSet;
+use super::{
+    AggregateOperation, BlockId, Effects, Function, InstructionId, Intrinsic, MemoryEffect, OperandOperation,
+    Operation, Terminator, ValueDefinition, ValueId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EffectDomain {
@@ -24,10 +26,66 @@ pub(crate) enum EffectDefinition {
     Terminator(BlockId),
 }
 
+/// A set of effect definitions.
+///
+/// These are built and copied once per effectful instruction per domain, and
+/// the analysis is recomputed after every pass that changes anything, so the
+/// set is held as a sorted vector: copying one is a single allocation rather
+/// than a tree walk, and nearly all of them hold a single definition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct EffectSet(Vec<EffectDefinition>);
+
+impl EffectSet {
+    pub(crate) fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn from_one(definition: EffectDefinition) -> Self {
+        Self(vec![definition])
+    }
+
+    /// Take a set from definitions already sorted and free of duplicates.
+    pub(crate) fn from_sorted(definitions: Vec<EffectDefinition>) -> Self {
+        debug_assert!(definitions.windows(2).all(|pair| pair[0] < pair[1]));
+        Self(definitions)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[EffectDefinition] {
+        &self.0
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &EffectDefinition> {
+        self.0.iter()
+    }
+}
+
+impl FromIterator<EffectDefinition> for EffectSet {
+    fn from_iter<I: IntoIterator<Item = EffectDefinition>>(definitions: I) -> Self {
+        let mut set = Self(definitions.into_iter().collect());
+        // A block almost always inherits a single definition, and sorting is
+        // the most expensive thing this pass does per block.
+        if set.0.len() > 1 {
+            set.0.sort_unstable();
+            set.0.dedup();
+        }
+        set
+    }
+}
+
+impl<const N: usize> From<[EffectDefinition; N]> for EffectSet {
+    fn from(definitions: [EffectDefinition; N]) -> Self {
+        Self::from_iter(definitions)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffectAccess {
     pub(crate) effect: MemoryEffect,
-    pub(crate) dependencies: BTreeSet<EffectDefinition>,
+    pub(crate) dependencies: EffectSet,
     pub(crate) definition: Option<EffectDefinition>,
 }
 
@@ -147,11 +205,7 @@ fn operation_memory_locations(
 
     if let Operation::FieldAccess(field_access) = operation {
         let bytes = field_access.kind.width().bytes();
-        if !add_location(
-            0,
-            bytes,
-            field_access.kind.writes(),
-        ) {
+        if !add_location(0, bytes, field_access.kind.writes()) {
             return unknown_access(effect);
         }
         return access;
@@ -269,9 +323,41 @@ fn address_location(function: &Function, value: ValueId, bytes: u8) -> Option<Me
         return None;
     }
     Some(MemoryLocation {
-        identity: MemoryLocationIdentity::Address(instruction.inputs.clone()),
+        identity: MemoryLocationIdentity::Address(instruction.inputs.to_vec()),
         bytes,
     })
+}
+
+/// What two locations must have in common before `alias` can call them the
+/// same one.
+///
+/// Grouping the locations a pass is tracking by this key turns "is any of these
+/// the same location" from a walk over all of them into a lookup. It has to
+/// agree with `alias`: two locations it gives different keys must never be
+/// `Must`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum LocationKey {
+    /// An address reached through constants: the same base, offset and width
+    /// is the same location however it was spelled.
+    ConstantAddress(ValueId, i128, u8),
+    /// An operand slot named by a constant index.
+    ConstantOperand(i64),
+    /// Anything else, where only being spelled identically makes it the same.
+    AsSpelled(MemoryLocation),
+}
+
+pub(crate) fn location_key(function: &Function, location: &MemoryLocation) -> LocationKey {
+    match &location.identity {
+        MemoryLocationIdentity::Address(components) => match constant_address(function, components) {
+            Some((base, offset)) => LocationKey::ConstantAddress(base, offset, location.bytes),
+            None => LocationKey::AsSpelled(location.clone()),
+        },
+        MemoryLocationIdentity::IndexedOperand(index) => match constant_integer(function, *index) {
+            Some(index) => LocationKey::ConstantOperand(index),
+            None => LocationKey::AsSpelled(location.clone()),
+        },
+        MemoryLocationIdentity::BytecodeField(_) => LocationKey::AsSpelled(location.clone()),
+    }
 }
 
 pub(crate) fn alias(function: &Function, lhs: &MemoryLocation, rhs: &MemoryLocation) -> AliasResult {
@@ -289,6 +375,11 @@ pub(crate) fn alias(function: &Function, lhs: &MemoryLocation, rhs: &MemoryLocat
             if lhs_base != rhs_base {
                 return AliasResult::May;
             }
+            // Two accesses of the same width off the same base at the same
+            // offset are the same location, however they were spelled.
+            if lhs_offset == rhs_offset && lhs.bytes == rhs.bytes {
+                return AliasResult::Must;
+            }
             let lhs_end = lhs_offset.saturating_add(lhs.bytes as i128);
             let rhs_end = rhs_offset.saturating_add(rhs.bytes as i128);
             if lhs_end <= rhs_offset || rhs_end <= lhs_offset {
@@ -299,7 +390,8 @@ pub(crate) fn alias(function: &Function, lhs: &MemoryLocation, rhs: &MemoryLocat
         }
         (MemoryLocationIdentity::IndexedOperand(lhs), MemoryLocationIdentity::IndexedOperand(rhs)) => {
             match (constant_integer(function, *lhs), constant_integer(function, *rhs)) {
-                (Some(lhs), Some(rhs)) if lhs != rhs => AliasResult::No,
+                (Some(lhs), Some(rhs)) if lhs == rhs => AliasResult::Must,
+                (Some(_), Some(_)) => AliasResult::No,
                 _ => AliasResult::May,
             }
         }
@@ -330,8 +422,8 @@ fn constant_integer(function: &Function, value: ValueId) -> Option<i64> {
 pub(crate) struct DomainDependencies {
     instruction_accesses: Vec<Option<EffectAccess>>,
     #[cfg(test)]
-    phi_inputs: Vec<Option<BTreeSet<EffectDefinition>>>,
-    block_inputs: Vec<BTreeSet<EffectDefinition>>,
+    phi_inputs: Vec<Option<EffectSet>>,
+    block_inputs: Vec<EffectSet>,
 }
 
 impl DomainDependencies {
@@ -347,9 +439,13 @@ impl DomainDependencies {
                 (inputs.len() > 1 && cfg.predecessors(BlockId(block)).len() > 1).then(|| inputs.clone())
             })
             .collect::<Vec<_>>();
-        let phi_blocks = phi_inputs.iter().map(Option::is_some).collect::<Vec<_>>();
-        let (block_inputs, mut block_outputs) =
-            compute_domain_block_states(function, cfg, domain, &phi_blocks);
+        let mut phi_blocks = phi_inputs.iter().map(Option::is_some).collect::<Vec<_>>();
+        for block in 0..function.blocks.len() {
+            for (_, failure) in function.guard_exits(BlockId(block)) {
+                phi_blocks[failure.0] = true;
+            }
+        }
+        let (block_inputs, mut block_outputs) = compute_domain_block_states(function, cfg, domain, &phi_blocks);
 
         for block_index in 0..function.blocks.len() {
             let block = BlockId(block_index);
@@ -366,7 +462,7 @@ impl DomainDependencies {
                     definition,
                 });
                 if let Some(definition) = definition {
-                    dependencies = BTreeSet::from([definition]);
+                    dependencies = EffectSet::from_one(definition);
                 }
             }
 
@@ -382,7 +478,7 @@ impl DomainDependencies {
             block_outputs[block_index] = if let Some(access) = &terminator_accesses[block_index]
                 && let Some(definition) = access.definition
             {
-                BTreeSet::from([definition])
+                EffectSet::from_one(definition)
             } else {
                 dependencies
             };
@@ -401,14 +497,13 @@ impl DomainDependencies {
     }
 
     #[cfg(test)]
-    pub(crate) fn phi_inputs(&self, block: BlockId) -> Option<&BTreeSet<EffectDefinition>> {
+    pub(crate) fn phi_inputs(&self, block: BlockId) -> Option<&EffectSet> {
         self.phi_inputs[block.0].as_ref()
     }
 
-    pub(crate) fn block_input(&self, block: BlockId) -> &BTreeSet<EffectDefinition> {
+    pub(crate) fn block_input(&self, block: BlockId) -> &EffectSet {
         &self.block_inputs[block.0]
     }
-
 }
 
 fn compute_domain_block_states(
@@ -416,39 +511,78 @@ fn compute_domain_block_states(
     cfg: &ControlFlowGraph,
     domain: EffectDomain,
     phi_blocks: &[bool],
-) -> (Vec<BTreeSet<EffectDefinition>>, Vec<BTreeSet<EffectDefinition>>) {
-    let mut inputs = vec![BTreeSet::new(); function.blocks.len()];
-    let mut outputs = inputs.clone();
+) -> (Vec<EffectSet>, Vec<EffectSet>) {
+    // What a block leaves behind, when the block writes at all, is its own
+    // last write and nothing that reached it. That does not depend on the
+    // analysis, so it is found once rather than rediscovered by walking every
+    // instruction on every sweep.
+    let block_writes = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(block_index, block)| {
+            if terminator_effect(block.terminator.as_ref(), domain).writes() {
+                return Some(EffectDefinition::Terminator(BlockId(block_index)));
+            }
+            block
+                .instructions
+                .iter()
+                .rev()
+                .find(|instruction| effect_for(function.instructions[instruction.0].effects, domain).writes())
+                .map(|instruction| EffectDefinition::Instruction(*instruction))
+        })
+        .collect::<Vec<_>>();
+
+    let mut inputs = vec![EffectSet::new(); function.blocks.len()];
+    let mut outputs = block_writes
+        .iter()
+        .map(|write| write.map(EffectSet::from_one).unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    // A block's input comes from its predecessors, so visiting predecessors
+    // first propagates a change the whole way in one sweep instead of one
+    // block per sweep. Blocks the entry cannot reach are visited last, since
+    // reverse postorder does not name them.
+    let mut order = cfg.reverse_postorder().to_vec();
+    order.extend(
+        (0..function.blocks.len())
+            .map(BlockId)
+            .filter(|block| !cfg.is_reachable(*block)),
+    );
+
+    // Building each block's input into a scratch buffer and only storing it
+    // when it actually moved keeps the later sweeps, where almost nothing
+    // changes, from allocating a set per block and throwing it away.
+    let mut input = Vec::new();
     loop {
         let mut changed = false;
-        for (block_index, block) in function.blocks.iter().enumerate() {
-            let id = BlockId(block_index);
-            let mut input = if id == function.entry || cfg.predecessors(id).is_empty() {
-                BTreeSet::from([EffectDefinition::Entry])
+        for id in order.iter().copied() {
+            let block_index = id.0;
+            input.clear();
+            if id == function.entry || cfg.predecessors(id).is_empty() {
+                input.push(EffectDefinition::Entry);
             } else if phi_blocks.get(block_index) == Some(&true) {
-                BTreeSet::from([EffectDefinition::Phi(id)])
+                input.push(EffectDefinition::Phi(id));
             } else {
-                cfg.predecessors(id)
-                    .iter()
-                    .flat_map(|predecessor| outputs[predecessor.0].iter().copied())
-                    .collect()
-            };
-            if input.is_empty() {
-                input.insert(EffectDefinition::Entry);
-            }
-            let mut output = input.clone();
-            for instruction in &block.instructions {
-                if effect_for(function.instructions[instruction.0].effects, domain).writes() {
-                    output = BTreeSet::from([EffectDefinition::Instruction(*instruction)]);
+                for predecessor in cfg.predecessors(id) {
+                    input.extend(outputs[predecessor.0].iter().copied());
+                }
+                if input.len() > 1 {
+                    input.sort_unstable();
+                    input.dedup();
                 }
             }
-            if terminator_effect(block.terminator.as_ref(), domain).writes() {
-                output = BTreeSet::from([EffectDefinition::Terminator(id)]);
+            if input.is_empty() {
+                input.push(EffectDefinition::Entry);
             }
-            if input != inputs[block_index] || output != outputs[block_index] {
-                inputs[block_index] = input;
-                outputs[block_index] = output;
+            if inputs[block_index].as_slice() != input {
+                inputs[block_index] = EffectSet::from_sorted(input.clone());
                 changed = true;
+                // A block that writes ends the chain, so only one that does
+                // not passes what reached it along.
+                if block_writes[block_index].is_none() {
+                    outputs[block_index] = inputs[block_index].clone();
+                }
             }
         }
         if !changed {
@@ -475,8 +609,8 @@ fn terminator_effect(terminator: Option<&Terminator>, domain: EffectDomain) -> M
 mod tests {
     use super::*;
     use crate::intrinsic::{OperandLoad, OperandOperation, OperandStore};
-    use crate::types::Type;
     use crate::ssa::{BlockLayout, Operation};
+    use crate::types::Type;
 
     fn address(function: &mut Function, base: ValueId, offset: i64) -> ValueId {
         let offset = function.add_constant(Type::U64, super::super::Constant::Integer(offset));
@@ -494,10 +628,7 @@ mod tests {
         let header = function.create_empty_block("header", BlockLayout::Hot);
         let body = function.create_empty_block("body", BlockLayout::Hot);
         let exit = function.create_empty_block("exit", BlockLayout::Hot);
-        function.set_terminator(
-            function.entry,
-            Terminator::jump(header),
-        );
+        function.set_terminator(function.entry, Terminator::jump(header));
         let load = function.append_instruction_with_effects(
             header,
             Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field)),
@@ -508,10 +639,7 @@ mod tests {
                 ..Effects::PURE
             },
         );
-        function.set_terminator(
-            header,
-            Terminator::branch(function.parameter(0), body, exit),
-        );
+        function.set_terminator(header, Terminator::branch(function.parameter(0), body, exit));
         function.append_instruction_with_effects(
             body,
             Intrinsic::Operand(OperandOperation::Store(OperandStore::Field)),
@@ -522,10 +650,7 @@ mod tests {
                 ..Effects::PURE
             },
         );
-        function.set_terminator(
-            body,
-            Terminator::jump(header),
-        );
+        function.set_terminator(body, Terminator::jump(header));
         function.set_terminator(exit, Terminator::Return(Vec::new()));
 
         let cfg = ControlFlowGraph::compute(&function);
@@ -536,15 +661,15 @@ mod tests {
 
         assert_eq!(
             memory.instruction_access(load).unwrap().dependencies,
-            BTreeSet::from([EffectDefinition::Phi(header)])
+            EffectSet::from([EffectDefinition::Phi(header)])
         );
         assert_eq!(
             memory.instruction_access(store).unwrap().dependencies,
-            BTreeSet::from([EffectDefinition::Phi(header)])
+            EffectSet::from([EffectDefinition::Phi(header)])
         );
         assert_eq!(
             memory.phi_inputs(header).unwrap(),
-            &BTreeSet::from([EffectDefinition::Entry, EffectDefinition::Instruction(store)])
+            &EffectSet::from([EffectDefinition::Entry, EffectDefinition::Instruction(store)])
         );
     }
 
@@ -602,10 +727,7 @@ mod tests {
                 ..Effects::PURE
             },
         )[0];
-        function.set_terminator(
-            function.entry,
-            Terminator::branch(function.parameter(0), write, clean),
-        );
+        function.set_terminator(function.entry, Terminator::branch(function.parameter(0), write, clean));
         function.append_instruction_with_effects(
             write,
             Intrinsic::Operand(OperandOperation::Store(OperandStore::Field)),
@@ -616,14 +738,8 @@ mod tests {
                 ..Effects::PURE
             },
         );
-        function.set_terminator(
-            write,
-            Terminator::jump(join),
-        );
-        function.set_terminator(
-            clean,
-            Terminator::jump(join),
-        );
+        function.set_terminator(write, Terminator::jump(join));
+        function.set_terminator(clean, Terminator::jump(join));
         function.set_terminator(join, Terminator::Return(Vec::new()));
 
         let cfg = ControlFlowGraph::compute(&function);
@@ -681,5 +797,4 @@ mod tests {
         assert_eq!(locations.reads[0].bytes, 1);
         assert!(!locations.unknown_read);
     }
-
 }

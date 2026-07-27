@@ -6,19 +6,29 @@
 
 //! Lower target-independent SSA into LowIR.
 
+use super::{
+    AddressDisplacement, AddressRegister, AddressScale, Handler, Instruction, Label, MemoryAddress, Operand,
+    Relocation, VirtualRegister, emit_instructions as emit,
+};
+use crate::bytecode::{BytecodeFieldId, HandlerLayout as BytecodeHandlerLayout};
+use crate::frontend::layout::{KnownLayoutConstant, LayoutConstantCategory, LayoutConstants};
+use crate::hash::{HashMap, HashSet};
+use crate::intrinsic::{
+    AddressOperation, AggregateOperation, AssertionOperation, BranchOperation, BytecodeOperation, CallOperation,
+    CheckedIntegerOperation, ClassificationOperation, ComparisonDomain, ComparisonRelation, ControlOperation,
+    FloatConversion, FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, IntegerSignedness,
+    Intrinsic, LowLevelOperation, MemoryOperation, OperandLoad, OperandOperation, OperandStore, ValueOperation,
+};
+use crate::ssa::{
+    BlockId, BlockLayout, Constant, Edge, Function, InstructionId, Operation, Terminator, ValueDefinition, ValueId,
+};
+use crate::target::description::{
+    BinaryOperation, EqualityCondition, IntegerWidth, MemoryWidth, Operation as MachineOperation, OrderedCondition,
+    OverflowOperation, PairWidth, SignCondition, TestCondition, ZeroCondition,
+};
 use crate::types::{InterpreterRegister, RegisterClass, Type};
-use crate::bytecode::{
-    BytecodeFieldId, HandlerLayout as BytecodeHandlerLayout,
-};
-use crate::frontend::layout::{
-    KnownLayoutConstant, LayoutConstantCategory, LayoutConstants,
-};
-use crate::intrinsic::{AddressOperation, AggregateOperation, AssertionOperation, BranchOperation, BytecodeOperation, CallOperation, CheckedIntegerOperation, ClassificationOperation, ComparisonDomain, ComparisonRelation, ControlOperation, FloatConversion, FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, IntegerSignedness, Intrinsic, LowLevelOperation, MemoryOperation, OperandLoad, OperandOperation, OperandStore, ValueOperation};
-use crate::ssa::{BlockId, BlockLayout, Constant, Edge, Function, InstructionId, Operation, Terminator, ValueDefinition, ValueId};
-use crate::target::description::{BinaryOperation, EqualityCondition, IntegerWidth, MemoryWidth, Operation as MachineOperation, OrderedCondition, OverflowOperation, PairWidth, SignCondition, TestCondition, ZeroCondition};
 use crate::{CompileError, CompileStage};
-use super::{AddressDisplacement, AddressRegister, AddressScale, Handler, Instruction, Label, MemoryAddress, Operand, Relocation, VirtualRegister, emit_instructions as emit, intern_virtual_registers};
-use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 pub(crate) fn lower_handler_with_constants(
     function: &Function,
@@ -26,10 +36,9 @@ pub(crate) fn lower_handler_with_constants(
     constants: &LayoutConstants,
     id: crate::identity::HandlerId,
 ) -> Result<Handler, CompileError> {
-    let mut handler =
-        lower_handler_internal(function, is_cold, constants, id).map_err(|message| {
-        CompileError::new(CompileStage::LowIr, Some(&function.name), message)
-    })?;
+    let function = &FunctionUses::new(function, id);
+    let mut handler = lower_handler_internal(function, is_cold, constants, id)
+        .map_err(|message| CompileError::new(CompileStage::LowIr, Some(&function.name), message))?;
     materialize_layout_constants(&mut handler);
     Ok(handler)
 }
@@ -73,10 +82,7 @@ fn materialize_bytecode_field(
                 CompileError::new(
                     CompileStage::LowIr,
                     Some(handler),
-                    format!(
-                        "unknown bytecode field '{}'",
-                        layout.field_name(field)
-                    ),
+                    format!("unknown bytecode field '{}'", layout.field_name(field)),
                 )
             })?
             .try_into()
@@ -97,12 +103,8 @@ fn materialize_bytecode_field(
             *operand = Operand::Immediate(resolve(*field)?);
         }
         Operand::Address(address) => {
-            if let Some(AddressDisplacement::BytecodeField(field)) =
-                &address.displacement
-            {
-                address.displacement = Some(
-                    AddressDisplacement::Immediate(resolve(*field)?),
-                );
+            if let Some(AddressDisplacement::BytecodeField(field)) = &address.displacement {
+                address.displacement = Some(AddressDisplacement::Immediate(resolve(*field)?));
             }
         }
         _ => {}
@@ -110,9 +112,7 @@ fn materialize_bytecode_field(
     Ok(())
 }
 
-pub(crate) fn materialize_layout_constants(
-    handler: &mut Handler,
-) {
+pub(crate) fn materialize_layout_constants(handler: &mut Handler) {
     for instruction in &mut handler.instructions {
         for operand in &mut instruction.operands {
             resolve_layout_constant(operand);
@@ -131,15 +131,10 @@ fn resolve_layout_constant(operand: &mut Operand) {
         }
         Operand::Address(address) => {
             if let Some(AddressScale::LayoutConstant(constant)) = address.scale {
-                address.scale =
-                    Some(AddressScale::Immediate(constant.value()));
+                address.scale = Some(AddressScale::Immediate(constant.value()));
             }
-            if let Some(AddressDisplacement::LayoutConstant(constant)) =
-                &address.displacement
-            {
-                address.displacement = Some(AddressDisplacement::Immediate(
-                    constant.value(),
-                ));
+            if let Some(AddressDisplacement::LayoutConstant(constant)) = &address.displacement {
+                address.displacement = Some(AddressDisplacement::Immediate(constant.value()));
             }
         }
         _ => {}
@@ -147,32 +142,33 @@ fn resolve_layout_constant(operand: &mut Operand) {
 }
 
 fn lower_handler_internal(
-    function: &Function,
+    function: &FunctionUses<'_>,
     is_cold: bool,
     constants: &LayoutConstants,
     id: crate::identity::HandlerId,
 ) -> Result<Handler, String> {
-    let mut folded_instructions = function
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            let Some(Terminator::Branch { condition, .. }) = &block.terminator else {
-                return None;
-            };
-            selected_branch(function, *condition)
-                .map(|branch| branch.instruction)
-                .or_else(|| selected_int32_pair(function, *condition).map(|(instruction, _, _)| instruction))
-        })
-        .collect::<HashSet<_>>();
+    let mut folded_instructions = FoldedInstructions::new(function.instructions.len());
     for block in &function.blocks {
         let Some(Terminator::Branch { condition, .. }) = &block.terminator else {
             continue;
         };
         if let Some(branch) = selected_branch(function, *condition) {
+            folded_instructions.insert(branch.instruction);
             folded_instructions.extend(branch.folded_inputs);
+        } else if let Some((instruction, _, _)) = selected_int32_pair(function, *condition) {
+            folded_instructions.insert(instruction);
         }
     }
     for instruction in &function.instructions {
+        if instruction.operation.guard_failure().is_some() {
+            let condition = instruction.inputs[0];
+            if let Some(branch) = selected_branch(function, condition) {
+                folded_instructions.insert(branch.instruction);
+                folded_instructions.extend(branch.folded_inputs);
+            } else if let Some((instruction, _, _)) = selected_int32_pair(function, condition) {
+                folded_instructions.insert(instruction);
+            }
+        }
         if let Some((instruction, _)) = folded_bitwise_not_source(function, instruction) {
             folded_instructions.insert(instruction);
         }
@@ -183,7 +179,10 @@ fn lower_handler_internal(
             folded_instructions.insert(instruction);
         }
         if matches!(instruction.operation, Operation::Intrinsic(Intrinsic::IntegerBinary(operation)) if operation.supports_narrow_result())
-            && instruction.results.first().is_some_and(|result| integer_result_can_stay_narrow(function, *result))
+            && instruction
+                .results
+                .first()
+                .is_some_and(|result| integer_result_can_stay_narrow(function, *result))
         {
             for input in &instruction.inputs {
                 if let Some((instructions, _)) = folded_32bit_operation_source(function, *input) {
@@ -201,18 +200,20 @@ fn lower_handler_internal(
         }
     }
     for block in &function.blocks {
-        let Some(Terminator::CheckedOperation {
-            operation,
-            inputs,
-            ..
-        }) = &block.terminator
-        else {
+        let Some(Terminator::CheckedOperation { operation, inputs, .. }) = &block.terminator else {
             continue;
         };
-        if matches!(operation, Operation::Intrinsic(Intrinsic::CheckedInteger(CheckedIntegerOperation::Add | CheckedIntegerOperation::Subtract | CheckedIntegerOperation::Multiply))) {
-            folded_instructions.extend(inputs.iter().filter_map(|input| {
-                folded_checked_i32_source(function, *input).map(|(instruction, _)| instruction)
-            }));
+        if matches!(
+            operation,
+            Operation::Intrinsic(Intrinsic::CheckedInteger(
+                CheckedIntegerOperation::Add | CheckedIntegerOperation::Subtract | CheckedIntegerOperation::Multiply
+            ))
+        ) {
+            folded_instructions.extend(
+                inputs.iter().filter_map(|input| {
+                    folded_checked_i32_source(function, *input).map(|(instruction, _)| instruction)
+                }),
+            );
         } else if let Operation::Intrinsic(Intrinsic::Branch(operation)) = operation
             && typed_narrow_signed_branch_operation(function, *operation, inputs).is_some()
         {
@@ -223,65 +224,62 @@ fn lower_handler_internal(
             }
         }
     }
-    folded_instructions.extend(function.instructions.iter().enumerate().filter_map(|(index, instruction)| {
-        (instruction.operation == Operation::Intrinsic(Intrinsic::Value(ValueOperation::Reuse)))
-            .then_some(InstructionId(index))
-    }));
+    folded_instructions.extend(
+        function
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (instruction.operation == Operation::Intrinsic(Intrinsic::Value(ValueOperation::Reuse)))
+                    .then_some(InstructionId(index))
+            }),
+    );
     let preferred_order = schedule_blocks(function);
     let alternate_order = schedule_blocks_with_successor_order(function, false);
     let profile_order = schedule_blocks_by_profile(function);
-    let preferred_profile_score = profile_layout_score(function, &preferred_order);
-    let alternate_profile_score = profile_layout_score(function, &alternate_order);
-    let preferred = lower_blocks(
-        function,
-        &folded_instructions,
-        constants,
-        preferred_order,
-    )?;
-    let alternate = lower_blocks(
-        function,
-        &folded_instructions,
-        constants,
-        alternate_order,
-    )?;
-    let preferred_cost = control_flow_cost(&preferred)?;
-    let alternate_cost = control_flow_cost(&alternate)?;
-    let (selected_profile_score, mut selected) = if alternate_profile_score > preferred_profile_score
-        || alternate_profile_score == preferred_profile_score && alternate_cost < preferred_cost
-    {
-        (alternate_profile_score, alternate)
-    } else {
-        (preferred_profile_score, preferred)
-    };
-    let profile_score = profile_layout_score(function, &profile_order);
-    if profile_score > selected_profile_score {
-        selected = lower_blocks(
-            function,
-            &folded_instructions,
-            constants,
-            profile_order,
-        )?;
+    let mut candidate_orders = vec![preferred_order.clone()];
+    if alternate_order != preferred_order {
+        candidate_orders.push(alternate_order);
     }
-    let mut instructions = selected;
+    if !candidate_orders.contains(&profile_order) {
+        candidate_orders.push(profile_order);
+    }
+    let lowered = lower_blocks(function, &folded_instructions, constants, preferred_order.clone())?;
+    let lowered_blocks = LoweredBlockFragments::new(&lowered, &preferred_order)?;
+    let mut selected = None;
+    for order in candidate_orders {
+        let instructions = lowered_blocks.layout_instructions(&lowered, &order);
+        let mut graph = super::cfg::ControlFlowGraph::from_instructions(instructions)?;
+        graph.simplify();
+        let cost = graph.linearized_instruction_count()?;
+        let profile_score = profile_layout_score(function, &order);
+        if selected.as_ref().is_none_or(|(selected_profile, selected_cost, _)| {
+            profile_score > *selected_profile || profile_score == *selected_profile && cost < *selected_cost
+        }) {
+            selected = Some((profile_score, cost, order));
+        }
+    }
+    let selected_order = selected.expect("there is always a preferred block order").2;
+    let mut instructions = if selected_order == preferred_order {
+        lowered
+    } else {
+        lowered_blocks.reorder(&lowered, &selected_order)
+    };
     // Preserve the semantic exec_ctx value for targets that derive it from a
     // different pinned base. The dedicated instruction also exposes any
     // scratch register needed for that derivation to register allocation.
     for instruction in &mut instructions {
         let stores_execution_context = match instruction.operands.get(1) {
-            Some(Operand::InterpreterRegister(register)) => {
-                *register == InterpreterRegister::ExecutionContext
-            }
+            Some(Operand::InterpreterRegister(register)) => *register == InterpreterRegister::ExecutionContext,
             _ => false,
         };
-        if instruction.opcode.operation()
-            == MachineOperation::store(MemoryWidth::DoubleWord)
+        if instruction.opcode.operation() == MachineOperation::store(MemoryWidth::DoubleWord)
             && stores_execution_context
         {
             instruction.opcode = MachineOperation::StoreExecutionContext;
             instruction.operands.pop();
         }
     }
-    intern_virtual_registers(id, &mut instructions);
     Ok(Handler {
         id,
         name: function.name.clone(),
@@ -299,28 +297,55 @@ fn profile_layout_score(function: &Function, blocks: &[BlockId]) -> usize {
             function.blocks[pair[0].0]
                 .terminator
                 .as_ref()
-                .is_some_and(|terminator| {
-                    terminator
-                        .successors()
-                        .iter()
-                        .any(|successor| successor.block == pair[1])
-                })
+                .is_some_and(|terminator| terminator.successors().any(|successor| successor.block == pair[1]))
         })
         .count()
 }
 
+/// The instructions a later one has absorbed, so lowering must not emit them.
+struct FoldedInstructions(Vec<bool>);
+
+impl FoldedInstructions {
+    fn new(instructions: usize) -> Self {
+        Self(vec![false; instructions])
+    }
+
+    fn insert(&mut self, instruction: InstructionId) {
+        self.0[instruction.0] = true;
+    }
+
+    fn extend(&mut self, instructions: impl IntoIterator<Item = InstructionId>) {
+        for instruction in instructions {
+            self.insert(instruction);
+        }
+    }
+
+    fn contains(&self, instruction: InstructionId) -> bool {
+        self.0[instruction.0]
+    }
+}
+
 fn lower_blocks(
-    function: &Function,
-    folded_instructions: &HashSet<InstructionId>,
+    function: &FunctionUses<'_>,
+    folded_instructions: &FoldedInstructions,
     constants: &LayoutConstants,
     block_order: Vec<BlockId>,
 ) -> Result<Vec<Instruction>, String> {
     let mut body = Vec::new();
     let mut edge_temporary = 0usize;
-    let mut deferred_switch_tails = HashMap::<BlockId, Vec<Instruction>>::new();
+    let mut deferred_switch_tails = HashMap::<BlockId, Vec<Instruction>>::default();
+    let entry_is_branch_target = (0..function.blocks.len()).any(|index| {
+        function.blocks[index]
+            .terminator
+            .as_ref()
+            .is_some_and(|terminator| terminator.successors().any(|edge| edge.block == function.entry))
+            || function
+                .guard_exits(BlockId(index))
+                .any(|(_, failure)| failure == function.entry)
+    });
     for (position, &block_id) in block_order.iter().enumerate() {
         let block = &function.blocks[block_id.0];
-        if block_id != function.entry {
+        if block_id != function.entry || entry_is_branch_target {
             let label = block_label(block_id);
             if block.layout == BlockLayout::Cold {
                 emit!(body; MachineOperation::Cold => [Operand::Label(label.clone())];);
@@ -332,7 +357,7 @@ fn lower_blocks(
             .instructions
             .iter()
             .copied()
-            .filter(|instruction| !folded_instructions.contains(instruction))
+            .filter(|instruction| !folded_instructions.contains(*instruction))
             .collect::<Vec<_>>();
         let mut instruction_index = 0;
         while instruction_index < instructions.len() {
@@ -346,13 +371,25 @@ fn lower_blocks(
                     )
                 })
                 .map(|offset| instruction_index + 1 + offset);
-            if let Some(next_index) = next_instruction
-                && lower_field_access_pair(
+            if let Some(failure) = function.instructions[instruction_id.0].operation.guard_failure() {
+                let name = format!("guard_{}", instruction_id.0);
+                let continue_label = Label::new(format!(".ssa_{name}_pass"));
+                emit_conditional_branch(
                     function,
-                    instruction_id,
-                    instructions[next_index],
+                    constants,
+                    &name,
+                    block_body_start,
+                    function.instructions[instruction_id.0].inputs[0],
+                    &continue_label,
                     &mut body,
-                )?
+                )?;
+                emit!(body; MachineOperation::Control(ControlOperation::JumpLabel) => [Operand::Label(block_label(failure))];);
+                emit!(body; MachineOperation::Label => [Operand::Label(continue_label)];);
+                instruction_index += 1;
+                continue;
+            }
+            if let Some(next_index) = next_instruction
+                && lower_field_access_pair(function, instruction_id, instructions[next_index], &mut body)?
             {
                 instruction_index = next_index + 1;
                 continue;
@@ -371,12 +408,7 @@ fn lower_blocks(
             .ok_or_else(|| format!("block {block_id:?} has no terminator"))?
         {
             Terminator::Jump(edge) => {
-                lower_edge_copies(
-                    function,
-                    edge,
-                    &mut body,
-                    &mut edge_temporary,
-                )?;
+                lower_edge_copies(function, edge, &mut body, &mut edge_temporary)?;
                 emit!(body; MachineOperation::Control(ControlOperation::JumpLabel) => [Operand::Label(block_label(edge.block))];);
             }
             Terminator::Branch {
@@ -385,144 +417,23 @@ fn lower_blocks(
                 else_edge,
             } => {
                 let then_label = Label::new(format!(".ssa_edge_{}_then", block_id.0));
-                let branch = selected_branch(function, *condition);
-                if let Some((_, lhs, rhs)) = selected_int32_pair(function, *condition) {
-                    let failure_label = Label::new(format!(".ssa_edge_{}_else", block_id.0));
-                    emit!(body;
-                        MachineOperation::branch_tag(EqualityCondition::NotEqual) => [value_operand(function, lhs)?, layout_operand(
-                                constants,
-                                KnownLayoutConstant::Int32Tag,
-                            )?, Operand::Label(failure_label.clone())];
-                    );
-                    emit!(body;
-                        MachineOperation::branch_tag(EqualityCondition::Equal) => [value_operand(function, rhs)?, layout_operand(
-                                constants,
-                                KnownLayoutConstant::Int32Tag,
-                            )?, Operand::Label(then_label.clone())];
-                    );
-                    emit!(body; MachineOperation::Label => [Operand::Label(failure_label)];);
-                } else if let Some(branch) = branch {
-                    let direct_tag_branch = branch.direct_tag_source.as_ref().and_then(|source| {
-                        if !branch.early_branches.is_empty() || branch.and_mask.is_some() {
-                            return None;
-                        }
-                        let [SelectedBranchInput::Value(lhs), SelectedBranchInput::Value(rhs)] =
-                            branch.inputs.as_slice()
-                        else {
-                            return None;
-                        };
-                        if !matches!(
-                            branch.operation,
-                            MachineOperation::Branch(BranchOperation::Equality {
-                                width: IntegerWidth::U64 | IntegerWidth::U16,
-                                ..
-                            })
-                        ) {
-                            return None;
-                        }
-                        if *lhs == source.tag {
-                            direct_tag_constant(function, *rhs).map(|tag| (source.value, tag))
-                        } else if *rhs == source.tag {
-                            direct_tag_constant(function, *lhs).map(|tag| (source.value, tag))
-                        } else {
-                            None
-                        }
-                    }).or_else(|| singleton_value_branch(function, &branch));
-                    if let Some(source) = branch.direct_tag_source.as_ref()
-                        && direct_tag_branch.is_none()
-                    {
-                        let tag = value_operand(function, source.tag)?;
-                        emit!(body; MachineOperation::ExtractTag => [tag, value_operand(function, source.value)?];);
-                    }
-                    for early_branch in &branch.early_branches {
-                        let mut operands = early_branch
-                            .inputs
-                            .iter()
-                            .map(|input| branch_input_operand(function, constants, input))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        materialize_symbolic_branch_rhs(
-                            early_branch.operation,
-                            block_id,
-                            block_body_start,
-                            &mut operands,
-                            &mut body,
-                        );
-                        operands.push(Operand::Label(then_label.clone()));
-                        body.push(machine_instruction(early_branch.operation, operands));
-                    }
-                    if let Some((value, expected_tag)) = direct_tag_branch {
-                        let singleton = matches!(
-                            &expected_tag,
-                            Operand::LayoutConstant(constant)
-                                if constant.category()
-                                    == LayoutConstantCategory::Value
-                        );
-                        emit!(body;
-                            match (
-                                singleton,
-                                matches!(
-                                    branch.operation,
-                                    MachineOperation::Branch(BranchOperation::Equality {
-                                        condition: EqualityCondition::Equal,
-                                        ..
-                                    })
-                                ),
-                            ) {
-                                (true, true) => MachineOperation::branch_singleton(EqualityCondition::Equal),
-                                (true, false) => MachineOperation::branch_singleton(EqualityCondition::NotEqual),
-                                (false, true) => MachineOperation::branch_tag(EqualityCondition::Equal),
-                                (false, false) => MachineOperation::branch_tag(EqualityCondition::NotEqual),
-                            } => [value_operand(function, value)?, expected_tag, Operand::Label(then_label.clone())];
-                        );
-                    } else {
-                        let mut operands = branch
-                            .inputs
-                            .iter()
-                            .map(|input| branch_input_operand(function, constants, input))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        if let Some((source, destination, mask)) = branch.and_mask {
-                            if source != destination {
-                                let destination = value_operand(function, destination)?;
-                                emit!(body; MachineOperation::Move(IntegerWidth::U64) => [destination, value_operand(function, source)?];);
-                            }
-                            emit!(body; MachineOperation::IntegerBinary { operation: IntegerBinaryOperation::Binary(BinaryOperation::And), width: IntegerWidth::U16 } => [value_operand(function, destination)?, layout_operand(constants, mask)?];);
-                        }
-                        materialize_symbolic_branch_rhs(
-                            branch.operation,
-                            block_id,
-                            block_body_start,
-                            &mut operands,
-                            &mut body,
-                        );
-                        operands.push(Operand::Label(then_label.clone()));
-                        body.push(machine_instruction(branch.operation, operands));
-                    }
-                } else {
-                    emit!(body; MachineOperation::branch_zero(IntegerWidth::U64, ZeroCondition::NonZero) => [value_operand(function, *condition)?, Operand::Label(then_label.clone())];);
-                }
-                lower_edge_copies(
+                emit_conditional_branch(
                     function,
-                    else_edge,
+                    constants,
+                    &format!("{}", block_id.0),
+                    block_body_start,
+                    *condition,
+                    &then_label,
                     &mut body,
-                    &mut edge_temporary,
                 )?;
+                lower_edge_copies(function, else_edge, &mut body, &mut edge_temporary)?;
                 emit!(body; MachineOperation::Control(ControlOperation::JumpLabel) => [Operand::Label(block_label(else_edge.block))];);
                 emit!(body; MachineOperation::Label => [Operand::Label(then_label)];);
-                lower_edge_copies(
-                    function,
-                    then_edge,
-                    &mut body,
-                    &mut edge_temporary,
-                )?;
+                lower_edge_copies(function, then_edge, &mut body, &mut edge_temporary)?;
                 emit!(body; MachineOperation::Control(ControlOperation::JumpLabel) => [Operand::Label(block_label(then_edge.block))];);
             }
             Terminator::Switch { value, cases, default } => {
-                let preferred_tail_after = preferred_switch_tail_after(
-                    &block_order,
-                    position,
-                    cases,
-                    default,
-                );
+                let preferred_tail_after = preferred_switch_tail_after(&block_order, position, cases, default);
                 if let Some((target, tail)) = lower_switch(
                     function,
                     block_id,
@@ -582,9 +493,11 @@ fn lower_blocks(
                     Some(label.clone())
                 })
                 .collect::<Vec<_>>();
-            body.extend(internal_labels.into_iter().map(|label| {
-                machine_instruction(MachineOperation::Cold, vec![Operand::Label(label)])
-            }));
+            body.extend(
+                internal_labels
+                    .into_iter()
+                    .map(|label| machine_instruction(MachineOperation::Cold, vec![Operand::Label(label)])),
+            );
         }
     }
     if !deferred_switch_tails.is_empty() {
@@ -600,19 +513,112 @@ fn lower_blocks(
     Ok(body)
 }
 
-fn control_flow_cost(instructions: &[Instruction]) -> Result<usize, String> {
-    let mut instructions = instructions.to_vec();
-    super::optimize::invert_branches_over_jumps(&mut instructions);
-    super::optimize::remove_unreferenced_labels(&mut instructions);
-    super::optimize::invert_branches_over_jumps(&mut instructions);
-    super::optimize::remove_unreferenced_labels(&mut instructions);
-    let mut graph = super::cfg::ControlFlowGraph::from_instructions(instructions)?;
-    graph.thread_unconditional_jumps();
-    graph.remove_unreferenced_jump_blocks();
-    graph.remove_unreachable_blocks();
-    let layout = graph.layout_hot_and_cold()?;
-    Ok(graph.linearize_omitting_jumps_to_next_block(&layout.hot).len()
-        + graph.linearize_omitting_jumps_to_next_block(&layout.cold).len())
+struct LoweredBlockFragments {
+    ranges: Vec<Range<usize>>,
+}
+
+impl LoweredBlockFragments {
+    fn new(instructions: &[Instruction], original_order: &[BlockId]) -> Result<Self, String> {
+        let labels = original_order
+            .iter()
+            .map(|block| (block_label(*block), *block))
+            .collect::<HashMap<_, _>>();
+        let mut starts = Vec::with_capacity(original_order.len());
+        for (index, instruction) in instructions.iter().enumerate() {
+            if instruction.opcode.operation() != MachineOperation::Label {
+                continue;
+            }
+            let [Operand::Label(label)] = instruction.operands.as_slice() else {
+                continue;
+            };
+            let Some(block) = labels.get(label).copied() else {
+                continue;
+            };
+            let start = if index > 0
+                && instructions[index - 1].opcode.operation() == MachineOperation::Cold
+                && instructions[index - 1].operands == instruction.operands
+            {
+                index - 1
+            } else {
+                index
+            };
+            starts.push((block, start));
+        }
+        if starts.first().is_none_or(|(_, start)| *start != 0) {
+            starts.insert(0, (original_order[0], 0));
+        }
+        let mut ranges = vec![0..0; original_order.len()];
+        let mut found = vec![false; original_order.len()];
+        for (position, (block, start)) in starts.iter().enumerate() {
+            let end = starts.get(position + 1).map_or(instructions.len(), |(_, start)| *start);
+            if block.0 >= ranges.len() || std::mem::replace(&mut found[block.0], true) {
+                return Err("lowered block fragments do not cover the scheduled SSA blocks".to_string());
+            }
+            ranges[block.0] = *start..end;
+        }
+        if found.contains(&false) {
+            return Err("lowered block fragments do not cover the scheduled SSA blocks".to_string());
+        }
+        Ok(Self { ranges })
+    }
+
+    fn reorder(&self, instructions: &[Instruction], new_order: &[BlockId]) -> Vec<Instruction> {
+        let mut reordered = Vec::with_capacity(instructions.len());
+        for block in new_order {
+            reordered.extend_from_slice(&instructions[self.ranges[block.0].clone()]);
+        }
+        reordered
+    }
+
+    fn layout_instructions(
+        &self,
+        instructions: &[Instruction],
+        new_order: &[BlockId],
+    ) -> Vec<Instruction<LayoutOperand>> {
+        let mut reordered = Vec::with_capacity(instructions.len());
+        for block in new_order {
+            reordered.extend(instructions[self.ranges[block.0].clone()].iter().map(|instruction| {
+                Instruction {
+                    opcode: instruction.opcode,
+                    operands: instruction
+                        .operands
+                        .iter()
+                        .map(|operand| match operand {
+                            Operand::Label(label) => LayoutOperand::Label(label.clone()),
+                            _ => LayoutOperand::Other,
+                        })
+                        .collect(),
+                }
+            }));
+        }
+        reordered
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LayoutOperand {
+    Label(Label),
+    Other,
+}
+
+impl super::ControlFlowOperand for LayoutOperand {
+    fn label(&self) -> Option<&Label> {
+        match self {
+            Self::Label(label) => Some(label),
+            Self::Other => None,
+        }
+    }
+
+    fn label_mut(&mut self) -> Option<&mut Label> {
+        match self {
+            Self::Label(label) => Some(label),
+            Self::Other => None,
+        }
+    }
+
+    fn from_label(label: Label) -> Self {
+        Self::Label(label)
+    }
 }
 
 fn schedule_blocks(function: &Function) -> Vec<BlockId> {
@@ -620,42 +626,43 @@ fn schedule_blocks(function: &Function) -> Vec<BlockId> {
 }
 
 fn schedule_blocks_with_successor_order(function: &Function, reverse_successors: bool) -> Vec<BlockId> {
-    fn visit(
-        function: &Function,
-        block: BlockId,
-        reverse_successors: bool,
-        visited: &mut HashSet<BlockId>,
-        postorder: &mut Vec<BlockId>,
-    ) {
-        if !visited.insert(block) {
-            return;
-        }
-        if let Some(terminator) = &function.blocks[block.0].terminator {
-            let mut successors = terminator.successors();
-            if reverse_successors {
-                successors.reverse();
-            }
-            for successor in successors {
-                visit(function, successor.block, reverse_successors, visited, postorder);
-            }
-        }
-        postorder.push(block);
-    }
-
-    let mut visited = HashSet::new();
-    let mut reverse_postorder = Vec::new();
-    visit(
-        function,
-        function.entry,
-        reverse_successors,
-        &mut visited,
-        &mut reverse_postorder,
-    );
-    reverse_postorder.reverse();
-    for index in 0..function.blocks.len() {
-        let block = BlockId(index);
-        if visited.insert(block) {
+    // Walk the graph with an explicit stack to handle deeply nested control
+    // flow without consuming the call stack.
+    let mut visited = vec![false; function.blocks.len()];
+    let mut reverse_postorder = Vec::with_capacity(function.blocks.len());
+    let mut stack = vec![(function.entry, 0usize)];
+    visited[function.entry.0] = true;
+    while let Some((block, next)) = stack.last_mut() {
+        let block = *block;
+        let successors = function.blocks[block.0]
+            .terminator
+            .as_ref()
+            .map_or(0, Terminator::successor_count);
+        if *next == successors {
             reverse_postorder.push(block);
+            stack.pop();
+            continue;
+        }
+        let index = if reverse_successors {
+            successors - 1 - *next
+        } else {
+            *next
+        };
+        *next += 1;
+        let successor = function.blocks[block.0]
+            .terminator
+            .as_ref()
+            .expect("a block with successors has a terminator")
+            .successor(index)
+            .block;
+        if !std::mem::replace(&mut visited[successor.0], true) {
+            stack.push((successor, 0));
+        }
+    }
+    reverse_postorder.reverse();
+    for (index, was_visited) in visited.iter_mut().enumerate() {
+        if !std::mem::replace(was_visited, true) {
+            reverse_postorder.push(BlockId(index));
         }
     }
     let mut scheduled = reverse_postorder
@@ -756,7 +763,7 @@ fn schedule_blocks_by_profile(function: &Function) -> Vec<BlockId> {
 
 #[allow(clippy::too_many_arguments)]
 fn lower_switch(
-    function: &Function,
+    function: &FunctionUses<'_>,
     block: BlockId,
     next_block: Option<BlockId>,
     preferred_tail_after: Option<BlockId>,
@@ -771,16 +778,13 @@ fn lower_switch(
         && let Some(preferred_tail_after) = preferred_tail_after
     {
         let tail_label = Label::new(format!(".ssa_switch_{}_after_preferred", block.0));
-        if emit_inverted_switch_group_test(
-            function,
-            &value,
-            &cases[..group_length],
-            &tail_label,
-            output,
-        )? {
+        if emit_inverted_switch_group_test(function, &value, &cases[..group_length], &tail_label, output)? {
             lower_edge_copies(function, preferred_edge, output, temporary_index)?;
             emit!(output; MachineOperation::Control(ControlOperation::JumpLabel) => [Operand::Label(block_label(preferred_edge.block))];);
-            let mut tail = vec![machine_instruction(MachineOperation::Label, vec![Operand::Label(tail_label)])];
+            let mut tail = vec![machine_instruction(
+                MachineOperation::Label,
+                vec![Operand::Label(tail_label)],
+            )];
             lower_switch_cases(
                 function,
                 block,
@@ -794,16 +798,7 @@ fn lower_switch(
             return Ok(Some((preferred_tail_after, tail)));
         }
     }
-    lower_switch_cases(
-        function,
-        block,
-        &value,
-        cases,
-        0,
-        default,
-        output,
-        temporary_index,
-    )?;
+    lower_switch_cases(function, block, &value, cases, 0, default, output, temporary_index)?;
     Ok(None)
 }
 
@@ -845,7 +840,7 @@ fn first_preferred_switch_group<'a>(
 }
 
 fn emit_inverted_switch_group_test(
-    function: &Function,
+    function: &FunctionUses<'_>,
     value: &Operand,
     cases: &[(ValueId, Edge)],
     failure: &Label,
@@ -862,9 +857,7 @@ fn emit_inverted_switch_group_test(
         .collect::<Option<Vec<_>>>();
     let Some(values) = values.filter(|values| {
         values.last().unwrap().checked_add(1).is_some()
-            && values
-                .windows(2)
-                .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+            && values.windows(2).all(|pair| pair[0].checked_add(1) == Some(pair[1]))
     }) else {
         return Ok(false);
     };
@@ -879,7 +872,7 @@ fn emit_inverted_switch_group_test(
 
 #[allow(clippy::too_many_arguments)]
 fn lower_switch_cases(
-    function: &Function,
+    function: &FunctionUses<'_>,
     block: BlockId,
     value: &Operand,
     cases: &[(ValueId, Edge)],
@@ -904,9 +897,7 @@ fn lower_switch_cases(
             .filter(|values| {
                 values.len() > 1
                     && values.last().unwrap().checked_add(1).is_some()
-                    && values
-                        .windows(2)
-                        .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+                    && values.windows(2).all(|pair| pair[0].checked_add(1) == Some(pair[1]))
             });
         if let Some(values) = consecutive_integers {
             let start = values[0];
@@ -953,7 +944,7 @@ fn lower_switch_cases(
 
 #[allow(clippy::too_many_arguments)]
 fn lower_checked_operation(
-    function: &Function,
+    function: &FunctionUses<'_>,
     block: BlockId,
     operation: &Operation,
     inputs: &[ValueId],
@@ -989,7 +980,10 @@ fn lower_checked_operation(
         }
     } else if let Operation::Intrinsic(Intrinsic::FloatingPoint(operation)) = operation {
         if !operation.is_fallible() {
-            return Err(format!("non-fallible floating-point operation '{}' used as a checked operation", operation.name()));
+            return Err(format!(
+                "non-fallible floating-point operation '{}' used as a checked operation",
+                operation.name()
+            ));
         }
         let operands = results
             .iter()
@@ -1021,7 +1015,9 @@ fn lower_checked_operation(
                 emit!(output; MachineOperation::Overflow(OverflowOperation::MultiplyCopy) => [result, value_operand(function, lhs)?, value_operand(function, rhs_value)?, Operand::Label(failure_label.clone())];);
             } else {
                 emit!(output; MachineOperation::Move(IntegerWidth::U64) => [result.clone(), value_operand(function, lhs)?];);
-                if checked_operation == OverflowOperation::AddWithOverflow && integer_constant(function, *rhs) == Some(1) {
+                if checked_operation == OverflowOperation::AddWithOverflow
+                    && integer_constant(function, *rhs) == Some(1)
+                {
                     emit!(output; MachineOperation::Overflow(OverflowOperation::Increment) => [result, Operand::Label(failure_label.clone())];);
                 } else if checked_operation == OverflowOperation::SubtractWithOverflow
                     && integer_constant(function, *rhs) == Some(1)
@@ -1053,7 +1049,10 @@ fn lower_checked_operation(
     } else {
         let (operation_name, machine_operation) = match operation {
             Operation::Parameter(parameter) => {
-                return Err(format!("unresolved operation parameter {} reached LowIR lowering", parameter.0));
+                return Err(format!(
+                    "unresolved operation parameter {} reached LowIR lowering",
+                    parameter.0
+                ));
             }
             Operation::Intrinsic(Intrinsic::LowLevel(operation)) => {
                 (operation.name(), Some(low_level_machine_operation(*operation)))
@@ -1073,8 +1072,7 @@ fn lower_checked_operation(
             .chain([Operand::Label(failure_label.clone())])
             .collect();
         output.push(machine_instruction(
-            machine_operation
-                .ok_or_else(|| format!("checked operation '{operation_name}' has no LowIR operation"))?,
+            machine_operation.ok_or_else(|| format!("checked operation '{operation_name}' has no LowIR operation"))?,
             operands,
         ));
     }
@@ -1103,11 +1101,7 @@ struct SelectedBranch {
 }
 
 impl SelectedBranch {
-    fn new(
-        instruction: InstructionId,
-        operation: MachineOperation,
-        inputs: Vec<SelectedBranchInput>,
-    ) -> Self {
+    fn new(instruction: InstructionId, operation: MachineOperation, inputs: Vec<SelectedBranchInput>) -> Self {
         Self {
             instruction,
             operation,
@@ -1140,20 +1134,23 @@ enum SelectedBranchInput {
     Layout(KnownLayoutConstant),
 }
 
-fn selected_branch(function: &Function, condition: ValueId) -> Option<SelectedBranch> {
+fn selected_branch(function: &FunctionUses<'_>, condition: ValueId) -> Option<SelectedBranch> {
     let mut branch = select_branch(function, condition)?;
     fold_load_into_branch(function, &mut branch);
     Some(branch)
 }
 
-fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBranch> {
+fn select_branch(function: &FunctionUses<'_>, condition: ValueId) -> Option<SelectedBranch> {
     let (instruction, operation) = single_use_instruction(function, condition)?;
     let (comparison, classification) = match &operation.operation {
         Operation::Intrinsic(Intrinsic::IntegerComparison(comparison)) => (Some(*comparison), None),
         Operation::Intrinsic(Intrinsic::Classification(classification)) => (None, Some(*classification)),
         _ => return None,
     };
-    if matches!(comparison, Some(IntegerComparisonOperation::Equal | IntegerComparisonOperation::NotEqual)) {
+    if matches!(
+        comparison,
+        Some(IntegerComparisonOperation::Equal | IntegerComparisonOperation::NotEqual)
+    ) {
         let [lhs, rhs] = operation.inputs.as_slice() else {
             return None;
         };
@@ -1193,11 +1190,16 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
         let [lhs, rhs] = operation.inputs.as_slice() else {
             return None;
         };
-        if function.values[lhs.0].ty == Type::U32 && is_i32_max(function, *rhs)
-        {
+        if function.values[lhs.0].ty == Type::U32 && is_i32_max(function, *rhs) {
             return Some(SelectedBranch::new(
                 instruction,
-                if matches!(comparison, Some(IntegerComparisonOperation::Relational { relation: ComparisonRelation::LessOrEqual, .. })) {
+                if matches!(
+                    comparison,
+                    Some(IntegerComparisonOperation::Relational {
+                        relation: ComparisonRelation::LessOrEqual,
+                        ..
+                    })
+                ) {
                     MachineOperation::branch_bit(TestCondition::Clear)
                 } else {
                     MachineOperation::branch_bit(TestCondition::Set)
@@ -1222,14 +1224,28 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
                 .unwrap_or((*lhs, Vec::new()));
             let mut branch = SelectedBranch::new(
                 instruction,
-                if matches!(comparison, Some(IntegerComparisonOperation::Relational { relation: ComparisonRelation::Less, .. })) {
+                if matches!(
+                    comparison,
+                    Some(IntegerComparisonOperation::Relational {
+                        relation: ComparisonRelation::Less,
+                        ..
+                    })
+                ) {
                     MachineOperation::branch_sign(
-                        if function.values[lhs.0].ty == Type::I32 { IntegerWidth::U32 } else { IntegerWidth::U64 },
+                        if function.values[lhs.0].ty == Type::I32 {
+                            IntegerWidth::U32
+                        } else {
+                            IntegerWidth::U64
+                        },
                         SignCondition::Negative,
                     )
                 } else {
                     MachineOperation::branch_sign(
-                        if function.values[lhs.0].ty == Type::I32 { IntegerWidth::U32 } else { IntegerWidth::U64 },
+                        if function.values[lhs.0].ty == Type::I32 {
+                            IntegerWidth::U32
+                        } else {
+                            IntegerWidth::U64
+                        },
                         SignCondition::NotNegative,
                     )
                 },
@@ -1294,14 +1310,30 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
         .all(|input| function.values[input.0].ty == Type::ValueTag);
     let comparison = comparison?;
     let branch_operation = match comparison {
-        IntegerComparisonOperation::Equal if compares_value_tags => MachineOperation::branch_equality(IntegerWidth::U16, EqualityCondition::Equal),
-        IntegerComparisonOperation::NotEqual if compares_value_tags => MachineOperation::branch_equality(IntegerWidth::U16, EqualityCondition::NotEqual),
-        IntegerComparisonOperation::Equal if compares_u32 => MachineOperation::branch_equality(IntegerWidth::U32, EqualityCondition::Equal),
-        IntegerComparisonOperation::NotEqual if compares_u32 => MachineOperation::branch_equality(IntegerWidth::U32, EqualityCondition::NotEqual),
-        IntegerComparisonOperation::Equal => MachineOperation::branch_equality(IntegerWidth::U64, EqualityCondition::Equal),
-        IntegerComparisonOperation::NotEqual => MachineOperation::branch_equality(IntegerWidth::U64, EqualityCondition::NotEqual),
+        IntegerComparisonOperation::Equal if compares_value_tags => {
+            MachineOperation::branch_equality(IntegerWidth::U16, EqualityCondition::Equal)
+        }
+        IntegerComparisonOperation::NotEqual if compares_value_tags => {
+            MachineOperation::branch_equality(IntegerWidth::U16, EqualityCondition::NotEqual)
+        }
+        IntegerComparisonOperation::Equal if compares_u32 => {
+            MachineOperation::branch_equality(IntegerWidth::U32, EqualityCondition::Equal)
+        }
+        IntegerComparisonOperation::NotEqual if compares_u32 => {
+            MachineOperation::branch_equality(IntegerWidth::U32, EqualityCondition::NotEqual)
+        }
+        IntegerComparisonOperation::Equal => {
+            MachineOperation::branch_equality(IntegerWidth::U64, EqualityCondition::Equal)
+        }
+        IntegerComparisonOperation::NotEqual => {
+            MachineOperation::branch_equality(IntegerWidth::U64, EqualityCondition::NotEqual)
+        }
         IntegerComparisonOperation::Relational { relation, domain } => MachineOperation::branch_ordered(
-            if compares_i32 { IntegerWidth::U32 } else { IntegerWidth::U64 },
+            if compares_i32 {
+                IntegerWidth::U32
+            } else {
+                IntegerWidth::U64
+            },
             relation,
             match domain {
                 ComparisonDomain::SignedInteger => IntegerSignedness::Signed,
@@ -1309,8 +1341,12 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
                 ComparisonDomain::Value => return None,
             },
         ),
-        IntegerComparisonOperation::BitsSet => MachineOperation::branch_bits(MemoryWidth::DoubleWord, TestCondition::Set),
-        IntegerComparisonOperation::BitsClear => MachineOperation::branch_bits(MemoryWidth::DoubleWord, TestCondition::Clear),
+        IntegerComparisonOperation::BitsSet => {
+            MachineOperation::branch_bits(MemoryWidth::DoubleWord, TestCondition::Set)
+        }
+        IntegerComparisonOperation::BitsClear => {
+            MachineOperation::branch_bits(MemoryWidth::DoubleWord, TestCondition::Clear)
+        }
     };
     let direct_tag_source = operation
         .inputs
@@ -1327,10 +1363,14 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
         .map(|input| {
             if matches!(
                 branch_operation,
-                MachineOperation::Branch(BranchOperation::Equality { width: IntegerWidth::U32, .. })
-                    | MachineOperation::Branch(BranchOperation::Ordered { width: IntegerWidth::U32, .. })
-            )
-                && let Some((instructions, source)) = folded_32bit_operation_source(function, input)
+                MachineOperation::Branch(BranchOperation::Equality {
+                    width: IntegerWidth::U32,
+                    ..
+                }) | MachineOperation::Branch(BranchOperation::Ordered {
+                    width: IntegerWidth::U32,
+                    ..
+                })
+            ) && let Some((instructions, source)) = folded_32bit_operation_source(function, input)
             {
                 folded_inputs.extend(instructions);
                 source
@@ -1347,7 +1387,7 @@ fn select_branch(function: &Function, condition: ValueId) -> Option<SelectedBran
 }
 
 fn branch_input_operand(
-    function: &Function,
+    function: &FunctionUses<'_>,
     constants: &LayoutConstants,
     input: &SelectedBranchInput,
 ) -> Result<Operand, String> {
@@ -1359,7 +1399,7 @@ fn branch_input_operand(
     }
 }
 
-fn fold_load_into_branch(function: &Function, branch: &mut SelectedBranch) {
+fn fold_load_into_branch(function: &FunctionUses<'_>, branch: &mut SelectedBranch) {
     for load_index in 0..branch.inputs.len().min(2) {
         let SelectedBranchInput::Value(value) = branch.inputs[load_index] else {
             continue;
@@ -1380,9 +1420,7 @@ fn fold_load_into_branch(function: &Function, branch: &mut SelectedBranch) {
                     width: IntegerWidth::U64,
                     condition,
                 }),
-            )
-                if byte_immediate.is_some() =>
-            (
+            ) if byte_immediate.is_some() => (
                 MachineOperation::branch_equality(IntegerWidth::U8, condition),
                 other.unwrap(),
             ),
@@ -1392,9 +1430,7 @@ fn fold_load_into_branch(function: &Function, branch: &mut SelectedBranch) {
                     width: MemoryWidth::DoubleWord,
                     condition,
                 }),
-            )
-                if byte_immediate.is_some() =>
-            (
+            ) if byte_immediate.is_some() => (
                 MachineOperation::branch_bits(MemoryWidth::Byte, condition),
                 other.unwrap(),
             ),
@@ -1413,20 +1449,26 @@ fn fold_load_into_branch(function: &Function, branch: &mut SelectedBranch) {
             ),
             (
                 width @ (MemoryWidth::Word | MemoryWidth::DoubleWord),
-                MachineOperation::Branch(BranchOperation::Equality { width: branch_width, condition }),
-            ) if other.as_ref().is_some_and(|other| {
-                branch_register_is_compatible(function, other, width, branch_width)
-            }) => (
-                MachineOperation::branch_memory(
-                    match width {
-                        MemoryWidth::Word => PairWidth::Word,
-                        MemoryWidth::DoubleWord => PairWidth::DoubleWord,
-                        _ => unreachable!(),
-                    },
+                MachineOperation::Branch(BranchOperation::Equality {
+                    width: branch_width,
                     condition,
-                ),
-                other.unwrap(),
-            ),
+                }),
+            ) if other
+                .as_ref()
+                .is_some_and(|other| branch_register_is_compatible(function, other, width, branch_width)) =>
+            {
+                (
+                    MachineOperation::branch_memory(
+                        match width {
+                            MemoryWidth::Word => PairWidth::Word,
+                            MemoryWidth::DoubleWord => PairWidth::DoubleWord,
+                            _ => unreachable!(),
+                        },
+                        condition,
+                    ),
+                    other.unwrap(),
+                )
+            }
             _ => continue,
         };
         branch.operation = operation;
@@ -1437,7 +1479,7 @@ fn fold_load_into_branch(function: &Function, branch: &mut SelectedBranch) {
 }
 
 fn branch_register_is_compatible(
-    function: &Function,
+    function: &FunctionUses<'_>,
     input: &SelectedBranchInput,
     load_width: MemoryWidth,
     branch_width: IntegerWidth,
@@ -1447,8 +1489,7 @@ fn branch_register_is_compatible(
     };
     if !matches!(
         (load_width, branch_width),
-        (MemoryWidth::Word, IntegerWidth::U32 | IntegerWidth::U64)
-            | (MemoryWidth::DoubleWord, IntegerWidth::U64)
+        (MemoryWidth::Word, IntegerWidth::U32 | IntegerWidth::U64) | (MemoryWidth::DoubleWord, IntegerWidth::U64)
     ) {
         return false;
     }
@@ -1468,7 +1509,7 @@ struct LoweredLoad {
 }
 
 fn lowered_single_use_load(
-    function: &Function,
+    function: &FunctionUses<'_>,
     value: ValueId,
     branch: &SelectedBranch,
 ) -> Option<LoweredLoad> {
@@ -1476,9 +1517,7 @@ fn lowered_single_use_load(
     let mut instructions = Vec::new();
     loop {
         let (instruction, source) = single_use_instruction(function, value)?;
-        if source.operation
-            != Operation::Intrinsic(Intrinsic::Value(ValueOperation::Reuse))
-        {
+        if source.operation != Operation::Intrinsic(Intrinsic::Value(ValueOperation::Reuse)) {
             instructions.push(instruction);
             break;
         }
@@ -1494,17 +1533,13 @@ fn lowered_single_use_load(
         .chain(&branch.folded_inputs)
         .copied()
         .collect::<HashSet<_>>();
-    let adjacent = function.blocks.iter().any(|block| {
-        let first = block.instructions.iter().position(|id| *id == load_instruction);
-        let last = block.instructions.iter().position(|id| *id == branch.instruction);
-        first.zip(last).is_some_and(|(first, last)| {
-            first < last
-                && block.instructions[first + 1..last]
-                    .iter()
-                    .all(|id| omitted.contains(id))
-        })
-    });
-    if !adjacent {
+    let (load_block, first) = function.position(load_instruction)?;
+    let (branch_block, last) = function.position(branch.instruction)?;
+    if load_block != branch_block || first >= last {
+        return None;
+    }
+    let between = &function.blocks[load_block as usize].instructions[first as usize + 1..last as usize];
+    if !between.iter().all(|id| omitted.contains(id)) {
         return None;
     }
     let mut lowered = Vec::new();
@@ -1518,19 +1553,13 @@ fn lowered_single_use_load(
     let [load] = lowered.as_slice() else {
         return None;
     };
-    let MachineOperation::Memory(MemoryOperation::Load {
-        width,
-        signed: false,
-    }) = load.opcode.operation()
-    else {
+    let MachineOperation::Memory(MemoryOperation::Load { width, signed: false }) = load.opcode.operation() else {
         return None;
     };
     let [destination, address] = load.operands.as_slice() else {
         return None;
     };
-    if destination != &value_operand(function, value).ok()?
-        || !matches!(address, Operand::Address(_))
-    {
+    if destination != &value_operand(function, value).ok()? || !matches!(address, Operand::Address(_)) {
         return None;
     }
     Some(LoweredLoad {
@@ -1553,9 +1582,10 @@ fn branch_input_integer(function: &Function, input: &SelectedBranchInput) -> Opt
     }
 }
 
-fn direct_tag_source(function: &Function, tag: ValueId) -> Option<DirectTagSource> {
+fn direct_tag_source(function: &FunctionUses<'_>, tag: ValueId) -> Option<DirectTagSource> {
     let (extract_instruction, extract) = single_use_instruction(function, tag)?;
-    if extract.operation != Operation::Intrinsic(Intrinsic::Value(ValueOperation::ExtractTag { rematerialized: false })) {
+    if extract.operation != Operation::Intrinsic(Intrinsic::Value(ValueOperation::ExtractTag { rematerialized: false }))
+    {
         return None;
     }
     let [value] = extract.inputs.as_slice() else {
@@ -1568,10 +1598,7 @@ fn direct_tag_source(function: &Function, tag: ValueId) -> Option<DirectTagSourc
     })
 }
 
-fn selected_int32_pair(
-    function: &Function,
-    condition: ValueId,
-) -> Option<(InstructionId, ValueId, ValueId)> {
+fn selected_int32_pair(function: &FunctionUses<'_>, condition: ValueId) -> Option<(InstructionId, ValueId, ValueId)> {
     let (instruction, operation) = single_use_instruction(function, condition)?;
     if operation.operation != Operation::Intrinsic(Intrinsic::Classification(ClassificationOperation::Int32Pair)) {
         return None;
@@ -1582,7 +1609,7 @@ fn selected_int32_pair(
     Some((instruction, *lhs, *rhs))
 }
 
-fn single_use_reused_source(function: &Function, value: ValueId) -> Option<(InstructionId, ValueId)> {
+fn single_use_reused_source(function: &FunctionUses<'_>, value: ValueId) -> Option<(InstructionId, ValueId)> {
     let (instruction, reuse) = single_use_instruction(function, value)?;
     if reuse.operation != Operation::Intrinsic(Intrinsic::Value(ValueOperation::Reuse)) {
         return None;
@@ -1593,45 +1620,162 @@ fn single_use_reused_source(function: &Function, value: ValueId) -> Option<(Inst
     Some((instruction, *source))
 }
 
-fn single_use_instruction(
-    function: &Function,
+fn single_use_instruction<'a>(
+    function: &'a FunctionUses<'a>,
     value: ValueId,
-) -> Option<(InstructionId, &super::ir::Instruction)> {
+) -> Option<(InstructionId, &'a super::ir::Instruction)> {
     if value_use_count(function, value) != 1 {
         return None;
     }
     defining_instruction(function, value)
 }
 
-fn defining_instruction(
-    function: &Function,
-    value: ValueId,
-) -> Option<(InstructionId, &super::ir::Instruction)> {
-    let ValueDefinition::InstructionResult { instruction, .. } =
-        function.values[value.0].definition
-    else {
+fn defining_instruction(function: &Function, value: ValueId) -> Option<(InstructionId, &super::ir::Instruction)> {
+    let ValueDefinition::InstructionResult { instruction, .. } = function.values[value.0].definition else {
         return None;
     };
     Some((instruction, &function.instructions[instruction.0]))
 }
 
-fn value_use_count(function: &Function, value: ValueId) -> usize {
-    function
-        .instructions
-        .iter()
-        .flat_map(|instruction| &instruction.inputs)
-        .filter(|input| **input == value)
-        .count()
-        + function
-            .blocks
+/// A function together with how many times each of its values is used.
+///
+/// Lowering asks that question constantly, and answering it by scanning the
+/// whole function each time makes compilation quadratic in the function size.
+pub(crate) struct FunctionUses<'a> {
+    function: &'a Function,
+    counts: Vec<u32>,
+    user_offsets: Vec<u32>,
+    users: Vec<ValueUser>,
+    registers: Vec<Option<VirtualRegister>>,
+    positions: Vec<Option<(u32, u32)>>,
+}
+
+/// One place a value is read.
+#[derive(Clone, Copy)]
+enum ValueUser {
+    Instruction(InstructionId),
+    Terminator(BlockId),
+}
+
+impl<'a> FunctionUses<'a> {
+    fn new(function: &'a Function, handler: crate::identity::HandlerId) -> Self {
+        let mut counts = vec![0u32; function.values.len()];
+        let mut terminator_inputs = Vec::new();
+        // Where each instruction sits. Selection asks whether two instructions
+        // are adjacent in a block, and searching the whole function for them is
+        // quadratic on a large program.
+        let mut positions = vec![None; function.instructions.len()];
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (position, instruction) in block.instructions.iter().enumerate() {
+                positions[instruction.0] = Some((block_index as u32, position as u32));
+            }
+        }
+        for instruction in &function.instructions {
+            for input in &instruction.inputs {
+                counts[input.0] += 1;
+            }
+        }
+        for block in &function.blocks {
+            let Some(terminator) = block.terminator.as_ref() else {
+                continue;
+            };
+            for input in terminator.inputs() {
+                counts[input.0] += 1;
+            }
+        }
+        // The users of each value live in one flat array, indexed by a per-value
+        // offset. Asking who reads a value is the question the narrowing
+        // analysis asks about nearly every result it lowers.
+        let mut user_offsets = Vec::with_capacity(counts.len() + 1);
+        let mut total = 0;
+        for count in &counts {
+            user_offsets.push(total);
+            total += count;
+        }
+        user_offsets.push(total);
+        let mut filled = user_offsets.clone();
+        let mut users = vec![ValueUser::Instruction(InstructionId(0)); total as usize];
+        for (index, instruction) in function.instructions.iter().enumerate() {
+            for input in &instruction.inputs {
+                users[filled[input.0] as usize] = ValueUser::Instruction(InstructionId(index));
+                filled[input.0] += 1;
+            }
+        }
+        for (index, block) in function.blocks.iter().enumerate() {
+            let Some(terminator) = block.terminator.as_ref() else {
+                continue;
+            };
+            terminator_inputs.clear();
+            terminator_inputs.extend(terminator.inputs());
+            for input in &terminator_inputs {
+                users[filled[input.0] as usize] = ValueUser::Terminator(BlockId(index));
+                filled[input.0] += 1;
+            }
+        }
+        let mut register_index = 0u32;
+        let registers = function
+            .values
             .iter()
-            .flat_map(|block| block.terminator.as_ref().into_iter().flat_map(Terminator::inputs))
-            .filter(|input| *input == value)
-            .count()
+            .enumerate()
+            .map(|(value_index, value)| {
+                if !matches!(
+                    value.definition,
+                    ValueDefinition::InstructionResult { .. }
+                        | ValueDefinition::BlockParameter { .. }
+                        | ValueDefinition::TerminatorResult { .. }
+                ) {
+                    return None;
+                }
+                let class = value.ty.register_class()?;
+                let register = VirtualRegister::ssa(handler, register_index, value_index, class);
+                register_index = register_index
+                    .checked_add(1)
+                    .expect("one handler cannot contain more than u32::MAX virtual registers");
+                Some(register)
+            })
+            .collect();
+        Self {
+            function,
+            counts,
+            user_offsets,
+            users,
+            registers,
+            positions,
+        }
+    }
+
+    /// The block an instruction belongs to and where it sits in it.
+    fn position(&self, instruction: InstructionId) -> Option<(u32, u32)> {
+        self.positions[instruction.0]
+    }
+
+    /// The virtual register an SSA value is named by, if it lives in one.
+    fn register(&self, value: ValueId) -> Option<&VirtualRegister> {
+        self.registers[value.0].as_ref()
+    }
+
+    fn users_of(&self, value: ValueId) -> &[ValueUser] {
+        &self.users[self.user_offsets[value.0] as usize..self.user_offsets[value.0 + 1] as usize]
+    }
+}
+
+impl std::ops::Deref for FunctionUses<'_> {
+    type Target = Function;
+
+    fn deref(&self) -> &Function {
+        self.function
+    }
+}
+
+fn value_use_count(function: &FunctionUses<'_>, value: ValueId) -> usize {
+    function.counts[value.0] as usize
 }
 
 fn is_integer_zero(function: &Function, value: ValueId) -> bool {
-    matches!(function.values[value.0].definition, ValueDefinition::Constant(Constant::Integer(0)))
+    matches!(
+        function.values[value.0].definition,
+        ValueDefinition::Constant(Constant::Integer(0))
+    )
 }
 
 fn is_i32_max(function: &Function, value: ValueId) -> bool {
@@ -1643,9 +1787,7 @@ fn is_i32_max(function: &Function, value: ValueId) -> bool {
 
 fn direct_tag_constant(function: &Function, value: ValueId) -> Option<Operand> {
     match &function.values[value.0].definition {
-        ValueDefinition::Constant(Constant::Layout(constant))
-            if constant.category() == LayoutConstantCategory::Tag =>
-        {
+        ValueDefinition::Constant(Constant::Layout(constant)) if constant.category() == LayoutConstantCategory::Tag => {
             Some(Operand::LayoutConstant(*constant))
         }
         ValueDefinition::Constant(Constant::Integer(tag)) if u16::try_from(*tag).is_ok() => {
@@ -1655,7 +1797,7 @@ fn direct_tag_constant(function: &Function, value: ValueId) -> Option<Operand> {
     }
 }
 
-fn singleton_value_branch(function: &Function, branch: &SelectedBranch) -> Option<(ValueId, Operand)> {
+fn singleton_value_branch(function: &FunctionUses<'_>, branch: &SelectedBranch) -> Option<(ValueId, Operand)> {
     if !branch.early_branches.is_empty()
         || branch.and_mask.is_some()
         || !matches!(
@@ -1678,9 +1820,7 @@ fn singleton_value_branch(function: &Function, branch: &SelectedBranch) -> Optio
         if value_use_count(function, singleton) != 1 {
             return None;
         }
-        let ValueDefinition::Constant(Constant::Layout(singleton)) =
-            &function.values[singleton.0].definition
-        else {
+        let ValueDefinition::Constant(Constant::Layout(singleton)) = &function.values[singleton.0].definition else {
             return None;
         };
         if ![
@@ -1705,7 +1845,7 @@ fn integer_constant(function: &Function, value: ValueId) -> Option<i64> {
 }
 
 fn lower_edge_copies(
-    function: &Function,
+    function: &FunctionUses<'_>,
     edge: &Edge,
     output: &mut Vec<Instruction>,
     temporary_index: &mut usize,
@@ -1769,7 +1909,19 @@ fn copy_instruction(destination: Operand, source: Operand, ty: &Type) -> Instruc
 }
 
 fn block_label(block: BlockId) -> Label {
-    Label::new(format!(".ssa_block_{}", block.0))
+    // Block labels are function-local and depend only on the block index, even
+    // though this cache outlives each function lowered on the thread.
+    thread_local! {
+        static LABELS: std::cell::RefCell<Vec<Label>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    LABELS.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        while labels.len() <= block.0 {
+            let next = labels.len();
+            labels.push(Label::new(format!(".ssa_block_{next}")));
+        }
+        labels[block.0].clone()
+    })
 }
 
 fn lower_memory_operation(
@@ -1794,7 +1946,7 @@ fn lower_memory_operation(
 }
 
 fn lower_field_access_pair(
-    function: &Function,
+    function: &FunctionUses<'_>,
     first_id: InstructionId,
     second_id: InstructionId,
     output: &mut Vec<Instruction>,
@@ -1858,10 +2010,7 @@ fn lower_field_access_pair(
 
 /// The SSA results of an instruction, whose count semantic analysis has
 /// already checked against the operation's signature.
-fn require_results<'a, T, const COUNT: usize>(
-    results: &'a [T],
-    what: &str,
-) -> Result<&'a [T; COUNT], String> {
+fn require_results<'a, T, const COUNT: usize>(results: &'a [T], what: &str) -> Result<&'a [T; COUNT], String> {
     results
         .try_into()
         .map_err(|_| format!("'{what}' requires {COUNT} SSA result(s)"))
@@ -1869,17 +2018,14 @@ fn require_results<'a, T, const COUNT: usize>(
 
 /// The SSA inputs of an instruction, whose count semantic analysis has
 /// already checked against the operation's signature.
-fn require_inputs<'a, T, const COUNT: usize>(
-    inputs: &'a [T],
-    what: &str,
-) -> Result<&'a [T; COUNT], String> {
+fn require_inputs<'a, T, const COUNT: usize>(inputs: &'a [T], what: &str) -> Result<&'a [T; COUNT], String> {
     inputs
         .try_into()
         .map_err(|_| format!("'{what}' requires {COUNT} SSA input(s)"))
 }
 
 fn lower_instruction(
-    function: &Function,
+    function: &FunctionUses<'_>,
     instruction_id: InstructionId,
     instruction: &super::ir::Instruction,
     output: &mut Vec<Instruction>,
@@ -1904,24 +2050,16 @@ fn lower_instruction(
             emit!(output; MachineOperation::ExtractTag => [destination.clone(), value.clone()];);
         }
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Copy)) => {
-            let [Operand::BytecodeField(destination), Operand::BytecodeField(source)] = inputs.as_slice()
-            else {
+            let [Operand::BytecodeField(destination), Operand::BytecodeField(source)] = inputs.as_slice() else {
                 return Err("'copy_operand' requires two bytecode fields".to_string());
             };
-            let destination_index_register = VirtualRegister::new(format!(
-                "ssa_move_operand_{}_destination_index",
-                instruction_id.0
-            ));
-            let source_index_register = VirtualRegister::new(format!(
-                "ssa_move_operand_{}_source_index",
-                instruction_id.0
-            ));
+            let destination_index_register =
+                VirtualRegister::new(format!("ssa_move_operand_{}_destination_index", instruction_id.0));
+            let source_index_register =
+                VirtualRegister::new(format!("ssa_move_operand_{}_source_index", instruction_id.0));
             let destination_index = Operand::VirtualRegister(destination_index_register.clone());
             let source_index = Operand::VirtualRegister(source_index_register.clone());
-            let value = Operand::VirtualRegister(format!(
-                "ssa_move_operand_{}_value",
-                instruction_id.0
-            ).into());
+            let value = Operand::VirtualRegister(format!("ssa_move_operand_{}_value", instruction_id.0).into());
             emit!(output; MachineOperation::load_pair(PairWidth::Word) => [destination_index.clone(), source_index.clone(), bytecode_field_memory(destination), bytecode_field_memory(source)];);
             emit!(output;
                 MachineOperation::load(MemoryWidth::DoubleWord, false) => [value.clone(), Operand::Address(MemoryAddress {
@@ -1956,7 +2094,9 @@ fn lower_instruction(
             };
             emit!(output; MachineOperation::load(MemoryWidth::Word, false) => [destination.clone(), bytecode_field_memory(field)];);
         }
-        Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(OperandLoad::Index | OperandLoad::RematerializedIndex))) => {
+        Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(
+            OperandLoad::Index | OperandLoad::RematerializedIndex,
+        ))) => {
             let [destination] = require_results(&results, "load_indexed_operand")?;
             let [index] = require_inputs(&inputs, "load_indexed_operand")?;
             emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [destination.clone(), indexed_value_memory(index)?];);
@@ -1972,10 +2112,7 @@ fn lower_instruction(
         Operation::Intrinsic(Intrinsic::Value(ValueOperation::ValueToFloat64)) => {
             let [destination] = require_results(&results, "unbox_f64")?;
             let [source] = require_inputs(&inputs, "unbox_f64")?;
-            if matches!(
-                source,
-                Operand::Immediate(_) | Operand::LayoutConstant(_)
-            ) {
+            if matches!(source, Operand::Immediate(_) | Operand::LayoutConstant(_)) {
                 let temporary = Operand::VirtualRegister(format!("ssa_fp_bits_{}", instruction_id.0).into());
                 emit!(output; MachineOperation::Move(IntegerWidth::U64) => [temporary.clone(), source.clone()];);
                 emit!(output; MachineOperation::FloatMove => [destination.clone(), temporary];);
@@ -1986,22 +2123,13 @@ fn lower_instruction(
         Operation::Intrinsic(Intrinsic::Value(ValueOperation::BoxNumber)) => {
             let [destination] = require_results(&results, "box_number")?;
             let [source] = require_inputs(&inputs, "box_number")?;
-            let integer = Operand::VirtualRegister(format!(
-                "ssa_box_number_{}_integer",
-                instruction_id.0
-            ).into());
+            let integer = Operand::VirtualRegister(format!("ssa_box_number_{}_integer", instruction_id.0).into());
             let check_negative_zero = Operand::Label(Label::new(format!(
                 ".ssa_box_number_{}_check_negative_zero",
                 instruction_id.0
             )));
-            let not_integer = Operand::Label(Label::new(format!(
-                ".ssa_box_number_{}_not_integer",
-                instruction_id.0
-            )));
-            let done = Operand::Label(Label::new(format!(
-                ".ssa_box_number_{}_done",
-                instruction_id.0
-            )));
+            let not_integer = Operand::Label(Label::new(format!(".ssa_box_number_{}_not_integer", instruction_id.0)));
+            let done = Operand::Label(Label::new(format!(".ssa_box_number_{}_done", instruction_id.0)));
             emit!(output; MachineOperation::Float(FloatingPointOperation::Convert(FloatConversion::Float64ToInt32)) => [integer.clone(), source.clone(), not_integer.clone()];);
             emit!(output; MachineOperation::branch_zero(IntegerWidth::U64, ZeroCondition::Zero) => [integer.clone(), check_negative_zero.clone()];);
             emit!(output; MachineOperation::BoxInt32 { clean: false } => [destination.clone(), integer.clone()];);
@@ -2016,7 +2144,9 @@ fn lower_instruction(
             emit!(output; MachineOperation::Control(ControlOperation::JumpLabel) => [done.clone()];);
             emit!(output; MachineOperation::Label => [done];);
         }
-        Operation::Intrinsic(Intrinsic::LowLevel(operation @ (LowLevelOperation::ClearBit | LowLevelOperation::ToggleBit))) => {
+        Operation::Intrinsic(Intrinsic::LowLevel(
+            operation @ (LowLevelOperation::ClearBit | LowLevelOperation::ToggleBit),
+        )) => {
             let [destination] = require_results(&results, operation.name())?;
             let [source, bit] = require_inputs(&inputs, operation.name())?;
             emit!(output; MachineOperation::Move(IntegerWidth::U64) => [destination.clone(), source.clone()];);
@@ -2048,12 +2178,13 @@ fn lower_instruction(
         Operation::Intrinsic(Intrinsic::Value(operation @ (ValueOperation::ToInt32 | ValueOperation::ToUint32))) => {
             let [destination] = require_results(&results, operation.name())?;
             let folded_boolean = folded_i32_bool_source(function, instruction);
-            let source = if let Some((_, source)) = folded_boolean.or_else(|| folded_u32_unbox_source(function, instruction)) {
-                value_operand(function, source)?
-            } else {
-                let [source] = require_inputs(&inputs, operation.name())?;
-                source.clone()
-            };
+            let source =
+                if let Some((_, source)) = folded_boolean.or_else(|| folded_u32_unbox_source(function, instruction)) {
+                    value_operand(function, source)?
+                } else {
+                    let [source] = require_inputs(&inputs, operation.name())?;
+                    source.clone()
+                };
             let representation_only = folded_boolean.is_none()
                 && matches!(
                     (operation, &function.values[instruction.inputs[0].0].ty),
@@ -2124,14 +2255,19 @@ fn lower_instruction(
                 emit!(output; narrow_integer_operation(machine_operation) => [destination.clone(), lhs, rhs];);
             } else if *operation == IntegerBinaryOperation::Binary(BinaryOperation::Multiply) {
                 emit!(output; machine_operation => [destination.clone(), lhs.clone(), rhs.clone()];);
+                narrow_wide_result_to_i32(function, instruction.results[0], destination, output);
             } else {
                 emit!(output; MachineOperation::Move(IntegerWidth::U64) => [destination.clone(), lhs.clone()];);
                 let rhs = materialize_symbolic_logical_rhs(*operation, destination, rhs, output)?;
                 emit!(output; machine_operation => [destination.clone(), rhs];);
+                narrow_wide_result_to_i32(function, instruction.results[0], destination, output);
             }
         }
         Operation::Intrinsic(Intrinsic::IntegerComparison(operation)) => {
-            return Err(format!("comparison '{}' was not folded into control flow", operation.name()));
+            return Err(format!(
+                "comparison '{}' was not folded into control flow",
+                operation.name()
+            ));
         }
         Operation::Intrinsic(Intrinsic::FloatingPoint(FloatingPointOperation::Binary(operation))) => {
             let name = FloatingPointOperation::Binary(*operation).name();
@@ -2221,9 +2357,7 @@ fn lower_instruction(
         }
         Operation::Intrinsic(Intrinsic::Call(operation)) => {
             let expected_inputs = match operation {
-                CallOperation::SlowPath
-                | CallOperation::Interpreter
-                | CallOperation::RawNative => 1,
+                CallOperation::SlowPath | CallOperation::Interpreter | CallOperation::RawNative => 1,
                 CallOperation::Helper => 2,
             };
             if inputs.len() != expected_inputs || results.len() != operation.result_count() {
@@ -2235,7 +2369,10 @@ fn lower_instruction(
             ));
         }
         Operation::Intrinsic(Intrinsic::Branch(operation)) => {
-            return Err(format!("branch operation '{}' reached instruction lowering", operation.name()));
+            return Err(format!(
+                "branch operation '{}' reached instruction lowering",
+                operation.name()
+            ));
         }
         Operation::Intrinsic(Intrinsic::Assertion(operation)) => {
             output.push(machine_instruction(MachineOperation::Assertion(*operation), inputs));
@@ -2255,16 +2392,25 @@ fn lower_instruction(
             ));
         }
         Operation::Intrinsic(Intrinsic::CheckedInteger(operation)) => {
-            return Err(format!("checked operation '{}' reached instruction lowering", operation.name()));
+            return Err(format!(
+                "checked operation '{}' reached instruction lowering",
+                operation.name()
+            ));
         }
         Operation::Intrinsic(Intrinsic::Classification(operation)) => {
-            return Err(format!("classification operation '{}' reached instruction lowering", operation.name()));
+            return Err(format!(
+                "classification operation '{}' reached instruction lowering",
+                operation.name()
+            ));
         }
         Operation::Intrinsic(Intrinsic::Control(operation)) => {
             output.push(machine_instruction(MachineOperation::Control(*operation), inputs));
         }
         Operation::Parameter(parameter) => {
-            return Err(format!("unresolved operation parameter {} reached LowIR lowering", parameter.0));
+            return Err(format!(
+                "unresolved operation parameter {} reached LowIR lowering",
+                parameter.0
+            ));
         }
         Operation::InlineCall(id) => {
             return Err(format!("unexpanded inline call #{} reached LowIR lowering", id.index()));
@@ -2274,9 +2420,11 @@ fn lower_instruction(
             let operation = match intrinsic {
                 Intrinsic::Address(AddressOperation::EmbeddedField) => MachineOperation::LoadEffectiveAddress,
                 Intrinsic::LowLevel(LowLevelOperation::Move)
-                    if destination == Operand::InterpreterRegister(crate::types::InterpreterRegister::ProgramCounter) => {
-                        MachineOperation::Move(IntegerWidth::U32)
-                    }
+                    if destination
+                        == Operand::InterpreterRegister(crate::types::InterpreterRegister::ProgramCounter) =>
+                {
+                    MachineOperation::Move(IntegerWidth::U32)
+                }
                 Intrinsic::LowLevel(LowLevelOperation::Move) => MachineOperation::Move(IntegerWidth::U64),
                 Intrinsic::Memory(operation) => {
                     lower_memory_operation(*operation, &[destination], &inputs, output)?;
@@ -2286,30 +2434,36 @@ fn lower_instruction(
             };
             output.push(Instruction {
                 opcode: operation,
-                operands: std::iter::once(destination)
-                    .chain(inputs)
-                    .collect(),
+                operands: std::iter::once(destination).chain(inputs).collect(),
             });
         }
         Operation::BlockReference(_) => {}
         Operation::Address => {}
+        // A guard needs the block's label naming and its emitted position, so
+        // block lowering handles it rather than this per-instruction pass.
+        Operation::Guard { .. } => return Err("a guard is lowered with its block".to_string()),
     }
     Ok(())
 }
 
 fn folded_bitwise_not_source(
-    function: &Function,
+    function: &FunctionUses<'_>,
     instruction: &super::ir::Instruction,
 ) -> Option<(InstructionId, ValueId)> {
     folded_unary_source(
         function,
         instruction,
         Operation::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::BitwiseNotInt32)),
-        |operation| matches!(operation, Operation::Intrinsic(Intrinsic::Value(ValueOperation::UnboxInt32 { .. }))),
+        |operation| {
+            matches!(
+                operation,
+                Operation::Intrinsic(Intrinsic::Value(ValueOperation::UnboxInt32 { .. }))
+            )
+        },
     )
 }
 
-fn folded_checked_i32_source(function: &Function, value: ValueId) -> Option<(InstructionId, ValueId)> {
+fn folded_checked_i32_source(function: &FunctionUses<'_>, value: ValueId) -> Option<(InstructionId, ValueId)> {
     if value_use_count(function, value) != 1 && !integer_result_can_stay_narrow(function, value) {
         return None;
     }
@@ -2323,16 +2477,11 @@ fn folded_checked_i32_source(function: &Function, value: ValueId) -> Option<(Ins
     Some((instruction, *source))
 }
 
-fn folded_32bit_operation_source(
-    function: &Function,
-    value: ValueId,
-) -> Option<(Vec<InstructionId>, ValueId)> {
+fn folded_32bit_operation_source(function: &FunctionUses<'_>, value: ValueId) -> Option<(Vec<InstructionId>, ValueId)> {
     let mut instructions = Vec::new();
     let mut source = value;
     loop {
-        if value_use_count(function, source) != 1
-            && !integer_result_can_stay_narrow(function, source)
-        {
+        if value_use_count(function, source) != 1 && !integer_result_can_stay_narrow(function, source) {
             break;
         }
         let Some((instruction, conversion)) = defining_instruction(function, source) else {
@@ -2340,7 +2489,9 @@ fn folded_32bit_operation_source(
         };
         if !matches!(
             conversion.operation,
-            Operation::Intrinsic(Intrinsic::Value(ValueOperation::UnboxInt32 { rematerialized: false } | ValueOperation::ToUint32))
+            Operation::Intrinsic(Intrinsic::Value(
+                ValueOperation::UnboxInt32 { rematerialized: false } | ValueOperation::ToUint32
+            ))
         ) {
             break;
         }
@@ -2353,10 +2504,15 @@ fn folded_32bit_operation_source(
     (!instructions.is_empty()).then_some((instructions, source))
 }
 
-fn folded_shift_count(function: &Function, value: ValueId) -> Option<(Vec<InstructionId>, ValueId)> {
-    let (mut instructions, value) = folded_32bit_operation_source(function, value).unwrap_or_else(|| (Vec::new(), value));
+fn folded_shift_count(function: &FunctionUses<'_>, value: ValueId) -> Option<(Vec<InstructionId>, ValueId)> {
+    let (mut instructions, value) =
+        folded_32bit_operation_source(function, value).unwrap_or_else(|| (Vec::new(), value));
     let (instruction, mask) = single_use_instruction(function, value)?;
-    if mask.operation != Operation::Intrinsic(Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(BinaryOperation::And))) {
+    if mask.operation
+        != Operation::Intrinsic(Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(
+            BinaryOperation::And,
+        )))
+    {
         return None;
     }
     let [lhs, rhs] = mask.inputs.as_slice() else {
@@ -2377,19 +2533,24 @@ fn folded_shift_count(function: &Function, value: ValueId) -> Option<(Vec<Instru
 }
 
 fn folded_u32_unbox_source(
-    function: &Function,
+    function: &FunctionUses<'_>,
     instruction: &super::ir::Instruction,
 ) -> Option<(InstructionId, ValueId)> {
     folded_unary_source(
         function,
         instruction,
         Operation::Intrinsic(Intrinsic::Value(ValueOperation::ToUint32)),
-        |operation| matches!(operation, Operation::Intrinsic(Intrinsic::Value(ValueOperation::UnboxInt32 { .. }))),
+        |operation| {
+            matches!(
+                operation,
+                Operation::Intrinsic(Intrinsic::Value(ValueOperation::UnboxInt32 { .. }))
+            )
+        },
     )
 }
 
 fn folded_i32_bool_source(
-    function: &Function,
+    function: &FunctionUses<'_>,
     instruction: &super::ir::Instruction,
 ) -> Option<(InstructionId, ValueId)> {
     folded_unary_source(
@@ -2401,7 +2562,7 @@ fn folded_i32_bool_source(
 }
 
 fn folded_unary_source(
-    function: &Function,
+    function: &FunctionUses<'_>,
     instruction: &super::ir::Instruction,
     operation: Operation,
     source_matches: impl FnOnce(&Operation) -> bool,
@@ -2413,9 +2574,7 @@ fn folded_unary_source(
         return None;
     };
     let (unbox_instruction, source) = defining_instruction(function, *input)?;
-    if !source_matches(&source.operation)
-        || value_use_count(function, *input) != 1
-    {
+    if !source_matches(&source.operation) || value_use_count(function, *input) != 1 {
         return None;
     }
     let [boxed] = source.inputs.as_slice() else {
@@ -2424,7 +2583,7 @@ fn folded_unary_source(
     Some((unbox_instruction, *boxed))
 }
 
-fn value_operand(function: &Function, value: ValueId) -> Result<Operand, String> {
+fn value_operand(function: &FunctionUses<'_>, value: ValueId) -> Result<Operand, String> {
     let value = resolve_reuse_value(function, value);
     let virtual_register = |name| {
         let class = function.values[value.0]
@@ -2434,29 +2593,36 @@ fn value_operand(function: &Function, value: ValueId) -> Result<Operand, String>
         Operand::VirtualRegister(VirtualRegister::with_class(name, class))
     };
     Ok(match &function.values[value.0].definition {
-        ValueDefinition::FunctionParameter(index) => {
-            Operand::BytecodeField(BytecodeFieldId::new(*index))
+        ValueDefinition::FunctionParameter(index) => Operand::BytecodeField(BytecodeFieldId::new(*index)),
+        ValueDefinition::InstructionResult { instruction, .. }
+            if function.instructions[instruction.0].operation == Operation::Address =>
+        {
+            memory_operand(function, &function.instructions[instruction.0].inputs)?
         }
         ValueDefinition::InstructionResult { instruction, .. }
-            if function.instructions[instruction.0].operation == Operation::Address => {
-                memory_operand(function, &function.instructions[instruction.0].inputs)?
+            if matches!(
+                function.instructions[instruction.0].operation,
+                Operation::BlockReference(_)
+            ) =>
+        {
+            let Operation::BlockReference(target) = function.instructions[instruction.0].operation else {
+                unreachable!()
+            };
+            if !function.instructions[instruction.0].inputs.is_empty() {
+                return Err("capturing block references cannot be used as machine labels".to_string());
             }
-        ValueDefinition::InstructionResult { instruction, .. }
-            if matches!(function.instructions[instruction.0].operation, Operation::BlockReference(_)) => {
-                let Operation::BlockReference(target) = function.instructions[instruction.0].operation else {
-                    unreachable!()
-                };
-                if !function.instructions[instruction.0].inputs.is_empty() {
-                    return Err("capturing block references cannot be used as machine labels".to_string());
-                }
-                Operand::Label(block_label(target))
-            }
-        ValueDefinition::InstructionResult { .. } | ValueDefinition::BlockParameter { .. }
-        | ValueDefinition::TerminatorResult { .. } => virtual_register(format!("ssa_{}", value.0)),
+            Operand::Label(block_label(target))
+        }
+        ValueDefinition::InstructionResult { .. }
+        | ValueDefinition::BlockParameter { .. }
+        | ValueDefinition::TerminatorResult { .. } => Operand::VirtualRegister(
+            function
+                .register(value)
+                .ok_or_else(|| format!("SSA value {value:?} has no register class"))?
+                .clone(),
+        ),
         ValueDefinition::Constant(Constant::Integer(value)) => Operand::Immediate(*value),
-        ValueDefinition::Constant(Constant::Layout(constant)) => {
-            Operand::LayoutConstant(*constant)
-        }
+        ValueDefinition::Constant(Constant::Layout(constant)) => Operand::LayoutConstant(*constant),
         ValueDefinition::Constant(Constant::KnownLayout(known)) => {
             return Err(format!(
                 "unresolved known layout constant {} reached LowIR lowering",
@@ -2464,14 +2630,10 @@ fn value_operand(function: &Function, value: ValueId) -> Result<Operand, String>
             ));
         }
         ValueDefinition::Constant(Constant::LayoutValue(value)) => {
-            return Err(format!(
-                "unresolved layout value {value:?} reached LowIR lowering"
-            ));
+            return Err(format!("unresolved layout value {value:?} reached LowIR lowering"));
         }
         ValueDefinition::Constant(Constant::Symbol(name)) => {
-            return Err(format!(
-                "unresolved layout constant '{name}' reached LowIR lowering"
-            ));
+            return Err(format!("unresolved layout constant '{name}' reached LowIR lowering"));
         }
         ValueDefinition::Constant(Constant::SlowPath(name))
         | ValueDefinition::Constant(Constant::FunctionSymbol(name)) => {
@@ -2495,8 +2657,7 @@ fn value_operand(function: &Function, value: ValueId) -> Result<Operand, String>
 }
 
 fn offset_memory(base: &Operand, offset: i64) -> Result<Operand, String> {
-    let base = address_register(base)
-        .ok_or_else(|| "indexed memory requires a register base".to_string())?;
+    let base = address_register(base).ok_or_else(|| "indexed memory requires a register base".to_string())?;
     Ok(Operand::Address(MemoryAddress {
         base,
         index: None,
@@ -2529,16 +2690,19 @@ fn resolve_reuse_value(function: &Function, mut value: ValueId) -> ValueId {
     }
 }
 
-fn memory_operand(function: &Function, components: &[ValueId]) -> Result<Operand, String> {
+fn memory_operand(function: &FunctionUses<'_>, components: &[ValueId]) -> Result<Operand, String> {
     if !(1..=3).contains(&components.len()) {
-        return Err(format!("memory address requires one to three components, got {}", components.len()));
+        return Err(format!(
+            "memory address requires one to three components, got {}",
+            components.len()
+        ));
     }
     let mut operands = components
         .iter()
         .map(|component| value_operand(function, *component))
         .collect::<Result<Vec<_>, _>>()?;
-    let base = address_register(&operands.remove(0))
-        .ok_or_else(|| "memory address base must be a register".to_string())?;
+    let base =
+        address_register(&operands.remove(0)).ok_or_else(|| "memory address base must be a register".to_string())?;
     let mut address = MemoryAddress {
         base,
         index: None,
@@ -2554,16 +2718,16 @@ fn memory_operand(function: &Function, components: &[ValueId]) -> Result<Operand
             address.displacement = Some(AddressDisplacement::Immediate(*offset));
         }
         [Operand::LayoutConstant(offset)] => {
-            address.displacement =
-                Some(AddressDisplacement::LayoutConstant(*offset));
+            address.displacement = Some(AddressDisplacement::LayoutConstant(*offset));
         }
         [Operand::BytecodeField(offset)] => {
-            address.displacement =
-                Some(AddressDisplacement::BytecodeField(*offset));
+            address.displacement = Some(AddressDisplacement::BytecodeField(*offset));
         }
         [Operand::Immediate(index), Operand::Immediate(scale)] => {
             address.displacement = Some(AddressDisplacement::Immediate(
-                index.checked_mul(*scale).ok_or_else(|| "constant sequence offset overflow".to_string())?,
+                index
+                    .checked_mul(*scale)
+                    .ok_or_else(|| "constant sequence offset overflow".to_string())?,
             ));
         }
         [index, scale] if address_register(index).is_some() => {
@@ -2575,9 +2739,7 @@ fn memory_operand(function: &Function, components: &[ValueId]) -> Result<Operand
                     address.scale = Some(AddressScale::LayoutConstant(*scale));
                 }
                 Operand::BytecodeField(displacement) => {
-                    address.displacement = Some(
-                        AddressDisplacement::BytecodeField(*displacement),
-                    );
+                    address.displacement = Some(AddressDisplacement::BytecodeField(*displacement));
                 }
                 other => return Err(format!("invalid memory address scale {other:?}")),
             }
@@ -2620,13 +2782,15 @@ fn typed_narrow_signed_branch_operation(
     ))
 }
 
-fn branch_uses_narrow_inputs(
-    function: &Function,
-    operation: BranchOperation,
-    inputs: &[ValueId],
-) -> bool {
+fn branch_uses_narrow_inputs(function: &Function, operation: BranchOperation, inputs: &[ValueId]) -> bool {
     are_i32_pair(function, inputs)
-        && matches!(operation, BranchOperation::Ordered { signedness: IntegerSignedness::Signed, .. })
+        && matches!(
+            operation,
+            BranchOperation::Ordered {
+                signedness: IntegerSignedness::Signed,
+                ..
+            }
+        )
 }
 
 fn typed_signed_comparison_uses_narrow_inputs(
@@ -2635,7 +2799,13 @@ fn typed_signed_comparison_uses_narrow_inputs(
     inputs: &[ValueId],
 ) -> bool {
     are_i32_pair(function, inputs)
-        && matches!(operation, IntegerComparisonOperation::Relational { domain: ComparisonDomain::SignedInteger, .. })
+        && matches!(
+            operation,
+            IntegerComparisonOperation::Relational {
+                domain: ComparisonDomain::SignedInteger,
+                ..
+            }
+        )
 }
 
 fn checked_i32_operation_uses_narrow_inputs(
@@ -2643,82 +2813,98 @@ fn checked_i32_operation_uses_narrow_inputs(
     operation: CheckedIntegerOperation,
     inputs: &[ValueId],
 ) -> bool {
-    are_i32_pair(function, inputs)
-        && operation != CheckedIntegerOperation::Negate
+    are_i32_pair(function, inputs) && operation != CheckedIntegerOperation::Negate
 }
 
 fn are_i32_pair(function: &Function, inputs: &[ValueId]) -> bool {
-    inputs.len() == 2
-        && inputs
-            .iter()
-            .all(|input| function.values[input.0].ty == Type::I32)
+    inputs.len() == 2 && inputs.iter().all(|input| function.values[input.0].ty == Type::I32)
 }
 
-fn integer_result_can_stay_narrow(function: &Function, result: ValueId) -> bool {
+/// Clear the top half of a 32-bit result computed at full width.
+///
+/// Addition, subtraction and multiplication cannot produce a narrow result
+/// directly, because the overflow check they usually carry needs the wide one,
+/// so they are emitted at full width and the checked form truncates afterwards.
+/// An unchecked one has no such check to truncate for it, and everything that
+/// consumes an `i32` is entitled to assume the top half is clear.
+fn narrow_wide_result_to_i32(
+    function: &Function,
+    result: ValueId,
+    destination: &Operand,
+    output: &mut Vec<Instruction>,
+) {
+    if function.values[result.0].ty != Type::I32 {
+        return;
+    }
+    emit!(output; MachineOperation::Move(IntegerWidth::U32) => [destination.clone(), destination.clone()];);
+}
+
+fn integer_result_can_stay_narrow(function: &FunctionUses<'_>, result: ValueId) -> bool {
     match function.values[result.0].ty {
         Type::U32 => true,
-        Type::I32 => i32_consumers_stay_narrow(function, result, &mut HashSet::new()),
+        Type::I32 => i32_consumers_stay_narrow(function, result, &mut HashSet::default()),
         _ => false,
     }
 }
 
-fn i32_consumers_stay_narrow(
-    function: &Function,
-    value: ValueId,
-    visiting: &mut HashSet<ValueId>,
-) -> bool {
+fn i32_consumers_stay_narrow(function: &FunctionUses<'_>, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
     if !visiting.insert(value) {
         return false;
     }
-    for block in &function.blocks {
-        let terminator = block.terminator.as_ref().unwrap();
-        if !terminator.inputs().contains(&value) {
-            continue;
-        }
-        let Terminator::CheckedOperation {
-            operation,
-            inputs,
-            success,
-            failure,
-            ..
-        } = terminator
-        else {
-            return false;
-        };
-        let uses_narrow_inputs = match operation {
-            Operation::Intrinsic(Intrinsic::Branch(operation)) => branch_uses_narrow_inputs(function, *operation, inputs),
-            Operation::Intrinsic(Intrinsic::CheckedInteger(operation)) => checked_i32_operation_uses_narrow_inputs(function, *operation, inputs),
-            _ => false,
-        };
-        if !inputs.contains(&value)
-            || success.arguments.contains(&value)
-            || failure.arguments.contains(&value)
-            || !uses_narrow_inputs
-        {
-            return false;
-        }
-    }
-
     let mut found_use = false;
-    for instruction in &function.instructions {
-        if !instruction.inputs.contains(&value) {
-            continue;
-        }
+    for user in function.users_of(value) {
+        let instruction = match user {
+            ValueUser::Terminator(block) => {
+                let terminator = function.blocks[block.0].terminator.as_ref().unwrap();
+                let Terminator::CheckedOperation {
+                    operation,
+                    inputs,
+                    success,
+                    failure,
+                    ..
+                } = terminator
+                else {
+                    return false;
+                };
+                let uses_narrow_inputs = match operation {
+                    Operation::Intrinsic(Intrinsic::Branch(operation)) => {
+                        branch_uses_narrow_inputs(function, *operation, inputs)
+                    }
+                    Operation::Intrinsic(Intrinsic::CheckedInteger(operation)) => {
+                        checked_i32_operation_uses_narrow_inputs(function, *operation, inputs)
+                    }
+                    _ => false,
+                };
+                if !inputs.contains(&value)
+                    || success.arguments.contains(&value)
+                    || failure.arguments.contains(&value)
+                    || !uses_narrow_inputs
+                {
+                    return false;
+                }
+                found_use = true;
+                continue;
+            }
+            ValueUser::Instruction(instruction) => &function.instructions[instruction.0],
+        };
         found_use = true;
         match &instruction.operation {
             Operation::InlineCall(_) => return false,
-            Operation::Intrinsic(Intrinsic::Value(ValueOperation::BoxInt32 { clean: true } | ValueOperation::ToUint32)) => continue,
+            Operation::Intrinsic(Intrinsic::Value(
+                ValueOperation::BoxInt32 { clean: true } | ValueOperation::ToUint32,
+            )) => continue,
             Operation::Intrinsic(Intrinsic::IntegerBinary(operation)) if operation.supports_narrow_result() => {}
             Operation::Intrinsic(Intrinsic::IntegerComparison(operation))
-                if typed_signed_comparison_uses_narrow_inputs(function, *operation, &instruction.inputs) => continue,
+                if typed_signed_comparison_uses_narrow_inputs(function, *operation, &instruction.inputs) =>
+            {
+                continue;
+            }
             _ => return false,
         }
         if !instruction.results.iter().all(|result| {
-                matches!(function.values[result.0].ty, Type::I32 | Type::U32)
-                    && (function.values[result.0].ty == Type::U32
-                        || i32_consumers_stay_narrow(function, *result, visiting))
-            })
-        {
+            matches!(function.values[result.0].ty, Type::I32 | Type::U32)
+                && (function.values[result.0].ty == Type::U32 || i32_consumers_stay_narrow(function, *result, visiting))
+        }) {
             return false;
         }
     }
@@ -2732,8 +2918,10 @@ fn materialize_symbolic_logical_rhs(
     rhs: &Operand,
     output: &mut Vec<Instruction>,
 ) -> Result<Operand, String> {
-    if !matches!(operation, IntegerBinaryOperation::Binary(BinaryOperation::Or) | IntegerBinaryOperation::Binary(BinaryOperation::Xor))
-        || !matches!(rhs, Operand::LayoutConstant(_))
+    if !matches!(
+        operation,
+        IntegerBinaryOperation::Binary(BinaryOperation::Or) | IntegerBinaryOperation::Binary(BinaryOperation::Xor)
+    ) || !matches!(rhs, Operand::LayoutConstant(_))
     {
         return Ok(rhs.clone());
     }
@@ -2745,9 +2933,133 @@ fn materialize_symbolic_logical_rhs(
     Ok(temporary)
 }
 
+/// Emit the machine branch that goes to `then_label` when `condition` holds.
+///
+/// A branch terminator and a guard differ only in where control goes when the
+/// condition fails, so both select their machine instruction here. `name` makes
+/// the labels and temporaries this emits unique within the handler.
+fn emit_conditional_branch(
+    function: &FunctionUses<'_>,
+    constants: &LayoutConstants,
+    name: &str,
+    block_body_start: usize,
+    condition: ValueId,
+    then_label: &Label,
+    body: &mut Vec<Instruction>,
+) -> Result<(), String> {
+    let branch = selected_branch(function, condition);
+    if let Some((_, lhs, rhs)) = selected_int32_pair(function, condition) {
+        let failure_label = Label::new(format!(".ssa_edge_{name}_else"));
+        emit!(body;
+            MachineOperation::branch_tag(EqualityCondition::NotEqual) => [value_operand(function, lhs)?, layout_operand(
+                    constants,
+                    KnownLayoutConstant::Int32Tag,
+                )?, Operand::Label(failure_label.clone())];
+        );
+        emit!(body;
+            MachineOperation::branch_tag(EqualityCondition::Equal) => [value_operand(function, rhs)?, layout_operand(
+                    constants,
+                    KnownLayoutConstant::Int32Tag,
+                )?, Operand::Label(then_label.clone())];
+        );
+        emit!(body; MachineOperation::Label => [Operand::Label(failure_label)];);
+    } else if let Some(branch) = branch {
+        let direct_tag_branch = branch
+            .direct_tag_source
+            .as_ref()
+            .and_then(|source| {
+                if !branch.early_branches.is_empty() || branch.and_mask.is_some() {
+                    return None;
+                }
+                let [SelectedBranchInput::Value(lhs), SelectedBranchInput::Value(rhs)] = branch.inputs.as_slice()
+                else {
+                    return None;
+                };
+                if !matches!(
+                    branch.operation,
+                    MachineOperation::Branch(BranchOperation::Equality {
+                        width: IntegerWidth::U64 | IntegerWidth::U16,
+                        ..
+                    })
+                ) {
+                    return None;
+                }
+                if *lhs == source.tag {
+                    direct_tag_constant(function, *rhs).map(|tag| (source.value, tag))
+                } else if *rhs == source.tag {
+                    direct_tag_constant(function, *lhs).map(|tag| (source.value, tag))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| singleton_value_branch(function, &branch));
+        if let Some(source) = branch.direct_tag_source.as_ref()
+            && direct_tag_branch.is_none()
+        {
+            let tag = value_operand(function, source.tag)?;
+            emit!(body; MachineOperation::ExtractTag => [tag, value_operand(function, source.value)?];);
+        }
+        for early_branch in &branch.early_branches {
+            let mut operands = early_branch
+                .inputs
+                .iter()
+                .map(|input| branch_input_operand(function, constants, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            materialize_symbolic_branch_rhs(early_branch.operation, name, block_body_start, &mut operands, body);
+            operands.push(Operand::Label(then_label.clone()));
+            body.push(machine_instruction(early_branch.operation, operands));
+        }
+        if let Some((value, expected_tag)) = direct_tag_branch {
+            let singleton = matches!(
+                &expected_tag,
+                Operand::LayoutConstant(constant)
+                    if constant.category()
+                        == LayoutConstantCategory::Value
+            );
+            emit!(body;
+                match (
+                    singleton,
+                    matches!(
+                        branch.operation,
+                        MachineOperation::Branch(BranchOperation::Equality {
+                            condition: EqualityCondition::Equal,
+                            ..
+                        })
+                    ),
+                ) {
+                    (true, true) => MachineOperation::branch_singleton(EqualityCondition::Equal),
+                    (true, false) => MachineOperation::branch_singleton(EqualityCondition::NotEqual),
+                    (false, true) => MachineOperation::branch_tag(EqualityCondition::Equal),
+                    (false, false) => MachineOperation::branch_tag(EqualityCondition::NotEqual),
+                } => [value_operand(function, value)?, expected_tag, Operand::Label(then_label.clone())];
+            );
+        } else {
+            let mut operands = branch
+                .inputs
+                .iter()
+                .map(|input| branch_input_operand(function, constants, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some((source, destination, mask)) = branch.and_mask {
+                if source != destination {
+                    let destination = value_operand(function, destination)?;
+                    emit!(body; MachineOperation::Move(IntegerWidth::U64) => [destination, value_operand(function, source)?];);
+                }
+                emit!(body; MachineOperation::IntegerBinary { operation: IntegerBinaryOperation::Binary(BinaryOperation::And), width: IntegerWidth::U16 } => [value_operand(function, destination)?, layout_operand(constants, mask)?];);
+            }
+            materialize_symbolic_branch_rhs(branch.operation, name, block_body_start, &mut operands, body);
+            operands.push(Operand::Label(then_label.clone()));
+            body.push(machine_instruction(branch.operation, operands));
+        }
+    } else {
+        emit!(body; MachineOperation::branch_zero(IntegerWidth::U64, ZeroCondition::NonZero) => [value_operand(function, condition)?, Operand::Label(then_label.clone())];);
+    }
+
+    Ok(())
+}
+
 fn materialize_symbolic_branch_rhs(
     operation: MachineOperation,
-    block: BlockId,
+    name: &str,
     block_body_start: usize,
     operands: &mut [Operand],
     output: &mut Vec<Instruction>,
@@ -2767,8 +3079,7 @@ fn materialize_symbolic_branch_rhs(
                 width: IntegerWidth::U32,
                 ..
             })
-        )
-            && is_direct_u32_constant(rhs))
+        ) && is_direct_u32_constant(rhs))
     {
         return;
     }
@@ -2784,7 +3095,7 @@ fn materialize_symbolic_branch_rhs(
         *rhs = register;
         return;
     }
-    let temporary = Operand::VirtualRegister(format!("ssa_branch_{}_rhs", block.0).into());
+    let temporary = Operand::VirtualRegister(format!("ssa_branch_{name}_rhs").into());
     emit!(output; MachineOperation::Move(IntegerWidth::U64) => [temporary.clone(), rhs.clone()];);
     *rhs = temporary;
 }
@@ -2814,16 +3125,10 @@ fn value_machine_operation(operation: ValueOperation) -> Option<MachineOperation
         | ValueOperation::TruncateUint16
         | ValueOperation::ReinterpretUint64AsValue => MachineOperation::Move(IntegerWidth::U64),
         ValueOperation::BoxInt32 { clean } => MachineOperation::BoxInt32 { clean },
-        ValueOperation::BoxFloat64 | ValueOperation::ValueToFloat64 => {
-            MachineOperation::FloatMove
-        }
-        ValueOperation::UnboxInt32 { .. } | ValueOperation::UnboxBoolean => {
-            MachineOperation::UnboxInt32
-        }
+        ValueOperation::BoxFloat64 | ValueOperation::ValueToFloat64 => MachineOperation::FloatMove,
+        ValueOperation::UnboxInt32 { .. } | ValueOperation::UnboxBoolean => MachineOperation::UnboxInt32,
         ValueOperation::ExtractTag { .. } => MachineOperation::ExtractTag,
-        ValueOperation::ToInt32 | ValueOperation::ToUint32 => {
-            MachineOperation::Move(IntegerWidth::U32)
-        }
+        ValueOperation::ToInt32 | ValueOperation::ToUint32 => MachineOperation::Move(IntegerWidth::U32),
         ValueOperation::UnboxObject => MachineOperation::UnboxObject,
         ValueOperation::BoxNumber | ValueOperation::LogicalNot => return None,
     })
@@ -2881,24 +3186,84 @@ fn indexed_value_memory(index: &Operand) -> Result<Operand, String> {
 }
 
 fn operand_load_index(instruction: InstructionId, result_index: usize) -> Operand {
-    Operand::VirtualRegister(format!(
-        "ssa_operand_load_{}_{}_index",
-        instruction.0, result_index
-    ).into())
+    Operand::VirtualRegister(format!("ssa_operand_load_{}_{}_index", instruction.0, result_index).into())
 }
 
 fn is_fpr(ty: &Type) -> bool {
     ty.register_class() == Some(RegisterClass::FloatingPoint)
 }
 
-fn layout_operand(
-    constants: &LayoutConstants,
-    known: KnownLayoutConstant,
-) -> Result<Operand, String> {
+fn layout_operand(constants: &LayoutConstants, known: KnownLayoutConstant) -> Result<Operand, String> {
     constants
         .known(known)
         .map(Operand::LayoutConstant)
-        .ok_or_else(|| {
-            format!("unknown constant '{}'", known.name())
-        })
+        .ok_or_else(|| format!("unknown constant '{}'", known.name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_materialized_values_without_a_register_class() {
+        let mut function = Function::new("invalid", Vec::new(), Vec::new());
+        let value = function.append_instruction(
+            function.entry,
+            Intrinsic::LowLevel(LowLevelOperation::Negate),
+            Vec::new(),
+            vec![Type::Tuple(Vec::new())],
+        )[0];
+        let function = FunctionUses::new(&function, crate::identity::HandlerId::new(0));
+
+        assert_eq!(
+            value_operand(&function, value).unwrap_err(),
+            format!("SSA value {value:?} has no register class")
+        );
+    }
+
+    #[test]
+    fn keeps_i32_values_narrow_when_only_a_checked_terminator_uses_them() {
+        let mut function = Function::new("narrow", vec![Type::I32, Type::I32], Vec::new());
+        let value = function.append_instruction(
+            function.entry,
+            Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(BinaryOperation::Add)),
+            vec![function.parameter(0), function.parameter(1)],
+            vec![Type::I32],
+        )[0];
+        let success = function.create_named_block("success", BlockLayout::Hot, vec![Type::I32]);
+        let failure = function.create_empty_block("failure", BlockLayout::Cold);
+        function.set_checked_operation(
+            function.entry,
+            Intrinsic::CheckedInteger(CheckedIntegerOperation::Add),
+            vec![value, function.parameter(1)],
+            vec![Type::I32],
+            crate::ssa::Effects::PURE,
+            success,
+            Vec::new(),
+            Edge::new(failure),
+        );
+        let function = FunctionUses::new(&function, crate::identity::HandlerId::new(0));
+
+        assert!(integer_result_can_stay_narrow(&function, value));
+    }
+
+    #[test]
+    fn reorders_lowered_block_fragments_without_splitting_internal_labels() {
+        let first = BlockId(0);
+        let second = BlockId(1);
+        let instructions = vec![
+            machine_instruction(MachineOperation::Move(IntegerWidth::U64), vec![]),
+            machine_instruction(MachineOperation::Label, vec![Operand::Label(block_label(second))]),
+            machine_instruction(MachineOperation::Label, vec![Operand::Label(Label::new(".internal"))]),
+        ];
+        let fragments = LoweredBlockFragments::new(&instructions, &[first, second]).unwrap();
+        let reordered = fragments.reorder(&instructions, &[second, first]);
+
+        assert_eq!(reordered[0].operands, [Operand::Label(block_label(second))]);
+        assert_eq!(reordered[1].operands, [Operand::Label(Label::new(".internal"))]);
+        assert_eq!(
+            reordered[2].opcode.operation(),
+            MachineOperation::Move(IntegerWidth::U64)
+        );
+    }
 }

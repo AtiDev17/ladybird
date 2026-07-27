@@ -5,12 +5,12 @@
  */
 
 use flapc::{
-    Architecture, CompilationUnit, CompileOptions, Compiler, ObjectFormat, OptimizationReportOptions, Target,
+    Architecture, CompilationUnit, CompileOptions, Compiler, ObjectFormat, OptimizationReportOptions, SourceInput,
+    Target,
 };
 use std::fs;
 
-const USAGE: &str =
-    "Usage: flapc --arch x86_64 --input <file.flap> --output <file.S> [--constants <file>] [--bytecode-def <file>] [--optimization-report <file>] [--dump-changed-ir]";
+const USAGE: &str = "Usage: flapc --arch x86_64 --input <file.flap> --output <file.S> [--constants <file>] [--bytecode-def <file>] [--optimization-report <file>] [--dump-changed-ir]";
 
 struct CommandLine {
     options: CompileOptions,
@@ -37,10 +37,20 @@ fn run() -> Result<(), String> {
 
     let compiler = Compiler::new(command_line.options);
     let unit = CompilationUnit {
-        source_name: &command_line.input_path,
-        source: &source,
-        constants: constants.as_deref(),
-        bytecode_def: bytecode_def.as_deref(),
+        source: SourceInput {
+            name: &command_line.input_path,
+            contents: &source,
+        },
+        constants: command_line
+            .constants_path
+            .as_deref()
+            .zip(constants.as_deref())
+            .map(|(name, contents)| SourceInput { name, contents }),
+        bytecode_def: command_line
+            .bytecode_def_path
+            .as_deref()
+            .zip(bytecode_def.as_deref())
+            .map(|(name, contents)| SourceInput { name, contents }),
     };
     let assembly = if let Some(report_path) = &command_line.optimization_report_path {
         let (prepared, report) = compiler

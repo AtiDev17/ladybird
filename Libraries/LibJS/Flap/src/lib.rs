@@ -11,9 +11,20 @@
 //! allocation, and target-specific assembly emission. The compiler operates
 //! entirely on in-memory inputs and outputs; the `flapc` binary is only a file
 //! system and command-line adapter.
+//!
+//! # Security and resource contract
+//!
+//! Flap is an internal compiler for trusted, generated build inputs. Its parser
+//! and optimization pipeline do not impose general-purpose nesting, value,
+//! block, or diagnostic budgets, and its internal string tables use a
+//! deterministic non-cryptographic hasher. Do not expose this API directly to
+//! attacker-controlled source. A service accepting untrusted Flap programs
+//! must enforce input and resource limits before compilation and replace or
+//! isolate the deterministic source-key tables.
 
 pub(crate) mod bytecode;
 pub(crate) mod frontend;
+pub(crate) mod hash;
 pub(crate) mod hir;
 pub(crate) mod identity;
 pub(crate) mod intrinsic;
@@ -22,22 +33,24 @@ pub(crate) mod ssa;
 pub(crate) mod target;
 pub(crate) mod types;
 
+use crate::hash::HashMap;
 use bytecode::HandlerLayout as BytecodeHandlerLayout;
-use frontend::diagnostic::{Diagnostic, SourceLocation};
+use frontend::diagnostic::Diagnostic;
 use frontend::layout::{LayoutConstants, LayoutDatabase, LayoutError};
 use identity::HandlerId;
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 use target::emitter::DISPATCH_TABLE_SIZE;
 use types::BlockTemperature;
 
-pub use frontend::diagnostic::SourceSpan;
+pub use frontend::diagnostic::{SourceLocation, SourceSpan};
 pub use low_ir::Program as LowProgram;
-pub use ssa::report::OptimizationReport;
-pub use target::ir::{
-    AllocatedProgram, MachineProgram, Program as TargetProgram,
+pub use ssa::report::{
+    FixedPointOptimizationReport, FunctionOptimizationReport, OptimizationRecord, OptimizationRemark,
+    OptimizationRemarkKind, OptimizationReport, PassRunReport,
 };
+pub use target::ir::{AllocatedProgram, MachineProgram, Program as TargetProgram};
 
 /// A machine architecture supported by Flap's textual assembly backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -76,12 +89,43 @@ pub struct OptimizationReportOptions {
     pub dump_changed_ir: bool,
 }
 
+/// One named in-memory compiler input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceInput<'a> {
+    pub name: &'a str,
+    pub contents: &'a str,
+}
+
 /// In-memory source inputs for one Flap compilation.
 pub struct CompilationUnit<'a> {
-    pub source_name: &'a str,
-    pub source: &'a str,
-    pub constants: Option<&'a str>,
-    pub bytecode_def: Option<&'a str>,
+    pub source: SourceInput<'a>,
+    pub constants: Option<SourceInput<'a>>,
+    pub bytecode_def: Option<SourceInput<'a>>,
+}
+
+/// Timing and IR size measurements collected by an instrumented compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompilationMetrics {
+    pub prepare: Duration,
+    pub lower: Duration,
+    pub select: Duration,
+    pub allocate: Duration,
+    pub finalize: Duration,
+    pub emit: Duration,
+    pub handlers: usize,
+    pub ssa_blocks: usize,
+    pub ssa_instructions: usize,
+    pub ssa_values: usize,
+    pub low_ir_instructions: usize,
+    pub target_instructions: usize,
+    pub virtual_registers: usize,
+    pub machine_instructions: usize,
+}
+
+impl CompilationMetrics {
+    pub fn elapsed(&self) -> Duration {
+        self.prepare + self.lower + self.select + self.allocate + self.finalize + self.emit
+    }
 }
 
 #[derive(Clone)]
@@ -120,7 +164,6 @@ impl Assembly {
     pub fn as_str(&self) -> &str {
         &self.text
     }
-
 }
 
 /// A diagnostic produced by one of the compiler stages.
@@ -147,11 +190,7 @@ pub struct CompileError {
 }
 
 impl CompileError {
-    pub(crate) fn new(
-        stage: CompileStage,
-        handler: Option<&str>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(stage: CompileStage, handler: Option<&str>, message: impl Into<String>) -> Self {
         Self {
             stage,
             handler: handler.map(str::to_string),
@@ -169,14 +208,55 @@ impl CompileError {
         }
     }
 
-    fn from_layout_error(error: LayoutError) -> Self {
-        let location = SourceLocation {
-            offset: 0,
-            line: error.line,
-            column: 1,
+    fn from_layout_error(source: SourceInput<'_>, error: LayoutError) -> Self {
+        let location = (error.line != 0).then(|| {
+            let offset = source
+                .contents
+                .split_inclusive('\n')
+                .take(error.line.saturating_sub(1))
+                .map(str::len)
+                .sum::<usize>();
+            let line = source.contents[offset..].lines().next().unwrap_or_default();
+            let indentation = line.len() - line.trim_start().len();
+            SourceLocation {
+                offset: offset + indentation,
+                line: error.line,
+                column: indentation + 1,
+            }
+        });
+        let message = if let Some(location) = location {
+            format!(
+                "{}:{}:{}: error: {}",
+                source.name, location.line, location.column, error.message
+            )
+        } else {
+            format!("{}: error: {}", source.name, error.message)
         };
         Self {
             stage: CompileStage::Layout,
+            handler: None,
+            span: location.map(|location| SourceSpan {
+                start: location,
+                end: location,
+            }),
+            message,
+        }
+    }
+
+    fn from_bytecode_def_error(source: SourceInput<'_>, error: bytecode_def::ParseError) -> Self {
+        let line_offset = source
+            .contents
+            .split_inclusive('\n')
+            .take(error.line.saturating_sub(1))
+            .map(str::len)
+            .sum::<usize>();
+        let location = SourceLocation {
+            offset: line_offset + error.column.saturating_sub(1),
+            line: error.line,
+            column: error.column,
+        };
+        Self {
+            stage: CompileStage::Parse,
             handler: None,
             span: Some(SourceSpan {
                 start: location,
@@ -216,6 +296,91 @@ impl Compiler {
         self.compile_prepared(&prepared)
     }
 
+    /// Compile while collecting stage timings and IR size measurements.
+    ///
+    /// The regular compilation entry points do not collect these metrics and
+    /// therefore do not pay for timers or IR traversal.
+    pub fn compile_with_metrics(
+        &self,
+        unit: CompilationUnit<'_>,
+    ) -> Result<(Assembly, CompilationMetrics), CompileError> {
+        let started_at = Instant::now();
+        let prepared = self.prepare(unit)?;
+        let prepare = started_at.elapsed();
+        let handlers = prepared.handlers.len();
+        let ssa_blocks = prepared
+            .handlers
+            .iter()
+            .map(|handler| handler.function.blocks.len())
+            .sum();
+        let ssa_instructions = prepared
+            .handlers
+            .iter()
+            .map(|handler| handler.function.instructions.len())
+            .sum();
+        let ssa_values = prepared
+            .handlers
+            .iter()
+            .map(|handler| handler.function.values.len())
+            .sum();
+
+        let started_at = Instant::now();
+        let program = self.lower(&prepared)?;
+        let lower = started_at.elapsed();
+        let low_ir_instructions = program.handlers.iter().map(|handler| handler.instructions.len()).sum();
+
+        let started_at = Instant::now();
+        let selected = self.select(program)?;
+        let select = started_at.elapsed();
+        let target_instructions = selected
+            .functions
+            .iter()
+            .map(|function| function.instructions.len())
+            .sum();
+        let virtual_registers = selected
+            .functions
+            .iter()
+            .map(|function| function.virtual_registers.len())
+            .sum();
+
+        let started_at = Instant::now();
+        let allocated = self.allocate(selected)?;
+        let allocate = started_at.elapsed();
+
+        let started_at = Instant::now();
+        let machine = self.finalize(allocated)?;
+        let finalize = started_at.elapsed();
+        let machine_instructions = machine
+            .functions
+            .iter()
+            .map(|function| function.hot_instructions.len() + function.cold_instructions.len())
+            .sum();
+
+        let started_at = Instant::now();
+        let assembly = self.emit_program(&machine)?;
+        let emit = started_at.elapsed();
+
+        Ok((
+            assembly,
+            CompilationMetrics {
+                prepare,
+                lower,
+                select,
+                allocate,
+                finalize,
+                emit,
+                handlers,
+                ssa_blocks,
+                ssa_instructions,
+                ssa_values,
+                low_ir_instructions,
+                target_instructions,
+                virtual_registers,
+                machine_instructions,
+            },
+        ))
+    }
+
     /// Parse, type-check, inline, and optimize all reusable handler templates.
     pub fn prepare(&self, unit: CompilationUnit<'_>) -> Result<PreparedProgram, CompileError> {
         self.prepare_internal(unit, None).map(|(prepared, _)| prepared)
@@ -238,22 +403,21 @@ impl Compiler {
     ) -> Result<(PreparedProgram, Option<OptimizationReport>), CompileError> {
         let layouts = unit
             .constants
-            .map(LayoutDatabase::parse)
-            .transpose()
-            .map_err(CompileError::from_layout_error)?;
+            .map(|source| {
+                LayoutDatabase::parse(source.contents).map_err(|error| CompileError::from_layout_error(source, error))
+            })
+            .transpose()?;
 
-        let ast = frontend::parser::parse(unit.source_name, unit.source)
+        let ast = frontend::parser::parse(unit.source.name, unit.source.contents)
             .map_err(|diagnostic| CompileError::from_diagnostic(CompileStage::Parse, diagnostic))?;
         let typed_program = if let Some(layouts) = &layouts {
-            hir::check_with_layouts(unit.source_name, &ast, layouts.fields())
+            hir::check_with_layouts(unit.source.name, &ast, layouts.fields())
         } else {
-            hir::check(unit.source_name, &ast)
+            hir::check(unit.source.name, &ast)
         }
         .map_err(|diagnostic| CompileError::from_diagnostic(CompileStage::Semantic, diagnostic))?;
 
-        let constants = layouts
-            .map(LayoutDatabase::into_constants)
-            .unwrap_or_default();
+        let constants = layouts.map(LayoutDatabase::into_constants).unwrap_or_default();
 
         let ssa_inline_functions = typed_program
             .inline_functions
@@ -303,18 +467,16 @@ impl Compiler {
         };
 
         for handler in &mut handlers {
-            ssa::optimize::resolve_layout_constants(
-                &mut handler.function,
-                &constants,
-            )?;
+            ssa::optimize::resolve_layout_constants(&mut handler.function, &constants)?;
         }
 
         let handler_ids = handlers
             .iter()
             .map(|handler| (handler.name(), handler.id))
             .collect::<HashMap<_, _>>();
-        let (op_layouts, dispatch_handlers) = if let Some(bytecode_def) = unit.bytecode_def {
-            let ops = bytecode_def::parse_bytecode_def(bytecode_def);
+        let (ops, dispatch_handlers) = if let Some(bytecode_def) = unit.bytecode_def {
+            let ops = bytecode_def::parse_bytecode_def(bytecode_def.name, bytecode_def.contents)
+                .map_err(|error| CompileError::from_bytecode_def_error(bytecode_def, error))?;
             // The interpreter dispatches on a single opcode byte, so a table beyond 256 entries
             // would have unreachable handlers.
             if ops.len() > DISPATCH_TABLE_SIZE {
@@ -327,26 +489,30 @@ impl Compiler {
                     ),
                 ));
             }
-            (
-                Some(bytecode_def::compute_layouts(&ops)),
-                ops.iter()
-                    .map(|op| handler_ids.get(op.name.as_str()).copied())
-                    .collect(),
-            )
+            let dispatch_handlers = ops
+                .iter()
+                .map(|op| handler_ids.get(op.name.as_str()).copied())
+                .collect();
+            (Some(ops), dispatch_handlers)
         } else {
             (None, Vec::new())
         };
+        let ops_by_name = ops
+            .as_ref()
+            .map(|ops| ops.iter().map(|op| (op.name.as_str(), op)).collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         let handler_layouts = handlers
             .iter()
             .map(|handler| {
                 BytecodeHandlerLayout::new(
+                    handler.name(),
                     &handler.function.parameter_names,
-                    op_layouts
-                        .as_ref()
-                        .and_then(|layouts| layouts.get(handler.name())),
+                    &handler.function.parameter_types,
+                    ops_by_name.get(handler.name()).copied(),
                 )
+                .map_err(|message| CompileError::new(CompileStage::Semantic, Some(handler.name()), message))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok((
             PreparedProgram {
@@ -364,8 +530,7 @@ impl Compiler {
     /// Lower every prepared handler template to target-independent LowIR.
     pub fn lower(&self, prepared: &PreparedProgram) -> Result<LowProgram, CompileError> {
         let mut program = LowProgram::new();
-        program.runtime =
-            low_ir::RuntimeConstants::from_layout(&prepared.constants);
+        program.runtime = low_ir::RuntimeConstants::from_layout(&prepared.constants);
         program.dispatch_handlers = prepared.bytecode.dispatch_handlers.clone();
 
         for template in &prepared.handlers {
@@ -377,8 +542,7 @@ impl Compiler {
             )?;
             low_ir::lowering::materialize_bytecode_layout(
                 &mut handler,
-                &prepared.bytecode.handler_layouts
-                    [template.id.index()],
+                &prepared.bytecode.handler_layouts[template.id.index()],
             )?;
             program.handlers.push(handler);
         }
@@ -392,10 +556,7 @@ impl Compiler {
     }
 
     /// Assign physical registers to a selected target program.
-    pub fn allocate(
-        &self,
-        program: TargetProgram,
-    ) -> Result<AllocatedProgram, CompileError> {
+    pub fn allocate(&self, program: TargetProgram) -> Result<AllocatedProgram, CompileError> {
         if program.architecture != self.architecture() {
             return Err(CompileError::new(
                 CompileStage::Allocation,
@@ -485,10 +646,18 @@ const CANON_NAN_BITS = 0x7FF8000000000000
 
     fn unit(bytecode_def: &'static str) -> CompilationUnit<'static> {
         CompilationUnit {
-            source_name: "test.flap",
-            source: "handler Nop() { dispatch_next; }",
-            constants: Some(REQUIRED_LAYOUT),
-            bytecode_def: Some(bytecode_def),
+            source: SourceInput {
+                name: "test.flap",
+                contents: "handler Nop() { dispatch_next; }",
+            },
+            constants: Some(SourceInput {
+                name: "layout.conf",
+                contents: REQUIRED_LAYOUT,
+            }),
+            bytecode_def: Some(SourceInput {
+                name: "TestBytecode.def",
+                contents: bytecode_def,
+            }),
         }
     }
 
@@ -496,8 +665,8 @@ const CANON_NAN_BITS = 0x7FF8000000000000
     fn compiles_from_in_memory_sources_for_each_target() {
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let assembly = compiler(architecture)
-            .compile(unit("op Nop\nendop\n"))
-            .expect("in-memory compilation should succeed");
+                .compile(unit("op Nop < Instruction\nendop\n"))
+                .expect("in-memory compilation should succeed");
 
             assert!(assembly.as_str().contains("js_interpreter"));
             assert!(assembly.as_str().contains("handler_Nop"));
@@ -505,10 +674,32 @@ const CANON_NAN_BITS = 0x7FF8000000000000
     }
 
     #[test]
+    fn reports_compilation_metrics() {
+        let compiler = compiler(Architecture::X86_64);
+        let (assembly, metrics) = compiler
+            .compile_with_metrics(unit("op Nop < Instruction\nendop\n"))
+            .expect("instrumented compilation should succeed");
+
+        assert!(assembly.as_str().contains("handler_Nop"));
+        assert_eq!(metrics.handlers, 1);
+        assert!(metrics.ssa_blocks != 0);
+        assert!(metrics.ssa_instructions != 0);
+        assert!(metrics.low_ir_instructions != 0);
+        assert!(metrics.target_instructions != 0);
+        assert!(metrics.machine_instructions != 0);
+        assert_eq!(
+            metrics.elapsed(),
+            metrics.prepare + metrics.lower + metrics.select + metrics.allocate + metrics.finalize + metrics.emit
+        );
+    }
+
+    #[test]
     fn exposes_reusable_compiler_stages() {
         let compiler = compiler(Architecture::X86_64);
 
-        let prepared = compiler.prepare(unit("op Nop\nendop\n")).expect("preparation should succeed");
+        let prepared = compiler
+            .prepare(unit("op Nop < Instruction\nendop\n"))
+            .expect("preparation should succeed");
         let program = compiler.lower(&prepared).expect("machine lowering should succeed");
         let selected = compiler.select(program).expect("selection should succeed");
         assert_eq!(selected.architecture(), Architecture::X86_64);
@@ -516,8 +707,13 @@ const CANON_NAN_BITS = 0x7FF8000000000000
         let machine = compiler.finalize(allocated).expect("finalization should succeed");
         assert_eq!(machine.architecture(), Architecture::X86_64);
         let staged = compiler.emit_program(&machine).expect("emission should succeed");
-        assert_eq!(staged, compiler.emit_program(&machine).expect("re-emission should succeed"));
-        let one_shot = compiler.compile(unit("op Nop\nendop\n")).expect("one-shot compilation should succeed");
+        assert_eq!(
+            staged,
+            compiler.emit_program(&machine).expect("re-emission should succeed")
+        );
+        let one_shot = compiler
+            .compile(unit("op Nop < Instruction\nendop\n"))
+            .expect("one-shot compilation should succeed");
         assert_eq!(staged, one_shot);
     }
 
@@ -525,17 +721,38 @@ const CANON_NAN_BITS = 0x7FF8000000000000
     fn resolves_bytecode_dispatch_to_handler_identities() {
         let compiler = compiler(Architecture::X86_64);
         let prepared = compiler
-            .prepare(unit("op Nop\nendop\nop Missing\nendop\n"))
+            .prepare(unit("op Nop < Instruction\nendop\nop Missing < Instruction\nendop\n"))
             .unwrap();
         let handler_id = prepared.handlers[0].id;
 
-        assert_eq!(
-            prepared.bytecode.dispatch_handlers,
-            [Some(handler_id), None]
-        );
+        assert_eq!(prepared.bytecode.dispatch_handlers, [Some(handler_id), None]);
         let lowered = compiler.lower(&prepared).unwrap();
         assert_eq!(lowered.handlers[0].id, handler_id);
         assert_eq!(lowered.dispatch_handlers, [Some(handler_id), None]);
+    }
+
+    #[test]
+    fn rejects_handler_parameter_type_mismatches_against_bytecode_fields() {
+        let compiler = compiler(Architecture::X86_64);
+        let error = compiler
+            .prepare(CompilationUnit {
+                source: SourceInput {
+                    name: "test.flap",
+                    contents: "handler Test(lhs: u64) { let value = load(lhs); dispatch_variable(value); }",
+                },
+                constants: None,
+                bytecode_def: Some(SourceInput {
+                    name: "TestBytecode.def",
+                    contents: "op Test < Instruction\n    m_lhs: Operand\nendop\n",
+                }),
+            })
+            .err()
+            .expect("handler parameter type mismatch should fail");
+
+        assert_eq!(error.stage, CompileStage::Semantic);
+        assert_eq!(error.handler.as_deref(), Some("Test"));
+        assert!(error.message.contains("handler parameter 'm_lhs' has type u64"));
+        assert!(error.message.contains("bytecode field 'Test.m_lhs' has type Operand"));
     }
 
     #[test]
@@ -543,7 +760,7 @@ const CANON_NAN_BITS = 0x7FF8000000000000
         let compiler = compiler(Architecture::X86_64);
         let (_, report) = compiler
             .prepare_with_optimization_report(
-                unit("op Nop\nendop\n"),
+                unit("op Nop < Instruction\nendop\n"),
                 OptimizationReportOptions {
                     include_remarks: true,
                     dump_changed_ir: true,
@@ -554,6 +771,19 @@ const CANON_NAN_BITS = 0x7FF8000000000000
         assert_eq!(report.pipeline, "aot-prepare");
         assert_eq!(report.functions.len(), 1);
         assert_eq!(report.functions[0].function, "Nop");
+        assert!(report.functions[0].records.iter().any(|record| {
+            matches!(
+                record,
+                OptimizationRecord::Pass(pass) if pass.name == "sparse-conditional-constant-propagation"
+            )
+        }));
+        assert!(report.functions[0].records.iter().any(|record| {
+            matches!(
+                record,
+                OptimizationRecord::FixedPoint(fixed_point)
+                    if fixed_point.name == "block-parameter-cleanup" && fixed_point.converged
+            )
+        }));
         let report = report.to_string();
         assert!(report.contains("pass sparse-conditional-constant-propagation"));
         assert!(report.contains("fixed-point block-parameter-cleanup: iterations=1/2 converged"));
@@ -564,8 +794,10 @@ const CANON_NAN_BITS = 0x7FF8000000000000
         let compiler = compiler(Architecture::X86_64);
         let parse_error = compiler
             .prepare(CompilationUnit {
-                source_name: "bad.flap",
-                source: "handler Broken(",
+                source: SourceInput {
+                    name: "bad.flap",
+                    contents: "handler Broken(",
+                },
                 constants: None,
                 bytecode_def: None,
             })
@@ -577,9 +809,14 @@ const CANON_NAN_BITS = 0x7FF8000000000000
 
         let layout_error = compiler
             .prepare(CompilationUnit {
-                source_name: "test.flap",
-                source: "handler Nop() { dispatch_next; }",
-                constants: Some("field Object.shape Shape MISSING nullable\n"),
+                source: SourceInput {
+                    name: "test.flap",
+                    contents: "handler Nop() { dispatch_next; }",
+                },
+                constants: Some(SourceInput {
+                    name: "broken-layout.conf",
+                    contents: "field Object.shape Shape MISSING nullable\n",
+                }),
                 bytecode_def: None,
             })
             .err()
@@ -587,13 +824,44 @@ const CANON_NAN_BITS = 0x7FF8000000000000
         assert_eq!(layout_error.stage, CompileStage::Layout);
         assert_eq!(layout_error.span.unwrap().start.line, 1);
         assert!(layout_error.message.contains("undefined layout value"));
+        assert!(layout_error.message.contains("broken-layout.conf:1:1"));
+
+        let bytecode_error = compiler
+            .prepare(CompilationUnit {
+                source: SourceInput {
+                    name: "test.flap",
+                    contents: "handler Nop() { dispatch_next; }",
+                },
+                constants: None,
+                bytecode_def: Some(SourceInput {
+                    name: "BrokenBytecode.def",
+                    contents: "op Nop\n    malformed\nendop\n",
+                }),
+            })
+            .err()
+            .expect("invalid bytecode definition should fail");
+        assert_eq!(bytecode_error.stage, CompileStage::Parse);
+        let span = bytecode_error.span.unwrap();
+        assert_eq!(span.start.offset, 11);
+        assert_eq!(span.start.line, 2);
+        assert_eq!(span.start.column, 5);
+        assert!(
+            bytecode_error
+                .message
+                .contains("BrokenBytecode.def:2:5: error: malformed field line")
+        );
 
         let emission_error = compiler
             .compile(CompilationUnit {
-                source_name: "test.flap",
-                source: "handler Nop() { dispatch_next; }",
+                source: SourceInput {
+                    name: "test.flap",
+                    contents: "handler Nop() { dispatch_next; }",
+                },
                 constants: None,
-                bytecode_def: Some("op Nop\nendop\n"),
+                bytecode_def: Some(SourceInput {
+                    name: "TestBytecode.def",
+                    contents: "op Nop < Instruction\nendop\n",
+                }),
             })
             .expect_err("missing runtime metadata should fail");
         assert_eq!(emission_error.stage, CompileStage::Emission);

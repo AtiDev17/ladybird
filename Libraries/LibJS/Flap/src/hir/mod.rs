@@ -15,19 +15,23 @@ pub(crate) use definitions::*;
 
 use crate::frontend::ast;
 use crate::frontend::ast::{BinaryOperator, ExpressionKind, ParameterMode, StatementKind, UnaryOperator};
-use crate::types::{BlockTemperature, InterpreterRegister, Type};
 use crate::frontend::diagnostic::{Diagnostic, SourceSpan};
 use crate::frontend::layout;
+use crate::hash::{HashMap, HashSet};
 use crate::identity::{ExternalSymbol, InlineFunctionId};
-use crate::intrinsic::{AddressOperation, AggregateOperation, BinaryOperation, BytecodeOperation, CallOperation, ComparisonRelation, ControlOperation, FieldAccess, FieldAccessKind, FieldPair, FieldWidth, FloatBinaryOperation, FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, Intrinsic, LowLevelOperation, MemoryOperation, OperandLoad, OperandOperation, OperationValue, ShiftOperation, ValueOperation};
+use crate::intrinsic::{
+    AddressOperation, AggregateOperation, BinaryOperation, BytecodeOperation, CallOperation, ComparisonRelation,
+    ControlOperation, FieldAccess, FieldAccessKind, FieldPair, FieldWidth, FloatBinaryOperation,
+    FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, Intrinsic, LowLevelOperation,
+    MemoryOperation, OperandLoad, OperandOperation, OperationValue, ShiftOperation, ValueOperation,
+};
+use crate::types::{BlockTemperature, InterpreterRegister, Type};
 use capture::{collect_captures, collect_input_captures};
 use definite_initialization::check_definite_initialization;
 use intrinsic::{
-    Signature, intrinsic_is_terminal,
-    resolve_intrinsic,
-    operation_signature, resolve_operation, signature, signatures_match,
+    Signature, intrinsic_is_terminal, operation_signature, resolve_intrinsic, resolve_operation, signature,
+    signatures_match,
 };
-use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
 struct Symbol {
@@ -57,18 +61,26 @@ struct TypedElseContinuation {
     body: Vec<Statement>,
 }
 
+#[derive(Clone)]
+struct TypeFacts {
+    known_null_pointers: HashSet<VariableId>,
+    known_integer_literals: HashSet<VariableId>,
+}
+
 struct Checker<'a> {
     filename: &'a str,
-    signatures: HashMap<String, Signature>,
-    inline_function_ids: HashMap<String, InlineFunctionId>,
+    signatures: &'a HashMap<String, Signature>,
+    inline_function_ids: &'a HashMap<String, InlineFunctionId>,
     variables: Vec<Variable>,
     scopes: Vec<HashMap<String, Symbol>>,
     continuation_scopes: Vec<HashMap<String, ContinuationSymbol>>,
     next_continuation_scope: u64,
     statements: Vec<Statement>,
-    layouts: HashMap<(Type, String), LayoutField>,
-    aggregate_strides: HashMap<Type, layout::LayoutValue>,
+    layouts: &'a HashMap<(Type, String), LayoutField>,
+    aggregate_strides: &'a HashMap<Type, layout::LayoutValue>,
     bytecode_fields: HashSet<VariableId>,
+    known_null_pointers: HashSet<VariableId>,
+    known_integer_literals: HashSet<VariableId>,
     active_value_tags: Vec<(VariableId, VariableId)>,
 }
 
@@ -86,23 +98,25 @@ struct LayoutField {
 impl<'a> Checker<'a> {
     fn new(
         filename: &'a str,
-        signatures: HashMap<String, Signature>,
-        inline_function_ids: HashMap<String, InlineFunctionId>,
-        layouts: HashMap<(Type, String), LayoutField>,
-        aggregate_strides: HashMap<Type, layout::LayoutValue>,
+        signatures: &'a HashMap<String, Signature>,
+        inline_function_ids: &'a HashMap<String, InlineFunctionId>,
+        layouts: &'a HashMap<(Type, String), LayoutField>,
+        aggregate_strides: &'a HashMap<Type, layout::LayoutValue>,
     ) -> Self {
         Self {
             filename,
             signatures,
             inline_function_ids,
             variables: Vec::new(),
-            scopes: vec![HashMap::new()],
+            scopes: vec![HashMap::default()],
             continuation_scopes: Vec::new(),
             next_continuation_scope: 0,
             statements: Vec::new(),
             layouts,
             aggregate_strides,
-            bytecode_fields: HashSet::new(),
+            bytecode_fields: HashSet::default(),
+            known_null_pointers: HashSet::default(),
+            known_integer_literals: HashSet::default(),
             active_value_tags: Vec::new(),
         }
     }
@@ -120,6 +134,18 @@ impl<'a> Checker<'a> {
 
     fn lookup(&self, name: &str) -> Option<&Symbol> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn type_facts(&self) -> TypeFacts {
+        TypeFacts {
+            known_null_pointers: self.known_null_pointers.clone(),
+            known_integer_literals: self.known_integer_literals.clone(),
+        }
+    }
+
+    fn restore_type_facts(&mut self, facts: TypeFacts) {
+        self.known_null_pointers = facts.known_null_pointers;
+        self.known_integer_literals = facts.known_integer_literals;
     }
 
     fn declare(
@@ -149,7 +175,7 @@ impl<'a> Checker<'a> {
     fn collect_continuations(&mut self, block: &ast::Block) -> Result<HashMap<String, ContinuationSymbol>, Diagnostic> {
         let scope_id = self.next_continuation_scope;
         self.next_continuation_scope += 1;
-        let mut continuations = HashMap::new();
+        let mut continuations = HashMap::default();
         for statement in &block.statements {
             if let StatementKind::Continuation {
                 name,
@@ -158,11 +184,14 @@ impl<'a> Checker<'a> {
                 ..
             } = &statement.kind
             {
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 let mut continuation_parameters = Vec::with_capacity(parameters.len());
                 for parameter in parameters {
                     if !names.insert(parameter.name.clone()) {
-                        return self.error(parameter.span, format!("duplicate continuation parameter '{}'", parameter.name));
+                        return self.error(
+                            parameter.span,
+                            format!("duplicate continuation parameter '{}'", parameter.name),
+                        );
                     }
                     continuation_parameters.push(ContinuationParameter {
                         name: parameter.name.clone(),
@@ -177,7 +206,10 @@ impl<'a> Checker<'a> {
                             lowered_name: format!(".{}_s{scope_id}", name.trim_start_matches('.')),
                             temperature: *temperature,
                             ty: Type::Continuation(
-                                continuation_parameters.iter().map(|parameter| parameter.ty.clone()).collect(),
+                                continuation_parameters
+                                    .iter()
+                                    .map(|parameter| parameter.ty.clone())
+                                    .collect(),
                             ),
                             parameters: continuation_parameters,
                         },
@@ -193,7 +225,7 @@ impl<'a> Checker<'a> {
 
     fn check_block(&mut self, block: &ast::Block, create_scope: bool) -> Result<(), Diagnostic> {
         if create_scope {
-            self.scopes.push(HashMap::new());
+            self.scopes.push(HashMap::default());
         }
         let continuations = self.collect_continuations(block)?;
         self.continuation_scopes.push(continuations);
@@ -208,11 +240,13 @@ impl<'a> Checker<'a> {
     }
 
     fn check_scoped_block(&mut self, block: &ast::Block) -> Result<Vec<Statement>, Diagnostic> {
-        self.scopes.push(HashMap::new());
+        let facts = self.type_facts();
+        self.scopes.push(HashMap::default());
         let start = self.statements.len();
         let result = self.check_block(block, false);
         let statements = self.statements.split_off(start);
         self.scopes.pop();
+        self.restore_type_facts(facts);
         result?;
         Ok(statements)
     }
@@ -227,8 +261,8 @@ impl<'a> Checker<'a> {
             ast::ElseContinuation::Label(label) => {
                 let target = self.check_value(
                     &ast::Expression {
-                    kind: ExpressionKind::Name(label.clone()),
-                    span,
+                        kind: ExpressionKind::Name(label.clone()),
+                        span,
                     },
                     &Type::label(),
                 )?;
@@ -240,14 +274,17 @@ impl<'a> Checker<'a> {
                     temperature: BlockTemperature::Default,
                     captures: Vec::new(),
                     body: vec![Statement::new(
-                        StatementKindIr::call([], Call::with_control_flow(
-                            CallTarget::Intrinsic(Intrinsic::Control(ControlOperation::JumpLabel)),
-                            vec![target],
-                            vec![ParameterMode::In],
-                            None,
-                            true,
-                            branch_target,
-                        )),
+                        StatementKindIr::call(
+                            [],
+                            Call::with_control_flow(
+                                CallTarget::Intrinsic(Intrinsic::Control(ControlOperation::JumpLabel)),
+                                vec![target],
+                                vec![ParameterMode::In],
+                                None,
+                                true,
+                                branch_target,
+                            ),
+                        ),
                         span,
                     )],
                 })
@@ -282,10 +319,12 @@ impl<'a> Checker<'a> {
         name: &str,
         span: SourceSpan,
     ) -> Value {
-        if let [Statement {
-            kind: StatementKindIr::Call(destinations, call),
-            ..
-        }] = continuation.body.as_slice()
+        if let [
+            Statement {
+                kind: StatementKindIr::Call(destinations, call),
+                ..
+            },
+        ] = continuation.body.as_slice()
             && destinations.is_empty()
             && call.terminal
             && call.intrinsic() == Some(Intrinsic::Control(ControlOperation::JumpLabel))
@@ -316,9 +355,7 @@ impl<'a> Checker<'a> {
             .iter()
             .zip(element_types)
             .map(|(pattern, ty)| match pattern {
-                ast::Pattern::Binding { name, ty: None } => {
-                    self.declare(name, ty, None, span)
-                }
+                ast::Pattern::Binding { name, ty: None } => self.declare(name, ty, None, span),
                 ast::Pattern::Wildcard => Ok(self.declare_hidden("discard", ty, span)),
                 _ => self.error(span, "invalid tuple binding pattern"),
             })
@@ -342,7 +379,8 @@ impl<'a> Checker<'a> {
         block: &ast::Block,
         span: SourceSpan,
     ) -> Result<(Option<VariableId>, Vec<Statement>), Diagnostic> {
-        self.scopes.push(HashMap::new());
+        let facts = self.type_facts();
+        self.scopes.push(HashMap::default());
         let binding = binding
             .map(|binding| self.declare(binding, ty, None, span))
             .transpose()?;
@@ -350,6 +388,7 @@ impl<'a> Checker<'a> {
         let result = self.check_block(block, false);
         let statements = self.statements.split_off(start);
         self.scopes.pop();
+        self.restore_type_facts(facts);
         result?;
         Ok((binding, statements))
     }
@@ -362,12 +401,14 @@ impl<'a> Checker<'a> {
         expected: Option<&Type>,
         span: SourceSpan,
     ) -> Result<(Option<VariableId>, Vec<Statement>, Call), Diagnostic> {
-        self.scopes.push(HashMap::new());
+        let facts = self.type_facts();
+        self.scopes.push(HashMap::default());
         let binding = binding
             .map(|binding| self.declare(binding, binding_type, None, span))
             .transpose()?;
         let result = self.check_value_block(block, expected);
         self.scopes.pop();
+        self.restore_type_facts(facts);
         result.map(|(statements, value)| (binding, statements, value))
     }
 
@@ -380,10 +421,7 @@ impl<'a> Checker<'a> {
             return self.check_label(label, span);
         }
         let continuation = self.check_else_continuation(continuation, span)?;
-        let ValueKind::Label(label) = self
-            .materialize_else_continuation(continuation, "guard", span)
-            .kind
-        else {
+        let ValueKind::Label(label) = self.materialize_else_continuation(continuation, "guard", span).kind else {
             unreachable!()
         };
         Ok(label)
@@ -404,11 +442,7 @@ impl<'a> Checker<'a> {
         } else {
             None
         };
-        let active_value_tag = if let (
-            Some(tag),
-            ValueKind::Variable(value),
-        ) = (tag, &value.kind)
-        {
+        let active_value_tag = if let (Some(tag), ValueKind::Variable(value)) = (tag, &value.kind) {
             self.active_value_tags.push((*value, tag));
             true
         } else {
@@ -448,10 +482,7 @@ impl<'a> Checker<'a> {
                     Diagnostic::new(
                         self.filename,
                         statement.span,
-                        format!(
-                            "Value<{}> match arm does not produce a value",
-                            arm.representation
-                        ),
+                        format!("Value<{}> match arm does not produce a value", arm.representation),
                     )
                 })?;
                 if let Some(expected) = &result_type
@@ -459,25 +490,16 @@ impl<'a> Checker<'a> {
                 {
                     return self.error(
                         statement.span,
-                        format!(
-                            "value-producing match arms produce {expected} and {arm_type}"
-                        ),
+                        format!("value-producing match arms produce {expected} and {arm_type}"),
                     );
                 }
                 result_type = Some(arm_type);
                 (binding, body, Some(value))
             } else {
-                let (binding, body) = self.check_bound_block(
-                    arm.binding.as_deref(),
-                    binding_type,
-                    &arm.body,
-                    statement.span,
-                )?;
+                let (binding, body) =
+                    self.check_bound_block(arm.binding.as_deref(), binding_type, &arm.body, statement.span)?;
                 if !body.last().is_some_and(statement_is_terminal) {
-                    return self.error(
-                        statement.span,
-                        "every match arm must terminate control flow",
-                    );
+                    return self.error(statement.span, "every match arm must terminate control flow");
                 }
                 (binding, body, None)
             };
@@ -495,10 +517,7 @@ impl<'a> Checker<'a> {
             return self.error(statement.span, "Value match requires an i32 arm");
         }
         if name.is_some() && !kinds.contains(&ValueMatchArmKind::Double) {
-            return self.error(
-                statement.span,
-                "value-producing Value match requires an f64 arm",
-            );
+            return self.error(statement.span, "value-producing Value match requires an f64 arm");
         }
         let fallback = self.check_value_match_fallback(fallback)?;
         if !fallback.body.last().is_some_and(statement_is_terminal) {
@@ -512,20 +531,12 @@ impl<'a> Checker<'a> {
             );
         }
         let destination = if let Some(name) = name {
-            let result_type = result_type.ok_or_else(|| {
-                Diagnostic::new(
-                    self.filename,
-                    statement.span,
-                    "value-producing match has no arms",
-                )
-            })?;
+            let result_type = result_type
+                .ok_or_else(|| Diagnostic::new(self.filename, statement.span, "value-producing match has no arms"))?;
             let destination = self.declare(name, result_type, None, statement.span)?;
             for (arm, value) in &mut checked_arms {
                 arm.body.push(Statement::new(
-                    StatementKindIr::call(
-                        [destination],
-                        value.take().expect("value-producing arm has a value"),
-                    ),
+                    StatementKindIr::call([destination], value.take().expect("value-producing arm has a value")),
                     statement.span,
                 ));
             }
@@ -536,10 +547,7 @@ impl<'a> Checker<'a> {
         if active_value_tag {
             self.active_value_tags.pop();
         }
-        let arms = checked_arms
-            .into_iter()
-            .map(|(arm, _)| arm)
-            .collect::<Vec<_>>();
+        let arms = checked_arms.into_iter().map(|(arm, _)| arm).collect::<Vec<_>>();
         let mut captures = if destination.is_some() {
             arms.iter()
                 .flat_map(|arm| collect_captures(&arm.body, outer_variable_count))
@@ -566,16 +574,18 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
-    fn check_if_statement(
-        &mut self,
-        statement: &ast::Statement,
-        name: &Option<String>,
-        ty: &Option<Type>,
-        condition: &ast::Expression,
-        temperature: &BlockTemperature,
-        then_body: &ast::Block,
-        else_body: &Option<ast::Block>,
-    ) -> Result<(), Diagnostic> {
+    fn check_if_statement(&mut self, statement: &ast::Statement) -> Result<(), Diagnostic> {
+        let ast::StatementKind::If {
+            name,
+            ty,
+            condition,
+            temperature,
+            then_body,
+            else_body,
+        } = &statement.kind
+        else {
+            unreachable!()
+        };
         let mut condition = self.check_condition(condition)?;
         let outer_variable_count = self.variables.len();
         let Some(else_body) = else_body else {
@@ -599,81 +609,93 @@ impl<'a> Checker<'a> {
             ));
             return Ok(());
         };
-        let (destination, then_body, else_body) = if let Some(name) = name {
-            let (mut then_body, then_value) = self.check_value_block(then_body, ty.as_ref())?;
-            let (mut else_body, else_value) = self.check_value_block(else_body, ty.as_ref())?;
-            let then_type = then_value.return_type.clone().ok_or_else(|| {
-                Diagnostic::new(self.filename, statement.span, "then arm does not produce a value")
-            })?;
-            let else_type = else_value.return_type.clone().ok_or_else(|| {
-                Diagnostic::new(self.filename, statement.span, "else arm does not produce a value")
-            })?;
-            if then_type != else_type {
-                return self.error(
-                    statement.span,
-                    format!("value-producing if arms produce {then_type} and {else_type}"),
-                );
-            }
-            if let Some(expected) = ty
-                && *expected != then_type
-            {
-                return self.error(
-                    statement.span,
-                    format!("value-producing if produces {then_type}, not {expected}"),
-                );
-            }
-            let destination = self.declare(name, then_type, None, statement.span)?;
-            then_body.push(Statement::new(StatementKindIr::call([destination], then_value), statement.span));
-            else_body.push(Statement::new(StatementKindIr::call([destination], else_value), statement.span));
-            (Some(destination), then_body, else_body)
-        } else {
-            let active_value_tag = match &condition {
-                Condition::ValueTag {
-                    value: Value { kind: ValueKind::Variable(value), .. },
-                    tag,
-                    ..
-                } => {
-                    self.active_value_tags.push((*value, *tag));
-                    true
+        let (destination, then_body, else_body) =
+            if let Some(name) = name {
+                let (mut then_body, then_value) = self.check_value_block(then_body, ty.as_ref())?;
+                let (mut else_body, else_value) = self.check_value_block(else_body, ty.as_ref())?;
+                let then_type = then_value.return_type.clone().ok_or_else(|| {
+                    Diagnostic::new(self.filename, statement.span, "then arm does not produce a value")
+                })?;
+                let else_type = else_value.return_type.clone().ok_or_else(|| {
+                    Diagnostic::new(self.filename, statement.span, "else arm does not produce a value")
+                })?;
+                if then_type != else_type {
+                    return self.error(
+                        statement.span,
+                        format!("value-producing if arms produce {then_type} and {else_type}"),
+                    );
                 }
-                _ => false,
+                if let Some(expected) = ty
+                    && *expected != then_type
+                {
+                    return self.error(
+                        statement.span,
+                        format!("value-producing if produces {then_type}, not {expected}"),
+                    );
+                }
+                let destination = self.declare(name, then_type, None, statement.span)?;
+                then_body.push(Statement::new(
+                    StatementKindIr::call([destination], then_value),
+                    statement.span,
+                ));
+                else_body.push(Statement::new(
+                    StatementKindIr::call([destination], else_value),
+                    statement.span,
+                ));
+                (Some(destination), then_body, else_body)
+            } else {
+                let active_value_tag = match &condition {
+                    Condition::ValueTag {
+                        value:
+                            Value {
+                                kind: ValueKind::Variable(value),
+                                ..
+                            },
+                        tag,
+                        ..
+                    } => {
+                        self.active_value_tags.push((*value, *tag));
+                        true
+                    }
+                    _ => false,
+                };
+                let then_body = self.check_scoped_block(then_body)?;
+                let else_body = self.check_scoped_block(else_body)?;
+                if active_value_tag {
+                    self.active_value_tags.pop();
+                }
+                (None, then_body, else_body)
             };
-            let then_body = self.check_scoped_block(then_body)?;
-            let else_body = self.check_scoped_block(else_body)?;
-            if active_value_tag {
-                self.active_value_tags.pop();
-            }
-            (None, then_body, else_body)
-        };
         let mut captures = collect_captures(&then_body, outer_variable_count);
         captures.extend(collect_captures(&else_body, outer_variable_count));
         captures.sort_unstable();
         captures.dedup();
         if destination.is_none()
             && let Condition::ValueTag {
-            value,
-            tag,
-            source_tag,
-            mask: Some(_),
-            ..
-        } = &mut condition
+                value,
+                tag,
+                source_tag,
+                mask: Some(_),
+                ..
+            } = &mut condition
             && source_tag.is_none()
             && captures.contains(tag)
         {
             let raw_tag = *tag;
             let compared_tag = self.declare_hidden("if_else_compared_tag", Type::ValueTag, statement.span);
             self.statements.push(Statement::new(
-                StatementKindIr::call([], Call::new(
-                    CallTarget::Intrinsic(Intrinsic::Value(ValueOperation::ExtractTag {
-                        rematerialized: false,
-                    })),
-                    vec![
-                        Value::new(ValueKind::Variable(raw_tag), Type::ValueTag, statement.span),
-                        value.clone(),
-                    ],
-                    vec![ParameterMode::Out, ParameterMode::In],
-                    None,
-                )),
+                StatementKindIr::call(
+                    [],
+                    Call::new(
+                        CallTarget::Intrinsic(Intrinsic::Value(ValueOperation::ExtractTag { rematerialized: false })),
+                        vec![
+                            Value::new(ValueKind::Variable(raw_tag), Type::ValueTag, statement.span),
+                            value.clone(),
+                        ],
+                        vec![ParameterMode::Out, ParameterMode::In],
+                        None,
+                    ),
+                ),
                 statement.span,
             ));
             *tag = compared_tag;
@@ -702,16 +724,14 @@ impl<'a> Checker<'a> {
         value: &ast::Expression,
         failure: &ast::ElseContinuation,
     ) -> Result<(), Diagnostic> {
-        let Some(ast::Pattern::Binding { name: binding, ty: None }) = binding.as_deref() else {
+        let Some(ast::Pattern::Binding {
+            name: binding,
+            ty: None,
+        }) = binding.as_deref()
+        else {
             return self.error(statement.span, "Value refinement requires an untyped binding");
         };
-        let (
-            binding_type,
-            expected_tag,
-            payload_operation,
-            hidden_tag_name,
-            reuse_active_tag,
-        ) = match representation {
+        let (binding_type, expected_tag, payload_operation, hidden_tag_name, reuse_active_tag) = match representation {
             "i32" => (
                 Type::I32,
                 Some("INT32_TAG"),
@@ -719,13 +739,7 @@ impl<'a> Checker<'a> {
                 "int32_tag",
                 false,
             ),
-            "f64" => (
-                Type::F64,
-                None,
-                ValueOperation::ValueToFloat64,
-                "double_tag",
-                false,
-            ),
+            "f64" => (Type::F64, None, ValueOperation::ValueToFloat64, "double_tag", false),
             "Object" => (
                 Type::Object,
                 Some("OBJECT_TAG"),
@@ -746,10 +760,7 @@ impl<'a> Checker<'a> {
             if binding_symbol.ty != binding_type {
                 return self.error(
                     statement.span,
-                    format!(
-                        "Value refinement requires {binding_type}, found {}",
-                        binding_symbol.ty
-                    ),
+                    format!("Value refinement requires {binding_type}, found {}", binding_symbol.ty),
                 );
             }
             self.ensure_writable(&binding_symbol, statement.span)?;
@@ -759,9 +770,7 @@ impl<'a> Checker<'a> {
         };
         let value = self.check_materialized_value(value, &Type::Value)?;
         let failure = self.check_guard_continuation(failure, statement.span)?;
-        let tag = if reuse_active_tag
-            && let Some(tag) = self.lookup("tag").filter(|tag| tag.ty == Type::ValueTag)
-        {
+        let tag = if reuse_active_tag && let Some(tag) = self.lookup("tag").filter(|tag| tag.ty == Type::ValueTag) {
             tag.id
         } else {
             self.declare_hidden(hidden_tag_name, Type::ValueTag, statement.span)
@@ -788,7 +797,8 @@ impl<'a> Checker<'a> {
     ) -> Result<(), Diagnostic> {
         if name.contains('.') {
             let call = self.check_field_store(name, initializer, statement.span)?;
-            self.statements.push(Statement::new(StatementKindIr::call([], call), statement.span));
+            self.statements
+                .push(Statement::new(StatementKindIr::call([], call), statement.span));
             return Ok(());
         }
         let Some(symbol) = self.lookup(name).cloned() else {
@@ -797,16 +807,21 @@ impl<'a> Checker<'a> {
             };
             let call = self.check_initializer_with_expected(initializer, Some(&machine_type))?;
             let Some(return_type) = &call.return_type else {
-                return self.error(initializer.span, format!("'{}' does not return a value", call.display_name()));
+                return self.error(
+                    initializer.span,
+                    format!("'{}' does not return a value", call.display_name()),
+                );
             };
             let intrinsic = match call.target {
                 CallTarget::Intrinsic(intrinsic @ Intrinsic::LowLevel(LowLevelOperation::Move))
                 | CallTarget::Intrinsic(intrinsic @ Intrinsic::Address(AddressOperation::EmbeddedField)) => intrinsic,
                 CallTarget::FieldAccess(field_access) => Intrinsic::Memory(field_access.kind.memory_operation()),
-                _ => return self.error(
-                    initializer.span,
-                    "machine register assignment currently requires a binding or field projection",
-                ),
+                _ => {
+                    return self.error(
+                        initializer.span,
+                        "machine register assignment currently requires a binding or field projection",
+                    );
+                }
             };
             if return_type != &machine_type {
                 return self.error(
@@ -828,7 +843,10 @@ impl<'a> Checker<'a> {
         self.ensure_writable(&symbol, statement.span)?;
         let call = self.check_initializer_with_expected(initializer, Some(&symbol.ty))?;
         let Some(return_type) = &call.return_type else {
-            return self.error(initializer.span, format!("'{}' does not return a value", call.display_name()));
+            return self.error(
+                initializer.span,
+                format!("'{}' does not return a value", call.display_name()),
+            );
         };
         if *return_type != symbol.ty {
             return self.error(
@@ -836,10 +854,10 @@ impl<'a> Checker<'a> {
                 format!("cannot assign {return_type} to '{name}' of type {}", symbol.ty),
             );
         }
-        self.statements.push(Statement::new(
-            StatementKindIr::call([symbol.id], call),
-            statement.span,
-        ));
+        self.update_known_null_pointer(symbol.id, initializer, &symbol.ty);
+        self.update_known_integer_literal(symbol.id, initializer, &symbol.ty);
+        self.statements
+            .push(Statement::new(StatementKindIr::call([symbol.id], call), statement.span));
         Ok(())
     }
 
@@ -880,7 +898,10 @@ impl<'a> Checker<'a> {
         }
         let body = self.check_scoped_block(fallback)?;
         if !body.last().is_some_and(statement_is_terminal) {
-            return self.error(statement.span, "a scalar match fallback block must terminate control flow");
+            return self.error(
+                statement.span,
+                "a scalar match fallback block must terminate control flow",
+            );
         }
         captures.extend(collect_input_captures(&body, outer_variable_count));
         normalize_variables(&mut captures);
@@ -953,8 +974,7 @@ impl<'a> Checker<'a> {
         failure: &ast::ElseContinuation,
     ) -> Result<(), Diagnostic> {
         let failure = self.check_else_continuation(failure, statement.span)?;
-        let failure =
-            self.materialize_else_continuation(failure, callee, statement.span);
+        let failure = self.materialize_else_continuation(failure, callee, statement.span);
         let call = self.check_call(callee, arguments, Some(failure), statement.span)?;
         let Some(Type::Tuple(element_types)) = call.return_type.clone() else {
             return self.error(statement.span, format!("'{callee}' does not return a tuple"));
@@ -969,9 +989,11 @@ impl<'a> Checker<'a> {
                 ),
             );
         }
-        let destinations =
-            self.declare_tuple_destinations(patterns, element_types, statement.span)?;
-        self.statements.push(Statement::new(StatementKindIr::call(destinations, call), statement.span));
+        let destinations = self.declare_tuple_destinations(patterns, element_types, statement.span)?;
+        self.statements.push(Statement::new(
+            StatementKindIr::call(destinations, call),
+            statement.span,
+        ));
         Ok(())
     }
 
@@ -986,12 +1008,13 @@ impl<'a> Checker<'a> {
     ) -> Result<(), Diagnostic> {
         let outer_variable_count = self.variables.len();
         let failure = self.check_else_continuation(failure, statement.span)?;
-        let structured_failure = resolve_intrinsic(callee, arguments.len())
-            .is_some_and(|resolved| matches!(
+        let structured_failure = resolve_intrinsic(callee, arguments.len()).is_some_and(|resolved| {
+            matches!(
                 resolved.intrinsic,
                 Intrinsic::CheckedInteger(operation)
                     if operation.unchecked().is_some()
-            ));
+            )
+        });
         let (mut call, failure) = if structured_failure {
             let target = Value::new(
                 ValueKind::Label(format!(".fallible_{callee}_{}", self.statements.len())),
@@ -1003,12 +1026,8 @@ impl<'a> Checker<'a> {
                 Some(failure),
             )
         } else {
-            let target =
-                self.materialize_else_continuation(failure, callee, statement.span);
-            (
-                self.check_call(callee, arguments, Some(target), statement.span)?,
-                None,
-            )
+            let target = self.materialize_else_continuation(failure, callee, statement.span);
+            (self.check_call(callee, arguments, Some(target), statement.span)?, None)
         };
         let Some(return_type) = call.return_type.clone() else {
             return self.error(statement.span, format!("'{callee}' does not return a value"));
@@ -1023,10 +1042,7 @@ impl<'a> Checker<'a> {
         let destination = self.declare(name, destination_type, None, statement.span)?;
         if let Some(failure) = failure {
             call.failure = Some(CallFailure {
-                captures: collect_captures(
-                    &failure.body,
-                    outer_variable_count,
-                ),
+                captures: collect_captures(&failure.body, outer_variable_count),
                 body: failure.body,
             });
         }
@@ -1047,7 +1063,10 @@ impl<'a> Checker<'a> {
         if let Some(initializer) = initializer {
             let call = self.check_initializer_with_expected(initializer, ty.as_ref())?;
             let Some(return_type) = call.return_type.clone() else {
-                return self.error(initializer.span, format!("'{}' does not return a value", call.display_name()));
+                return self.error(
+                    initializer.span,
+                    format!("'{}' does not return a value", call.display_name()),
+                );
             };
             if matches!(return_type, Type::Tuple(_)) {
                 return self.error(initializer.span, "a tuple return value must be destructured");
@@ -1061,13 +1080,12 @@ impl<'a> Checker<'a> {
                     ),
                 );
             }
-            let id = self.declare(
-                name,
-                ty.clone().unwrap_or(return_type),
-                None,
-                statement.span,
-            )?;
-            self.statements.push(Statement::new(StatementKindIr::call([id], call), statement.span));
+            let declared_type = ty.clone().unwrap_or(return_type);
+            let id = self.declare(name, declared_type.clone(), None, statement.span)?;
+            self.update_known_null_pointer(id, initializer, &declared_type);
+            self.update_known_integer_literal(id, initializer, &declared_type);
+            self.statements
+                .push(Statement::new(StatementKindIr::call([id], call), statement.span));
         } else {
             self.declare(
                 name,
@@ -1103,9 +1121,11 @@ impl<'a> Checker<'a> {
                 ),
             );
         }
-        let destinations =
-            self.declare_tuple_destinations(patterns, element_types, statement.span)?;
-        self.statements.push(Statement::new(StatementKindIr::call(destinations, call), statement.span));
+        let destinations = self.declare_tuple_destinations(patterns, element_types, statement.span)?;
+        self.statements.push(Statement::new(
+            StatementKindIr::call(destinations, call),
+            statement.span,
+        ));
         Ok(())
     }
 
@@ -1143,26 +1163,34 @@ impl<'a> Checker<'a> {
                 let (base, element_type) = self.check_index_base(base)?;
                 let index = self.check_sequence_index(index)?;
                 let value = self.check_materialized_value(value, &element_type)?;
-                let (_, store_operation, scale) = sequence_access(&element_type)
-                    .ok_or_else(|| Diagnostic::new(self.filename, value.span, format!("cannot store sequence element of type {element_type}")))?;
+                let (_, store_operation, scale) = sequence_access(&element_type).ok_or_else(|| {
+                    Diagnostic::new(
+                        self.filename,
+                        value.span,
+                        format!("cannot store sequence element of type {element_type}"),
+                    )
+                })?;
                 self.statements.push(Statement::new(
-                    StatementKindIr::call([], Call::new(
-                        CallTarget::Intrinsic(Intrinsic::Memory(store_operation)),
-                        vec![
-                            Value::new(
-                                ValueKind::Memory(vec![
-                                    base,
-                                    index,
-                                    Value::new(ValueKind::Integer(scale), Type::U8, statement.span),
-                                ]),
-                                Type::Memory,
-                                statement.span,
-                            ),
-                            value,
-                        ],
-                        vec![ParameterMode::In, ParameterMode::In],
-                        None,
-                    )),
+                    StatementKindIr::call(
+                        [],
+                        Call::new(
+                            CallTarget::Intrinsic(Intrinsic::Memory(store_operation)),
+                            vec![
+                                Value::new(
+                                    ValueKind::Memory(vec![
+                                        base,
+                                        index,
+                                        Value::new(ValueKind::Integer(scale), Type::U8, statement.span),
+                                    ]),
+                                    Type::Memory,
+                                    statement.span,
+                                ),
+                                value,
+                            ],
+                            vec![ParameterMode::In, ParameterMode::In],
+                            None,
+                        ),
+                    ),
                     statement.span,
                 ));
             }
@@ -1176,7 +1204,8 @@ impl<'a> Checker<'a> {
                 if call.return_type.is_some() {
                     return self.error(expression.span, format!("return value of '{callee}' is ignored"));
                 }
-                self.statements.push(Statement::new(StatementKindIr::call([], call), statement.span));
+                self.statements
+                    .push(Statement::new(StatementKindIr::call([], call), statement.span));
             }
             StatementKind::FallibleCall {
                 callee,
@@ -1184,22 +1213,25 @@ impl<'a> Checker<'a> {
                 failure,
             } => {
                 let failure = self.check_else_continuation(failure, statement.span)?;
-                let failure =
-                    self.materialize_else_continuation(failure, callee, statement.span);
+                let failure = self.materialize_else_continuation(failure, callee, statement.span);
                 let call = self.check_call(callee, arguments, Some(failure), statement.span)?;
                 if call.return_type.is_some() {
                     return self.error(statement.span, format!("return value of '{callee}' is ignored"));
                 }
-                self.statements.push(Statement::new(StatementKindIr::call([], call), statement.span));
+                self.statements
+                    .push(Statement::new(StatementKindIr::call([], call), statement.span));
             }
             StatementKind::GuardLet {
-                pattern: ast::Pattern::ValueRepresentation { representation, binding },
+                pattern:
+                    ast::Pattern::ValueRepresentation {
+                        representation,
+                        binding,
+                    },
                 initializer: value,
                 failure,
-            } if matches!(
-                representation.as_str(),
-                "i32" | "f64" | "Object" | "PrimitiveString"
-            ) => self.check_value_refinement_statement(statement, representation, binding, value, failure)?,
+            } if matches!(representation.as_str(), "i32" | "f64" | "Object" | "PrimitiveString") => {
+                self.check_value_refinement_statement(statement, representation, binding, value, failure)?
+            }
             StatementKind::GuardLet { .. } => return self.error(statement.span, "invalid fallible binding pattern"),
             StatementKind::ValueMatch {
                 name,
@@ -1207,15 +1239,14 @@ impl<'a> Checker<'a> {
                 arms,
                 fallback,
             } => self.check_value_match_statement(statement, name, value, arms, fallback)?,
-            StatementKind::ScalarMatch { value, arms, fallback } => self.check_scalar_match_statement(statement, value, arms, fallback)?,
+            StatementKind::ScalarMatch { value, arms, fallback } => {
+                self.check_scalar_match_statement(statement, value, arms, fallback)?
+            }
             StatementKind::Guard { condition, failure } => {
                 let condition = self.check_condition(condition)?;
                 let failure = self.check_guard_continuation(failure, statement.span)?;
                 self.statements.push(Statement::new(
-                    StatementKindIr::Guard {
-                        condition,
-                        failure,
-                    },
+                    StatementKindIr::Guard { condition, failure },
                     statement.span,
                 ));
             }
@@ -1237,15 +1268,12 @@ impl<'a> Checker<'a> {
                 let (_, _, body) = self.check_continuation_invocation(target, arguments, statement.span)?;
                 self.statements.extend(body);
             }
-            StatementKind::If {
-                name,
-                ty,
+            StatementKind::If { .. } => self.check_if_statement(statement)?,
+            StatementKind::While {
                 condition,
-                temperature,
-                then_body,
-                else_body,
-            } => self.check_if_statement(statement, name, ty, condition, temperature, then_body, else_body)?,
-            StatementKind::While { condition, body, post_tested } => {
+                body,
+                post_tested,
+            } => {
                 let outer_variable_count = self.variables.len();
                 let condition_start = self.statements.len();
                 let condition = self.check_condition(condition)?;
@@ -1295,14 +1323,13 @@ impl<'a> Checker<'a> {
                 Intrinsic::Call(CallOperation::Interpreter | CallOperation::RawNative)
             ) && resolved.signature.return_type.is_some()
         });
-        let indirect_condition = self.lookup(callee).is_some_and(|symbol| {
-            matches!(symbol.ty, Type::IntegerCondition | Type::FloatCondition)
-        });
+        let indirect_condition = self
+            .lookup(callee)
+            .is_some_and(|symbol| matches!(symbol.ty, Type::IntegerCondition | Type::FloatCondition));
         let bytecode_load = (|| {
             if arguments.len() != 1
                 || !resolved_intrinsic.as_ref().is_some_and(|resolved| {
-                    resolved.intrinsic
-                        == Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field))
+                    resolved.intrinsic == Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field))
                 })
             {
                 return None;
@@ -1333,14 +1360,14 @@ impl<'a> Checker<'a> {
             let resolved = resolved_intrinsic
                 .take()
                 .expect("returning builtins are resolved intrinsics");
-            (
-                CallTarget::Intrinsic(resolved.intrinsic),
-                resolved.signature,
-            )
+            (CallTarget::Intrinsic(resolved.intrinsic), resolved.signature)
         } else if let Some((parameter_type, return_type, width)) = &bytecode_load {
             (
                 CallTarget::Intrinsic(Intrinsic::Bytecode(BytecodeOperation::Load(*width))),
-                signature(&[(ParameterMode::In, parameter_type.clone())], Some(return_type.clone())),
+                signature(
+                    &[(ParameterMode::In, parameter_type.clone())],
+                    Some(return_type.clone()),
+                ),
             )
         } else if let Some(signature) = self.signatures.get(callee).cloned() {
             (
@@ -1388,23 +1415,22 @@ impl<'a> Checker<'a> {
         }
 
         let mut values = Vec::new();
-        for (argument, (mode, expected_type)) in arguments
-            .iter()
-            .zip(&signature.parameters[..explicit_parameter_count])
+        for (argument, (mode, expected_type)) in arguments.iter().zip(&signature.parameters[..explicit_parameter_count])
         {
             if *expected_type == Type::Operand
                 && let ExpressionKind::Name(name) = &argument.kind
-                    && let Some(symbol) = self.lookup(name) {
-                        match (mode, symbol.parameter_mode) {
-                            (ParameterMode::In, Some(ParameterMode::Out)) => {
-                                return self.error(argument.span, "cannot read through an out Operand parameter");
-                            }
-                            (ParameterMode::InOut, Some(ParameterMode::Out)) => {
-                                return self.error(argument.span, "cannot read through an out Operand parameter");
-                            }
-                            _ => {}
-                        }
+                && let Some(symbol) = self.lookup(name)
+            {
+                match (mode, symbol.parameter_mode) {
+                    (ParameterMode::In, Some(ParameterMode::Out)) => {
+                        return self.error(argument.span, "cannot read through an out Operand parameter");
                     }
+                    (ParameterMode::InOut, Some(ParameterMode::Out)) => {
+                        return self.error(argument.span, "cannot read through an out Operand parameter");
+                    }
+                    _ => {}
+                }
+            }
             let value = if *expected_type == Type::AnyGpr {
                 self.check_materialized_gpr_value(argument)?
             } else if *mode == ParameterMode::In
@@ -1425,13 +1451,13 @@ impl<'a> Checker<'a> {
                         .as_ref()
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "no value".to_string());
-                    return self.error(
-                        argument.span,
-                        format!("expected {expected_type}, found {found}"),
-                    );
+                    return self.error(argument.span, format!("expected {expected_type}, found {found}"));
                 }
                 let destination = self.declare_hidden("argument", expected_type.clone(), argument.span);
-                self.statements.push(Statement::new(StatementKindIr::call([destination], call), argument.span));
+                self.statements.push(Statement::new(
+                    StatementKindIr::call([destination], call),
+                    argument.span,
+                ));
                 Value::new(ValueKind::Variable(destination), expected_type.clone(), argument.span)
             } else {
                 self.check_value(argument, expected_type)?
@@ -1458,11 +1484,10 @@ impl<'a> Checker<'a> {
             values.push(failure);
         }
 
-        let terminal = signature.terminal
-            || matches!(target, CallTarget::Intrinsic(intrinsic) if intrinsic.is_terminal());
-        let branch_target = failure_target.or_else(|| {
-            branch_target(&target, &values, &self.variables, indirect_condition)
-        });
+        let terminal =
+            signature.terminal || matches!(target, CallTarget::Intrinsic(intrinsic) if intrinsic.is_terminal());
+        let branch_target =
+            failure_target.or_else(|| branch_target(&target, &values, &self.variables, indirect_condition));
         Ok(Call::with_control_flow(
             target,
             values,
@@ -1495,11 +1520,7 @@ impl<'a> Checker<'a> {
             ));
         }
         let width = field_width(&field.ty, false)
-            .ok_or_else(|| Diagnostic::new(
-                self.filename,
-                span,
-                format!("cannot load field of type {}", field.ty),
-            ))?;
+            .ok_or_else(|| Diagnostic::new(self.filename, span, format!("cannot load field of type {}", field.ty)))?;
         Ok(Call::new(
             CallTarget::FieldAccess(FieldAccess {
                 kind: FieldAccessKind::Load {
@@ -1516,34 +1537,25 @@ impl<'a> Checker<'a> {
 
     fn field_memory(&self, base: Value, field: &LayoutField, span: SourceSpan) -> Value {
         let (base, offset) = match (&base.kind, &field.pinned_base, &field.pinned_offset) {
-            (ValueKind::MachineRegister(_), Some(pinned_base), Some(pinned_offset)) => {
-                (
-                    Value::new(
-                        ValueKind::MachineRegister(pinned_base.clone().into()),
-                        machine_register_type(pinned_base)
-                            .expect("generated pinned field base must name a machine register"),
-                        span,
-                    ),
-                    *pinned_offset,
-                )
-            }
+            (ValueKind::MachineRegister(_), Some(pinned_base), Some(pinned_offset)) => (
+                Value::new(
+                    ValueKind::MachineRegister(pinned_base.clone().into()),
+                    machine_register_type(pinned_base)
+                        .expect("generated pinned field base must name a machine register"),
+                    span,
+                ),
+                *pinned_offset,
+            ),
             _ => (base, field.offset),
         };
         Value::new(
-            ValueKind::Memory(vec![
-                base,
-                Value::new(ValueKind::LayoutValue(offset), Type::U64, span),
-            ]),
+            ValueKind::Memory(vec![base, Value::new(ValueKind::LayoutValue(offset), Type::U64, span)]),
             Type::Memory,
             span,
         )
     }
 
-    fn check_field_projection_base(
-        &mut self,
-        name: &str,
-        span: SourceSpan,
-    ) -> Result<(Value, String), Diagnostic> {
+    fn check_field_projection_base(&mut self, name: &str, span: SourceSpan) -> Result<(Value, String), Diagnostic> {
         let mut components = name.split('.');
         let base_name = components.next().unwrap();
         let base = if let Some(base) = self.lookup(base_name).cloned() {
@@ -1562,10 +1574,8 @@ impl<'a> Checker<'a> {
             let call = self.check_field_load(base, intermediate_field, span)?;
             let ty = call.return_type.clone().unwrap();
             let destination = self.declare_hidden("field_base", ty.clone(), span);
-            self.statements.push(Statement::new(
-                StatementKindIr::call([destination], call),
-                span,
-            ));
+            self.statements
+                .push(Statement::new(StatementKindIr::call([destination], call), span));
             base = Value::new(ValueKind::Variable(destination), ty, span);
         }
         Ok((base, (*field_name).to_string()))
@@ -1586,12 +1596,21 @@ impl<'a> Checker<'a> {
             .layouts
             .get(&(base.ty.clone(), field_name.clone()))
             .cloned()
-            .ok_or_else(|| Diagnostic::new(self.filename, span, format!("type {} has no field '{field_name}'", base.ty)))?;
+            .ok_or_else(|| {
+                Diagnostic::new(
+                    self.filename,
+                    span,
+                    format!("type {} has no field '{field_name}'", base.ty),
+                )
+            })?;
         if field.embedded {
             return self.error(span, format!("cannot assign embedded field '{}.{field_name}'", base.ty));
         }
-        if field.nonnull && matches!(&initializer.kind, ExpressionKind::Name(name) if name == "null") {
-            return self.error(initializer.span, format!("cannot assign null to non-null field '{}.{field_name}'", base.ty));
+        if field.nonnull && self.initializer_is_known_null_pointer(initializer, &field.ty) {
+            return self.error(
+                initializer.span,
+                format!("cannot assign null to non-null field '{}.{field_name}'", base.ty),
+            );
         }
         if matches!(
             &initializer.kind,
@@ -1601,7 +1620,10 @@ impl<'a> Checker<'a> {
             if field.ty != Type::ScriptOrModule {
                 return self.error(
                     initializer.span,
-                    format!("cannot zero-initialize field '{}.{field_name}' of type {}", base.ty, field.ty),
+                    format!(
+                        "cannot zero-initialize field '{}.{field_name}' of type {}",
+                        base.ty, field.ty
+                    ),
                 );
             }
             return Ok(Call::new(
@@ -1620,7 +1642,10 @@ impl<'a> Checker<'a> {
         }
         if field.ty == Type::ScriptOrModule {
             let ExpressionKind::Name(source_name) = &initializer.kind else {
-                return self.error(initializer.span, "a ScriptOrModule field can only be copied from another ScriptOrModule field");
+                return self.error(
+                    initializer.span,
+                    "a ScriptOrModule field can only be copied from another ScriptOrModule field",
+                );
             };
             let (source_base, source_field_name) = self.check_field_projection_base(source_name, initializer.span)?;
             let source_field = self
@@ -1635,16 +1660,21 @@ impl<'a> Checker<'a> {
                     )
                 })?;
             if source_field.ty != Type::ScriptOrModule {
-                return self.error(initializer.span, format!("expected ScriptOrModule, got {}", source_field.ty));
+                return self.error(
+                    initializer.span,
+                    format!("expected ScriptOrModule, got {}", source_field.ty),
+                );
             }
-            let memory = |base, offset: layout::LayoutValue, value_span| Value::new(
-                ValueKind::Memory(vec![
-                    base,
-                    Value::new(ValueKind::LayoutValue(offset), Type::U64, value_span),
-                ]),
-                Type::Memory,
-                value_span,
-            );
+            let memory = |base, offset: layout::LayoutValue, value_span| {
+                Value::new(
+                    ValueKind::Memory(vec![
+                        base,
+                        Value::new(ValueKind::LayoutValue(offset), Type::U64, value_span),
+                    ]),
+                    Type::Memory,
+                    value_span,
+                )
+            };
             return Ok(Call::new(
                 CallTarget::Intrinsic(Intrinsic::Aggregate(AggregateOperation::Copy16)),
                 vec![
@@ -1658,23 +1688,64 @@ impl<'a> Checker<'a> {
         let memory = self.field_memory(base, &field, span);
         let value = self.check_materialized_value(initializer, &field.ty)?;
         let width = field_width(&field.ty, true)
-            .ok_or_else(|| Diagnostic::new(
-                self.filename,
-                span,
-                format!("cannot store field of type {}", field.ty),
-            ))?;
+            .ok_or_else(|| Diagnostic::new(self.filename, span, format!("cannot store field of type {}", field.ty)))?;
         Ok(Call::new(
             CallTarget::FieldAccess(FieldAccess {
                 kind: FieldAccessKind::Store(width),
                 pair: field.pair,
             }),
-            vec![
-                memory,
-                value,
-            ],
+            vec![memory, value],
             vec![ParameterMode::In, ParameterMode::In],
             None,
         ))
+    }
+
+    fn update_known_null_pointer(&mut self, variable: VariableId, initializer: &ast::Expression, ty: &Type) {
+        if self.initializer_is_known_null_pointer(initializer, ty) {
+            self.known_null_pointers.insert(variable);
+        } else {
+            self.known_null_pointers.remove(&variable);
+        }
+    }
+
+    fn initializer_is_known_null_pointer(&self, initializer: &ast::Expression, ty: &Type) -> bool {
+        let ExpressionKind::Name(name) = &initializer.kind else {
+            return false;
+        };
+        if name == "null" {
+            return is_pointer_like(ty);
+        }
+        self.lookup(name)
+            .is_some_and(|symbol| symbol.ty == *ty && self.known_null_pointers.contains(&symbol.id))
+    }
+
+    fn update_known_integer_literal(&mut self, variable: VariableId, initializer: &ast::Expression, ty: &Type) {
+        if self.initializer_is_known_integer_literal(initializer, ty) {
+            self.known_integer_literals.insert(variable);
+        } else {
+            self.known_integer_literals.remove(&variable);
+        }
+    }
+
+    fn initializer_is_known_integer_literal(&self, initializer: &ast::Expression, ty: &Type) -> bool {
+        if !is_integer_arithmetic_type(ty) {
+            return false;
+        }
+        match &initializer.kind {
+            ExpressionKind::Integer(_) => true,
+            ExpressionKind::Name(name) => self
+                .lookup(name)
+                .is_some_and(|symbol| symbol.ty == *ty && self.known_integer_literals.contains(&symbol.id)),
+            _ => false,
+        }
+    }
+
+    fn value_is_known_integer_literal(&self, value: &Value) -> bool {
+        match value.kind {
+            ValueKind::Integer(_) | ValueKind::Constant(_) => true,
+            ValueKind::Variable(variable) => self.known_integer_literals.contains(&variable),
+            _ => false,
+        }
     }
 
     fn check_initializer(&mut self, expression: &ast::Expression) -> Result<Call, Diagnostic> {
@@ -1718,6 +1789,17 @@ impl<'a> Checker<'a> {
                             Some(Type::Value),
                         ));
                     }
+                    if name == "null"
+                        && let Some(expected) = expected
+                        && is_pointer_like(expected)
+                    {
+                        return Ok(Call::new(
+                            CallTarget::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::Move)),
+                            vec![Value::new(ValueKind::Integer(0), expected.clone(), expression.span)],
+                            vec![ParameterMode::In],
+                            Some(expected.clone()),
+                        ));
+                    }
                     if let Some(expected) = expected
                         && is_constant(name, expected)
                     {
@@ -1733,21 +1815,32 @@ impl<'a> Checker<'a> {
                     };
                     return Ok(Call::new(
                         CallTarget::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::Move)),
-                        vec![Value::new(ValueKind::MachineRegister(name.clone().into()), ty.clone(), expression.span)],
+                        vec![Value::new(
+                            ValueKind::MachineRegister(name.clone().into()),
+                            ty.clone(),
+                            expression.span,
+                        )],
                         vec![ParameterMode::In],
                         Some(ty),
                     ));
                 };
                 Ok(Call::new(
                     CallTarget::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::Move)),
-                    vec![Value::new(ValueKind::Variable(symbol.id), symbol.ty.clone(), expression.span)],
+                    vec![Value::new(
+                        ValueKind::Variable(symbol.id),
+                        symbol.ty.clone(),
+                        expression.span,
+                    )],
                     vec![ParameterMode::In],
                     Some(symbol.ty),
                 ))
             }
             ExpressionKind::Integer(_) => {
                 let Some(expected) = expected else {
-                    return self.error(expression.span, "an integer literal initializer requires an explicit type");
+                    return self.error(
+                        expression.span,
+                        "an integer literal initializer requires an explicit type",
+                    );
                 };
                 let value = self.check_value(expression, expected)?;
                 Ok(Call::new(
@@ -1760,8 +1853,13 @@ impl<'a> Checker<'a> {
             ExpressionKind::Index { base, index } => {
                 let (base, element_type) = self.check_index_base(base)?;
                 let index = self.check_sequence_index(index)?;
-                let (load_operation, _, scale) = sequence_access(&element_type)
-                    .ok_or_else(|| Diagnostic::new(self.filename, expression.span, format!("cannot load sequence element of type {element_type}")))?;
+                let (load_operation, _, scale) = sequence_access(&element_type).ok_or_else(|| {
+                    Diagnostic::new(
+                        self.filename,
+                        expression.span,
+                        format!("cannot load sequence element of type {element_type}"),
+                    )
+                })?;
                 Ok(Call::new(
                     CallTarget::Intrinsic(Intrinsic::Memory(load_operation)),
                     vec![Value::new(
@@ -1815,7 +1913,10 @@ impl<'a> Checker<'a> {
             ExpressionKind::Binary { operator, lhs, rhs } => {
                 self.check_binary_initializer(*operator, lhs, rhs, expected, expression.span)
             }
-            _ => self.error(expression.span, "a binding initializer must be a call or arithmetic expression"),
+            _ => self.error(
+                expression.span,
+                "a binding initializer must be a call or arithmetic expression",
+            ),
         }
     }
 
@@ -1861,11 +1962,7 @@ impl<'a> Checker<'a> {
             })?;
             return Ok(Call::new(
                 CallTarget::Intrinsic(Intrinsic::Address(AddressOperation::SequenceElement)),
-                vec![
-                    base,
-                    index,
-                    Value::new(ValueKind::LayoutValue(*scale), Type::U64, span),
-                ],
+                vec![base, index, Value::new(ValueKind::LayoutValue(*scale), Type::U64, span)],
                 vec![ParameterMode::In, ParameterMode::In, ParameterMode::In],
                 Some(element_type),
             ));
@@ -1908,16 +2005,14 @@ impl<'a> Checker<'a> {
     ) -> Result<Call, Diagnostic> {
         if let Some(operation) = integer_binary_operation(operator) {
             let integer_operation = IntegerBinaryOperation::Binary(operation);
-            let integer_type = self
-                .infer_integer_arithmetic_type(expected, lhs)
-                .or_else(|| {
-                    matches!(
-                        operation,
-                        BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Xor
-                    )
-                    .then(|| self.infer_value_tag_bitwise_type(expected, lhs))
-                    .flatten()
-                });
+            let integer_type = self.infer_integer_arithmetic_type(expected, lhs).or_else(|| {
+                matches!(
+                    operation,
+                    BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Xor
+                )
+                .then(|| self.infer_value_tag_bitwise_type(expected, lhs))
+                .flatten()
+            });
             if let Some(integer_type) = integer_type {
                 return self.check_integer_arithmetic(lhs, rhs, &integer_type, integer_operation);
             }
@@ -1945,7 +2040,10 @@ impl<'a> Checker<'a> {
                 } else {
                     "arithmetic"
                 };
-                return self.error(lhs.span, format!("f64 {operation} requires a binding as its left operand"));
+                return self.error(
+                    lhs.span,
+                    format!("f64 {operation} requires a binding as its left operand"),
+                );
             }
             return Ok(Call::new(
                 CallTarget::Intrinsic(Intrinsic::FloatingPoint(FloatingPointOperation::Binary(operation))),
@@ -1957,7 +2055,10 @@ impl<'a> Checker<'a> {
         if operator == BinaryOperator::Modulo {
             return Ok(Call::new(
                 CallTarget::InlineFunction(self.inline_function_id("modulo", span)?),
-                vec![self.check_value(lhs, &Type::Value)?, self.check_value(rhs, &Type::Value)?],
+                vec![
+                    self.check_value(lhs, &Type::Value)?,
+                    self.check_value(rhs, &Type::Value)?,
+                ],
                 vec![ParameterMode::In, ParameterMode::In],
                 Some(Type::Value),
             ));
@@ -2008,13 +2109,14 @@ impl<'a> Checker<'a> {
                 _ => unreachable!(),
             };
             return Ok(Call::new(
-                CallTarget::Intrinsic(Intrinsic::IntegerComparison(
-                    IntegerComparisonOperation::Relational {
-                        relation,
-                        domain: crate::intrinsic::ComparisonDomain::Value,
-                    },
-                )),
-                vec![self.check_value(lhs, &Type::Value)?, self.check_value(rhs, &Type::Value)?],
+                CallTarget::Intrinsic(Intrinsic::IntegerComparison(IntegerComparisonOperation::Relational {
+                    relation,
+                    domain: crate::intrinsic::ComparisonDomain::Value,
+                })),
+                vec![
+                    self.check_value(lhs, &Type::Value)?,
+                    self.check_value(rhs, &Type::Value)?,
+                ],
                 vec![ParameterMode::In, ParameterMode::In],
                 Some(Type::Value),
             ));
@@ -2042,11 +2144,7 @@ impl<'a> Checker<'a> {
         ))
     }
 
-    fn infer_integer_arithmetic_type(
-        &self,
-        expected: Option<&Type>,
-        lhs: &ast::Expression,
-    ) -> Option<Type> {
+    fn infer_integer_arithmetic_type(&self, expected: Option<&Type>, lhs: &ast::Expression) -> Option<Type> {
         if let Some(expected) = expected.filter(|ty| is_integer_arithmetic_type(ty)) {
             return Some(expected.clone());
         }
@@ -2061,11 +2159,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_value_tag_bitwise_type(
-        &self,
-        expected: Option<&Type>,
-        lhs: &ast::Expression,
-    ) -> Option<Type> {
+    fn infer_value_tag_bitwise_type(&self, expected: Option<&Type>, lhs: &ast::Expression) -> Option<Type> {
         if expected == Some(&Type::ValueTag) {
             return Some(Type::ValueTag);
         }
@@ -2091,7 +2185,10 @@ impl<'a> Checker<'a> {
                     Diagnostic::new(self.filename, expression.span, "indexed base does not produce a value")
                 })?;
                 let destination = self.declare_hidden("indexed_base", ty.clone(), expression.span);
-                self.statements.push(Statement::new(StatementKindIr::call([destination], call), expression.span));
+                self.statements.push(Statement::new(
+                    StatementKindIr::call([destination], call),
+                    expression.span,
+                ));
                 Value::new(ValueKind::Variable(destination), ty, expression.span)
             }
             ExpressionKind::Name(name) => {
@@ -2100,8 +2197,8 @@ impl<'a> Checker<'a> {
                     .map(|symbol| symbol.ty.clone())
                     .or_else(|| machine_register_type(name))
                     .ok_or_else(|| {
-                    Diagnostic::new(self.filename, expression.span, format!("unknown binding '{name}'"))
-                })?;
+                        Diagnostic::new(self.filename, expression.span, format!("unknown binding '{name}'"))
+                    })?;
                 self.check_value(expression, &ty)?
             }
             _ => return self.error(expression.span, "indexed base must be a binding or field projection"),
@@ -2124,7 +2221,10 @@ impl<'a> Checker<'a> {
             _ => Type::U32,
         };
         if !matches!(expected, Type::U32 | Type::U64) {
-            return self.error(expression.span, format!("sequence index must be u32 or u64, found {expected}"));
+            return self.error(
+                expression.span,
+                format!("sequence index must be u32 or u64, found {expected}"),
+            );
         }
         self.check_materialized_value(expression, &expected)
     }
@@ -2138,19 +2238,23 @@ impl<'a> Checker<'a> {
             .value
             .as_ref()
             .expect("the parser requires a tail expression for value-producing blocks");
-        self.scopes.push(HashMap::new());
+        let facts = self.type_facts();
+        self.scopes.push(HashMap::default());
         let start = self.statements.len();
-        self.check_block(block, false)?;
-        let mut value = self.check_initializer_with_expected(value, expected)?;
-        if value.intrinsic() == Some(Intrinsic::LowLevel(LowLevelOperation::Move))
-            && value.return_type == Some(Type::BytecodeOffset)
-            && matches!(value.arguments[0].kind, ValueKind::Variable(source) if self.bytecode_fields.contains(&source))
-        {
-            value.target = CallTarget::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::LoadLabel));
-        }
+        let result = self.check_block(block, false).and_then(|()| {
+            let mut value = self.check_initializer_with_expected(value, expected)?;
+            if value.intrinsic() == Some(Intrinsic::LowLevel(LowLevelOperation::Move))
+                && value.return_type == Some(Type::BytecodeOffset)
+                && matches!(value.arguments[0].kind, ValueKind::Variable(source) if self.bytecode_fields.contains(&source))
+            {
+                value.target = CallTarget::Intrinsic(Intrinsic::LowLevel(LowLevelOperation::LoadLabel));
+            }
+            Ok(value)
+        });
         let statements = self.statements.split_off(start);
         self.scopes.pop();
-        Ok((statements, value))
+        self.restore_type_facts(facts);
+        Ok((statements, result?))
     }
 
     fn check_condition(&mut self, expression: &ast::Expression) -> Result<Condition, Diagnostic> {
@@ -2243,33 +2347,48 @@ impl<'a> Checker<'a> {
             return Ok(Condition::LogicalNot(Box::new(self.check_condition(operand)?)));
         }
         let scalar_equality = match &expression.kind {
-            ExpressionKind::Binary { operator: BinaryOperator::LooseEqual, lhs, rhs } => {
-                Some((true, lhs, rhs))
-            }
-            ExpressionKind::Binary { operator: BinaryOperator::LooseNotEqual, lhs, rhs } => {
-                Some((false, lhs, rhs))
-            }
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LooseEqual,
+                lhs,
+                rhs,
+            } => Some((true, lhs, rhs)),
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LooseNotEqual,
+                lhs,
+                rhs,
+            } => Some((false, lhs, rhs)),
             _ => None,
         };
         if let Some((equal, lhs, rhs)) = scalar_equality {
             if let Some(condition) = self.check_scalar_equality(lhs, rhs, equal)? {
                 return Ok(condition);
             }
-            return self.error(expression.span, "Value equality requires an explicit equality operation");
+            return self.error(
+                expression.span,
+                "Value equality requires an explicit equality operation",
+            );
         }
         let scalar_relational = match &expression.kind {
-            ExpressionKind::Binary { operator: BinaryOperator::LessThan, lhs, rhs } => {
-                Some((ComparisonRelation::Less, lhs, rhs))
-            }
-            ExpressionKind::Binary { operator: BinaryOperator::GreaterThan, lhs, rhs } => {
-                Some((ComparisonRelation::Greater, lhs, rhs))
-            }
-            ExpressionKind::Binary { operator: BinaryOperator::LessThanOrEqual, lhs, rhs } => {
-                Some((ComparisonRelation::LessOrEqual, lhs, rhs))
-            }
-            ExpressionKind::Binary { operator: BinaryOperator::GreaterThanOrEqual, lhs, rhs } => {
-                Some((ComparisonRelation::GreaterOrEqual, lhs, rhs))
-            }
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LessThan,
+                lhs,
+                rhs,
+            } => Some((ComparisonRelation::Less, lhs, rhs)),
+            ExpressionKind::Binary {
+                operator: BinaryOperator::GreaterThan,
+                lhs,
+                rhs,
+            } => Some((ComparisonRelation::Greater, lhs, rhs)),
+            ExpressionKind::Binary {
+                operator: BinaryOperator::LessThanOrEqual,
+                lhs,
+                rhs,
+            } => Some((ComparisonRelation::LessOrEqual, lhs, rhs)),
+            ExpressionKind::Binary {
+                operator: BinaryOperator::GreaterThanOrEqual,
+                lhs,
+                rhs,
+            } => Some((ComparisonRelation::GreaterOrEqual, lhs, rhs)),
             _ => None,
         };
         if let Some((relation, lhs, rhs)) = scalar_relational {
@@ -2303,9 +2422,7 @@ impl<'a> Checker<'a> {
             ast::Pattern::Binding { .. }
             | ast::Pattern::Tuple(_)
             | ast::Pattern::Wildcard
-            | ast::Pattern::ValueRepresentation { .. } => {
-                self.error(span, "pattern is not valid in a scalar match")
-            }
+            | ast::Pattern::ValueRepresentation { .. } => self.error(span, "pattern is not valid in a scalar match"),
         }
     }
 
@@ -2324,7 +2441,12 @@ impl<'a> Checker<'a> {
             _ => return Ok(None),
         };
         let rhs = self.check_materialized_value(rhs, &lhs_type)?;
-        Ok(Some(Condition::ScalarRelational { lhs, rhs, relation, signed }))
+        Ok(Some(Condition::ScalarRelational {
+            lhs,
+            rhs,
+            relation,
+            signed,
+        }))
     }
 
     fn check_scalar_equality(
@@ -2358,7 +2480,11 @@ impl<'a> Checker<'a> {
                     return Ok(None);
                 };
                 return Ok(Some((
-                    Value::new(ValueKind::MachineRegister(name.clone().into()), ty.clone(), expression.span),
+                    Value::new(
+                        ValueKind::MachineRegister(name.clone().into()),
+                        ty.clone(),
+                        expression.span,
+                    ),
                     ty,
                 )));
             };
@@ -2377,18 +2503,17 @@ impl<'a> Checker<'a> {
             return self.error(expression.span, "left operand does not produce a value");
         };
         let destination = self.declare_hidden("condition", ty.clone(), expression.span);
-        self.statements.push(Statement::new(StatementKindIr::call([destination], call), expression.span));
+        self.statements.push(Statement::new(
+            StatementKindIr::call([destination], call),
+            expression.span,
+        ));
         Ok(Some((
             Value::new(ValueKind::Variable(destination), ty.clone(), expression.span),
             ty,
         )))
     }
 
-    fn check_materialized_value(
-        &mut self,
-        expression: &ast::Expression,
-        expected: &Type,
-    ) -> Result<Value, Diagnostic> {
+    fn check_materialized_value(&mut self, expression: &ast::Expression, expected: &Type) -> Result<Value, Diagnostic> {
         if let ExpressionKind::Call { callee, arguments } = &expression.kind
             && callee == "alias"
         {
@@ -2414,8 +2539,15 @@ impl<'a> Checker<'a> {
                 return self.error(expression.span, format!("expected {expected}, found {found}"));
             }
             let destination = self.declare_hidden("expression", expected.clone(), expression.span);
-            self.statements.push(Statement::new(StatementKindIr::call([destination], call), expression.span));
-            return Ok(Value::new(ValueKind::Variable(destination), expected.clone(), expression.span));
+            self.statements.push(Statement::new(
+                StatementKindIr::call([destination], call),
+                expression.span,
+            ));
+            return Ok(Value::new(
+                ValueKind::Variable(destination),
+                expected.clone(),
+                expression.span,
+            ));
         }
         self.check_value(expression, expected)
     }
@@ -2435,17 +2567,15 @@ impl<'a> Checker<'a> {
                     .transpose()?,
                 ExpressionKind::Name(_) => {
                     let call = self.check_initializer(source)?;
-                    call.return_type
-                        .as_ref()
-                        .is_some_and(is_pointer_like)
-                        .then_some(call)
+                    call.return_type.as_ref().is_some_and(is_pointer_like).then_some(call)
                 }
                 _ => None,
             };
             if let Some(call) = pointer_call {
                 let source_type = call.return_type.clone().unwrap();
                 let destination = self.declare_hidden("alias_source", source_type.clone(), source.span);
-                self.statements.push(Statement::new(StatementKindIr::call([destination], call), source.span));
+                self.statements
+                    .push(Statement::new(StatementKindIr::call([destination], call), source.span));
                 Value::new(ValueKind::Variable(destination), source_type, source.span)
             } else {
                 self.check_materialized_gpr_value(source)?
@@ -2467,6 +2597,9 @@ impl<'a> Checker<'a> {
         );
         let raw_alias = (source.ty == Type::U64 || is_pointer_like(&source.ty))
             && (*expected == Type::U64 || is_pointer_like(expected));
+        if raw_alias && is_pointer_like(expected) && self.value_is_known_integer_literal(&source) {
+            return self.error(span, format!("cannot alias integer literal as {expected}"));
+        }
         if !explicit_type_change && !raw_alias {
             return self.error(span, format!("cannot alias {} as {expected}", source.ty));
         }
@@ -2482,7 +2615,10 @@ impl<'a> Checker<'a> {
             return self.error(expression.span, format!("'{callee}' does not return f64"));
         }
         let destination = self.declare_hidden("expression", Type::F64, expression.span);
-        self.statements.push(Statement::new(StatementKindIr::call([destination], call), expression.span));
+        self.statements.push(Statement::new(
+            StatementKindIr::call([destination], call),
+            expression.span,
+        ));
         Ok(Value::new(ValueKind::Variable(destination), Type::F64, expression.span))
     }
 
@@ -2523,7 +2659,11 @@ impl<'a> Checker<'a> {
                             format!("expected {expected}, found {} for '{name}'", symbol.ty),
                         );
                     }
-                    return Ok(Value::new(ValueKind::Variable(symbol.id), symbol.ty.clone(), expression.span));
+                    return Ok(Value::new(
+                        ValueKind::Variable(symbol.id),
+                        symbol.ty.clone(),
+                        expression.span,
+                    ));
                 }
                 if let Some(ty) = machine_register_type(name) {
                     if &ty != expected {
@@ -2549,20 +2689,16 @@ impl<'a> Checker<'a> {
                 }
                 if *expected == Type::SlowPath
                     && (name.starts_with("asm_slow_path_")
-                        || name
-                            .chars()
-                            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'))
+                        || name.chars().all(|character| {
+                            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+                        }))
                 {
                     return Ok(Value::new(
-                        ValueKind::SlowPath(
-                            ExternalSymbol::new(
-                                if name.starts_with("asm_slow_path_") {
-                                    name.clone()
-                                } else {
-                                    format!("asm_slow_path_{name}")
-                                },
-                            ),
-                        ),
+                        ValueKind::SlowPath(ExternalSymbol::new(if name.starts_with("asm_slow_path_") {
+                            name.clone()
+                        } else {
+                            format!("asm_slow_path_{name}")
+                        })),
                         Type::SlowPath,
                         expression.span,
                     ));
@@ -2574,12 +2710,11 @@ impl<'a> Checker<'a> {
                         expression.span,
                     ));
                 }
-                let matches_inline_operation = operation_signature(expected)
-                    .is_some_and(|signature| {
-                        self.signatures
-                            .get(name)
-                            .is_some_and(|candidate| signatures_match(candidate, &signature))
-                    });
+                let matches_inline_operation = operation_signature(expected).is_some_and(|signature| {
+                    self.signatures
+                        .get(name)
+                        .is_some_and(|candidate| signatures_match(candidate, &signature))
+                });
                 if let Some(intrinsic) = resolve_operation(name, expected) {
                     return Ok(Value::new(
                         ValueKind::Operation(OperationValue::Intrinsic(intrinsic)),
@@ -2604,9 +2739,11 @@ impl<'a> Checker<'a> {
                 }
                 self.error(expression.span, format!("unknown name '{name}'"))
             }
-            ExpressionKind::Integer(value) if is_integer_representation(expected) => {
-                Ok(Value::new(ValueKind::Integer(*value), expected.clone(), expression.span))
-            }
+            ExpressionKind::Integer(value) if is_integer_representation(expected) => Ok(Value::new(
+                ValueKind::Integer(*value),
+                expected.clone(),
+                expression.span,
+            )),
             ExpressionKind::Integer(_) => {
                 self.error(expression.span, format!("expected {expected}, found integer literal"))
             }
@@ -2615,9 +2752,7 @@ impl<'a> Checker<'a> {
             | ExpressionKind::Binary { .. }
             | ExpressionKind::Index { .. }
             | ExpressionKind::Tuple(_)
-            | ExpressionKind::Memory(_) => {
-                self.error(expression.span, "nested expressions are not supported here")
-            }
+            | ExpressionKind::Memory(_) => self.error(expression.span, "nested expressions are not supported here"),
         }
     }
 
@@ -2625,7 +2760,11 @@ impl<'a> Checker<'a> {
         if let ExpressionKind::Name(name) = &expression.kind {
             if let Some(symbol) = self.lookup(name) {
                 if matches!(symbol.ty, Type::Field(_)) {
-                    return Ok(Value::new(ValueKind::Variable(symbol.id), symbol.ty.clone(), expression.span));
+                    return Ok(Value::new(
+                        ValueKind::Variable(symbol.id),
+                        symbol.ty.clone(),
+                        expression.span,
+                    ));
                 }
                 if !is_gpr_type(&symbol.ty) {
                     return self.error(
@@ -2678,39 +2817,48 @@ impl<'a> Checker<'a> {
             );
         }
         let destination = self.declare_hidden("expression", return_type.clone(), expression.span);
-        self.statements.push(Statement::new(StatementKindIr::call([destination], call), expression.span));
-        Ok(Value::new(ValueKind::Variable(destination), return_type, expression.span))
+        self.statements.push(Statement::new(
+            StatementKindIr::call([destination], call),
+            expression.span,
+        ));
+        Ok(Value::new(
+            ValueKind::Variable(destination),
+            return_type,
+            expression.span,
+        ))
     }
 
     fn check_memory_component(&self, expression: &ast::Expression) -> Result<Value, Diagnostic> {
         if let ExpressionKind::Name(name) = &expression.kind
             && let Some(symbol) = self.lookup(name)
-                && matches!(
-                    symbol.ty,
-                    Type::Field(_) | Type::Operand
-                ) {
-                    return Ok(Value::new(ValueKind::Variable(symbol.id), symbol.ty.clone(), expression.span));
-                }
+            && matches!(symbol.ty, Type::Field(_) | Type::Operand)
+        {
+            return Ok(Value::new(
+                ValueKind::Variable(symbol.id),
+                symbol.ty.clone(),
+                expression.span,
+            ));
+        }
         self.check_gpr_value(expression)
     }
 
     fn resolve_continuation_symbol(&self, name: &str) -> Option<&ContinuationSymbol> {
-        self.continuation_scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name))
+        self.continuation_scopes.iter().rev().find_map(|scope| scope.get(name))
     }
 
     fn push_jump(&mut self, target: &str, span: SourceSpan) {
         self.statements.push(Statement::new(
-            StatementKindIr::call([], Call::with_control_flow(
-                CallTarget::Intrinsic(Intrinsic::Control(ControlOperation::JumpLabel)),
-                vec![Value::new(ValueKind::Label(target.to_string()), Type::label(), span)],
-                vec![ParameterMode::In],
-                None,
-                true,
-                Some(target.to_string()),
-            )),
+            StatementKindIr::call(
+                [],
+                Call::with_control_flow(
+                    CallTarget::Intrinsic(Intrinsic::Control(ControlOperation::JumpLabel)),
+                    vec![Value::new(ValueKind::Label(target.to_string()), Type::label(), span)],
+                    vec![ParameterMode::In],
+                    None,
+                    true,
+                    Some(target.to_string()),
+                ),
+            ),
             span,
         ));
     }
@@ -2741,7 +2889,10 @@ impl<'a> Checker<'a> {
         for (argument, parameter) in arguments.iter().zip(parameters) {
             let call = self.check_initializer_with_expected(argument, Some(&parameter.ty))?;
             let Some(return_type) = &call.return_type else {
-                return self.error(argument.span, format!("'{}' does not return a value", call.display_name()));
+                return self.error(
+                    argument.span,
+                    format!("'{}' does not return a value", call.display_name()),
+                );
             };
             if *return_type != parameter.ty {
                 return self.error(argument.span, format!("expected {}, found {return_type}", parameter.ty));
@@ -2942,20 +3093,17 @@ fn branch_target(
         || matches!(
             target,
             CallTarget::Intrinsic(
-                Intrinsic::Branch(_)
-                    | Intrinsic::CheckedInteger(_)
-                    | Intrinsic::Control(ControlOperation::JumpLabel)
+                Intrinsic::Branch(_) | Intrinsic::CheckedInteger(_) | Intrinsic::Control(ControlOperation::JumpLabel)
             )
         ))
-        && let Some(value) = values.last() {
-            return match &value.kind {
-                ValueKind::Label(label) => Some(label.clone()),
-                ValueKind::Variable(variable) if value.ty == Type::label() => {
-                    Some(variables[*variable].name.clone())
-                }
-                _ => None,
-            };
-        }
+        && let Some(value) = values.last()
+    {
+        return match &value.kind {
+            ValueKind::Label(label) => Some(label.clone()),
+            ValueKind::Variable(variable) if value.ty == Type::label() => Some(variables[*variable].name.clone()),
+            _ => None,
+        };
+    }
     None
 }
 
@@ -2968,10 +3116,7 @@ fn ast_block_is_terminal(block: &ast::Block, signatures: &HashMap<String, Signat
 
 fn ast_statement_is_terminal(statement: &ast::Statement, signatures: &HashMap<String, Signature>) -> bool {
     let call_is_terminal = |callee: &str| {
-        intrinsic_is_terminal(callee)
-            || signatures
-                .get(callee)
-                .is_some_and(|signature| signature.terminal)
+        intrinsic_is_terminal(callee) || signatures.get(callee).is_some_and(|signature| signature.terminal)
     };
     match &statement.kind {
         ast::StatementKind::Expression(ast::Expression {
@@ -2990,7 +3135,7 @@ fn ast_statement_is_terminal(statement: &ast::Statement, signatures: &HashMap<St
 }
 
 fn collect_signatures(filename: &str, program: &ast::Program) -> Result<HashMap<String, Signature>, Diagnostic> {
-    let mut signatures = HashMap::new();
+    let mut signatures = HashMap::default();
     for declaration in &program.declarations {
         let ast::Declaration::InlineFunction(declaration) = declaration else {
             continue;
@@ -3013,19 +3158,17 @@ fn collect_signatures(filename: &str, program: &ast::Program) -> Result<HashMap<
             ));
         }
     }
+
     loop {
-        let newly_terminal: Vec<_> = program
-            .declarations
-            .iter()
-            .filter_map(|declaration| {
-                let ast::Declaration::InlineFunction(declaration) = declaration else {
-                    return None;
-                };
-                (!signatures[&declaration.name].terminal
-                    && ast_block_is_terminal(&declaration.body, &signatures))
-                .then_some(declaration.name.clone())
-            })
-            .collect();
+        let mut newly_terminal = Vec::new();
+        for declaration in &program.declarations {
+            let ast::Declaration::InlineFunction(function) = declaration else {
+                continue;
+            };
+            if !signatures[&function.name].terminal && ast_block_is_terminal(&function.body, &signatures) {
+                newly_terminal.push(function.name.clone());
+            }
+        }
         if newly_terminal.is_empty() {
             break;
         }
@@ -3034,6 +3177,174 @@ fn collect_signatures(filename: &str, program: &ast::Program) -> Result<HashMap<
         }
     }
     Ok(signatures)
+}
+
+#[derive(Default)]
+struct InlineCallSummary {
+    callees: HashSet<usize>,
+    invoked_parameters: HashSet<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum InlineOperationArgument {
+    Function(InlineFunctionId),
+    Parameter(VariableId),
+}
+
+struct InlineCallSite {
+    callee: usize,
+    operation_arguments: Vec<Option<InlineOperationArgument>>,
+}
+
+fn collect_inline_call_facts(
+    statements: &[Statement],
+    parameter_indices: &HashMap<VariableId, usize>,
+    summary: &mut InlineCallSummary,
+    call_sites: &mut Vec<InlineCallSite>,
+) {
+    for statement in statements {
+        if let StatementKindIr::Call(_, call) = &statement.kind {
+            match call.target {
+                CallTarget::InlineFunction(callee) => {
+                    summary.callees.insert(callee.index());
+                    call_sites.push(InlineCallSite {
+                        callee: callee.index(),
+                        operation_arguments: call
+                            .arguments
+                            .iter()
+                            .map(|argument| match argument.kind {
+                                ValueKind::Operation(OperationValue::InlineFunction(function)) => {
+                                    Some(InlineOperationArgument::Function(function))
+                                }
+                                ValueKind::Variable(variable) if parameter_indices.contains_key(&variable) => {
+                                    Some(InlineOperationArgument::Parameter(variable))
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    });
+                }
+                CallTarget::OperationParameter(parameter) => {
+                    if let Some(index) = parameter_indices.get(&parameter) {
+                        summary.invoked_parameters.insert(*index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        statement
+            .kind
+            .for_each_nested_body(|body| collect_inline_call_facts(body, parameter_indices, summary, call_sites));
+    }
+}
+
+fn find_inline_cycle(
+    function: usize,
+    graph: &[Vec<usize>],
+    states: &mut [u8],
+    stack: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    states[function] = 1;
+    stack.push(function);
+    for &callee in &graph[function] {
+        if states[callee] == 0 {
+            if let Some(cycle) = find_inline_cycle(callee, graph, states, stack) {
+                return Some(cycle);
+            }
+        } else if states[callee] == 1 {
+            let start = stack.iter().position(|candidate| *candidate == callee).unwrap();
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(callee);
+            return Some(cycle);
+        }
+    }
+    stack.pop();
+    states[function] = 2;
+    None
+}
+
+fn validate_inline_call_graph(filename: &str, inline_functions: &[InlineFunction]) -> Result<(), Diagnostic> {
+    let parameter_indices = inline_functions
+        .iter()
+        .map(|function| {
+            function
+                .parameters
+                .iter()
+                .enumerate()
+                .map(|(index, parameter)| (*parameter, index))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let mut summaries = (0..inline_functions.len())
+        .map(|_| InlineCallSummary::default())
+        .collect::<Vec<_>>();
+    let mut call_sites = (0..inline_functions.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (function, inline_function) in inline_functions.iter().enumerate() {
+        collect_inline_call_facts(
+            &inline_function.body.statements,
+            &parameter_indices[function],
+            &mut summaries[function],
+            &mut call_sites[function],
+        );
+    }
+
+    let mut invoked_parameters = Vec::new();
+    loop {
+        let mut changed = false;
+        for (function, function_calls) in call_sites.iter().enumerate() {
+            for call in function_calls {
+                invoked_parameters.clear();
+                invoked_parameters.extend(summaries[call.callee].invoked_parameters.iter().copied());
+                for &parameter in &invoked_parameters {
+                    let Some(Some(argument)) = call.operation_arguments.get(parameter) else {
+                        continue;
+                    };
+                    match argument {
+                        InlineOperationArgument::Function(callee) => {
+                            changed |= summaries[function].callees.insert(callee.index());
+                        }
+                        InlineOperationArgument::Parameter(variable) => {
+                            if let Some(parameter) = parameter_indices[function].get(variable) {
+                                changed |= summaries[function].invoked_parameters.insert(*parameter);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let graph = summaries
+        .into_iter()
+        .map(|summary| summary.callees.into_iter().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut states = vec![0; inline_functions.len()];
+    for function in 0..inline_functions.len() {
+        if states[function] != 0 {
+            continue;
+        }
+        let Some(cycle) = find_inline_cycle(function, &graph, &mut states, &mut Vec::new()) else {
+            continue;
+        };
+        let names = cycle
+            .iter()
+            .map(|function| inline_functions[*function].name.as_str())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let member = cycle[0];
+        return Err(Diagnostic::new(
+            filename,
+            inline_functions[member].span,
+            format!(
+                "recursive inline function cycle involving '{}': {names}",
+                inline_functions[member].name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3048,13 +3359,7 @@ fn check_body(
     layouts: &HashMap<(Type, String), LayoutField>,
     aggregate_strides: &HashMap<Type, layout::LayoutValue>,
 ) -> Result<(Vec<VariableId>, Body), Diagnostic> {
-    let mut checker = Checker::new(
-        filename,
-        signatures.clone(),
-        inline_function_ids.clone(),
-        layouts.clone(),
-        aggregate_strides.clone(),
-    );
+    let mut checker = Checker::new(filename, signatures, inline_function_ids, layouts, aggregate_strides);
     let mut parameter_ids = Vec::new();
     for parameter in parameters {
         parameter_ids.push(checker.declare(
@@ -3074,7 +3379,7 @@ fn check_body(
         bytecode_fields: if parameters_are_bytecode_fields {
             parameter_ids.iter().copied().collect()
         } else {
-            HashSet::new()
+            HashSet::default()
         },
     };
     check_definite_initialization(filename, &body, &parameter_ids, check_outputs)?;
@@ -3090,9 +3395,9 @@ pub(crate) fn check_with_layouts(
     program: &ast::Program,
     layout_fields: &[layout::Field],
 ) -> Result<Program, Diagnostic> {
-    let mut layouts = HashMap::new();
-    let mut aggregate_strides = HashMap::new();
-    let mut pairs = HashMap::new();
+    let mut layouts = HashMap::default();
+    let mut aggregate_strides = HashMap::default();
+    let mut pairs = HashMap::default();
     let mut next_pair_id = 0u32;
     for field in layout_fields {
         let owner = field.owner.clone();
@@ -3108,9 +3413,10 @@ pub(crate) fn check_with_layouts(
             pair
         });
         if let Some(stride) = field.stride
-            && let Some(previous) = aggregate_strides.insert(owner.clone(), stride) {
-                assert_eq!(previous, stride, "conflicting generated strides for {}", field.owner);
-            }
+            && let Some(previous) = aggregate_strides.insert(owner.clone(), stride)
+        {
+            assert_eq!(previous, stride, "conflicting generated strides for {}", field.owner);
+        }
         layouts.insert(
             (owner, field.name.clone()),
             LayoutField {
@@ -3139,7 +3445,7 @@ pub(crate) fn check_with_layouts(
         .collect::<HashMap<_, _>>();
     let mut inline_functions = Vec::new();
     let mut handlers = Vec::new();
-    let mut declaration_names = HashSet::new();
+    let mut declaration_names = HashSet::default();
     for declaration in &program.declarations {
         match declaration {
             ast::Declaration::InlineFunction(declaration) => {
@@ -3186,7 +3492,10 @@ pub(crate) fn check_with_layouts(
                             for (index, value) in return_values.iter().enumerate() {
                                 let name = format!("__return_value_{index}");
                                 ast_body.statements.push(ast::Statement {
-                                    kind: ast::StatementKind::Assign { name, initializer: value.clone() },
+                                    kind: ast::StatementKind::Assign {
+                                        name,
+                                        initializer: value.clone(),
+                                    },
                                     span: declaration.span,
                                 });
                             }
@@ -3226,21 +3535,21 @@ pub(crate) fn check_with_layouts(
                         }
                     }
                 }
-                let (parameters, body) =
-                    check_body(
-                        filename,
-                        &signatures,
-                        &inline_function_ids,
-                        &ast_parameters,
-                        &ast_body,
-                        true,
-                        false,
-                        &layouts,
-                        &aggregate_strides,
-                    )?;
+                let (parameters, body) = check_body(
+                    filename,
+                    &signatures,
+                    &inline_function_ids,
+                    &ast_parameters,
+                    &ast_body,
+                    true,
+                    false,
+                    &layouts,
+                    &aggregate_strides,
+                )?;
                 inline_functions.push(InlineFunction {
                     id: inline_function_ids[&declaration.name],
                     name: declaration.name.clone(),
+                    span: declaration.span,
                     parameters,
                     return_type: declaration.return_type.clone(),
                     body,
@@ -3254,18 +3563,17 @@ pub(crate) fn check_with_layouts(
                         format!("duplicate declaration '{}'", declaration.name),
                     ));
                 }
-                let (parameters, body) =
-                    check_body(
-                        filename,
-                        &signatures,
-                        &inline_function_ids,
-                        &declaration.parameters,
-                        &declaration.body,
-                        false,
-                        true,
-                        &layouts,
-                        &aggregate_strides,
-                    )?;
+                let (parameters, body) = check_body(
+                    filename,
+                    &signatures,
+                    &inline_function_ids,
+                    &declaration.parameters,
+                    &declaration.body,
+                    false,
+                    true,
+                    &layouts,
+                    &aggregate_strides,
+                )?;
                 handlers.push(Handler {
                     name: declaration.name.clone(),
                     parameters,
@@ -3275,12 +3583,19 @@ pub(crate) fn check_with_layouts(
             }
         }
     }
-    Ok(Program { inline_functions, handlers })
+    validate_inline_call_graph(filename, &inline_functions)?;
+    Ok(Program {
+        inline_functions,
+        handlers,
+    })
 }
 
 fn statement_uses_and_defs(statement: &Statement) -> (Vec<VariableId>, Vec<VariableId>) {
     let call_uses_and_defs = |call: &Call| {
-        if call.intrinsic() == Some(Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(BinaryOperation::Xor)))
+        if call.intrinsic()
+            == Some(Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(
+                BinaryOperation::Xor,
+            )))
             && call.arguments.len() == 2
             && call.arguments[0].kind == call.arguments[1].kind
             && let ValueKind::Variable(id) = call.arguments[0].kind
@@ -3294,9 +3609,10 @@ fn statement_uses_and_defs(statement: &Statement) -> (Vec<VariableId>, Vec<Varia
                 uses.extend(value_variable_ids(value));
             }
             if matches!(mode, ParameterMode::Out | ParameterMode::InOut)
-                && let ValueKind::Variable(id) = value.kind {
-                    defs.push(id);
-                }
+                && let ValueKind::Variable(id) = value.kind
+            {
+                defs.push(id);
+            }
         }
         (uses, defs)
     };
@@ -3307,12 +3623,10 @@ fn statement_uses_and_defs(statement: &Statement) -> (Vec<VariableId>, Vec<Varia
             defs.extend(destinations.iter().copied());
             (uses, defs)
         }
-        StatementKindIr::MachineAssign { arguments, .. } => {
-            (direct_value_variables(arguments), Vec::new())
-        }
-        StatementKindIr::ValueRefinement { binding, value, tag, .. } => {
-            (direct_value_variables([value]), vec![*tag, *binding])
-        }
+        StatementKindIr::MachineAssign { arguments, .. } => (direct_value_variables(arguments), Vec::new()),
+        StatementKindIr::ValueRefinement {
+            binding, value, tag, ..
+        } => (direct_value_variables([value]), vec![*tag, *binding]),
         StatementKindIr::ValueMatch {
             destination,
             value,
@@ -3324,7 +3638,9 @@ fn statement_uses_and_defs(statement: &Statement) -> (Vec<VariableId>, Vec<Varia
             normalize_variables(&mut uses);
             (uses, destination.iter().copied().collect())
         }
-        StatementKindIr::ScalarMatch { value, captures, arms, .. } => {
+        StatementKindIr::ScalarMatch {
+            value, captures, arms, ..
+        } => {
             let mut uses = captures.clone();
             uses.extend(direct_value_variables([value]));
             for arm in arms {
@@ -3343,9 +3659,12 @@ fn statement_uses_and_defs(statement: &Statement) -> (Vec<VariableId>, Vec<Varia
         } => {
             let (mut uses, mut definitions) = condition_uses_and_defs(condition);
             if else_body.is_some() {
-                uses.extend(captures.iter().copied().filter(|capture| {
-                    destination.is_some() || !definitions.contains(capture)
-                }));
+                uses.extend(
+                    captures
+                        .iter()
+                        .copied()
+                        .filter(|capture| destination.is_some() || !definitions.contains(capture)),
+                );
                 definitions.extend(destination);
             } else if !terminal {
                 // Conditional definitions are also uses at the join because the
@@ -3421,28 +3740,19 @@ fn value_variable_ids(value: &Value) -> Vec<VariableId> {
 pub(crate) fn condition_uses_and_defs(condition: &Condition) -> (Vec<VariableId>, Vec<VariableId>) {
     match condition {
         Condition::LogicalNot(condition) => condition_uses_and_defs(condition),
-        Condition::ScalarEquality { lhs, rhs, .. } => (
-            direct_value_variables([lhs, rhs]),
-            Vec::new(),
-        ),
-        Condition::ScalarRelational { lhs, rhs, .. } => (
-            direct_value_variables([lhs, rhs]),
-            Vec::new(),
-        ),
-        Condition::BitTest { value, mask, .. } => (
-            direct_value_variables([value, mask]),
-            Vec::new(),
-        ),
-        Condition::ValueTag { value, tag, source_tag, .. } => {
+        Condition::ScalarEquality { lhs, rhs, .. } => (direct_value_variables([lhs, rhs]), Vec::new()),
+        Condition::ScalarRelational { lhs, rhs, .. } => (direct_value_variables([lhs, rhs]), Vec::new()),
+        Condition::BitTest { value, mask, .. } => (direct_value_variables([value, mask]), Vec::new()),
+        Condition::ValueTag {
+            value, tag, source_tag, ..
+        } => {
             let mut uses = direct_value_variables([value]);
             if let Some(source_tag) = source_tag {
                 uses.push(*source_tag);
             }
             (uses, vec![*tag])
         }
-        Condition::ValueBits { value, expected, .. } => {
-            (direct_value_variables([value]), vec![*expected])
-        }
+        Condition::ValueBits { value, expected, .. } => (direct_value_variables([value]), vec![*expected]),
     }
 }
 
@@ -3455,9 +3765,7 @@ pub(super) fn statement_is_terminal(statement: &Statement) -> bool {
             then_body,
             else_body: Some(else_body),
             ..
-        } => {
-            block_is_terminal(then_body) && block_is_terminal(else_body)
-        }
+        } => block_is_terminal(then_body) && block_is_terminal(else_body),
         _ => false,
     }
 }
@@ -3465,12 +3773,7 @@ pub(super) fn statement_is_terminal(statement: &Statement) -> bool {
 pub(super) fn block_is_terminal(body: &[Statement]) -> bool {
     body.iter()
         .rev()
-        .find(|statement| {
-            !matches!(
-                statement.kind,
-                StatementKindIr::Continuation { .. }
-            )
-        })
+        .find(|statement| !matches!(statement.kind, StatementKindIr::Continuation { .. }))
         .is_some_and(statement_is_terminal)
 }
 
@@ -3552,10 +3855,7 @@ handler Read(src: in Operand) {
         let StatementKindIr::Call(_, call) = &program.handlers[0].body.statements[1].kind else {
             panic!("expected inline function call")
         };
-        assert_eq!(
-            call.target,
-            CallTarget::InlineFunction(program.inline_functions[0].id)
-        );
+        assert_eq!(call.target, CallTarget::InlineFunction(program.inline_functions[0].id));
     }
 
     #[test]
@@ -3627,9 +3927,7 @@ handler Invoke() {
                 if id == add.id
         ));
 
-        let StatementKindIr::Call(_, call) =
-            &program.handlers[0].body.statements[0].kind
-        else {
+        let StatementKindIr::Call(_, call) = &program.handlers[0].body.statements[0].kind else {
             panic!("expected interpreter call")
         };
         assert!(matches!(
@@ -3709,16 +4007,17 @@ handler Add(lhs: i32, rhs: i32) {
         )
         .unwrap();
 
-        let StatementKindIr::Call(destinations, call) =
-            &program.handlers[0].body.statements[1].kind
-        else {
+        let StatementKindIr::Call(destinations, call) = &program.handlers[0].body.statements[1].kind else {
             panic!("expected checked add")
         };
         let failure = call.failure.as_ref().expect("expected structured failure");
         assert_eq!(program.handlers[0].body.variables[destinations[0]].ty, Type::I32);
-        assert_eq!(call.intrinsic(), Some(Intrinsic::CheckedInteger(
-            crate::intrinsic::CheckedIntegerOperation::Add,
-        )));
+        assert_eq!(
+            call.intrinsic(),
+            Some(Intrinsic::CheckedInteger(
+                crate::intrinsic::CheckedIntegerOperation::Add,
+            ))
+        );
         assert_eq!(failure.captures, &[0, 2]);
     }
 
@@ -3762,7 +4061,10 @@ handler Check(value: i32) {
 "#,
         )
         .unwrap_err();
-        assert_eq!(unexpected_else.message, "'identity' does not accept an else continuation");
+        assert_eq!(
+            unexpected_else.message,
+            "'identity' does not accept an else continuation"
+        );
     }
 
     rejects!(
@@ -3841,7 +4143,11 @@ inline fn bad(frame: in ExecutionContext) {
         .unwrap();
         let error = check_with_layouts("test.flap", &ast, layouts.fields()).unwrap_err();
 
-        assert!(error.message.contains("cannot write through an in ExecutionContext parameter"));
+        assert!(
+            error
+                .message
+                .contains("cannot write through an in ExecutionContext parameter")
+        );
     }
 
     #[test]
@@ -3857,6 +4163,88 @@ handler Initialize(address: u64) {
     let frame: ExecutionContext = alias(address);
     frame.yield_is_await = false;
     frame.yield_is_await = true;
+    dispatch_next;
+}
+"#,
+        )
+        .unwrap();
+
+        check_with_layouts("test.flap", &ast, layouts.fields()).unwrap();
+    }
+
+    #[test]
+    fn rejects_definitely_null_binding_store_to_nonnull_field() {
+        let layouts =
+            crate::frontend::layout::LayoutDatabase::parse("const SHAPE = 0\nfield Object.shape Shape SHAPE nonnull\n")
+                .unwrap();
+        let ast = parser::parse(
+            "test.flap",
+            r#"
+handler StoreNull(address: u64) {
+    let object: Object = alias(address);
+    let shape: Shape = null;
+    object.shape = shape;
+    dispatch_next;
+}
+"#,
+        )
+        .unwrap();
+        let error = check_with_layouts("test.flap", &ast, layouts.fields()).unwrap_err();
+
+        assert!(
+            error
+                .message
+                .contains("cannot assign null to non-null field 'Object.shape'"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_null_binding_store_after_conditional_assignment() {
+        let layouts =
+            crate::frontend::layout::LayoutDatabase::parse("const SHAPE = 0\nfield Object.shape Shape SHAPE nonnull\n")
+                .unwrap();
+        let ast = parser::parse(
+            "test.flap",
+            r#"
+handler StoreNull(address: u64, flag: u32) {
+    let object: Object = alias(address);
+    let shape: Shape = null;
+    if load(flag) == 0 {
+        shape = object.shape;
+    } else {
+    }
+    object.shape = shape;
+    dispatch_next;
+}
+"#,
+        )
+        .unwrap();
+        let error = check_with_layouts("test.flap", &ast, layouts.fields()).unwrap_err();
+
+        assert!(
+            error
+                .message
+                .contains("cannot assign null to non-null field 'Object.shape'"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn accepts_reassigned_null_binding_store_to_nonnull_field() {
+        let layouts =
+            crate::frontend::layout::LayoutDatabase::parse("const SHAPE = 0\nfield Object.shape Shape SHAPE nonnull\n")
+                .unwrap();
+        let ast = parser::parse(
+            "test.flap",
+            r#"
+handler StoreShape(address: u64) {
+    let object: Object = alias(address);
+    let shape: Shape = null;
+    shape = object.shape;
+    object.shape = shape;
     dispatch_next;
 }
 "#,
@@ -3938,6 +4326,41 @@ handler Box(dst: out Operand, value: bool) {
         rejects_implicit_numeric_promotion,
         "handler Bad(value: u8) { let widened: u64 = value; dispatch_next; }",
         "cannot initialize 'widened' of type u64 with u8"
+    );
+
+    rejects!(
+        rejects_aliasing_integer_literals_to_pointer_types,
+        "handler Bad() { let raw: u64 = 1; let object: Object = alias(raw); dispatch_next; }",
+        "cannot alias integer literal as Object"
+    );
+
+    rejects!(
+        rejects_aliasing_conditionally_assigned_integer_literals_to_pointer_types,
+        r#"
+handler Bad(address: u64, flag: u32) {
+    let raw: u64 = 1;
+    if load(flag) == 0 {
+        raw = address;
+    } else {
+    }
+    let object: Object = alias(raw);
+    dispatch_next;
+}
+"#,
+        "cannot alias integer literal as Object"
+    );
+
+    accepts!(
+        accepts_aliasing_reassigned_integer_variables_to_pointer_types,
+        r#"
+handler Good(address: u64) {
+    let raw: u64 = 1;
+    raw = address;
+    let object: Object = alias(raw);
+    assert_nonzero(object);
+    dispatch_next;
+}
+"#
     );
 
     accepts!(
@@ -4028,6 +4451,22 @@ inline fn terminal(value: out Value, slow: SlowPath) {
     );
 
     accepts!(
+        permits_uninitialized_output_on_terminal_match_paths,
+        r#"
+inline fn terminal(value: out Value, input: Value, slow: SlowPath) {
+    match input {
+        Value<i32>(integer) => {
+            call_slow_path(slow);
+        },
+        _ => {
+            call_slow_path(slow);
+        },
+    }
+}
+"#
+    );
+
+    accepts!(
         treats_goto_handler_as_terminal_in_continuations,
         r#"
 handler Jump(target: BytecodeOffset) {
@@ -4083,6 +4522,51 @@ handler Jump(target: Label) {
     goto finish;
 }
 "#
+    );
+
+    rejects!(
+        rejects_directly_recursive_inline_functions,
+        r#"
+inline fn recurse(value: i32) -> i32 {
+    recurse(value)
+}
+"#,
+        "recursive inline function cycle involving 'recurse'"
+    );
+
+    rejects!(
+        rejects_mutually_recursive_inline_functions,
+        r#"
+inline fn first(value: i32) -> i32 {
+    second(value)
+}
+
+inline fn second(value: i32) -> i32 {
+    first(value)
+}
+"#,
+        "recursive inline function cycle involving"
+    );
+
+    rejects!(
+        rejects_recursion_through_an_operation_parameter,
+        r#"
+inline fn apply(lhs: inout i32, rhs: i32, operation: BinaryOperation<i32>) {
+    operation(lhs, rhs);
+}
+
+inline fn recurse(lhs: inout i32, rhs: i32) {
+    apply(lhs, rhs, recurse);
+}
+
+handler Loop(lhs: i32, rhs: i32) {
+    let value = lhs;
+    recurse(value, rhs);
+    assert_nonzero(value);
+    dispatch_next;
+}
+"#,
+        "recursive inline function cycle involving 'recurse': recurse -> recurse"
     );
 
     #[test]

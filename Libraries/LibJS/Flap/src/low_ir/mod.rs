@@ -6,24 +6,22 @@
 
 //! Target-independent low-level IR before instruction selection.
 
+pub(crate) mod analysis;
 pub(crate) mod cfg;
 pub(crate) mod lowering;
 pub(crate) mod optimize;
 pub(crate) mod preallocate;
 
-use crate::ssa as ir;
 use crate::bytecode::BytecodeFieldId;
-use crate::frontend::layout::{
-    KnownLayoutConstant, LayoutConstant, LayoutConstants,
-};
+use crate::frontend::layout::{KnownLayoutConstant, LayoutConstant, LayoutConstants};
+use crate::hash::HashMap;
 use crate::identity::{ExternalSymbol, HandlerId};
-use crate::types::{InterpreterRegister, RegisterClass};
+use crate::ssa as ir;
+use crate::target::description::{InstructionDescription, Operation, SelectedOpcode};
 use crate::target::registers::PhysicalRegister;
-use crate::target::description::{
-    InstructionDescription, Operation, SelectedOpcode,
-};
+use crate::types::{InterpreterRegister, RegisterClass};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, hash_map::DefaultHasher};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -41,6 +39,16 @@ enum VirtualRegisterOrigin {
 pub(crate) struct VirtualRegisterId {
     function: HandlerId,
     index: u32,
+}
+
+impl VirtualRegisterId {
+    pub(crate) fn function(self) -> HandlerId {
+        self.function
+    }
+
+    pub(crate) fn index(self) -> u32 {
+        self.index
+    }
 }
 
 /// A virtual register and its non-semantic debug name.
@@ -79,6 +87,16 @@ impl VirtualRegister {
         }
     }
 
+    pub(crate) fn ssa(function: HandlerId, index: u32, value: usize, class: RegisterClass) -> Self {
+        Self {
+            id: Some(VirtualRegisterId { function, index }),
+            name: format!("ssa_{value}").into(),
+            class,
+            origin: VirtualRegisterOrigin::Ssa,
+            identity_hash: 0,
+        }
+    }
+
     pub(crate) fn class(&self) -> RegisterClass {
         self.class
     }
@@ -103,9 +121,7 @@ impl PartialEq for VirtualRegister {
     fn eq(&self, other: &Self) -> bool {
         match (self.id, other.id) {
             (Some(lhs), Some(rhs)) => lhs == rhs,
-            (None, None) => {
-                self.name == other.name && self.class == other.class
-            }
+            (None, None) => self.name == other.name && self.class == other.class,
             _ => false,
         }
     }
@@ -123,10 +139,7 @@ impl Ord for VirtualRegister {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self.id, other.id) {
             (Some(lhs), Some(rhs)) => lhs.cmp(&rhs),
-            (None, None) => self
-                .name
-                .cmp(&other.name)
-                .then_with(|| self.class.cmp(&other.class)),
+            (None, None) => self.name.cmp(&other.name).then_with(|| self.class.cmp(&other.class)),
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
         }
@@ -197,16 +210,55 @@ impl fmt::Display for Relocation {
 }
 
 /// A branch target within a machine function.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct Label(String);
+///
+/// Every control-flow pass copies labels around, indexes blocks by them and
+/// compares them, so the name is shared rather than copied and its hash is
+/// taken once, when the label is made.
+#[derive(Debug, Clone)]
+pub(crate) struct Label {
+    name: Arc<str>,
+    hash: u64,
+}
 
 impl Label {
     pub(crate) fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+        let name: Arc<str> = name.into().into();
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        Self {
+            hash: hasher.finish(),
+            name,
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.name
+    }
+}
+
+impl PartialEq for Label {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.name == other.name
+    }
+}
+
+impl Eq for Label {}
+
+impl PartialOrd for Label {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Label {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(&other.name)
+    }
+}
+
+impl Hash for Label {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
     }
 }
 
@@ -224,7 +276,7 @@ impl From<String> for Label {
 
 impl fmt::Display for Label {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.name.fmt(formatter)
     }
 }
 
@@ -237,10 +289,7 @@ impl Deref for Label {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AddressRegister<
-    V = VirtualRegister,
-    I = InterpreterRegister,
-> {
+pub(crate) enum AddressRegister<V = VirtualRegister, I = InterpreterRegister> {
     Virtual(V),
     Interpreter(I),
     Physical(PhysicalRegister),
@@ -291,17 +340,7 @@ pub(crate) enum Operand {
     BytecodeField(BytecodeFieldId),
 }
 
-impl Operand {
-    pub(crate) fn references(&self, register: &VirtualRegister) -> bool {
-        match self {
-            Self::VirtualRegister(candidate) => candidate == register,
-            Self::Address(address) => std::iter::once(&address.base)
-                .chain(&address.index)
-                .any(|candidate| matches!(candidate, AddressRegister::Virtual(candidate) if candidate == register)),
-            _ => false,
-        }
-    }
-}
+impl Operand {}
 
 pub(crate) trait ControlFlowOperand: Clone {
     fn label(&self) -> Option<&Label>;
@@ -311,7 +350,7 @@ pub(crate) trait ControlFlowOperand: Clone {
 
 pub(crate) trait ControlFlowOpcode: Clone + fmt::Debug {
     fn operation(&self) -> Operation;
-    fn description(&self) -> InstructionDescription;
+    fn description(&self) -> &'static InstructionDescription;
     fn replacing_operation(&self, operation: Operation) -> Self;
 }
 
@@ -320,7 +359,7 @@ impl ControlFlowOpcode for Operation {
         *self
     }
 
-    fn description(&self) -> InstructionDescription {
+    fn description(&self) -> &'static InstructionDescription {
         self.description()
     }
 
@@ -334,7 +373,7 @@ impl ControlFlowOpcode for SelectedOpcode {
         self.operation()
     }
 
-    fn description(&self) -> InstructionDescription {
+    fn description(&self) -> &'static InstructionDescription {
         self.description()
     }
 
@@ -394,25 +433,7 @@ macro_rules! emit_instructions {
 
 pub(crate) use emit_instructions;
 
-/// Count appearances of virtual registers in the instruction operand stream.
-pub(crate) fn count_virtual_register_uses<C>(
-    instructions: &[Instruction<Operand, C>],
-) -> HashMap<VirtualRegister, u32> {
-    let mut counts = HashMap::new();
-    for instruction in instructions {
-        for operand in &instruction.operands {
-            visit_virtual_registers(operand, &mut |register| {
-                *counts.entry(register.clone()).or_insert(0) += 1;
-            });
-        }
-    }
-    counts
-}
-
-pub(crate) fn visit_virtual_registers(
-    operand: &Operand,
-    visit: &mut impl FnMut(&VirtualRegister),
-) {
+pub(crate) fn visit_virtual_registers(operand: &Operand, visit: &mut impl FnMut(&VirtualRegister)) {
     match operand {
         Operand::VirtualRegister(register) => visit(register),
         Operand::Address(address) => {
@@ -426,16 +447,11 @@ pub(crate) fn visit_virtual_registers(
     }
 }
 
-fn visit_virtual_registers_mut(
-    operand: &mut Operand,
-    visit: &mut impl FnMut(&mut VirtualRegister),
-) {
+pub(crate) fn visit_virtual_registers_mut(operand: &mut Operand, visit: &mut impl FnMut(&mut VirtualRegister)) {
     match operand {
         Operand::VirtualRegister(register) => visit(register),
         Operand::Address(address) => {
-            for register in std::iter::once(&mut address.base)
-                .chain(address.index.iter_mut())
-            {
+            for register in std::iter::once(&mut address.base).chain(address.index.iter_mut()) {
                 if let AddressRegister::Virtual(register) = register {
                     visit(register);
                 }
@@ -445,38 +461,26 @@ fn visit_virtual_registers_mut(
     }
 }
 
-pub(crate) fn intern_virtual_registers(
-    function: HandlerId,
-    instructions: &mut [Instruction],
-) {
-    for instruction in instructions.iter_mut() {
-        for operand in &mut instruction.operands {
-            visit_virtual_registers_mut(operand, &mut |register| {
-                register.id = None;
-            });
-        }
-    }
-
-    let mut registers = BTreeSet::new();
+pub(crate) fn intern_virtual_registers(function: HandlerId, instructions: &mut [Instruction]) -> Vec<VirtualRegister> {
+    let mut ids = HashMap::default();
+    let mut interned_registers = Vec::new();
     for instruction in instructions.iter() {
         for operand in &instruction.operands {
             visit_virtual_registers(operand, &mut |register| {
-                registers.insert(register.clone());
+                if !ids.contains_key(register) {
+                    let id = VirtualRegisterId {
+                        function,
+                        index: u32::try_from(interned_registers.len())
+                            .expect("one handler cannot contain more than u32::MAX virtual registers"),
+                    };
+                    let mut interned = register.clone();
+                    interned.id = Some(id);
+                    ids.insert(register.clone(), id);
+                    interned_registers.push(interned);
+                }
             });
         }
     }
-    let ids = registers
-        .into_iter()
-        .enumerate()
-        .map(|(index, register)| {
-            let id = VirtualRegisterId {
-                function,
-                index: u32::try_from(index)
-                    .expect("one handler cannot contain more than u32::MAX virtual registers"),
-            };
-            (register, id)
-        })
-        .collect::<HashMap<_, _>>();
 
     for instruction in instructions {
         for operand in &mut instruction.operands {
@@ -485,6 +489,7 @@ pub(crate) fn intern_virtual_registers(
             });
         }
     }
+    interned_registers
 }
 
 #[derive(Debug, Clone)]
@@ -504,8 +509,7 @@ pub(crate) struct RuntimeConstants {
 impl RuntimeConstants {
     pub(crate) fn from_layout(constants: &LayoutConstants) -> Self {
         Self {
-            values: KnownLayoutConstant::ALL
-                .map(|constant| constants.known(constant).map(|value| value.value())),
+            values: KnownLayoutConstant::ALL.map(|constant| constants.known(constant).map(|value| value.value())),
         }
     }
 
@@ -514,9 +518,7 @@ impl RuntimeConstants {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_values(
-        values: impl IntoIterator<Item = (KnownLayoutConstant, i64)>,
-    ) -> Self {
+    pub(crate) fn from_values(values: impl IntoIterator<Item = (KnownLayoutConstant, i64)>) -> Self {
         let mut constants = Self::default();
         for (constant, value) in values {
             constants.values[constant as usize] = Some(value);
@@ -550,15 +552,12 @@ impl Program {
             dispatch_handlers: Vec::new(),
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::description::{
-        IntegerWidth, Operation as MachineOperation,
-    };
+    use crate::target::description::{IntegerWidth, Operation as MachineOperation};
 
     #[test]
     fn interns_virtual_registers_per_handler() {
@@ -577,10 +576,9 @@ mod tests {
             ],
         }];
 
-        intern_virtual_registers(HandlerId::new(3), &mut instructions);
+        let registers = intern_virtual_registers(HandlerId::new(3), &mut instructions);
 
-        let Operand::VirtualRegister(value) = &instructions[0].operands[0]
-        else {
+        let Operand::VirtualRegister(value) = &instructions[0].operands[0] else {
             unreachable!()
         };
         let Operand::Address(address) = &instructions[0].operands[1] else {
@@ -595,13 +593,27 @@ mod tests {
         assert_eq!(value.id(), base.id());
         assert_ne!(value.id(), index.id());
         assert!(value.id().is_some());
+        assert_eq!(registers, [value.clone(), index.clone()]);
+    }
 
-        let original = value.id();
-        intern_virtual_registers(HandlerId::new(3), &mut instructions);
-        let Operand::VirtualRegister(value) = &instructions[0].operands[0]
-        else {
+    #[test]
+    fn compacts_preassigned_virtual_register_ids() {
+        let handler = HandlerId::new(3);
+        let first = VirtualRegister::ssa(handler, 0, 0, RegisterClass::GeneralPurpose);
+        let last = VirtualRegister::ssa(handler, 2, 9, RegisterClass::GeneralPurpose);
+        let mut instructions = vec![Instruction {
+            opcode: MachineOperation::Move(IntegerWidth::U64),
+            operands: vec![Operand::VirtualRegister(first), Operand::VirtualRegister(last)],
+        }];
+
+        let registers = intern_virtual_registers(handler, &mut instructions);
+
+        assert_eq!(registers.len(), 2);
+        assert_eq!(registers[0].id().unwrap().index(), 0);
+        assert_eq!(registers[1].id().unwrap().index(), 1);
+        let Operand::VirtualRegister(last) = &instructions[0].operands[1] else {
             unreachable!()
         };
-        assert_eq!(value.id(), original);
+        assert_eq!(last.id().unwrap().index(), 1);
     }
 }

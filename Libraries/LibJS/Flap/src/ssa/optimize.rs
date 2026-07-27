@@ -6,20 +6,24 @@
 
 //! Target-independent SSA optimizations.
 
-use super::analysis::{ControlFlowGraph, reachable_blocks};
-use super::effects::{EffectDefinition, EffectDomain};
+use super::analysis::{ControlFlowGraph, ValueUses, reachable_blocks};
+use super::effects::{EffectDomain, EffectSet};
 use super::pass::{AnalysisManager, FunctionPass, PassManagerOptions, PassRunner};
 use super::report::FunctionOptimizationReport;
-use super::{BlockId, BlockLayout, Edge, Effects, Function, Instruction, InstructionId, Intrinsic, OperandOperation, Operation, Terminator, ValueDefinition, ValueId, ValueOperation};
-use crate::intrinsic::{OperandLoad, OperandStore};
 #[cfg(test)]
 use super::{BinaryOperation, IntegerBinaryOperation};
+use super::{
+    BlockId, BlockLayout, Edge, Effects, Function, Instruction, InstructionId, Intrinsic, OperandOperation, Operation,
+    Terminator, ValueDefinition, ValueId, ValueOperation,
+};
 use crate::frontend::layout::{LayoutConstants, LayoutValue};
-use crate::types::Type;
-use crate::{CompileError, CompileStage};
+use crate::hash::{HashMap, HashSet};
 #[cfg(test)]
 use crate::identity::ExternalSymbol;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::intrinsic::{OperandLoad, OperandStore};
+use crate::types::Type;
+use crate::{CompileError, CompileStage};
+use std::rc::Rc;
 
 pub(crate) fn resolve_constants(function: &mut Function, constants: &LayoutConstants) {
     let values = function
@@ -41,24 +45,17 @@ pub(crate) fn resolve_constants(function: &mut Function, constants: &LayoutConst
     for value_id in values {
         let value = &mut function.values[value_id.0];
         let constant = match &value.definition {
-            ValueDefinition::Constant(
-                super::ir::Constant::KnownLayout(known),
-            ) => constants.known(*known),
-            ValueDefinition::Constant(
-                super::ir::Constant::LayoutValue(
-                    LayoutValue::Constant(constant),
-                ),
-            ) => Some(*constant),
-            ValueDefinition::Constant(
-                super::ir::Constant::Symbol(name),
-            ) => constants.get(name),
+            ValueDefinition::Constant(super::ir::Constant::KnownLayout(known)) => constants.known(*known),
+            ValueDefinition::Constant(super::ir::Constant::LayoutValue(LayoutValue::Constant(constant))) => {
+                Some(*constant)
+            }
+            ValueDefinition::Constant(super::ir::Constant::Symbol(name)) => constants.get(name),
             _ => None,
         };
         let Some(constant) = constant else {
             continue;
         };
-        value.definition =
-            ValueDefinition::Constant(super::ir::Constant::Integer(constant.value()));
+        value.definition = ValueDefinition::Constant(super::ir::Constant::Integer(constant.value()));
     }
 }
 
@@ -67,61 +64,39 @@ pub(crate) fn resolve_layout_constants(
     constants: &LayoutConstants,
 ) -> Result<(), CompileError> {
     for value in &mut function.values {
-        if let ValueDefinition::Constant(
-            super::ir::Constant::KnownLayout(known),
-        ) = value.definition
-        {
-            let constant = constants
-                .known(known)
-                .ok_or_else(|| {
-                    CompileError::new(
-                        CompileStage::Ssa,
-                        Some(&function.name),
-                        format!("unknown constant '{}'", known.name()),
-                    )
-                })?;
-            value.definition = ValueDefinition::Constant(
-                super::ir::Constant::Layout(constant),
-            );
-            continue;
-        }
-        if let ValueDefinition::Constant(
-            super::ir::Constant::LayoutValue(layout_value),
-        ) = value.definition
-        {
-            value.definition = ValueDefinition::Constant(
-                match layout_value {
-                    LayoutValue::Immediate(value) => {
-                        super::ir::Constant::Integer(value)
-                    }
-                    LayoutValue::Constant(constant) => {
-                        super::ir::Constant::Layout(constant)
-                    }
-                },
-            );
-            continue;
-        }
-        let ValueDefinition::Constant(super::ir::Constant::Symbol(name)) =
-            &value.definition
-        else {
-            continue;
-        };
-        if let Ok(integer) = name.parse() {
-            value.definition =
-                ValueDefinition::Constant(super::ir::Constant::Integer(integer));
-            continue;
-        }
-        let constant = constants
-            .get(name)
-            .ok_or_else(|| {
+        if let ValueDefinition::Constant(super::ir::Constant::KnownLayout(known)) = value.definition {
+            let constant = constants.known(known).ok_or_else(|| {
                 CompileError::new(
                     CompileStage::Ssa,
                     Some(&function.name),
-                    format!("unknown constant '{name}'"),
+                    format!("unknown constant '{}'", known.name()),
                 )
             })?;
-        value.definition =
-            ValueDefinition::Constant(super::ir::Constant::Layout(constant));
+            value.definition = ValueDefinition::Constant(super::ir::Constant::Layout(constant));
+            continue;
+        }
+        if let ValueDefinition::Constant(super::ir::Constant::LayoutValue(layout_value)) = value.definition {
+            value.definition = ValueDefinition::Constant(match layout_value {
+                LayoutValue::Immediate(value) => super::ir::Constant::Integer(value),
+                LayoutValue::Constant(constant) => super::ir::Constant::Layout(constant),
+            });
+            continue;
+        }
+        let ValueDefinition::Constant(super::ir::Constant::Symbol(name)) = &value.definition else {
+            continue;
+        };
+        if let Ok(integer) = name.parse() {
+            value.definition = ValueDefinition::Constant(super::ir::Constant::Integer(integer));
+            continue;
+        }
+        let constant = constants.get(name).ok_or_else(|| {
+            CompileError::new(
+                CompileStage::Ssa,
+                Some(&function.name),
+                format!("unknown constant '{name}'"),
+            )
+        })?;
+        value.definition = ValueDefinition::Constant(super::ir::Constant::Layout(constant));
     }
     Ok(())
 }
@@ -132,8 +107,8 @@ struct Expression {
     inputs: Vec<ValueId>,
     result_types: Vec<Type>,
     effects: Effects,
-    memory_dependencies: BTreeSet<EffectDefinition>,
-    machine_state_dependencies: BTreeSet<EffectDefinition>,
+    memory_dependencies: EffectSet,
+    machine_state_dependencies: EffectSet,
 }
 
 pub(crate) fn optimize_function(function: &mut Function) {
@@ -148,7 +123,7 @@ pub(crate) fn optimize_function_with_report(
 }
 
 pub(crate) fn fuse_operand_accesses(function: &mut Function) {
-    let mut eliminated = HashSet::new();
+    let mut eliminated = HashSet::default();
     for block in &function.blocks {
         for pair in block.instructions.windows(2) {
             let [first_id, second_id] = pair else { unreachable!() };
@@ -161,9 +136,7 @@ pub(crate) fn fuse_operand_accesses(function: &mut Function) {
             let second = &function.instructions[second_id.0];
             let (operation, inputs, results) = if matches!(
                 second.operation,
-                Operation::Intrinsic(Intrinsic::Operand(
-                    OperandOperation::Store(OperandStore::Field),
-                ))
+                Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Store(OperandStore::Field),))
             ) && let [destination, stored] = second.inputs.as_slice()
                 && second.results.is_empty()
                 && *stored == result
@@ -178,10 +151,18 @@ pub(crate) fn fuse_operand_accesses(function: &mut Function) {
             };
             let first = &mut function.instructions[first_id.0];
             first.operation = Operation::Intrinsic(Intrinsic::Operand(operation));
-            first.inputs = inputs;
-            first.results = results;
-            let memory = if operation == OperandOperation::Copy { super::MemoryEffect::ReadWrite } else { super::MemoryEffect::Read };
-            first.effects = Effects { memory, ..Effects::PURE };
+            first.inputs = inputs.into();
+            first.results = results.into();
+            let memory = if operation == OperandOperation::Copy {
+                super::MemoryEffect::ReadWrite
+            } else {
+                super::MemoryEffect::Read
+            };
+            first.base_effects = Effects {
+                memory,
+                ..Effects::PURE
+            };
+            first.effects = first.base_effects;
             if operation == OperandOperation::Copy {
                 function.values[result.0].definition = ValueDefinition::Dead;
             }
@@ -195,21 +176,20 @@ pub(crate) fn fuse_operand_accesses(function: &mut Function) {
 }
 
 fn operand_field_load(instruction: &Instruction) -> Option<(ValueId, ValueId)> {
-    match (&instruction.operation, instruction.inputs.as_slice(), instruction.results.as_slice()) {
-        (Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field))), [input], [result]) => Some((*input, *result)),
+    match (
+        &instruction.operation,
+        instruction.inputs.as_slice(),
+        instruction.results.as_slice(),
+    ) {
+        (Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field))), [input], [result]) => {
+            Some((*input, *result))
+        }
         _ => None,
     }
 }
 
 fn recompute_effects(function: &mut Function) {
-    for index in 0..function.instructions.len() {
-        let instruction = &function.instructions[index];
-        if matches!(instruction.operation, Operation::Intrinsic(Intrinsic::Operand(OperandOperation::LoadPair | OperandOperation::Copy))) {
-            continue;
-        }
-        let effects = function.effects_for_operation(&instruction.operation, &instruction.inputs);
-        function.instructions[index].effects = effects;
-    }
+    function.recompute_machine_state_dependencies();
 }
 
 fn binary_operand_pair(function: &Function, lhs: ValueId, rhs: ValueId) -> bool {
@@ -238,13 +218,14 @@ fn run_optimization_pipeline(
             }
         };
     }
+    run_pass!("merge-straight-line-blocks", merge_straight_line_blocks_pass);
     run_pass!("sparse-conditional-constant-propagation", super::sccp::run);
 
     let mut iterations = Vec::new();
     let mut converged = false;
     for _ in 1..=2 {
         let mut passes = Vec::new();
-        let mut changed = false;
+        let mut feedback_changed = false;
         for (name, pass) in [
             (
                 "eliminate-trivial-block-parameters",
@@ -253,7 +234,9 @@ fn run_optimization_pipeline(
             ("resolve-block-references", resolve_block_references),
         ] {
             let (pass_changed, report) = runner.run(function, name, pass);
-            changed |= pass_changed;
+            if name == "resolve-block-references" {
+                feedback_changed = pass_changed;
+            }
             if let Some(report) = report {
                 passes.push(report);
             }
@@ -261,7 +244,10 @@ fn run_optimization_pipeline(
         if options.is_some() {
             iterations.push(passes);
         }
-        if !changed {
+        // Parameter elimination reaches its own fixed point. Only resolving
+        // an indirect block reference can expose new work for another outer
+        // iteration.
+        if !feedback_changed {
             converged = true;
             break;
         }
@@ -297,10 +283,8 @@ fn resolve_block_references(function: &mut Function, _: &mut AnalysisManager) ->
         let Operation::BlockReference(target) = instruction.operation else {
             continue;
         };
-        function.blocks[block_index].terminator = Some(Terminator::jump_with_arguments(
-            target,
-            instruction.inputs.clone(),
-        ));
+        function.blocks[block_index].terminator =
+            Some(Terminator::jump_with_arguments(target, instruction.inputs.to_vec()));
         changed = true;
     }
     changed
@@ -318,19 +302,38 @@ pub(crate) fn eliminate_trivial_block_parameters(function: &mut Function) {
 fn eliminate_trivial_block_parameters_pass(function: &mut Function, _: &mut AnalysisManager) -> bool {
     let mut changed = false;
     loop {
-        let mut replacements = HashMap::new();
+        // Which edges arrive at a block does not change while the round runs,
+        // so it is found once. Rediscovering it by scanning every other block
+        // per parameter is quadratic.
+        let mut incoming_edges = vec![Vec::new(); function.blocks.len()];
         for (block_index, block) in function.blocks.iter().enumerate() {
-            let block_id = BlockId(block_index);
+            let terminator = block.terminator.as_ref().unwrap();
+            for index in 0..terminator.successor_count() {
+                incoming_edges[terminator.successor(index).block.0].push((block_index, index));
+            }
+        }
+
+        let mut replacements = HashMap::default();
+        for (block_index, block) in function.blocks.iter().enumerate() {
             for (parameter_index, parameter) in block.parameters.iter().enumerate() {
-                let incoming = function
-                    .blocks
-                    .iter()
-                    .flat_map(|predecessor| predecessor.terminator.as_ref().unwrap().successors())
-                    .filter(|edge| edge.block == block_id)
-                    .map(|edge| edge.arguments[parameter_index])
-                    .filter(|argument| argument != parameter)
-                    .collect::<Vec<_>>();
-                let Some(replacement) = incoming.first().copied() else {
+                let mut replacement = None;
+                let mut uniform = true;
+                for (predecessor, edge_index) in &incoming_edges[block_index] {
+                    let edge = function.blocks[*predecessor]
+                        .terminator
+                        .as_ref()
+                        .unwrap()
+                        .successor(*edge_index);
+                    let argument = edge.arguments[parameter_index];
+                    if argument == *parameter {
+                        continue;
+                    }
+                    match replacement {
+                        None => replacement = Some(argument),
+                        Some(first) => uniform &= argument == first,
+                    }
+                }
+                let Some(replacement) = replacement else {
                     continue;
                 };
                 if matches!(
@@ -339,7 +342,7 @@ fn eliminate_trivial_block_parameters_pass(function: &mut Function, _: &mut Anal
                 ) {
                     continue;
                 }
-                if incoming.iter().all(|incoming| *incoming == replacement) {
+                if uniform {
                     replacements.insert(*parameter, replacement);
                 }
             }
@@ -348,7 +351,7 @@ fn eliminate_trivial_block_parameters_pass(function: &mut Function, _: &mut Anal
         let candidates = replacements.clone();
         replacements.retain(|parameter, _| {
             let mut value = *parameter;
-            let mut visited = HashSet::new();
+            let mut visited = HashSet::default();
             while let Some(replacement) = candidates.get(&value) {
                 if !visited.insert(value) {
                     return false;
@@ -474,10 +477,12 @@ pub(super) fn eliminate_unreachable_blocks(function: &mut Function) -> bool {
     }
 
     for instruction in &mut function.instructions {
-        let Operation::BlockReference(target) = &mut instruction.operation else {
-            continue;
-        };
-        *target = block_map[target.0].expect("reachable block reference cannot target an unreachable block");
+        match &mut instruction.operation {
+            Operation::BlockReference(target) | Operation::Guard { failure: target } => {
+                *target = block_map[target.0].expect("a reachable block cannot name an unreachable one");
+            }
+            _ => continue,
+        }
     }
 
     function.entry = block_map[function.entry.0].expect("the entry block is always reachable");
@@ -485,20 +490,158 @@ pub(super) fn eliminate_unreachable_blocks(function: &mut Function) -> bool {
     true
 }
 
+/// Merge a block into the only block that jumps to it.
+///
+/// Large generated functions can contain thousands of blocks holding two or
+/// three instructions each. Many are entered from exactly one place that
+/// goes nowhere else: the two are one straight line spelled as two blocks, and
+/// every later phase pays for the split with a terminator, a label in the
+/// machine listing and a row in every block-indexed analysis.
+fn merge_straight_line_blocks_pass(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
+    // A block named as a value is jumped to indirectly, and a guard can leave
+    // from the middle of a block. Neither target can be folded into a
+    // terminator predecessor without invalidating that reference.
+    let mut unmergeable = vec![false; function.blocks.len()];
+    for instruction in &function.instructions {
+        if let Operation::BlockReference(target) | Operation::Guard { failure: target } = instruction.operation {
+            unmergeable[target.0] = true;
+        }
+    }
+    let cfg = analyses.cfg(function);
+    let mut single_predecessor = (0..function.blocks.len())
+        .map(|index| {
+            let predecessors = cfg.predecessors(BlockId(index));
+            (predecessors.len() == 1).then(|| predecessors[0])
+        })
+        .collect::<Vec<_>>();
+
+    let mut merged_into = vec![None; function.blocks.len()];
+    let mut replacements = HashMap::default();
+    for index in 0..function.blocks.len() {
+        // Follow the chain from a block nothing has merged away, so a run of
+        // straight-line blocks collapses in one visit.
+        if merged_into[index].is_some() {
+            continue;
+        }
+        let head = BlockId(index);
+        while let Some(next) = mergeable_successor(function, head, &single_predecessor, &unmergeable) {
+            let edge = match function.blocks[head.0].terminator.take() {
+                Some(Terminator::Jump(edge)) => edge,
+                _ => unreachable!("only a jump names a mergeable successor"),
+            };
+            let absorbed_parameters = std::mem::take(&mut function.blocks[next.0].parameters);
+            let absorbed_instructions = std::mem::take(&mut function.blocks[next.0].instructions);
+            let absorbed_terminator = function.blocks[next.0].terminator.take();
+            if let Some(Terminator::Jump(edge)) = &absorbed_terminator
+                && single_predecessor[edge.block.0] == Some(next)
+            {
+                single_predecessor[edge.block.0] = Some(head);
+            }
+            for (parameter, argument) in absorbed_parameters.iter().zip(&edge.arguments) {
+                replacements.insert(*parameter, *argument);
+                function.values[parameter.0].definition = ValueDefinition::Dead;
+            }
+            let block = &mut function.blocks[head.0];
+            block.instructions.extend(absorbed_instructions);
+            block.terminator = absorbed_terminator;
+            merged_into[next.0] = Some(head);
+        }
+    }
+
+    if replacements.is_empty() && merged_into.iter().all(Option::is_none) {
+        return false;
+    }
+    analyses.report(
+        super::report::OptimizationRemarkKind::Applied,
+        "block-merging",
+        merged_into.iter().filter(|merged| merged.is_some()).count() as u64,
+        "folded a block into the only block that jumps to it",
+    );
+
+    // A parameter may stand for another parameter that is itself being folded
+    // away, so the substitution is followed to what it finally names.
+    let direct = replacements.clone();
+    for value in replacements.values_mut() {
+        let mut seen = HashSet::default();
+        while let Some(next) = direct.get(value) {
+            if !seen.insert(*value) {
+                break;
+            }
+            *value = *next;
+        }
+    }
+    rewrite_function_uses(function, &replacements);
+
+    let mut block_map = vec![None; function.blocks.len()];
+    let mut blocks = Vec::new();
+    for (old_index, block) in std::mem::take(&mut function.blocks).into_iter().enumerate() {
+        if merged_into[old_index].is_some() {
+            continue;
+        }
+        block_map[old_index] = Some(BlockId(blocks.len()));
+        blocks.push(block);
+    }
+    for (block_index, block) in blocks.iter_mut().enumerate() {
+        let block_id = BlockId(block_index);
+        for (parameter_index, parameter) in block.parameters.iter().enumerate() {
+            function.values[parameter.0].definition = ValueDefinition::BlockParameter {
+                block: block_id,
+                index: parameter_index,
+            };
+        }
+        let terminator = block.terminator.as_mut().expect("a surviving block keeps a terminator");
+        if let Terminator::CheckedOperation { results, .. } = terminator {
+            for (result_index, result) in results.iter().enumerate() {
+                function.values[result.0].definition = ValueDefinition::TerminatorResult {
+                    block: block_id,
+                    index: result_index,
+                };
+            }
+        }
+        for edge in terminator_edges_mut(terminator) {
+            edge.block = block_map[edge.block.0].expect("a merged block is never a branch target");
+        }
+    }
+    for instruction in &mut function.instructions {
+        if let Operation::BlockReference(target) | Operation::Guard { failure: target } = &mut instruction.operation {
+            *target = block_map[target.0].expect("a merged block is never named by another block");
+        }
+    }
+    function.entry = block_map[function.entry.0].expect("the entry block is never merged away");
+    function.blocks = blocks;
+    rebuild_instruction_arena(function, &HashSet::default(), InstructionOrder::ByBlock);
+    true
+}
+
+/// The block `head` can absorb, if there is one.
+fn mergeable_successor(
+    function: &Function,
+    head: BlockId,
+    single_predecessor: &[Option<BlockId>],
+    unmergeable: &[bool],
+) -> Option<BlockId> {
+    let Some(Terminator::Jump(edge)) = &function.blocks[head.0].terminator else {
+        return None;
+    };
+    let next = edge.block;
+    if next == head || next == function.entry || unmergeable[next.0] || single_predecessor[next.0] != Some(head) {
+        return None;
+    }
+    let (head_block, next_block) = (&function.blocks[head.0], &function.blocks[next.0]);
+    if next_block.layout != head_block.layout {
+        return None;
+    }
+    Some(next)
+}
+
 fn terminator_edges_mut(terminator: &mut Terminator) -> Vec<&mut Edge> {
     match terminator {
         Terminator::Jump(edge) => vec![edge],
         Terminator::Branch {
-            then_edge,
-            else_edge,
-            ..
+            then_edge, else_edge, ..
         } => vec![then_edge, else_edge],
-        Terminator::Switch { cases, default, .. } => {
-            cases.iter_mut().map(|(_, edge)| edge).chain([default]).collect()
-        }
-        Terminator::CheckedOperation {
-            success, failure, ..
-        } => vec![success, failure],
+        Terminator::Switch { cases, default, .. } => cases.iter_mut().map(|(_, edge)| edge).chain([default]).collect(),
+        Terminator::CheckedOperation { success, failure, .. } => vec![success, failure],
         Terminator::IndirectJump { .. } | Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
     }
 }
@@ -512,25 +655,54 @@ pub(crate) fn eliminate_common_subexpressions(function: &mut Function) {
     );
 }
 
-fn eliminate_common_subexpressions_pass(
-    function: &mut Function,
-    analyses: &mut AnalysisManager,
-) -> bool {
-    let mut replacements = HashMap::new();
-    let mut eliminated = HashSet::new();
+fn eliminate_common_subexpressions_pass(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
+    let mut replacements = HashMap::default();
+    let mut eliminated = HashSet::default();
     let analyses = analyses.get(function);
     let dominators = analyses.dominators;
-    let mut worklist = vec![(function.entry, HashMap::<Expression, Vec<ValueId>>::new())];
-    while let Some((block, mut available)) = worklist.pop() {
-        for instruction_id in function.blocks[block.0].instructions.clone() {
+    let guards = analyses.guards;
+    // Availability is scoped to the dominator subtree being walked. Copying the
+    // whole table for each child costs a clone of every expression in it per
+    // block, so the table is shared and each block records what it has to put
+    // back on the way out.
+    let mut available = HashMap::<Rc<Expression>, Vec<ValueId>>::default();
+    let mut undo = Vec::<(Rc<Expression>, Option<Vec<ValueId>>)>::new();
+    let mut worklist = vec![DominatorStep::Enter(function.entry)];
+    while let Some(step) = worklist.pop() {
+        let block = match step {
+            DominatorStep::Leave(mark) => {
+                while undo.len() > mark {
+                    let (expression, previous) = undo.pop().expect("undo log is not empty above its mark");
+                    match previous {
+                        Some(results) => available.insert(expression, results),
+                        None => available.remove(&expression),
+                    };
+                }
+                continue;
+            }
+            DominatorStep::Enter(block) => block,
+        };
+        worklist.push(DominatorStep::Leave(undo.len()));
+        // Everything published past a guard is unavailable wherever the guard's
+        // exit leads, since taking the exit skipped it.
+        let mut guard_mark = None;
+        for position in 0..function.blocks[block.0].instructions.len() {
+            let instruction_id = function.blocks[block.0].instructions[position];
             let instruction = &mut function.instructions[instruction_id.0];
+            if instruction.operation.guard_failure().is_some() && guard_mark.is_none() {
+                guard_mark = Some(undo.len());
+            }
             rewrite_values(&mut instruction.inputs, &replacements);
-            // The current allocator cannot preserve virtual registers across
+            // Allocation only preserves simple rematerializable values across
             // calls, and sharing across a trapping check increases pressure on
-            // paths that may exit. Keep cheap expressions rematerializable on
-            // each side of those boundaries.
+            // paths that may exit. Keep other cheap expressions rematerializable
+            // on each side of those boundaries.
             if instruction.effects.may_call || instruction.effects.may_trap {
-                available.clear();
+                undo.extend(
+                    available
+                        .drain()
+                        .map(|(expression, results)| (expression, Some(results))),
+                );
                 continue;
             }
             if !instruction.effects.can_be_eliminated()
@@ -548,6 +720,20 @@ fn eliminate_common_subexpressions_pass(
             {
                 continue;
             }
+            // A computation with nothing but constants for inputs is cheaper to
+            // repeat than to keep, and keeping it is actively harmful: sharing
+            // one between distant uses stretches a live range across everything
+            // in between, including calls, which no allocatable register
+            // survives. Availability is cleared at a call, but only along the
+            // dominator path the walk takes, so a call on any other path
+            // between the two uses goes unnoticed.
+            if instruction
+                .inputs
+                .iter()
+                .all(|input| matches!(function.values[input.0].definition, ValueDefinition::Constant(_)))
+            {
+                continue;
+            }
             let effect_dependencies = |domain| {
                 analyses
                     .effects
@@ -558,7 +744,7 @@ fn eliminate_common_subexpressions_pass(
             };
             let expression = Expression {
                 operation: instruction.operation.clone(),
-                inputs: instruction.inputs.clone(),
+                inputs: instruction.inputs.to_vec(),
                 result_types: instruction
                     .results
                     .iter()
@@ -579,11 +765,34 @@ fn eliminate_common_subexpressions_pass(
                 }
                 eliminated.insert(instruction_id);
             } else {
-                available.insert(expression, instruction.results.clone());
+                let expression = Rc::new(expression);
+                undo.push((Rc::clone(&expression), None));
+                available.insert(expression, instruction.results.to_vec());
             }
         }
-        for child in dominators.children(block).iter().rev() {
-            worklist.push((*child, available.clone()));
+        let children = dominators.children(block);
+        let Some(guard_mark) = guard_mark else {
+            for child in children.iter().rev() {
+                worklist.push(DominatorStep::Enter(*child));
+            }
+            continue;
+        };
+        // Rolling back is one-way, so the children that keep the block's whole
+        // table run first and the ones an exit can reach run after the undo.
+        for child in children
+            .iter()
+            .rev()
+            .filter(|child| guards.is_reachable_from_exit(**child))
+        {
+            worklist.push(DominatorStep::Enter(*child));
+        }
+        worklist.push(DominatorStep::Leave(guard_mark));
+        for child in children
+            .iter()
+            .rev()
+            .filter(|child| !guards.is_reachable_from_exit(**child))
+        {
+            worklist.push(DominatorStep::Enter(*child));
         }
     }
 
@@ -594,6 +803,14 @@ fn eliminate_common_subexpressions_pass(
     rewrite_function_uses(function, &replacements);
     rebuild_instruction_arena(function, &eliminated, InstructionOrder::ByBlock);
     true
+}
+
+/// A step of the dominator-tree walk: either a block to process or the point
+/// at which everything that block made available goes out of scope.
+#[derive(Debug, Clone, Copy)]
+enum DominatorStep {
+    Enter(BlockId),
+    Leave(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -607,13 +824,11 @@ pub(crate) fn schedule_global_code_motion(function: &mut Function) {
     run_single_pass(function, "global-code-motion", schedule_global_code_motion_pass);
 }
 
-fn schedule_global_code_motion_pass(
-    function: &mut Function,
-    analyses: &mut AnalysisManager,
-) -> bool {
-    let analyses = analyses.get(function);
+fn schedule_global_code_motion_pass(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
+    let analyses = analyses.placement(function);
     let dominators = &analyses.dominators;
     let instruction_layout = &analyses.instruction_layout;
+    let guards = analyses.guards;
     let mut loop_depths = vec![0usize; function.blocks.len()];
     for natural_loop in analyses.loops {
         for block in &natural_loop.blocks {
@@ -621,14 +836,26 @@ fn schedule_global_code_motion_pass(
         }
     }
 
-    let movable = function
-        .instructions
-        .iter()
-        .map(instruction_is_globally_movable)
-        .collect::<Vec<_>>();
     let uses = collect_instruction_uses(function);
     let original_placements = (0..function.instructions.len())
         .map(|index| instruction_layout.block(InstructionId(index)))
+        .collect::<Vec<_>>();
+    // A value another block reads along a guard's exit stays where the guard
+    // already passes it. Sinking it towards a use would put it after an exit
+    // that reads it, and forcing it above the guard instead is no better: what
+    // it is computed from can be something that cannot move at all.
+    let movable = (0..function.instructions.len())
+        .map(|index| {
+            instruction_is_globally_movable(&function.instructions[index])
+                && !escapes_through_a_guard(
+                    function,
+                    InstructionId(index),
+                    original_placements[index],
+                    &uses,
+                    &original_placements,
+                    guards,
+                )
+        })
         .collect::<Vec<_>>();
     let mut placements = original_placements.clone();
 
@@ -658,13 +885,7 @@ fn schedule_global_code_motion_pass(
             if !dominators.dominates(source, latest) {
                 continue;
             }
-            let placement = cheapest_motion_block(
-                function,
-                source,
-                latest,
-                dominators,
-                &loop_depths,
-            );
+            let placement = cheapest_motion_block(function, source, latest, dominators, &loop_depths);
             if placements[instruction.0] != placement {
                 placements[instruction.0] = placement;
                 changed = true;
@@ -696,7 +917,7 @@ fn schedule_global_code_motion_pass(
     let mut schedules = vec![Vec::new(); function.blocks.len()];
     for block_index in 0..function.blocks.len() {
         let block = BlockId(block_index);
-        let mut emitted = HashSet::new();
+        let mut emitted = HashSet::default();
         for instruction in &assigned[block_index] {
             if movable[instruction.0] {
                 continue;
@@ -757,6 +978,31 @@ fn schedule_global_code_motion_pass(
     true
 }
 
+/// Whether another block reads this instruction's result along a guard's exit.
+fn escapes_through_a_guard(
+    function: &Function,
+    instruction: InstructionId,
+    block: BlockId,
+    uses: &[Vec<InstructionUse>],
+    placements: &[BlockId],
+    guards: &super::analysis::GuardExits,
+) -> bool {
+    // Nothing leaves a block that has no guard before its terminator, so
+    // everything it defines reaches wherever it dominates.
+    if !guards.has_guard(block) {
+        return false;
+    }
+    function.instructions[instruction.0]
+        .results
+        .iter()
+        .flat_map(|result| uses[result.0].iter())
+        .map(|use_site| match use_site {
+            InstructionUse::Instruction(user) => placements[user.0],
+            InstructionUse::Terminator(user) => *user,
+        })
+        .any(|user| user != block && guards.is_reachable_from_exit(user))
+}
+
 fn instruction_is_globally_movable(instruction: &super::Instruction) -> bool {
     instruction.effects == Effects::PURE
         && !instruction.results.is_empty()
@@ -765,15 +1011,27 @@ fn instruction_is_globally_movable(instruction: &super::Instruction) -> bool {
             Operation::Intrinsic(Intrinsic::Address(_)) => true,
             Operation::FieldAccess(_) => true,
             Operation::Intrinsic(Intrinsic::LowLevel(operation)) => *operation != super::LowLevelOperation::Move,
-            Operation::Intrinsic(Intrinsic::Classification(_)) | Operation::Intrinsic(Intrinsic::FloatingPoint(_)) | Operation::Intrinsic(Intrinsic::IntegerBinary(_)) | Operation::Intrinsic(Intrinsic::IntegerComparison(_))
+            Operation::Intrinsic(Intrinsic::Classification(_))
+            | Operation::Intrinsic(Intrinsic::FloatingPoint(_))
+            | Operation::Intrinsic(Intrinsic::IntegerBinary(_))
+            | Operation::Intrinsic(Intrinsic::IntegerComparison(_))
             | Operation::Intrinsic(Intrinsic::Operand(_)) => true,
             Operation::Intrinsic(Intrinsic::Value(operation)) => {
-                *operation != ValueOperation::Reuse
-                    && !operation.is_rematerialized()
+                *operation != ValueOperation::Reuse && !operation.is_rematerialized()
             }
-            Operation::Intrinsic(Intrinsic::Aggregate(_)) | Operation::Intrinsic(Intrinsic::Assertion(_)) | Operation::Intrinsic(Intrinsic::Branch(_)) | Operation::Intrinsic(Intrinsic::Bytecode(_)) | Operation::Intrinsic(Intrinsic::Call(_)) | Operation::Intrinsic(Intrinsic::CheckedInteger(_)) | Operation::Intrinsic(Intrinsic::Control(_)) | Operation::Intrinsic(Intrinsic::Memory(_)) | Operation::InlineCall(_) | Operation::Parameter(_)
+            Operation::Intrinsic(Intrinsic::Aggregate(_))
+            | Operation::Intrinsic(Intrinsic::Assertion(_))
+            | Operation::Intrinsic(Intrinsic::Branch(_))
+            | Operation::Intrinsic(Intrinsic::Bytecode(_))
+            | Operation::Intrinsic(Intrinsic::Call(_))
+            | Operation::Intrinsic(Intrinsic::CheckedInteger(_))
+            | Operation::Intrinsic(Intrinsic::Control(_))
+            | Operation::Intrinsic(Intrinsic::Memory(_))
+            | Operation::InlineCall(_)
+            | Operation::Parameter(_)
             | Operation::MachineAssign { .. }
-            | Operation::BlockReference(_) => false,
+            | Operation::BlockReference(_)
+            | Operation::Guard { .. } => false,
         }
 }
 
@@ -854,14 +1112,7 @@ fn schedule_value_dependencies(
     dependencies.dedup();
     for dependency in dependencies {
         schedule_instruction(
-            function,
-            block,
-            dependency,
-            placements,
-            movable,
-            ranks,
-            emitted,
-            schedule,
+            function, block, dependency, placements, movable, ranks, emitted, schedule,
         );
     }
 }
@@ -900,30 +1151,43 @@ pub(crate) fn eliminate_dead_code(function: &mut Function) {
     run_single_pass(function, "dead-code-elimination", eliminate_dead_code_pass);
 }
 
-fn eliminate_dead_code_pass(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
-    let mut changed = false;
-    loop {
-        let uses = analyses.uses(function);
-
-        let eliminated = function
-            .instructions
-            .iter()
-            .enumerate()
-            .filter(|(_, instruction)| {
-                instruction.effects.can_be_eliminated()
-                    && instruction.results.iter().all(|result| uses.count(*result) == 0)
-            })
-            .map(|(index, _)| InstructionId(index))
-            .collect::<HashSet<_>>();
-        if eliminated.is_empty() {
-            break;
+fn eliminate_dead_code_pass(function: &mut Function, _analyses: &mut AnalysisManager) -> bool {
+    let mut uses = ValueUses::compute(function);
+    let mut worklist = function
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, instruction)| {
+            instruction.can_be_eliminated() && instruction.results.iter().all(|result| uses.count(*result) == 0)
+        })
+        .map(|(index, _)| InstructionId(index))
+        .collect::<Vec<_>>();
+    let mut eliminated = HashSet::default();
+    while let Some(instruction_id) = worklist.pop() {
+        if eliminated.contains(&instruction_id) {
+            continue;
         }
-        changed = true;
-        rebuild_instruction_arena(function, &eliminated, InstructionOrder::ByBlock);
-        analyses.invalidate();
+        let instruction = &function.instructions[instruction_id.0];
+        if !instruction.can_be_eliminated() || instruction.results.iter().any(|result| uses.count(*result) != 0) {
+            continue;
+        }
+        eliminated.insert(instruction_id);
+        for input in &instruction.inputs {
+            uses.remove_use(*input);
+            if uses.count(*input) != 0 {
+                continue;
+            }
+            if let ValueDefinition::InstructionResult { instruction, .. } = function.values[input.0].definition {
+                worklist.push(instruction);
+            }
+        }
     }
 
-    changed
+    if eliminated.is_empty() {
+        return false;
+    }
+    rebuild_instruction_arena(function, &eliminated, InstructionOrder::ByBlock);
+    true
 }
 
 pub(super) fn rewrite_values(values: &mut [ValueId], replacements: &HashMap<ValueId, ValueId>) {
@@ -996,14 +1260,25 @@ pub(super) enum InstructionOrder {
     Original,
 }
 
-pub(super) fn rebuild_instruction_arena(function: &mut Function, eliminated: &HashSet<InstructionId>, order: InstructionOrder) {
+pub(super) fn rebuild_instruction_arena(
+    function: &mut Function,
+    eliminated: &HashSet<InstructionId>,
+    order: InstructionOrder,
+) {
     let old_instructions = std::mem::take(&mut function.instructions);
-    function.instructions.reserve(old_instructions.len() - eliminated.len());
+    function
+        .instructions
+        .reserve(old_instructions.len().saturating_sub(eliminated.len()));
     let mut instruction_map = vec![None; old_instructions.len()];
     let order: Vec<_> = if matches!(order, InstructionOrder::Original) {
         (0..old_instructions.len()).map(InstructionId).collect()
     } else {
-        function.blocks.iter().flat_map(|block| &block.instructions).copied().collect()
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .copied()
+            .collect()
     };
     for old_id in order {
         if eliminated.contains(&old_id) {
@@ -1032,7 +1307,12 @@ pub(super) fn rebuild_instruction_arena(function: &mut Function, eliminated: &Ha
             };
         }
     }
-    debug_assert!(instruction_map.iter().enumerate().all(|(index, mapped)| eliminated.contains(&InstructionId(index)) || mapped.is_some()));
+    debug_assert!(
+        instruction_map
+            .iter()
+            .enumerate()
+            .all(|(index, mapped)| eliminated.contains(&InstructionId(index)) || mapped.is_some())
+    );
 }
 
 #[cfg(test)]
@@ -1041,8 +1321,7 @@ mod tests {
     use crate::frontend::parser;
     use crate::hir as typecheck;
     use crate::intrinsic::{
-        AssertionOperation, CallOperation, ControlOperation, OperandLoad, OperandOperation,
-        OperandStore,
+        AssertionOperation, CallOperation, ControlOperation, OperandLoad, OperandOperation, OperandStore,
     };
     use crate::ssa::{Constant, LowLevelOperation, MemoryEffect, lowering as ir_lowering};
 
@@ -1055,14 +1334,46 @@ mod tests {
         effects: Effects,
     ) -> (InstructionId, Vec<ValueId>) {
         let instruction = InstructionId(function.instructions.len());
-        let results = function.append_instruction_with_effects(
-            block,
-            operation,
-            inputs,
-            result_types,
-            effects,
-        );
+        let results = function.append_instruction_with_effects(block, operation, inputs, result_types, effects);
         (instruction, results)
+    }
+
+    #[test]
+    fn does_not_merge_a_guard_failure_target_into_its_predecessor() {
+        let mut function = Function::new("guard-target", vec![Type::Bool], Vec::new());
+        let failure = function.create_empty_block("failure", BlockLayout::Cold);
+        function.append_instruction(
+            function.entry,
+            Operation::Guard { failure },
+            vec![function.parameter(0)],
+            Vec::new(),
+        );
+        function.set_terminator(function.entry, Terminator::jump(failure));
+        function.set_terminator(failure, Terminator::Return(Vec::new()));
+
+        assert!(!merge_straight_line_blocks_pass(
+            &mut function,
+            &mut AnalysisManager::default()
+        ));
+        assert_eq!(function.blocks.len(), 2);
+        function.validate().unwrap();
+    }
+
+    #[test]
+    fn merges_an_entire_straight_line_block_chain_in_one_pass() {
+        let mut function = Function::new("block-chain", Vec::new(), Vec::new());
+        let middle = function.create_empty_block("middle", BlockLayout::Hot);
+        let tail = function.create_empty_block("tail", BlockLayout::Hot);
+        function.set_terminator(function.entry, Terminator::jump(middle));
+        function.set_terminator(middle, Terminator::jump(tail));
+        function.set_terminator(tail, Terminator::Return(Vec::new()));
+
+        assert!(merge_straight_line_blocks_pass(
+            &mut function,
+            &mut AnalysisManager::default()
+        ));
+        assert_eq!(function.blocks.len(), 1);
+        function.validate().unwrap();
     }
 
     #[test]
@@ -1168,18 +1479,12 @@ mod tests {
             Vec::new(),
             Effects::UNKNOWN,
         );
-        function.set_terminator(
-            entry,
-            Terminator::jump(header),
-        );
+        function.set_terminator(entry, Terminator::jump(header));
         function.set_terminator(
             header,
             Terminator::branch_edges(condition, Edge::new(body), Edge::new(exit)),
         );
-        function.set_terminator(
-            body,
-            Terminator::jump(header),
-        );
+        function.set_terminator(body, Terminator::jump(header));
         function.set_terminator(exit, Terminator::Return(Vec::new()));
 
         schedule_global_code_motion(&mut function);
@@ -1192,10 +1497,7 @@ mod tests {
     #[test]
     fn eliminates_trivial_loop_parameters() {
         let mut function = Function::new("loop", Vec::new(), Vec::new());
-        let constant = function.add_constant(
-            Type::SlowPath,
-            Constant::SlowPath(ExternalSymbol::new("slow")),
-        );
+        let constant = function.add_constant(Type::SlowPath, Constant::SlowPath(ExternalSymbol::new("slow")));
         let header = function.create_named_block("header", BlockLayout::Hot, vec![Type::SlowPath]);
         let parameter = function.blocks[header.0].parameters[0];
         let use_instruction = function.append_instruction(
@@ -1205,20 +1507,14 @@ mod tests {
             Vec::new(),
         );
         assert!(use_instruction.is_empty());
-        function.set_terminator(
-            function.entry,
-            Terminator::jump_with_arguments(header, vec![constant]),
-        );
-        function.set_terminator(
-            header,
-            Terminator::jump_with_arguments(header, vec![parameter]),
-        );
+        function.set_terminator(function.entry, Terminator::jump_with_arguments(header, vec![constant]));
+        function.set_terminator(header, Terminator::jump_with_arguments(header, vec![parameter]));
 
         eliminate_trivial_block_parameters(&mut function);
 
         assert!(function.blocks[header.0].parameters.is_empty());
         assert!(matches!(function.values[parameter.0].definition, ValueDefinition::Dead));
-        assert_eq!(function.instructions[0].inputs, vec![constant]);
+        assert_eq!(function.instructions[0].inputs.as_slice(), [constant]);
         for block in &function.blocks {
             for edge in block.terminator.as_ref().unwrap().successors() {
                 assert!(edge.arguments.is_empty());
@@ -1250,7 +1546,7 @@ handler Add(lhs: i32, rhs: i32) {
         assert_eq!(entry.instructions.len(), 4);
         let first_add = &function.instructions[entry.instructions[0].0];
         let total = &function.instructions[entry.instructions[1].0];
-        assert_eq!(total.inputs, vec![first_add.results[0], first_add.results[0]]);
+        assert_eq!(total.inputs.as_slice(), [first_add.results[0], first_add.results[0]]);
     }
 
     #[test]
@@ -1414,10 +1710,7 @@ handler Add(lhs: i32) {
         );
         let child = function.create_empty_block("child", BlockLayout::Hot);
         let exit = function.create_empty_block("exit", BlockLayout::Hot);
-        function.set_terminator(
-            function.entry,
-            Terminator::branch(function.parameter(0), child, exit),
-        );
+        function.set_terminator(function.entry, Terminator::branch(function.parameter(0), child, exit));
         function.append_instruction(
             child,
             Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(BinaryOperation::Add)),
@@ -1568,11 +1861,7 @@ handler Add(lhs: i32) {
         let case = function.add_constant(Type::U32, Constant::Integer(7));
         function.set_terminator(
             function.entry,
-            Terminator::switch(
-                value,
-                vec![(case, Edge::new(selected))],
-                Edge::new(default),
-            ),
+            Terminator::switch(value, vec![(case, Edge::new(selected))], Edge::new(default)),
         );
         function.set_terminator(selected, Terminator::Unreachable);
         function.set_terminator(default, Terminator::Unreachable);
@@ -1601,10 +1890,7 @@ handler Add(lhs: i32) {
 
         resolve_constants(
             &mut function,
-            &LayoutConstants::from_values([(
-                "FIELD_OFFSET".to_string(),
-                24,
-            )]),
+            &LayoutConstants::from_values([("FIELD_OFFSET".to_string(), 24)]),
         );
 
         assert_eq!(
@@ -1615,22 +1901,14 @@ handler Add(lhs: i32) {
 
     #[test]
     fn preserves_layout_value_resolution_points() {
-        let constants = LayoutConstants::from_values([(
-            "FIELD_OFFSET".to_string(),
-            24,
-        )]);
+        let constants = LayoutConstants::from_values([("FIELD_OFFSET".to_string(), 24)]);
         let mut function = Function::new("constants", Vec::new(), Vec::new());
         let base = function.add_constant(Type::U64, Constant::Integer(0));
         let named = function.add_constant(
             Type::U64,
-            Constant::LayoutValue(LayoutValue::Constant(
-                constants.get("FIELD_OFFSET").unwrap(),
-            )),
+            Constant::LayoutValue(LayoutValue::Constant(constants.get("FIELD_OFFSET").unwrap())),
         );
-        let immediate = function.add_constant(
-            Type::U64,
-            Constant::LayoutValue(LayoutValue::Immediate(8)),
-        );
+        let immediate = function.add_constant(Type::U64, Constant::LayoutValue(LayoutValue::Immediate(8)));
         function.append_instruction(
             function.entry,
             Operation::Address,
@@ -1647,9 +1925,7 @@ handler Add(lhs: i32) {
         );
         assert_eq!(
             function.values[immediate.0].definition,
-            ValueDefinition::Constant(Constant::LayoutValue(
-                LayoutValue::Immediate(8)
-            ))
+            ValueDefinition::Constant(Constant::LayoutValue(LayoutValue::Immediate(8)))
         );
 
         resolve_layout_constants(&mut function, &constants).unwrap();
@@ -1663,16 +1939,9 @@ handler Add(lhs: i32) {
     #[test]
     fn rejects_unknown_layout_constants_during_resolution() {
         let mut function = Function::new("Missing", Vec::new(), Vec::new());
-        function.add_constant(
-            Type::U64,
-            Constant::Symbol("MISSING".to_string()),
-        );
+        function.add_constant(Type::U64, Constant::Symbol("MISSING".to_string()));
 
-        let error = resolve_layout_constants(
-            &mut function,
-            &LayoutConstants::default(),
-        )
-        .unwrap_err();
+        let error = resolve_layout_constants(&mut function, &LayoutConstants::default()).unwrap_err();
 
         assert_eq!(error.stage, CompileStage::Ssa);
         assert_eq!(error.handler.as_deref(), Some("Missing"));

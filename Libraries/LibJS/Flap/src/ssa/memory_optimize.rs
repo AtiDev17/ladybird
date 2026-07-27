@@ -7,22 +7,52 @@
 //! Memory forwarding and dead-store elimination over proven locations.
 
 use super::effects::{
-    AliasResult, EffectDefinition, MemoryAccessLocations, MemoryLocation, alias, instruction_memory_locations,
+    AliasResult, EffectDefinition, LocationKey, MemoryAccessLocations, MemoryLocation, alias,
+    instruction_memory_locations, location_key,
 };
 use super::optimize::{InstructionOrder, rebuild_instruction_arena, rewrite_function_uses};
-use super::pass::{AnalysisManager};
+use super::pass::AnalysisManager;
 use super::{Function, InstructionId, Intrinsic, OperandOperation, Operation, ValueId};
-use std::collections::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet};
 
 pub(super) fn run(function: &mut Function, analyses: &mut AnalysisManager) -> bool {
     let analysis = analyses.get(function);
     let memory = analysis.effects.domain(super::effects::EffectDomain::Memory);
-    let mut replacements = HashMap::new();
-    let mut eliminated = HashSet::new();
-    let mut available_loads = Vec::<(InstructionId, MemoryLocation, ValueId)>::new();
+    let mut replacements = HashMap::default();
+    let mut eliminated = HashSet::default();
+    // Loads still worth reusing, grouped by what they would have to have in
+    // common with a later load to be the same location. Keeping them in one
+    // list means rescanning every load seen so far for every load reached,
+    // which on a large function is the whole cost of the pass.
+    let mut available_loads = HashMap::<LocationKey, Vec<(InstructionId, MemoryLocation, ValueId)>>::default();
+    let mut availability_undo = Vec::<LocationKey>::new();
     let mut load_candidates = 0u64;
 
-    for block in analysis.cfg.reverse_postorder() {
+    enum AvailabilityStep {
+        Enter(super::BlockId),
+        Leave(usize),
+    }
+    let mut worklist = vec![AvailabilityStep::Enter(function.entry)];
+    while let Some(step) = worklist.pop() {
+        let block = match step {
+            AvailabilityStep::Leave(mark) => {
+                while availability_undo.len() > mark {
+                    let key = availability_undo
+                        .pop()
+                        .expect("availability undo log is not empty above its mark");
+                    let loads = available_loads
+                        .get_mut(&key)
+                        .expect("an available load exists until its dominator subtree is left");
+                    loads.pop();
+                    if loads.is_empty() {
+                        available_loads.remove(&key);
+                    }
+                }
+                continue;
+            }
+            AvailabilityStep::Enter(block) => block,
+        };
+        worklist.push(AvailabilityStep::Leave(availability_undo.len()));
         for instruction_id in &function.blocks[block.0].instructions {
             let access = instruction_memory_locations(function, *instruction_id);
             let Some(location) = simple_load(function, *instruction_id, &access) else {
@@ -55,31 +85,36 @@ pub(super) fn run(function: &mut Function, analyses: &mut AnalysisManager) -> bo
             // NB: A load that traps carries an assertion about what it loaded, so it can only reuse
             //     a load that made the same assertion. Reusing a plain load would drop the check.
             let traps = function.instructions[instruction_id.0].effects.may_trap;
-            let forwarded_load = available_loads.iter().rev().find_map(|(load, loaded_location, value)| {
-                ((!traps || function.instructions[load.0].effects.may_trap)
-                    && dominates_instruction(&analysis, *load, *instruction_id)
-                    && alias(function, loaded_location, location) == AliasResult::Must
-                    && function.values[value.0].ty == *result_type
-                    && (memory
-                        .instruction_access(*load)
-                        .map(|access| &access.dependencies)
-                        == dependencies
-                        || memory_unchanged_between(
-                            function,
-                            &analysis,
-                            *load,
-                            *instruction_id,
-                            location,
-                        )))
-                    .then_some(*value)
-            });
+            let key = location_key(function, location);
+            let forwarded_load =
+                available_loads
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .find_map(|(load, loaded_location, value)| {
+                        ((!traps || function.instructions[load.0].effects.may_trap)
+                            && dominates_instruction(&analysis, *load, *instruction_id)
+                            && alias(function, loaded_location, location) == AliasResult::Must
+                            && function.values[value.0].ty == *result_type
+                            && (memory.instruction_access(*load).map(|access| &access.dependencies) == dependencies
+                                || memory_unchanged_between(function, &analysis, *load, *instruction_id, location)))
+                        .then_some(*value)
+                    });
 
             if let Some(value) = forwarded_store.or(forwarded_load) {
                 replacements.insert(result, value);
                 eliminated.insert(*instruction_id);
             } else {
-                available_loads.push((*instruction_id, location.clone(), result));
+                available_loads
+                    .entry(key.clone())
+                    .or_default()
+                    .push((*instruction_id, location.clone(), result));
+                availability_undo.push(key);
             }
+        }
+        for child in analysis.dominators.children(block).iter().rev() {
+            worklist.push(AvailabilityStep::Enter(*child));
         }
     }
 
@@ -112,15 +147,11 @@ fn memory_unchanged_between(
     instruction: InstructionId,
     location: &MemoryLocation,
 ) -> bool {
-    let block = analysis.instruction_layout.block(load);
-    if analysis.instruction_layout.block(instruction) != block {
-        return false;
-    }
-    let start = analysis.instruction_layout.position(load) + 1;
-    let end = analysis.instruction_layout.position(instruction);
-    function.blocks[block.0].instructions[start..end]
-        .iter()
-        .all(|instruction| {
+    let load_block = analysis.instruction_layout.block(load);
+    let use_block = analysis.instruction_layout.block(instruction);
+
+    let untouched = |instructions: &[InstructionId]| {
+        instructions.iter().all(|instruction| {
             let access = instruction_memory_locations(function, *instruction);
             !access.unknown_write
                 && access
@@ -128,6 +159,37 @@ fn memory_unchanged_between(
                     .iter()
                     .all(|write| alias(function, write, location) == AliasResult::No)
         })
+    };
+
+    if load_block == use_block {
+        let start = analysis.instruction_layout.position(load) + 1;
+        let end = analysis.instruction_layout.position(instruction);
+        return untouched(&function.blocks[load_block.0].instructions[start..end]);
+    }
+
+    // Walk back from the use towards the load while each block has exactly one
+    // way in. A second predecessor could carry a write that invalidates it.
+    let mut block = use_block;
+    let end = analysis.instruction_layout.position(instruction);
+    if !untouched(&function.blocks[block.0].instructions[..end]) {
+        return false;
+    }
+    // A chain longer than the function cannot exist, so this also bounds a loop
+    // back to a block already visited.
+    for _ in 0..function.blocks.len() {
+        let [predecessor] = analysis.cfg.predecessors(block) else {
+            return false;
+        };
+        block = *predecessor;
+        if block == load_block {
+            let start = analysis.instruction_layout.position(load) + 1;
+            return untouched(&function.blocks[block.0].instructions[start..]);
+        }
+        if !untouched(&function.blocks[block.0].instructions) {
+            return false;
+        }
+    }
+    false
 }
 
 fn dominates_instruction(
@@ -137,10 +199,14 @@ fn dominates_instruction(
 ) -> bool {
     let dominator_block = analysis.instruction_layout.block(dominator);
     let instruction_block = analysis.instruction_layout.block(instruction);
+    let position = analysis.instruction_layout.position(dominator);
     if dominator_block == instruction_block {
-        analysis.instruction_layout.position(dominator) < analysis.instruction_layout.position(instruction)
+        position < analysis.instruction_layout.position(instruction)
     } else {
         analysis.dominators.dominates(dominator_block, instruction_block)
+            && analysis
+                .guards
+                .definition_reaches(dominator_block, position, instruction_block)
     }
 }
 
@@ -154,15 +220,13 @@ pub(super) fn simple_load<'a>(
         Operation::Intrinsic(Intrinsic::Memory(operation)) => !operation.writes() && operation.address_count() == 1,
         Operation::FieldAccess(access) => !access.kind.writes(),
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Load(_))) => true,
-        Operation::Intrinsic(Intrinsic::Operand(OperandOperation::LoadPair | OperandOperation::Decode
-            | OperandOperation::Store(_) | OperandOperation::Copy)) => false,
+        Operation::Intrinsic(Intrinsic::Operand(
+            OperandOperation::LoadPair | OperandOperation::Decode | OperandOperation::Store(_) | OperandOperation::Copy,
+        )) => false,
         _ => false,
     };
-    (instruction.results.len() == 1
-        && access.reads.len() == 1
-        && access.writes.is_empty()
-        && is_single_load)
-    .then(|| &access.reads[0])
+    (instruction.results.len() == 1 && access.reads.len() == 1 && access.writes.is_empty() && is_single_load)
+        .then(|| &access.reads[0])
 }
 
 fn simple_store<'a>(
@@ -175,8 +239,9 @@ fn simple_store<'a>(
         Operation::Intrinsic(Intrinsic::Memory(operation)) => operation.writes() && operation.address_count() == 1,
         Operation::FieldAccess(access) => access.kind.writes(),
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Store(_))) => true,
-        Operation::Intrinsic(Intrinsic::Operand(OperandOperation::Decode | OperandOperation::Load(_)
-            | OperandOperation::LoadPair | OperandOperation::Copy)) => false,
+        Operation::Intrinsic(Intrinsic::Operand(
+            OperandOperation::Decode | OperandOperation::Load(_) | OperandOperation::LoadPair | OperandOperation::Copy,
+        )) => false,
         _ => false,
     };
     (instruction.results.is_empty()
@@ -191,18 +256,13 @@ fn simple_store<'a>(
 mod tests {
     use super::*;
     use crate::intrinsic::{MemoryOperation, MemoryWidth};
-    use crate::types::Type;
     use crate::ssa::{BlockId, BlockLayout, Constant, Effects, MemoryEffect, Terminator};
+    use crate::types::Type;
 
     fn address(function: &mut Function, base: ValueId, offset: i64) -> ValueId {
         let block = function.entry;
         let offset = function.add_constant(Type::U64, Constant::Integer(offset));
-        function.append_instruction(
-            block,
-            Operation::Address,
-            vec![base, offset],
-            vec![Type::Memory],
-        )[0]
+        function.append_instruction(block, Operation::Address, vec![base, offset], vec![Type::Memory])[0]
     }
 
     fn load(function: &mut Function, address: ValueId) -> ValueId {
@@ -213,7 +273,10 @@ mod tests {
     fn load_in(function: &mut Function, block: BlockId, address: ValueId) -> ValueId {
         function.append_instruction_with_effects(
             block,
-            Intrinsic::Memory(MemoryOperation::Load { width: MemoryWidth::DoubleWord, signed: false }),
+            Intrinsic::Memory(MemoryOperation::Load {
+                width: MemoryWidth::DoubleWord,
+                signed: false,
+            }),
             vec![address],
             vec![Type::U64],
             Effects {
@@ -275,10 +338,7 @@ mod tests {
         let stored_value = function.parameter(1);
         let location = address(&mut function, base, 0);
         store(&mut function, location, stored_value);
-        function.set_terminator(
-            function.entry,
-            Terminator::jump(successor),
-        );
+        function.set_terminator(function.entry, Terminator::jump(successor));
         let loaded = load_in(&mut function, successor, location);
         function.set_terminator(successor, Terminator::Return(vec![loaded]));
 
@@ -298,10 +358,7 @@ mod tests {
         let base = function.parameter(0);
         let location = address(&mut function, base, 0);
         let first = load(&mut function, location);
-        function.set_terminator(
-            function.entry,
-            Terminator::jump(successor),
-        );
+        function.set_terminator(function.entry, Terminator::jump(successor));
         let second = load_in(&mut function, successor, location);
         function.set_terminator(successor, Terminator::Return(vec![second]));
 

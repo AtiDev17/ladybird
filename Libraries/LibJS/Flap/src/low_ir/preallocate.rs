@@ -6,10 +6,13 @@
 
 //! Target-aware instruction combining before register allocation.
 
-use super::{Instruction, Operand, VirtualRegister};
+use super::{Instruction, Operand, VirtualRegister, visit_virtual_registers, visit_virtual_registers_mut};
+use crate::hash::{HashMap, HashSet};
 use crate::intrinsic::{BranchOperation, IntegerBinaryOperation, IntegerSignedness};
+use crate::low_ir::analysis::virtual_register_access;
+use crate::low_ir::cfg::instruction_blocks;
 use crate::target::description::{
-    BinaryOperation, EqualityCondition, IntegerWidth, MemoryWidth, Operation, OperandKind, PairWidth,
+    BinaryOperation, EqualityCondition, IntegerWidth, MemoryWidth, OperandKind, Operation, PairWidth,
 };
 use crate::types::InterpreterRegister;
 
@@ -22,9 +25,7 @@ use crate::types::InterpreterRegister;
 /// A handler that assigns `pc` itself is the exception. Its assignment lands in
 /// the pinned register, and the terminator that dispatches on it reads that
 /// register back, so uses in between must be left alone.
-pub(crate) fn materialize_program_counter_reads(
-    instructions: &mut Vec<Instruction>,
-) -> Result<(), String> {
+pub(crate) fn materialize_program_counter_reads(instructions: &mut Vec<Instruction>) -> Result<(), String> {
     let program_counter = Operand::InterpreterRegister(InterpreterRegister::ProgramCounter);
     let mut index = 0;
     let mut reads = 0;
@@ -73,10 +74,7 @@ pub(crate) fn materialize_program_counter_reads(
             }
             match description.operand_kind(position, operand_count) {
                 Some(
-                    OperandKind::GprIn
-                    | OperandKind::RegisterIn
-                    | OperandKind::GprInOrImm
-                    | OperandKind::GprInOrMemory,
+                    OperandKind::GprIn | OperandKind::RegisterIn | OperandKind::GprInOrImm | OperandKind::GprInOrMemory,
                 ) => read_positions.push(position),
                 Some(OperandKind::GprInOut) => {
                     return Err(format!(
@@ -92,9 +90,7 @@ pub(crate) fn materialize_program_counter_reads(
             continue;
         }
 
-        let temporary = Operand::VirtualRegister(VirtualRegister::from(format!(
-            "program_counter_read_{reads}"
-        )));
+        let temporary = Operand::VirtualRegister(VirtualRegister::from(format!("program_counter_read_{reads}")));
         reads += 1;
         for position in read_positions {
             instructions[index].operands[position] = temporary.clone();
@@ -122,10 +118,8 @@ pub(crate) fn schedule_x86_relational_operand_loads(instructions: &mut Vec<Instr
         let lhs_load = instructions[index + 1].clone();
         let rhs_load = instructions[index + 2].clone();
         if pair.opcode.operation() != Operation::load_pair(PairWidth::Word)
-            || lhs_load.opcode.operation()
-                != Operation::load(MemoryWidth::DoubleWord, false)
-            || rhs_load.opcode.operation()
-                != Operation::load(MemoryWidth::DoubleWord, false)
+            || lhs_load.opcode.operation() != Operation::load(MemoryWidth::DoubleWord, false)
+            || rhs_load.opcode.operation() != Operation::load(MemoryWidth::DoubleWord, false)
             || pair.operands.len() != 4
             || lhs_load.operands.len() != 2
             || rhs_load.operands.len() != 2
@@ -143,15 +137,13 @@ pub(crate) fn schedule_x86_relational_operand_loads(instructions: &mut Vec<Instr
             .unwrap_or(hot_tail.len());
         let hot_tail = &hot_tail[..hot_tail_end];
         let has_lhs_tag_check = hot_tail.iter().any(|instruction| {
-            instruction.opcode.operation()
-                == Operation::branch_tag(EqualityCondition::NotEqual)
+            instruction.opcode.operation() == Operation::branch_tag(EqualityCondition::NotEqual)
                 && instruction.operands.first() == Some(&lhs_value)
         });
         let rhs_tag_check = hot_tail
             .iter()
             .position(|instruction| {
-                instruction.opcode.operation()
-                    == Operation::branch_tag(EqualityCondition::NotEqual)
+                instruction.opcode.operation() == Operation::branch_tag(EqualityCondition::NotEqual)
                     && instruction.operands.first() == Some(&rhs_value)
             })
             .map(|position| index + 3 + position);
@@ -218,6 +210,24 @@ pub(crate) fn schedule_x86_relational_operand_loads(instructions: &mut Vec<Instr
 /// at the add, reversing the operands lets the allocator coalesce `result`
 /// with `rhs` and removes both an otherwise-required register and the move.
 pub(crate) fn orient_commutative_updates(instructions: &mut [Instruction]) {
+    // Where each register is named for the last time. Asking whether a value
+    // outlives an instruction by scanning the rest of the listing turns this
+    // into a quadratic pass over a large function. Reversing a pair of
+    // operands only moves a register between the two instructions of the pair,
+    // both of which lie before every listing suffix later steps look at, so
+    // these positions stay correct as the pass runs.
+    let mut last_reference = HashMap::default();
+    for (index, instruction) in instructions.iter().enumerate() {
+        for operand in &instruction.operands {
+            visit_virtual_registers(operand, &mut |register| {
+                last_reference.insert(register.clone(), index);
+            });
+        }
+    }
+    let referenced_after = |register: &VirtualRegister, position: usize| {
+        last_reference.get(register).is_some_and(|last| *last >= position)
+    };
+
     let mut index = 0;
     while index + 1 < instructions.len() {
         let copy = &instructions[index];
@@ -227,10 +237,7 @@ pub(crate) fn orient_commutative_updates(instructions: &mut [Instruction]) {
                 update.opcode.operation(),
                 Operation::IntegerBinary {
                     operation: IntegerBinaryOperation::Binary(
-                        BinaryOperation::Add
-                            | BinaryOperation::And
-                            | BinaryOperation::Or
-                            | BinaryOperation::Xor,
+                        BinaryOperation::Add | BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Xor,
                     ),
                     width: IntegerWidth::U64,
                 }
@@ -263,12 +270,8 @@ pub(crate) fn orient_commutative_updates(instructions: &mut [Instruction]) {
             }
             (lhs.clone(), rhs.clone())
         };
-        let lhs_is_live = instructions[index + 2..]
-            .iter()
-            .any(|instruction| instruction_references_register(instruction, &lhs));
-        let rhs_is_dead = !instructions[index + 2..]
-            .iter()
-            .any(|instruction| instruction_references_register(instruction, &rhs));
+        let lhs_is_live = referenced_after(&lhs, index + 2);
+        let rhs_is_dead = !referenced_after(&rhs, index + 2);
         if lhs_is_live && rhs_is_dead {
             instructions[index].operands[1] = Operand::VirtualRegister(rhs);
             instructions[index + 1].operands[1] = Operand::VirtualRegister(lhs);
@@ -277,12 +280,159 @@ pub(crate) fn orient_commutative_updates(instructions: &mut [Instruction]) {
     }
 }
 
-fn instruction_references_register(
-    instruction: &Instruction,
-    register: &VirtualRegister,
-) -> bool {
-    instruction
-        .operands
+/// Split cheap values around calls when their entire live range is local to
+/// one machine block. This keeps the AOT interpreter spill-free while letting
+/// constants be recreated after caller-saved registers are destroyed.
+pub(crate) fn split_rematerializable_live_ranges_across_calls(instructions: &mut Vec<Instruction>) {
+    let calls = instructions
         .iter()
-        .any(|operand| operand.references(register))
+        .enumerate()
+        .filter_map(|(index, instruction)| instruction.opcode.description().is_call.then_some(index))
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return;
+    }
+
+    #[derive(Default)]
+    struct RegisterFacts {
+        block: Option<usize>,
+        crosses_blocks: bool,
+        definitions: Vec<usize>,
+        recipe: Option<(usize, Instruction)>,
+        reads: Vec<usize>,
+    }
+
+    let instruction_references = instructions.iter().collect::<Vec<_>>();
+    let blocks = instruction_blocks(&instruction_references);
+    let mut facts = HashMap::<VirtualRegister, RegisterFacts>::default();
+    for (index, instruction) in instructions.iter().enumerate() {
+        let access = virtual_register_access(instruction, None);
+        for register in access.reads {
+            let facts = facts.entry(register).or_default();
+            facts.reads.push(index);
+            if let Some(block) = facts.block {
+                facts.crosses_blocks |= block != blocks[index];
+            } else {
+                facts.block = Some(blocks[index]);
+            }
+        }
+        for register in access.definitions {
+            let facts = facts.entry(register.clone()).or_default();
+            facts.definitions.push(index);
+            if let Some(block) = facts.block {
+                facts.crosses_blocks |= block != blocks[index];
+            } else {
+                facts.block = Some(blocks[index]);
+            }
+            if let Some((recipe_register, recipe)) = rematerialization_recipe(instruction)
+                && recipe_register == register
+            {
+                facts.recipe = Some((index, recipe));
+            }
+        }
+    }
+
+    let mut registers = facts.keys().cloned().collect::<HashSet<_>>();
+    let mut split_index = 0u64;
+    let mut splits = Vec::new();
+    for (register, facts) in facts {
+        let Some((definition, recipe)) = facts.recipe else {
+            continue;
+        };
+        if facts.crosses_blocks {
+            continue;
+        }
+        let block = facts.block.expect("a defined register belongs to a block");
+        let mut split_calls = facts
+            .reads
+            .iter()
+            .filter_map(|read| {
+                let insertion = calls.partition_point(|call| *call < *read);
+                (insertion > 0).then(|| calls[insertion - 1])
+            })
+            .filter(|call| *call > definition && blocks[*call] == block)
+            .filter(|call| {
+                facts.definitions.partition_point(|candidate| *candidate <= *call) == 1
+                    && facts.definitions[0] == definition
+            })
+            .collect::<Vec<_>>();
+        split_calls.sort_unstable();
+        split_calls.dedup();
+        for call in split_calls {
+            let end = calls
+                .get(calls.partition_point(|candidate| *candidate <= call))
+                .copied()
+                .filter(|next| blocks[*next] == block)
+                .map(|next| next + 1)
+                .unwrap_or_else(|| {
+                    blocks[call + 1..]
+                        .iter()
+                        .position(|candidate| *candidate != block)
+                        .map_or(instructions.len(), |offset| call + 1 + offset)
+                });
+            let replacement = loop {
+                let candidate =
+                    VirtualRegister::with_class(format!("{register}_after_call_{split_index}"), register.class());
+                split_index += 1;
+                if registers.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            splits.push((call, end, register.clone(), replacement, recipe.clone()));
+        }
+    }
+
+    for (call, end, register, replacement, _) in &splits {
+        for instruction in &mut instructions[call + 1..*end] {
+            for operand in &mut instruction.operands {
+                visit_virtual_registers_mut(operand, &mut |candidate| {
+                    if candidate == register {
+                        *candidate = replacement.clone();
+                    }
+                });
+            }
+        }
+    }
+    splits.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then_with(|| lhs.2.cmp(&rhs.2)));
+    while let Some(call) = splits.last().map(|split| split.0) {
+        let start = splits.partition_point(|split| split.0 < call);
+        let rematerializations = splits[start..]
+            .iter()
+            .filter(|split| split.0 == call)
+            .cloned()
+            .map(|(_, _, _, replacement, mut recipe)| {
+                let Operand::VirtualRegister(destination) = &mut recipe.operands[0] else {
+                    unreachable!("rematerialization recipe must define a virtual register")
+                };
+                *destination = replacement;
+                recipe
+            })
+            .collect::<Vec<_>>();
+        let count = rematerializations.len();
+        instructions.splice(call + 1..call + 1, rematerializations);
+        splits.truncate(splits.len() - count);
+    }
+}
+
+fn rematerialization_recipe(instruction: &Instruction) -> Option<(VirtualRegister, Instruction)> {
+    if !matches!(
+        instruction.opcode.operation(),
+        Operation::Move(IntegerWidth::U32 | IntegerWidth::U64)
+    ) {
+        return None;
+    }
+    let [
+        Operand::VirtualRegister(register),
+        source @ (Operand::Immediate(_) | Operand::ValueConstant(_)),
+    ] = instruction.operands.as_slice()
+    else {
+        return None;
+    };
+    Some((
+        register.clone(),
+        Instruction {
+            opcode: instruction.opcode,
+            operands: vec![Operand::VirtualRegister(register.clone()), source.clone()],
+        },
+    ))
 }

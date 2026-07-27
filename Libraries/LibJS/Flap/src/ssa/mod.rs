@@ -17,14 +17,19 @@ pub(crate) mod print;
 pub(crate) mod report;
 mod sccp;
 
-use crate::types::{BlockTemperature, InterpreterRegister, RegisterReference, Type};
+use crate::hash::{HashMap, HashSet};
+use crate::hir as typecheck;
 use crate::identity::{ExternalSymbol, InlineFunctionId};
-pub(crate) use crate::intrinsic::{AggregateOperation, BinaryOperation, CheckedIntegerOperation, ComparisonDomain, ComparisonRelation, FieldAccess, IntegerBinaryOperation, IntegerComparisonOperation, Intrinsic, LowLevelOperation, OperandOperation, OperationValue, ShiftOperation, ValueOperation};
 pub(crate) use crate::intrinsic::IntrinsicEffects as Effects;
 pub(crate) use crate::intrinsic::ModRef as MemoryEffect;
-use crate::hir as typecheck;
+pub(crate) use crate::intrinsic::{
+    AggregateOperation, BinaryOperation, CheckedIntegerOperation, ComparisonDomain, ComparisonRelation, FieldAccess,
+    IntegerBinaryOperation, IntegerComparisonOperation, Intrinsic, LowLevelOperation, OperandOperation, OperationValue,
+    ShiftOperation, ValueOperation,
+};
 use crate::ssa as ir;
-use std::collections::{HashMap, HashSet};
+use crate::types::{BlockTemperature, InterpreterRegister, RegisterReference, Type};
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub usize);
@@ -73,6 +78,17 @@ pub(crate) enum Operation {
     },
     BlockReference(BlockId),
     Address,
+    /// A conditional side exit: control leaves the block for `failure` when the
+    /// condition is false, and falls through to the next instruction otherwise.
+    ///
+    /// A handler is mostly checks, and spelling each one as a branch terminator
+    /// costs two blocks -- the one the check continues into and the one its
+    /// join needs -- for code that is a single conditional jump. Keeping the
+    /// check inside the block leaves the path that passes it straight-line,
+    /// which is what every later phase is indexed by.
+    Guard {
+        failure: BlockId,
+    },
 }
 
 impl From<Intrinsic> for Operation {
@@ -96,7 +112,15 @@ impl Operation {
                 };
                 effects
             }
-            Self::BlockReference(_) | Self::Address => Effects::PURE,
+            Self::BlockReference(_) | Self::Address | Self::Guard { .. } => Effects::PURE,
+        }
+    }
+
+    /// Where control goes when this operation decides not to continue.
+    pub(crate) fn guard_failure(&self) -> Option<BlockId> {
+        match self {
+            Self::Guard { failure } => Some(*failure),
+            _ => None,
         }
     }
 }
@@ -104,9 +128,16 @@ impl Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Instruction {
     pub(crate) operation: Operation,
-    pub(crate) inputs: Vec<ValueId>,
-    pub(crate) results: Vec<ValueId>,
+    pub(crate) inputs: SmallVec<[ValueId; 2]>,
+    pub(crate) results: SmallVec<[ValueId; 2]>,
+    base_effects: Effects,
     pub(crate) effects: Effects,
+}
+
+impl Instruction {
+    pub(crate) fn can_be_eliminated(&self) -> bool {
+        self.effects.can_be_eliminated() && self.operation.guard_failure().is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -125,22 +156,15 @@ pub(crate) enum Constant {
 impl Constant {
     fn symbol(name: impl Into<String>) -> Self {
         let name = name.into();
-        crate::frontend::layout::KnownLayoutConstant::from_name(&name)
-            .map_or(Self::Symbol(name), Self::KnownLayout)
+        crate::frontend::layout::KnownLayoutConstant::from_name(&name).map_or(Self::Symbol(name), Self::KnownLayout)
     }
 
-    fn layout_value(
-        value: crate::frontend::layout::LayoutValue,
-    ) -> Self {
+    fn layout_value(value: crate::frontend::layout::LayoutValue) -> Self {
         match value {
             crate::frontend::layout::LayoutValue::Constant(constant) => {
-                constant
-                    .known()
-                    .map_or(Self::LayoutValue(value), Self::KnownLayout)
+                constant.known().map_or(Self::LayoutValue(value), Self::KnownLayout)
             }
-            crate::frontend::layout::LayoutValue::Immediate(_) => {
-                Self::LayoutValue(value)
-            }
+            crate::frontend::layout::LayoutValue::Immediate(_) => Self::LayoutValue(value),
         }
     }
 }
@@ -149,25 +173,24 @@ impl Constant {
 pub(crate) enum ValueDefinition {
     Dead,
     FunctionParameter(usize),
-    BlockParameter {
-        block: BlockId,
-        index: usize,
-    },
-    InstructionResult {
-        instruction: InstructionId,
-        index: usize,
-    },
-    TerminatorResult {
-        block: BlockId,
-        index: usize,
-    },
+    BlockParameter { block: BlockId, index: usize },
+    InstructionResult { instruction: InstructionId, index: usize },
+    TerminatorResult { block: BlockId, index: usize },
     Constant(Constant),
+}
+
+struct UseAnalyses<'a> {
+    cfg: &'a analysis::ControlFlowGraph,
+    dominators: &'a analysis::DominatorTree,
+    instruction_layout: &'a analysis::InstructionLayout,
+    guards: &'a analysis::GuardExits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Value {
     pub(crate) ty: Type,
     pub(crate) definition: ValueDefinition,
+    depends_on_machine_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,33 +263,42 @@ impl Terminator {
         }
     }
 
-    pub(crate) fn switch(
-        value: ValueId,
-        cases: Vec<(ValueId, Edge)>,
-        default: Edge,
-    ) -> Self {
-        Self::Switch {
-            value,
-            cases,
-            default,
+    pub(crate) fn switch(value: ValueId, cases: Vec<(ValueId, Edge)>, default: Edge) -> Self {
+        Self::Switch { value, cases, default }
+    }
+
+    pub(crate) fn successor_count(&self) -> usize {
+        match self {
+            Self::Jump(_) => 1,
+            Self::Branch { .. } | Self::CheckedOperation { .. } => 2,
+            Self::Switch { cases, .. } => cases.len() + 1,
+            Self::IndirectJump { .. } | Self::Return(_) | Self::Unreachable => 0,
         }
     }
 
-    pub(crate) fn successors(&self) -> Vec<&Edge> {
+    pub(crate) fn successor(&self, index: usize) -> &Edge {
         match self {
-            Self::Jump(edge) => vec![edge],
-            Self::Branch {
-                then_edge,
-                else_edge,
-                ..
-            } => vec![then_edge, else_edge],
-            Self::Switch { cases, default, .. } => {
-                cases.iter().map(|(_, edge)| edge).chain([default]).collect()
-            }
-            Self::CheckedOperation {
-                success, failure, ..
-            } => vec![success, failure],
-            Self::IndirectJump { .. } | Self::Return(_) | Self::Unreachable => Vec::new(),
+            Self::Jump(edge) if index == 0 => edge,
+            Self::Branch { then_edge, .. } if index == 0 => then_edge,
+            Self::Branch { else_edge, .. } if index == 1 => else_edge,
+            Self::CheckedOperation { success, .. } if index == 0 => success,
+            Self::CheckedOperation { failure, .. } if index == 1 => failure,
+            Self::Switch { cases, default, .. } => cases.get(index).map(|(_, edge)| edge).unwrap_or_else(|| {
+                if index == cases.len() {
+                    default
+                } else {
+                    panic!("no successor {index}")
+                }
+            }),
+            _ => panic!("no successor {index}"),
+        }
+    }
+
+    pub(crate) fn successors(&self) -> Successors<'_> {
+        Successors {
+            terminator: self,
+            front: 0,
+            back: self.successor_count(),
         }
     }
 
@@ -310,6 +342,43 @@ impl Terminator {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct Successors<'a> {
+    terminator: &'a Terminator,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> Iterator for Successors<'a> {
+    type Item = &'a Edge;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let edge = self.terminator.successor(self.front);
+        self.front += 1;
+        Some(edge)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.back - self.front;
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for Successors<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.terminator.successor(self.back))
+    }
+}
+
+impl ExactSizeIterator for Successors<'_> {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Block {
     pub(crate) name: Option<String>,
@@ -344,6 +413,7 @@ impl Function {
             .map(|(index, ty)| Value {
                 ty,
                 definition: ValueDefinition::FunctionParameter(index),
+                depends_on_machine_state: false,
             })
             .collect();
         Self {
@@ -361,7 +431,7 @@ impl Function {
             instructions: Vec::new(),
             values,
             entry: BlockId(0),
-            constant_values: HashMap::new(),
+            constant_values: HashMap::default(),
         }
     }
 
@@ -381,6 +451,7 @@ impl Function {
         self.values.push(Value {
             ty: ty.clone(),
             definition: ValueDefinition::Constant(constant.clone()),
+            depends_on_machine_state: matches!(constant, Constant::MachineRegister(_)),
         });
         self.constant_values.insert((ty, constant), id);
         id
@@ -401,6 +472,7 @@ impl Function {
                 self.values.push(Value {
                     ty,
                     definition: ValueDefinition::BlockParameter { block, index },
+                    depends_on_machine_state: false,
                 });
                 value
             })
@@ -436,7 +508,7 @@ impl Function {
         result_types: Vec<Type>,
     ) -> Vec<ValueId> {
         let operation = operation.into();
-        let effects = self.effects_for_operation(&operation, &inputs);
+        let effects = operation.effects();
         self.append_instruction_with_effects(block, operation, inputs, result_types, effects)
     }
 
@@ -449,6 +521,9 @@ impl Function {
         effects: Effects,
     ) -> Vec<ValueId> {
         let operation = operation.into();
+        let base_effects = effects;
+        let effects = self.effects_for_inputs(base_effects, &inputs);
+        let depends_on_machine_state = effects.machine_state != MemoryEffect::None;
         let instruction = InstructionId(self.instructions.len());
         let results = result_types
             .into_iter()
@@ -458,14 +533,16 @@ impl Function {
                 self.values.push(Value {
                     ty,
                     definition: ValueDefinition::InstructionResult { instruction, index },
+                    depends_on_machine_state,
                 });
                 value
             })
             .collect::<Vec<_>>();
         self.instructions.push(Instruction {
             operation,
-            inputs,
-            results: results.clone(),
+            inputs: inputs.into(),
+            results: results.clone().into(),
+            base_effects,
             effects,
         });
         self.blocks[block.0].instructions.push(instruction);
@@ -477,10 +554,7 @@ impl Function {
     }
 
     fn effects_for_inputs(&self, mut effects: Effects, inputs: &[ValueId]) -> Effects {
-        if inputs
-            .iter()
-            .any(|input| self.value_depends_on_machine_state(*input))
-        {
+        if inputs.iter().any(|input| self.value_depends_on_machine_state(*input)) {
             effects.machine_state = if effects.machine_state.writes() {
                 MemoryEffect::ReadWrite
             } else {
@@ -491,18 +565,109 @@ impl Function {
     }
 
     fn value_depends_on_machine_state(&self, value: ValueId) -> bool {
-        match &self.values[value.0].definition {
-            ValueDefinition::Constant(Constant::MachineRegister(_)) => true,
-            ValueDefinition::InstructionResult { instruction, .. } => {
-                let instruction = &self.instructions[instruction.0];
-                instruction.effects.machine_state != MemoryEffect::None
-                    || instruction
-                        .inputs
-                        .iter()
-                        .any(|input| self.value_depends_on_machine_state(*input))
+        self.values[value.0].depends_on_machine_state
+    }
+
+    fn recompute_machine_state_dependencies(&mut self) {
+        let mut dependent_values = vec![false; self.values.len()];
+        let mut dependents = vec![Vec::new(); self.values.len()];
+        let mut worklist = Vec::new();
+
+        for (index, value) in self.values.iter().enumerate() {
+            if matches!(
+                value.definition,
+                ValueDefinition::Constant(Constant::MachineRegister(_))
+            ) {
+                dependent_values[index] = true;
+                worklist.push(ValueId(index));
             }
-            _ => false,
         }
+        for instruction in &self.instructions {
+            for input in &instruction.inputs {
+                dependents[input.0].extend(instruction.results.iter().copied());
+            }
+            if instruction.base_effects.machine_state != MemoryEffect::None {
+                for result in &instruction.results {
+                    if !dependent_values[result.0] {
+                        dependent_values[result.0] = true;
+                        worklist.push(*result);
+                    }
+                }
+            }
+        }
+        for block in &self.blocks {
+            let terminator = block
+                .terminator
+                .as_ref()
+                .expect("machine-state dependencies require complete SSA");
+            if let Terminator::CheckedOperation {
+                inputs,
+                results,
+                effects,
+                ..
+            } = terminator
+            {
+                for input in inputs {
+                    dependents[input.0].extend(results.iter().copied());
+                }
+                if effects.machine_state != MemoryEffect::None {
+                    for result in results {
+                        if !dependent_values[result.0] {
+                            dependent_values[result.0] = true;
+                            worklist.push(*result);
+                        }
+                    }
+                }
+            }
+            for edge in terminator.successors() {
+                for (argument, parameter) in edge.arguments.iter().zip(&self.blocks[edge.block.0].parameters) {
+                    dependents[argument.0].push(*parameter);
+                }
+            }
+        }
+
+        while let Some(value) = worklist.pop() {
+            for dependent in &dependents[value.0] {
+                if !dependent_values[dependent.0] {
+                    dependent_values[dependent.0] = true;
+                    worklist.push(*dependent);
+                }
+            }
+        }
+
+        for (value, dependent) in self.values.iter_mut().zip(&dependent_values) {
+            value.depends_on_machine_state = *dependent;
+        }
+        let effects = self
+            .instructions
+            .iter()
+            .map(|instruction| self.effects_for_inputs(instruction.base_effects, &instruction.inputs))
+            .collect::<Vec<_>>();
+        for (instruction, effects) in self.instructions.iter_mut().zip(effects) {
+            instruction.effects = effects;
+        }
+    }
+
+    /// The blocks a guard in `block` can exit to, with where the guard sits.
+    ///
+    /// A guard exit is an edge the terminator knows nothing about, so anything
+    /// that walks control flow has to ask for these as well.
+    pub(crate) fn guard_exits(&self, block: BlockId) -> impl Iterator<Item = (usize, BlockId)> + '_ {
+        self.blocks[block.0]
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(position, instruction)| {
+                self.instructions[instruction.0]
+                    .operation
+                    .guard_failure()
+                    .map(|failure| (position, failure))
+            })
+    }
+
+    /// Where the first guard in `block` sits, if it has one.
+    pub(crate) fn first_guard_position(&self, block: BlockId) -> Option<usize> {
+        self.guard_exits(block).next().map(|(position, _)| position)
     }
 
     pub(crate) fn set_terminator(&mut self, block: BlockId, terminator: Terminator) {
@@ -531,6 +696,7 @@ impl Function {
                 self.values.push(Value {
                     ty,
                     definition: ValueDefinition::TerminatorResult { block, index },
+                    depends_on_machine_state: false,
                 });
                 value
             })
@@ -544,11 +710,7 @@ impl Function {
                 effects,
                 success: Edge::with_arguments(
                     success_block,
-                    results
-                    .iter()
-                    .copied()
-                    .chain(success_arguments)
-                    .collect(),
+                    results.iter().copied().chain(success_arguments).collect(),
                 ),
                 failure,
             },
@@ -596,7 +758,7 @@ impl Function {
         }
         for (index, instruction) in self.instructions.iter().enumerate() {
             let instruction_id = InstructionId(index);
-            self.validate_operation(&instruction.operation)?;
+            self.validate_instruction(instruction_id, instruction)?;
             for (result_index, result) in instruction.results.iter().enumerate() {
                 let Some(value) = self.values.get(result.0) else {
                     return Err(format!("instruction {instruction_id:?} has an invalid result"));
@@ -614,7 +776,46 @@ impl Function {
         self.validate_uses()
     }
 
+    fn validate_instruction(&self, instruction_id: InstructionId, instruction: &Instruction) -> Result<(), String> {
+        self.validate_operation(&instruction.operation)?;
+        if !matches!(instruction.operation, Operation::Guard { .. }) {
+            return Ok(());
+        }
+        let [condition] = instruction.inputs.as_slice() else {
+            return Err(format!(
+                "guard instruction {instruction_id:?} in '{}' must have exactly one input",
+                self.name
+            ));
+        };
+        let condition_type = &self
+            .values
+            .get(condition.0)
+            .ok_or_else(|| format!("guard instruction {instruction_id:?} uses invalid value {condition:?}"))?
+            .ty;
+        if condition_type != &Type::Bool {
+            return Err(format!(
+                "guard instruction {instruction_id:?} in '{}' uses {condition_type:?}, not Bool",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_operation(&self, operation: &Operation) -> Result<(), String> {
+        if let Operation::Guard { failure } = operation {
+            let Some(target) = self.blocks.get(failure.0) else {
+                return Err(format!("a guard in '{}' exits to invalid block {failure:?}", self.name));
+            };
+            // A guard exit carries no arguments, so nothing can supply the
+            // parameters of the block it leaves for.
+            if !target.parameters.is_empty() {
+                return Err(format!(
+                    "a guard in '{}' exits to {failure:?}, which takes parameters",
+                    self.name
+                ));
+            }
+            return Ok(());
+        }
         let Operation::Parameter(parameter) = operation else {
             return Ok(());
         };
@@ -653,7 +854,7 @@ impl Function {
                     .ok_or_else(|| format!("block {block:?} switches on invalid value {value:?}"))?
                     .ty
                     .clone();
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 for (pattern, _) in cases {
                     let pattern_type = self
                         .values
@@ -686,7 +887,9 @@ impl Function {
                         return Err(format!("checked operation in {block:?} does not own result {result:?}"));
                     }
                     if success.arguments.get(index) != Some(result) {
-                        return Err(format!("checked operation result {result:?} is not passed to its success block"));
+                        return Err(format!(
+                            "checked operation result {result:?} is not passed to its success block"
+                        ));
                     }
                     if success
                         .arguments
@@ -696,7 +899,9 @@ impl Function {
                         return Err(format!("checked operation result {result:?} is passed more than once"));
                     }
                     if failure.arguments.contains(result) {
-                        return Err(format!("checked operation result {result:?} is available on its failure edge"));
+                        return Err(format!(
+                            "checked operation result {result:?} is available on its failure edge"
+                        ));
                     }
                 }
             }
@@ -776,6 +981,13 @@ impl Function {
         let cfg = analysis::ControlFlowGraph::compute(self);
         let dominators = analysis::DominatorTree::compute(self, &cfg);
         let instruction_layout = analysis::InstructionLayout::compute(self)?;
+        let guards = analysis::GuardExits::compute(self, &cfg);
+        let analyses = UseAnalyses {
+            cfg: &cfg,
+            dominators: &dominators,
+            instruction_layout: &instruction_layout,
+            guards: &guards,
+        };
 
         for (instruction_index, instruction) in self.instructions.iter().enumerate() {
             let instruction_id = InstructionId(instruction_index);
@@ -785,20 +997,13 @@ impl Function {
                     *input,
                     block,
                     Some(instruction_layout.position(instruction_id)),
-                    &dominators,
-                    &instruction_layout,
+                    &analyses,
                 )?;
             }
         }
         for (block_index, block) in self.blocks.iter().enumerate() {
             for input in block.terminator.as_ref().unwrap().inputs() {
-                self.validate_use(
-                    input,
-                    BlockId(block_index),
-                    None,
-                    &dominators,
-                    &instruction_layout,
-                )?;
+                self.validate_use(input, BlockId(block_index), None, &analyses)?;
             }
         }
         Ok(())
@@ -809,9 +1014,14 @@ impl Function {
         value: ValueId,
         use_block: BlockId,
         use_position: Option<usize>,
-        dominators: &analysis::DominatorTree,
-        instruction_layout: &analysis::InstructionLayout,
+        analyses: &UseAnalyses<'_>,
     ) -> Result<(), String> {
+        let UseAnalyses {
+            cfg,
+            dominators,
+            instruction_layout,
+            guards,
+        } = analyses;
         let definition = self
             .values
             .get(value.0)
@@ -828,9 +1038,10 @@ impl Function {
             ValueDefinition::Dead => unreachable!(),
             ValueDefinition::FunctionParameter(_) | ValueDefinition::Constant(_) => return Ok(()),
             ValueDefinition::BlockParameter { block, .. } => (block, None),
-            ValueDefinition::InstructionResult { instruction, .. } => {
-                (instruction_layout.block(instruction), Some(instruction_layout.position(instruction)))
-            }
+            ValueDefinition::InstructionResult { instruction, .. } => (
+                instruction_layout.block(instruction),
+                Some(instruction_layout.position(instruction)),
+            ),
             ValueDefinition::TerminatorResult { .. } => unreachable!(),
         };
         if definition_block == use_block {
@@ -844,6 +1055,14 @@ impl Function {
         if !dominators.dominates(definition_block, use_block) {
             return Err(format!("value {value:?} does not dominate its use in {use_block:?}"));
         }
+        let position = definition_position.unwrap_or(0);
+        if !guards.definition_reaches(definition_block, position, use_block)
+            && guards.definition_escapes(self, cfg, definition_block, position, use_block)
+        {
+            return Err(format!(
+                "value {value:?} is defined past a guard in {definition_block:?} and cannot reach {use_block:?}"
+            ));
+        }
         Ok(())
     }
 }
@@ -855,7 +1074,14 @@ mod tests {
 
     #[test]
     fn exposes_intrinsic_properties_to_ssa() {
-        assert_eq!(MemoryOperation::Load { width: MemoryWidth::HalfWord, signed: true }.access_width(), 2);
+        assert_eq!(
+            MemoryOperation::Load {
+                width: MemoryWidth::HalfWord,
+                signed: true
+            }
+            .access_width(),
+            2
+        );
         assert_eq!(MemoryOperation::StorePair(PairWidth::DoubleWord).address_count(), 2);
         assert!(MemoryOperation::StorePair(PairWidth::DoubleWord).writes());
         assert!(!MemoryOperation::LoadPair(PairWidth::DoubleWord).writes());
@@ -911,14 +1137,8 @@ mod tests {
             vec![function.parameter(1)],
             vec![Type::I32],
         )[0];
-        function.set_terminator(
-            then_block,
-            Terminator::jump(join),
-        );
-        function.set_terminator(
-            else_block,
-            Terminator::jump(join),
-        );
+        function.set_terminator(then_block, Terminator::jump(join));
+        function.set_terminator(else_block, Terminator::jump(join));
         function.set_terminator(join, Terminator::Return(vec![value]));
 
         assert!(function.validate().unwrap_err().contains("does not dominate"));
@@ -955,7 +1175,10 @@ mod tests {
         let symbol = function.add_constant(Type::U64, Constant::Symbol("CAGE_MASK".to_string()));
         let value = function.append_instruction_with_effects(
             function.entry,
-            Intrinsic::Memory(MemoryOperation::Load { width: MemoryWidth::Word, signed: false }),
+            Intrinsic::Memory(MemoryOperation::Load {
+                width: MemoryWidth::Word,
+                signed: false,
+            }),
             vec![function.parameter(0), offset, symbol],
             vec![Type::U32],
             Effects {
@@ -968,6 +1191,88 @@ mod tests {
         function.set_terminator(function.entry, Terminator::Return(vec![value]));
 
         function.validate().unwrap();
+    }
+
+    #[test]
+    fn tracks_machine_state_dependencies_in_linear_time() {
+        let mut function = Function::new("machine-state-dag", Vec::new(), Vec::new());
+        let machine_state = function.add_constant(
+            Type::U64,
+            Constant::MachineRegister(RegisterReference::Interpreter(InterpreterRegister::ProgramBase)),
+        );
+        let one = function.add_constant(Type::U64, Constant::Integer(1));
+        let mut previous = machine_state;
+        let mut current = one;
+        for _ in 0..100 {
+            let next = function.append_instruction(
+                function.entry,
+                Intrinsic::IntegerBinary(IntegerBinaryOperation::Binary(BinaryOperation::Add)),
+                vec![previous, current],
+                vec![Type::U64],
+            )[0];
+            previous = current;
+            current = next;
+        }
+        function.set_terminator(function.entry, Terminator::Return(vec![current]));
+
+        assert_eq!(
+            function.instructions.last().unwrap().effects.machine_state,
+            MemoryEffect::Read
+        );
+
+        function.instructions[0].inputs[0] = one;
+        function.recompute_machine_state_dependencies();
+        assert_eq!(
+            function.instructions.last().unwrap().effects.machine_state,
+            MemoryEffect::None
+        );
+    }
+
+    #[test]
+    fn tracks_machine_state_through_checked_results_and_block_parameters() {
+        let mut function = Function::new("checked-machine-state", Vec::new(), Vec::new());
+        let machine_state = function.add_constant(
+            Type::U64,
+            Constant::MachineRegister(RegisterReference::Interpreter(InterpreterRegister::ProgramBase)),
+        );
+        let one = function.add_constant(Type::U64, Constant::Integer(1));
+        let success = function.create_named_block("success", BlockLayout::Hot, vec![Type::U64]);
+        let failure = function.create_empty_block("failure", BlockLayout::Cold);
+        let results = function.set_checked_operation(
+            function.entry,
+            Intrinsic::CheckedInteger(CheckedIntegerOperation::Add),
+            vec![machine_state, one],
+            vec![Type::U64],
+            Effects::PURE,
+            success,
+            Vec::new(),
+            Edge::new(failure),
+        );
+        let parameter = function.blocks[success.0].parameters[0];
+        function.append_instruction(
+            success,
+            Intrinsic::LowLevel(LowLevelOperation::Negate),
+            vec![parameter],
+            vec![Type::U64],
+        );
+        function.set_terminator(success, Terminator::Return(Vec::new()));
+        function.set_terminator(failure, Terminator::Unreachable);
+
+        function.recompute_machine_state_dependencies();
+        assert!(function.values[results[0].0].depends_on_machine_state);
+        assert!(function.values[parameter.0].depends_on_machine_state);
+        assert_eq!(function.instructions[0].effects.machine_state, MemoryEffect::Read);
+
+        let Terminator::CheckedOperation { inputs, .. } =
+            function.blocks[function.entry.0].terminator.as_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        inputs[0] = one;
+        function.recompute_machine_state_dependencies();
+        assert!(!function.values[results[0].0].depends_on_machine_state);
+        assert!(!function.values[parameter.0].depends_on_machine_state);
+        assert_eq!(function.instructions[0].effects.machine_state, MemoryEffect::None);
     }
 
     #[test]
@@ -994,16 +1299,20 @@ mod tests {
             Vec::new(),
         );
         scalar_function.set_terminator(scalar_function.entry, Terminator::Return(Vec::new()));
-        assert!(scalar_function
-            .validate()
-            .unwrap_err()
-            .contains("references non-operation parameter 0"));
+        assert!(
+            scalar_function
+                .validate()
+                .unwrap_err()
+                .contains("references non-operation parameter 0")
+        );
 
         function.instructions[0].operation = Operation::Parameter(OperationParameterId(1));
-        assert!(function
-            .validate()
-            .unwrap_err()
-            .contains("references invalid operation parameter 1"));
+        assert!(
+            function
+                .validate()
+                .unwrap_err()
+                .contains("references invalid operation parameter 1")
+        );
     }
 
     #[test]
@@ -1018,20 +1327,93 @@ mod tests {
         assert_eq!(function.values.len(), 2);
     }
 
-    #[test]
-    fn unifies_known_source_and_layout_constants() {
-        let constants = crate::frontend::layout::LayoutConstants::from_values([
-            ("EMPTY_VALUE".to_string(), 0x7ffb_0000_0000_0000),
-        ]);
+    fn guarded_function() -> (Function, BlockId, ValueId) {
+        let mut function = Function::new("guarded", vec![Type::Bool, Type::I32], vec![Type::I32]);
+        let failure = function.create_empty_block("failure", BlockLayout::Cold);
+        function.append_instruction(
+            function.entry,
+            Operation::Guard { failure },
+            vec![function.parameter(0)],
+            Vec::new(),
+        );
+        let value = function.append_instruction(
+            function.entry,
+            Intrinsic::Value(ValueOperation::Reuse),
+            vec![function.parameter(1)],
+            vec![Type::I32],
+        )[0];
+        function.set_terminator(function.entry, Terminator::Return(vec![value]));
+        (function, failure, value)
+    }
 
-        assert_eq!(
-            Constant::symbol("EMPTY_VALUE"),
-            Constant::layout_value(
-                crate::frontend::layout::LayoutValue::Constant(
-                    constants.get("EMPTY_VALUE").unwrap(),
-                )
-            )
+    #[test]
+    fn a_guard_exit_is_an_edge_out_of_the_middle_of_its_block() {
+        let (mut function, failure, _) = guarded_function();
+        function.set_terminator(failure, Terminator::Return(vec![function.parameter(1)]));
+
+        let cfg = analysis::ControlFlowGraph::compute(&function);
+
+        assert_eq!(cfg.successors(function.entry), [failure]);
+        assert_eq!(cfg.predecessors(failure), [function.entry]);
+        assert!(cfg.is_reachable(failure));
+        function.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_guards_without_one_boolean_condition() {
+        let (mut function, failure, _) = guarded_function();
+        function.set_terminator(failure, Terminator::Unreachable);
+        let guard = function.blocks[function.entry.0].instructions[0];
+        function.instructions[guard.0].inputs.clear();
+        assert!(function.validate().unwrap_err().contains("must have exactly one input"));
+
+        let non_boolean = function.parameter(1);
+        function.instructions[guard.0].inputs.push(non_boolean);
+        assert!(function.validate().unwrap_err().contains("uses I32, not Bool"));
+    }
+
+    #[test]
+    fn rejects_a_value_defined_past_a_guard_where_the_guard_leaves_for() {
+        let (mut function, failure, value) = guarded_function();
+        function.set_terminator(failure, Terminator::Return(vec![value]));
+
+        assert!(
+            function
+                .validate()
+                .unwrap_err()
+                .contains("is defined past a guard in BlockId(0)")
         );
     }
 
+    #[test]
+    fn accepts_a_value_defined_past_a_guard_no_exit_of_its_own_reaches() {
+        let (mut function, failure, value) = guarded_function();
+        let reader = function.create_empty_block("reader", BlockLayout::Hot);
+        let elsewhere = function.create_empty_block("elsewhere", BlockLayout::Hot);
+        function.blocks[function.entry.0].terminator = Some(Terminator::jump(elsewhere));
+        function.append_instruction(
+            elsewhere,
+            Operation::Guard { failure: reader },
+            vec![function.parameter(0)],
+            Vec::new(),
+        );
+        function.set_terminator(elsewhere, Terminator::jump(reader));
+        function.set_terminator(reader, Terminator::Return(vec![value]));
+        function.set_terminator(failure, Terminator::Unreachable);
+
+        function.validate().unwrap();
+    }
+
+    #[test]
+    fn unifies_known_source_and_layout_constants() {
+        let constants =
+            crate::frontend::layout::LayoutConstants::from_values([("EMPTY_VALUE".to_string(), 0x7ffb_0000_0000_0000)]);
+
+        assert_eq!(
+            Constant::symbol("EMPTY_VALUE"),
+            Constant::layout_value(crate::frontend::layout::LayoutValue::Constant(
+                constants.get("EMPTY_VALUE").unwrap(),
+            ))
+        );
+    }
 }

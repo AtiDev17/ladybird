@@ -24,3 +24,65 @@ jobs:
 
       - name: Lint
         run: "${GITHUB_WORKSPACE}/Meta/lint-ci.sh"
+
+  flap:
+    permissions:
+      contents: read
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.repository == 'LadybirdBrowser/ladybird'
+    container:
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.07.04
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set Up Environment
+        uses: ./.github/actions/setup
+        with:
+          os: 'Linux'
+          arch: 'x86_64'
+          type: 'lint'
+
+      - name: Check Flap
+        run: |
+          cargo fmt --manifest-path Libraries/LibJS/Flap/Cargo.toml -- --check
+          cargo clippy --manifest-path Libraries/LibJS/Flap/Cargo.toml \
+            --all-targets -- -D clippy::all
+          cargo test --manifest-path Libraries/LibJS/Flap/Cargo.toml \
+            --all-targets
+
+      - name: Check BytecodeDef
+        run: |
+          cargo fmt --manifest-path Libraries/LibJS/BytecodeDef/Cargo.toml -- --check
+          cargo clippy --manifest-path Libraries/LibJS/BytecodeDef/Cargo.toml \
+            --all-targets -- -D clippy::all
+          cargo test --manifest-path Libraries/LibJS/BytecodeDef/Cargo.toml \
+            --all-targets
+
+      - name: Generate and assemble the Flap interpreter
+        run: |
+          cargo build --release --manifest-path Libraries/LibJS/Flap/Cargo.toml
+          mkdir -p "${RUNNER_TEMP}/flap-smoke"
+          for arch in x86_64 aarch64; do
+            Libraries/LibJS/Flap/target/release/flapc \
+              --arch "${arch}" \
+              --object-format elf \
+              --constants Libraries/LibJS/Flap/tests/interpreter-layout.conf \
+              --bytecode-def Libraries/LibJS/Bytecode/Bytecode.def \
+              --input Libraries/LibJS/Interpreter/interpreter.flap \
+              --output "${RUNNER_TEMP}/flap-smoke/${arch}.S"
+            clang --target="${arch}-unknown-linux-gnu" \
+              -c "${RUNNER_TEMP}/flap-smoke/${arch}.S" \
+              -o "${RUNNER_TEMP}/flap-smoke/${arch}.o"
+            Libraries/LibJS/Flap/target/release/flapc \
+              --arch "${arch}" \
+              --object-format elf \
+              --constants Libraries/LibJS/Flap/tests/interpreter-layout.conf \
+              --bytecode-def Libraries/LibJS/Bytecode/Bytecode.def \
+              --input Libraries/LibJS/Interpreter/interpreter.flap \
+              --output "${RUNNER_TEMP}/flap-smoke/${arch}-repeat.S"
+            cmp "${RUNNER_TEMP}/flap-smoke/${arch}.S" \
+              "${RUNNER_TEMP}/flap-smoke/${arch}-repeat.S"
+          done

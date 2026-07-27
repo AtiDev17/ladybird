@@ -6,13 +6,11 @@
 
 //! Lexical capture analysis for nested HIR regions.
 
-use super::{
-    Statement, VariableId, statement_uses_and_defs,
-};
-use std::collections::HashSet;
+use super::{Statement, VariableId, statement_uses_and_defs};
+use crate::hash::HashSet;
 
 pub(super) fn collect_captures(statements: &[Statement], outer_variable_count: usize) -> Vec<VariableId> {
-    let mut captures = HashSet::new();
+    let mut captures = HashSet::default();
     for statement in statements {
         let (uses, definitions) = statement_uses_and_defs(statement);
         captures.extend(
@@ -30,8 +28,8 @@ pub(super) fn collect_captures(statements: &[Statement], outer_variable_count: u
 }
 
 pub(super) fn collect_input_captures(statements: &[Statement], outer_variable_count: usize) -> Vec<VariableId> {
-    let mut captures = HashSet::new();
-    let mut definitions = HashSet::new();
+    let mut captures = HashSet::default();
+    let mut definitions = HashSet::default();
     for statement in statements {
         let (uses, defs) = statement_uses_and_defs(statement);
         captures.extend(

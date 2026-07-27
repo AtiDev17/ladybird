@@ -7,18 +7,29 @@
 //! SSA optimization pass orchestration and analysis caching.
 
 use super::Function;
-use super::analysis::{ControlFlowGraph, DominatorTree, InstructionLayout, NaturalLoop, ValueUses, find_natural_loops};
+use super::analysis::{
+    ControlFlowGraph, DominatorTree, GuardExits, InstructionLayout, NaturalLoop, find_natural_loops,
+};
 use super::effects::EffectDependencies;
 use super::print::function_to_string;
 use super::report::{OptimizationRemark, OptimizationRemarkKind, PassRunReport};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FunctionAnalyses<'a> {
     pub(crate) cfg: &'a ControlFlowGraph,
     pub(crate) dominators: &'a DominatorTree,
     pub(crate) instruction_layout: &'a InstructionLayout,
-    pub(crate) loops: &'a [NaturalLoop],
     pub(crate) effects: &'a EffectDependencies,
+    pub(crate) guards: &'a GuardExits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlacementAnalyses<'a> {
+    pub(crate) dominators: &'a DominatorTree,
+    pub(crate) instruction_layout: &'a InstructionLayout,
+    pub(crate) loops: &'a [NaturalLoop],
+    pub(crate) guards: &'a GuardExits,
 }
 
 #[derive(Debug, Default)]
@@ -36,14 +47,13 @@ pub(crate) struct AnalysisManager {
     instruction_layout: Option<InstructionLayout>,
     loops: Option<Vec<NaturalLoop>>,
     effects: Option<EffectDependencies>,
-    uses: Option<ValueUses>,
+    guards: Option<GuardExits>,
     instrumentation: Option<PassInstrumentation>,
 }
 
 impl AnalysisManager {
     pub(crate) fn cfg<'a>(&'a mut self, function: &Function) -> &'a ControlFlowGraph {
-        self.cfg
-            .get_or_insert_with(|| ControlFlowGraph::compute(function))
+        self.cfg.get_or_insert_with(|| ControlFlowGraph::compute(function))
     }
 
     pub(crate) fn dominators<'a>(&'a mut self, function: &Function) -> &'a DominatorTree {
@@ -57,8 +67,7 @@ impl AnalysisManager {
 
     pub(crate) fn instruction_layout<'a>(&'a mut self, function: &Function) -> &'a InstructionLayout {
         self.instruction_layout.get_or_insert_with(|| {
-            InstructionLayout::compute(function)
-                .expect("valid SSA has a valid instruction layout")
+            InstructionLayout::compute(function).expect("valid SSA has a valid instruction layout")
         })
     }
 
@@ -66,11 +75,7 @@ impl AnalysisManager {
         if self.loops.is_none() {
             self.cfg(function);
             self.dominators(function);
-            let loops = find_natural_loops(
-                function,
-                self.cfg.as_ref().unwrap(),
-                self.dominators.as_ref().unwrap(),
-            );
+            let loops = find_natural_loops(function, self.cfg.as_ref().unwrap(), self.dominators.as_ref().unwrap());
             self.loops = Some(loops);
         }
         self.loops.as_deref().unwrap()
@@ -85,22 +90,46 @@ impl AnalysisManager {
         self.effects.as_ref().unwrap()
     }
 
-    pub(crate) fn uses<'a>(&'a mut self, function: &Function) -> &'a ValueUses {
-        self.uses.get_or_insert_with(|| ValueUses::compute(function))
+    pub(crate) fn guards<'a>(&'a mut self, function: &Function) -> &'a GuardExits {
+        if self.guards.is_none() {
+            self.cfg(function);
+            let guards = GuardExits::compute(function, self.cfg.as_ref().unwrap());
+            self.guards = Some(guards);
+        }
+        self.guards.as_ref().unwrap()
+    }
+
+    /// The analyses a pass needs to decide where an instruction belongs.
+    ///
+    /// Placement says nothing about effects, and computing the effect
+    /// dependencies of a whole large function is the most expensive analysis
+    /// there is, so asking for the bundle that includes them costs a pass that
+    /// never reads them dearly.
+    pub(crate) fn placement<'a>(&'a mut self, function: &Function) -> PlacementAnalyses<'a> {
+        self.dominators(function);
+        self.instruction_layout(function);
+        self.loops(function);
+        self.guards(function);
+        PlacementAnalyses {
+            dominators: self.dominators.as_ref().unwrap(),
+            instruction_layout: self.instruction_layout.as_ref().unwrap(),
+            loops: self.loops.as_deref().unwrap(),
+            guards: self.guards.as_ref().unwrap(),
+        }
     }
 
     pub(crate) fn get<'a>(&'a mut self, function: &Function) -> FunctionAnalyses<'a> {
         self.cfg(function);
         self.dominators(function);
         self.instruction_layout(function);
-        self.loops(function);
         self.effects(function);
+        self.guards(function);
         FunctionAnalyses {
             cfg: self.cfg.as_ref().unwrap(),
             dominators: self.dominators.as_ref().unwrap(),
             instruction_layout: self.instruction_layout.as_ref().unwrap(),
-            loops: self.loops.as_deref().unwrap(),
             effects: self.effects.as_ref().unwrap(),
+            guards: self.guards.as_ref().unwrap(),
         }
     }
 
@@ -110,7 +139,7 @@ impl AnalysisManager {
         self.instruction_layout = None;
         self.loops = None;
         self.effects = None;
-        self.uses = None;
+        self.guards = None;
     }
 
     pub(crate) fn report(
@@ -147,10 +176,7 @@ impl AnalysisManager {
     }
 
     fn finish_pass(&mut self, changed: bool) -> PassInstrumentation {
-        let mut instrumentation = self
-            .instrumentation
-            .take()
-            .expect("pass instrumentation was enabled");
+        let mut instrumentation = self.instrumentation.take().expect("pass instrumentation was enabled");
         if instrumentation.attempted_transformations == 0 {
             instrumentation.attempted_transformations = 1;
             instrumentation.successful_transformations = u64::from(changed);
@@ -198,18 +224,20 @@ impl PassRunner {
         if let Some(options) = self.options {
             self.analyses.begin_pass(options.collect_remarks);
         }
+        let started_at = self.options.map(|_| Instant::now());
         let changed = pass(function, &mut self.analyses);
+        let elapsed = started_at.map(|started_at| started_at.elapsed());
         let instrumentation = self.options.map(|_| self.analyses.finish_pass(changed));
         if changed {
+            function.recompute_machine_state_dependencies();
             self.analyses.invalidate();
         }
-        if cfg!(debug_assertions) {
-            function
-                .validate()
-                .unwrap_or_else(|error| panic!("SSA pass '{name}' produced invalid IR: {error}"));
-        }
+        function
+            .validate()
+            .unwrap_or_else(|error| panic!("SSA pass '{name}' produced invalid IR: {error}"));
         let report = instrumentation.map(|instrumentation| PassRunReport {
             name: name.to_string(),
+            elapsed: elapsed.expect("pass timing was enabled with instrumentation"),
             changed,
             attempted_transformations: instrumentation.attempted_transformations,
             successful_transformations: instrumentation.successful_transformations,
@@ -228,12 +256,22 @@ mod tests {
     use crate::ssa::Terminator;
 
     fn report_change(_: &mut Function, analyses: &mut AnalysisManager) -> bool {
-        analyses.report(OptimizationRemarkKind::Applied, "test-change", 1, "changed the test function");
+        analyses.report(
+            OptimizationRemarkKind::Applied,
+            "test-change",
+            1,
+            "changed the test function",
+        );
         true
     }
 
     fn report_no_change(_: &mut Function, analyses: &mut AnalysisManager) -> bool {
-        analyses.report(OptimizationRemarkKind::Missed, "test-change", 1, "the test condition was false");
+        analyses.report(
+            OptimizationRemarkKind::Missed,
+            "test-change",
+            1,
+            "the test condition was false",
+        );
         false
     }
 
@@ -248,7 +286,7 @@ mod tests {
         assert!(analyses.instruction_layout.is_none());
         assert!(analyses.loops.is_none());
         assert!(analyses.effects.is_none());
-        assert!(analyses.uses.is_none());
+        assert!(analyses.guards.is_none());
         false
     }
 
@@ -289,11 +327,7 @@ mod tests {
         let mut runner = PassRunner::new(None);
         assert!(
             runner
-                .run(
-                    &mut function,
-                    "compute-and-invalidate",
-                    compute_and_invalidate_analyses,
-                )
+                .run(&mut function, "compute-and-invalidate", compute_and_invalidate_analyses,)
                 .0
         );
         runner.run(&mut function, "assert-invalidated", assert_analyses_were_invalidated);
