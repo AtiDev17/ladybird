@@ -16,12 +16,15 @@ from dataclasses import field
 from pathlib import Path
 
 TEST_ROOT_RELATIVE = Path("Tests") / "LibWeb"
+HARNESS_STATUS_POLL_INTERVAL_SECONDS = 0.1
+PROCESS_TERMINATION_TIMEOUT_SECONDS = 5
 
 
 @dataclass
 class LevelResult:
     level: int
     failures: int
+    timed_out: bool = False
 
 
 @dataclass
@@ -30,6 +33,8 @@ class CandidateReport:
     levels: list = field(default_factory=list)
 
     def status(self, repeat):
+        if any(level.timed_out for level in self.levels):
+            return "timeout"
         total_failures = sum(level.failures for level in self.levels)
         if total_failures == 0:
             return "reliable"
@@ -139,6 +144,65 @@ def discover_candidates(args, repo_root, test_web_binary, base_worktree, scratch
     return sorted(new_tests) + sorted(modified_tests)
 
 
+def normalize_requested_test_path(repo_root, requested_path):
+    path, separator, query = requested_path.partition("?")
+    path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+
+    test_root = (repo_root / TEST_ROOT_RELATIVE).resolve()
+    requested = Path(path)
+    if requested.is_absolute():
+        try:
+            path = requested.resolve().relative_to(test_root).as_posix()
+        except ValueError:
+            pass
+    else:
+        prefix = TEST_ROOT_RELATIVE.as_posix() + "/"
+        if path.startswith(prefix):
+            path = path[len(prefix) :]
+        elif path == TEST_ROOT_RELATIVE.as_posix():
+            path = ""
+
+    return path.rstrip("/") + separator + query
+
+
+def discover_requested_candidates(args, repo_root, test_web_binary, scratch_dir):
+    test_root = repo_root / TEST_ROOT_RELATIVE
+    log(f"Discovering tests in working tree ({test_root})...")
+    discovered_tests = dry_run_tests(
+        test_web_binary, test_root, args.python_executable, scratch_dir / "dry-run-requested"
+    )
+    log(f"  {len(discovered_tests)} tests discovered.")
+
+    candidates = set()
+    all_paths_matched = True
+    for requested_path in args.test_paths:
+        normalized_path = normalize_requested_test_path(repo_root, requested_path)
+        base_path, separator, _query = normalized_path.partition("?")
+        if separator:
+            matches = {normalized_path} & discovered_tests
+        else:
+            matches = {
+                test
+                for test in discovered_tests
+                if not base_path
+                or test.partition("?")[0] == base_path
+                or test.partition("?")[0].startswith(base_path + "/")
+            }
+        if matches:
+            candidates.update(matches)
+        else:
+            log(f"Error: no tests matched requested path: {requested_path}")
+            all_paths_matched = False
+
+    if not all_paths_matched:
+        return None
+
+    log(f"  {len(candidates)} requested test(s) found.")
+    return sorted(candidates)
+
+
 def parse_concurrency_levels(spec):
     levels = []
     for level_string in spec.split(","):
@@ -159,6 +223,25 @@ def load_results(results_js_path):
         return json.loads(text)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def harness_status_has_timeout(harness_status_path):
+    try:
+        status = harness_status_path.read_text()
+    except OSError:
+        return False
+
+    match = re.search(r"^timeout:\s+(\d+)\s*$", status, re.MULTILINE)
+    return match is not None and int(match.group(1)) > 0
+
+
+def terminate_process(process):
+    process.terminate()
+    try:
+        return process.communicate(timeout=PROCESS_TERMINATION_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.communicate()
 
 
 def run_candidate(args, test_web_binary, test_root, candidate, level, deadline, results_root):
@@ -186,25 +269,52 @@ def run_candidate(args, test_web_binary, test_root, candidate, level, deadline, 
     if remaining is not None and remaining <= 0:
         return None
 
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    detected_timeout = False
     try:
-        subprocess.run(command, capture_output=True, text=True, timeout=remaining)
-    except subprocess.TimeoutExpired:
-        log(f"  {candidate} at -j{level}: deadline reached, skipped.")
-        return None
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                terminate_process(process)
+                log(f"  {candidate} at -j{level}: deadline reached, skipped.")
+                return None
+
+            poll_timeout = HARNESS_STATUS_POLL_INTERVAL_SECONDS
+            if remaining is not None:
+                poll_timeout = min(poll_timeout, remaining)
+
+            try:
+                stdout, stderr = process.communicate(timeout=poll_timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if harness_status_has_timeout(results_dir / "harness-status.txt"):
+                    detected_timeout = True
+                    stdout, stderr = terminate_process(process)
+                    break
+    except BaseException:
+        if process.poll() is None:
+            terminate_process(process)
+        raise
 
     results_path = results_dir / "results.js"
     results = load_results(results_path)
     if results is None:
+        if detected_timeout:
+            return LevelResult(level=level, failures=1, timed_out=True)
+        log(stdout)
+        log(stderr)
         raise RuntimeError(f"Could not parse {results_path} for {candidate} at -j{level}")
 
     failures = 0
+    timed_out = detected_timeout
     for entry in results.get("tests", []):
         if entry.get("result") == "Skipped":
             continue
         name = re.sub(r"^run-\d+/", "", entry.get("name", ""))
         if name == candidate or name.startswith(candidate + "@"):
             failures += 1
-    return failures
+            timed_out = timed_out or entry.get("result") == "Timeout"
+    return LevelResult(level=level, failures=failures, timed_out=timed_out)
 
 
 def format_levels(report, repeat):
@@ -214,10 +324,11 @@ def format_levels(report, repeat):
 def write_summary(reports, skipped, levels, repeat):
     flaky = [report for report in reports if report.status(repeat) == "flaky"]
     failing = [report for report in reports if report.status(repeat) == "fail"]
+    timed_out = [report for report in reports if report.status(repeat) == "timeout"]
 
     lines = [
         f"Checked {len(reports)} candidate test(s) at parallelism levels {levels}: "
-        f"{len(flaky)} flaky, {len(failing)} always failing.",
+        f"{len(flaky)} flaky, {len(failing)} always failing, {len(timed_out)} timed out.",
         "",
     ]
 
@@ -235,6 +346,14 @@ def write_summary(reports, skipped, levels, repeat):
             lines.append(f"- {report.relative_path}")
         lines.append("")
 
+    if timed_out:
+        lines.append("Tests that timed out")
+        lines.append("")
+        for report in timed_out:
+            timeout_levels = ", ".join(f"-j{result.level}" for result in report.levels if result.timed_out)
+            lines.append(f"- {report.relative_path} at {timeout_levels}")
+        lines.append("")
+
     if skipped:
         lines.append("Not checked (time budget exhausted)")
         lines.append("")
@@ -243,7 +362,7 @@ def write_summary(reports, skipped, levels, repeat):
         lines.append("")
 
     print("\n".join(lines))
-    return flaky + failing
+    return flaky + failing + timed_out
 
 
 def parse_args(argv):
@@ -273,6 +392,12 @@ def parse_args(argv):
     parser.add_argument(
         "--python-executable", default="python3", help="Path to python3 for test-web (default: python3)"
     )
+    parser.add_argument(
+        "test_paths",
+        nargs="*",
+        metavar="TEST_PATH",
+        help="Specific test files or directories to check instead of discovering new and modified tests",
+    )
     return parser.parse_args(argv)
 
 
@@ -294,13 +419,21 @@ def main(argv):
     deadline = None if args.deadline_seconds <= 0 else time.monotonic() + args.deadline_seconds
 
     scratch_dir = Path(tempfile.mkdtemp(prefix="flaky-tests-check-")).resolve()
-    base_worktree_path = scratch_dir / "base-worktree"
-    try:
-        log(f"Adding base worktree for {args.base_ref}...")
-        run_git(repo_root, "worktree", "add", "--detach", str(base_worktree_path), args.base_ref)
-        candidates = discover_candidates(args, repo_root, test_web_binary, base_worktree_path, scratch_dir)
-    finally:
-        cleanup_worktree(repo_root, base_worktree_path, scratch_dir)
+    if args.test_paths:
+        try:
+            candidates = discover_requested_candidates(args, repo_root, test_web_binary, scratch_dir)
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+        if candidates is None:
+            return 2
+    else:
+        base_worktree_path = scratch_dir / "base-worktree"
+        try:
+            log(f"Adding base worktree for {args.base_ref}...")
+            run_git(repo_root, "worktree", "add", "--detach", str(base_worktree_path), args.base_ref)
+            candidates = discover_candidates(args, repo_root, test_web_binary, base_worktree_path, scratch_dir)
+        finally:
+            cleanup_worktree(repo_root, base_worktree_path, scratch_dir)
 
     if not candidates:
         log("No new or modified tests: nothing to check.")
@@ -322,13 +455,15 @@ def main(argv):
             saw_pass = False
             saw_fail = False
             for level in levels:
-                failures = run_candidate(args, test_web_binary, pr_test_root, candidate, level, deadline, results_root)
-                if failures is None:
+                level_result = run_candidate(
+                    args, test_web_binary, pr_test_root, candidate, level, deadline, results_root
+                )
+                if level_result is None:
                     break
-                report.levels.append(LevelResult(level=level, failures=failures))
-                saw_pass = saw_pass or failures < args.repeat
-                saw_fail = saw_fail or failures > 0
-                if saw_pass and saw_fail:
+                report.levels.append(level_result)
+                saw_pass = saw_pass or level_result.failures < args.repeat
+                saw_fail = saw_fail or level_result.failures > 0
+                if level_result.timed_out or (saw_pass and saw_fail):
                     break
             if not report.levels:
                 skipped.append(candidate)
@@ -339,6 +474,8 @@ def main(argv):
                 log(f"  FLAKY: {candidate} ({format_levels(report, args.repeat)})")
             elif status == "fail":
                 log(f"  FAIL: {candidate}")
+            elif status == "timeout":
+                log(f"  TIMEOUT: {candidate}")
     finally:
         shutil.rmtree(results_root, ignore_errors=True)
 
