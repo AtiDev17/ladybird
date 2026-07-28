@@ -8,6 +8,19 @@
 
 namespace Web::Painting {
 
+static StringView line_style_name(Gfx::LineStyle line_style)
+{
+    switch (line_style) {
+    case Gfx::LineStyle::Solid:
+        return "Solid"sv;
+    case Gfx::LineStyle::Dotted:
+        return "Dotted"sv;
+    case Gfx::LineStyle::Dashed:
+        return "Dashed"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 static StringView scaling_mode_name(Gfx::ScalingMode scaling_mode)
 {
     switch (scaling_mode) {
@@ -25,9 +38,7 @@ static StringView scaling_mode_name(Gfx::ScalingMode scaling_mode)
 
 Gfx::IntRect PaintOuterBoxShadow::bounding_rect() const
 {
-    auto rect = shadow_rect;
-    rect.inflate(blur_radius * 2, blur_radius * 2, blur_radius * 2, blur_radius * 2);
-    return rect;
+    return shadow_rect.inflated(blur_radius * 2, blur_radius * 2, blur_radius * 2, blur_radius * 2);
 }
 
 Gfx::IntRect PaintInnerBoxShadow::bounding_rect() const
@@ -155,8 +166,13 @@ void FillPath::dump(StringBuilder& builder) const
     builder.appendff(" path_bounding_rect={}", path_bounding_rect);
 }
 
-void StrokePath::dump(StringBuilder&) const
+void StrokePath::dump(StringBuilder& builder) const
 {
+    builder.appendff(" path_bounding_rect={} thickness={}", path_bounding_rect, thickness);
+    if (paint_kind == PathPaintKind::Color)
+        builder.appendff(" color={}", color);
+    if (dash_array.size > 0)
+        builder.appendff(" dash_array_size={} dash_offset={:.2f}", dash_array.size / sizeof(float), dash_offset);
 }
 
 void DrawEllipse::dump(StringBuilder& builder) const
@@ -171,7 +187,9 @@ void FillEllipse::dump(StringBuilder& builder) const
 
 void DrawLine::dump(StringBuilder& builder) const
 {
-    builder.appendff(" from={} to={} color={} thickness={}", from, to, color, thickness);
+    builder.appendff(" from={} to={} color={} thickness={} style={}", from, to, color, thickness, line_style_name(style));
+    if (style != Gfx::LineStyle::Solid)
+        builder.appendff(" alternate_color={}", alternate_color);
 }
 
 void ApplyBackdropFilter::dump(StringBuilder& builder) const

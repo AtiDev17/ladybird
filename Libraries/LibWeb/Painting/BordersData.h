@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/GenericShorthands.h>
 #include <LibGfx/Color.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/Export.h>
@@ -22,10 +23,11 @@ enum class BorderEdge : u8 {
 };
 
 struct BorderDataDevicePixels {
-public:
     Color color { Color::Transparent };
     CSS::LineStyle line_style { CSS::LineStyle::None };
     DevicePixels width { 0 };
+
+    bool operator==(BorderDataDevicePixels const&) const = default;
 };
 
 struct BordersDataDevicePixels {
@@ -43,15 +45,18 @@ struct BordersDataDevicePixels {
             return right;
         case BorderEdge::Bottom:
             return bottom;
-        default: // BorderEdge::Left:
+        case BorderEdge::Left:
             return left;
         }
+        ASSERT_NOT_REACHED();
     }
 
     BorderDataDevicePixels const& for_edge(BorderEdge edge) const
     {
         return const_cast<BordersDataDevicePixels&>(*this).for_edge(edge);
     }
+
+    bool all_are_equal() const { return first_is_equal_to_all_of(top, right, bottom, left); }
 };
 
 struct WEB_API BordersData {

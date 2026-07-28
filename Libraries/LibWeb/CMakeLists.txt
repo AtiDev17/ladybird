@@ -802,25 +802,16 @@ set(SOURCES
     Layout/AudioBox.cpp
     Layout/AvailableSpace.cpp
     Layout/BlockContainer.cpp
-    Layout/BlockFormattingContext.cpp
     Layout/Box.cpp
     Layout/BreakNode.cpp
     Layout/CanvasBox.cpp
     Layout/CheckBox.cpp
     Layout/FieldSetBox.cpp
-    Layout/FlexFormattingContext.cpp
-    Layout/FormattingContext.cpp
-    Layout/GridFormattingContext.cpp
     Layout/ImageBox.cpp
     Layout/ImageProvider.cpp
-    Layout/InlineFormattingContext.cpp
-    Layout/InlineLevelIterator.cpp
     Layout/InlineNode.cpp
-    Layout/LayoutState.cpp
+    Layout/LayoutRustBridge.cpp
     Layout/LegendBox.cpp
-    Layout/LineBox.cpp
-    Layout/LineBoxFragment.cpp
-    Layout/LineBuilder.cpp
     Layout/ListItemBox.cpp
     Layout/ListItemMarkerBox.cpp
     Layout/NavigableContainerViewport.cpp
@@ -829,11 +820,9 @@ set(SOURCES
     Layout/RadioButton.cpp
     Layout/RangeInputBox.cpp
     Layout/ReplacedBox.cpp
-    Layout/ReplacedWithChildrenFormattingContext.cpp
     Layout/SVGBox.cpp
     Layout/SVGClipBox.cpp
     Layout/SVGForeignObjectBox.cpp
-    Layout/SVGFormattingContext.cpp
     Layout/SVGGeometryBox.cpp
     Layout/SVGGraphicsBox.cpp
     Layout/SVGImageBox.cpp
@@ -843,7 +832,6 @@ set(SOURCES
     Layout/SVGTextBox.cpp
     Layout/SVGTextPathBox.cpp
     Layout/ScrollableOverflow.cpp
-    Layout/TableFormattingContext.cpp
     Layout/TableGrid.cpp
     Layout/TableWrapper.cpp
     Layout/TextAreaBox.cpp
@@ -1350,7 +1338,9 @@ import_rust_crate(
         StyleValueRustFFI.h
         ComputedValuesRustFFI.h
         Layout/TreeBuilderRustFFI.h
+        Layout/LayoutRustFFI.h
 )
+target_link_libraries(libweb_rust INTERFACE LibGfx)
 
 set(content_blocker_rust_features "")
 if (NOT BUILD_SHARED_LIBS)
@@ -1386,6 +1376,7 @@ if(NOT BUILD_SHARED_LIBS)
     # re-merges the fresh Rust objects.
     set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE Layout/LayoutRustBridge.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Loader/ContentBlocker.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_content_blocker_rust_lib})
 endif()
