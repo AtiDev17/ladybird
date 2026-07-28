@@ -84,6 +84,7 @@ public:
     ~ContextState();
 
     bool is_owned_by(CompositorStateWebContentClient const&) const;
+    CompositorStateWebContentClient& web_content_client() const { return m_web_content_client; }
     void request_rendering_update();
     void dispatch_mouse_event_to_web_content(Web::MouseEvent const&);
 
@@ -103,8 +104,8 @@ public:
         Web::Painting::ScrollStateSnapshot&&);
     void update_visual_context_tree(Web::Painting::AccumulatedVisualContextTree);
     void update_scroll_state(Web::Painting::ScrollStateSnapshot&&);
-    void update_video_frame(Web::Painting::VideoFrameResourceId, NonnullRefPtr<Media::VideoFrame const>);
-    void clear_video_frame(Web::Painting::VideoFrameResourceId);
+    void set_video_sink(Web::Painting::VideoSinkResourceId, RefPtr<Media::VideoSink>);
+    HashMap<u64, Media::VideoSinkHandle> const& video_sink_handles() const { return m_display_list_resource_storage.video_sink_handles(); }
 
     void invalidate_wheel_event_listener_state(u64 generation);
     ContextUpdateResult handle_mouse_event(Web::MouseEvent const&);
@@ -141,6 +142,7 @@ public:
     Optional<PendingFrame> take_pending_present_frame_if_unblocked();
     bool needs_rasterization() const;
     Optional<Gfx::IntRect> current_frame_rect_to_present() const;
+    Optional<Gfx::IntRect> video_present_rect() const;
     Optional<PreparedFrame> prepare_frame(Web::Painting::DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
     void did_submit_prepared_frame(Gfx::IntRect);
     bool present_synchronously(Web::Painting::DisplayListPlayerSkia&, CompositedContextResolver const*);

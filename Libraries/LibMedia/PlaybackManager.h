@@ -11,18 +11,22 @@
 #include <AK/HashTable.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
+#include <AK/ThreadID.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
-#include <LibMedia/MediaTimeProvider.h>
+#include <LibMedia/MediaClock.h>
+#include <LibMedia/MediaTime.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/PlaybackStates/Forward.h>
 #include <LibMedia/PlaybackStates/PlaybackState.h>
+#include <LibMedia/Sinks/RemoteVideoSink.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
+#include <LibMedia/VideoSinkHandle.h>
 #include <LibSync/Mutex.h>
 
 namespace Media {
@@ -66,14 +70,11 @@ public:
     Optional<Track> preferred_video_track() { return m_preferred_video_track; }
     Optional<Track> preferred_audio_track() { return m_preferred_audio_track; }
 
-    // Creates a DisplayingVideoSink for the specified track.
-    //
-    // Note that in order for the current frame to change based on the media time, users must call
-    // DisplayingVideoSink::update(). It is recommended to drive this off of vertical sync.
-    NonnullRefPtr<DisplayingVideoSink> get_or_create_the_displaying_video_sink_for_track(Track const&);
-    // Removes the DisplayingVideoSink for the specified track. This will prevent the sink from
-    // retrieving any subsequent frames from the decoder.
-    void remove_the_displaying_video_sink_for_track(Track const&);
+    VideoSinkHandle reserve_video_sink_handle(Track const&);
+    void disable_video_sink_by_handle(VideoSinkHandle);
+    static void set_video_sink_ticking(VideoSinkHandle, bool);
+    void detach_lost_video_sink(VideoSinkHandle);
+    void set_video_resize_handler(VideoSinkHandle, Function<void(Gfx::Size<u32>)>);
 
     void enable_an_audio_track(Track const&);
     void disable_an_audio_track(Track const&);
@@ -98,17 +99,35 @@ public:
     Function<void(Track const&)> on_track_added;
     Function<void()> on_playback_state_change;
     Function<void(AK::Duration)> on_duration_change;
+    Function<void()> on_buffered_ranges_change;
     Function<void(DecoderError&&)> on_error;
 
     void add_media_source(NonnullRefPtr<MediaStream> const&);
     void add_media_source(NonnullRefPtr<Demuxer> const&);
 
+    struct RemoteVideoEdge {
+        NonnullRefPtr<RemoteVideoSink> sink;
+        MediaTimeReader time_reader;
+    };
+    // The edge is created unattached, so the caller can transmit it to its consumer before the pump
+    // can produce any traffic; attach_video_edge() then starts the flow.
+    static ErrorOr<RemoteVideoEdge> create_video_edge(VideoSinkHandle, RemoteVideoSink::Delegates);
+    static void attach_video_edge(VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
+    static RefPtr<VideoFrame> current_presented_frame(VideoSinkHandle);
+    static void release_video_edge(VideoSinkHandle);
+
 private:
     struct VideoTrackData {
         Track track;
         NonnullRefPtr<DecodedVideoProducer> producer;
-        RefPtr<DisplayingVideoSink> display;
-        PipelineStatus sink_status { PipelineStatus::HaveData };
+        Optional<VideoSinkHandle> handle { OptionalNone() };
+        RefPtr<VideoSink> video_sink { nullptr };
+        PipelineStatus sink_status { PipelineStatus::Pending };
+        // While ticking, the sink's dispatched status is live and remains the sole ending
+        // authority; while unticked, it is stale and the track ends at its verified end time.
+        bool ticking { true };
+        bool read_blocked { false };
+        Function<void(Gfx::Size<u32>)> on_resize { nullptr };
     };
     using VideoTrackDatas = Vector<VideoTrackData, EXPECTED_VIDEO_TRACK_COUNT>;
 
@@ -116,6 +135,7 @@ private:
         Track track;
         NonnullRefPtr<DecodedAudioProducer> producer;
         bool enabled { false };
+        bool read_blocked { false };
     };
     using AudioTrackDatas = Vector<AudioTrackData, EXPECTED_AUDIO_TRACK_COUNT>;
 
@@ -123,12 +143,16 @@ private:
 
     WeakPlaybackManager weak();
 
-    void set_time_provider(NonnullRefPtr<MediaTimeProvider> const&);
+    void set_clock(NonnullRefPtr<MediaClock> const&);
     void disable_audio();
 
     void set_up_producers();
+    void attach_video_sink(VideoTrackData&, NonnullRefPtr<VideoSink>);
     void on_audio_sink_state_changed(PipelineStatus);
     void on_video_sink_state_changed(Track const&, PipelineStatus);
+    void update_duration_from_scan_states();
+    bool is_enabled_supported_track(Track const&) const;
+    Optional<AK::Duration> verified_end_time_for_track(Track const&) const;
     void update_pipeline_state();
     void reset_pipeline_state();
     PipelineStatus combined_pipeline_status() const;
@@ -144,6 +168,23 @@ private:
         }
 
         VERIFY_NOT_REACHED();
+    }
+    // Handles are never reused, so a superseded or released handle simply finds no track data.
+    template<typename Self>
+    auto* find_video_data_for_handle(this Self&& self, VideoSinkHandle handle)
+    {
+        for (auto& track_data : self.m_video_track_datas) {
+            if (track_data.handle == handle)
+                return &track_data;
+        }
+        return static_cast<decltype(&self.m_video_track_datas[0])>(nullptr);
+    }
+    template<typename Self>
+    decltype(auto) get_video_data_for_handle(this Self&& self, VideoSinkHandle handle)
+    {
+        auto* track_data = self.find_video_data_for_handle(handle);
+        VERIFY(track_data != nullptr);
+        return *track_data;
     }
     template<typename Self>
     decltype(auto) get_audio_data_for_track(this Self&& self, Track const& track)
@@ -166,10 +207,13 @@ private:
 
     NonnullRefPtr<WeakPlaybackManagerLink> m_weak_link;
 
-    NonnullRefPtr<MediaTimeProvider> m_time_provider;
+    NonnullRefPtr<MediaClock> m_clock;
+    MediaTimeReader m_time_reader;
     float m_playback_rate { 1.0f };
 
     bool m_audio_output_disabled { false };
+
+    Vector<NonnullRefPtr<Demuxer>> m_demuxers;
 
     VideoTracks m_video_tracks;
     VideoTrackDatas m_video_track_datas;
@@ -213,7 +257,6 @@ class WeakPlaybackManagerLink : public AtomicRefCounted<WeakPlaybackManagerLink>
 public:
     WeakPlaybackManagerLink(PlaybackManager& manager)
         : m_manager(&manager)
-        , m_originating_event_loop(Core::EventLoop::current())
     {
     }
 
@@ -237,13 +280,12 @@ public:
 private:
     void verify_thread_is_originating_thread() const
     {
-        VERIFY(Core::EventLoop::is_running());
-        VERIFY(&Core::EventLoop::current() == &m_originating_event_loop);
+        VERIFY(m_originating_thread_id.is_current_thread());
     }
 
     mutable Sync::Mutex m_mutex;
     PlaybackManager* m_manager { nullptr };
-    Core::EventLoop& m_originating_event_loop;
+    AK::ThreadID m_originating_thread_id { AK::ThreadID::current() };
 };
 
 class WeakPlaybackManager {

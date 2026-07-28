@@ -19,6 +19,7 @@
 #include <LibGfx/Size.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/VideoPresentation/VideoPresentationServerConnection.h>
 #include <LibWeb/Compositor/Types.h>
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
@@ -45,8 +46,9 @@ public:
     void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList> const&, Web::Painting::AccumulatedVisualContextTree const&, Web::Painting::DisplayListResourceTransaction, Web::Painting::ScrollStateSnapshot const&);
     void update_visual_context_tree(Web::Compositor::CompositorContextId, Web::Painting::AccumulatedVisualContextTree const&);
     void update_scroll_state(Web::Compositor::CompositorContextId, Web::Painting::ScrollStateSnapshot const&);
-    void update_video_frame(Web::Compositor::CompositorContextId, Web::Painting::VideoFrameResourceId, NonnullRefPtr<Media::VideoFrame const> const&);
-    void clear_video_frame(Web::Compositor::CompositorContextId, Web::Painting::VideoFrameResourceId);
+    void add_video_sink(Media::VideoSinkHandle);
+    void remove_video_sink(Media::VideoSinkHandle);
+    void set_video_update_flags(Media::VideoSinkHandle, Web::Compositor::VideoUpdateFlags);
     Optional<Web::Painting::CanvasId> create_canvas_2d_context(Gfx::IntSize, bool alpha);
     void update_canvas_2d_stream(Web::Painting::Canvas2DCommandStream&);
     void destroy_canvas_context(Web::Painting::CanvasId);
@@ -70,6 +72,7 @@ public:
     Web::WebGL::ReadPixelsResult read_webgl_pixels(Web::Painting::CanvasId, Web::WebGL::GLint x, Web::WebGL::GLint y, Web::WebGL::GLsizei width, Web::WebGL::GLsizei height, Web::WebGL::GLenum format, Web::WebGL::GLenum type, Web::WebGL::GLsizei buf_size, Core::AnonymousBuffer const& pixels);
     bool read_webgl_buffer_sub_data(Web::Painting::CanvasId, Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
+    void ensure_video_presentation_channel();
     Function<void(u64 page_id, Web::MouseEvent)> on_mouse_event;
     Function<void()> on_compositor_lost;
 
@@ -95,6 +98,7 @@ private:
     HashMap<Web::Compositor::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     u64 m_next_screenshot_request_id { 1 };
     bool m_has_lost_compositor { false };
+    RefPtr<Media::VideoPresentationServerConnection> m_video_presentation_channel;
 };
 
 }

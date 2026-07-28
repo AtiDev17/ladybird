@@ -75,7 +75,7 @@ private:
             return m_target_timestamp;
         Optional<AK::Duration> latest_fast_seek_target;
         for (auto const& video_track_data : manager().m_video_track_datas) {
-            if (video_track_data.display == nullptr)
+            if (video_track_data.video_sink == nullptr)
                 continue;
             auto fast_seek_target = video_track_data.producer->select_fast_seek_target(m_target_timestamp, m_mode);
             if (!latest_fast_seek_target.has_value() || fast_seek_target > latest_fast_seek_target.value())
@@ -88,16 +88,13 @@ private:
     {
         m_chosen_timestamp = choose_timestamp();
 
-        for (auto& video_track_data : manager().m_video_track_datas) {
-            if (video_track_data.display == nullptr)
-                continue;
-            video_track_data.display->seek(m_chosen_timestamp);
-        }
+        manager().m_clock->seek(m_chosen_timestamp);
 
-        if (manager().m_audio_sink)
-            manager().m_audio_sink->seek(m_chosen_timestamp);
-        else
-            manager().m_time_provider->seek(m_chosen_timestamp);
+        for (auto& video_track_data : manager().m_video_track_datas) {
+            if (video_track_data.video_sink == nullptr)
+                continue;
+            video_track_data.video_sink->seek(m_chosen_timestamp);
+        }
     }
 
     AK::Duration m_target_timestamp;

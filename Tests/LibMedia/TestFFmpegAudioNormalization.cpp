@@ -15,6 +15,8 @@
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibTest/TestCase.h>
 
+#include "TestMediaCommon.h"
+
 template<typename Integer>
 requires(IsIntegral<Integer>)
 static void append_little_endian(ByteBuffer& buffer, Integer value)
@@ -70,7 +72,7 @@ template<typename Sample>
 requires(IsSigned<Sample>)
 static void decode_and_expect()
 {
-    Core::EventLoop loop;
+    auto& loop = never_destroyed_event_loop();
 
     constexpr size_t sample_count = 2048;
     auto wav_data = make_square_wav<Sample>(sample_count);
@@ -93,11 +95,9 @@ static void decode_and_expect()
 
     MonotonicTime deadline = MonotonicTime::now_coarse() + AK::Duration::from_seconds(1);
     while (MonotonicTime::now_coarse() < deadline) {
-        Media::AudioBlock block;
-        auto status = producer->status();
-        if (status == Media::PipelineStatus::HaveData)
-            producer->pull(block);
-        if (status == Media::PipelineStatus::HaveData) {
+        auto output = producer->peek();
+        if (output.status == Media::PipelineStatus::HaveData) {
+            auto const& block = *output.block;
             EXPECT(!block.is_empty());
             for (size_t channel = 0; channel < block.channel_count(); ++channel) {
                 for (float sample : block.channel_data(channel)) {
@@ -113,7 +113,8 @@ static void decode_and_expect()
                 }
             }
             decoded_frame_count += block.frame_count();
-        } else if (status == Media::PipelineStatus::EndOfStream) {
+            producer->consume();
+        } else if (output.status == Media::PipelineStatus::EndOfStream) {
             reached_end_of_stream = true;
             break;
         }

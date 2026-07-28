@@ -20,18 +20,44 @@ namespace Media::Matroska {
 DecoderErrorOr<NonnullRefPtr<MatroskaDemuxer>> MatroskaDemuxer::from_stream(NonnullRefPtr<MediaStream> const& stream)
 {
     auto cursor = stream->create_cursor();
-    return make_ref_counted<MatroskaDemuxer>(stream, TRY(Reader::from_stream(cursor)));
+    auto demuxer = make_ref_counted<MatroskaDemuxer>(stream, TRY(Reader::from_stream(cursor)));
+    demuxer->start_buffered_scan_thread(TRY(Reader::from_stream(stream->create_cursor())));
+    return demuxer;
 }
 
 MatroskaDemuxer::MatroskaDemuxer(NonnullRefPtr<MediaStream> const& stream, Reader&& reader)
     : m_stream(stream)
-    , m_buffered_scan_cursor(stream->create_cursor())
     , m_reader(move(reader))
 {
-    m_buffered_scan_cursor->set_is_blocking(false);
 }
 
-MatroskaDemuxer::~MatroskaDemuxer() = default;
+MatroskaDemuxer::~MatroskaDemuxer()
+{
+    if (m_buffered_scan_thread != nullptr)
+        m_buffered_scan_thread->shutdown();
+}
+
+void MatroskaDemuxer::start_buffered_scan_thread(Reader&& scan_reader)
+{
+    auto scan_cursor = m_stream->create_cursor();
+    scan_cursor->set_is_blocking(false);
+
+    Vector<Track> tracks;
+    tracks.extend(MUST(get_tracks_for_type(TrackType::Video)));
+    tracks.extend(MUST(get_tracks_for_type(TrackType::Audio)));
+
+    DemuxerScanState initial_state;
+    initial_state.duration = m_reader.duration().value_or(AK::Duration::zero());
+    m_buffered_scan_thread = DemuxerScanThread<BufferedScanPayload>::start(m_stream, move(initial_state),
+        BufferedScanPayload { move(scan_reader), move(scan_cursor), move(tracks) },
+        [](MediaStream& stream, BufferedScanPayload& payload) {
+            auto byte_ranges = stream.available_byte_ranges();
+            HashMap<u64, BufferedRangesScan> scans_by_track_number;
+            if (!byte_ranges.is_empty())
+                scans_by_track_number = payload.reader.buffered_time_ranges_by_track_number(payload.scan_cursor, byte_ranges);
+            return DemuxerScanState::create_from_track_scans(payload.tracks, move(scans_by_track_number), payload.reader.duration().value_or(AK::Duration::zero()), stream.closing_bytes_are_available());
+        });
+}
 
 static TrackEntry::TrackType matroska_track_type_from_track_type(TrackType type)
 {
@@ -148,10 +174,14 @@ DecoderErrorOr<CodedFrame> MatroskaDemuxer::get_next_sample_for_track(Track cons
     //        Matroska should make a RefPtr<ByteBuffer>, probably.
     auto& status = get_track_status(track);
 
-    if (!status.block.has_value() || status.frame_index >= status.frames.size()) {
+    if (!status.block.has_value() || (!status.frames.is_empty() && status.frame_index >= status.frames.size())) {
         status.block = TRY(status.iterator.next_block());
-        status.frames = TRY(status.iterator.get_frames(status.block.value()));
+        status.frames.clear();
         status.frame_index = 0;
+    }
+    if (status.frames.is_empty()) {
+        status.frames = TRY(status.iterator.get_frames(status.block.value()));
+        VERIFY(!status.frames.is_empty());
     }
 
     VERIFY(status.block.has_value());
@@ -177,12 +207,14 @@ DecoderErrorOr<AK::Duration> MatroskaDemuxer::total_duration()
     return duration.value_or(AK::Duration::zero());
 }
 
-TimeRanges MatroskaDemuxer::buffered_time_ranges() const
+DemuxerScanState const& MatroskaDemuxer::scan_state() const
 {
-    auto byte_ranges = m_stream->available_byte_ranges();
-    if (byte_ranges.is_empty())
-        return {};
-    return m_reader.buffered_time_ranges(m_buffered_scan_cursor, byte_ranges);
+    return m_buffered_scan_thread->main_thread_state();
+}
+
+void MatroskaDemuxer::set_scan_state_change_handler(Function<void()> handler)
+{
+    m_buffered_scan_thread->set_change_handler(move(handler));
 }
 
 DecoderErrorOr<AK::Duration> MatroskaDemuxer::duration_of_track(Track const&)
@@ -202,10 +234,10 @@ void MatroskaDemuxer::reset_blocking_reads_aborted_for_track(Track const& track)
     status.iterator.cursor().reset_abort();
 }
 
-bool MatroskaDemuxer::is_read_blocked_for_track(Track const& track)
+void MatroskaDemuxer::set_read_blocked_change_handler_for_track(Track const& track, ReadBlockedChangeHandler handler)
 {
     auto& status = get_track_status(track);
-    return status.iterator.cursor().is_blocked();
+    status.iterator.cursor().set_blocked_change_handler(move(handler));
 }
 
 }

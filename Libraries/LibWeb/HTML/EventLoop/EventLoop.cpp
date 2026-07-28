@@ -125,6 +125,8 @@ void EventLoop::process()
     GC::Ptr<Task> oldest_task;
     [[maybe_unused]] double task_start_time = 0;
 
+    m_task_generation++;
+
     // Some algorithms request that steps or states only occur once the event loop has reached step 1.
     // Invoke a set of tasks that these algorithms request us to in order to achieve this.
     auto reached_step_1_tasks = move(m_reached_step_1_tasks);
@@ -354,10 +356,6 @@ void EventLoop::update_the_rendering()
 
         return true;
     });
-
-    // AD-HOC: Update all the displayed video frames on HTMLMediaElements in documents' pages.
-    for (auto& document : docs)
-        document->page().update_all_media_element_video_sinks();
 
     // FIXME: 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
 

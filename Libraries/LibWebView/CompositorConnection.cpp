@@ -6,10 +6,12 @@
 
 #include <LibWebView/CompositorConnection.h>
 
+#include <AK/Debug.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
+#include <LibIPC/Transport.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 
 namespace WebView {
@@ -22,6 +24,30 @@ CompositorConnection::CompositorConnection(NonnullOwnPtr<IPC::Transport> transpo
 void CompositorConnection::die()
 {
     did_lose_compositor();
+}
+
+void CompositorConnection::ensure_video_presentation_channel()
+{
+    if (m_video_presentation_channel)
+        return;
+    if (!can_send_message_to_compositor())
+        return;
+
+    auto paired_or_error = IPC::Transport::create_paired();
+    if (paired_or_error.is_error()) {
+        dbgln("Failed to create video presentation channel transport: {}", paired_or_error.error());
+        return;
+    }
+    auto paired = paired_or_error.release_value();
+
+    m_video_presentation_channel = Media::VideoPresentationServerConnection::construct(move(paired.local));
+
+#ifdef AK_OS_WINDOWS
+    m_video_presentation_channel->transport().set_peer_pid(transport().peer_pid());
+#endif
+
+    async_offer_video_presentation_channel(paired.remote_handle);
+    dbgln_if(VIDEO_PRESENTATION_CHANNEL_DEBUG, "WebContent: offered video presentation channel to Compositor");
 }
 
 void CompositorConnection::set_parent_context(Web::Compositor::CompositorContextId context_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
@@ -85,21 +111,25 @@ void CompositorConnection::update_scroll_state(Web::Compositor::CompositorContex
     async_update_scroll_state(context_id, scroll_state_snapshot);
 }
 
-void CompositorConnection::update_video_frame(Web::Compositor::CompositorContextId context_id, Web::Painting::VideoFrameResourceId frame_id, NonnullRefPtr<Media::VideoFrame const> const& frame)
+void CompositorConnection::add_video_sink(Media::VideoSinkHandle video_sink_handle)
 {
     if (!can_send_message_to_compositor())
         return;
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateVideoFrame::static_encode(context_id, frame_id, frame));
-    if (post_message(encoded_message).is_error())
-        did_lose_compositor();
+    async_add_video_sink(video_sink_handle);
 }
 
-void CompositorConnection::clear_video_frame(Web::Compositor::CompositorContextId context_id, Web::Painting::VideoFrameResourceId frame_id)
+void CompositorConnection::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_clear_video_frame(context_id, frame_id);
+    async_remove_video_sink(video_sink_handle);
+}
+
+void CompositorConnection::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, Web::Compositor::VideoUpdateFlags flags)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    async_set_video_update_flags(video_sink_handle, flags);
 }
 
 Optional<Web::Painting::CanvasId> CompositorConnection::create_canvas_2d_context(Gfx::IntSize size, bool alpha)

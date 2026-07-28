@@ -57,6 +57,8 @@ set(AK_TEST_SOURCES
     TestRandom.cpp
     TestRedBlackTree.cpp
     TestRefPtr.cpp
+    TestSeqLock.cpp
+    TestSingleProducerCircularQueue.cpp
     TestSinglyLinkedList.cpp
     TestSourceGenerator.cpp
     TestSourceLocation.cpp
@@ -66,6 +68,7 @@ set(AK_TEST_SOURCES
     TestStringConversions.cpp
     TestStringUtils.cpp
     TestStringView.cpp
+    TestTearableAtomic.cpp
     TestTime.cpp
     TestTrie.cpp
     TestTuple.cpp
@@ -106,5 +109,7 @@ if (APPLE)
     target_compile_options(TestFunctionObjCArc PRIVATE -fobjc-arc)
 endif()
 
+target_link_libraries(TestSeqLock PRIVATE LibThreading)
 target_link_libraries(TestString PRIVATE LibUnicode)
+target_link_libraries(TestTearableAtomic PRIVATE LibThreading)
 target_link_libraries(TestUtf16String PRIVATE LibUnicode)

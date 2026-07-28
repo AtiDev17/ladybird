@@ -43,8 +43,11 @@ public:
     u64 next_chunk_start() const { return m_last_chunk_end; }
 
     void close();
+    virtual bool is_closed() const override;
 
     virtual Vector<ByteRange> available_byte_ranges() const override;
+
+    virtual void set_available_ranges_change_observer(Function<void()>) override;
 
     u64 size();
     void set_expected_size(u64);
@@ -66,7 +69,7 @@ public:
         virtual void reset_abort() override { m_aborted = false; }
         virtual bool is_aborted() const override { return m_aborted; }
 
-        virtual bool is_blocked() const override { return m_blocked; }
+        virtual void set_blocked_change_handler(ReadBlockedChangeHandler) override;
 
     private:
         friend class IncrementallyPopulatedStream;
@@ -77,7 +80,8 @@ public:
         bool m_is_blocking { true };
         size_t m_position { 0 };
         bool m_aborted { false };
-        Atomic<bool> m_blocked { false };
+        bool m_blocked { false };
+        ReadBlockedChangeHandler m_read_blocked_change_handler;
         MonotonicTime m_active_timeout { MonotonicTime::now_coarse() };
     };
 
@@ -114,6 +118,7 @@ private:
     void begin_new_request_while_locked(u64 position);
     bool check_if_data_is_available_or_begin_request_while_locked(Cursor&, u64 position, u64 length);
     size_t read_from_chunks_while_locked(u64 position, Bytes& bytes) const;
+    void notify_available_ranges_changed_while_locked();
 
     mutable Sync::Mutex m_mutex;
     Vector<Cursor&> m_cursors;
@@ -122,6 +127,8 @@ private:
     Chunks m_chunks;
     Optional<u64> m_expected_size;
     bool m_closed { false };
+
+    Function<void()> m_available_ranges_change_observer;
 
     RefPtr<Core::WeakEventLoopReference> m_callback_event_loop;
     DataRequestCallback m_data_request_callback;

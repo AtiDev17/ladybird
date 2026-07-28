@@ -5,6 +5,7 @@
  */
 
 #include <AK/BinarySearch.h>
+#include <LibCore/EventLoop.h>
 #include <LibWeb/MediaSourceExtensions/TrackBufferDemuxer.h>
 
 namespace Web::MediaSourceExtensions {
@@ -57,6 +58,7 @@ void TrackBufferDemuxer::add_coded_frame(Media::CodedFrame frame)
         m_read_position++;
 
     m_data_changed.broadcast();
+    queue_scan_state_change_dispatch_while_locked();
 }
 
 void TrackBufferDemuxer::remove_coded_frames_and_dependants_in_range(AK::Duration start, AK::Duration end)
@@ -105,6 +107,8 @@ void TrackBufferDemuxer::remove_coded_frames_and_dependants_in_range(AK::Duratio
 
         m_last_returned_timestamp.clear();
     }
+
+    queue_scan_state_change_dispatch_while_locked();
 }
 
 size_t TrackBufferDemuxer::total_bytes() const
@@ -144,6 +148,7 @@ size_t TrackBufferDemuxer::take_earliest_frame()
     m_total_bytes -= bytes;
     if (m_read_position > 0)
         m_read_position--;
+    queue_scan_state_change_dispatch_while_locked();
     return bytes;
 }
 
@@ -165,6 +170,7 @@ size_t TrackBufferDemuxer::take_latest_frame()
     m_track_buffer_ranges.remove_range(frame.timestamp(), frame.timestamp() + frame.duration());
     auto bytes = frame.data().size();
     m_total_bytes -= bytes;
+    queue_scan_state_change_dispatch_while_locked();
     return bytes;
 }
 
@@ -173,12 +179,14 @@ void TrackBufferDemuxer::set_reached_end_of_stream()
     Sync::MutexLocker locker { m_mutex };
     m_reached_end_of_stream = true;
     m_data_changed.broadcast();
+    queue_scan_state_change_dispatch_while_locked();
 }
 
 void TrackBufferDemuxer::clear_reached_end_of_stream()
 {
     Sync::MutexLocker locker { m_mutex };
     m_reached_end_of_stream = false;
+    queue_scan_state_change_dispatch_while_locked();
 }
 
 Media::DecoderErrorOr<void> TrackBufferDemuxer::create_context_for_track(Media::Track const&)
@@ -220,13 +228,30 @@ Media::DecoderErrorOr<Media::CodedFrame> TrackBufferDemuxer::get_next_sample_for
 {
     Sync::MutexLocker locker { m_mutex };
 
+    bool notified_blocked = false;
+    Optional<Media::DecoderError> error;
     while (m_read_position >= m_coded_frames.size() || next_frame_is_in_gap_while_locked()) {
-        if (m_aborted.load())
-            return Media::DecoderError::with_description(Media::DecoderErrorCategory::Aborted, "Read aborted"sv);
-        if (m_read_position >= m_coded_frames.size() && m_reached_end_of_stream)
-            return Media::DecoderError::with_description(Media::DecoderErrorCategory::EndOfStream, "End of stream"sv);
+        if (m_aborted.load()) {
+            error = Media::DecoderError::with_description(Media::DecoderErrorCategory::Aborted, "Read aborted"sv);
+            break;
+        }
+        if (m_read_position >= m_coded_frames.size() && m_reached_end_of_stream) {
+            error = Media::DecoderError::with_description(Media::DecoderErrorCategory::EndOfStream, "End of stream"sv);
+            break;
+        }
+        if (!notified_blocked) {
+            notified_blocked = true;
+            if (m_read_blocked_change_handler)
+                m_read_blocked_change_handler(Media::ReadBlocked::Yes);
+        }
         m_data_changed.wait();
     }
+
+    if (notified_blocked && m_read_blocked_change_handler)
+        m_read_blocked_change_handler(Media::ReadBlocked::No);
+
+    if (error.has_value())
+        return error.release_value();
 
     m_last_returned_timestamp = m_coded_frames[m_read_position].timestamp();
     return m_coded_frames[m_read_position++];
@@ -341,9 +366,40 @@ Media::DecoderErrorOr<AK::Duration> TrackBufferDemuxer::total_duration()
     return AK::Duration::zero();
 }
 
-Media::TimeRanges TrackBufferDemuxer::buffered_time_ranges() const
+Media::DemuxerScanState const& TrackBufferDemuxer::scan_state() const
 {
-    return track_buffer_ranges();
+    return m_scan_state;
+}
+
+void TrackBufferDemuxer::set_scan_state_change_handler(Function<void()> handler)
+{
+    m_scan_state_change_handler = move(handler);
+    Sync::MutexLocker locker { m_mutex };
+    m_scan_state_change_handler_event_loop = &Core::EventLoop::current();
+    // Deliver any state that was built up before a home event loop existed.
+    queue_scan_state_change_dispatch_while_locked();
+}
+
+void TrackBufferDemuxer::queue_scan_state_change_dispatch_while_locked()
+{
+    if (m_scan_state_change_dispatch_pending)
+        return;
+    if (m_scan_state_change_handler_event_loop == nullptr)
+        return;
+    m_scan_state_change_dispatch_pending = true;
+    m_scan_state_change_handler_event_loop->deferred_invoke([self = NonnullRefPtr(*this)] {
+        bool reached_end_of_stream;
+        {
+            Sync::MutexLocker locker { self->m_mutex };
+            self->m_scan_state_change_dispatch_pending = false;
+            reached_end_of_stream = self->m_reached_end_of_stream;
+        }
+        Vector<Media::DemuxerTrackScanState> tracks;
+        tracks.empend(self->m_track, self->track_buffer_ranges(), reached_end_of_stream);
+        self->m_scan_state = { move(tracks), AK::Duration::zero() };
+        if (self->m_scan_state_change_handler)
+            self->m_scan_state_change_handler();
+    });
 }
 
 void TrackBufferDemuxer::set_blocking_reads_aborted_for_track(Media::Track const&)
@@ -358,12 +414,10 @@ void TrackBufferDemuxer::reset_blocking_reads_aborted_for_track(Media::Track con
     m_aborted.store(false);
 }
 
-bool TrackBufferDemuxer::is_read_blocked_for_track(Media::Track const&)
+void TrackBufferDemuxer::set_read_blocked_change_handler_for_track(Media::Track const&, Media::ReadBlockedChangeHandler handler)
 {
     Sync::MutexLocker locker { m_mutex };
-    if (m_aborted.load())
-        return false;
-    return m_read_position >= m_coded_frames.size() || next_frame_is_in_gap_while_locked();
+    m_read_blocked_change_handler = move(handler);
 }
 
 }

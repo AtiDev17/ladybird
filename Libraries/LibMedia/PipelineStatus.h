@@ -9,14 +9,15 @@
 #include <AK/Format.h>
 #include <AK/Function.h>
 #include <AK/Types.h>
+#include <LibGfx/Forward.h>
 
 namespace Media {
 
 enum class PipelineStatus : u8 {
     Pending,
     HaveData,
-    MovedPosition,
     Blocked,
+    Suspended,
     EndOfStream,
     Error,
 };
@@ -67,13 +68,12 @@ constexpr PipelineStatus select_combined_pipeline_status(PipelineStatus a, Pipel
         return PipelineStatus::Pending;
     if (a == PipelineStatus::HaveData || b == PipelineStatus::HaveData)
         return PipelineStatus::HaveData;
-    if (a == PipelineStatus::MovedPosition || b == PipelineStatus::MovedPosition)
-        return PipelineStatus::MovedPosition;
     return PipelineStatus::EndOfStream;
 }
 
 using PipelineStateChangeHandler = Function<void(PipelineStatus)>;
 using PipelineWakeHandler = Function<void()>;
+using PipelineResizeHandler = Function<void(Gfx::Size<u32>)>;
 
 constexpr StringView pipeline_status_to_string(PipelineStatus status)
 {
@@ -82,10 +82,10 @@ constexpr StringView pipeline_status_to_string(PipelineStatus status)
         return "Pending"sv;
     case PipelineStatus::HaveData:
         return "HaveData"sv;
-    case PipelineStatus::MovedPosition:
-        return "MovedPosition"sv;
     case PipelineStatus::Blocked:
         return "Blocked"sv;
+    case PipelineStatus::Suspended:
+        return "Suspended"sv;
     case PipelineStatus::EndOfStream:
         return "EndOfStream"sv;
     case PipelineStatus::Error:
@@ -99,7 +99,7 @@ constexpr StringView pipeline_status_to_string(PipelineStatus status)
 namespace AK {
 
 template<>
-struct Formatter<Media::PipelineStatus> final : Formatter<StringView> {
+struct Formatter<Media::PipelineStatus> : Formatter<StringView> {
     ErrorOr<void> format(FormatBuilder& builder, Media::PipelineStatus state)
     {
         return Formatter<StringView>::format(builder, Media::pipeline_status_to_string(state));

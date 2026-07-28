@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Checked.h>
 #include <LibCore/EventLoop.h>
+#include <LibGfx/YUVData.h>
 #include <LibMedia/CodedVideoFrameData.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
@@ -17,17 +19,27 @@
 
 namespace Media {
 
-static constexpr int AUTO_SUSPEND_IDLE_TIMEOUT_MS = 10000;
+namespace {
 
-DecoderErrorOr<NonnullRefPtr<DecodedVideoProducer>> DecodedVideoProducer::try_create(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track)
+DecoderErrorOr<FramePlaneLayout> plane_layout_for_frame(VideoFrameMetadata const& metadata)
+{
+    auto layout_result = frame_plane_layout(metadata.size, metadata.bit_depth, metadata.subsampling);
+    if (layout_result.is_error())
+        return DecoderError::format(DecoderErrorCategory::Invalid, "Failed to compute video frame plane layout: {}", layout_result.release_error());
+    return layout_result.release_value();
+}
+
+}
+
+DecoderErrorOr<NonnullRefPtr<DecodedVideoProducer>> DecodedVideoProducer::try_create(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration auto_suspend_idle_timeout)
 {
     TRY(demuxer->create_context_for_track(track));
-    auto duration = TRY(demuxer->duration_of_track(track));
-    auto thread_data = DECODER_TRY_ALLOC(try_make_ref_counted<DecodedVideoProducer::ThreadData>(main_thread_event_loop, demuxer, track, duration));
+    auto thread_data = DECODER_TRY_ALLOC(try_make_ref_counted<DecodedVideoProducer::ThreadData>(main_thread_event_loop, demuxer, track, auto_suspend_idle_timeout));
     TRY(thread_data->create_decoder());
     auto producer = DECODER_TRY_ALLOC(try_make_ref_counted<DecodedVideoProducer>(thread_data));
 
     auto thread = DECODER_TRY_ALLOC(Threading::Thread::try_create("Video Decoder"sv, [thread_data]() -> int {
+        thread_data->register_decode_thread();
         thread_data->wait_for_start();
         while (!thread_data->should_thread_exit()) {
             if (thread_data->handle_auto_suspension())
@@ -35,6 +47,7 @@ DecoderErrorOr<NonnullRefPtr<DecodedVideoProducer>> DecodedVideoProducer::try_cr
             thread_data->handle_seek();
             thread_data->push_data_and_decode_some_frames();
         }
+        thread_data->release_decoder();
         return 0;
     }));
     thread->start();
@@ -58,9 +71,9 @@ void DecodedVideoProducer::set_error_handler(ErrorHandler&& handler)
     m_thread_data->set_error_handler(move(handler));
 }
 
-void DecodedVideoProducer::set_duration_change_handler(FrameEndTimeHandler&& handler)
+void DecodedVideoProducer::set_read_blocked_change_handler(ReadBlockedChangeHandler handler)
 {
-    m_thread_data->set_duration_change_handler(move(handler));
+    m_thread_data->set_read_blocked_change_handler(move(handler));
 }
 
 void DecodedVideoProducer::start()
@@ -68,14 +81,14 @@ void DecodedVideoProducer::start()
     m_thread_data->start();
 }
 
-void DecodedVideoProducer::pull(RefPtr<VideoFrame>& into)
+VideoProducerOutput DecodedVideoProducer::peek()
 {
-    m_thread_data->pull(into);
+    return m_thread_data->peek();
 }
 
-PipelineStatus DecodedVideoProducer::status() const
+void DecodedVideoProducer::consume()
 {
-    return m_thread_data->status();
+    m_thread_data->consume();
 }
 
 void DecodedVideoProducer::set_wake_handler(PipelineWakeHandler handler)
@@ -83,46 +96,38 @@ void DecodedVideoProducer::set_wake_handler(PipelineWakeHandler handler)
     m_thread_data->set_wake_handler(move(handler));
 }
 
-PipelineStatus DecodedVideoProducer::ThreadData::status() const
+VideoProducerOutput DecodedVideoProducer::ThreadData::peek()
 {
     auto locker = take_lock();
+    VERIFY(!m_decode_thread_id.is_current_thread());
     note_consumer_activity_while_locked();
-    auto status = status_while_locked();
-    m_downstream_needs_wake = is_waiting_for_data(status);
-    return status;
+    auto output = peek_while_locked();
+    m_downstream_needs_wake = is_waiting_for_data(output.status);
+    return output;
 }
 
-PipelineStatus DecodedVideoProducer::ThreadData::status_while_locked() const
+VideoProducerOutput DecodedVideoProducer::ThreadData::peek_while_locked()
 {
     if (m_last_processed_seek_id != m_seek_id)
-        return PipelineStatus::Pending;
-    if (m_moved_position_pending)
-        return PipelineStatus::MovedPosition;
+        return { nullptr, PipelineStatus::Pending };
     if (!m_queue.is_empty())
-        return PipelineStatus::HaveData;
-    if (m_current_halting_status != PipelineStatus::Pending)
-        return m_current_halting_status;
-    if (m_demuxer->is_read_blocked_for_track(m_track))
-        return PipelineStatus::Blocked;
-    return PipelineStatus::Pending;
+        return { m_queue.head().frame, PipelineStatus::HaveData };
+    return { nullptr, m_current_halting_status };
 }
 
-void DecodedVideoProducer::ThreadData::pull(RefPtr<VideoFrame>& into)
+void DecodedVideoProducer::ThreadData::consume()
 {
+    // Hold the frame until after the mutex is unlocked, or our pool slot freed callback may reentrantly lock.
+    RefPtr<VideoFrame> frame;
+
     auto locker = take_lock();
+    VERIFY(!m_decode_thread_id.is_current_thread());
     note_consumer_activity_while_locked();
-    if (m_moved_position_pending) {
-        m_moved_position_pending = false;
-        into = nullptr;
+    if (m_queue.is_empty())
         return;
-    }
-    if (!m_queue.is_empty()) {
-        into = m_queue.dequeue();
-        m_earliest_available_timestamp = max(m_earliest_available_timestamp, into->timestamp() + into->duration());
-        wake();
-        return;
-    }
-    into = nullptr;
+    frame = m_queue.dequeue().frame;
+    m_earliest_available_timestamp = max(m_earliest_available_timestamp, frame->timestamp() + frame->duration());
+    wake();
 }
 
 void DecodedVideoProducer::ThreadData::enter_halting_state(PipelineStatus status, Optional<DecoderError> error)
@@ -170,12 +175,15 @@ void DecodedVideoProducer::seek(AK::Duration timestamp)
     m_thread_data->seek(timestamp);
 }
 
-DecodedVideoProducer::ThreadData::ThreadData(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration duration)
+DecodedVideoProducer::ThreadData::ThreadData(Core::EventLoop& main_thread_event_loop, NonnullRefPtr<Demuxer> const& demuxer, Track const& track, AK::Duration auto_suspend_idle_timeout)
     : m_main_thread_event_loop(main_thread_event_loop)
     , m_demuxer(demuxer)
     , m_track(track)
-    , m_duration(duration)
+    , m_auto_suspend_idle_timeout(auto_suspend_idle_timeout)
 {
+    m_demuxer->set_read_blocked_change_handler_for_track(m_track, [this](ReadBlocked blocked) {
+        dispatch_read_blocked_change(blocked);
+    });
 }
 
 DecoderErrorOr<void> DecodedVideoProducer::ThreadData::create_decoder()
@@ -186,16 +194,34 @@ DecoderErrorOr<void> DecodedVideoProducer::ThreadData::create_decoder()
     return {};
 }
 
-TimeRanges DecodedVideoProducer::buffered_time_ranges() const
+void DecodedVideoProducer::ThreadData::release_decoder()
 {
-    return m_thread_data->buffered_time_ranges();
+    VERIFY(m_decode_thread_id.is_current_thread());
+    auto locker = take_lock();
+    m_decoder.clear();
 }
 
-DecodedVideoProducer::ThreadData::~ThreadData() = default;
+DecodedVideoProducer::ThreadData::~ThreadData()
+{
+    m_demuxer->set_read_blocked_change_handler_for_track(m_track, nullptr);
+}
 
 void DecodedVideoProducer::ThreadData::set_error_handler(ErrorHandler&& handler)
 {
     m_error_handler = move(handler);
+}
+
+void DecodedVideoProducer::ThreadData::set_read_blocked_change_handler(ReadBlockedChangeHandler handler)
+{
+    m_read_blocked_change_handler = move(handler);
+}
+
+void DecodedVideoProducer::ThreadData::dispatch_read_blocked_change(ReadBlocked blocked)
+{
+    m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this), blocked] {
+        if (self->m_read_blocked_change_handler)
+            self->m_read_blocked_change_handler(blocked);
+    });
 }
 
 void DecodedVideoProducer::ThreadData::start()
@@ -208,11 +234,6 @@ void DecodedVideoProducer::ThreadData::start()
     wake();
 }
 
-void DecodedVideoProducer::ThreadData::set_duration_change_handler(FrameEndTimeHandler&& handler)
-{
-    m_duration_change_handler = move(handler);
-}
-
 void DecodedVideoProducer::ThreadData::exit()
 {
     auto locker = take_lock();
@@ -223,25 +244,20 @@ void DecodedVideoProducer::ThreadData::exit()
 void DecodedVideoProducer::ThreadData::note_consumer_activity_while_locked() const
 {
     m_last_consumer_activity = MonotonicTime::now();
-    if (m_auto_suspend_requested)
-        m_auto_suspend_requested = false;
-    if (m_auto_suspended)
-        wake();
+    m_auto_suspend_requested = false;
 }
 
-void DecodedVideoProducer::ThreadData::wait_for_queue_space_or_auto_suspend_while_locked()
+void DecodedVideoProducer::ThreadData::wait_to_decode_or_auto_suspend_while_locked()
 {
     if (m_requested_state != RequestedState::Running)
         return;
     if (m_auto_suspended || m_auto_suspend_requested)
         return;
-    if (m_queue.size() < m_queue_max_size)
-        return;
 
-    auto idle_at = m_last_consumer_activity + AK::Duration::from_milliseconds(AUTO_SUSPEND_IDLE_TIMEOUT_MS);
+    auto idle_at = m_last_consumer_activity + m_auto_suspend_idle_timeout;
     auto now = MonotonicTime::now();
     if (now < idle_at) {
-        if (m_wait_condition.wait_for(idle_at - now))
+        if (m_wait_state->condition.wait_for(idle_at - now))
             return;
         if (MonotonicTime::now() < idle_at)
             return;
@@ -258,10 +274,13 @@ DecodedVideoProducer::FrameQueue& DecodedVideoProducer::ThreadData::queue()
 void DecodedVideoProducer::ThreadData::seek(AK::Duration timestamp)
 {
     auto locker = take_lock();
+    VERIFY(!m_decode_thread_id.is_current_thread());
     note_consumer_activity_while_locked();
     m_downstream_needs_wake = true;
 
-    if (timestamp >= m_earliest_available_timestamp && timestamp < m_latest_available_timestamp) {
+    auto is_within_available_range = timestamp >= m_earliest_available_timestamp
+        && (timestamp < m_latest_available_timestamp || m_current_halting_status == PipelineStatus::EndOfStream);
+    if (is_within_available_range) {
         dispatch_wake_if_needed_while_locked();
         return;
     }
@@ -279,11 +298,17 @@ AK::Duration DecodedVideoProducer::ThreadData::select_fast_seek_target(AK::Durat
     return m_demuxer->select_fast_seek_target_for_track(m_track, target, mode);
 }
 
+void DecodedVideoProducer::ThreadData::register_decode_thread()
+{
+    VERIFY(!m_decode_thread_id.is_valid());
+    m_decode_thread_id = AK::ThreadID::current();
+}
+
 void DecodedVideoProducer::ThreadData::wait_for_start()
 {
     auto locker = take_lock();
     while (m_requested_state == RequestedState::None)
-        m_wait_condition.wait();
+        m_wait_state->condition.wait();
 }
 
 bool DecodedVideoProducer::ThreadData::should_thread_exit_while_locked() const
@@ -309,6 +334,7 @@ void DecodedVideoProducer::ThreadData::invoke_on_main_thread_while_locked(Invoke
 
 bool DecodedVideoProducer::ThreadData::handle_auto_suspension()
 {
+    VERIFY(m_decode_thread_id.is_current_thread());
     auto locker = take_lock();
     if (!m_auto_suspend_requested)
         return false;
@@ -318,20 +344,24 @@ bool DecodedVideoProducer::ThreadData::handle_auto_suspension()
     m_latest_available_timestamp = m_earliest_available_timestamp;
     m_decoder.clear();
     m_decoder_needs_keyframe_next_seek = true;
+    if (m_frame_pool != nullptr)
+        m_frame_pool->shed_buffers();
     m_auto_suspended = true;
     m_auto_suspend_requested = false;
-    m_auto_suspend_entered_at = MonotonicTime::now();
+    m_current_halting_status = PipelineStatus::Suspended;
+    // The consumer's last peek predates the suspension, so wake it regardless of what it saw.
+    m_downstream_needs_wake = true;
+    dispatch_wake_if_needed_while_locked();
 
     while (true) {
         if (m_requested_state == RequestedState::Exit)
             return true;
         if (m_last_processed_seek_id != m_seek_id)
             break;
-        if (m_last_consumer_activity > m_auto_suspend_entered_at)
-            break;
-        m_wait_condition.wait();
+        m_wait_state->condition.wait();
     }
     m_auto_suspended = false;
+    m_current_halting_status = PipelineStatus::Pending;
 
     auto result = create_decoder();
     if (result.is_error()) {
@@ -339,44 +369,15 @@ bool DecodedVideoProducer::ThreadData::handle_auto_suspension()
         return true;
     }
 
-    if (m_last_processed_seek_id == m_seek_id.load()) {
-        m_seek_id++;
-        m_seek_timestamp = m_latest_available_timestamp;
-    }
-
     return true;
-}
-
-template<typename Invokee>
-void DecodedVideoProducer::ThreadData::invoke_on_main_thread(Invokee invokee)
-{
-    auto locker = take_lock();
-    invoke_on_main_thread_while_locked(move(invokee));
-}
-
-void DecodedVideoProducer::ThreadData::dispatch_frame_end_time(CodedFrame const& frame)
-{
-    auto end_time = frame.timestamp() + frame.duration();
-    if (end_time < m_duration)
-        return;
-    m_duration = end_time;
-    invoke_on_main_thread([end_time](auto const& self) {
-        if (self->m_duration_change_handler)
-            self->m_duration_change_handler(end_time);
-    });
-}
-
-static AK::Duration conservative_frame_end(VideoFrame& frame)
-{
-    return frame.timestamp() + frame.duration().scaled_by(3, 2);
 }
 
 void DecodedVideoProducer::ThreadData::queue_frame(NonnullRefPtr<VideoFrame> const& frame)
 {
     if (m_seek_id.load() != m_last_processed_seek_id)
         return;
-    m_queue.enqueue(frame);
-    m_latest_available_timestamp = max(m_latest_available_timestamp, conservative_frame_end(frame));
+    m_queue.enqueue({ frame });
+    m_latest_available_timestamp = max(m_latest_available_timestamp, frame->conservative_end());
     dispatch_wake_if_needed_while_locked();
 }
 
@@ -391,15 +392,13 @@ void DecodedVideoProducer::ThreadData::dispatch_error(DecoderError&& error)
 void DecodedVideoProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
 {
     m_last_processed_seek_id = seek_id;
-    if (moved_position) {
+    if (moved_position)
         m_current_halting_status = PipelineStatus::Pending;
-        m_moved_position_pending = true;
-        m_queue.clear();
-    }
 }
 
 bool DecodedVideoProducer::ThreadData::handle_seek()
 {
+    VERIFY(m_decode_thread_id.is_current_thread());
     VERIFY(m_decoder);
 
     auto seek_id = m_seek_id.load();
@@ -411,11 +410,8 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
 
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
-        m_queue.clear();
-        if (moved_position) {
+        if (moved_position)
             m_current_halting_status = PipelineStatus::Pending;
-            m_moved_position_pending = true;
-        }
         enter_halting_state(PipelineStatus::Error, move(error));
         m_last_processed_seek_id = seek_id;
     };
@@ -426,6 +422,7 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
             seek_id = m_seek_id;
             timestamp = m_seek_timestamp;
             m_demuxer->reset_blocking_reads_aborted_for_track(m_track);
+            m_queue.clear();
         }
 
         auto seek_options = DemuxerSeekOptions::None;
@@ -459,8 +456,6 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
                 }
             } else {
                 auto coded_frame = coded_frame_result.release_value();
-                dispatch_frame_end_time(coded_frame);
-
                 auto const& video_frame_data = coded_frame.auxiliary_data().get<CodedVideoFrameData>();
                 auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data(), video_frame_data.decode_timestamp());
                 if (decode_result.is_error()) {
@@ -470,9 +465,9 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
             }
 
             while (new_seek_id == seek_id) {
-                auto frame_result = m_decoder->get_decoded_frame(m_track.video_data().cicp);
-                if (frame_result.is_error()) {
-                    if (frame_result.error().category() == DecoderErrorCategory::EndOfStream) {
+                auto metadata_result = m_decoder->peek_next_output(m_track.video_data().cicp);
+                if (metadata_result.is_error()) {
+                    if (metadata_result.error().category() == DecoderErrorCategory::EndOfStream) {
                         auto locker = take_lock();
                         resolve_seek(seek_id, moved_position);
                         if (last_frame != nullptr)
@@ -480,9 +475,46 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
                         return true;
                     }
 
-                    if (frame_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
+                    if (metadata_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
                         break;
 
+                    handle_error(metadata_result.release_error());
+                    return true;
+                }
+                auto metadata = metadata_result.release_value();
+
+                if (auto pool_result = ensure_frame_pool(); pool_result.is_error()) {
+                    handle_error(pool_result.release_error());
+                    return true;
+                }
+
+                auto layout_result = plane_layout_for_frame(metadata);
+                if (layout_result.is_error()) {
+                    handle_error(layout_result.release_error());
+                    return true;
+                }
+
+                Optional<VideoFramePool::AcquiredSlot> acquired_slot;
+                {
+                    auto locker = take_lock();
+                    while (true) {
+                        acquired_slot = m_frame_pool->try_acquire(layout_result.value().total_byte_count);
+                        if (acquired_slot.has_value())
+                            break;
+                        if (should_thread_exit_while_locked())
+                            return true;
+                        if (m_seek_id != seek_id)
+                            break;
+                        m_wait_state->condition.wait();
+                    }
+                }
+                if (!acquired_slot.has_value()) {
+                    new_seek_id = m_seek_id;
+                    continue;
+                }
+
+                auto frame_result = take_frame_into_acquired_slot(metadata, acquired_slot.release_value());
+                if (frame_result.is_error()) {
                     handle_error(frame_result.release_error());
                     return true;
                 }
@@ -507,8 +539,48 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
     }
 }
 
+DecoderErrorOr<void> DecodedVideoProducer::ThreadData::ensure_frame_pool()
+{
+    VERIFY(m_decode_thread_id.is_current_thread());
+    if (m_frame_pool != nullptr)
+        return {};
+
+    // Only the decode thread waits for slots, so a release on the decode thread itself never
+    // needs a wake: its next try_acquire() comes after this release in program order.
+    auto pool_result = VideoFramePool::create(
+        [wait_state = m_wait_state, decode_thread_id = m_decode_thread_id] {
+            if (decode_thread_id.is_current_thread())
+                return;
+            Sync::MutexLocker locker { wait_state->mutex };
+            wait_state->condition.broadcast();
+        });
+    if (pool_result.is_error())
+        return DecoderError::format(DecoderErrorCategory::Memory, "Failed to create a video frame pool: {}", pool_result.release_error());
+    m_frame_pool = pool_result.release_value();
+    return {};
+}
+
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> DecodedVideoProducer::ThreadData::take_frame_into_acquired_slot(VideoFrameMetadata const& metadata, VideoFramePool::AcquiredSlot const& acquired_slot)
+{
+    auto pool_slot_result = m_frame_pool->try_adopt_acquired_slot(acquired_slot);
+    if (pool_slot_result.is_error())
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate a pooled frame slot reference"sv);
+    auto pool_slot = pool_slot_result.release_value();
+
+    auto layout = TRY(plane_layout_for_frame(metadata));
+    auto y_data = acquired_slot.bytes.slice(0, layout.y_size);
+    auto u_data = acquired_slot.bytes.slice(layout.u_offset, layout.u_size);
+    auto v_data = acquired_slot.bytes.slice(layout.v_offset, layout.v_size);
+
+    auto yuv_data = DECODER_TRY_ALLOC(Gfx::YUVData::create(metadata.size, metadata.bit_depth, metadata.subsampling, metadata.cicp, y_data, u_data, v_data));
+    TRY(m_decoder->take_next_output_into(yuv_data));
+
+    return DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(metadata.timestamp, metadata.duration, metadata.size.to_type<u32>(), metadata.bit_depth, yuv_data, move(pool_slot)));
+}
+
 void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
 {
+    VERIFY(m_decode_thread_id.is_current_thread());
     VERIFY(m_decoder);
 
     // FIXME: Check if the PlaybackManager's current time is ahead of the next keyframe, and seek to it if so.
@@ -523,7 +595,7 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
         while (true) {
             if (m_seek_id != m_last_processed_seek_id)
                 return;
-            m_wait_condition.wait();
+            m_wait_state->condition.wait();
             if (should_thread_exit_while_locked())
                 return;
         }
@@ -545,8 +617,6 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
         }
     } else {
         auto coded_frame = sample_result.release_value();
-        dispatch_frame_end_time(coded_frame);
-
         auto const& video_frame_data = coded_frame.auxiliary_data().get<CodedVideoFrameData>();
         auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data(), video_frame_data.decode_timestamp());
         if (decode_result.is_error()) {
@@ -556,53 +626,56 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
     }
 
     while (true) {
-        auto frame_result = m_decoder->get_decoded_frame(m_track.video_data().cicp);
-        if (frame_result.is_error()) {
-            if (frame_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
+        auto metadata_result = m_decoder->peek_next_output(m_track.video_data().cicp);
+        if (metadata_result.is_error()) {
+            if (metadata_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
                 break;
-            if (frame_result.error().category() == DecoderErrorCategory::EndOfStream)
+            if (metadata_result.error().category() == DecoderErrorCategory::EndOfStream)
                 set_halting_status_and_wait_for_seek(PipelineStatus::EndOfStream, {});
             else
-                set_halting_status_and_wait_for_seek(PipelineStatus::Error, frame_result.release_error());
+                set_halting_status_and_wait_for_seek(PipelineStatus::Error, metadata_result.release_error());
+            break;
+        }
+        auto metadata = metadata_result.release_value();
+
+        if (auto pool_result = ensure_frame_pool(); pool_result.is_error()) {
+            set_halting_status_and_wait_for_seek(PipelineStatus::Error, pool_result.release_error());
             break;
         }
 
-        auto frame = frame_result.release_value();
+        auto layout_result = plane_layout_for_frame(metadata);
+        if (layout_result.is_error()) {
+            set_halting_status_and_wait_for_seek(PipelineStatus::Error, layout_result.release_error());
+            break;
+        }
 
-        {
-            auto queue_size = [&] {
-                auto locker = take_lock();
-                return m_queue.size();
-            }();
+        Optional<VideoFramePool::AcquiredSlot> acquired_slot;
+        while (true) {
+            if (handle_seek())
+                return;
 
-            while (queue_size >= m_queue_max_size) {
-                if (handle_seek())
-                    return;
-
-                if (handle_auto_suspension())
-                    return;
-
-                {
-                    auto locker = take_lock();
-                    queue_size = m_queue.size();
-                    if (queue_size < m_queue_max_size)
-                        continue;
-                    wait_for_queue_space_or_auto_suspend_while_locked();
-                    if (should_thread_exit_while_locked())
-                        return;
-                    queue_size = m_queue.size();
-                }
-            }
+            if (handle_auto_suspension())
+                return;
 
             auto locker = take_lock();
-            queue_frame(frame);
+            acquired_slot = m_frame_pool->try_acquire(layout_result.value().total_byte_count);
+            if (acquired_slot.has_value())
+                break;
+            wait_to_decode_or_auto_suspend_while_locked();
+            if (should_thread_exit_while_locked())
+                return;
         }
-    }
-}
 
-TimeRanges DecodedVideoProducer::ThreadData::buffered_time_ranges() const
-{
-    return m_demuxer->buffered_time_ranges();
+        auto frame_result = take_frame_into_acquired_slot(metadata, acquired_slot.release_value());
+        if (frame_result.is_error()) {
+            set_halting_status_and_wait_for_seek(PipelineStatus::Error, frame_result.release_error());
+            break;
+        }
+        auto frame = frame_result.release_value();
+
+        auto locker = take_lock();
+        queue_frame(frame);
+    }
 }
 
 }

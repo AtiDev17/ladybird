@@ -5,7 +5,6 @@
  */
 
 #include <AK/Math.h>
-#include <AK/TypedTransfer.h>
 #include <LibMedia/Audio/WSOLATimeStretcher.h>
 #include <LibMedia/Processors/AudioTimeStretchProcessor.h>
 
@@ -31,17 +30,12 @@ ErrorOr<void> AudioTimeStretchProcessor::connect_input(NonnullRefPtr<AudioProduc
     VERIFY(m_input == nullptr);
     m_input = input;
     input->set_wake_handler([this] {
-        bool should_wake_downstream;
+        bool should_wake;
         {
             Sync::MutexLocker locker { m_mutex };
-            auto status = PipelineStatus::HaveData;
-            if (m_pending_block.is_empty())
-                status = produce_block_while_locked(m_pending_block);
-            if (!m_pending_block.is_empty())
-                status = PipelineStatus::HaveData;
-            should_wake_downstream = m_downstream_needs_wake && resolves_seek(status);
+            should_wake = m_downstream_needs_wake;
         }
-        if (should_wake_downstream)
+        if (should_wake)
             dispatch_wake();
     });
 
@@ -71,22 +65,9 @@ void AudioTimeStretchProcessor::seek(AK::Duration timestamp)
     {
         Sync::MutexLocker locker { m_mutex };
         VERIFY(m_sample_specification.is_valid());
-        auto sample_rate = m_sample_specification.sample_rate();
-        auto target_frame = timestamp.to_time_units(1, sample_rate);
-        auto output_frame = target_frame;
+        auto target_frame = timestamp.to_time_units(1, m_sample_specification.sample_rate());
+        prime_stretcher_for_input_seek_while_locked(target_frame, target_frame);
 
-        ensure_stretcher_while_locked();
-        auto prerolled_target_frame = max(target_frame - m_stretcher->preroll_frame_count(), 0);
-        auto actual_preroll_delta = target_frame - prerolled_target_frame;
-        target_frame = prerolled_target_frame;
-        output_frame = output_frame - AK::round_to<i64>(static_cast<float>(actual_preroll_delta) / m_playback_rate);
-
-        m_next_emit_media_time = AK::Duration::from_time_units(target_frame, 1, sample_rate);
-        m_next_output_frame = output_frame;
-
-        m_stretcher->flush(m_next_emit_media_time, m_next_output_frame);
-
-        m_moved_position_pending = true;
         m_pending_block.clear();
         m_downstream_needs_wake = true;
         m_stretcher_reached_eos = false;
@@ -158,6 +139,16 @@ void AudioTimeStretchProcessor::set_playback_rate(float rate)
         dispatch_wake();
 }
 
+void AudioTimeStretchProcessor::prime_stretcher_for_input_seek_while_locked(i64 target_frame, i64 output_frame) const
+{
+    ensure_stretcher_while_locked();
+    auto prerolled_target_frame = max(target_frame - m_stretcher->preroll_frame_count(), 0);
+    auto actual_preroll_delta = target_frame - prerolled_target_frame;
+    m_next_emit_media_time = AK::Duration::from_time_units(prerolled_target_frame, 1, m_sample_specification.sample_rate());
+    m_next_output_frame = output_frame - AK::round_to<i64>(static_cast<float>(actual_preroll_delta) / m_playback_rate);
+    m_stretcher->flush(m_next_emit_media_time, m_next_output_frame);
+}
+
 void AudioTimeStretchProcessor::ensure_stretcher_while_locked() const
 {
     if (m_stretcher) {
@@ -175,17 +166,10 @@ void AudioTimeStretchProcessor::maybe_recover_from_stale_upstream_eos_while_lock
     if (!m_stretcher_reached_eos)
         return;
 
-    auto status = m_input->status();
-    while (status == PipelineStatus::MovedPosition) {
-        m_input->pull(m_input_block);
-        VERIFY(m_input_block.is_empty());
-        status = m_input->status();
-    }
-    if (is_terminal(status))
+    if (is_terminal(m_input->peek().status))
         return;
 
     m_stretcher->flush(m_next_emit_media_time, m_next_output_frame);
-    m_input_block.clear();
     m_stretcher_reached_eos = false;
 }
 
@@ -196,59 +180,45 @@ PipelineStatus AudioTimeStretchProcessor::produce_block_while_locked(AudioBlock&
 
     VERIFY(m_playback_rate != 0.0f);
 
-    auto pull_input = [&](AudioBlock& input_block) -> PipelineStatus {
-        auto status = m_input->status();
-        while (status == PipelineStatus::MovedPosition) {
-            m_input->pull(input_block);
-            VERIFY(input_block.is_empty());
-            status = m_input->status();
-        }
-        if (status == PipelineStatus::HaveData)
-            m_input->pull(input_block);
-        else
-            input_block.clear();
-        return status;
-    };
-
     ensure_stretcher_while_locked();
     maybe_recover_from_stale_upstream_eos_while_locked();
 
     while (true) {
-        auto result = m_stretcher->retrieve_block();
+        auto result = m_stretcher->retrieve_block(into);
         if (!result.is_error()) {
-            into = result.release_value();
             m_next_output_frame = into.end_frame_index();
             m_next_emit_media_time = into.media_time_end();
             return PipelineStatus::HaveData;
         }
+        VERIFY(into.is_empty());
         if (result.error().category() == DecoderErrorCategory::EndOfStream) {
-            into.clear();
             m_stretcher_reached_eos = true;
             return PipelineStatus::EndOfStream;
         }
-        if (result.error().category() != DecoderErrorCategory::NeedsMoreInput) {
-            into.clear();
+        if (result.error().category() != DecoderErrorCategory::NeedsMoreInput)
             return PipelineStatus::Error;
-        }
 
-        auto status = pull_input(m_input_block);
-        if (status == PipelineStatus::EndOfStream) {
-            VERIFY(m_input_block.is_empty());
+        auto output = m_input->peek();
+        if (output.status == PipelineStatus::EndOfStream) {
             m_stretcher->signal_end_of_stream();
             m_stretcher_reached_eos = false;
             continue;
         }
-        if (m_input_block.is_empty()) {
-            into.clear();
-            return status;
+        if (output.status == PipelineStatus::Suspended) {
+            auto emit_target_frame = m_next_emit_media_time.to_time_units(1, m_sample_specification.sample_rate());
+            prime_stretcher_for_input_seek_while_locked(emit_target_frame, m_next_output_frame);
+            m_input->seek(m_next_emit_media_time);
+            return PipelineStatus::Pending;
         }
-        VERIFY(status == PipelineStatus::HaveData);
-        VERIFY(m_input_block.sample_specification() == m_sample_specification);
-        m_stretcher->push_block(m_input_block);
+        if (output.status != PipelineStatus::HaveData)
+            return output.status;
+        VERIFY(output.block->sample_specification() == m_sample_specification);
+        m_stretcher->push_block(*output.block);
+        m_input->consume();
     }
 }
 
-PipelineStatus AudioTimeStretchProcessor::status() const
+AudioProducerOutput AudioTimeStretchProcessor::peek()
 {
     Sync::MutexLocker locker { m_mutex };
     auto status = PipelineStatus::HaveData;
@@ -256,34 +226,14 @@ PipelineStatus AudioTimeStretchProcessor::status() const
         status = produce_block_while_locked(m_pending_block);
     if (!m_pending_block.is_empty())
         status = PipelineStatus::HaveData;
-
-    if (m_moved_position_pending)
-        status = PipelineStatus::MovedPosition;
     m_downstream_needs_wake = is_waiting_for_data(status);
-    return status;
+    return { m_pending_block.is_empty() ? nullptr : &m_pending_block, status };
 }
 
-void AudioTimeStretchProcessor::pull(AudioBlock& into)
+void AudioTimeStretchProcessor::consume()
 {
     Sync::MutexLocker locker { m_mutex };
-
-    if (m_moved_position_pending) {
-        m_moved_position_pending = false;
-        into.clear();
-        return;
-    }
-
-    if (!m_pending_block.is_empty()) {
-        into.initialize(m_pending_block.sample_specification(), m_pending_block.first_frame_index(), m_pending_block.frame_count());
-        for (size_t channel = 0; channel < into.channel_count(); channel++)
-            AK::TypedTransfer<float>::copy(into.channel_data(channel).data(), m_pending_block.channel_data(channel).data(), into.frame_count());
-        into.set_media_time_start(m_pending_block.media_time_start());
-        into.set_media_time_duration(m_pending_block.media_time_duration());
-        m_pending_block.clear();
-        return;
-    }
-
-    into.clear();
+    m_pending_block.clear();
 }
 
 }

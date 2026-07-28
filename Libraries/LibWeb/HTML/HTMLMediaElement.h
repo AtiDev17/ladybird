@@ -14,9 +14,11 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
+#include <LibCore/Forward.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/VideoSinkHandle.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
@@ -117,8 +119,8 @@ public:
     void set_current_time(double);
     void fast_seek(double);
 
-    double current_playback_position() const { return m_current_playback_position; }
-    void set_current_playback_position(double);
+    double current_playback_position() const;
+    void set_official_playback_position(double);
 
     double duration() const;
     JS::Object* get_start_date();
@@ -156,7 +158,8 @@ public:
 
     void set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track);
 
-    void update_video_frame_and_timeline();
+    void add_current_video_sink();
+    void detach_video_sink_after_compositor_lost();
 
     GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
 
@@ -175,13 +178,11 @@ public:
 
     CORSSettingAttribute crossorigin() const { return m_crossorigin; }
 
-    RefPtr<Media::DisplayingVideoSink> const& selected_video_track_sink() const { return m_selected_video_track_sink; }
+    Optional<Media::VideoSinkHandle> video_sink_handle() const;
+    RefPtr<Media::VideoFrame> current_presented_frame() const;
 
-    Painting::VideoFrameResourceId ensure_video_frame_resource_id();
-    Optional<Painting::VideoFrameResourceId> video_frame_resource_id() const { return m_video_frame_resource_id; }
-    u64 video_frame_content_generation() const { return m_video_frame_content_generation; }
+    Optional<Painting::VideoSinkResourceId> video_sink_resource_id() const;
 
-    virtual bool update_intrinsic_video_dimensions() { return false; }
     virtual void update_natural_dimensions() { }
 
 protected:
@@ -199,6 +200,7 @@ protected:
 private:
     friend SourceElementSelector;
 
+    class ActiveVideoSink;
     struct RemoteFetchData;
     virtual bool is_html_media_element() const final { return true; }
 
@@ -226,6 +228,9 @@ private:
     void continue_fetching_the_resource_after_an_implementation_defined_event();
     void run_remote_mode_resource_fetch_steps(ByteRange, u32 fetch_generation);
 
+    void add_current_video_sink(Media::VideoSinkHandle);
+    void release_active_video_sink();
+
     Optional<Utf16String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
     bool should_hold_screen_wake_lock() const;
     void update_screen_wake_lock();
@@ -249,6 +254,8 @@ private:
     void on_video_track_added(Media::Track const&);
     void on_metadata_parsed();
     void on_playback_manager_state_change();
+    void upon_current_playback_position_possibly_changed();
+    void start_or_stop_playback_position_update_timer();
     void play_element();
     void pause_element();
     void seek_element(double playback_position, MediaSeekMode = MediaSeekMode::Accurate);
@@ -262,9 +269,9 @@ private:
 
     void volume_or_muted_attribute_changed();
     void update_volume();
-    void update_compositor_video_frame(NonnullRefPtr<Media::VideoFrame const>);
-    void clear_compositor_video_frame();
-    void update_current_video_frame();
+    void attach_selected_video_track_sink(Media::Track const&);
+    void sync_video_update_flags() const;
+    void note_frame_captured() const;
 
     bool is_eligible_for_autoplay() const;
     bool is_allowed_to_play() const;
@@ -326,11 +333,13 @@ private:
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-seeking
     bool m_seeking { false };
 
-    // https://html.spec.whatwg.org/multipage/media.html#current-playback-position
-    double m_current_playback_position { 0 };
+    // The current playback position as of the last possible-change check; empty until the first check
+    // for each media resource.
+    Optional<double> m_last_known_current_playback_position;
 
     // https://html.spec.whatwg.org/multipage/media.html#official-playback-position
-    double m_official_playback_position { 0 };
+    mutable double m_official_playback_position { 0 };
+    mutable u64 m_official_playback_position_task_generation { 0 };
 
     // https://html.spec.whatwg.org/multipage/media.html#default-playback-start-position
     double m_default_playback_start_position { 0 };
@@ -397,8 +406,12 @@ private:
     bool m_waiting_for_an_implementation_defined_event_to_fetch_the_resource { false };
 
     OwnPtr<Media::PlaybackManager> m_playback_manager;
+
+    RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;
-    RefPtr<Media::DisplayingVideoSink> m_selected_video_track_sink;
+    OwnPtr<ActiveVideoSink> m_active_video_sink;
+    mutable bool m_video_frame_was_recently_captured { false };
+    mutable RefPtr<Core::Timer> m_video_frame_capture_keepalive_timer;
     Optional<ScreenWakeLockHandle> m_screen_wake_lock;
 
     bool m_loop_was_specified_when_reaching_end_of_media_resource { false };
@@ -407,9 +420,6 @@ private:
 
     bool m_has_enabled_preferred_audio_track { false };
     bool m_has_selected_preferred_video_track { false };
-
-    Optional<Painting::VideoFrameResourceId> m_video_frame_resource_id;
-    u64 m_video_frame_content_generation { 0 };
 };
 
 }

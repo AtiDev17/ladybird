@@ -1,8 +1,8 @@
 include(audio)
 
 set(SOURCES
-    Audio/AudioBuffer.cpp
     Audio/AudioDevices.cpp
+    Audio/AudioRingBuffer.cpp
     Audio/NullPlaybackStream.cpp
     Audio/PlaybackStream.cpp
     Audio/WSOLAAlgorithm.cpp
@@ -21,8 +21,9 @@ set(SOURCES
     Containers/Matroska/SampleIterator.cpp
     Containers/Matroska/Streamer.cpp
     DecodeAudioStream.cpp
-    GenericTimeProvider.cpp
     IncrementallyPopulatedStream.cpp
+    MediaTime.cpp
+    MonotonicMediaClock.cpp
     PlaybackManager.cpp
     PlaybackStates/BufferingStateHandler.cpp
     PlaybackStates/PlayingStateHandler.cpp
@@ -34,11 +35,27 @@ set(SOURCES
     Processors/AudioTimeStretchProcessor.cpp
     Producers/DecodedAudioProducer.cpp
     Producers/DecodedVideoProducer.cpp
+    Producers/RemoteVideoProducer.cpp
     Sinks/AudioPlaybackSink.cpp
     Sinks/DisplayingVideoSink.cpp
+    Sinks/RemoteVideoSink.cpp
+    VideoPresentation/PresentedFramePage.cpp
+    VideoPresentation/VideoPresentationClientConnection.cpp
+    VideoPresentation/VideoPresentationServerConnection.cpp
     TimeRanges.cpp
+    VideoEdgeQueue.cpp
     VideoFrame.cpp
+    VideoFrameHandle.cpp
+    VideoFramePool.cpp
 )
+
+set(GENERATED_SOURCES
+    VideoPresentation/VideoPresentationClientEndpoint.h
+    VideoPresentation/VideoPresentationServerEndpoint.h
+)
+
+compile_ipc(VideoPresentation/VideoPresentationClient.ipc VideoPresentation/VideoPresentationClientEndpoint.h)
+compile_ipc(VideoPresentation/VideoPresentationServer.ipc VideoPresentation/VideoPresentationServerEndpoint.h)
 
 ladybird_lib(LibMedia media EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibMedia PRIVATE LibCore LibCrypto LibIPC LibGfx LibSync LibThreading LibUnicode)

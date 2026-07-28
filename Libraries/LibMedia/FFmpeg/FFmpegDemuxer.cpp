@@ -37,6 +37,9 @@ FFmpegDemuxer::~FFmpegDemuxer()
         if (context->format_context != nullptr)
             avformat_close_input(&context->format_context);
     }
+
+    if (m_buffered_scan_thread != nullptr)
+        m_buffered_scan_thread->shutdown();
 }
 
 static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_context, AVIOContext& io_context)
@@ -186,7 +189,7 @@ DecoderErrorOr<NonnullRefPtr<FFmpegDemuxer>> FFmpegDemuxer::from_stream(NonnullR
             demuxer->m_preferred_track_for_type[type_index] = static_cast<int>(i);
     }
 
-    demuxer->m_container_navigator = create_container_navigator(*format_context, demuxer->m_total_duration, stream);
+    demuxer->start_buffered_scan_thread(*format_context);
 
     avformat_close_input(&format_context);
     return demuxer;
@@ -213,7 +216,7 @@ static inline i64 duration_to_time_units(AK::Duration duration, AVRational const
     return duration.to_time_units(time_base.num, time_base.den);
 }
 
-OwnPtr<ContainerNavigator> FFmpegDemuxer::create_container_navigator(AVFormatContext& context, AK::Duration total_duration, NonnullRefPtr<MediaStream> const& stream)
+OwnPtr<ContainerNavigator> FFmpegDemuxer::create_single_track_container_navigator(AVFormatContext& context, AK::Duration total_duration, NonnullRefPtr<MediaStream> const& stream)
 {
     auto format_name = StringView(context.iformat->name, strlen(context.iformat->name));
 
@@ -289,45 +292,66 @@ OwnPtr<ContainerNavigator> FFmpegDemuxer::create_container_navigator(AVFormatCon
         return OggNavigator::create(first_packet, move(cursor), codec_id, static_cast<u32>(av_stream.time_base.num), static_cast<u32>(av_stream.time_base.den), sample_rate, codec_initialization_data);
     }
 
-    return create_container_navigator_from_index(context);
+    return nullptr;
 }
 
-OwnPtr<ContainerNavigator> FFmpegDemuxer::create_container_navigator_from_index(AVFormatContext& context)
+void FFmpegDemuxer::start_buffered_scan_thread(AVFormatContext& context)
 {
-    Vector<IndexEntry> entries;
-    for (u32 i = 0; i < context.nb_streams; i++) {
-        auto* stream = context.streams[i];
-        auto entry_count = avformat_index_get_entries_count(stream);
-        if (entry_count <= 0)
-            continue;
+    m_fallback_scan_state.duration = m_total_duration;
 
-        MUST(entries.try_ensure_capacity(entries.size() + entry_count));
-        for (int j = 0; j < entry_count; j++) {
-            auto const* entry = avformat_index_get_entry(stream, j);
-            entries.unchecked_append({
-                .position = static_cast<size_t>(entry->pos),
-                .timestamp = time_units_to_duration(entry->timestamp, stream->time_base),
-            });
+    if (m_stream_info.is_empty())
+        return;
+
+    OwnPtr<ContainerNavigator> navigator = create_single_track_container_navigator(context, m_total_duration, m_stream);
+    if (navigator == nullptr) {
+        Vector<IndexedContainerNavigator::TrackIndex> track_indices;
+        for (u32 i = 0; i < context.nb_streams; i++) {
+            auto* stream = context.streams[i];
+            auto entry_count = avformat_index_get_entries_count(stream);
+            if (entry_count <= 0)
+                continue;
+
+            Vector<IndexEntry> entries;
+            MUST(entries.try_ensure_capacity(entry_count));
+            for (int j = 0; j < entry_count; j++) {
+                auto const* entry = avformat_index_get_entry(stream, j);
+                entries.unchecked_append({
+                    .position = static_cast<size_t>(entry->pos),
+                    .timestamp = time_units_to_duration(entry->timestamp, stream->time_base),
+                });
+            }
+
+            // Ensure monotonic ordering of both positions and timestamps.
+            bool is_monotonic = true;
+            for (size_t j = 1; j < entries.size(); j++) {
+                if (entries[j - 1].position >= entries[j].position || entries[j - 1].timestamp > entries[j].timestamp) {
+                    is_monotonic = false;
+                    break;
+                }
+            }
+            if (!is_monotonic)
+                continue;
+
+            track_indices.empend(m_stream_info[i].track.identifier(), move(entries));
         }
+        if (!track_indices.is_empty())
+            navigator = make<IndexedContainerNavigator>(move(track_indices), m_total_duration);
     }
+    if (navigator == nullptr)
+        return;
 
-    if (entries.is_empty())
-        return nullptr;
+    Vector<Track> tracks;
+    for (auto const& stream_info : m_stream_info)
+        tracks.append(stream_info.track);
 
-    quick_sort(entries, [](auto const& left, auto const& right) {
-        return left.position < right.position;
-    });
-
-    // Ensure monotonic ordering of both positions and timestamps.
-    for (size_t i = 1; i < entries.size(); i++) {
-        if (entries[i - 1].position == entries[i].position)
-            return nullptr;
-        if (entries[i - 1].timestamp > entries[i].timestamp)
-            return nullptr;
-    }
-
-    auto duration = AK::Duration::from_time_units(context.duration, 1, AV_TIME_BASE);
-    return make<IndexedContainerNavigator>(move(entries), duration);
+    DemuxerScanState initial_state;
+    initial_state.duration = m_total_duration;
+    m_buffered_scan_thread = DemuxerScanThread<BufferedScanPayload>::start(m_stream, move(initial_state),
+        BufferedScanPayload { navigator.release_nonnull(), move(tracks), m_total_duration },
+        [](MediaStream& stream, BufferedScanPayload& payload) {
+            auto scans = payload.navigator->buffered_time_ranges_by_track(stream.available_byte_ranges());
+            return DemuxerScanState::create_from_track_scans(payload.tracks, move(scans), payload.initial_duration, stream.closing_bytes_are_available());
+        });
 }
 
 DecoderErrorOr<void> FFmpegDemuxer::create_context_for_track(Track const& track)
@@ -368,17 +392,18 @@ Optional<AK::UnixDateTime> FFmpegDemuxer::start_time_realtime() const
     return m_start_time_realtime;
 }
 
-TimeRanges FFmpegDemuxer::buffered_time_ranges() const
+DemuxerScanState const& FFmpegDemuxer::scan_state() const
 {
-    if (!m_container_navigator) {
-        TimeRanges ranges;
-        if (!m_total_duration.is_zero())
-            ranges.add_range(AK::Duration::zero(), m_total_duration);
-        return ranges;
-    }
+    if (m_buffered_scan_thread == nullptr)
+        return m_fallback_scan_state;
+    return m_buffered_scan_thread->main_thread_state();
+}
 
-    auto byte_ranges = m_stream->available_byte_ranges();
-    return m_container_navigator->buffered_time_ranges(byte_ranges);
+void FFmpegDemuxer::set_scan_state_change_handler(Function<void()> handler)
+{
+    if (m_buffered_scan_thread == nullptr)
+        return;
+    m_buffered_scan_thread->set_change_handler(move(handler));
 }
 
 DecoderErrorOr<AK::Duration> FFmpegDemuxer::duration_of_track(Track const& track)
@@ -437,8 +462,8 @@ DecoderErrorOr<DemuxerSeekResult> FFmpegDemuxer::seek_to_most_recent_keyframe(Tr
     format_context.pb->eof_reached = 0;
     format_context.pb->error = 0;
 
-    if (m_container_navigator) {
-        auto seek_result = TRY(m_container_navigator->seek_to_timestamp(timestamp));
+    if (m_buffered_scan_thread != nullptr) {
+        auto seek_result = TRY(m_buffered_scan_thread->payload().navigator->seek_to_timestamp(track.identifier(), timestamp));
         if (seek_result.has<SeekSkipped>()) {
             return DemuxerSeekResult::KeptCurrentPosition;
         }
@@ -558,10 +583,10 @@ void FFmpegDemuxer::reset_blocking_reads_aborted_for_track(Track const& track)
     track_context.cursor->reset_abort();
 }
 
-bool FFmpegDemuxer::is_read_blocked_for_track(Track const& track)
+void FFmpegDemuxer::set_read_blocked_change_handler_for_track(Track const& track, ReadBlockedChangeHandler handler)
 {
     auto& track_context = get_track_context(track);
-    return track_context.cursor->is_blocked();
+    track_context.cursor->set_blocked_change_handler(move(handler));
 }
 
 FFmpegDemuxer::TrackContext::~TrackContext()

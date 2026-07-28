@@ -8,13 +8,22 @@
 
 #include <AK/Array.h>
 #include <AK/Atomic.h>
+#include <AK/Noncopyable.h>
 #include <AK/Optional.h>
+#include <AK/TearableAtomic.h>
 #include <LibMedia/AudioBlockTiming.h>
 
 namespace Media {
 
+// Written by a single writer; readers are lock-free and may access the ring in place from
+// other threads or, through shared memory, other processes.
 class AudioBlockTimingRing {
+    AK_MAKE_NONCOPYABLE(AudioBlockTimingRing);
+    AK_MAKE_NONMOVABLE(AudioBlockTimingRing);
+
 public:
+    AudioBlockTimingRing() = default;
+
     static constexpr size_t capacity = 32;
 
     void clear()
@@ -29,9 +38,9 @@ public:
 
         auto version = slot.version.load();
         slot.version.store(version + 1);
-        slot.sequence = sequence;
-        slot.timing = timing;
-        slot.version.store(version + 2);
+        AK::atomic_thread_fence(AK::MemoryOrder::memory_order_seq_cst);
+        slot.record.store_relaxed({ .sequence = sequence, .timing = timing });
+        slot.version.store(version + 2, AK::MemoryOrder::memory_order_release);
 
         m_latest_sequence.store(sequence);
     }
@@ -83,25 +92,24 @@ private:
         AudioBlockTiming timing;
     };
 
+    // Ordering between the version and the payload is provided by the fences in enqueue() and
+    // read_record(), and by their explicitly annotated version accesses.
     struct Slot {
-        Atomic<u64> version { 0 };
-        u64 sequence { 0 };
-        AudioBlockTiming timing;
+        Atomic<u64, AK::MemoryOrder::memory_order_relaxed> version { 0 };
+        TearableAtomic<Record> record;
     };
 
     Optional<Record> read_record(u64 expected_sequence) const
     {
         auto const& slot = m_slots[expected_sequence % capacity];
 
-        auto version_before = slot.version.load();
+        auto version_before = slot.version.load(AK::MemoryOrder::memory_order_acquire);
         if (version_before % 2 != 0)
             return {};
 
-        Record record {
-            .sequence = slot.sequence,
-            .timing = slot.timing,
-        };
+        auto record = slot.record.load_relaxed();
 
+        AK::atomic_thread_fence(AK::MemoryOrder::memory_order_acquire);
         auto version_after = slot.version.load();
         if (version_before != version_after || version_after % 2 != 0)
             return {};

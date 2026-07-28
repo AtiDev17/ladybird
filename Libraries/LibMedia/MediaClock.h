@@ -8,14 +8,15 @@
 
 #include <AK/Time.h>
 #include <LibMedia/MediaPipelineNode.h>
+#include <LibMedia/MediaTime.h>
 
 namespace Media {
 
-class MediaTimeProvider : public virtual MediaPipelineNode {
+class MediaClock : public virtual MediaPipelineNode {
 public:
-    virtual ~MediaTimeProvider() = default;
+    virtual ~MediaClock() = default;
 
-    virtual AK::Duration current_time() const = 0;
+    virtual MediaTimeReader time_reader() const = 0;
     virtual void resume() = 0;
     virtual void pause() = 0;
     virtual void seek(AK::Duration) = 0;

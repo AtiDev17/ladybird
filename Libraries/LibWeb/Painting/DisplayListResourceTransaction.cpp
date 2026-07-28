@@ -84,31 +84,19 @@ ErrorOr<Web::Painting::DisplayListImageFrameResource> decode(Decoder& decoder)
 }
 
 template<>
-ErrorOr<void> encode(Encoder& encoder, Web::Painting::DisplayListVideoFrameResource const& resource)
+ErrorOr<void> encode(Encoder& encoder, Web::Painting::DisplayListVideoSinkResource const& resource)
 {
-    Optional<NonnullRefPtr<Media::VideoFrame const>> frame;
-    if (resource.frame)
-        frame = NonnullRefPtr<Media::VideoFrame const> { *resource.frame };
-
     TRY(encoder.encode(resource.id));
-    TRY(encoder.encode(frame));
+    TRY(encoder.encode(resource.sink_handle));
     return {};
 }
 
 template<>
-ErrorOr<Web::Painting::DisplayListVideoFrameResource> decode(Decoder& decoder)
+ErrorOr<Web::Painting::DisplayListVideoSinkResource> decode(Decoder& decoder)
 {
-    auto id = TRY(decoder.decode<Web::Painting::VideoFrameResourceId>());
-    auto frame = TRY(decoder.decode<Optional<NonnullRefPtr<Media::VideoFrame const>>>());
-
-    RefPtr<Media::VideoFrame const> decoded_frame;
-    if (frame.has_value())
-        decoded_frame = frame.release_value();
-
-    return Web::Painting::DisplayListVideoFrameResource {
-        .id = id,
-        .frame = move(decoded_frame),
-    };
+    auto id = TRY(decoder.decode<Web::Painting::VideoSinkResourceId>());
+    auto sink_handle = TRY(decoder.decode<Media::VideoSinkHandle>());
+    return Web::Painting::DisplayListVideoSinkResource { .id = id, .sink_handle = sink_handle };
 }
 
 template<>
@@ -116,7 +104,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::DisplayListResourceTransac
 {
     TRY(encoder.encode(transaction.fonts));
     TRY(encoder.encode(transaction.image_frames));
-    TRY(encoder.encode(transaction.video_frames));
+    TRY(encoder.encode(transaction.video_sinks));
     TRY(encoder.encode_size(transaction.display_lists.size()));
     for (auto const& display_list : transaction.display_lists) {
         TRY(encoder.encode(*display_list.display_list));
@@ -124,7 +112,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::DisplayListResourceTransac
     }
     TRY(encoder.encode(transaction.font_ids_to_remove));
     TRY(encoder.encode(transaction.image_frame_ids_to_remove));
-    TRY(encoder.encode(transaction.video_frame_ids_to_remove));
+    TRY(encoder.encode(transaction.video_sink_ids_to_remove));
     TRY(encoder.encode(transaction.display_list_ids_to_remove));
     return {};
 }
@@ -134,7 +122,7 @@ ErrorOr<Web::Painting::DisplayListResourceTransaction> decode(Decoder& decoder)
 {
     auto fonts = TRY(decoder.decode<Vector<Web::Painting::DisplayListFontResource>>());
     auto image_frames = TRY(decoder.decode<Vector<Web::Painting::DisplayListImageFrameResource>>());
-    auto video_frames = TRY(decoder.decode<Vector<Web::Painting::DisplayListVideoFrameResource>>());
+    auto video_sinks = TRY(decoder.decode<Vector<Web::Painting::DisplayListVideoSinkResource>>());
 
     auto display_list_count = TRY(decoder.decode_size());
     Vector<Web::Painting::DisplayListResource> display_lists;
@@ -148,11 +136,11 @@ ErrorOr<Web::Painting::DisplayListResourceTransaction> decode(Decoder& decoder)
     return Web::Painting::DisplayListResourceTransaction {
         .fonts = move(fonts),
         .image_frames = move(image_frames),
-        .video_frames = move(video_frames),
+        .video_sinks = move(video_sinks),
         .display_lists = move(display_lists),
         .font_ids_to_remove = TRY(decoder.decode<Vector<Web::Painting::FontResourceId>>()),
         .image_frame_ids_to_remove = TRY(decoder.decode<Vector<Web::Painting::ImageFrameResourceId>>()),
-        .video_frame_ids_to_remove = TRY(decoder.decode<Vector<Web::Painting::VideoFrameResourceId>>()),
+        .video_sink_ids_to_remove = TRY(decoder.decode<Vector<Web::Painting::VideoSinkResourceId>>()),
         .display_list_ids_to_remove = TRY(decoder.decode<Vector<Web::Painting::DisplayListResourceId>>()),
     };
 }

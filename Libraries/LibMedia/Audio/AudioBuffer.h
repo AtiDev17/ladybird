@@ -8,33 +8,55 @@
 
 #include <AK/FixedArray.h>
 #include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/AudioBlock.h>
 
 namespace Audio {
 
 class AudioBuffer {
 public:
-    explicit AudioBuffer(SampleSpecification);
+    AudioBuffer() = default;
 
+    AudioBuffer(SampleSpecification sample_specification, size_t frame_count)
+        : m_sample_specification(sample_specification)
+        , m_frame_count(frame_count)
+        , m_data(MUST(FixedArray<float>::create(frame_count * sample_specification.channel_count())))
+    {
+    }
+
+    SampleSpecification const& sample_specification() const { return m_sample_specification; }
+    u8 channel_count() const { return m_sample_specification.channel_count(); }
     size_t frame_count() const { return m_frame_count; }
 
-    void clear();
-    void append(Media::AudioBlock const&);
-    void append_silence(size_t frame_count);
-    void drop_front(size_t frame_count);
-    void copy_frames_to(size_t source_offset, size_t frame_count, size_t destination_offset, Media::AudioBlock&) const;
+    Span<float> channel_data(size_t channel)
+    {
+        VERIFY(channel < channel_count());
+        return m_data.span().slice(channel * m_frame_count, m_frame_count);
+    }
+
+    ReadonlySpan<float> channel_data(size_t channel) const
+    {
+        VERIFY(channel < channel_count());
+        return m_data.span().slice(channel * m_frame_count, m_frame_count);
+    }
+
+    void zero()
+    {
+        m_data.fill_with(0.0f);
+    }
+
+    void zero_frames(size_t starting_frame, size_t frame_count)
+    {
+        VERIFY(starting_frame <= m_frame_count);
+        VERIFY(frame_count <= m_frame_count - starting_frame);
+        for (size_t channel = 0; channel < channel_count(); channel++) {
+            for (auto& sample : channel_data(channel).slice(starting_frame, frame_count))
+                sample = 0.0f;
+        }
+    }
 
 private:
-    void ensure_capacity(size_t required_frame_capacity);
-    void copy_channel_to_buffer(ReadonlySpan<float>, size_t channel, size_t destination_offset);
-    void copy_channel_from_buffer(size_t channel, size_t source_offset, Span<float>) const;
-    void zero_channel(size_t channel, size_t destination_offset, size_t frame_count);
-
-    SampleSpecification const m_sample_specification;
-    FixedArray<float> m_data;
-    size_t m_frame_capacity { 0 };
+    SampleSpecification m_sample_specification;
     size_t m_frame_count { 0 };
-    size_t m_start_offset { 0 };
+    FixedArray<float> m_data;
 };
 
 }
