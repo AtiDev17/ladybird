@@ -2633,12 +2633,15 @@ double Element::scroll_top() const
         return window->scroll_y();
 
     // 8. If the element does not have any associated box, return zero and terminate these steps.
-    if (!paintable_box())
+    // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
+    //     stored scroll offset from when it was one for restoration when it becomes one again.
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return 0.0;
 
     // 9. Return the y-coordinate of the scrolling area at the alignment point with the top of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box()->scroll_offset().y().to_double();
+    return paintable_box->scroll_offset().y().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -2675,12 +2678,15 @@ double Element::scroll_left() const
         return window->scroll_x();
 
     // 8. If the element does not have any associated box, return zero and terminate these steps.
-    if (!paintable_box())
+    // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
+    //     stored scroll offset from when it was one for restoration when it becomes one again.
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return 0.0;
 
     // 9. Return the x-coordinate of the scrolling area at the alignment point with the left of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box()->scroll_offset().x().to_double();
+    return paintable_box->scroll_offset().x().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -4343,12 +4349,13 @@ GC::Ref<WebIDL::Promise> Element::scroll(Bindings::ScrollToOptions options)
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element
     //     has no overflow, return a resolved Promise and abort the remaining steps.
     // FIXME: or the element has no overflow
-    if (!paintable_box())
+    auto paintable_box = this->paintable_box();
+    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
         return WebIDL::create_resolved_promise(realm(), JS::js_undefined());
 
     // 11. Scroll the element to x,y, with the scroll behavior being the value of the behavior dictionary member of
     //     options. Let scrollPromise be the Promise returned from this step.
-    auto scroll_offset = paintable_box()->scroll_offset();
+    auto scroll_offset = paintable_box->scroll_offset();
     scroll_offset.set_x(CSSPixels::nearest_value_for(x));
     scroll_offset.set_y(CSSPixels::nearest_value_for(y));
     auto navigable = document.navigable();
