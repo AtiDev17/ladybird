@@ -641,10 +641,7 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
     }
 
     pub(crate) fn text_may_require_bidi_processing(&self, node: Node) -> bool {
-        // SAFETY: The host reads the live TextNode synchronously.
-        unsafe {
-            (self.callbacks.text_may_require_bidi_processing)(self.callbacks.context, self.callbacks.shell(node))
-        }
+        self.callbacks.text_content(node).may_require_bidi_processing
     }
 
     pub(crate) fn compute_inset(&self, node: Node) {
@@ -733,13 +730,19 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
         next.map(|next| next - containing_block_offset_in_root)
     }
 
-    fn parent_resolve_used_block_size(&self, node: Node, treated_as_auto: bool, available_space: AvailableSpace) {
+    fn parent_resolve_used_block_size(
+        &self,
+        node: Node,
+        treated_as_auto: bool,
+        available_space: AvailableSpace,
+        child_automatic_block_size: Option<CssPixels>,
+    ) {
         if treated_as_auto {
             self.parent.resolve_used_block_size_if_treated_as_auto(
                 node,
                 available_space,
                 self.input.containing_block_constraints,
-                None,
+                child_automatic_block_size,
             );
         } else {
             self.parent.resolve_used_block_size_if_not_treated_as_auto(
@@ -901,19 +904,32 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
             inline_size: crate::layout::AvailableSize::definite(inline_size),
             block_size: crate::layout::AvailableSize::Indefinite,
         };
-        self.parent_resolve_used_block_size(node, false, inline_definite_space);
+        self.parent_resolve_used_block_size(node, false, inline_definite_space, None);
         if style.display.is_flex_inside() {
-            self.parent_resolve_used_block_size(node, true, inline_definite_space);
+            self.parent_resolve_used_block_size(node, true, inline_definite_space, None);
         }
         sizing.make_button_content_box_definite(node, self.layout_mode, available_space, constraints, None);
+        let inner_before_cached_measurement = self
+            .used(node)
+            .available_inner_space_or_constraints_from(available_space);
+        let cached_automatic_block_size = sizing.apply_cached_intrinsic_inline_measurement(
+            node,
+            available_space.inline_size,
+            inner_before_cached_measurement.block_size,
+            constraints,
+        );
         let inner = self
             .used(node)
             .available_inner_space_or_constraints_from(available_space);
-        let child_layout = self.layout_inside(node, inner);
-        if sizing.should_treat_block_size_as_auto(node, available_space, constraints) {
-            self.parent_resolve_used_block_size(node, true, available_space);
+        let child_layout = if cached_automatic_block_size.is_some() {
+            None
         } else {
-            self.parent_resolve_used_block_size(node, false, available_space);
+            self.layout_inside(node, inner)
+        };
+        if sizing.should_treat_block_size_as_auto(node, available_space, constraints) {
+            self.parent_resolve_used_block_size(node, true, available_space, cached_automatic_block_size);
+        } else {
+            self.parent_resolve_used_block_size(node, false, available_space, None);
         }
         if let Some(child_layout) = child_layout {
             child_layout.finish();

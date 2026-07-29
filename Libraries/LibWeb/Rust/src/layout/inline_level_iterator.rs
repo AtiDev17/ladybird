@@ -68,7 +68,8 @@ struct ExtraBoxMetrics {
 
 #[derive(Clone, Copy)]
 struct TextNodeContext {
-    facts: FfiTextNodeFacts,
+    chunks: &'static [TextChunk],
+    text: &'static [u16],
     next_chunk_index: usize,
     should_collapse_whitespace: bool,
     should_respect_linebreaks: bool,
@@ -114,7 +115,6 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
         iterator.skip_to_next();
         iterator.generate_all_items();
         InlineLevelIterator {
-            is_unidirectional_left_to_right: iterator.is_unidirectional_left_to_right,
             visited_fragmented_inlines: iterator.visited_fragmented_inlines,
             items: iterator.items,
             next_item_index: iterator.next_item_index,
@@ -127,22 +127,6 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
 
     fn context_mut(&mut self) -> &mut InlineFormattingContext<'context, 'pass> {
         self.context
-    }
-
-    fn chunks(facts: FfiTextNodeFacts) -> &'static [FfiTextChunk] {
-        if facts.chunk_count == 0 {
-            return &[];
-        }
-        // SAFETY: The state-owned text snapshot remains alive for the pass.
-        unsafe { std::slice::from_raw_parts(facts.chunks, facts.chunk_count) }
-    }
-
-    fn text(facts: FfiTextNodeFacts) -> &'static [u16] {
-        if facts.text_length_in_code_units == 0 {
-            return &[];
-        }
-        // SAFETY: The state-owned text snapshot remains alive for the pass.
-        unsafe { std::slice::from_raw_parts(facts.text_utf16, facts.text_length_in_code_units) }
     }
 
     fn is_out_of_flow(&self, node: Node) -> bool {
@@ -322,22 +306,23 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
             style.white_space_collapse,
             white_space_collapse::PRESERVE | white_space_collapse::PRESERVE_BREAKS | white_space_collapse::BREAK_SPACES
         );
+        let should_collapse_whitespace = matches!(
+            style.white_space_collapse,
+            white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
+        );
         let callbacks = self.context().callbacks;
-        let facts = self
-            .context()
-            .state
-            .text_facts(
-                &callbacks,
-                text_node,
-                should_wrap_lines,
-                should_respect_linebreaks,
-                self.is_unidirectional_left_to_right,
-            )
-            .ffi();
+        let chunks = self.context().state.text_chunks(
+            &callbacks,
+            text_node,
+            should_wrap_lines,
+            should_respect_linebreaks,
+            self.is_unidirectional_left_to_right,
+        );
         self.text_node_context = Some(TextNodeContext {
-            facts,
+            chunks,
+            text: &callbacks.text_content(text_node).text,
             next_chunk_index: 0,
-            should_collapse_whitespace: facts.should_collapse_whitespace,
+            should_collapse_whitespace,
             should_respect_linebreaks,
             last_known_direction: None,
         });
@@ -345,7 +330,7 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
 
     fn resolve_text_direction_from_context(&self) -> u8 {
         let context = self.text_node_context.unwrap();
-        let next_known_direction = Self::chunks(context.facts)[context.next_chunk_index..]
+        let next_known_direction = context.chunks[context.next_chunk_index..]
             .iter()
             .find_map(|chunk| {
                 matches!(chunk.text_type, GLYPH_TEXT_TYPE_LTR | GLYPH_TEXT_TYPE_RTL).then_some(chunk.text_type)
@@ -405,7 +390,7 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
             self.enter_text_node(text_node);
         }
         let mut text_context = self.text_node_context.unwrap();
-        let chunks = Self::chunks(text_context.facts);
+        let chunks = text_context.chunks;
         let is_first_chunk = text_context.next_chunk_index == 0;
         let chunk = chunks.get(text_context.next_chunk_index).copied();
         if chunk.is_some() {
@@ -415,14 +400,18 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
         let is_empty_editable = chunk.is_none()
             && is_first_chunk
             && is_last_chunk
-            && text_context.facts.text_length_in_code_units == 0
-            && text_context.facts.is_empty_editable;
+            && text_context.text.is_empty()
+            && {
+                let callbacks = self.context().callbacks;
+                // SAFETY: The host reads the live TextNode synchronously.
+                unsafe { (callbacks.text_node_is_empty_editable)(callbacks.context, callbacks.shell(text_node)) }
+            };
         let chunk = if let Some(chunk) = chunk {
             chunk
         } else if is_empty_editable {
             text_context.next_chunk_index = 1;
             let parent_style = self.context().style(self.context().parent_node(text_node));
-            FfiTextChunk {
+            TextChunk {
                 start: 0,
                 length: 0,
                 font: parent_style.first_available_font(),
@@ -459,7 +448,7 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
 
         let style = self.context().style(self.context().parent_node(text_node));
         let mut inline_offset = 0.0f32;
-        let full_text = Self::text(text_context.facts);
+        let full_text = text_context.text;
         let mut shaped_start = chunk.start;
         let mut shaped_length = chunk.length;
         if chunk.has_breaking_tab {
@@ -480,7 +469,7 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
                 tab_inline_size
             };
             let zero_width = font_glyph_width(chunk.font, b'0' as u32);
-            if tab_stop_distance < CssPixels::nearest_value_for_f32(zero_width * 0.5) {
+            if tab_stop_distance.to_double() < f64::from(zero_width) * 0.5 {
                 tab_stop_distance += tab_inline_size;
             }
             let tab_count = full_text[chunk.start..chunk.start + chunk.length]
@@ -501,8 +490,8 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
             style.letter_spacing.to_double() as f32,
         );
         let chunk_inline_size = CssPixels::nearest_value_for_f32(glyphs.width + inline_offset);
-        let generated_empty =
-            is_empty_editable || (text_context.facts.is_generated_for_pseudo_element && chunk.length == 0);
+        let generated_empty = is_empty_editable
+            || (self.context().facts(text_node).is_generated_for_pseudo_element() && chunk.length == 0);
         let mut item = Item::new(ItemType::Text, text_node);
         item.glyphs = Some(glyphs);
         item.offset_in_node = chunk.start;
@@ -591,7 +580,6 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
 }
 
 pub(crate) struct InlineLevelIterator {
-    is_unidirectional_left_to_right: bool,
     visited_fragmented_inlines: Vec<Node>,
     items: Vec<Item>,
     next_item_index: usize,
@@ -600,14 +588,6 @@ pub(crate) struct InlineLevelIterator {
 impl InlineLevelIterator {
     pub(crate) fn new(context: &mut InlineFormattingContext<'_, '_>) -> Self {
         InlineLevelIteratorGenerator::generate(context)
-    }
-
-    fn text(facts: FfiTextNodeFacts) -> &'static [u16] {
-        if facts.text_length_in_code_units == 0 {
-            return &[];
-        }
-        // SAFETY: The state-owned text snapshot remains alive for the pass.
-        unsafe { std::slice::from_raw_parts(facts.text_utf16, facts.text_length_in_code_units) }
     }
 
     pub(crate) fn next(&mut self) -> Option<Item> {
@@ -636,17 +616,7 @@ impl InlineLevelIterator {
                 if item.type_ != ItemType::Text || item.is_collapsible_whitespace {
                     break;
                 }
-                let facts = context
-                    .state
-                    .text_facts(
-                        &context.callbacks,
-                        item.node,
-                        true,
-                        false,
-                        self.is_unidirectional_left_to_right,
-                    )
-                    .ffi();
-                let text = Self::text(facts);
+                let text = &context.callbacks.text_content(item.node).text;
                 if text[item.offset_in_node..item.offset_in_node + item.length_in_node]
                     .iter()
                     .all(|unit| *unit <= 0x7f && (*unit as u8).is_ascii_whitespace())
@@ -661,23 +631,8 @@ impl InlineLevelIterator {
 
     pub(crate) fn item_is_ascii_whitespace(&self, context: &InlineFormattingContext<'_, '_>, item: &Item) -> bool {
         assert_eq!(item.type_, ItemType::Text);
-        let style = context.style(context.parent_node(item.node));
-        let should_wrap = style.text_wrap_mode == text_wrap_mode::WRAP;
-        let should_respect = matches!(
-            style.white_space_collapse,
-            white_space_collapse::PRESERVE | white_space_collapse::PRESERVE_BREAKS | white_space_collapse::BREAK_SPACES
-        );
-        let facts = context
-            .state
-            .text_facts(
-                &context.callbacks,
-                item.node,
-                should_wrap,
-                should_respect,
-                self.is_unidirectional_left_to_right,
-            )
-            .ffi();
-        Self::text(facts)[item.offset_in_node..item.offset_in_node + item.length_in_node]
+        let text = &context.callbacks.text_content(item.node).text;
+        text[item.offset_in_node..item.offset_in_node + item.length_in_node]
             .iter()
             .all(|unit| *unit <= 0x7f && (*unit as u8).is_ascii_whitespace())
     }
@@ -685,33 +640,6 @@ impl InlineLevelIterator {
     pub(crate) fn take_visited_fragmented_inlines(&mut self) -> Vec<Node> {
         std::mem::take(&mut self.visited_fragmented_inlines)
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiTextChunk {
-    pub start: usize,
-    pub length: usize,
-    pub font: *const c_void,
-    pub has_breaking_newline: bool,
-    pub has_breaking_tab: bool,
-    pub is_all_whitespace: bool,
-    pub can_break_after: bool,
-    pub text_type: u8,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiTextNodeFacts {
-    pub text_utf16: *const u16,
-    pub text_length_in_code_units: usize,
-    pub chunks: *const FfiTextChunk,
-    pub chunk_count: usize,
-    pub should_collapse_whitespace: bool,
-    pub is_generated_for_pseudo_element: bool,
-    pub is_empty_editable: bool,
-    pub has_dom_node: bool,
-    pub retained: *mut c_void,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -723,57 +651,4 @@ pub struct FfiDrawGlyph {
     pub glyph_width: f32,
     pub glyph_id: u32,
     pub should_paint: bool,
-}
-
-pub(crate) struct TextNodeFacts {
-    ffi: FfiTextNodeFacts,
-    release: unsafe extern "C" fn(*mut c_void, *mut c_void),
-}
-
-impl TextNodeFacts {
-    pub(crate) fn build(
-        callbacks: &FfiLayoutFcCallbacks,
-        text_node: Node,
-        should_wrap_lines: bool,
-        should_respect_linebreaks: bool,
-        unidirectional_ltr: bool,
-    ) -> Self {
-        let mut ffi = std::mem::MaybeUninit::<FfiTextNodeFacts>::uninit();
-        // SAFETY: The host synchronously initializes `ffi` on the true path.
-        let built = unsafe {
-            (callbacks.build_text_facts)(
-                callbacks.context,
-                callbacks.shell(text_node),
-                should_wrap_lines,
-                should_respect_linebreaks,
-                unidirectional_ltr,
-                ffi.as_mut_ptr(),
-            )
-        };
-        assert!(built);
-        // SAFETY: `built` is true, so the callback initialized every field.
-        let ffi = unsafe { ffi.assume_init() };
-        assert!(!ffi.retained.is_null());
-        assert!(ffi.text_length_in_code_units == 0 || !ffi.text_utf16.is_null());
-        assert!(ffi.chunk_count == 0 || !ffi.chunks.is_null());
-        Self {
-            ffi,
-            release: callbacks.release_text_facts,
-        }
-    }
-
-    pub(crate) fn ffi(&self) -> FfiTextNodeFacts {
-        self.ffi
-    }
-}
-
-impl Drop for TextNodeFacts {
-    fn drop(&mut self) {
-        // The release operation is context-independent by contract: text
-        // snapshots can outlive the bridge instance that populated the state.
-        // SAFETY: `retained` is owned by this snapshot and released once.
-        unsafe {
-            (self.release)(std::ptr::null_mut(), self.ffi.retained);
-        }
-    }
 }

@@ -25,7 +25,8 @@ pub enum FfiSizeKind {
 ///
 /// `kind` is an `FfiSizeKind`. `fraction` is used for Percentage, `px` for Px,
 /// and `calc` for Calc. FitContent uses the matching payload for its optional
-/// inner length-percentage; an all-zero payload is its keyword/zero form.
+/// inner length-percentage, and `fit_content_has_argument` distinguishes the
+/// keyword-only form from an argument that resolves to zero.
 ///
 /// Values decoded in Rust from the node's style group payloads borrow their
 /// calc pointer from those payloads, which outlive the synchronous layout
@@ -44,6 +45,7 @@ pub struct FfiSizeValue {
     pub calc_is_bridge_retained: bool,
     pub contains_percentage: bool,
     pub contains_anchor_function: bool,
+    pub fit_content_has_argument: bool,
 }
 
 pub type FfiReleaseCalcHandleCallback = unsafe extern "C" fn(*const c_void);
@@ -59,6 +61,7 @@ impl FfiSizeValue {
             calc_is_bridge_retained: false,
             contains_percentage: false,
             contains_anchor_function: false,
+            fit_content_has_argument: false,
         }
     }
 
@@ -71,6 +74,7 @@ impl FfiSizeValue {
             calc_is_bridge_retained: false,
             contains_percentage: false,
             contains_anchor_function: false,
+            fit_content_has_argument: false,
         }
     }
 
@@ -84,6 +88,7 @@ impl FfiSizeValue {
             calc_is_bridge_retained: false,
             contains_percentage: false,
             contains_anchor_function: false,
+            fit_content_has_argument: false,
         }
     }
 
@@ -217,6 +222,8 @@ pub enum FfiStyleField {
     TextJustify,
     WhiteSpaceCollapse,
     TextWrapMode,
+    WordBreak,
+    FontVariantEmoji,
     LineHeight,
     FontSize,
     BoxSizing,
@@ -409,6 +416,7 @@ pub struct FfiResidualStyleValues {
     pub vertical_align_keyword: u8,
     pub vertical_align_value: FfiSizeValue,
     pub first_available_font: *const c_void,
+    pub font_cascade_list: *const c_void,
     pub font_ascent: f32,
     pub font_descent: f32,
     pub font_x_height: f32,
@@ -443,6 +451,7 @@ impl Default for FfiResidualStyleValues {
             vertical_align_keyword: 0,
             vertical_align_value: FfiSizeValue::auto_value(),
             first_available_font: std::ptr::null(),
+            font_cascade_list: std::ptr::null(),
             font_ascent: 0.0,
             font_descent: 0.0,
             font_x_height: 0.0,
@@ -673,6 +682,7 @@ fn decode_length_percentage(handle: &crate::layout::ComputedStyleValueHandle) ->
             calc_is_bridge_retained: false,
             contains_percentage: true,
             contains_anchor_function: false,
+            fit_content_has_argument: false,
         },
         StyleValueData::Calculated { .. } => {
             // SAFETY: The style value outlives the pass; the calc pointer
@@ -689,6 +699,7 @@ fn decode_length_percentage(handle: &crate::layout::ComputedStyleValueHandle) ->
                 calc_is_bridge_retained: false,
                 contains_percentage,
                 contains_anchor_function,
+                fit_content_has_argument: false,
             }
         }
         _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
@@ -728,6 +739,7 @@ fn decode_computed_size(value: &crate::layout::ComputedSize) -> FfiSizeValue {
             } else {
                 let mut result = decode_length_percentage(&value.value);
                 result.kind = FfiSizeKind::FitContent as u8;
+                result.fit_content_has_argument = true;
                 result
             }
         }
@@ -766,6 +778,8 @@ pub(crate) struct DecodedStyleScalars {
     pub text_justify: u8,
     pub white_space_collapse: u8,
     pub text_wrap_mode: u8,
+    pub word_break: u8,
+    pub font_variant_emoji: u8,
     pub line_height: CssPixels,
     pub font_size: CssPixels,
     pub box_sizing: u8,
@@ -859,6 +873,8 @@ impl DecodedStyleScalars {
             text_justify: reader.u8(FfiStyleField::TextJustify),
             white_space_collapse: reader.u8(FfiStyleField::WhiteSpaceCollapse),
             text_wrap_mode: reader.u8(FfiStyleField::TextWrapMode),
+            word_break: reader.u8(FfiStyleField::WordBreak),
+            font_variant_emoji: reader.u8(FfiStyleField::FontVariantEmoji),
             line_height: reader.css_pixels(FfiStyleField::LineHeight),
             font_size: reader.css_pixels(FfiStyleField::FontSize),
             box_sizing: reader.u8(FfiStyleField::BoxSizing),
@@ -1071,6 +1087,10 @@ impl<'a> StyleValues<'a> {
 
     pub(crate) fn first_available_font(self) -> *const c_void {
         self.residual().first_available_font
+    }
+
+    pub(crate) fn font_cascade_list(self) -> *const c_void {
+        self.residual().font_cascade_list
     }
 
     pub(crate) fn font_ascent(self) -> f32 {
