@@ -6,6 +6,11 @@
 
 #import <Interface/LocationSearchField.h>
 #import <Interface/Menu.h>
+#import <Utilities/Conversions.h>
+
+#include <LibWebView/Application.h>
+#include <LibWebView/Omnibox.h>
+#include <LibWebView/URL.h>
 
 #if !__has_feature(objc_arc)
 #    error "This project requires ARC"
@@ -28,10 +33,15 @@ static NSImage* location_field_globe_icon()
     return image;
 }
 
-@interface LocationSearchField ()
+@interface LocationSearchField () <NSTextViewDelegate, NSMenuItemValidation>
 
 - (CGFloat)trailingBadgeInset;
 - (void)badgeLayoutDidChange;
+- (NSString*)copyLinkText;
+- (NSMenu*)createLocationContextMenu;
+- (NSMenuItem*)createPasteAndGoMenuItem;
+- (void)copyLink:(NSMenuItem*)sender;
+- (void)pasteAndGo:(NSMenuItem*)sender;
 
 @end
 
@@ -158,6 +168,138 @@ static NSImage* location_field_globe_icon()
 
     if (self.willBeginEditing)
         self.willBeginEditing();
+}
+
+- (NSMenu*)textView:(NSTextView*)text_view
+               menu:(NSMenu*)menu
+           forEvent:(NSEvent*)event
+            atIndex:(NSUInteger)character_index
+{
+    if (text_view != [self currentEditor])
+        return menu;
+
+    auto existing_item_index = [menu indexOfItemWithTarget:self andAction:@selector(pasteAndGo:)];
+    if (existing_item_index >= 0)
+        [menu removeItemAtIndex:existing_item_index];
+
+    auto* paste_and_go_item = [self createPasteAndGoMenuItem];
+
+    NSInteger paste_item_index = -1;
+    for (NSInteger index = 0; index < [menu numberOfItems]; ++index) {
+        if ([[menu itemAtIndex:index] action] == @selector(paste:)) {
+            paste_item_index = index;
+            break;
+        }
+    }
+
+    if (paste_item_index >= 0)
+        [menu insertItem:paste_and_go_item atIndex:paste_item_index + 1];
+    else
+        [menu addItem:paste_and_go_item];
+
+    return menu;
+}
+
+- (NSMenu*)createLocationContextMenu
+{
+    auto* menu = [[NSMenu alloc] init];
+
+    auto* copy_link_item = [[NSMenuItem alloc]
+        initWithTitle:@"Copy Link"
+               action:@selector(copyLink:)
+        keyEquivalent:@""];
+    [copy_link_item setTarget:self];
+    [copy_link_item setRepresentedObject:[[self copyLinkText] copy]];
+    [copy_link_item setEnabled:[self validateMenuItem:copy_link_item]];
+    [menu addItem:copy_link_item];
+
+    [menu addItem:[self createPasteAndGoMenuItem]];
+
+    return menu;
+}
+
+- (BOOL)handleContextMenuEvent:(NSEvent*)event
+{
+    auto* editor = [self currentEditor];
+    if (editor != nil && [[self window] firstResponder] == editor)
+        return NO;
+
+    [NSMenu popUpContextMenu:[self createLocationContextMenu] withEvent:event forView:self];
+    return YES;
+}
+
+- (NSMenuItem*)createPasteAndGoMenuItem
+{
+    auto* pasteboard_text = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+    auto clipboard_text = pasteboard_text == nil
+        ? String {}
+        : Ladybird::ns_string_to_string(pasteboard_text);
+    auto has_search_engine_enabled = WebView::Application::settings().search_engine().has_value();
+    auto clipboard_holds_url = !clipboard_text.is_empty() && WebView::location_looks_like_url(clipboard_text);
+    auto action_will_search = !clipboard_holds_url && has_search_engine_enabled;
+
+    auto* paste_and_go_item = [[NSMenuItem alloc]
+        initWithTitle:Ladybird::string_to_ns_string(WebView::Omnibox::text_for_paste_and_go_action(clipboard_text, has_search_engine_enabled))
+               action:@selector(pasteAndGo:)
+        keyEquivalent:@""];
+    [paste_and_go_item setTarget:self];
+    [paste_and_go_item setRepresentedObject:[pasteboard_text copy]];
+    [paste_and_go_item setEnabled:[self validateMenuItem:paste_and_go_item]];
+    [paste_and_go_item setImage:action_will_search
+            ? [NSImage imageWithSystemSymbolName:@"magnifyingglass" accessibilityDescription:@"Search"]
+            : [NSImage imageNamed:NSImageNameGoRightTemplate]];
+
+    return paste_and_go_item;
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem*)menu_item
+{
+    if ([menu_item action] == @selector(copyLink:)) {
+        id copy_link_text = [menu_item representedObject];
+        return [copy_link_text isKindOfClass:[NSString class]]
+            && [(NSString*)copy_link_text length] > 0;
+    }
+
+    if ([menu_item action] == @selector(pasteAndGo:)) {
+        id clipboard_text = [menu_item representedObject];
+        return [self isEditable]
+            && [clipboard_text isKindOfClass:[NSString class]]
+            && [(NSString*)clipboard_text length] > 0;
+    }
+
+    return YES;
+}
+
+- (NSString*)copyLinkText
+{
+    if (self.copyLinkTextProvider)
+        return self.copyLinkTextProvider();
+
+    return [self stringValue];
+}
+
+- (void)copyLink:(NSMenuItem*)sender
+{
+    id copy_link_text = [sender representedObject];
+    if (![copy_link_text isKindOfClass:[NSString class]]
+        || [(NSString*)copy_link_text length] == 0)
+        return;
+
+    auto* paste_board = [NSPasteboard generalPasteboard];
+    [paste_board clearContents];
+    [paste_board setString:(NSString*)copy_link_text forType:NSPasteboardTypeString];
+}
+
+- (void)pasteAndGo:(NSMenuItem*)sender
+{
+    id clipboard_text = [sender representedObject];
+    if (![self isEditable]
+        || ![clipboard_text isKindOfClass:[NSString class]]
+        || [(NSString*)clipboard_text length] == 0)
+        return;
+
+    if (self.pasteAndGoHandler)
+        self.pasteAndGoHandler((NSString*)clipboard_text);
 }
 
 - (void)layout

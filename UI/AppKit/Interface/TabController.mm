@@ -1327,6 +1327,27 @@ private:
         [location_search_field setWillBeginEditing:^{
             [weak_self restoreLocationFieldForEditing];
         }];
+        [location_search_field setCopyLinkTextProvider:^NSString* {
+            TabController* self = weak_self;
+            if (self == nil)
+                return nil;
+
+            auto const& url = [[[self tab] web_view] view].url();
+            return Ladybird::string_to_ns_string(url.serialize());
+        }];
+        [location_search_field setPasteAndGoHandler:^(NSString* clipboard_text) {
+            TabController* self = weak_self;
+            if (self == nil)
+                return;
+
+            auto query = Ladybird::ns_string_to_string(clipboard_text);
+            WebView::Omnibox::Display display {
+                .text = query,
+                .selection_start = {},
+            };
+            [self applyOmniboxDisplay:display];
+            self->m_omnibox->navigate_directly_to_query(move(query));
+        }];
 
         if (@available(macOS 26, *)) {
             [location_search_field setBordered:YES];

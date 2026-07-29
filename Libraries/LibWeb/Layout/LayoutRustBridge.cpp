@@ -120,9 +120,6 @@ static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP
     F(BorderRightStyle, CSS::ComputedValues::BorderValues, border_right.line_style, offsetof(CSS::ComputedValues::BorderValues, border_right) + offsetof(CSS::BorderData, line_style), U8)    \
     F(BorderBottomStyle, CSS::ComputedValues::BorderValues, border_bottom.line_style, offsetof(CSS::ComputedValues::BorderValues, border_bottom) + offsetof(CSS::BorderData, line_style), U8) \
     F(BorderLeftStyle, CSS::ComputedValues::BorderValues, border_left.line_style, offsetof(CSS::ComputedValues::BorderValues, border_left) + offsetof(CSS::BorderData, line_style), U8)       \
-    F(Position, CSS::ComputedValues::BoxValues, position, offsetof(CSS::ComputedValues::BoxValues, position), U8)                                                                             \
-    F(Float, CSS::ComputedValues::BoxValues, float_, offsetof(CSS::ComputedValues::BoxValues, float_), U8)                                                                                    \
-    F(Clear, CSS::ComputedValues::BoxValues, clear, offsetof(CSS::ComputedValues::BoxValues, clear), U8)                                                                                      \
     F(TextAlign, CSS::ComputedValues::InheritedTextValues, text_align, offsetof(CSS::ComputedValues::InheritedTextValues, text_align), U8)                                                    \
     F(TextJustify, CSS::ComputedValues::InheritedTextValues, text_justify, offsetof(CSS::ComputedValues::InheritedTextValues, text_justify), U8)                                              \
     F(WhiteSpaceCollapse, CSS::ComputedValues::InheritedTextValues, white_space_collapse, offsetof(CSS::ComputedValues::InheritedTextValues, white_space_collapse), U8)                       \
@@ -131,9 +128,6 @@ static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP
     F(FontVariantEmoji, CSS::ComputedValues::FontValues, font_variant_emoji, offsetof(CSS::ComputedValues::FontValues, font_variant_emoji), U8)                                               \
     F(LineHeight, CSS::ComputedValues::FontValues, line_height.used_value, offsetof(CSS::ComputedValues::FontValues, line_height) + offsetof(CSS::LineHeightData, used_value), CssPixels)     \
     F(FontSize, CSS::ComputedValues::FontValues, font_size, offsetof(CSS::ComputedValues::FontValues, font_size), CssPixels)                                                                  \
-    F(BoxSizing, CSS::ComputedValues::BoxValues, box_sizing, offsetof(CSS::ComputedValues::BoxValues, box_sizing), U8)                                                                        \
-    F(OverflowX, CSS::ComputedValues::BoxValues, overflow_x, offsetof(CSS::ComputedValues::BoxValues, overflow_x), U8)                                                                        \
-    F(OverflowY, CSS::ComputedValues::BoxValues, overflow_y, offsetof(CSS::ComputedValues::BoxValues, overflow_y), U8)                                                                        \
     F(TextOverflow, CSS::ComputedValues::TextResetValues, text_overflow, offsetof(CSS::ComputedValues::TextResetValues, text_overflow), U8)                                                   \
     F(TableLayout, CSS::ComputedValues::MiscResetValues, table_layout, offsetof(CSS::ComputedValues::MiscResetValues, table_layout), U8)                                                      \
     F(LetterSpacing, CSS::ComputedValues::InheritedTextValues, letter_spacing, offsetof(CSS::ComputedValues::InheritedTextValues, letter_spacing), CssPixels)                                 \
@@ -759,60 +753,6 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::Size const& value)
     }
     case CSS::Size::Type::None:
         return size_value_with_kind(RustFFI::FfiSizeKind::None_);
-    }
-    VERIFY_NOT_REACHED();
-}
-
-StyleVerticalAlignFacts build_style_vertical_align_value(Variant<CSS::VerticalAlign, CSS::LengthPercentage> const& value)
-{
-    if (value.has<CSS::VerticalAlign>()) {
-        return {
-            .is_keyword = true,
-            .keyword = to_underlying(value.get<CSS::VerticalAlign>()),
-            .value = size_value_with_kind(RustFFI::FfiSizeKind::Auto),
-        };
-    }
-    return {
-        .is_keyword = false,
-        .keyword = 0,
-        .value = build_style_size_value(value.get<CSS::LengthPercentage>()),
-    };
-}
-
-static RustFFI::FfiDisplay encode_display(CSS::Display const& display)
-{
-    static_assert(to_underlying(CSS::Display::Type::OutsideAndInside) == 0);
-    static_assert(to_underlying(CSS::Display::Type::Internal) == 1);
-    static_assert(to_underlying(CSS::Display::Type::Box) == 2);
-
-    switch (display.type()) {
-    case CSS::Display::Type::OutsideAndInside:
-        return {
-            .tag = to_underlying(display.type()),
-            .outside = to_underlying(display.outside()),
-            .inside = to_underlying(display.inside()),
-            .list_item = display.is_list_item(),
-            .internal = 0,
-            .box_value = 0,
-        };
-    case CSS::Display::Type::Internal:
-        return {
-            .tag = to_underlying(display.type()),
-            .outside = 0,
-            .inside = 0,
-            .list_item = false,
-            .internal = to_underlying(display.internal()),
-            .box_value = 0,
-        };
-    case CSS::Display::Type::Box:
-        return {
-            .tag = to_underlying(display.type()),
-            .outside = 0,
-            .inside = 0,
-            .list_item = false,
-            .internal = 0,
-            .box_value = display.is_none() ? to_underlying(CSS::DisplayBox::None) : to_underlying(CSS::DisplayBox::Contents),
-        };
     }
     VERIFY_NOT_REACHED();
 }
@@ -1660,23 +1600,6 @@ bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const& box)
     return true;
 }
 
-static bool can_skip_is_anonymous_text_run(Box& box)
-{
-    if (box.is_anonymous() && !box.is_generated_for_pseudo_element() && !box.first_child_of_type<BlockContainer>()) {
-        bool contains_only_white_space = true;
-        box.for_each_in_subtree([&](auto const& node) {
-            if (!is<TextNode>(node) || !static_cast<TextNode const&>(node).text().is_ascii_whitespace()) {
-                contains_only_white_space = false;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-        if (contains_only_white_space)
-            return true;
-    }
-    return false;
-}
-
 RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
 {
     static_assert(to_underlying(Painting::Paintable::ConflictingElementKind::Cell) == 0);
@@ -1761,12 +1684,7 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             return decode_residual_style(*payloads); },
         .release_calc_handle = ladybird_layout_release_calc_handle,
         .release_anchor_name_handle = ladybird_layout_release_anchor_name_handle,
-        .build_style_snapshot = [](void*, void const* style) {
-            auto const& values = *static_cast<CSS::ComputedValues const*>(style);
-            return RustFFI::FfiStyleSnapshot {
-                .payloads = style_payloads(values),
-                .display = encode_display(values.display()),
-            }; },
+        .build_style_payloads = [](void*, void const* style) { return style_payloads(*static_cast<CSS::ComputedValues const*>(style)); },
         .build_replaced_content_facts = [](void*, void* node) {
             RustFFI::FfiReplacedContentFacts facts {};
             auto const* box = as_if<Box>(*static_cast<Node const*>(node));
@@ -2112,7 +2030,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
                 return;
             }
             box.set_default_scroll_shift(static_cast<Box*>(anchor)->make_weak_ptr(), horizontal, vertical); },
-        .can_skip_is_anonymous_text_run = [](void*, void* box) { return can_skip_is_anonymous_text_run(*static_cast<Box*>(box)); },
     };
 }
 
@@ -2158,33 +2075,6 @@ static RustFFI::FfiResidualStyleValues decode_residual_style(RustFFI::FfiStylePa
         ++s_outstanding_anchor_name_handles;
         result.position_anchor_retained_name = anchor.name->to_raw_leaked();
     }
-
-    auto const& box = group.operator()<CSS::ComputedValues::BoxValues>();
-    auto vertical_align = build_style_vertical_align_value(box.vertical_align);
-    result.vertical_align_is_keyword = vertical_align.is_keyword;
-    result.vertical_align_keyword = vertical_align.keyword;
-    result.vertical_align_value = vertical_align.value;
-    result.box_sizing_for_aspect_ratio = to_underlying(box.aspect_ratio.use_natural_aspect_ratio_if_available
-            ? CSS::BoxSizing::ContentBox
-            : box.box_sizing);
-    result.aspect_ratio_uses_natural_when_available = box.aspect_ratio.use_natural_aspect_ratio_if_available;
-    if (box.aspect_ratio.preferred_ratio.has_value() && !box.aspect_ratio.preferred_ratio->is_degenerate()) {
-        // The floating-point CSSPixelFraction constructor rescues denominators that
-        // round to zero CSSPixels, and the converted fraction can still collapse to
-        // zero even though is_degenerate() (which operates on doubles) passed.
-        auto fraction = CSSPixelFraction(box.aspect_ratio.preferred_ratio->numerator(), box.aspect_ratio.preferred_ratio->denominator());
-        if (fraction != 0) {
-            result.css_preferred_aspect_ratio_numerator = fraction.numerator().raw_value();
-            result.css_preferred_aspect_ratio_denominator = fraction.denominator().raw_value();
-        }
-    }
-    result.containment_bits = static_cast<u8>(static_cast<u8>(box.contain.size_containment)
-        | static_cast<u8>(box.contain.inline_size_containment) << 1
-        | static_cast<u8>(box.contain.layout_containment) << 2
-        | static_cast<u8>(box.contain.style_containment) << 3
-        | static_cast<u8>(box.contain.paint_containment) << 4
-        | static_cast<u8>(box.container_type.is_size_container) << 5
-        | static_cast<u8>(box.container_type.is_inline_size_container) << 6);
 
     auto const& font_values = group.operator()<CSS::ComputedValues::FontValues>();
     VERIFY(font_values.font_list);
