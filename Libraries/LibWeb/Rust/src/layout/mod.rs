@@ -16,6 +16,7 @@ pub(crate) use crate::css::display::*;
 include!("node_facts.rs");
 
 include!("formatting_context.rs");
+include!("abspos_engine.rs");
 include!("block_formatting_context.rs");
 include!("flex_formatting_context.rs");
 include!("grid_formatting_context.rs");
@@ -55,6 +56,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::mem::size_of;

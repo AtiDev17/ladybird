@@ -48,8 +48,6 @@
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLTableCellElement.h>
-#include <LibWeb/HTML/HTMLTableColElement.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/DominantBaseline.h>
 #include <LibWeb/Layout/FieldSetBox.h>
@@ -1051,8 +1049,6 @@ StringView formatting_context_type_name(RustFFI::FfiFormattingContextType type)
         return "SVG"sv;
     case RustFFI::FfiFormattingContextType::ReplacedWithChildren:
         return "Replaced, with children"sv;
-    case RustFFI::FfiFormattingContextType::AbsposReplay:
-        return "Abspos replay"sv;
     case RustFFI::FfiFormattingContextType::InternalReplaced:
         return "Replaced"sv;
     case RustFFI::FfiFormattingContextType::InternalDummy:
@@ -1065,25 +1061,13 @@ RustFFI::FfiTableBoxFacts build_table_box_facts(NodeWithStyle const& node)
 {
     auto const& values = node.computed_values();
 
-    size_t cell_column_span = 1;
-    size_t cell_row_span = 1;
-    u32 column_span = 1;
     u32 raw_column_span = 1;
     if (auto const* dom_node = node.dom_node()) {
-        if (auto const* cell = as_if<HTML::HTMLTableCellElement>(*dom_node)) {
-            cell_column_span = cell->col_span();
-            cell_row_span = cell->row_span();
-        }
-        if (auto const* column = as_if<HTML::HTMLTableColElement>(*dom_node))
-            column_span = column->span();
         if (auto const* element = as_if<HTML::HTMLElement>(*dom_node))
             raw_column_span = element->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
     }
 
     return {
-        .cell_column_span = cell_column_span,
-        .cell_row_span = cell_row_span,
-        .column_span = column_span,
         .raw_column_span = raw_column_span,
         .border_top_color = values.border_top().color.value(),
         .border_right_color = values.border_right().color.value(),
