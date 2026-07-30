@@ -18,9 +18,9 @@ use crate::hir::{
     ValueMatchArm, ValueMatchArmKind, ValueMatchFallbackIr, VariableId,
 };
 use crate::intrinsic::{
-    BinaryOperation, ClassificationOperation, ComparisonDomain, ControlOperation, IntegerBinaryOperation,
-    IntegerComparisonOperation, Intrinsic, LowLevelOperation, OperandLoad, OperandOperation, OperandStore,
-    ValueOperation,
+    BinaryOperation, BytecodeOperation, CallOperation, ClassificationOperation, ComparisonDomain, ControlOperation,
+    FieldWidth, IntegerBinaryOperation, IntegerComparisonOperation, Intrinsic, LowLevelOperation, OperandLoad,
+    OperandOperation, OperandStore, ValueOperation,
 };
 use crate::types::{BlockTemperature, Type};
 use crate::{CompileError, CompileStage};
@@ -593,16 +593,31 @@ impl Lowerer<'_> {
         let tag_value = self.extract_tag(value, false)?;
         self.bindings.insert(tag, tag_value);
         let original_bindings = self.bindings.clone();
+        let inherited_cold = self.function.blocks[source.0].layout == BlockLayout::Cold;
+        let arm_layout = |layout: BlockTemperature| {
+            if inherited_cold {
+                BlockLayout::Cold
+            } else {
+                layout.into()
+            }
+        };
         let arm = |kind| arms.iter().find(|arm| arm.kind == kind);
         let int32_arm = arm(ValueMatchArmKind::Int32).expect("control value match must have an Int32 arm");
-        let int32_block = self.function.create_empty_block("value_match_int32", BlockLayout::Hot);
-        let double_block = arm(ValueMatchArmKind::Double)
-            .map(|_| self.function.create_empty_block("value_match_double", BlockLayout::Hot));
-        let boolean_block = arm(ValueMatchArmKind::Boolean).map(|_| {
+        let int32_block = self
+            .function
+            .create_empty_block("value_match_int32", arm_layout(int32_arm.layout));
+        let double_block = arm(ValueMatchArmKind::Double).map(|arm| {
             self.function
-                .create_empty_block("value_match_boolean", BlockLayout::Hot)
+                .create_empty_block("value_match_double", arm_layout(arm.layout))
+        });
+        let boolean_block = arm(ValueMatchArmKind::Boolean).map(|arm| {
+            self.function
+                .create_empty_block("value_match_boolean", arm_layout(arm.layout))
         });
         let (fallback_edge, fallback_block) = self.value_match_fallback(fallback, "value_match_fallback", &[], &[])?;
+        if inherited_cold && let Some(block) = fallback_block {
+            self.function.blocks[block.0].layout = BlockLayout::Cold;
+        }
 
         let arm_blocks = arms
             .iter()
@@ -617,7 +632,9 @@ impl Lowerer<'_> {
                 ))
             })
             .collect::<Vec<_>>();
-        if let Some((_, block)) = arm_blocks.first() {
+        if let Some((_, block)) = arm_blocks.first()
+            && self.function.blocks[block.0].layout != BlockLayout::Cold
+        {
             self.function.blocks[block.0].layout = BlockLayout::Preferred;
         }
         self.lower_value_match_tests(
@@ -901,9 +918,18 @@ impl Lowerer<'_> {
             let next = if index + 1 == arms.len() {
                 fallback.clone()
             } else {
+                let remaining_is_cold = arms[index + 1..]
+                    .iter()
+                    .all(|(_, block)| self.function.blocks[block.0].layout == BlockLayout::Cold)
+                    && self.function.blocks[fallback.block.0].layout == BlockLayout::Cold;
+                let layout = if remaining_is_cold {
+                    BlockLayout::Cold
+                } else {
+                    BlockLayout::Hot
+                };
                 Edge::new(
                     self.function
-                        .create_empty_block(format!("{block_name}_{}", index + 1), BlockLayout::Hot),
+                        .create_empty_block(format!("{block_name}_{}", index + 1), layout),
                 )
             };
             self.function.set_terminator(
@@ -1535,6 +1561,80 @@ impl Lowerer<'_> {
                 outputs.push((variable, argument.ty.clone()));
             }
         }
+        if call.intrinsic() == Some(Intrinsic::Bytecode(BytecodeOperation::LoadInlineInt32)) {
+            let [field] = inputs.as_slice() else {
+                return Err("'load_inline_int32' requires one bytecode field".to_string());
+            };
+            if result_types != [Type::Value] {
+                return Err("'load_inline_int32' requires one Value result".to_string());
+            }
+            let block = self.current()?;
+            let integer = self.function.append_instruction(
+                block,
+                Intrinsic::Bytecode(BytecodeOperation::Load(FieldWidth::U32)),
+                vec![*field],
+                vec![Type::I32],
+            )[0];
+            let value = self.function.append_instruction(
+                block,
+                Intrinsic::Value(ValueOperation::BoxInt32 { clean: true }),
+                vec![integer],
+                vec![Type::Value],
+            )[0];
+            return Ok(vec![value]);
+        }
+        if call.intrinsic() == Some(Intrinsic::Call(CallOperation::BinarySlowPath)) {
+            let [slow_path, destination, lhs, rhs] = inputs.as_slice() else {
+                return Err("'call_binary_slow_path' requires a slow path, destination, lhs, and rhs".to_string());
+            };
+            if !result_types.is_empty() {
+                return Err("'call_binary_slow_path' cannot return a value".to_string());
+            }
+            let block = self.current()?;
+            let destination = self.function.append_instruction(
+                block,
+                Intrinsic::Operand(OperandOperation::Decode),
+                vec![*destination],
+                vec![Type::U32],
+            )[0];
+            self.function.append_instruction(
+                block,
+                Intrinsic::Call(CallOperation::BinarySlowPath),
+                vec![*slow_path, destination, *lhs, *rhs],
+                Vec::new(),
+            );
+            return Ok(Vec::new());
+        }
+        if call.intrinsic() == Some(Intrinsic::Call(CallOperation::JumpSlowPath)) {
+            let [slow_path, lhs, rhs, true_target, false_target] = inputs.as_slice() else {
+                return Err(
+                    "'call_jump_slow_path' requires a slow path, lhs, rhs, true target, and false target".to_string(),
+                );
+            };
+            if !result_types.is_empty() {
+                return Err("'call_jump_slow_path' cannot return a value".to_string());
+            }
+            let block = self.current()?;
+            let true_target = self.function.append_instruction(
+                block,
+                Intrinsic::Bytecode(BytecodeOperation::Load(FieldWidth::U32)),
+                vec![*true_target],
+                vec![Type::U32],
+            )[0];
+            let false_target = self.function.append_instruction(
+                block,
+                Intrinsic::Bytecode(BytecodeOperation::Load(FieldWidth::U32)),
+                vec![*false_target],
+                vec![Type::U32],
+            )[0];
+            self.function.append_instruction(
+                block,
+                Intrinsic::Call(CallOperation::JumpSlowPath),
+                vec![*slow_path, *lhs, *rhs, true_target, false_target],
+                Vec::new(),
+            );
+            return Ok(Vec::new());
+        }
         if call.intrinsic() == Some(Intrinsic::Operand(OperandOperation::Load(OperandLoad::Field)))
             && accesses_inout_operand
         {
@@ -1839,6 +1939,72 @@ handler Check(value: i32) {
             function.blocks[function.entry.0].terminator,
             Some(Terminator::Branch { .. })
         ));
+        function.validate().unwrap();
+    }
+
+    #[test]
+    fn preserves_cold_control_value_match_regions() {
+        let function = lower_source(
+            r#"
+handler Match(value: Value, nested: Value) {
+    match value {
+        Value<i32> => { dispatch_next; },
+        Value<f64> => @cold {
+            match nested {
+                Value<i32> => { dispatch_next; },
+                Value<f64> => { dispatch_next; },
+                _ => { dispatch_next; },
+            }
+        },
+        _ => @cold { dispatch_next; },
+    }
+}
+"#,
+        );
+
+        let double = function
+            .blocks
+            .iter()
+            .find(|block| block.name.as_deref() == Some("value_match_double"))
+            .unwrap();
+        assert_eq!(double.layout, BlockLayout::Cold);
+        assert!(
+            function
+                .blocks
+                .iter()
+                .filter(|block| block.name.as_deref() == Some("value_match_int32"))
+                .any(|block| block.layout == BlockLayout::Cold)
+        );
+        assert!(
+            function
+                .blocks
+                .iter()
+                .filter(|block| block.name.as_deref() == Some("value_match_test_1"))
+                .any(|block| block.layout == BlockLayout::Cold)
+        );
+        function.validate().unwrap();
+    }
+
+    #[test]
+    fn outlines_an_all_cold_value_match_tail() {
+        let function = lower_source(
+            r#"
+handler Match(value: Value) {
+    match value {
+        Value<i32> => { dispatch_next; },
+        Value<f64> => @cold { dispatch_next; },
+        _ => @cold { dispatch_next; },
+    }
+}
+"#,
+        );
+
+        let test = function
+            .blocks
+            .iter()
+            .find(|block| block.name.as_deref() == Some("value_match_test_1"))
+            .unwrap();
+        assert_eq!(test.layout, BlockLayout::Cold);
         function.validate().unwrap();
     }
 }

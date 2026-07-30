@@ -20,14 +20,14 @@ isect$63c4d7d5 var-hoisting-tdz.js:5:5
     [2] = Int32(3)
 
 block0:
-  [   0] Mov2 dst1:i~0, src1:Undefined, dst2:i~0, src2:Int32(0)
+  [   0] Mov2 c0_dst:i~0, c0_src:Undefined, c1_dst:i~0, c1_src:Int32(0)
   [  18] Jump target:block2
 
 block1:
   [  20] PostfixIncrement dst:reg5, src:i~0
 
 block2:
-  [  30] JumpLessThan lhs:i~0, rhs:Int32(3), true_target:block1, false_target:block3
+  [  30] JumpLessThanRhsInt32 lhs:i~0, rhs:3, true_target:block1, false_target:block3
 
 block3:
   [  48] Mov dst:i~0, src:Int32(0)
@@ -37,7 +37,7 @@ block4:
   [  60] PostfixIncrement dst:reg5, src:i~0
 
 block5:
-  [  70] JumpLessThan lhs:i~0, rhs:Int32(3), true_target:block4, false_target:block6
+  [  70] JumpLessThanRhsInt32 lhs:i~0, rhs:3, true_target:block4, false_target:block6
 
 block6:
   [  88] End value:Undefined

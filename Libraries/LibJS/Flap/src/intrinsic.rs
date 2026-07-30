@@ -620,6 +620,7 @@ define_named_intrinsic_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BytecodeOperation {
     Load(FieldWidth),
+    LoadInlineInt32,
 }
 
 impl BytecodeOperation {
@@ -629,6 +630,7 @@ impl BytecodeOperation {
             Self::Load(FieldWidth::U16) => 2,
             Self::Load(FieldWidth::U32) => 4,
             Self::Load(FieldWidth::U64) => 8,
+            Self::LoadInlineInt32 => 4,
         }
     }
 }
@@ -638,6 +640,7 @@ intrinsic_names!(BytecodeOperation {
     Self::Load(FieldWidth::U16) => "load_bytecode_u16";
     Self::Load(FieldWidth::U32) => "load_bytecode_u32";
     Self::Load(FieldWidth::U64) => "load_bytecode_u64";
+    Self::LoadInlineInt32 => "load_inline_int32";
 });
 
 define_named_intrinsic_enum! {
@@ -800,6 +803,8 @@ define_named_intrinsic_enum! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum CallOperation {
         SlowPath => "call_slow_path" signatures [signature!([In SlowPath])];
+        BinarySlowPath => "call_binary_slow_path" signatures [signature!([In SlowPath, Out Operand, In Value, In Value])];
+        JumpSlowPath => "call_jump_slow_path" signatures [signature!([In SlowPath, In Value, In Value, In BytecodeOffset, In BytecodeOffset])];
         Interpreter => "call_interp" signatures [signature!([In FunctionSymbol] -> I32), signature!([In FunctionSymbol, Out AnyGpr])];
         Helper => "call_helper" signatures [signature!([In FunctionSymbol, In AnyGpr, Out AnyGpr])];
         RawNative => "call_raw_native" signatures [signature!([In AnyGpr] -> (Value, U64)), signature!([In AnyGpr, Out AnyGpr, Out AnyGpr])];
@@ -809,7 +814,7 @@ define_named_intrinsic_enum! {
 impl CallOperation {
     pub(crate) fn result_count(self) -> usize {
         match self {
-            Self::SlowPath => 0,
+            Self::SlowPath | Self::BinarySlowPath | Self::JumpSlowPath => 0,
             Self::Interpreter | Self::Helper => 1,
             Self::RawNative => 2,
         }
@@ -1041,7 +1046,10 @@ impl Intrinsic {
             },
             Self::Bytecode(operation) => IntrinsicEffects {
                 memory: ModRef::Read,
-                machine_state: if matches!(operation, BytecodeOperation::Load(FieldWidth::U8 | FieldWidth::U32)) {
+                machine_state: if matches!(
+                    operation,
+                    BytecodeOperation::Load(FieldWidth::U8 | FieldWidth::U32) | BytecodeOperation::LoadInlineInt32
+                ) {
                     ModRef::Read
                 } else {
                     ModRef::None
@@ -1099,7 +1107,10 @@ impl Intrinsic {
         matches!(
             self,
             Self::Control(operation) if operation.is_terminal()
-        ) || self == Self::Call(CallOperation::SlowPath)
+        ) || matches!(
+            self,
+            Self::Call(CallOperation::SlowPath | CallOperation::BinarySlowPath | CallOperation::JumpSlowPath)
+        )
     }
 }
 

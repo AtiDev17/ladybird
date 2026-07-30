@@ -20,7 +20,7 @@ use crate::target::description::{FloatConversion, FloatingPointOperation};
 use crate::target::finalize_support::{
     AllocatedOperands, Emit, MemoryBranch, finalization_error, finalize_error,
     indexed_pair_store as decode_indexed_pair_store, interpreter_layout, machine_address, pair_access,
-    required_runtime_constant, verified_label, verified_register,
+    required_runtime_constant, schedule_parallel_moves, verified_label, verified_register,
 };
 use crate::target::finalize_support::{memory_branch, push_plain_move};
 use crate::target::ir::{AllocatedOperand, MachineInstruction, MachineMemoryAddress, MachineOpcode, MachineOperand};
@@ -226,6 +226,16 @@ fn push_alu_register(
     emit!(emit.output, X86_64; Opcode::AluRegister { operation, width } => [register destination, register source];);
 }
 
+fn push_alu_memory(
+    emit: &mut Emit<'_>,
+    operation: super::AluOperation,
+    width: IntegerWidth,
+    destination: PhysicalRegister,
+    source: MachineMemoryAddress,
+) {
+    emit!(emit.output, X86_64; Opcode::AluMemory { operation, width } => [register destination, address source];);
+}
+
 fn push_alu_immediate(
     emit: &mut Emit<'_>,
     operation: super::AluOperation,
@@ -295,6 +305,48 @@ fn branch_scalar(emit: &mut Emit<'_>, condition: ScalarBranchCondition, target: 
     use super::Condition;
     let condition = Condition::from_scalar(condition);
     emit!(emit.output, X86_64; Opcode::JumpCondition(condition) => [label target.clone()];);
+}
+
+fn immediate_scalar_branch_taken(lhs: i64, rhs: i64, width: IntegerWidth, condition: ScalarBranchCondition) -> bool {
+    let mask = match width {
+        IntegerWidth::U16 => u16::MAX as u64,
+        IntegerWidth::U32 => u32::MAX as u64,
+        IntegerWidth::U64 => u64::MAX,
+        _ => unreachable!("allocated scalar branch was verified"),
+    };
+    let lhs = lhs as u64 & mask;
+    let rhs = rhs as u64 & mask;
+    match condition {
+        ScalarBranchCondition::Equal => lhs == rhs,
+        ScalarBranchCondition::NotEqual => lhs != rhs,
+        ScalarBranchCondition::Unsigned(relation) => ordered_relation_holds(lhs, rhs, relation),
+        ScalarBranchCondition::Signed(relation) => {
+            let lhs = match width {
+                IntegerWidth::U16 => lhs as i16 as i64,
+                IntegerWidth::U32 => lhs as i32 as i64,
+                IntegerWidth::U64 => lhs as i64,
+                _ => unreachable!("allocated scalar branch was verified"),
+            };
+            let rhs = match width {
+                IntegerWidth::U16 => rhs as i16 as i64,
+                IntegerWidth::U32 => rhs as i32 as i64,
+                IntegerWidth::U64 => rhs as i64,
+                _ => unreachable!("allocated scalar branch was verified"),
+            };
+            ordered_relation_holds(lhs, rhs, relation)
+        }
+    }
+}
+
+fn ordered_relation_holds<T: PartialOrd>(lhs: T, rhs: T, relation: crate::intrinsic::ComparisonRelation) -> bool {
+    use crate::intrinsic::ComparisonRelation;
+
+    match relation {
+        ComparisonRelation::Less => lhs < rhs,
+        ComparisonRelation::LessOrEqual => lhs <= rhs,
+        ComparisonRelation::Greater => lhs > rhs,
+        ComparisonRelation::GreaterOrEqual => lhs >= rhs,
+    }
 }
 
 pub(crate) enum StoreSource {
@@ -576,8 +628,69 @@ pub(crate) fn interpreter_call_arguments(emit: &mut Emit<'_>) {
     );
 }
 
+fn store_slow_path_program_counter(emit: &mut Emit<'_>) -> Result<(), CompileError> {
+    use crate::target::registers::x86_64::{R13, RBX};
+
+    let [_, _, program_counter, _, values_offset] = interpreter_layout(emit.runtime, emit.handler)?;
+    let program_counter_from_values = program_counter
+        .checked_sub(values_offset)
+        .ok_or_else(|| finalization_error(emit.handler, "execution-context program-counter offset overflow"))?;
+    emit!(emit.output, X86_64; Opcode::StoreAdditiveDisplacement(MemoryWidth::Word) => [address MachineMemoryAddress::offset(RBX, program_counter_from_values), register R13];);
+    Ok(())
+}
+
+fn finish_slow_path_call(
+    emit: &mut Emit<'_>,
+    result_scratch: PhysicalRegister,
+    state_scratch: PhysicalRegister,
+) -> Result<(), CompileError> {
+    use crate::target::registers::x86_64::{R13, R14, RBX};
+
+    let [execution_context, executable, _, bytecode, values_offset] = interpreter_layout(emit.runtime, emit.handler)?;
+    emit!(emit.output, X86_64;
+        Opcode::TestRegister(IntegerWidth::U64) => [register result_scratch];
+        Opcode::JumpNegativeToExit => [];
+    );
+
+    vm_load(emit, state_scratch);
+    push_load(
+        emit,
+        RBX,
+        MachineMemoryAddress::offset(state_scratch, execution_context),
+    );
+    emit!(emit.output, X86_64;
+        Opcode::AluImmediate {
+        operation: super::AluOperation::Add,
+        width: IntegerWidth::U64,
+    } => [register RBX, immediate values_offset];
+    );
+    let executable_from_values = executable
+        .checked_sub(values_offset)
+        .ok_or_else(|| finalization_error(emit.handler, "execution-context executable offset overflow"))?;
+    emit!(emit.output, X86_64;
+        Opcode::LoadAdditiveDisplacement {
+        width: MemoryWidth::DoubleWord,
+        signed: false,
+    } => [register state_scratch, address MachineMemoryAddress::offset(RBX, executable_from_values)];
+    );
+    push_load(emit, R14, MachineMemoryAddress::offset(state_scratch, bytecode));
+    emit!(emit.output, X86_64; Opcode::Move32Register => [register R13, register result_scratch];);
+    dispatch_from_instruction_pointer(emit, result_scratch);
+    Ok(())
+}
+
 fn push_register_move(emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister) {
     emit!(emit.output, X86_64; Opcode::Move64Register => [register destination, register source];);
+}
+
+fn push_parallel_register_moves(
+    emit: &mut Emit<'_>,
+    requested_moves: &[(PhysicalRegister, PhysicalRegister)],
+    scratch: PhysicalRegister,
+) {
+    for (destination, source) in schedule_parallel_moves(requested_moves, scratch) {
+        push_register_move(emit, destination, source);
+    }
 }
 
 fn push_load(emit: &mut Emit<'_>, destination: PhysicalRegister, address: MachineMemoryAddress) {
@@ -798,47 +911,85 @@ impl Backend for X86_64Backend {
     fn slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
         let function = operands.relocation(0);
         let [result_scratch, state_scratch] = [operands.physical_register(1), operands.physical_register(2)];
-        use crate::target::registers::x86_64::{R13, R14, RBX};
 
-        let [execution_context, executable, program_counter, bytecode, values_offset] =
-            interpreter_layout(emit.runtime, emit.handler)?;
-        let program_counter_from_values = program_counter
-            .checked_sub(values_offset)
-            .ok_or_else(|| finalization_error(emit.handler, "execution-context program-counter offset overflow"))?;
-        emit!(emit.output, X86_64; Opcode::StoreAdditiveDisplacement(MemoryWidth::Word) => [address MachineMemoryAddress::offset(RBX, program_counter_from_values), register R13];);
-
+        store_slow_path_program_counter(emit)?;
         interpreter_call_arguments(emit);
         direct_call(emit, function);
-        emit!(emit.output, X86_64;
-            Opcode::TestRegister(IntegerWidth::U64) => [register result_scratch];
-            Opcode::JumpNegativeToExit => [];
-        );
+        finish_slow_path_call(emit, result_scratch, state_scratch)
+    }
 
-        vm_load(emit, state_scratch);
-        push_load(
-            emit,
-            RBX,
-            MachineMemoryAddress::offset(state_scratch, execution_context),
-        );
-        emit!(emit.output, X86_64;
-            Opcode::AluImmediate {
-            operation: super::AluOperation::Add,
-            width: IntegerWidth::U64,
-        } => [register RBX, immediate values_offset];
-        );
-        let executable_from_values = executable
-            .checked_sub(values_offset)
-            .ok_or_else(|| finalization_error(emit.handler, "execution-context executable offset overflow"))?;
-        emit!(emit.output, X86_64;
-            Opcode::LoadAdditiveDisplacement {
-            width: MemoryWidth::DoubleWord,
-            signed: false,
-        } => [register state_scratch, address MachineMemoryAddress::offset(RBX, executable_from_values)];
-        );
-        push_load(emit, R14, MachineMemoryAddress::offset(state_scratch, bytecode));
-        emit!(emit.output, X86_64; Opcode::Move32Register => [register R13, register result_scratch];);
-        dispatch_from_instruction_pointer(emit, result_scratch);
-        Ok(())
+    fn binary_slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
+        let function = operands.relocation(0);
+        let [destination, lhs, rhs] = [
+            operands.physical_register(1),
+            operands.physical_register(2),
+            operands.physical_register(3),
+        ];
+        let [result_scratch, state_scratch] = [operands.physical_register(4), operands.physical_register(5)];
+        use crate::target::registers::x86_64::{R8, R9, R13, RBP, RCX, RDI, RDX, RSI};
+
+        store_slow_path_program_counter(emit)?;
+        if emit.object_format == ObjectFormat::Coff {
+            store(
+                emit,
+                MemoryWidth::DoubleWord,
+                MachineMemoryAddress::offset(RBP, super::WIN64_RAW_NATIVE_RETURN_SLOT),
+                StoreSource::Register(rhs),
+                None,
+            );
+            push_parallel_register_moves(emit, &[(R8, destination), (R9, lhs)], state_scratch);
+            vm_load(emit, RCX);
+            emit!(emit.output, X86_64; Opcode::Move32Register => [register RDX, register R13];);
+        } else {
+            push_parallel_register_moves(emit, &[(RDX, destination), (RCX, lhs), (R8, rhs)], state_scratch);
+            vm_load(emit, RDI);
+            emit!(emit.output, X86_64; Opcode::Move32Register => [register RSI, register R13];);
+        }
+        direct_call(emit, function);
+        finish_slow_path_call(emit, result_scratch, state_scratch)
+    }
+
+    fn jump_slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
+        let function = operands.relocation(0);
+        let [lhs, rhs, true_target, false_target] = [
+            operands.physical_register(1),
+            operands.physical_register(2),
+            operands.physical_register(3),
+            operands.physical_register(4),
+        ];
+        let [result_scratch, state_scratch] = [operands.physical_register(5), operands.physical_register(6)];
+        use crate::target::registers::x86_64::{R8, R9, R13, RBP, RCX, RDI, RDX, RSI};
+
+        store_slow_path_program_counter(emit)?;
+        if emit.object_format == ObjectFormat::Coff {
+            store(
+                emit,
+                MemoryWidth::DoubleWord,
+                MachineMemoryAddress::offset(RBP, super::WIN64_RAW_NATIVE_RETURN_SLOT),
+                StoreSource::Register(true_target),
+                None,
+            );
+            store(
+                emit,
+                MemoryWidth::DoubleWord,
+                MachineMemoryAddress::offset(RBP, super::WIN64_RAW_NATIVE_VARIANT_SLOT),
+                StoreSource::Register(false_target),
+                None,
+            );
+            push_parallel_register_moves(emit, &[(R8, lhs), (R9, rhs)], state_scratch);
+            vm_load(emit, RCX);
+            emit!(emit.output, X86_64; Opcode::Move32Register => [register RDX, register R13];);
+        } else {
+            push_parallel_register_moves(
+                emit,
+                &[(RDX, lhs), (RCX, rhs), (R8, true_target), (R9, false_target)],
+                state_scratch,
+            );
+            vm_load(emit, RDI);
+            emit!(emit.output, X86_64; Opcode::Move32Register => [register RSI, register R13];);
+        }
+        direct_call(emit, function);
+        finish_slow_path_call(emit, result_scratch, state_scratch)
     }
 
     fn dispatch_current(&self, emit: &mut Emit<'_>, scratches: &[AllocatedOperand]) -> Result<(), CompileError> {
@@ -932,7 +1083,27 @@ impl Backend for X86_64Backend {
         operands: &[AllocatedOperand],
     ) -> Result<(), CompileError> {
         let (width, condition) = operation.scalar_branch().expect("allocated scalar branch was verified");
-        scalar_compare(emit, operands.physical_register(0), operands.operand(1), width)?;
+        if let [
+            AllocatedOperand::Immediate(lhs),
+            AllocatedOperand::Immediate(rhs),
+            AllocatedOperand::Label(target),
+        ] = operands
+        {
+            if immediate_scalar_branch_taken(*lhs, *rhs, width, condition) {
+                emit!(emit.output, X86_64; Opcode::Jump => [label target.clone()];);
+            }
+            return Ok(());
+        }
+        let (lhs, rhs) = if let Some(lhs) = operands.operand(0).physical_register() {
+            (lhs, operands.operand(1))
+        } else if matches!(operation, Operation::Branch(BranchOperation::Equality { .. }))
+            && let Some(rhs) = operands.operand(1).physical_register()
+        {
+            (rhs, operands.operand(0))
+        } else {
+            return emit.error("scalar comparison requires at least one register operand");
+        };
+        scalar_compare(emit, lhs, rhs, width)?;
         branch_scalar(emit, condition, &operands.label(2));
         Ok(())
     }
@@ -1446,6 +1617,9 @@ impl Backend for X86_64Backend {
                         } => [register destination, immediate *value];
                         );
                     }
+                    AllocatedOperand::Address(address) => {
+                        push_alu_memory(emit, operation, IntegerWidth::U32, destination, address.clone());
+                    }
                     rhs => emit.output.push(machine_instruction(
                         Opcode::AluRegister {
                             operation,
@@ -1458,6 +1632,30 @@ impl Backend for X86_64Backend {
                     )),
                 }
                 verified_label(target_operand)
+            }
+            (
+                operation @ (OverflowOperation::RecoverAddLhs | OverflowOperation::RecoverSubtractLhs),
+                [destination, rhs],
+            ) => {
+                let destination = verified_register(destination);
+                let operation = match operation {
+                    OverflowOperation::RecoverAddLhs => super::AluOperation::Subtract,
+                    OverflowOperation::RecoverSubtractLhs => super::AluOperation::Add,
+                    _ => unreachable!(),
+                };
+                match rhs {
+                    AllocatedOperand::Immediate(value) => {
+                        debug_assert!(super::alu_immediate_fits(IntegerWidth::U32, *value));
+                        push_alu_immediate(emit, operation, IntegerWidth::U32, destination, *value);
+                    }
+                    AllocatedOperand::Address(address) => {
+                        push_alu_memory(emit, operation, IntegerWidth::U32, destination, address.clone());
+                    }
+                    rhs => {
+                        push_alu_register(emit, operation, IntegerWidth::U32, destination, verified_register(rhs));
+                    }
+                }
+                return;
             }
             (OverflowOperation::MultiplyWithOverflow, [destination, source, target_operand]) => {
                 push_overflow_multiply(emit, verified_register(destination), verified_register(source));
@@ -1553,13 +1751,46 @@ impl Backend for X86_64Backend {
     }
 
     fn finalize_divide(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) {
-        let [_, _, dividend, divisor] = operands.physical_registers();
-        use crate::target::registers::x86_64::RAX;
+        let [_, dividend, divisor, accumulator] = operands.physical_registers();
 
         emit!(emit.output, X86_64;
-            Opcode::Move64Register => [register RAX, register dividend];
-            Opcode::SignExtendRaxToRdx => [];
-            Opcode::SignedDivide64Register => [register divisor];
+            Opcode::Move32Register => [register accumulator, register dividend];
+            Opcode::SignExtendEaxToEdx => [];
+            Opcode::SignedDivide32Register => [register divisor];
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intrinsic::ComparisonRelation;
+
+    #[test]
+    fn evaluates_ordered_immediate_branches() {
+        assert!(immediate_scalar_branch_taken(
+            -1,
+            1,
+            IntegerWidth::U32,
+            ScalarBranchCondition::Signed(ComparisonRelation::Less),
+        ));
+        assert!(immediate_scalar_branch_taken(
+            -1,
+            1,
+            IntegerWidth::U32,
+            ScalarBranchCondition::Unsigned(ComparisonRelation::Greater),
+        ));
+        assert!(!immediate_scalar_branch_taken(
+            2,
+            1,
+            IntegerWidth::U16,
+            ScalarBranchCondition::Signed(ComparisonRelation::LessOrEqual),
+        ));
+        assert!(immediate_scalar_branch_taken(
+            2,
+            1,
+            IntegerWidth::U64,
+            ScalarBranchCondition::Unsigned(ComparisonRelation::GreaterOrEqual),
+        ));
     }
 }

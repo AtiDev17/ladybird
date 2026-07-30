@@ -234,7 +234,7 @@ define_machine_opcodes! {
     [BranchLinkRegister] => Self::BranchLinkRegister => [[R]] printing simple!("blr"; native(0));
     [BranchBitSetToExit(u8)] => Self::BranchBitSetToExit(bit) => [[R]] encoding {
         bit < 64
-    } printing simple!("tbnz"; native(0), SimpleOperand::HashValue(i64::from(bit)), SimpleOperand::Literal(".Lexit"));
+    };
     [Subtract32Register] => Self::Subtract32Register => [[R, R, R]] printing simple!("sub"; word(0), word(1), word(2));
     [SetInstructionPointer] => Self::SetInstructionPointer => [[R]] printing simple!("add"; SimpleOperand::Literal("x21"), SimpleOperand::Literal("x26"), word(0), SimpleOperand::Literal("uxtw"));
     [AdvanceInstructionPointer] => Self::AdvanceInstructionPointer => [[R]] printing simple!("add"; SimpleOperand::Literal("x21"), SimpleOperand::Literal("x21"), word(0), SimpleOperand::Literal("uxtw"));
@@ -397,8 +397,8 @@ define_machine_opcodes! {
     [BitClear64Immediate] => Self::BitClear64Immediate => [[R, I]] encoding {
         immediate(1).is_some_and(|value| is_logical_immediate(IntegerWidth::U64, value as u64))
     } printing simple!("bic"; native(0), native(0), SimpleOperand::HashImmediate(1, true));
-    [SignedDivide64] => Self::SignedDivide64 => [[R, R, R]] printing simple!("sdiv"; native(0), native(1), native(2));
-    [MultiplySubtract64] => Self::MultiplySubtract64 => [[R, R, R, R]] printing simple!("msub"; native(0), native(1), native(2), native(3));
+    [SignedDivide32] => Self::SignedDivide32 => [[R, R, R]] printing simple!("sdiv"; word(0), word(1), word(2));
+    [MultiplySubtract32] => Self::MultiplySubtract32 => [[R, R, R, R]] printing simple!("msub"; word(0), word(1), word(2), word(3));
 }
 
 pub(crate) struct ImmediateMove {
@@ -628,9 +628,12 @@ impl Opcode {
             Operation::Float(operation) => match operation {
                 FloatingPointOperation::Binary(operation) => Self::FloatArithmetic(operation),
                 FloatingPointOperation::Unary(operation) => Self::FloatUnary(operation),
-                FloatingPointOperation::Convert(
-                    IntrinsicFloatConversion::Int32ToFloat64 | IntrinsicFloatConversion::Uint32ToFloat64,
-                ) => Self::FloatConversion(FloatConversion::Signed64ToDouble),
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Int32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed32ToDouble)
+                }
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Uint32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed64ToDouble)
+                }
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Float32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::FloatToDouble)
                 }
@@ -770,6 +773,10 @@ pub(crate) fn generate(program: &Program, options: &CompileOptions) -> String {
                 "//",
                 |out, _| emit_handler_alignment(out, object_format),
                 emit_instruction,
+                |out| {
+                    w!(out, ".Lexit_veneer:");
+                    w!(out, "    b .Lexit");
+                },
             )
         },
         |out| generate_exit_point(out, object_format),
@@ -886,7 +893,7 @@ fn generate_fallback_handler(out: &mut String, program: &Program, object_format:
     w!(out, "    mov x2, x21");
     w!(out, "    bl CSYM(asm_fallback_handler)");
     // Check for exit (return < 0)
-    w!(out, "    tbnz x0, #63, .Lexit");
+    emit_branch_bit_set_to_exit(out, registers::X0, 63);
     // Reload exec_ctx, pb, and values
     emit_state_reload(out, program);
     // w0 = new pc (32-bit), x26 = new pb; compute x21 = pb + pc
@@ -1125,9 +1132,19 @@ fn emit_instruction(out: &mut String, insn: &MachineInstruction, handler: &Handl
         return;
     }
     match opcode {
+        Opcode::BranchBitSetToExit(bit) => {
+            emit_branch_bit_set_to_exit(out, insn.physical_register(0), bit);
+        }
         Opcode::Label => emit_label(out, insn, handler),
         _ => unreachable!("target pseudo reached the AArch64 machine printer"),
     }
+}
+
+fn emit_branch_bit_set_to_exit(out: &mut String, register: PhysicalRegister, bit: u8) {
+    // A test-bit branch only has a +/-32 KiB range, while the shared exit point
+    // follows all interpreter handlers. Branch to the veneer between the hot
+    // and cold regions, which can reach the exit using a wider-range branch.
+    w!(out, "    tbnz {register}, #{bit}, .Lexit_veneer");
 }
 
 #[cfg(test)]
@@ -1237,6 +1254,31 @@ mod tests {
         emit_instruction(&mut out, &instruction, handler);
 
         assert!(out.contains("mov w0, w0"));
+    }
+
+    #[test]
+    fn bit_test_exit_branch_uses_the_shared_veneer() {
+        let program = machine_coff_program(Vec::new());
+        let handler = &program.functions[0];
+        let instruction = MachineInstruction {
+            opcode: super::super::ir::MachineOpcode::Aarch64(Opcode::BranchBitSetToExit(63)),
+            operands: vec![Operand::PhysicalRegister(crate::target::registers::aarch64::X0)],
+        };
+        let mut out = String::new();
+
+        emit_instruction(&mut out, &instruction, handler);
+
+        assert_eq!(out, "    tbnz x0, #63, .Lexit_veneer\n");
+    }
+
+    #[test]
+    fn emits_one_exit_veneer_between_hot_and_cold_handlers() {
+        let output = generate(&coff_program(Vec::new()));
+
+        assert_eq!(output.matches(".Lexit_veneer:").count(), 1);
+        assert!(output.contains("    tbnz x0, #63, .Lexit_veneer"));
+        assert!(output.contains(".Lexit_veneer:\n    b .Lexit\n"));
+        assert!(output.find(".Lexit_veneer:") < output.find("// Cold handler paths"));
     }
 
     #[test]

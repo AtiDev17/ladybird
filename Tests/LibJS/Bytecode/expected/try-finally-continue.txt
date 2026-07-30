@@ -32,7 +32,7 @@ continueThroughFinally$49ed363e try-finally-continue.js:2:5
 
 block0:
   [   0] GetLexicalEnvironment dst:reg4
-  [   8] Mov2 dst1:result~1, src1:Int32(0), dst2:i~0, src2:Int32(0)
+  [   8] Mov2 c0_dst:result~1, c0_src:Int32(0), c1_dst:i~0, c1_src:Int32(0)
   [  20] Jump target:block3
 
 block1:
@@ -42,7 +42,7 @@ block2:
   [  30] PostfixIncrement dst:reg5, src:i~0
 
 block3:
-  [  40] JumpLessThan lhs:i~0, rhs:Int32(3), true_target:block1, false_target:block4
+  [  40] JumpLessThanRhsInt32 lhs:i~0, rhs:3, true_target:block1, false_target:block4
 
 block4:
   [  58] Return value:result~1
@@ -54,12 +54,12 @@ block5:
 
 block6:
   [  80] Mov dst:reg8, src:result~1
-  [  90] Add dst:reg7, lhs:reg8, rhs:Int32(10)
+  [  90] AddRhsInt32 dst:reg7, lhs:reg8, rhs:10
   [  a0] Mov dst:result~1, src:reg7
-  [  b0] JumpStrictlyEquals lhs:reg5, rhs:Int32(0), true_target:block10, false_target:block11
+  [  b0] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:0, true_target:block10, false_target:block11
 
 block7:
-  [  c8] JumpStrictlyEquals lhs:i~0, rhs:Int32(1), true_target:block8, false_target:block9
+  [  c8] JumpStrictlyEqualsRhsInt32 lhs:i~0, rhs:1, true_target:block8, false_target:block9
 
 block8:
   [  e0] Mov dst:reg5, src:Int32(3)
@@ -68,17 +68,17 @@ block8:
 block9:
   [  f8] Mov dst:reg7, src:result~1
   [ 108] Add dst:reg8, lhs:reg7, rhs:i~0
-  [ 118] Mov2 dst1:result~1, src1:reg8, dst2:reg5, src2:Int32(0)
+  [ 118] Mov2 c0_dst:result~1, c0_src:reg8, c1_dst:reg5, c1_src:Int32(0)
   [ 130] Jump target:block6
 
 block10:
   [ 138] Jump target:block2
 
 block11:
-  [ 140] JumpStrictlyEquals lhs:reg5, rhs:Int32(3), true_target:block2, false_target:block12
+  [ 140] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:3, true_target:block2, false_target:block12
 
 block12:
-  [ 158] JumpStrictlyEquals lhs:reg5, rhs:Int32(2), true_target:block13, false_target:block14
+  [ 158] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:2, true_target:block13, false_target:block14
 
 block13:
   [ 170] Return value:reg6
@@ -105,7 +105,7 @@ breakThroughFinally$d975d962 try-finally-continue.js:16:5
 
 block0:
   [   0] GetLexicalEnvironment dst:reg4
-  [   8] Mov2 dst1:result~1, src1:Int32(0), dst2:i~0, src2:Int32(0)
+  [   8] Mov2 c0_dst:result~1, c0_src:Int32(0), c1_dst:i~0, c1_src:Int32(0)
   [  20] Jump target:block3
 
 block1:
@@ -115,7 +115,7 @@ block2:
   [  30] PostfixIncrement dst:reg5, src:i~0
 
 block3:
-  [  40] JumpLessThan lhs:i~0, rhs:Int32(10), true_target:block1, false_target:block4
+  [  40] JumpLessThanRhsInt32 lhs:i~0, rhs:10, true_target:block1, false_target:block4
 
 block4:
   [  58] Return value:result~1
@@ -127,12 +127,12 @@ block5:
 
 block6:
   [  80] Mov dst:reg8, src:result~1
-  [  90] Add dst:reg7, lhs:reg8, rhs:Int32(100)
+  [  90] AddRhsInt32 dst:reg7, lhs:reg8, rhs:100
   [  a0] Mov dst:result~1, src:reg7
-  [  b0] JumpStrictlyEquals lhs:reg5, rhs:Int32(0), true_target:block10, false_target:block11
+  [  b0] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:0, true_target:block10, false_target:block11
 
 block7:
-  [  c8] JumpStrictlyEquals lhs:i~0, rhs:Int32(2), true_target:block8, false_target:block9
+  [  c8] JumpStrictlyEqualsRhsInt32 lhs:i~0, rhs:2, true_target:block8, false_target:block9
 
 block8:
   [  e0] Mov dst:reg5, src:Int32(3)
@@ -141,17 +141,17 @@ block8:
 block9:
   [  f8] Mov dst:reg7, src:result~1
   [ 108] Add dst:reg8, lhs:reg7, rhs:i~0
-  [ 118] Mov2 dst1:result~1, src1:reg8, dst2:reg5, src2:Int32(0)
+  [ 118] Mov2 c0_dst:result~1, c0_src:reg8, c1_dst:reg5, c1_src:Int32(0)
   [ 130] Jump target:block6
 
 block10:
   [ 138] Jump target:block2
 
 block11:
-  [ 140] JumpStrictlyEquals lhs:reg5, rhs:Int32(3), true_target:block4, false_target:block12
+  [ 140] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:3, true_target:block4, false_target:block12
 
 block12:
-  [ 158] JumpStrictlyEquals lhs:reg5, rhs:Int32(2), true_target:block13, false_target:block14
+  [ 158] JumpStrictlyEqualsRhsInt32 lhs:reg5, rhs:2, true_target:block13, false_target:block14
 
 block13:
   [ 170] Return value:reg6

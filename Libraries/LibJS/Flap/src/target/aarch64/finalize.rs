@@ -21,7 +21,7 @@ use crate::target::description::{
 use crate::target::finalize_support::{
     AllocatedOperands, Emit, MemoryBranch, finalization_error, finalize_error,
     indexed_pair_store as decode_indexed_pair_store, interpreter_layout, machine_address, operand_register,
-    pair_access, pair_element_size, verified_label, verified_register,
+    pair_access, pair_element_size, schedule_parallel_moves, verified_label, verified_register,
 };
 use crate::target::finalize_support::{memory_branch, push_plain_move};
 use crate::target::ir::{
@@ -851,6 +851,77 @@ pub(crate) fn instruction_argument(emit: &mut Emit<'_>) {
     emit!(emit.output, Aarch64; Opcode::MoveRegister(IntegerWidth::U64) => [register X2, register X21];);
 }
 
+fn push_parallel_register_moves(
+    emit: &mut Emit<'_>,
+    requested_moves: &[(PhysicalRegister, PhysicalRegister)],
+    scratch: PhysicalRegister,
+) {
+    for (destination, source) in schedule_parallel_moves(requested_moves, scratch) {
+        emit!(emit.output, Aarch64; Opcode::MoveRegister(IntegerWidth::U64) => [register destination, register source];);
+    }
+}
+
+fn store_slow_path_program_counter(
+    emit: &mut Emit<'_>,
+    dispatch_register: PhysicalRegister,
+    dispatch_scratch: PhysicalRegister,
+) -> Result<(), CompileError> {
+    use crate::target::registers::aarch64::{X1, X28};
+
+    let [_, _, program_counter, _, _] = interpreter_layout(emit.runtime, emit.handler)?;
+    store(
+        emit,
+        MemoryWidth::Word,
+        MachineMemoryAddress::offset(X28, program_counter),
+        StoreSource::Register(X1),
+        [dispatch_register, dispatch_scratch],
+    )
+    .map_err(|error| memory_address_compile_error(emit.handler, error))
+}
+
+fn finish_slow_path_call(
+    emit: &mut Emit<'_>,
+    dispatch_register: PhysicalRegister,
+    dispatch_scratch: PhysicalRegister,
+) -> Result<(), CompileError> {
+    use crate::target::registers::aarch64::{X0, X20, X26, X27, X28};
+
+    let [execution_context, executable, _, bytecode, values_offset] = interpreter_layout(emit.runtime, emit.handler)?;
+    emit!(emit.output, Aarch64; Opcode::BranchBitSetToExit(63) => [register X0];);
+
+    load(
+        emit,
+        MemoryWidth::DoubleWord,
+        false,
+        X28,
+        MachineMemoryAddress::offset(X20, execution_context),
+        &[dispatch_register, dispatch_scratch],
+    )
+    .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+    load(
+        emit,
+        MemoryWidth::DoubleWord,
+        false,
+        dispatch_register,
+        MachineMemoryAddress::offset(X28, executable),
+        &[dispatch_register, dispatch_scratch],
+    )
+    .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+    load(
+        emit,
+        MemoryWidth::DoubleWord,
+        false,
+        X26,
+        MachineMemoryAddress::offset(dispatch_register, bytecode),
+        &[dispatch_register, dispatch_scratch],
+    )
+    .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+    address_offset(emit, X27, X28, values_offset, dispatch_register);
+    emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register X0];);
+    dispatch_from_instruction_pointer(emit, dispatch_register, dispatch_scratch)
+        .map_err(|error| memory_address_compile_error(emit.handler, error))
+}
+
 fn dispatch_from_instruction_pointer(
     emit: &mut Emit<'_>,
     opcode_scratch: PhysicalRegister,
@@ -1131,55 +1202,51 @@ impl Backend for Aarch64Backend {
     fn slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
         let function = operands.relocation(0);
         let [dispatch_register, dispatch_scratch] = [operands.physical_register(1), operands.physical_register(2)];
-        use crate::target::registers::aarch64::{X0, X1, X20, X26, X27, X28};
-
-        let [execution_context, executable, program_counter, bytecode, values_offset] =
-            interpreter_layout(emit.runtime, emit.handler)?;
 
         vm_pc_arguments(emit);
-        store(
-            emit,
-            MemoryWidth::Word,
-            MachineMemoryAddress::offset(X28, program_counter),
-            StoreSource::Register(X1),
-            [dispatch_register, dispatch_scratch],
-        )
-        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+        store_slow_path_program_counter(emit, dispatch_register, dispatch_scratch)?;
         instruction_argument(emit);
         direct_call(emit, function);
-        emit!(emit.output, Aarch64; Opcode::BranchBitSetToExit(63) => [register X0];);
+        finish_slow_path_call(emit, dispatch_register, dispatch_scratch)
+    }
 
-        load(
+    fn binary_slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
+        let function = operands.relocation(0);
+        let [destination, lhs, rhs] = [
+            operands.physical_register(1),
+            operands.physical_register(2),
+            operands.physical_register(3),
+        ];
+        let [dispatch_register, dispatch_scratch] = [operands.physical_register(4), operands.physical_register(5)];
+        use crate::target::registers::aarch64::{X2, X3, X4};
+
+        push_parallel_register_moves(emit, &[(X2, destination), (X3, lhs), (X4, rhs)], dispatch_scratch);
+        vm_pc_arguments(emit);
+        store_slow_path_program_counter(emit, dispatch_register, dispatch_scratch)?;
+        direct_call(emit, function);
+        finish_slow_path_call(emit, dispatch_register, dispatch_scratch)
+    }
+
+    fn jump_slow_path_call(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
+        let function = operands.relocation(0);
+        let [lhs, rhs, true_target, false_target] = [
+            operands.physical_register(1),
+            operands.physical_register(2),
+            operands.physical_register(3),
+            operands.physical_register(4),
+        ];
+        let [dispatch_register, dispatch_scratch] = [operands.physical_register(5), operands.physical_register(6)];
+        use crate::target::registers::aarch64::{X2, X3, X4, X5};
+
+        push_parallel_register_moves(
             emit,
-            MemoryWidth::DoubleWord,
-            false,
-            X28,
-            MachineMemoryAddress::offset(X20, execution_context),
-            &[dispatch_register, dispatch_scratch],
-        )
-        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
-        load(
-            emit,
-            MemoryWidth::DoubleWord,
-            false,
-            dispatch_register,
-            MachineMemoryAddress::offset(X28, executable),
-            &[dispatch_register, dispatch_scratch],
-        )
-        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
-        load(
-            emit,
-            MemoryWidth::DoubleWord,
-            false,
-            X26,
-            MachineMemoryAddress::offset(dispatch_register, bytecode),
-            &[dispatch_register, dispatch_scratch],
-        )
-        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
-        address_offset(emit, X27, X28, values_offset, dispatch_register);
-        emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register X0];);
-        dispatch_from_instruction_pointer(emit, dispatch_register, dispatch_scratch)
-            .map_err(|error| memory_address_compile_error(emit.handler, error))
+            &[(X2, lhs), (X3, rhs), (X4, true_target), (X5, false_target)],
+            dispatch_scratch,
+        );
+        vm_pc_arguments(emit);
+        store_slow_path_program_counter(emit, dispatch_register, dispatch_scratch)?;
+        direct_call(emit, function);
+        finish_slow_path_call(emit, dispatch_register, dispatch_scratch)
     }
 
     fn dispatch_current(&self, emit: &mut Emit<'_>, scratches: &[AllocatedOperand]) -> Result<(), CompileError> {
@@ -1296,8 +1363,36 @@ impl Backend for Aarch64Backend {
         operands: &[AllocatedOperand],
     ) -> Result<(), CompileError> {
         let (width, condition) = operation.scalar_branch().expect("allocated scalar branch was verified");
-        let lhs = operands.physical_register(0);
-        let rhs = operands.operand(1);
+        if let [
+            AllocatedOperand::Immediate(lhs),
+            AllocatedOperand::Immediate(rhs),
+            _scratch,
+            AllocatedOperand::Label(target),
+        ] = operands
+        {
+            let mask = match width {
+                IntegerWidth::U16 => u16::MAX as u64,
+                IntegerWidth::U32 => u32::MAX as u64,
+                IntegerWidth::U64 => u64::MAX,
+                _ => unreachable!("allocated scalar branch was verified"),
+            };
+            let equal = (*lhs as u64 & mask) == (*rhs as u64 & mask);
+            if condition == ScalarBranchCondition::Equal && equal
+                || condition == ScalarBranchCondition::NotEqual && !equal
+            {
+                emit!(emit.output, Aarch64; Opcode::Branch => [label target.clone()];);
+            }
+            return Ok(());
+        }
+        let (lhs, rhs) = if let Some(lhs) = operands.operand(0).physical_register() {
+            (lhs, operands.operand(1))
+        } else if matches!(operation, Operation::Branch(BranchOperation::Equality { .. }))
+            && let Some(rhs) = operands.operand(1).physical_register()
+        {
+            (rhs, operands.operand(0))
+        } else {
+            return emit.error("scalar comparison requires at least one register operand");
+        };
         let scratch = operands.physical_register(2);
         let target = operands.label(3);
         compare(
@@ -1896,9 +1991,60 @@ impl Backend for Aarch64Backend {
                         move_immediate(emit, scratch, *value, IntegerWidth::U32);
                         push_overflow_add_subtract_register(emit, operation, destination, scratch);
                     }
+                    AllocatedOperand::Address(address) => {
+                        let loaded = load(
+                            emit,
+                            MemoryWidth::Word,
+                            false,
+                            scratch,
+                            address.clone(),
+                            std::slice::from_ref(&scratch),
+                        );
+                        assert!(loaded.is_ok(), "verified bytecode field addresses are encodable");
+                        push_overflow_add_subtract_register(emit, operation, destination, scratch);
+                    }
                     rhs => push_overflow_add_subtract_register(emit, operation, destination, verified_register(rhs)),
                 }
                 (Opcode::BranchOverflow, verified_label(target_operand), None)
+            }
+            (
+                operation @ (OverflowOperation::RecoverAddLhs | OverflowOperation::RecoverSubtractLhs),
+                [destination, rhs, scratch],
+            ) => {
+                let destination = verified_register(destination);
+                let scratch = verified_register(scratch);
+                let operation = match operation {
+                    OverflowOperation::RecoverAddLhs => AddSubtractOperation::Subtract,
+                    OverflowOperation::RecoverSubtractLhs => AddSubtractOperation::Add,
+                    _ => unreachable!(),
+                };
+                let source = match rhs {
+                    AllocatedOperand::Immediate(value) if *value > 0 && *value <= 4095 => {
+                        emit!(emit.output, Aarch64; Opcode::AddSubtract32ImmediateWithFlags(operation) => [register destination, immediate *value];);
+                        None
+                    }
+                    AllocatedOperand::Immediate(value) => {
+                        move_immediate(emit, scratch, *value, IntegerWidth::U32);
+                        Some(scratch)
+                    }
+                    AllocatedOperand::Address(address) => {
+                        let loaded = load(
+                            emit,
+                            MemoryWidth::Word,
+                            false,
+                            scratch,
+                            address.clone(),
+                            std::slice::from_ref(&scratch),
+                        );
+                        assert!(loaded.is_ok(), "verified bytecode field addresses are encodable");
+                        Some(scratch)
+                    }
+                    rhs => Some(verified_register(rhs)),
+                };
+                if let Some(source) = source {
+                    push_overflow_add_subtract_register(emit, operation, destination, source);
+                }
+                return;
             }
             (
                 operation @ (OverflowOperation::Increment | OverflowOperation::Decrement),
@@ -1997,11 +2143,8 @@ impl Backend for Aarch64Backend {
     }
 
     fn finalize_divide(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) {
-        let [quotient, remainder, dividend, divisor, scratch] = operands.physical_registers();
-        emit!(emit.output, Aarch64; Opcode::SignedDivide64 => [register scratch, register dividend, register divisor];);
-        emit!(emit.output, Aarch64; Opcode::MultiplySubtract64 => [register remainder, register scratch, register divisor, register dividend];);
-        if quotient != remainder {
-            emit!(emit.output, Aarch64; Opcode::MoveRegister(IntegerWidth::U64) => [register quotient, register scratch];);
-        }
+        let [remainder, dividend, divisor, scratch] = operands.physical_registers();
+        emit!(emit.output, Aarch64; Opcode::SignedDivide32 => [register scratch, register dividend, register divisor];);
+        emit!(emit.output, Aarch64; Opcode::MultiplySubtract32 => [register remainder, register scratch, register divisor, register dividend];);
     }
 }

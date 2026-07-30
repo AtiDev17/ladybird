@@ -74,6 +74,7 @@ pub(crate) fn alu_immediate_fits(width: IntegerWidth, value: i64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FloatConversion {
     Signed64ToDouble,
+    Signed32ToDouble,
     FloatToDouble,
     DoubleToFloat,
     DoubleToSigned32Truncate,
@@ -210,6 +211,11 @@ define_machine_opcodes! {
     [MoveAbsolute64Immediate] => Self::MoveAbsolute64Immediate => [[R, I]] printing simple!("movabs"; native(0), SimpleOperand::Immediate(1));
     [Or64Register] => Self::Or64Register => [[R, R]] printing simple!("or"; native(0), native(1));
     [AluRegister { operation: AluOperation, width: IntegerWidth }] => Self::AluRegister { operation, width } => [[R, R]] printing simple!(operation.mnemonic(); integer(0, width), integer(1, width));
+    [AluMemory { operation: AluOperation, width: IntegerWidth }] => Self::AluMemory { operation, width } => [[R, A]] printing simple!(operation.mnemonic(); integer(0, width), SimpleOperand::Resolved(1, match width {
+        IntegerWidth::U32 => "DWORD PTR ",
+        IntegerWidth::U64 => "QWORD PTR ",
+        IntegerWidth::U8 | IntegerWidth::U16 => unreachable!("unsupported x86-64 memory ALU width"),
+    }));
     [AluImmediate { operation: AluOperation, width: IntegerWidth }] => Self::AluImmediate { operation, width } => [[R, I]] encoding {
         immediate(1).is_some_and(|value| alu_immediate_fits(width, value))
     } printing simple!(operation.mnemonic(); integer(0, width), SimpleOperand::Immediate(1));
@@ -271,12 +277,13 @@ define_machine_opcodes! {
     };
     [FloatConversion(FloatConversion)] => Self::FloatConversion(conversion) => {
         match conversion {
-            FloatConversion::Signed64ToDouble => operands_match(operands, &[FR, R]),
+            FloatConversion::Signed64ToDouble | FloatConversion::Signed32ToDouble => operands_match(operands, &[FR, R]),
             FloatConversion::FloatToDouble | FloatConversion::DoubleToFloat => operands_match(operands, &[FR, FR]),
             FloatConversion::DoubleToSigned32Truncate | FloatConversion::DoubleToSigned64Truncate => operands_match(operands, &[R, FR]),
         }
     } printing match conversion {
         FloatConversion::Signed64ToDouble => simple!("cvtsi2sd"; native(0), native(1)),
+        FloatConversion::Signed32ToDouble => simple!("cvtsi2sd"; native(0), integer(1, IntegerWidth::U32)),
         FloatConversion::FloatToDouble => simple!("cvtss2sd"; native(0), native(1)),
         FloatConversion::DoubleToFloat => simple!("cvtsd2ss"; native(0), native(1)),
         FloatConversion::DoubleToSigned32Truncate => simple!("cvttsd2si"; integer(0, IntegerWidth::U32), native(1)),
@@ -298,8 +305,8 @@ define_machine_opcodes! {
     [ResetBit] => Self::ResetBit => [[R, I]] encoding {
         immediate(1).is_some_and(|value| (0..64).contains(&value))
     } printing simple!("btr"; native(0), SimpleOperand::Immediate(1));
-    [SignExtendRaxToRdx] => Self::SignExtendRaxToRdx => [[]] printing simple!("cqo");
-    [SignedDivide64Register] => Self::SignedDivide64Register => [[R]] printing simple!("idiv"; native(0));
+    [SignExtendEaxToEdx] => Self::SignExtendEaxToEdx => [[]] printing simple!("cdq");
+    [SignedDivide32Register] => Self::SignedDivide32Register => [[R]] printing simple!("idiv"; integer(0, IntegerWidth::U32));
 }
 
 impl Opcode {
@@ -390,9 +397,12 @@ impl Opcode {
             Operation::Float(operation) => match operation {
                 FloatingPointOperation::Binary(operation) => Self::FloatArithmetic(operation),
                 FloatingPointOperation::Unary(operation) => Self::FloatUnary(operation),
-                FloatingPointOperation::Convert(
-                    IntrinsicFloatConversion::Int32ToFloat64 | IntrinsicFloatConversion::Uint32ToFloat64,
-                ) => Self::FloatConversion(FloatConversion::Signed64ToDouble),
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Int32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed32ToDouble)
+                }
+                FloatingPointOperation::Convert(IntrinsicFloatConversion::Uint32ToFloat64) => {
+                    Self::FloatConversion(FloatConversion::Signed64ToDouble)
+                }
                 FloatingPointOperation::Convert(IntrinsicFloatConversion::Float32ToFloat64) => {
                     Self::FloatConversion(FloatConversion::FloatToDouble)
                 }
@@ -524,6 +534,7 @@ pub(crate) fn generate(program: &Program, options: &CompileOptions) -> String {
                 "#",
                 |out, cold| w!(out, "{}", if cold { ".p2align 4" } else { ".p2align 6" }),
                 |out, instruction, handler| emit_instruction(out, instruction, handler, program),
+                |_| {},
             )
         },
         |out| generate_exit_point(out, object_format, abi),
@@ -889,6 +900,47 @@ mod tests {
         )]);
 
         assert_eq!(output, "    or rax, r15\n");
+    }
+
+    #[test]
+    fn emits_checked_arithmetic_with_a_bytecode_field_operand() {
+        let output = emit([instruction(
+            Opcode::AluMemory {
+                operation: AluOperation::Add,
+                width: IntegerWidth::U32,
+            },
+            vec![
+                Operand::PhysicalRegister(crate::target::registers::x86_64::RAX),
+                memory("pb", Some("pc"), None, Some(12)),
+            ],
+        )]);
+
+        assert_eq!(output, "    add eax, DWORD PTR [r14 + r13 + 12]\n");
+    }
+
+    #[test]
+    fn recovers_checked_add_lhs_from_the_wrapped_result() {
+        let output = emit([
+            instruction(
+                Opcode::AluMemory {
+                    operation: AluOperation::Subtract,
+                    width: IntegerWidth::U32,
+                },
+                vec![
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                    memory("pb", Some("pc"), None, Some(12)),
+                ],
+            ),
+            instruction(
+                Opcode::SignExtend32To64,
+                vec![
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                    Operand::PhysicalRegister(crate::target::registers::x86_64::RCX),
+                ],
+            ),
+        ]);
+
+        assert_eq!(output, "    sub ecx, DWORD PTR [r14 + r13 + 12]\n    movsxd rcx, ecx\n");
     }
 
     #[test]

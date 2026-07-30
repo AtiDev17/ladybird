@@ -109,6 +109,8 @@ pub(crate) enum OverflowOperation {
     Increment,
     Decrement,
     SubtractWithOverflow,
+    RecoverAddLhs,
+    RecoverSubtractLhs,
     MultiplyWithOverflow,
     MultiplyCopy,
     Negate,
@@ -160,7 +162,7 @@ pub(crate) enum Operation {
     Or32Branch(SignCondition),
     Negate,
     Not(IntegerWidth),
-    DivMod,
+    Modulo,
     Overflow(OverflowOperation),
     ExtractTag,
     UnboxInt32,
@@ -423,6 +425,8 @@ pub(crate) enum OperandKind {
     GprInOrImm,
     /// GPR input or memory address.
     GprInOrMemory,
+    /// GPR input, immediate, or memory address.
+    GprInOrImmOrMemory,
     /// Compile-time integer (immediate, named constant, or field reference).
     Imm,
     /// Memory operand `[base, ...]`. Reads the GPRs referenced inside the
@@ -453,6 +457,10 @@ impl OperandKind {
             }
             Self::GprInOrMemory => {
                 register_class == Some(RegisterClass::GeneralPurpose) || shape == OperandShape::Address
+            }
+            Self::GprInOrImmOrMemory => {
+                register_class == Some(RegisterClass::GeneralPurpose)
+                    || matches!(shape, OperandShape::Immediate | OperandShape::Address)
             }
             Self::Imm => shape == OperandShape::Immediate,
             Self::Memory => shape == OperandShape::Address,
@@ -726,7 +734,13 @@ const fn spec() -> ArchSpec {
     ArchSpec::NONE
 }
 
-const fn scalar_compare_branch() -> InstructionDescription {
+const fn scalar_equality_branch() -> InstructionDescription {
+    plain(&[GprInOrImm, GprInOrImm])
+        .trailing(&[Label])
+        .pre_scratches(&[], &[X9])
+}
+
+const fn scalar_ordered_branch() -> InstructionDescription {
     plain(&[GprIn, GprInOrImm]).trailing(&[Label]).pre_scratches(&[], &[X9])
 }
 
@@ -762,6 +776,24 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
                     .terminal()
                     .call()
                     .x86_64(spec().scratches(&[RAX, RCX]))
+                    .aarch64(spec().scratches(&[X9, X10]))
+            }
+        }
+        Operation::Call(CallKind::BinarySlowPath) => {
+            &const {
+                plain(&[FuncSymbol, GprIn, GprIn, GprIn])
+                    .terminal()
+                    .call()
+                    .x86_64(spec().scratches(&[RAX, R11]))
+                    .aarch64(spec().scratches(&[X9, X10]))
+            }
+        }
+        Operation::Call(CallKind::JumpSlowPath) => {
+            &const {
+                plain(&[FuncSymbol, GprIn, GprIn, GprIn, GprIn])
+                    .terminal()
+                    .call()
+                    .x86_64(spec().scratches(&[RAX, R11]))
                     .aarch64(spec().scratches(&[X9, X10]))
             }
         }
@@ -912,19 +944,22 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
                     .coalesces(&[(0, 1)])
             }
         }
-        Operation::DivMod => {
+        Operation::Modulo => {
             &const {
-                plain(&[GprOut, GprOut, GprIn, GprIn])
-                    .x86_64(spec().outputs(&[RAX, RDX]).fixed(&[(0, RAX), (1, RDX)]))
+                plain(&[GprOut, GprIn, GprIn])
+                    .x86_64(spec().outputs(&[RDX]).fixed(&[(0, RDX)]).scratches(&[RAX]))
                     .aarch64(spec().scratches(&[X9]))
             }
         }
         Operation::Overflow(AddWithOverflow) | Operation::Overflow(SubtractWithOverflow) => {
             &const {
-                plain(&[GprInOut, GprInOrImm])
+                plain(&[GprInOut, GprInOrImmOrMemory])
                     .trailing(&[Label])
                     .pre_scratches(&[], &[X9])
             }
+        }
+        Operation::Overflow(RecoverAddLhs) | Operation::Overflow(RecoverSubtractLhs) => {
+            &const { plain(&[GprInOut, GprInOrImmOrMemory]).pre_scratches(&[], &[X9]) }
         }
         Operation::Overflow(Increment) | Operation::Overflow(Decrement) | Operation::Overflow(Negate) => {
             &const { plain(&[GprInOut, Label]) }
@@ -964,8 +999,8 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
         Operation::Float(FloatingPointOperation::CanonicalizeNan) => &const { plain(&[GprOut, FprIn]) },
         Operation::Branch(BranchOperation::Equality {
             width: U16 | U32 | U64, ..
-        })
-        | Operation::Branch(BranchOperation::Ordered { width: U32 | U64, .. }) => &const { scalar_compare_branch() },
+        }) => &const { scalar_equality_branch() },
+        Operation::Branch(BranchOperation::Ordered { width: U32 | U64, .. }) => &const { scalar_ordered_branch() },
         Operation::Branch(BranchOperation::Tag(_)) => {
             &const {
                 plain(&[GprIn, Imm])
@@ -1053,6 +1088,15 @@ mod tests {
             let info = lookup_operation(operation);
             assert!(info.x86_64.trailing_scratch_registers.is_empty());
             assert!(info.aarch64.trailing_scratch_registers.is_empty());
+        }
+    }
+
+    #[test]
+    fn aarch64_slow_path_dispatch_preserves_the_return_register() {
+        for kind in [CallKind::BinarySlowPath, CallKind::JumpSlowPath] {
+            let info = lookup_operation(Operation::Call(kind));
+            assert_eq!(info.aarch64.trailing_scratch_registers, &[X9, X10]);
+            assert!(!info.aarch64.trailing_scratch_registers.contains(&X0));
         }
     }
 }

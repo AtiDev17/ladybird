@@ -236,6 +236,8 @@ fn finalize_call(
         CallKind::Interpreter => backend.interpreter_call(emit, operands.relocation(0)),
         CallKind::RawNative => backend.raw_native_call(emit, operands),
         CallKind::SlowPath => backend.slow_path_call(emit, operands)?,
+        CallKind::BinarySlowPath => backend.binary_slow_path_call(emit, operands)?,
+        CallKind::JumpSlowPath => backend.jump_slow_path_call(emit, operands)?,
     }
     Ok(())
 }
@@ -402,7 +404,7 @@ fn finalize_instruction(
         Operation::Cold => {
             return emit.error("operation Cold was not expanded into legal machine instructions");
         }
-        Operation::DivMod => backend.finalize_divide(emit, operands),
+        Operation::Modulo => backend.finalize_divide(emit, operands),
         _ => emit.output.push(MachineInstruction {
             opcode,
             operands: instruction.operands,
