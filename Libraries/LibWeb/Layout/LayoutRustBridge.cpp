@@ -24,10 +24,8 @@
 #include <LibWeb/CSS/GridTrackPlacement.h>
 #include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/LengthBox.h>
-#include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Size.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
-#include <LibWeb/CSS/StyleValues/CalcNodeRef.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FlexStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
@@ -92,69 +90,7 @@ static Atomic<size_t> s_outstanding_grid_name_handles;
 static Atomic<size_t> s_outstanding_anchor_name_handles;
 static Atomic<size_t> s_outstanding_svg_path_handles;
 
-static constexpr size_t style_field_encoding_width(RustFFI::FfiStyleFieldEncoding encoding)
-{
-    switch (encoding) {
-    case RustFFI::FfiStyleFieldEncoding::U8:
-    case RustFFI::FfiStyleFieldEncoding::Bool:
-        return 1;
-    case RustFFI::FfiStyleFieldEncoding::I32:
-    case RustFFI::FfiStyleFieldEncoding::CssPixels:
-        return 4;
-    case RustFFI::FfiStyleFieldEncoding::F64:
-        return 8;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
-
-#define LIBWEB_LAYOUT_DIRECT_STYLE_FIELDS(F)                                                                                                                                                  \
-    F(BorderTopWidth, CSS::ComputedValues::BorderValues, border_top.width, offsetof(CSS::ComputedValues::BorderValues, border_top) + offsetof(CSS::BorderData, width), CssPixels)             \
-    F(BorderRightWidth, CSS::ComputedValues::BorderValues, border_right.width, offsetof(CSS::ComputedValues::BorderValues, border_right) + offsetof(CSS::BorderData, width), CssPixels)       \
-    F(BorderBottomWidth, CSS::ComputedValues::BorderValues, border_bottom.width, offsetof(CSS::ComputedValues::BorderValues, border_bottom) + offsetof(CSS::BorderData, width), CssPixels)    \
-    F(BorderLeftWidth, CSS::ComputedValues::BorderValues, border_left.width, offsetof(CSS::ComputedValues::BorderValues, border_left) + offsetof(CSS::BorderData, width), CssPixels)          \
-    F(BorderTopStyle, CSS::ComputedValues::BorderValues, border_top.line_style, offsetof(CSS::ComputedValues::BorderValues, border_top) + offsetof(CSS::BorderData, line_style), U8)          \
-    F(BorderRightStyle, CSS::ComputedValues::BorderValues, border_right.line_style, offsetof(CSS::ComputedValues::BorderValues, border_right) + offsetof(CSS::BorderData, line_style), U8)    \
-    F(BorderBottomStyle, CSS::ComputedValues::BorderValues, border_bottom.line_style, offsetof(CSS::ComputedValues::BorderValues, border_bottom) + offsetof(CSS::BorderData, line_style), U8) \
-    F(BorderLeftStyle, CSS::ComputedValues::BorderValues, border_left.line_style, offsetof(CSS::ComputedValues::BorderValues, border_left) + offsetof(CSS::BorderData, line_style), U8)       \
-    F(TextAlign, CSS::ComputedValues::InheritedTextValues, text_align, offsetof(CSS::ComputedValues::InheritedTextValues, text_align), U8)                                                    \
-    F(TextJustify, CSS::ComputedValues::InheritedTextValues, text_justify, offsetof(CSS::ComputedValues::InheritedTextValues, text_justify), U8)                                              \
-    F(WhiteSpaceCollapse, CSS::ComputedValues::InheritedTextValues, white_space_collapse, offsetof(CSS::ComputedValues::InheritedTextValues, white_space_collapse), U8)                       \
-    F(TextWrapMode, CSS::ComputedValues::InheritedTextValues, text_wrap_mode, offsetof(CSS::ComputedValues::InheritedTextValues, text_wrap_mode), U8)                                         \
-    F(WordBreak, CSS::ComputedValues::InheritedTextValues, word_break, offsetof(CSS::ComputedValues::InheritedTextValues, word_break), U8)                                                    \
-    F(FontVariantEmoji, CSS::ComputedValues::FontValues, font_variant_emoji, offsetof(CSS::ComputedValues::FontValues, font_variant_emoji), U8)                                               \
-    F(LineHeight, CSS::ComputedValues::FontValues, line_height.used_value, offsetof(CSS::ComputedValues::FontValues, line_height) + offsetof(CSS::LineHeightData, used_value), CssPixels)     \
-    F(FontSize, CSS::ComputedValues::FontValues, font_size, offsetof(CSS::ComputedValues::FontValues, font_size), CssPixels)                                                                  \
-    F(TextOverflow, CSS::ComputedValues::TextResetValues, text_overflow, offsetof(CSS::ComputedValues::TextResetValues, text_overflow), U8)                                                   \
-    F(TableLayout, CSS::ComputedValues::MiscResetValues, table_layout, offsetof(CSS::ComputedValues::MiscResetValues, table_layout), U8)                                                      \
-    F(LetterSpacing, CSS::ComputedValues::InheritedTextValues, letter_spacing, offsetof(CSS::ComputedValues::InheritedTextValues, letter_spacing), CssPixels)                                 \
-    F(WordSpacing, CSS::ComputedValues::InheritedTextValues, word_spacing, offsetof(CSS::ComputedValues::InheritedTextValues, word_spacing), CssPixels)                                       \
-    F(UnicodeBidi, CSS::ComputedValues::TextResetValues, unicode_bidi, offsetof(CSS::ComputedValues::TextResetValues, unicode_bidi), U8)                                                      \
-    F(GridAutoFlowRow, CSS::ComputedValues::GridValues, grid_auto_flow.row, offsetof(CSS::ComputedValues::GridValues, grid_auto_flow) + offsetof(CSS::GridAutoFlow, row), Bool)               \
-    F(GridAutoFlowDense, CSS::ComputedValues::GridValues, grid_auto_flow.dense, offsetof(CSS::ComputedValues::GridValues, grid_auto_flow) + offsetof(CSS::GridAutoFlow, dense), Bool)
-
-#define LIBWEB_PIN_DIRECT_STYLE_FIELD(field, group, member, offset, encoding)                                                           \
-    static_assert(sizeof(decltype(((group*)nullptr)->member)) == style_field_encoding_width(RustFFI::FfiStyleFieldEncoding::encoding)); \
-    static_assert(offset + sizeof(decltype(((group*)nullptr)->member)) <= sizeof(group));
-LIBWEB_LAYOUT_DIRECT_STYLE_FIELDS(LIBWEB_PIN_DIRECT_STYLE_FIELD)
-#undef LIBWEB_PIN_DIRECT_STYLE_FIELD
-
-static void register_style_schema()
-{
-    static bool const registered = [] {
-        static constexpr RustFFI::FfiStyleFieldSchema schema[] = {
-#define LIBWEB_DIRECT_STYLE_SCHEMA_ENTRY(field, group, member, offset, encoding) \
-    { RustFFI::FfiStyleField::field, group::style_group_index, offset, sizeof(group), RustFFI::FfiStyleFieldEncoding::encoding },
-            LIBWEB_LAYOUT_DIRECT_STYLE_FIELDS(LIBWEB_DIRECT_STYLE_SCHEMA_ENTRY)
-#undef LIBWEB_DIRECT_STYLE_SCHEMA_ENTRY
-        };
-        static_assert(array_size(schema) == to_underlying(RustFFI::FfiStyleField::Count));
-        RustFFI::rust_layout_register_style_schema(schema, array_size(schema));
-        return true;
-    }();
-    (void)registered;
-}
 
 static RustFFI::FfiStylePayloads style_payloads(CSS::ComputedValues const& values)
 {
@@ -163,8 +99,6 @@ static RustFFI::FfiStylePayloads style_payloads(CSS::ComputedValues const& value
         payloads.groups[index] = values.style_group_payload(static_cast<CSS::StyleGroupIndex>(index));
     return payloads;
 }
-
-static RustFFI::FfiResidualStyleValues decode_residual_style(RustFFI::FfiStylePayloads const&);
 
 static bool is_empty_editable_text_node(TextNode const& text_node)
 {
@@ -1076,10 +1010,59 @@ RustFFI::FfiTableBoxFacts build_table_box_facts(NodeWithStyle const& node)
     };
 }
 
-LayoutRustBridge::LayoutRustBridge()
+static size_t s_active_layout_pass_count { 0 };
+
+bool layout_pass_currently_running()
 {
-    register_style_schema();
+    return s_active_layout_pass_count > 0;
 }
+
+// Resolved anchor() insets recorded by the pass for writeback into computed
+// values. The pass only records; the bridge applies the batch once the
+// outermost pass has returned, so computed values are never replaced while
+// any layout pass can still read style (see NodeWithStyle::set_computed_values).
+static Vector<RustFFI::FfiDeferredResolvedAnchorInsets>& pending_resolved_anchor_insets()
+{
+    static NeverDestroyed<Vector<RustFFI::FfiDeferredResolvedAnchorInsets>> pending;
+    return *pending;
+}
+
+static void apply_pending_resolved_anchor_insets()
+{
+    auto pending = move(pending_resolved_anchor_insets());
+    for (auto const& entry : pending) {
+        auto& box = *static_cast<Box*>(entry.node);
+        auto const& resolved = entry.resolved;
+        auto const& existing = box.computed_values().inset();
+        auto resolve = [](bool resolves, bool is_auto, i32 value, CSS::LengthPercentageOrAuto const& existing_value) {
+            if (!resolves)
+                return existing_value;
+            if (is_auto)
+                return CSS::LengthPercentageOrAuto::make_auto();
+            return CSS::LengthPercentageOrAuto { CSS::LengthPercentage { CSS::Length::make_px(CSSPixels::from_raw(value)) } };
+        };
+        box.modify_computed_values([&](auto& values) {
+            values.set_inset({
+                resolve(resolved.resolves_top, resolved.top_is_auto, resolved.top, existing.top()),
+                resolve(resolved.resolves_right, resolved.right_is_auto, resolved.right, existing.right()),
+                resolve(resolved.resolves_bottom, resolved.bottom_is_auto, resolved.bottom, existing.bottom()),
+                resolve(resolved.resolves_left, resolved.left_is_auto, resolved.left, existing.left()),
+            });
+        });
+    }
+}
+
+class ActiveLayoutPassScope {
+public:
+    ActiveLayoutPassScope() { ++s_active_layout_pass_count; }
+    ~ActiveLayoutPassScope()
+    {
+        if (--s_active_layout_pass_count == 0)
+            apply_pending_resolved_anchor_insets();
+    }
+};
+
+LayoutRustBridge::LayoutRustBridge() = default;
 
 LayoutRustBridge::~LayoutRustBridge() = default;
 
@@ -1095,14 +1078,17 @@ void LayoutRustBridge::run_root_layout(Box& viewport, NodeWithStyleAndBoxModelMe
     viewport.document().layout_node_arena().sync_enrolled_text_node_content();
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
-    RustFFI::rust_layout_run_root_layout(
-        Node::slot_id(&viewport),
-        Node::slot_id(document_element_layout_node),
-        viewport_inline_size.raw_value(),
-        viewport_block_size.raw_value(),
-        should_collect_devtools_layout_data,
-        &callbacks,
-        &sink);
+    {
+        ActiveLayoutPassScope active_pass;
+        RustFFI::rust_layout_run_root_layout(
+            Node::slot_id(&viewport),
+            Node::slot_id(document_element_layout_node),
+            viewport_inline_size.raw_value(),
+            viewport_block_size.raw_value(),
+            should_collect_devtools_layout_data,
+            &callbacks,
+            &sink);
+    }
     VERIFY(!m_line_commit_context);
 }
 
@@ -1118,12 +1104,15 @@ void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& pa
     root.document().layout_node_arena().sync_enrolled_text_node_content();
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
-    RustFFI::rust_layout_compute_subtree_layout(
-        Node::slot_id(&root),
-        Node::slot_id(&root.root()),
-        &paintable_to_replace,
-        &callbacks,
-        &sink);
+    {
+        ActiveLayoutPassScope active_pass;
+        RustFFI::rust_layout_compute_subtree_layout(
+            Node::slot_id(&root),
+            Node::slot_id(&root.root()),
+            &paintable_to_replace,
+            &callbacks,
+            &sink);
+    }
     VERIFY(!m_line_commit_context);
 }
 
@@ -1139,7 +1128,10 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box, Painting::Paintable&
     box.document().layout_node_arena().sync_enrolled_text_node_content();
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
-    RustFFI::rust_layout_replay_saved_abspos_layout(Node::slot_id(&box), &paintable_to_replace, &callbacks, &sink);
+    {
+        ActiveLayoutPassScope active_pass;
+        RustFFI::rust_layout_replay_saved_abspos_layout(Node::slot_id(&box), &paintable_to_replace, &callbacks, &sink);
+    }
     VERIFY(!m_line_commit_context);
 }
 
@@ -1382,6 +1374,14 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 svg_foreign_object_paintable->set_computed_transforms(converted);
             if (auto* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable))
                 svg_svg_paintable->set_computed_transforms(converted); },
+        .set_svg_viewport_size = [](void*, void* paintable_pointer, RustFFI::FfiCssPixelSize viewport_size) {
+            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
+            if (auto* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable)) {
+                svg_svg_paintable->set_svg_viewport_size({
+                    CSSPixels::from_raw(viewport_size.width),
+                    CSSPixels::from_raw(viewport_size.height),
+                });
+            } },
         .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer) {
             VERIFY(path_pointer);
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
@@ -1663,9 +1663,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             auto const& box = *static_cast<Box const*>(node);
             dbgln("FIXME: InlineFormattingContext::dimension_box_on_line got unexpected box in inline context:");
             dump_tree(box); },
-        .decode_residual_style = [](void*, RustFFI::FfiStylePayloads const* payloads) {
-            VERIFY(payloads);
-            return decode_residual_style(*payloads); },
         .release_calc_handle = ladybird_layout_release_calc_handle,
         .release_anchor_name_handle = ladybird_layout_release_anchor_name_handle,
         .build_style_payloads = [](void*, void const* style) { return style_payloads(*static_cast<CSS::ComputedValues const*>(style)); },
@@ -1780,6 +1777,7 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
                     .x = paintable->offset().x().raw_value(),
                     .y = paintable->offset().y().raw_value(),
                 },
+                .svg_viewport_size = {},
                 .margin_left = box_model.margin.left.raw_value(),
                 .margin_right = box_model.margin.right.raw_value(),
                 .margin_top = box_model.margin.top.raw_value(),
@@ -1797,6 +1795,16 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
                 .inset_top = box_model.inset.top.raw_value(),
                 .inset_bottom = box_model.inset.bottom.raw_value(),
             };
+
+            // NB: We check the node type rather than the paintable type to mirror the rust-side logic.
+            if (is<SVGSVGBox>(*static_cast<Node const*>(node))) {
+                auto const* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable);
+                VERIFY(svg_svg_paintable);
+                out->svg_viewport_size = {
+                    .width = svg_svg_paintable->svg_viewport_size().width().raw_value(),
+                    .height = svg_svg_paintable->svg_viewport_size().height().raw_value(),
+                };
+            }
             return true; },
         .read_paintable_svg_transforms = [](void*, void* node, RustFFI::FfiSvgComputedTransforms* out) {
             VERIFY(out);
@@ -1989,24 +1997,7 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
                 .fraction = 0,
                 .value = fallback->rust_style_value_data(),
             }; },
-        .set_resolved_anchor_insets = [](void*, void* node, RustFFI::FfiResolvedAnchorInsets resolved) {
-            auto& box = *static_cast<Box*>(node);
-            auto const& existing = box.computed_values().inset();
-            auto resolve = [](bool resolves, bool is_auto, i32 value, CSS::LengthPercentageOrAuto const& existing_value) {
-                if (!resolves)
-                    return existing_value;
-                if (is_auto)
-                    return CSS::LengthPercentageOrAuto::make_auto();
-                return CSS::LengthPercentageOrAuto { CSS::LengthPercentage { CSS::Length::make_px(CSSPixels::from_raw(value)) } };
-            };
-            box.modify_computed_values([&](auto& values) {
-                values.set_inset({
-                    resolve(resolved.resolves_top, resolved.top_is_auto, resolved.top, existing.top()),
-                    resolve(resolved.resolves_right, resolved.right_is_auto, resolved.right, existing.right()),
-                    resolve(resolved.resolves_bottom, resolved.bottom_is_auto, resolved.bottom, existing.bottom()),
-                    resolve(resolved.resolves_left, resolved.left_is_auto, resolved.left, existing.left()),
-                });
-            }); },
+        .record_deferred_resolved_anchor_insets = [](void*, RustFFI::FfiDeferredResolvedAnchorInsets const* entries, size_t count) { pending_resolved_anchor_insets().append(entries, count); },
         .set_default_scroll_shift = [](void*, void* node, void* anchor, bool horizontal, bool vertical) {
             auto& box = *static_cast<Box*>(node);
             if (!anchor) {
@@ -2015,79 +2006,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             }
             box.set_default_scroll_shift(static_cast<Box*>(anchor)->make_weak_ptr(), horizontal, vertical); },
     };
-}
-
-static RustFFI::FfiResidualStyleValues decode_residual_style(RustFFI::FfiStylePayloads const& payloads)
-{
-    auto group = [&]<typename Group>() -> Group const& {
-        auto const* payload = payloads.groups[Group::style_group_index];
-        VERIFY(payload);
-        return *static_cast<Group const*>(payload);
-    };
-
-    RustFFI::FfiResidualStyleValues result {};
-    auto const& surround = group.operator()<CSS::ComputedValues::SurroundValues>();
-
-    auto decode_anchor_inset = [&](CSS::PropertyID property_id,
-                                   CSS::ComputedValuesFFI::ComputedStyleValueHandle const& anchor_inset_handle) {
-        if (!anchor_inset_handle.pointer)
-            return size_value_with_kind(RustFFI::FfiSizeKind::Auto);
-
-        auto anchor_inset = CSS::StyleValue::adopt_rust_style_value_data(
-            CSS::StyleValueFFI::rust_style_value_retain(
-                static_cast<CSS::StyleValueFFI::StyleValueData const*>(anchor_inset_handle.pointer)));
-        VERIFY(anchor_inset->is_anchor());
-        auto calculation_context = CSS::CalculationContext::for_property(CSS::PropertyNameAndID::from_id(property_id));
-        auto root = CSS::CalcNodeRef::non_math_function(
-            anchor_inset->as_anchor(),
-            CSS::NumericType { CSS::NumericType::BaseType::Length, 1 });
-        auto calculated = CSS::CalculatedStyleValue::create(
-            move(root),
-            CSS::NumericType { CSS::NumericType::BaseType::Length, 1 },
-            calculation_context);
-        return retain_calculated(*calculated, false);
-    };
-
-    result.anchor_inset_top = decode_anchor_inset(CSS::PropertyID::Top, surround.top_anchor_inset);
-    result.anchor_inset_right = decode_anchor_inset(CSS::PropertyID::Right, surround.right_anchor_inset);
-    result.anchor_inset_bottom = decode_anchor_inset(CSS::PropertyID::Bottom, surround.bottom_anchor_inset);
-    result.anchor_inset_left = decode_anchor_inset(CSS::PropertyID::Left, surround.left_anchor_inset);
-
-    auto const& anchor = group.operator()<CSS::ComputedValues::AnchorValues>().position_anchor;
-    result.position_anchor_has_value = anchor.name.has_value();
-    if (anchor.name.has_value()) {
-        ++s_outstanding_anchor_name_handles;
-        result.position_anchor_retained_name = anchor.name->to_raw_leaked();
-    }
-
-    auto const& font_values = group.operator()<CSS::ComputedValues::FontValues>();
-    VERIFY(font_values.font_list);
-    auto const& font = font_values.font_list->font_for_code_point(' ');
-    auto const& metrics = font.pixel_metrics();
-    result.first_available_font = &font;
-    result.font_cascade_list = font_values.font_list.ptr();
-    result.font_ascent = metrics.ascent;
-    result.font_descent = metrics.descent;
-    result.font_x_height = metrics.x_height;
-
-    auto const& misc = group.operator()<CSS::ComputedValues::MiscResetValues>();
-    result.column_width = build_style_size_value(misc.column_width);
-    result.column_count_has_value = !misc.column_count.is_auto();
-    result.column_count = misc.column_count.is_auto() ? 0 : misc.column_count.value();
-
-    auto const& inherited_text = group.operator()<CSS::ComputedValues::InheritedTextValues>();
-    result.text_indent = build_style_size_value(inherited_text.text_indent.length_percentage);
-    result.text_indent_each_line = inherited_text.text_indent.each_line;
-    result.text_indent_hanging = inherited_text.text_indent.hanging;
-    result.tab_size_is_number = inherited_text.tab_size.has<double>();
-    result.tab_size = inherited_text.tab_size.has<CSSPixels>()
-        ? inherited_text.tab_size.get<CSSPixels>().raw_value()
-        : 0;
-    result.tab_size_number = inherited_text.tab_size.has<double>()
-        ? inherited_text.tab_size.get<double>()
-        : 0;
-
-    return result;
 }
 
 static void release_calc_handle(void const* handle)

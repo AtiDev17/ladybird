@@ -10,10 +10,10 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/SVGElement.h>
 #include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGDescElement.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
@@ -205,6 +205,7 @@ void SVGElement::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     HTMLOrSVGOrMathMLElement::visit_edges(visitor);
     visitor.visit(m_class_name_animated_string);
+    visitor.visit(m_reflected_attribute_cache);
 }
 
 void SVGElement::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -381,30 +382,19 @@ GC::Ptr<SVGElement> SVGElement::viewport_element()
     return nullptr;
 }
 
-GC::Ref<SVGAnimatedLength> SVGElement::fake_animated_length_fixme() const
+GC::Ref<SVGAnimatedLength> SVGElement::svg_animated_length_for_attribute(Utf16FlyString const& attribute_name, SVGLength::Directionality directionality, NonnullRefPtr<CSS::StyleValue const>&& default_value)
 {
-    // FIXME: All callers of this method must implement their animated length correctly.
-    auto base_length = SVGLength::create(realm(), 0, 0, SVGLength::ReadOnly::No);
-    auto anim_length = SVGLength::create(realm(), 0, 0, SVGLength::ReadOnly::Yes);
-    return SVGAnimatedLength::create(realm(), base_length, anim_length);
-}
+    if (auto cached = m_reflected_attribute_cache.get(attribute_name); cached.has_value())
+        return as<SVGAnimatedLength>(*cached.value());
 
-GC::Ref<SVGAnimatedLength> SVGElement::svg_animated_length_for_property(CSS::PropertyID property) const
-{
-    // FIXME: Create a proper animated value when animations are supported.
-    auto make_length = [&](SVGLength::ReadOnly read_only) {
-        if (auto const computed_values = this->computed_values()) {
-            auto style_value = computed_values->computed_style_value(property);
+    auto base_length = SVGLength::create_reflected_attribute(realm(), *this, attribute_name, directionality, SVGLength::ReflectedAttributeType::BaseValue, default_value, SVGLength::ReadOnly::No);
+    // AD-HOC: The spec says this should reflect the base value of the attribute but other browsers reflect the SMIL
+    //         animated value instead.
+    auto anim_length = SVGLength::create_reflected_attribute(realm(), *this, attribute_name, directionality, SVGLength::ReflectedAttributeType::AnimatedValue, default_value, SVGLength::ReadOnly::Yes);
 
-            if (style_value && !style_value->has_auto() && (style_value->is_length() || style_value->is_percentage() || style_value->is_calculated()))
-                return SVGLength::from_length_percentage(realm(), CSS::LengthPercentage::from_style_value(*style_value), read_only);
-        }
-        return SVGLength::create(realm(), 0, 0, read_only);
-    };
-    return SVGAnimatedLength::create(
-        realm(),
-        make_length(SVGLength::ReadOnly::No),
-        make_length(SVGLength::ReadOnly::Yes));
+    auto animated_length = SVGAnimatedLength::create(realm(), base_length, anim_length);
+    m_reflected_attribute_cache.set(attribute_name, animated_length);
+    return animated_length;
 }
 
 }

@@ -10,6 +10,7 @@
 #include <LibWeb/HTML/Canvas/CanvasDrawImage.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/ImageBitmap.h>
+#include <LibWeb/SVG/SVGAnimatedLength.h>
 
 namespace Web::HTML {
 
@@ -36,7 +37,13 @@ Gfx::IntSize canvas_image_source_dimensions(CanvasImageSource const& image)
                 return *intrinsic_size;
 
             // FIXME: This is very janky and not correct.
-            return { source->width()->anim_val()->value(), source->height()->anim_val()->value() };
+            auto maybe_width = source->width()->anim_val()->value();
+            auto maybe_height = source->height()->anim_val()->value();
+
+            auto width = maybe_width.is_exception() ? 0 : maybe_width.release_value();
+            auto height = maybe_height.is_exception() ? 0 : maybe_height.release_value();
+
+            return { width, height };
         },
         [](GC::Ref<HTMLCanvasElement> source) -> Gfx::IntSize {
             return { source->width(), source->height() };

@@ -1,0 +1,12 @@
+Harness status: OK
+
+Found 7 tests
+
+7 Pass
+Pass	SVGLength, percentage conversion with different directionalities, horizontal (x)
+Pass	SVGLength, percentage conversion with different directionalities, vertical (y)
+Pass	SVGLength, percentage conversion with different directionalities, horizontal (width)
+Pass	SVGLength, percentage conversion with different directionalities, vertical (height)
+Pass	SVGLength, percentage conversion with different directionalities, unspecified directionality (circle r)
+Pass	SVGLength, percentage conversion with different directionalities, horizontal vs vertical produce different percentages
+Pass	SVGLength, percentage conversion with different directionalities, vertical percentage round-trip

@@ -1,0 +1,13 @@
+Harness status: OK
+
+Found 8 tests
+
+8 Pass
+Pass	vw unit in SVGLength
+Pass	Convert back to vw from new user unit value
+Pass	vh unit in SVGLength
+Pass	Convert back to vh from new user unit value
+Pass	vmin unit in SVGLength
+Pass	Convert back to vmin from new user unit value
+Pass	vmax unit in SVGLength
+Pass	Convert back to vmax from new user unit value

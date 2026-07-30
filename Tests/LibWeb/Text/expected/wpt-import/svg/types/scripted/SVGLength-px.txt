@@ -1,0 +1,16 @@
+Harness status: OK
+
+Found 10 tests
+
+7 Pass
+3 Fail
+Pass	SVGLength, converting from 'px' to other units (detached), unitless
+Pass	SVGLength, converting from 'px' to other units (detached), percentage
+Fail	SVGLength, converting from 'px' to other units (detached), ems
+Fail	SVGLength, converting from 'px' to other units (detached), exs
+Pass	SVGLength, converting from 'px' to other units (detached), cm
+Pass	SVGLength, converting from 'px' to other units (detached), mm
+Fail	SVGLength, converting from 'px' to other units (detached), q
+Pass	SVGLength, converting from 'px' to other units (detached), in
+Pass	SVGLength, converting from 'px' to other units (detached), pt
+Pass	SVGLength, converting from 'px' to other units (detached), pc

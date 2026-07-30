@@ -16,9 +16,9 @@ interface SVGLength {
     readonly attribute unsigned short unitType;
 
     attribute float value;
-    [FIXME] attribute float valueInSpecifiedUnits;
-    [FIXME] attribute Utf16DOMString valueAsString;
+    attribute float valueInSpecifiedUnits;
+    attribute Utf16DOMString valueAsString;
 
-    [FIXME] undefined newValueSpecifiedUnits(unsigned short unitType, float valueInSpecifiedUnits);
-    [FIXME] undefined convertToSpecifiedUnits(unsigned short unitType);
+    undefined newValueSpecifiedUnits(unsigned short unitType, float valueInSpecifiedUnits);
+    undefined convertToSpecifiedUnits(unsigned short unitType);
 };

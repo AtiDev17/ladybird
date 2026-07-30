@@ -1,0 +1,16 @@
+Harness status: OK
+
+Found 11 tests
+
+11 Pass
+Pass	SVGLength, converting from 'px' to other units (attached), unitless
+Pass	SVGLength, converting from 'px' to other units (attached), percentage
+Pass	SVGLength, converting from 'px' to other units (attached), changing percentage basis
+Pass	SVGLength, converting from 'px' to other units (attached), ems
+Pass	SVGLength, converting from 'px' to other units (attached) , exs
+Pass	SVGLength, converting from 'px' to other units (attached), exs (check style flush)
+Pass	SVGLength, converting from 'px' to other units (attached), cm
+Pass	SVGLength, converting from 'px' to other units (attached), mm
+Pass	SVGLength, converting from 'px' to other units (attached), in
+Pass	SVGLength, converting from 'px' to other units (attached), pt
+Pass	SVGLength, converting from 'px' to other units (attached), pc

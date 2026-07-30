@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	convertToSpecifiedUnits: width 120px in 400px viewport = 30%
+Pass	convertToSpecifiedUnits: height 120px in 400px viewport = 30%
+Pass	convertToSpecifiedUnits: width 180px in 600px viewport = 30%
+Pass	convertToSpecifiedUnits: 120px in 700px viewport (irrational %)

@@ -94,7 +94,9 @@ pub struct ComputedLengthBox {
     pub left: ComputedLengthPercentageOrAuto,
 }
 
-/// Layout of the computed inset, margin, and padding properties.
+/// Layout of the computed inset, margin, and padding properties, plus the
+/// computed position-anchor name the anchor lookup beside the anchor insets
+/// consults; the zero raw means position-anchor has no name.
 #[repr(C)]
 pub struct SurroundValues {
     pub inset: ComputedLengthBox,
@@ -102,6 +104,7 @@ pub struct SurroundValues {
     pub right_anchor_inset: ComputedStyleValueHandle,
     pub bottom_anchor_inset: ComputedStyleValueHandle,
     pub left_anchor_inset: ComputedStyleValueHandle,
+    pub position_anchor_name: crate::css::retained_fly_string::RetainedUtf16FlyString,
     pub margin: ComputedLengthBox,
     pub padding: ComputedLengthBox,
 }
@@ -143,6 +146,14 @@ pub struct BoxValues {
     pub overflow_y: u8,
     pub box_sizing: u8,
     pub resize: u8,
+    pub text_overflow: u8,
+    pub unicode_bidi: u8,
+    pub table_layout: u8,
+    pub grid_auto_flow_row: bool,
+    pub grid_auto_flow_dense: bool,
+    pub column_width: ComputedSize,
+    pub column_count_has_value: bool,
+    pub column_count: i32,
     pub has_z_index: bool,
     pub z_index: i32,
     pub vertical_align: ComputedVerticalAlign,
@@ -156,6 +167,72 @@ pub struct BoxValues {
     pub is_inline_size_container: bool,
     pub is_scroll_state_container: bool,
     pub container_name: crate::css::retained_fly_string::RetainedUtf16FlyStringList,
+}
+
+/// One computed border side, mirroring the C++ BorderData member layout:
+/// color, line style, used width. Layout reads the line style and width;
+/// the color rides along because the mirror covers whole sides.
+#[repr(C)]
+pub struct ComputedBorderSide {
+    pub color: u32,
+    pub line_style: u8,
+    pub width: crate::css::css_pixels::CssPixels,
+}
+
+/// The layout-facing prefix of the C++-owned border style group: its four
+/// BorderData members lead the group in this order, pinned by static
+/// asserts beside the C++ group definition.
+#[repr(C)]
+pub struct BorderLayoutFacts {
+    pub border_left: ComputedBorderSide,
+    pub border_top: ComputedBorderSide,
+    pub border_right: ComputedBorderSide,
+    pub border_bottom: ComputedBorderSide,
+}
+
+/// A computed text-indent value, mirroring the C++ TextIndentData layout:
+/// a retained length-percentage plus the each-line and hanging flags.
+#[repr(C)]
+pub struct ComputedTextIndent {
+    pub length_percentage: ComputedStyleValueHandle,
+    pub each_line: bool,
+    pub hanging: bool,
+}
+
+/// The layout-facing prefix of the C++-owned inherited-text style group,
+/// pinned by static asserts beside the C++ group definition. The computed
+/// tab-size is stored as an explicit length-or-number triple because the
+/// C++ Variant it replaced has no FFI-stable layout.
+#[repr(C)]
+pub struct InheritedTextLayoutFacts {
+    pub text_align: u8,
+    pub text_justify: u8,
+    pub white_space_collapse: u8,
+    pub text_wrap_mode: u8,
+    pub word_break: u8,
+    pub tab_size_is_number: bool,
+    pub letter_spacing: crate::css::css_pixels::CssPixels,
+    pub word_spacing: crate::css::css_pixels::CssPixels,
+    pub tab_size_length: crate::css::css_pixels::CssPixels,
+    pub tab_size_number: f64,
+    pub text_indent: ComputedTextIndent,
+}
+
+/// The layout-facing prefix of the C++-owned font style group, pinned by
+/// static asserts beside the C++ group definition. The metric fields and the
+/// first-available-font pointer are derived from the font cascade list when
+/// it is installed on the group; the pointers borrow objects the same
+/// payload keeps alive.
+#[repr(C)]
+pub struct FontLayoutFacts {
+    pub font_size: crate::css::css_pixels::CssPixels,
+    pub line_height_used: crate::css::css_pixels::CssPixels,
+    pub font_variant_emoji: u8,
+    pub font_ascent: f32,
+    pub font_descent: f32,
+    pub font_x_height: f32,
+    pub first_available_font: *const std::ffi::c_void,
+    pub font_cascade_list: *const std::ffi::c_void,
 }
 
 /// Layout of the non-inherited SVG geometry and painting properties.

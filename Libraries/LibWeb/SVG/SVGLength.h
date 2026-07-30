@@ -35,24 +35,77 @@ public:
         No,
     };
 
-    [[nodiscard]] static GC::Ref<SVGLength> create(JS::Realm&, u8 unit_type, float value, ReadOnly);
+    enum class ReflectedAttributeType : u8 {
+        BaseValue,
+        AnimatedValue,
+    };
+
+    enum class Directionality : u8 {
+        Horizontal,
+        Vertical,
+        Unspecified,
+    };
+
+    [[nodiscard]] static GC::Ref<SVGLength> create_detached(JS::Realm&, NonnullRefPtr<CSS::StyleValue const> value, ReadOnly);
+    [[nodiscard]] static GC::Ref<SVGLength> create_reflected_attribute(JS::Realm&, GC::Ref<SVGElement> element, Utf16FlyString name, Directionality, ReflectedAttributeType, NonnullRefPtr<CSS::StyleValue const> default_value, ReadOnly);
+
     virtual ~SVGLength() override;
 
-    float value() const { return m_value; }
+    WebIDL::ExceptionOr<float> value() const;
     WebIDL::ExceptionOr<void> set_value(float value);
 
-    u8 unit_type() const { return m_unit_type; }
+    u8 unit_type() const;
+
+    float value_in_specified_units() const;
+    WebIDL::ExceptionOr<void> set_value_in_specified_units(float value);
+
+    Utf16String value_as_string() const;
+    WebIDL::ExceptionOr<void> set_value_as_string(Utf16String);
+
+    WebIDL::ExceptionOr<void> new_value_specified_units(u16 unit_type, float value_in_specified_units);
+    WebIDL::ExceptionOr<void> convert_to_specified_units(u16 unit_type);
+
     ReadOnly read_only() const { return m_read_only; }
 
-    [[nodiscard]] static GC::Ref<SVGLength> from_length_percentage(JS::Realm&, CSS::LengthPercentage const&, ReadOnly);
-
 private:
-    SVGLength(JS::Realm&, u8 unit_type, float value, ReadOnly);
+    // An SVGLength object can be associated with a particular element, as well as being designated with a
+    // directionality: horizontal, vertical or unspecified.
+    GC::Ptr<SVGElement> m_element;
+    Directionality m_directionality;
+
+    // Every SVGLength object operates in one of four modes. It can:
+    // 1. reflect the base value of a reflected animatable attribute (being exposed through the baseVal member of an
+    //    SVGAnimatedLength),
+    struct ReflectedAttributeSource {
+        Utf16FlyString name;
+        ReflectedAttributeType type;
+
+        NonnullRefPtr<CSS::StyleValue const> default_value;
+    };
+
+    // 2. reflect a presentation attribute value (such as by SVGRectElement.width.baseVal),
+    // AD-HOC: This mode isn't used anywhere so we don't implement it - see https://github.com/w3c/svgwg/issues/1153
+
+    // 3. reflect an element of the base value of a reflected animatable attribute (being exposed through the methods on
+    //    the baseVal member of an SVGAnimatedLengthList), or
+    // FIXME: Implement this - we currently use a detached SVGLength for this.
+
+    // 4. be detached, which is the case for SVGLength objects created with createSVGLength.
+    struct DetachedSource {
+        NonnullRefPtr<CSS::StyleValue const> value;
+    };
+
+    using Source = Variant<ReflectedAttributeSource, DetachedSource>;
+
+    SVGLength(JS::Realm&, GC::Ptr<SVGElement> associated_element, Directionality, Source&&, ReadOnly);
 
     virtual void initialize(JS::Realm&) override;
+    virtual void visit_edges(Cell::Visitor&) override;
 
-    float m_value { 0 };
-    u8 m_unit_type { 0 };
+    // An SVGLength object maintains an internal <length> or <percentage> or <number> value, which is called its value.
+    NonnullRefPtr<CSS::StyleValue const> internal_value() const;
+
+    Source m_source;
 
     // https://svgwg.org/svg2-draft/types.html#ReadOnlyLength
     ReadOnly m_read_only;

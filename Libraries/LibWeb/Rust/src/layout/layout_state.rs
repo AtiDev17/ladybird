@@ -302,6 +302,7 @@ pub struct FfiPaintableGeometry {
     pub content_inline_size: crate::layout::CssPixels,
     pub content_block_size: crate::layout::CssPixels,
     pub content_offset: crate::layout::FfiCssPixelPoint,
+    pub svg_viewport_size: crate::layout::FfiCssPixelSize,
     pub margin_left: crate::layout::CssPixels,
     pub margin_right: crate::layout::CssPixels,
     pub margin_top: crate::layout::CssPixels,
@@ -336,6 +337,7 @@ pub struct FfiCommitSink {
     pub emit_inline_box_piece: unsafe extern "C" fn(*mut c_void, FfiInlineBoxPiece),
     pub finish_line_data: unsafe extern "C" fn(*mut c_void),
     pub set_computed_svg_transforms: unsafe extern "C" fn(*mut c_void, *mut c_void, crate::layout::FfiSvgComputedTransforms),
+    pub set_svg_viewport_size: unsafe extern "C" fn(*mut c_void, *mut c_void, crate::layout::FfiCssPixelSize),
     pub set_computed_svg_path: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
     pub set_grid_layout_data: unsafe extern "C" fn(*mut c_void, *mut c_void, *const FfiGridLayoutData),
     pub set_flex_layout_data: unsafe extern "C" fn(*mut c_void, *mut c_void, *const FfiFlexLayoutData),
@@ -840,6 +842,10 @@ pub(crate) struct LayoutState {
     contained_abspos_children: PagedStore<RefCell<VecDeque<PendingAbsposChild>>>,
     abspos_layout_pass_queue_in_completion_order: RefCell<VecDeque<Node>>,
     abspos_layout_pass_is_active: Cell<bool>,
+    /// Resolved anchor() insets awaiting the post-commit computed-values
+    /// writeback, one merged entry per node so a node resolved twice keeps
+    /// its final values and gets a single writeback.
+    deferred_resolved_anchor_insets: RefCell<Vec<crate::layout::FfiDeferredResolvedAnchorInsets>>,
     style_decode_values: PagedStore<StyleDecodeValues>,
     replaced_content_facts: PagedStore<crate::layout::FfiReplacedContentFacts>,
     list_item_facts: PagedStore<crate::layout::FfiListItemFacts>,
@@ -880,6 +886,7 @@ pub(crate) struct UsedValuesRareData {
     pub(crate) table_cell_coordinates: Option<FfiTableCellCoordinates>,
     pub(crate) computed_svg_path: Option<RetainedLayoutHandle>,
     pub(crate) computed_svg_transforms: Option<crate::layout::FfiSvgComputedTransforms>,
+    pub(crate) svg_viewport_size: Option<crate::layout::FfiCssPixelSize>,
     pub(crate) grid_layout_data: Option<OwnedGridLayoutData>,
     pub(crate) flex_layout_data: Option<OwnedFlexLayoutData>,
     pub(crate) used_grid_tracks: Option<OwnedUsedGridTracks>,
@@ -894,6 +901,7 @@ impl LayoutState {
             contained_abspos_children: PagedStore::default(),
             abspos_layout_pass_queue_in_completion_order: RefCell::new(VecDeque::new()),
             abspos_layout_pass_is_active: Cell::new(false),
+            deferred_resolved_anchor_insets: RefCell::new(Vec::new()),
             style_decode_values: PagedStore::default(),
             replaced_content_facts: PagedStore::default(),
             list_item_facts: PagedStore::default(),
@@ -1162,6 +1170,9 @@ impl LayoutState {
         used.inset_right.set(geometry.inset_right);
         used.inset_top.set(geometry.inset_top);
         used.inset_bottom.set(geometry.inset_bottom);
+        if self.node_facts(callbacks, node).is_svg_svg_box() {
+            self.used_values_rare_data_mut(slot_index).svg_viewport_size = Some(geometry.svg_viewport_size);
+        }
 
         Some(self.used_values.allocate(slot_index, used))
     }
@@ -1196,14 +1207,10 @@ impl LayoutState {
             let payloads = unsafe { (callbacks.build_style_payloads)(callbacks.context, data.style) };
             self.style_decode_values.allocate(
                 slot_index,
-                StyleDecodeValues::new(
-                    payloads,
-                    callbacks.release_calc_handle,
-                    callbacks.release_anchor_name_handle,
-                ),
+                StyleDecodeValues::new(payloads, callbacks.release_calc_handle),
             )
         };
-        StyleValues::new(cache, callbacks.context, callbacks.decode_residual_style)
+        StyleValues::new(cache)
     }
 
     pub(crate) fn replace_resolved_anchor_insets(
@@ -1236,6 +1243,54 @@ impl LayoutState {
         }
         if resolved.resolves_left {
             replace(SizeField::InsetLeft, resolved.left_is_auto, resolved.left);
+        }
+    }
+
+    pub(crate) fn defer_resolved_anchor_insets(
+        &self,
+        callbacks: &FfiLayoutFcCallbacks,
+        node: Node,
+        resolved: crate::layout::FfiResolvedAnchorInsets,
+    ) {
+        let node_shell = callbacks.shell(node);
+        let mut deferred = self.deferred_resolved_anchor_insets.borrow_mut();
+        let Some(entry) = deferred.iter_mut().find(|entry| entry.node == node_shell) else {
+            deferred.push(crate::layout::FfiDeferredResolvedAnchorInsets {
+                node: node_shell,
+                resolved,
+            });
+            return;
+        };
+        let earlier = &mut entry.resolved;
+        if resolved.resolves_top {
+            (earlier.resolves_top, earlier.top_is_auto, earlier.top) = (true, resolved.top_is_auto, resolved.top);
+        }
+        if resolved.resolves_right {
+            (earlier.resolves_right, earlier.right_is_auto, earlier.right) =
+                (true, resolved.right_is_auto, resolved.right);
+        }
+        if resolved.resolves_bottom {
+            (earlier.resolves_bottom, earlier.bottom_is_auto, earlier.bottom) =
+                (true, resolved.bottom_is_auto, resolved.bottom);
+        }
+        if resolved.resolves_left {
+            (earlier.resolves_left, earlier.left_is_auto, earlier.left) = (true, resolved.left_is_auto, resolved.left);
+        }
+    }
+
+    /// Hands the deferred resolved-anchor-inset batch to C++ once the pass
+    /// has committed, so the computed-values writeback runs only after layout
+    /// is done reading style. Passes that never commit drop their deferrals
+    /// with the state, exactly as their writebacks never happened before.
+    fn report_deferred_resolved_anchor_insets(&self, callbacks: &FfiLayoutFcCallbacks) {
+        let deferred = self.deferred_resolved_anchor_insets.borrow();
+        if deferred.is_empty() {
+            return;
+        }
+        // SAFETY: The entries stay alive for this synchronous call, and the
+        // C++ side only records them for application after the pass returns.
+        unsafe {
+            (callbacks.record_deferred_resolved_anchor_insets)(callbacks.context, deferred.as_ptr(), deferred.len());
         }
     }
 
@@ -1622,17 +1677,21 @@ impl LayoutState {
                 }
             }
 
-            let (transforms, path) = self
+            let (transforms, viewport_size, path) = self
                 .used_values_rare_data_mut_if_present(slot_index)
-                .map_or((None, None), |mut rare| {
+                .map_or((None, None, None), |mut rare| {
                     (
                         rare.computed_svg_transforms,
+                        rare.svg_viewport_size,
                         rare.computed_svg_path.as_mut().map(RetainedLayoutHandle::take),
                     )
                 });
             unsafe {
                 if let Some(transforms) = transforms {
                     (sink.set_computed_svg_transforms)(sink.context, paintable, transforms);
+                }
+                if let Some(viewport_size) = viewport_size {
+                    (sink.set_svg_viewport_size)(sink.context, paintable, viewport_size);
                 }
                 if let Some(path) = path {
                     (sink.set_computed_svg_path)(sink.context, paintable, path);
@@ -1726,6 +1785,7 @@ impl LayoutState {
         unsafe {
             (sink.finish_commit)(sink.context);
         }
+        self.report_deferred_resolved_anchor_insets(callbacks);
     }
 }
 

@@ -86,6 +86,16 @@ pub struct FfiResolvedAnchorInsets {
     pub left: CssPixels,
 }
 
+/// One node's resolved anchor() insets, reported to C++ in a batch after the
+/// pass commits so the computed-values writeback never runs while layout can
+/// still read style.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiDeferredResolvedAnchorInsets {
+    pub node: *mut c_void,
+    pub resolved: FfiResolvedAnchorInsets,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LineFragmentFacts {
     layout_node: Node,
@@ -2838,7 +2848,6 @@ pub struct FfiLayoutFcCallbacks {
     pub static_position_containing_block: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
     pub needs_inset_resolution: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    pub decode_residual_style: crate::layout::FfiDecodeResidualStyleCallback,
     pub release_calc_handle: crate::layout::FfiReleaseCalcHandleCallback,
     pub release_anchor_name_handle: crate::layout::FfiReleaseAnchorNameHandleCallback,
     pub build_style_payloads: FfiBuildStylePayloadsCallback,
@@ -2861,7 +2870,8 @@ pub struct FfiLayoutFcCallbacks {
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
     pub build_anchor_function_facts: unsafe extern "C" fn(*mut c_void, *const c_void) -> FfiAnchorFunctionFacts,
     pub anchor_function_fallback: unsafe extern "C" fn(*mut c_void, *const c_void) -> FfiAnchorFallbackFacts,
-    pub set_resolved_anchor_insets: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiResolvedAnchorInsets),
+    pub record_deferred_resolved_anchor_insets:
+        unsafe extern "C" fn(*mut c_void, *const FfiDeferredResolvedAnchorInsets, usize),
     pub set_default_scroll_shift: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool, bool),
 }
 

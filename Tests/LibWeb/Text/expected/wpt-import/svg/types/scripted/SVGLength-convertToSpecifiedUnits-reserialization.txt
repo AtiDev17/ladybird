@@ -1,0 +1,12 @@
+Harness status: OK
+
+Found 7 tests
+
+7 Pass
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to cm
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to in
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to percentage
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to unitless
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to pt
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, px to mm
+Pass	SVGLength, convertToSpecifiedUnits reserialization of reflected attribute, double conversion reserializes both times

@@ -43,10 +43,39 @@
 
 namespace Web::CSS {
 
+static constexpr bool style_group_payload_is_rust_native(ComputedValuesFFI::StyleGroupLifecycle lifecycle)
+{
+    switch (lifecycle) {
+    case ComputedValuesFFI::StyleGroupLifecycle::Cpp:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithBorderFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithInheritedTextFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithFontFacts:
+        return false;
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedTable:
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedBox:
+    case ComputedValuesFFI::StyleGroupLifecycle::Sizing:
+    case ComputedValuesFFI::StyleGroupLifecycle::Alignment:
+    case ComputedValuesFFI::StyleGroupLifecycle::SVGReset:
+    case ComputedValuesFFI::StyleGroupLifecycle::Surround:
+    case ComputedValuesFFI::StyleGroupLifecycle::Box:
+        return true;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+template<typename T>
+static consteval ComputedValuesFFI::StyleGroupLifecycle style_group_lifecycle_of()
+{
+    if constexpr (requires { T::style_group_lifecycle; })
+        return T::style_group_lifecycle;
+    else
+        return ComputedValuesFFI::StyleGroupLifecycle::Cpp;
+}
+
 template<typename T>
 static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
 {
-    if constexpr (requires { T::style_group_lifecycle; }) {
+    if constexpr (style_group_payload_is_rust_native(style_group_lifecycle_of<T>())) {
         return {
             .lifecycle = T::style_group_lifecycle,
             .size = sizeof(T),
@@ -58,7 +87,7 @@ static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
         };
     }
     return {
-        .lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Cpp,
+        .lifecycle = style_group_lifecycle_of<T>(),
         .size = sizeof(T),
         .align = alignof(T),
         .default_construct = [](void* payload) {
@@ -101,8 +130,6 @@ static constexpr Array text_reset_group_properties {
     PropertyID::TextDecorationThickness,
     PropertyID::TextDecorationStyle,
     PropertyID::TextDecorationColor,
-    PropertyID::TextOverflow,
-    PropertyID::UnicodeBidi,
     PropertyID::WhiteSpaceTrim,
 };
 
@@ -165,13 +192,10 @@ static constexpr Array misc_reset_group_properties {
     PropertyID::Appearance,
     PropertyID::OutlineStyle,
     PropertyID::ObjectFit,
-    PropertyID::ColumnCount,
-    PropertyID::ColumnWidth,
     PropertyID::ColumnHeight,
     PropertyID::OutlineColor,
     PropertyID::OutlineOffset,
     PropertyID::OutlineWidth,
-    PropertyID::TableLayout,
     PropertyID::UserSelect,
     PropertyID::ObjectPosition,
     PropertyID::ViewTransitionName,
@@ -281,7 +305,6 @@ static constexpr Array grid_group_properties {
     PropertyID::GridAutoRows,
     PropertyID::GridTemplateColumns,
     PropertyID::GridTemplateRows,
-    PropertyID::GridAutoFlow,
     PropertyID::GridColumnEnd,
     PropertyID::GridColumnStart,
     PropertyID::GridRowEnd,
@@ -446,8 +469,6 @@ static void register_style_group_field_descriptors()
     add(text_reset, PropertyID::TextDecorationThickness, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(text_reset, PropertyID::TextDecorationStyle, offsetof(TextReset, text_decoration_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_decoration_style>());
     add(text_reset, PropertyID::TextDecorationColor, offsetof(TextReset, text_decoration_color), GROUP_FIELD_COLOR, 0, nullptr);
-    add(text_reset, PropertyID::TextOverflow, offsetof(TextReset, text_overflow), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_overflow>());
-    add(text_reset, PropertyID::UnicodeBidi, offsetof(TextReset, unicode_bidi), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_unicode_bidi>());
     add(text_reset, PropertyID::WhiteSpaceTrim, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
 
     using Effects = ComputedValues::EffectsValues;
@@ -473,13 +494,10 @@ static void register_style_group_field_descriptors()
     add(misc_reset, PropertyID::Appearance, offsetof(MiscReset, computed_appearance), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_appearance>());
     add(misc_reset, PropertyID::OutlineStyle, offsetof(MiscReset, outline_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_outline_style>());
     add(misc_reset, PropertyID::ObjectFit, offsetof(MiscReset, object_fit), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_object_fit>());
-    add(misc_reset, PropertyID::ColumnCount, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    add(misc_reset, PropertyID::ColumnWidth, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::ColumnHeight, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineColor, offsetof(MiscReset, outline_color), GROUP_FIELD_COLOR_OR_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineOffset, 0, GROUP_FIELD_REQUIRE_PX, 0, nullptr, 0);
     add(misc_reset, PropertyID::OutlineWidth, offsetof(MiscReset, outline_width), GROUP_FIELD_CSS_PIXELS_NON_NEGATIVE, 0, nullptr);
-    add(misc_reset, PropertyID::TableLayout, offsetof(MiscReset, table_layout), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_table_layout>());
     add(misc_reset, PropertyID::UserSelect, offsetof(MiscReset, user_select), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_user_select>());
     add(misc_reset, PropertyID::ObjectPosition, 0, GROUP_FIELD_REQUIRE_INITIAL_VALUE, 0, nullptr);
     add(misc_reset, PropertyID::ViewTransitionName, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
@@ -673,6 +691,54 @@ static_assert(sizeof(Size) == sizeof(ComputedValuesFFI::ComputedSize));
 static_assert(alignof(Size) == alignof(ComputedValuesFFI::ComputedSize));
 static_assert(sizeof(RustStyleValueHandle) == sizeof(StyleValueFFI::StyleValueData const*));
 static_assert(alignof(RustStyleValueHandle) == alignof(StyleValueFFI::StyleValueData const*));
+
+// The border group keeps its C++ lifecycle, but its four leading BorderData
+// members double as the Rust BorderLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(Gfx::Color) == sizeof(u32));
+static_assert(sizeof(LineStyle) == sizeof(u8));
+static_assert(sizeof(BorderData) == sizeof(ComputedValuesFFI::ComputedBorderSide));
+static_assert(offsetof(BorderData, color) == offsetof(ComputedValuesFFI::ComputedBorderSide, color));
+static_assert(offsetof(BorderData, line_style) == offsetof(ComputedValuesFFI::ComputedBorderSide, line_style));
+static_assert(offsetof(BorderData, width) == offsetof(ComputedValuesFFI::ComputedBorderSide, width));
+static_assert(offsetof(ComputedValues::BorderValues, border_left) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_left));
+static_assert(offsetof(ComputedValues::BorderValues, border_top) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_top));
+static_assert(offsetof(ComputedValues::BorderValues, border_right) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_right));
+static_assert(offsetof(ComputedValues::BorderValues, border_bottom) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_bottom));
+static_assert(sizeof(ComputedValuesFFI::BorderLayoutFacts) <= offsetof(ComputedValues::BorderValues, border_left_color_style_value));
+
+// The inherited-text group keeps its C++ lifecycle, but its leading members
+// double as the Rust InheritedTextLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(TextIndentData) == sizeof(ComputedValuesFFI::ComputedTextIndent));
+static_assert(offsetof(TextIndentData, length_percentage) == offsetof(ComputedValuesFFI::ComputedTextIndent, length_percentage));
+static_assert(offsetof(TextIndentData, each_line) == offsetof(ComputedValuesFFI::ComputedTextIndent, each_line));
+static_assert(offsetof(TextIndentData, hanging) == offsetof(ComputedValuesFFI::ComputedTextIndent, hanging));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_align) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_align));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_justify) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_justify));
+static_assert(offsetof(ComputedValues::InheritedTextValues, white_space_collapse) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, white_space_collapse));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_wrap_mode) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_wrap_mode));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_break) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_break));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_is_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_is_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, letter_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, letter_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_length) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_length));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_indent) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_indent));
+static_assert(sizeof(ComputedValuesFFI::InheritedTextLayoutFacts) <= offsetof(ComputedValues::InheritedTextValues, color));
+
+// The font group keeps its C++ lifecycle, but its leading members double as
+// the Rust FontLayoutFacts prefix that layout reads as typed fields.
+static_assert(sizeof(RefPtr<Gfx::FontCascadeList const>) == sizeof(void const*));
+static_assert(offsetof(ComputedValues::FontValues, font_size) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_size));
+static_assert(offsetof(ComputedValues::FontValues, line_height_used) == offsetof(ComputedValuesFFI::FontLayoutFacts, line_height_used));
+static_assert(offsetof(ComputedValues::FontValues, font_variant_emoji) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_variant_emoji));
+static_assert(offsetof(ComputedValues::FontValues, font_ascent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_ascent));
+static_assert(offsetof(ComputedValues::FontValues, font_descent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_descent));
+static_assert(offsetof(ComputedValues::FontValues, font_x_height) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_x_height));
+static_assert(offsetof(ComputedValues::FontValues, first_available_font) == offsetof(ComputedValuesFFI::FontLayoutFacts, first_available_font));
+static_assert(offsetof(ComputedValues::FontValues, font_list) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_cascade_list));
+static_assert(sizeof(ComputedValuesFFI::FontLayoutFacts) <= offsetof(ComputedValues::FontValues, font_families));
 
 void const* style_group_default_payload(size_t group_index)
 {
@@ -937,6 +1003,28 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (anchor_adopted)
         computed_values.adopt_anchor_group(const_cast<void*>(anchor_payload));
 
+    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
+    auto const& position_anchor_value = computed_style.property(PropertyID::PositionAnchor);
+    PositionAnchor position_anchor;
+    if (position_anchor_value.is_custom_ident()) {
+        position_anchor.type = PositionAnchor::Type::Name;
+        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
+    } else {
+        switch (position_anchor_value.to_keyword()) {
+        case Keyword::Normal:
+            position_anchor.type = PositionAnchor::Type::Normal;
+            break;
+        case Keyword::None:
+            position_anchor.type = PositionAnchor::Type::None;
+            break;
+        case Keyword::Auto:
+            position_anchor.type = PositionAnchor::Type::Auto;
+            break;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+
     auto* surround_payload = ComputedValuesFFI::rust_build_surround_group(
         SurroundValues::style_group_index,
         computed_style.property(PropertyID::Top).rust_style_value_data(),
@@ -951,6 +1039,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_style.property(PropertyID::PaddingRight).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingBottom).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingLeft).rust_style_value_data(),
+        position_anchor.name.has_value() ? position_anchor.name->to_raw_leaked() : 0,
         inherit_parent ? static_cast<void const*>(inherit_parent->m_noninherited.surround.operator->()) : nullptr);
     VERIFY(surround_payload);
     computed_values.adopt_surround_group(const_cast<void*>(surround_payload));
@@ -958,6 +1047,10 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     auto containment = computed_style.contain();
     auto container_type = computed_style.container_type();
     auto z_index = computed_style.z_index();
+    Optional<int> column_count;
+    if (auto const& column_count_value = computed_style.property(PropertyID::ColumnCount); column_count_value.to_keyword() != Keyword::Auto)
+        column_count = int_from_style_value(NonnullRefPtr<StyleValue const> { column_count_value });
+    auto const grid_auto_flow = computed_style.grid_auto_flow();
     ComputedValuesFFI::BoxValues box_group_values {
         .display = to_ffi_display(computed_style.display()),
         .display_before_box_type_transformation = to_ffi_display(computed_style.display_before_box_type_transformation()),
@@ -968,6 +1061,14 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         .overflow_y = static_cast<u8>(to_underlying(computed_style.overflow_y())),
         .box_sizing = static_cast<u8>(to_underlying(computed_style.box_sizing())),
         .resize = static_cast<u8>(to_underlying(computed_style.resize())),
+        .text_overflow = static_cast<u8>(to_underlying(computed_style.text_overflow())),
+        .unicode_bidi = static_cast<u8>(to_underlying(computed_style.unicode_bidi())),
+        .table_layout = static_cast<u8>(to_underlying(computed_style.table_layout())),
+        .grid_auto_flow_row = grid_auto_flow.row,
+        .grid_auto_flow_dense = grid_auto_flow.dense,
+        .column_width = to_ffi_computed_size(computed_style.size_value(PropertyID::ColumnWidth)),
+        .column_count_has_value = column_count.has_value(),
+        .column_count = column_count.value_or(0),
         .has_z_index = z_index.has_value(),
         .z_index = z_index.value_or(0),
         .vertical_align = to_ffi_vertical_align(computed_style.vertical_align()),
@@ -1143,7 +1244,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     computed_values.set_font_style({ font_style.font_style(), move(font_style_angle) });
     computed_values.set_font_optical_sizing(computed_style.font_optical_sizing());
     computed_values.set_font_feature_data(computed_style.font_feature_data());
-    computed_values.set_line_height(computed_style.line_height_data(document.font_computer()));
+    computed_values.set_line_height(computed_style.line_height_data(), computed_style.line_height(document.font_computer()));
     computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     Array<ComputedValuesFFI::FfiGroupValueEntry, animation_group_properties.size()> animation_group_values;
@@ -1588,27 +1689,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!misc_reset_adopted)
         computed_values.set_computed_appearance(keyword_to_appearance(computed_style.property(PropertyID::Appearance).to_keyword()).release_value());
 
-    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
-    auto const& position_anchor_value = computed_style.property(CSS::PropertyID::PositionAnchor);
-    CSS::PositionAnchor position_anchor;
-    if (position_anchor_value.is_custom_ident()) {
-        position_anchor.type = CSS::PositionAnchor::Type::Name;
-        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
-    } else {
-        switch (position_anchor_value.to_keyword()) {
-        case CSS::Keyword::Normal:
-            position_anchor.type = CSS::PositionAnchor::Type::Normal;
-            break;
-        case CSS::Keyword::None:
-            position_anchor.type = CSS::PositionAnchor::Type::None;
-            break;
-        case CSS::Keyword::Auto:
-            position_anchor.type = CSS::PositionAnchor::Type::Auto;
-            break;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    }
     if (!anchor_adopted)
         computed_values.set_position_anchor(move(position_anchor));
 
@@ -1806,7 +1886,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_text_align(computed_style.text_align());
     if (!inherited_text_adopted)
         computed_values.set_text_justify(computed_style.text_justify());
-    computed_values.set_text_overflow(computed_style.text_overflow());
     auto const& text_underline_offset_value = computed_style.property(CSS::PropertyID::TextUnderlineOffset);
     CSS::TextUnderlineOffset text_underline_offset;
     text_underline_offset.used_value = computed_style.text_underline_offset();
@@ -2070,8 +2149,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_grid_row_start(computed_style.grid_row_start());
     if (!grid_adopted)
         computed_values.set_grid_template_areas(computed_style.grid_template_areas());
-    if (!grid_adopted)
-        computed_values.set_grid_auto_flow(computed_style.grid_auto_flow());
 
     if (!inherited_svg_adopted)
         computed_values.set_fill(computed_style.fill(color_resolution_context));
@@ -2160,14 +2237,9 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_svg_adopted)
         computed_values.set_dominant_baseline(computed_style.dominant_baseline());
 
-    if (auto const& column_count = computed_style.property(CSS::PropertyID::ColumnCount); !misc_reset_adopted && column_count.to_keyword() != Keyword::Auto)
-        computed_values.set_column_count(CSS::ColumnCount::make_integer(int_from_style_value(NonnullRefPtr<StyleValue const> { column_count })));
-
     if (!misc_reset_adopted)
         computed_values.set_column_span(computed_style.column_span());
 
-    if (!misc_reset_adopted)
-        computed_values.set_column_width(computed_style.size_value(CSS::PropertyID::ColumnWidth));
     if (!misc_reset_adopted)
         computed_values.set_column_height(computed_style.size_value(CSS::PropertyID::ColumnHeight));
 
@@ -2176,9 +2248,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
 
     if (!inherited_table_adopted)
         computed_values.set_empty_cells(computed_style.empty_cells());
-
-    if (!misc_reset_adopted)
-        computed_values.set_table_layout(computed_style.table_layout());
 
     if (!misc_reset_adopted)
         computed_values.set_touch_action(computed_style.touch_action());
@@ -2207,7 +2276,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_object_position(computed_style.object_position());
     if (!inherited_box_adopted)
         computed_values.set_direction(computed_style.direction());
-    computed_values.set_unicode_bidi(computed_style.unicode_bidi());
     if (!misc_reset_adopted)
         computed_values.set_scroll_behavior(CSS::keyword_to_scroll_behavior(computed_style.property(CSS::PropertyID::ScrollBehavior).to_keyword()).release_value());
     if (!inherited_ui_adopted)

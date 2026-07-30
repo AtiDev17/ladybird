@@ -30,8 +30,10 @@ pub enum FfiSizeKind {
 ///
 /// Values decoded in Rust from the node's style group payloads borrow their
 /// calc pointer from those payloads, which outlive the synchronous layout
-/// pass. Only values built by LayoutRustBridge carry a bridge-retained handle
-/// (`calc_is_bridge_retained`), released through the pass callback table.
+/// pass; anchor() inset values borrow theirs from the wrappers the node's
+/// decode cache owns. Only values built by LayoutRustBridge carry a
+/// bridge-retained handle (`calc_is_bridge_retained`), released through the
+/// pass callback table.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiSizeValue {
@@ -199,43 +201,8 @@ fn resolve_calc(calc: *const c_void, percentage_basis: CssPixels) -> CssPixels {
     CssPixels::nearest_value_for(result.value)
 }
 
-/// Every scalar computed-value field that still lives in a hand-written C++
-/// style group and therefore crosses as a C++-registered byte offset. Fields
-/// in Rust-native groups are read as typed payloads and never appear here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-// NB: Some variants are only constructed by C++ through the FFI.
-#[allow(dead_code)]
-pub enum FfiStyleField {
-    BorderTopWidth,
-    BorderRightWidth,
-    BorderBottomWidth,
-    BorderLeftWidth,
-    BorderTopStyle,
-    BorderRightStyle,
-    BorderBottomStyle,
-    BorderLeftStyle,
-    TextAlign,
-    TextJustify,
-    WhiteSpaceCollapse,
-    TextWrapMode,
-    WordBreak,
-    FontVariantEmoji,
-    LineHeight,
-    FontSize,
-    TextOverflow,
-    TableLayout,
-    LetterSpacing,
-    WordSpacing,
-    UnicodeBidi,
-    GridAutoFlowRow,
-    GridAutoFlowDense,
-    Count,
-}
-
-/// Every sizing-shaped value the layout engine reads. The Rust-native entries
-/// decode straight from the node's typed group payloads; ColumnWidth and
-/// TextIndent come from the C++ residual batch.
+/// Every sizing-shaped value the layout engine reads, each decoding straight
+/// from the node's typed group payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum SizeField {
@@ -267,26 +234,6 @@ pub(crate) enum SizeField {
     VerticalAlign,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiStyleFieldEncoding {
-    U8,
-    Bool,
-    I32,
-    F64,
-    CssPixels,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiStyleFieldSchema {
-    pub field: FfiStyleField,
-    pub group_index: u8,
-    pub offset: u32,
-    pub group_size: u32,
-    pub encoding: FfiStyleFieldEncoding,
-}
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiStylePayloads {
@@ -305,16 +252,6 @@ impl Default for FfiStylePayloads {
     }
 }
 
-pub(crate) const STYLE_FIELD_COUNT: usize = FfiStyleField::Count as usize;
-
-struct StyleSchema([FfiStyleFieldSchema; STYLE_FIELD_COUNT]);
-
-// SAFETY: Schema entries contain only immutable integers and enum values.
-unsafe impl Send for StyleSchema {}
-unsafe impl Sync for StyleSchema {}
-
-static STYLE_SCHEMA: OnceLock<StyleSchema> = OnceLock::new();
-
 /// The registered group indices of the Rust-native style groups, resolved
 /// once from the css module's lifecycle registration.
 struct NativeGroupIndices {
@@ -325,178 +262,40 @@ struct NativeGroupIndices {
     inherited_box: usize,
     inherited_table: usize,
     box_values: usize,
+    border_facts: usize,
+    inherited_text_facts: usize,
+    font_facts: usize,
 }
 
 static NATIVE_GROUP_INDICES: OnceLock<NativeGroupIndices> = OnceLock::new();
 
 fn native_group_indices() -> &'static NativeGroupIndices {
     use crate::css::computed_values::{StyleGroupLifecycle, style_group_index_with_lifecycle};
-    NATIVE_GROUP_INDICES.get_or_init(|| NativeGroupIndices {
-        sizing: style_group_index_with_lifecycle(StyleGroupLifecycle::Sizing),
-        surround: style_group_index_with_lifecycle(StyleGroupLifecycle::Surround),
-        alignment: style_group_index_with_lifecycle(StyleGroupLifecycle::Alignment),
-        svg_reset: style_group_index_with_lifecycle(StyleGroupLifecycle::SVGReset),
-        inherited_box: style_group_index_with_lifecycle(StyleGroupLifecycle::InheritedBox),
-        inherited_table: style_group_index_with_lifecycle(StyleGroupLifecycle::InheritedTable),
-        box_values: style_group_index_with_lifecycle(StyleGroupLifecycle::Box),
+    NATIVE_GROUP_INDICES.get_or_init(|| {
+        assert_eq!(crate::css::computed_values::registered_style_group_count(), STYLE_GROUP_COUNT);
+        NativeGroupIndices {
+            sizing: style_group_index_with_lifecycle(StyleGroupLifecycle::Sizing),
+            surround: style_group_index_with_lifecycle(StyleGroupLifecycle::Surround),
+            alignment: style_group_index_with_lifecycle(StyleGroupLifecycle::Alignment),
+            svg_reset: style_group_index_with_lifecycle(StyleGroupLifecycle::SVGReset),
+            inherited_box: style_group_index_with_lifecycle(StyleGroupLifecycle::InheritedBox),
+            inherited_table: style_group_index_with_lifecycle(StyleGroupLifecycle::InheritedTable),
+            box_values: style_group_index_with_lifecycle(StyleGroupLifecycle::Box),
+            border_facts: style_group_index_with_lifecycle(StyleGroupLifecycle::CppWithBorderFacts),
+            inherited_text_facts: style_group_index_with_lifecycle(StyleGroupLifecycle::CppWithInheritedTextFacts),
+            font_facts: style_group_index_with_lifecycle(StyleGroupLifecycle::CppWithFontFacts),
+        }
     })
 }
-
-/// # Safety
-///
-/// `entries` must point to `count` valid schema entries for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_layout_register_style_schema(entries: *const FfiStyleFieldSchema, count: usize) {
-    abort_on_panic(|| {
-        let entries = unsafe { std::slice::from_raw_parts(entries, count) };
-        assert_eq!(entries.len(), STYLE_FIELD_COUNT);
-        assert_eq!(crate::css::computed_values::registered_style_group_count(), STYLE_GROUP_COUNT);
-        let mut schema = [entries[0]; STYLE_FIELD_COUNT];
-        let mut present = [false; STYLE_FIELD_COUNT];
-        for entry in entries {
-            let index = entry.field as usize;
-            assert!(index < STYLE_FIELD_COUNT);
-            assert!((entry.group_index as usize) < STYLE_GROUP_COUNT);
-            assert!(!present[index], "duplicate style schema field");
-            let width = match entry.encoding {
-                FfiStyleFieldEncoding::U8 | FfiStyleFieldEncoding::Bool => 1,
-                FfiStyleFieldEncoding::I32 | FfiStyleFieldEncoding::CssPixels => 4,
-                FfiStyleFieldEncoding::F64 => 8,
-            };
-            assert!(entry.offset as usize + width <= entry.group_size as usize);
-            schema[index] = *entry;
-            present[index] = true;
-        }
-        assert!(present.iter().all(|present| *present));
-        assert!(
-            STYLE_SCHEMA.set(StyleSchema(schema)).is_ok(),
-            "style schema registered twice"
-        );
-    });
-}
-
-fn style_schema() -> &'static StyleSchema {
-    STYLE_SCHEMA.get().expect("style schema used before registration")
-}
-
-/// Every field whose immutable payload still requires C++ interpretation.
-/// One callback populates the whole value on the first residual read for a
-/// node. Anchor inset entries are populated only when the corresponding
-/// Rust-visible anchor handle is non-null.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiResidualStyleValues {
-    pub anchor_inset_top: FfiSizeValue,
-    pub anchor_inset_right: FfiSizeValue,
-    pub anchor_inset_bottom: FfiSizeValue,
-    pub anchor_inset_left: FfiSizeValue,
-    pub position_anchor_has_value: bool,
-    /// A transferred Utf16FlyString reference, when non-zero.
-    pub position_anchor_retained_name: usize,
-    pub first_available_font: *const c_void,
-    pub font_cascade_list: *const c_void,
-    pub font_ascent: f32,
-    pub font_descent: f32,
-    pub font_x_height: f32,
-    pub column_width: FfiSizeValue,
-    pub column_count_has_value: bool,
-    pub column_count: i32,
-    pub text_indent: FfiSizeValue,
-    pub text_indent_each_line: bool,
-    pub text_indent_hanging: bool,
-    pub tab_size_is_number: bool,
-    pub tab_size: CssPixels,
-    pub tab_size_number: f64,
-}
-
-impl Default for FfiResidualStyleValues {
-    fn default() -> Self {
-        Self {
-            anchor_inset_top: FfiSizeValue::auto_value(),
-            anchor_inset_right: FfiSizeValue::auto_value(),
-            anchor_inset_bottom: FfiSizeValue::auto_value(),
-            anchor_inset_left: FfiSizeValue::auto_value(),
-            position_anchor_has_value: false,
-            position_anchor_retained_name: 0,
-            first_available_font: std::ptr::null(),
-            font_cascade_list: std::ptr::null(),
-            font_ascent: 0.0,
-            font_descent: 0.0,
-            font_x_height: 0.0,
-            column_width: FfiSizeValue::auto_value(),
-            column_count_has_value: false,
-            column_count: 0,
-            text_indent: FfiSizeValue::auto_value(),
-            text_indent_each_line: false,
-            text_indent_hanging: false,
-            tab_size_is_number: false,
-            tab_size: CssPixels::default(),
-            tab_size_number: 0.0,
-        }
-    }
-}
-
-impl FfiResidualStyleValues {
-    fn release_handles(
-        self,
-        release_calc_handle: FfiReleaseCalcHandleCallback,
-        release_anchor_name_handle: FfiReleaseAnchorNameHandleCallback,
-    ) {
-        self.anchor_inset_top.release_bridge_calc_handle(release_calc_handle);
-        self.anchor_inset_right.release_bridge_calc_handle(release_calc_handle);
-        self.anchor_inset_bottom.release_bridge_calc_handle(release_calc_handle);
-        self.anchor_inset_left.release_bridge_calc_handle(release_calc_handle);
-        self.column_width.release_bridge_calc_handle(release_calc_handle);
-        self.text_indent.release_bridge_calc_handle(release_calc_handle);
-        if self.position_anchor_retained_name != 0 {
-            // SAFETY: The C++ residual decode transferred one raw fly-string
-            // reference for this node's position-anchor name.
-            unsafe {
-                release_anchor_name_handle(self.position_anchor_retained_name);
-            }
-        }
-    }
-}
-
-pub type FfiDecodeResidualStyleCallback =
-    unsafe extern "C" fn(*mut c_void, *const FfiStylePayloads) -> FfiResidualStyleValues;
 
 #[derive(Clone, Copy)]
 struct StyleReader {
     payloads: FfiStylePayloads,
-    schema: &'static StyleSchema,
 }
 
 impl StyleReader {
-    fn new(payloads: FfiStylePayloads, schema: &'static StyleSchema) -> Self {
-        Self { payloads, schema }
-    }
-
-    #[inline]
-    fn address(&self, field: FfiStyleField, encoding: FfiStyleFieldEncoding) -> *const u8 {
-        let schema = &self.schema.0[field as usize];
-        debug_assert_eq!(schema.encoding, encoding);
-        let payload = self.payloads.groups[schema.group_index as usize];
-        debug_assert!(!payload.is_null());
-        unsafe { (payload as *const u8).add(schema.offset as usize) }
-    }
-
-    #[inline]
-    fn u8(&self, field: FfiStyleField) -> u8 {
-        unsafe { self.address(field, FfiStyleFieldEncoding::U8).read_unaligned() }
-    }
-
-    #[inline]
-    fn bool(&self, field: FfiStyleField) -> bool {
-        let value = unsafe { self.address(field, FfiStyleFieldEncoding::Bool).read_unaligned() };
-        debug_assert!(value <= 1);
-        value != 0
-    }
-
-    #[inline]
-    fn css_pixels(&self, field: FfiStyleField) -> CssPixels {
-        let raw = unsafe { (self.address(field, FfiStyleFieldEncoding::CssPixels) as *const i32).read_unaligned() };
-        CssPixels::from_raw(raw)
+    fn new(payloads: FfiStylePayloads) -> Self {
+        Self { payloads }
     }
 
     #[inline]
@@ -543,6 +342,21 @@ impl StyleReader {
     fn box_values(&self) -> &crate::layout::BoxValues {
         self.native_group(native_group_indices().box_values)
     }
+
+    #[inline]
+    fn border_facts(&self) -> &crate::layout::BorderLayoutFacts {
+        self.native_group(native_group_indices().border_facts)
+    }
+
+    #[inline]
+    fn inherited_text_facts(&self) -> &crate::layout::InheritedTextLayoutFacts {
+        self.native_group(native_group_indices().inherited_text_facts)
+    }
+
+    #[inline]
+    fn font_facts(&self) -> &crate::layout::FontLayoutFacts {
+        self.native_group(native_group_indices().font_facts)
+    }
 }
 
 const SIZE_FIELD_COUNT: usize = 26;
@@ -551,24 +365,21 @@ pub(crate) struct StyleDecodeCache {
     reader: StyleReader,
     sizes: [Cell<FfiSizeValue>; SIZE_FIELD_COUNT],
     size_presence: Cell<u32>,
-    residual: RefCell<Option<FfiResidualStyleValues>>,
+    /// The in-crate-built calculated wrappers for anchor() insets, owned here
+    /// so the cached size slots can borrow their calc pointers for the cache
+    /// lifetime.
+    anchor_inset_calculated_wrappers: RefCell<Vec<std::sync::Arc<crate::css::style_value::StyleValueData>>>,
     release_calc_handle: FfiReleaseCalcHandleCallback,
-    release_anchor_name_handle: FfiReleaseAnchorNameHandleCallback,
 }
 
 impl StyleDecodeCache {
-    fn new(
-        reader: StyleReader,
-        release_calc_handle: FfiReleaseCalcHandleCallback,
-        release_anchor_name_handle: FfiReleaseAnchorNameHandleCallback,
-    ) -> Self {
+    fn new(reader: StyleReader, release_calc_handle: FfiReleaseCalcHandleCallback) -> Self {
         Self {
             reader,
             sizes: std::array::from_fn(|_| Cell::new(FfiSizeValue::auto_value())),
             size_presence: Cell::new(0),
-            residual: RefCell::new(None),
+            anchor_inset_calculated_wrappers: RefCell::new(Vec::new()),
             release_calc_handle,
-            release_anchor_name_handle,
         }
     }
 
@@ -585,16 +396,6 @@ impl StyleDecodeCache {
         self.sizes[index].set(value);
         self.size_presence.set(self.size_presence.get() | (1 << index));
         value
-    }
-
-    fn cached_residual(&self) -> Option<FfiResidualStyleValues> {
-        *self.residual.borrow()
-    }
-
-    fn cache_residual(&self, value: FfiResidualStyleValues) {
-        let mut residual = self.residual.borrow_mut();
-        assert!(residual.is_none());
-        *residual = Some(value);
     }
 
     pub(crate) fn replace_size(&self, field: SizeField, value: FfiSizeValue) {
@@ -618,9 +419,6 @@ impl Drop for StyleDecodeCache {
             if presence & (1 << index) != 0 {
                 value.get().release_bridge_calc_handle(self.release_calc_handle);
             }
-        }
-        if let Some(residual) = *self.residual.get_mut() {
-            residual.release_handles(self.release_calc_handle, self.release_anchor_name_handle);
         }
     }
 }
@@ -808,15 +606,11 @@ pub(crate) struct StyleDecodeValues {
 }
 
 impl StyleDecodeValues {
-    pub(crate) fn new(
-        payloads: FfiStylePayloads,
-        release_calc_handle: FfiReleaseCalcHandleCallback,
-        release_anchor_name_handle: FfiReleaseAnchorNameHandleCallback,
-    ) -> Self {
-        let reader = StyleReader::new(payloads, style_schema());
+    pub(crate) fn new(payloads: FfiStylePayloads, release_calc_handle: FfiReleaseCalcHandleCallback) -> Self {
+        let reader = StyleReader::new(payloads);
         Self {
             scalars: DecodedStyleScalars::decode(&reader),
-            cache: StyleDecodeCache::new(reader, release_calc_handle, release_anchor_name_handle),
+            cache: StyleDecodeCache::new(reader, release_calc_handle),
         }
     }
 
@@ -828,15 +622,12 @@ impl StyleDecodeValues {
 /// A thin Rust-only view over a node's immutable computed-value group
 /// payloads.
 ///
-/// Plain fields are decoded once into `DecodedStyleScalars`. Rust-owned
-/// complex payloads are interpreted in-crate; the first read of any genuinely
-/// C++-owned field fetches the one residual batch and caches it for the node.
+/// Plain fields are decoded once into `DecodedStyleScalars`; everything else
+/// is interpreted in-crate from the typed group payloads.
 #[derive(Clone, Copy)]
 pub(crate) struct StyleValues<'a> {
     scalars: &'a DecodedStyleScalars,
     cache: &'a StyleDecodeCache,
-    callback_context: *mut c_void,
-    decode_residual_callback: FfiDecodeResidualStyleCallback,
     vertical_align_override: u16,
 }
 
@@ -846,35 +637,38 @@ impl DecodedStyleScalars {
         let alignment = reader.alignment();
         let inherited_table = reader.inherited_table();
         let box_values = reader.box_values();
+        let border = reader.border_facts();
+        let inherited_text = reader.inherited_text_facts();
+        let font = reader.font_facts();
         let (css_preferred_aspect_ratio_numerator, css_preferred_aspect_ratio_denominator) =
             decode_css_preferred_aspect_ratio(&box_values.aspect_ratio);
         Self {
             display: box_values.display,
-            border_top_width: reader.css_pixels(FfiStyleField::BorderTopWidth),
-            border_right_width: reader.css_pixels(FfiStyleField::BorderRightWidth),
-            border_bottom_width: reader.css_pixels(FfiStyleField::BorderBottomWidth),
-            border_left_width: reader.css_pixels(FfiStyleField::BorderLeftWidth),
-            border_top_style: reader.u8(FfiStyleField::BorderTopStyle),
-            border_right_style: reader.u8(FfiStyleField::BorderRightStyle),
-            border_bottom_style: reader.u8(FfiStyleField::BorderBottomStyle),
-            border_left_style: reader.u8(FfiStyleField::BorderLeftStyle),
+            border_top_width: border.border_top.width,
+            border_right_width: border.border_right.width,
+            border_bottom_width: border.border_bottom.width,
+            border_left_width: border.border_left.width,
+            border_top_style: border.border_top.line_style,
+            border_right_style: border.border_right.line_style,
+            border_bottom_style: border.border_bottom.line_style,
+            border_left_style: border.border_left.line_style,
             position: box_values.position,
             float_: box_values.float_,
             clear: box_values.clear,
             writing_mode: inherited_box.writing_mode,
             direction: inherited_box.direction,
-            text_align: reader.u8(FfiStyleField::TextAlign),
-            text_justify: reader.u8(FfiStyleField::TextJustify),
-            white_space_collapse: reader.u8(FfiStyleField::WhiteSpaceCollapse),
-            text_wrap_mode: reader.u8(FfiStyleField::TextWrapMode),
-            word_break: reader.u8(FfiStyleField::WordBreak),
-            font_variant_emoji: reader.u8(FfiStyleField::FontVariantEmoji),
-            line_height: reader.css_pixels(FfiStyleField::LineHeight),
-            font_size: reader.css_pixels(FfiStyleField::FontSize),
+            text_align: inherited_text.text_align,
+            text_justify: inherited_text.text_justify,
+            white_space_collapse: inherited_text.white_space_collapse,
+            text_wrap_mode: inherited_text.text_wrap_mode,
+            word_break: inherited_text.word_break,
+            font_variant_emoji: font.font_variant_emoji,
+            line_height: font.line_height_used,
+            font_size: font.font_size,
             box_sizing: box_values.box_sizing,
             overflow_x: box_values.overflow_x,
             overflow_y: box_values.overflow_y,
-            text_overflow: reader.u8(FfiStyleField::TextOverflow),
+            text_overflow: box_values.text_overflow,
             flex_direction: alignment.flex_direction,
             flex_wrap: alignment.flex_wrap,
             flex_grow: alignment.flex_grow,
@@ -890,13 +684,13 @@ impl DecodedStyleScalars {
             border_spacing_horizontal: CssPixels::from_raw(inherited_table.border_spacing_horizontal),
             border_spacing_vertical: CssPixels::from_raw(inherited_table.border_spacing_vertical),
             caption_side: inherited_table.caption_side,
-            table_layout: reader.u8(FfiStyleField::TableLayout),
+            table_layout: box_values.table_layout,
             visibility: inherited_box.visibility,
-            letter_spacing: reader.css_pixels(FfiStyleField::LetterSpacing),
-            word_spacing: reader.css_pixels(FfiStyleField::WordSpacing),
-            unicode_bidi: reader.u8(FfiStyleField::UnicodeBidi),
-            grid_auto_flow_row: reader.bool(FfiStyleField::GridAutoFlowRow),
-            grid_auto_flow_dense: reader.bool(FfiStyleField::GridAutoFlowDense),
+            letter_spacing: inherited_text.letter_spacing,
+            word_spacing: inherited_text.word_spacing,
+            unicode_bidi: box_values.unicode_bidi,
+            grid_auto_flow_row: box_values.grid_auto_flow_row,
+            grid_auto_flow_dense: box_values.grid_auto_flow_dense,
             css_preferred_aspect_ratio_numerator,
             css_preferred_aspect_ratio_denominator,
         }
@@ -905,34 +699,11 @@ impl DecodedStyleScalars {
 
 impl<'a> StyleValues<'a> {
     #[inline]
-    pub(crate) fn new(
-        values: &'a StyleDecodeValues,
-        callback_context: *mut c_void,
-        decode_residual_callback: FfiDecodeResidualStyleCallback,
-    ) -> Self {
+    pub(crate) fn new(values: &'a StyleDecodeValues) -> Self {
         Self {
             scalars: &values.scalars,
             cache: &values.cache,
-            callback_context,
-            decode_residual_callback,
             vertical_align_override: u16::MAX,
-        }
-    }
-
-    fn residual(self) -> FfiResidualStyleValues {
-        if let Some(value) = self.cache.cached_residual() {
-            return value;
-        }
-        // SAFETY: The payload snapshot and bridge callback remain live for
-        // the synchronous layout pass.
-        let value =
-            unsafe { (self.decode_residual_callback)(self.callback_context, &raw const self.cache.reader.payloads) };
-        if let Some(existing) = self.cache.cached_residual() {
-            value.release_handles(self.cache.release_calc_handle, self.cache.release_anchor_name_handle);
-            existing
-        } else {
-            self.cache.cache_residual(value);
-            value
         }
     }
 
@@ -1022,7 +793,37 @@ impl<'a> StyleValues<'a> {
                 decode_length_percentage(if field == SizeField::X { &values.x } else { &values.y })
             }
             SizeField::VerticalAlign => decode_length_percentage(&self.cache.reader.box_values().vertical_align.value),
-            SizeField::ColumnWidth | SizeField::TextIndent => unreachable!(),
+            SizeField::TextIndent => {
+                decode_length_percentage(&self.cache.reader.inherited_text_facts().text_indent.length_percentage)
+            }
+            SizeField::ColumnWidth => decode_computed_size(&self.cache.reader.box_values().column_width),
+        }
+    }
+
+    fn anchor_inset_size_value(self, field: SizeField) -> FfiSizeValue {
+        let values = self.cache.reader.surround();
+        let handle = match field {
+            SizeField::InsetTop => &values.top_anchor_inset,
+            SizeField::InsetRight => &values.right_anchor_inset,
+            SizeField::InsetBottom => &values.bottom_anchor_inset,
+            SizeField::InsetLeft => &values.left_anchor_inset,
+            _ => unreachable!(),
+        };
+        // SAFETY: The inset_has_anchor guard checked the handle is non-null,
+        // and the node's style group payload keeps the anchor value alive for
+        // the synchronous layout pass.
+        let wrapper = unsafe { crate::css::calc::create_anchor_inset_calculated(handle.pointer.cast()) };
+        let calc = std::sync::Arc::as_ptr(&wrapper).cast();
+        self.cache.anchor_inset_calculated_wrappers.borrow_mut().push(wrapper);
+        FfiSizeValue {
+            kind: FfiSizeKind::Calc as u8,
+            px: CssPixels::default(),
+            fraction: 0.0,
+            calc,
+            calc_is_bridge_retained: false,
+            contains_percentage: false,
+            contains_anchor_function: true,
+            fit_content_has_argument: false,
         }
     }
 
@@ -1030,27 +831,18 @@ impl<'a> StyleValues<'a> {
         if let Some(value) = self.cache.cached_size(field) {
             return value;
         }
-        let residual = match field {
+        match field {
             SizeField::InsetTop | SizeField::InsetRight | SizeField::InsetBottom | SizeField::InsetLeft
                 if self.inset_has_anchor(field) =>
             {
-                let values = self.residual();
-                Some(match field {
-                    SizeField::InsetTop => values.anchor_inset_top,
-                    SizeField::InsetRight => values.anchor_inset_right,
-                    SizeField::InsetBottom => values.anchor_inset_bottom,
-                    SizeField::InsetLeft => values.anchor_inset_left,
-                    _ => unreachable!(),
-                })
+                let value = self.anchor_inset_size_value(field);
+                self.cache.cache_size(field, value)
             }
-            SizeField::ColumnWidth => Some(self.residual().column_width),
-            SizeField::TextIndent => Some(self.residual().text_indent),
-            _ => None,
-        };
-        residual.unwrap_or_else(|| {
-            let value = self.direct_size(field);
-            self.cache.cache_size(field, value)
-        })
+            _ => {
+                let value = self.direct_size(field);
+                self.cache.cache_size(field, value)
+            }
+        }
     }
 
     pub(crate) fn with_vertical_align_keyword(mut self, keyword: u8) -> Self {
@@ -1075,31 +867,37 @@ impl<'a> StyleValues<'a> {
     }
 
     pub(crate) fn has_position_anchor(self) -> bool {
-        self.residual().position_anchor_has_value
+        self.cache.reader.surround().position_anchor_name.raw() != 0
     }
 
+    /// The raw fly-string representation of the computed position-anchor
+    /// name, borrowed from the surround payload for the duration of the pass.
     pub(crate) fn position_anchor_name(self) -> usize {
-        self.residual().position_anchor_retained_name
+        self.cache.reader.surround().position_anchor_name.raw()
     }
 
     pub(crate) fn first_available_font(self) -> *const c_void {
-        self.residual().first_available_font
+        let font = self.cache.reader.font_facts().first_available_font;
+        debug_assert!(!font.is_null(), "layout read a font group that never received a font list");
+        font
     }
 
     pub(crate) fn font_cascade_list(self) -> *const c_void {
-        self.residual().font_cascade_list
+        let list = self.cache.reader.font_facts().font_cascade_list;
+        debug_assert!(!list.is_null(), "layout read a font group that never received a font list");
+        list
     }
 
     pub(crate) fn font_ascent(self) -> f32 {
-        self.residual().font_ascent
+        self.cache.reader.font_facts().font_ascent
     }
 
     pub(crate) fn font_descent(self) -> f32 {
-        self.residual().font_descent
+        self.cache.reader.font_facts().font_descent
     }
 
     pub(crate) fn font_x_height(self) -> f32 {
-        self.residual().font_x_height
+        self.cache.reader.font_facts().font_x_height
     }
 
     pub(crate) fn box_sizing_for_aspect_ratio(self) -> u8 {
@@ -1136,11 +934,11 @@ impl<'a> StyleValues<'a> {
     }
 
     pub(crate) fn has_column_count(self) -> bool {
-        self.residual().column_count_has_value
+        self.cache.reader.box_values().column_count_has_value
     }
 
     pub(crate) fn column_count(self) -> i32 {
-        self.residual().column_count
+        self.cache.reader.box_values().column_count
     }
 
     pub(crate) fn has_size_containment(self) -> bool {
@@ -1152,23 +950,23 @@ impl<'a> StyleValues<'a> {
     }
 
     pub(crate) fn text_indent_each_line(self) -> bool {
-        self.residual().text_indent_each_line
+        self.cache.reader.inherited_text_facts().text_indent.each_line
     }
 
     pub(crate) fn text_indent_hanging(self) -> bool {
-        self.residual().text_indent_hanging
+        self.cache.reader.inherited_text_facts().text_indent.hanging
     }
 
     pub(crate) fn tab_size_is_number(self) -> bool {
-        self.residual().tab_size_is_number
+        self.cache.reader.inherited_text_facts().tab_size_is_number
     }
 
     pub(crate) fn tab_size(self) -> CssPixels {
-        self.residual().tab_size
+        self.cache.reader.inherited_text_facts().tab_size_length
     }
 
     pub(crate) fn tab_size_number(self) -> f64 {
-        self.residual().tab_size_number
+        self.cache.reader.inherited_text_facts().tab_size_number
     }
 }
 

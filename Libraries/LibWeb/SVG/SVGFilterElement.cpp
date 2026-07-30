@@ -422,9 +422,16 @@ Optional<Gfx::Filter> SVGFilterElement::gfx_filter(Layout::NodeWithStyle const& 
             auto tile_stitch_size = [turbulence, scale_x, scale_y] {
                 auto stitch_tiles = turbulence->stitch_tiles()->base_val();
                 switch (stitch_tiles) {
-                case to_underlying(SVGFETurbulenceElement::StitchType::Stitch):
-                    // FIXME: Are these the correct width and height?
-                    return Gfx::IntSize { round_to<int>(turbulence->width()->base_val()->value() * scale_x), round_to<int>(turbulence->height()->base_val()->value() * scale_y) };
+                case to_underlying(SVGFETurbulenceElement::StitchType::Stitch): {
+                    // FIXME: Use the correct width and height
+                    auto maybe_width = turbulence->width()->base_val()->value();
+                    auto maybe_height = turbulence->height()->base_val()->value();
+
+                    auto width = maybe_width.is_exception() ? 0 : maybe_width.release_value();
+                    auto height = maybe_height.is_exception() ? 0 : maybe_height.release_value();
+
+                    return Gfx::IntSize { round_to<int>(width * scale_x), round_to<int>(height * scale_y) };
+                }
                 case to_underlying(SVGFETurbulenceElement::StitchType::NoStitch):
                     return Gfx::IntSize {};
                 default:
@@ -482,30 +489,6 @@ GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::filter_units() const
 GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::primitive_units() const
 {
     return SVGAnimatedEnumeration::create(realm(), to_underlying(m_primitive_units.value_or(SVGUnits::UserSpaceOnUse)));
-}
-
-// https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-x
-GC::Ref<SVGAnimatedLength> SVGFilterElement::x() const
-{
-    return svg_animated_length_for_property(CSS::PropertyID::X);
-}
-
-// https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-y
-GC::Ref<SVGAnimatedLength> SVGFilterElement::y() const
-{
-    return svg_animated_length_for_property(CSS::PropertyID::Y);
-}
-
-// https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-width
-GC::Ref<SVGAnimatedLength> SVGFilterElement::width() const
-{
-    return svg_animated_length_for_property(CSS::PropertyID::Width);
-}
-
-// https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-height
-GC::Ref<SVGAnimatedLength> SVGFilterElement::height() const
-{
-    return svg_animated_length_for_property(CSS::PropertyID::Height);
 }
 
 }
