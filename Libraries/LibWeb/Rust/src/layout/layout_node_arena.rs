@@ -8,7 +8,6 @@ use crate::abort_on_panic;
 use crate::layout::AbsposLayoutInputs;
 use crate::layout::AvailableSize;
 use crate::layout::CssPixels;
-use crate::layout::kind_is_box;
 use crate::layout::node_data::{FfiStylePayloads, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag, NodeSlotId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -144,16 +143,6 @@ struct TextContentSlot {
     content: Option<Box<TextContent>>,
 }
 
-/// Mirror of the node's ComputedValues group payload pointers, rewritten by
-/// C++ on every style application so layout can read style without a per-pass
-/// FFI round trip. Generation 0 never matches a live slot, so a matching
-/// generation alone means the mirror was written for this slot incarnation.
-#[derive(Default)]
-struct StylePayloadsSlot {
-    generation: u8,
-    payloads: FfiStylePayloads,
-}
-
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct TextChunkCacheKey {
     pub(crate) should_wrap_lines: bool,
@@ -219,7 +208,6 @@ pub(crate) struct LayoutNodeArena {
     intrinsic_size_caches: RefCell<Vec<IntrinsicSizeCacheSlot>>,
     saved_abspos_layout_inputs: RefCell<Vec<SavedAbsposLayoutInputsSlot>>,
     text_contents: Vec<TextContentSlot>,
-    style_payloads: Vec<StylePayloadsSlot>,
     text_chunk_caches: RefCell<Vec<TextChunkCacheSlot>>,
     owner_thread: thread::ThreadId,
 }
@@ -236,7 +224,6 @@ impl LayoutNodeArena {
             intrinsic_size_caches: RefCell::new(Vec::new()),
             saved_abspos_layout_inputs: RefCell::new(Vec::new()),
             text_contents: Vec::new(),
-            style_payloads: Vec::new(),
             text_chunk_caches: RefCell::new(Vec::new()),
             owner_thread: thread::current().id(),
         }
@@ -326,9 +313,6 @@ impl LayoutNodeArena {
         }
         if let Some(slot) = self.text_contents.get_mut(index as usize) {
             *slot = TextContentSlot::default();
-        }
-        if let Some(slot) = self.style_payloads.get_mut(index as usize) {
-            *slot = StylePayloadsSlot::default();
         }
         if let Some(slot) = self.text_chunk_caches.get_mut().get_mut(index as usize) {
             *slot = TextChunkCacheSlot::default();
@@ -693,25 +677,18 @@ impl LayoutNodeArena {
             .and_then(|slot| slot.content.as_deref())
     }
 
-    pub(crate) fn set_style_payloads(&mut self, id: NodeSlotId, payloads: FfiStylePayloads) {
-        self.assert_owner_thread();
-        self.data(id);
-        let index = id.slot_index() as usize;
-        if self.style_payloads.len() <= index {
-            self.style_payloads.resize_with(index + 1, StylePayloadsSlot::default);
-        }
-        self.style_payloads[index] = StylePayloadsSlot {
-            generation: id.generation(),
-            payloads,
-        };
-    }
-
+    /// The node's group payload pointer array, read in place from the
+    /// Rust-owned style container that NodeData.style addresses. The node's
+    /// retained immutable ComputedValues owns the container, and the pointer
+    /// is only replaced between passes, so the array stays valid for as long
+    /// as the node occupies its arena slot.
     pub(crate) fn style_payloads(&self, id: NodeSlotId) -> Option<&FfiStylePayloads> {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
-        self.style_payloads
-            .get(id.slot_index() as usize)
-            .filter(|slot| slot.generation == id.generation())
-            .map(|slot| &slot.payloads)
+        // SAFETY: data() generation-checks the slot and returns an
+        // initialized NodeData.
+        let style = unsafe { (&raw const (*self.data(id)).style).read() };
+        // SAFETY: A non-null style pointer addresses the container's group
+        // pointer array, which FfiStylePayloads mirrors exactly.
+        (!style.is_null()).then(|| unsafe { &*style.cast::<FfiStylePayloads>() })
     }
 
     pub(crate) fn text_chunks(
@@ -759,21 +736,6 @@ impl LayoutNodeArena {
         };
         let entry = slots[index].entry.as_deref().expect("entry was just stored");
         unsafe { std::slice::from_raw_parts(entry.chunks.as_ptr(), entry.chunks.len()) }
-    }
-
-    pub(crate) fn transfer_saved_abspos_layout_inputs(&self, old: NodeSlotId, new: NodeSlotId) {
-        self.assert_owner_thread();
-        assert_ne!(old, new, "cannot transfer saved abspos inputs to the same arena slot");
-
-        let old_data = self.data(old);
-        let new_data = self.data(new);
-        // SAFETY: data() returns pointers to live slots.
-        if !unsafe { kind_is_box((*old_data).kind) && kind_is_box((*new_data).kind) } {
-            return;
-        }
-        if let Some(inputs) = self.saved_abspos_layout_inputs(old_data) {
-            self.set_saved_abspos_layout_inputs(new_data, Some(inputs));
-        }
     }
 
     pub(crate) unsafe fn from_handle<'a>(arena: *mut c_void) -> &'a Self {
@@ -888,46 +850,11 @@ pub unsafe extern "C" fn layout_arena_set_text_content(
     });
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_style_payloads(
-    arena: *mut c_void,
-    id: NodeSlotId,
-    payloads: *const FfiStylePayloads,
-) {
-    abort_on_panic(|| {
-        assert!(!arena.is_null(), "layout node arena handle is null");
-        assert!(!payloads.is_null(), "style payload snapshot pointer is null");
-        // SAFETY: The C++ caller passes a live payload snapshot for the
-        // duration of this synchronous call, and the C++ wrapper keeps the
-        // arena alive while serializing all access on the document thread.
-        unsafe { (&mut *arena.cast::<LayoutNodeArena>()).set_style_payloads(id, *payloads) };
-    });
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_transfer_saved_abspos_layout_inputs(
-    arena: *mut c_void,
-    old: NodeSlotId,
-    new: NodeSlotId,
-) {
-    abort_on_panic(|| {
-        assert!(!arena.is_null(), "layout node arena handle is null");
-        // SAFETY: Both slots belong to this live arena for the duration of
-        // the synchronous replacement callback.
-        unsafe { &*arena.cast::<LayoutNodeArena>() }.transfer_saved_abspos_layout_inputs(old, new);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use crate::layout::layout_node_arena::{
         Chunk, IntrinsicInlineSizeMeasurement, IntrinsicSizeCacheKey, IntrinsicSizeCacheKind, LayoutNodeArena,
         SLOTS_PER_CHUNK,
-    };
-    use crate::layout::node_data::{NodeFlag, NodeKind};
-    use crate::layout::{
-        AbsposAlignment, AbsposAxisMode, AbsposContainingBlockInfo, AbsposLayoutInputs, StaticPositionAlignment,
-        StaticPositionRect,
     };
     use crate::layout::{AvailableSize, CssPixels};
 
@@ -1066,69 +993,5 @@ mod tests {
             None
         );
         arena.free(second.slot, second.generation);
-    }
-
-    #[test]
-    fn saved_abspos_inputs_transfer_and_validate_generation() {
-        let mut arena = LayoutNodeArena::new();
-        let old = arena.allocate();
-        let new = arena.allocate();
-        // SAFETY: Both allocations remain live.
-        unsafe {
-            (*old.data).kind = NodeKind::Box;
-            (*new.data).kind = NodeKind::Box;
-        }
-        let inputs = AbsposLayoutInputs {
-            static_position_rect: StaticPositionRect {
-                rect: Default::default(),
-                inline_alignment: StaticPositionAlignment::Center,
-                block_alignment: StaticPositionAlignment::End,
-                alignment_derives_from_own_computed_values: true,
-            },
-            containing_block_info: AbsposContainingBlockInfo {
-                rect: Default::default(),
-                inline_axis_mode: AbsposAxisMode::StaticPosition,
-                block_axis_mode: AbsposAxisMode::InsetFromRect,
-                inline_alignment: Some(AbsposAlignment::Center),
-                block_alignment: None,
-                derives_from_own_computed_values: true,
-            },
-        };
-
-        arena.set_saved_abspos_layout_inputs(old.data, Some(inputs));
-        assert_eq!(arena.saved_abspos_layout_inputs(old.data), Some(inputs));
-        // SAFETY: Both allocations remain live.
-        unsafe {
-            assert_ne!((*old.data).flags & NodeFlag::HasSavedAbsposLayoutInputs as u32, 0);
-            assert_ne!(
-                (*old.data).flags & NodeFlag::SavedAbsposCbDerivesFromOwnComputedValues as u32,
-                0
-            );
-            assert_ne!(
-                (*old.data).flags & NodeFlag::SavedAbsposAlignmentDerivesFromOwnComputedValues as u32,
-                0
-            );
-        }
-
-        arena.transfer_saved_abspos_layout_inputs(old.slot, new.slot);
-        assert_eq!(arena.saved_abspos_layout_inputs(new.data), Some(inputs));
-
-        arena.set_saved_abspos_layout_inputs(old.data, None);
-        assert_eq!(arena.saved_abspos_layout_inputs(old.data), None);
-        // SAFETY: The old allocation remains live.
-        unsafe {
-            let saved_abspos_flags = NodeFlag::HasSavedAbsposLayoutInputs as u32
-                | NodeFlag::SavedAbsposCbDerivesFromOwnComputedValues as u32
-                | NodeFlag::SavedAbsposAlignmentDerivesFromOwnComputedValues as u32;
-            assert_eq!((*old.data).flags & saved_abspos_flags, 0);
-        }
-        arena.free(old.slot, old.generation);
-
-        let reused = arena.allocate();
-        assert_eq!(reused.slot.slot_index(), old.slot.slot_index());
-        assert_ne!(reused.slot, old.slot);
-        assert_eq!(arena.saved_abspos_layout_inputs(reused.data), None);
-        arena.free(reused.slot, reused.generation);
-        arena.free(new.slot, new.generation);
     }
 }
