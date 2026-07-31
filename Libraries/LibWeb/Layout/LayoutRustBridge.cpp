@@ -91,14 +91,16 @@ static Atomic<size_t> s_outstanding_anchor_name_handles;
 static Atomic<size_t> s_outstanding_svg_path_handles;
 
 static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
-
-static RustFFI::FfiStylePayloads style_payloads(CSS::ComputedValues const& values)
-{
-    RustFFI::FfiStylePayloads payloads {};
-    for (size_t index = 0; index < to_underlying(CSS::StyleGroupIndex::Count); ++index)
-        payloads.groups[index] = values.style_group_payload(static_cast<CSS::StyleGroupIndex>(index));
-    return payloads;
-}
+static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTableValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TABLE);
+static_assert(to_underlying(CSS::StyleGroupIndex::InheritedTextValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_TEXT);
+static_assert(to_underlying(CSS::StyleGroupIndex::InheritedBoxValues) == RustFFI::STYLE_GROUP_INDEX_INHERITED_BOX);
+static_assert(to_underlying(CSS::StyleGroupIndex::FontValues) == RustFFI::STYLE_GROUP_INDEX_FONT);
+static_assert(to_underlying(CSS::StyleGroupIndex::SVGResetValues) == RustFFI::STYLE_GROUP_INDEX_SVG_RESET);
+static_assert(to_underlying(CSS::StyleGroupIndex::BorderValues) == RustFFI::STYLE_GROUP_INDEX_BORDER);
+static_assert(to_underlying(CSS::StyleGroupIndex::AlignmentValues) == RustFFI::STYLE_GROUP_INDEX_ALIGNMENT);
+static_assert(to_underlying(CSS::StyleGroupIndex::SizingValues) == RustFFI::STYLE_GROUP_INDEX_SIZING);
+static_assert(to_underlying(CSS::StyleGroupIndex::SurroundValues) == RustFFI::STYLE_GROUP_INDEX_SURROUND);
+static_assert(to_underlying(CSS::StyleGroupIndex::BoxValues) == RustFFI::STYLE_GROUP_INDEX_BOX);
 
 static bool is_empty_editable_text_node(TextNode const& text_node)
 {
@@ -1665,7 +1667,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             dump_tree(box); },
         .release_calc_handle = ladybird_layout_release_calc_handle,
         .release_anchor_name_handle = ladybird_layout_release_anchor_name_handle,
-        .build_style_payloads = [](void*, void const* style) { return style_payloads(*static_cast<CSS::ComputedValues const*>(style)); },
         .build_replaced_content_facts = [](void*, void* node) {
             RustFFI::FfiReplacedContentFacts facts {};
             auto const* box = as_if<Box>(*static_cast<Node const*>(node));

@@ -810,7 +810,7 @@ impl TableTree for TableFormattingContext<'_> {
     fn row_is_collapsed(&self, row: Node, row_group: Option<Node>) -> bool {
         // CSS::Visibility::Collapse is pinned to zero in
         // LayoutRustBridge.cpp.
-        self.style_facts(row).visibility == 0 || row_group.is_some_and(|group| self.style_facts(group).visibility == 0)
+        self.style_facts(row).visibility() == 0 || row_group.is_some_and(|group| self.style_facts(group).visibility() == 0)
     }
 }
 
@@ -896,10 +896,10 @@ impl<'pass> TableFormattingContext<'pass> {
         let style = self.style_facts(self.table_box);
         // When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
         // https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
-        if style.border_collapse != BORDER_COLLAPSE_SEPARATE {
+        if style.border_collapse() != BORDER_COLLAPSE_SEPARATE {
             CssPixels::default()
         } else {
-            style.border_spacing_horizontal
+            style.border_spacing_horizontal()
         }
     }
 
@@ -907,10 +907,10 @@ impl<'pass> TableFormattingContext<'pass> {
         let style = self.style_facts(self.table_box);
         // When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
         // https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
-        if style.border_collapse != BORDER_COLLAPSE_SEPARATE {
+        if style.border_collapse() != BORDER_COLLAPSE_SEPARATE {
             CssPixels::default()
         } else {
-            style.border_spacing_vertical
+            style.border_spacing_vertical()
         }
     }
 
@@ -920,29 +920,29 @@ impl<'pass> TableFormattingContext<'pass> {
         ElementBorders {
             top: FfiBorderData {
                 color: table.border_top_color,
-                line_style: style.border_top_style,
-                width: style.border_top_width,
+                line_style: style.border_top_style(),
+                width: style.border_top_width(),
             },
             right: FfiBorderData {
                 color: table.border_right_color,
-                line_style: style.border_right_style,
-                width: style.border_right_width,
+                line_style: style.border_right_style(),
+                width: style.border_right_width(),
             },
             bottom: FfiBorderData {
                 color: table.border_bottom_color,
-                line_style: style.border_bottom_style,
-                width: style.border_bottom_width,
+                line_style: style.border_bottom_style(),
+                width: style.border_bottom_width(),
             },
             left: FfiBorderData {
                 color: table.border_left_color,
-                line_style: style.border_left_style,
-                width: style.border_left_width,
+                line_style: style.border_left_style(),
+                width: style.border_left_width(),
             },
         }
     }
 
     fn border_conflict_resolution(&mut self) {
-        if self.style_facts(self.table_box).border_collapse == BORDER_COLLAPSE_SEPARATE {
+        if self.style_facts(self.table_box).border_collapse() == BORDER_COLLAPSE_SEPARATE {
             for cell_index in 0..self.cells.len() {
                 let cell = self.cells[cell_index];
                 self.set_cell_coordinates(cell);
@@ -1061,11 +1061,9 @@ impl<'pass> TableFormattingContext<'pass> {
         // specified width of the table root is either a <length-percentage>, min-content or fit-content. When the specified width is not one of
         // those values, or if the computed value of the table-layout property is auto, then the table-root is said to be laid out in auto mode.
         let style = self.style_facts(self.table_box);
-        style.table_layout == TABLE_LAYOUT_FIXED
-            && (style.width().is_length()
-                || style.width().is_percentage()
-                || style.width().is_min_content()
-                || style.width().is_fit_content())
+        let width = style.width();
+        style.table_layout() == TABLE_LAYOUT_FIXED
+            && (width.is_length() || width.is_percentage() || width.is_min_content() || width.is_fit_content())
     }
 
     fn compute_constrainedness(&mut self) {
@@ -1125,7 +1123,7 @@ impl<'pass> TableFormattingContext<'pass> {
         let block_basis = self.table_constraints.block_basis();
         self.compute_constrainedness();
         let fixed = self.use_fixed_mode_layout();
-        let collapsed = self.style_facts(self.table_box).border_collapse != BORDER_COLLAPSE_SEPARATE;
+        let collapsed = self.style_facts(self.table_box).border_collapse() != BORDER_COLLAPSE_SEPARATE;
 
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
@@ -1145,25 +1143,27 @@ impl<'pass> TableFormattingContext<'pass> {
                 )
             } else {
                 (
-                    style.border_top_width,
-                    style.border_bottom_width,
-                    style.border_left_width,
-                    style.border_right_width,
+                    style.border_top_width(),
+                    style.border_bottom_width(),
+                    style.border_left_width(),
+                    style.border_right_width(),
                 )
             };
             let inline_offsets = padding_inline_start + padding_inline_end + border_inline_start + border_inline_end;
+            let width = style.width();
+            let max_width = style.max_width();
             let mut min_inline = style.min_width().to_px(inline_basis);
-            let mut inline_size = if style.width().is_length() {
-                style.width().to_px(inline_basis)
+            let mut inline_size = if width.is_length() {
+                width.to_px(inline_basis)
             } else {
                 CssPixels::default()
             };
-            let mut max_inline = if style.max_width().is_length() {
-                style.max_width().to_px(inline_basis)
+            let mut max_inline = if max_width.is_length() {
+                max_width.to_px(inline_basis)
             } else {
                 CssPixels::from_raw(i32::MAX)
             };
-            if style.box_sizing == box_sizing::BORDER_BOX {
+            if style.box_sizing() == box_sizing::BORDER_BOX {
                 min_inline -= inline_offsets;
                 inline_size -= inline_offsets;
                 max_inline -= inline_offsets;
@@ -1174,7 +1174,7 @@ impl<'pass> TableFormattingContext<'pass> {
             // of cells is considered zero unless they are directly specified as a length-percentage, in which case they are
             // resolved based on the table width (if it is definite, otherwise use 0).
             let (min_content_inline, max_content_inline) = if fixed {
-                if style.width().is_length_percentage() {
+                if width.is_length_percentage() {
                     (inline_size, inline_size)
                 } else {
                     (CssPixels::default(), CssPixels::default())
@@ -1198,13 +1198,15 @@ impl<'pass> TableFormattingContext<'pass> {
                 // The tables specification isn't explicit on how to use the height and max-height CSS properties in the outer max-content formulas.
                 // However, during this early phase we don't have enough information to resolve percentage sizes yet and the formulas for outer sizes
                 // in the specification give enough clues to pick defaults in a way that makes sense.
-                let block_size = if style.height().is_length() {
-                    style.height().to_px(block_basis)
+                let height = style.height();
+                let max_height = style.max_height();
+                let block_size = if height.is_length() {
+                    height.to_px(block_basis)
                 } else {
                     CssPixels::default()
                 };
-                let max_block = if style.max_height().is_length() {
-                    style.max_height().to_px(block_basis)
+                let max_block = if max_height.is_length() {
+                    max_height.to_px(block_basis)
                 } else {
                     CssPixels::from_raw(i32::MAX)
                 };
@@ -1664,10 +1666,10 @@ impl<'pass> TableFormattingContext<'pass> {
             let outer = |inner: CssPixels| {
                 inner
                     + style.margin_left().to_px(basis)
-                    + style.border_left_width
+                    + style.border_left_width()
                     + style.padding_left().to_px(basis)
                     + style.padding_right().to_px(basis)
-                    + style.border_right_width
+                    + style.border_right_width()
                     + style.margin_right().to_px(basis)
             };
             let mut contribution = outer(self.calculate_min_content_inline_size(caption));
@@ -1708,7 +1710,7 @@ impl<'pass> TableFormattingContext<'pass> {
         // CSS Sizing says box-sizing:border-box applies length/percentage width/min-width/max-width constraints to
         // the border box. The table inline-size algorithm compares content inline sizes, so convert them before comparing.
         let mut resolved = constraint.to_px(basis);
-        if self.style_facts(self.table_box).box_sizing == box_sizing::BORDER_BOX {
+        if self.style_facts(self.table_box).box_sizing() == box_sizing::BORDER_BOX {
             let used = self.used_values(self.table_box);
             resolved -= used.border_box_left(false) + used.border_box_right(false);
         }
@@ -2013,17 +2015,17 @@ impl<'pass> TableFormattingContext<'pass> {
                 self.rows[row_index].base_block_size = CssPixels::default();
                 continue;
             }
-            let style = self.style_facts(self.rows[row_index].box_);
-            if style.height().is_length() {
+            let height = self.style_facts(self.rows[row_index].box_).height();
+            if height.is_length() {
                 // NOTE: A <length> block size resolves without a percentage basis.
                 self.rows[row_index].base_block_size = self.rows[row_index]
                     .base_block_size
-                    .max(style.height().to_px(CssPixels::default()));
+                    .max(height.to_px(CssPixels::default()));
             }
         }
         let inline_basis = self.participant_constraints.inline_basis();
         let participant_block_basis = self.participant_constraints.block_basis();
-        let collapsed = self.style_facts(self.table_box).border_collapse != BORDER_COLLAPSE_SEPARATE;
+        let collapsed = self.style_facts(self.table_box).border_collapse() != BORDER_COLLAPSE_SEPARATE;
         let inline_spacing = self.border_spacing_inline();
         // First pass of cells layout:
         for cell_index in 0..self.cells.len() {
@@ -2038,13 +2040,14 @@ impl<'pass> TableFormattingContext<'pass> {
             used.padding_left.set(style.padding_left().to_px(inline_basis));
             used.padding_right.set(style.padding_right().to_px(inline_basis));
             if !collapsed {
-                used.border_top.set(style.border_top_width);
-                used.border_bottom.set(style.border_bottom_width);
-                used.border_left.set(style.border_left_width);
-                used.border_right.set(style.border_right_width);
+                used.border_top.set(style.border_top_width());
+                used.border_bottom.set(style.border_bottom_width());
+                used.border_left.set(style.border_left_width());
+                used.border_right.set(style.border_right_width());
             }
-            if !self.rows[cell.row_index].is_collapsed && style.height().is_length() {
-                let cell_size = style.height().to_px(participant_block_basis);
+            let height = style.height();
+            if !self.rows[cell.row_index].is_collapsed && height.is_length() {
+                let cell_size = height.to_px(participant_block_basis);
                 used.set_content_block_size(
                     cell_size - used.border_box_top(collapsed) - used.border_box_bottom(collapsed),
                 );
@@ -2130,7 +2133,7 @@ impl<'pass> TableFormattingContext<'pass> {
             // If the table has a `height` property other than auto, it is treated as a minimum block size for the
             // table grid, and will eventually be distributed to the rows if their collective minimum block size is smaller.
             let mut specified = table_style.height().to_px(self.table_constraints.block_basis());
-            if table_style.box_sizing == box_sizing::BORDER_BOX {
+            if table_style.box_sizing() == box_sizing::BORDER_BOX {
                 let used = self.used_values(self.table_box);
                 specified -= used.border_box_top(false) + used.border_box_bottom(false);
             }
@@ -2360,7 +2363,7 @@ impl<'pass> TableFormattingContext<'pass> {
             offset += column.used_inline_size;
         }
         let spacing = self.border_spacing_inline();
-        let collapsed = self.style_facts(self.table_box).border_collapse != BORDER_COLLAPSE_SEPARATE;
+        let collapsed = self.style_facts(self.table_box).border_collapse() != BORDER_COLLAPSE_SEPARATE;
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
             let used = self.used_values(cell.box_);
@@ -2435,7 +2438,7 @@ impl<'pass> TableFormattingContext<'pass> {
     ) -> CssPixels {
         let mut total = CssPixels::default();
         for caption in self.matching_children(self.table_box, |facts| facts.is_table_caption()) {
-            if self.style_facts(caption).caption_side != phase as u8 {
+            if self.style_facts(caption).caption_side() != phase as u8 {
                 continue;
             }
             // Captions live inside the table wrapper, so their quirks percentage height basis derives

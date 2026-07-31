@@ -559,12 +559,12 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn inline_axis_is_reverse(&self) -> bool {
         let style = self.style();
-        match style.writing_mode {
+        match style.writing_mode() {
             writing_mode::HORIZONTAL_TB
             | writing_mode::VERTICAL_RL
             | writing_mode::VERTICAL_LR
-            | writing_mode::SIDEWAYS_RL => style.direction == 1,
-            writing_mode::SIDEWAYS_LR => style.direction == 0,
+            | writing_mode::SIDEWAYS_RL => style.direction() == 1,
+            writing_mode::SIDEWAYS_LR => style.direction() == 0,
             _ => unreachable!("invalid writing mode"),
         }
     }
@@ -723,11 +723,8 @@ impl<'pass> NodeFacts<'pass> {
                 });
             }
         }
-        let denominator = style.css_preferred_aspect_ratio_denominator();
-        (denominator != crate::layout::CssPixels::default()).then(|| PixelFraction {
-            numerator: style.css_preferred_aspect_ratio_numerator(),
-            denominator,
-        })
+        let (numerator, denominator) = style.css_preferred_aspect_ratio();
+        (denominator != crate::layout::CssPixels::default()).then_some(PixelFraction { numerator, denominator })
     }
 
     pub(crate) fn has_default_preferred_width(&self) -> bool {
@@ -757,15 +754,15 @@ impl<'pass> NodeFacts<'pass> {
         let style = self.style();
         let overflow_value_makes_box_a_scroll_container =
             |overflow: u8| matches!(overflow, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
-        overflow_value_makes_box_a_scroll_container(style.overflow_x)
-            || overflow_value_makes_box_a_scroll_container(style.overflow_y)
+        overflow_value_makes_box_a_scroll_container(style.overflow_x())
+            || overflow_value_makes_box_a_scroll_container(style.overflow_y())
     }
 
     pub(crate) fn display(&self) -> crate::layout::FfiDisplay {
         if self.data().style.is_null() {
             return crate::layout::FfiDisplay::block();
         }
-        self.state.style_facts(self.callbacks, self.node).display
+        self.state.style_facts(self.callbacks, self.node).display()
     }
 
     pub(crate) fn is_svg_box(&self) -> bool {
@@ -846,7 +843,7 @@ pub(crate) struct LayoutState {
     /// writeback, one merged entry per node so a node resolved twice keeps
     /// its final values and gets a single writeback.
     deferred_resolved_anchor_insets: RefCell<Vec<crate::layout::FfiDeferredResolvedAnchorInsets>>,
-    style_decode_values: PagedStore<StyleDecodeValues>,
+    anchor_inset_store: AnchorInsetStore,
     replaced_content_facts: PagedStore<crate::layout::FfiReplacedContentFacts>,
     list_item_facts: PagedStore<crate::layout::FfiListItemFacts>,
     table_facts: PagedStore<FfiTableBoxFacts>,
@@ -902,7 +899,7 @@ impl LayoutState {
             abspos_layout_pass_queue_in_completion_order: RefCell::new(VecDeque::new()),
             abspos_layout_pass_is_active: Cell::new(false),
             deferred_resolved_anchor_insets: RefCell::new(Vec::new()),
-            style_decode_values: PagedStore::default(),
+            anchor_inset_store: AnchorInsetStore::default(),
             replaced_content_facts: PagedStore::default(),
             list_item_facts: PagedStore::default(),
             table_facts: PagedStore::default(),
@@ -991,7 +988,7 @@ impl LayoutState {
         let adjust_for_box_sizing = |unadjusted: crate::layout::CssPixels, computed_size: crate::layout::FfiSizeValue, axis: Axis| {
             // box-sizing: content-box and automatic sizes need no
             // adjustment.
-            if style.box_sizing == box_sizing::CONTENT_BOX || computed_size.is_auto() {
+            if style.box_sizing() == box_sizing::CONTENT_BOX || computed_size.is_auto() {
                 return unadjusted;
             }
 
@@ -1001,15 +998,15 @@ impl LayoutState {
             let inline_basis = percentage_basis_inline_size.unwrap_or_default();
             let border_and_padding = match axis {
                 Axis::Inline => {
-                    style.border_left_width
+                    style.border_left_width()
                         + style.padding_left().to_px(inline_basis)
-                        + style.border_right_width
+                        + style.border_right_width()
                         + style.padding_right().to_px(inline_basis)
                 }
                 Axis::Block => {
-                    style.border_top_width
+                    style.border_top_width()
                         + style.padding_top().to_px(inline_basis)
-                        + style.border_bottom_width
+                        + style.border_bottom_width()
                         + style.padding_bottom().to_px(inline_basis)
                 }
             };
@@ -1196,21 +1193,11 @@ impl LayoutState {
         callbacks: &FfiLayoutFcCallbacks,
         node: Node,
     ) -> StyleValues<'pass> {
-        let slot_index = callbacks.slot_index(node);
-        let cache = if let Some(cache) = self.style_decode_values.get(slot_index) {
-            cache
-        } else {
-            let data = callbacks.node_data(node);
-            assert!(!data.style.is_null());
-            // SAFETY: NodeData retains the node's immutable ComputedValues for
-            // the synchronous layout pass.
-            let payloads = unsafe { (callbacks.build_style_payloads)(callbacks.context, data.style) };
-            self.style_decode_values.allocate(
-                slot_index,
-                StyleDecodeValues::new(payloads, callbacks.release_calc_handle),
-            )
-        };
-        StyleValues::new(cache)
+        StyleValues::new(
+            StyleReader::new(callbacks.style_payloads(node)),
+            &self.anchor_inset_store,
+            callbacks.slot_index(node),
+        )
     }
 
     pub(crate) fn replace_resolved_anchor_insets(
@@ -1220,17 +1207,13 @@ impl LayoutState {
         resolved: crate::layout::FfiResolvedAnchorInsets,
     ) {
         let slot_index = callbacks.slot_index(node);
-        let cache = self
-            .style_decode_values
-            .get(slot_index)
-            .expect("missing style decode cache");
         let replace = |field: SizeField, is_auto: bool, value: crate::layout::CssPixels| {
             let value = if is_auto {
                 crate::layout::FfiSizeValue::auto_value()
             } else {
                 crate::layout::FfiSizeValue::px_value(value)
             };
-            cache.replace_size(field, value);
+            self.anchor_inset_store.set_override(slot_index, field, value);
         };
         if resolved.resolves_top {
             replace(SizeField::InsetTop, resolved.top_is_auto, resolved.top);
@@ -1377,9 +1360,9 @@ impl LayoutState {
             should_wrap_lines,
             should_respect_linebreaks,
             unidirectional_ltr,
-            white_space_collapse: parent_style.white_space_collapse,
-            word_break: parent_style.word_break,
-            font_variant_emoji: parent_style.font_variant_emoji,
+            white_space_collapse: parent_style.white_space_collapse(),
+            word_break: parent_style.word_break(),
+            font_variant_emoji: parent_style.font_variant_emoji(),
             font_cascade_list: parent_style.font_cascade_list(),
         };
         let text = &callbacks.text_content(node).text;
