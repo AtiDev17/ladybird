@@ -277,8 +277,12 @@ TEST_CASE(targeted_entry_updates_find_nested_history_entries_by_navigation_api_k
     auto update_result = history.update_from_web_content(move(entries), { 0, 1, 2 }, 2);
     EXPECT_EQ(update_result, WebView::TraversableSessionHistory::UpdateResult::CompleteSnapshot);
 
-    EXPECT(history.update_nested_navigation_api_state(navigable_id("frame-1"sv), Utf16String::from_utf8("child-1"sv), state_record(9)));
-    EXPECT(history.update_nested_scroll_restoration_mode(navigable_id("frame-1"sv), Utf16String::from_utf8("child-1"sv), Web::HTML::ScrollRestorationMode::Manual));
+    EXPECT(history.update_entry(navigable_id("frame-1"sv), Utf16String::from_utf8("child-1"sv), [&](auto& entry) {
+        entry.navigation_api_state = state_record(9);
+    }));
+    EXPECT(history.update_entry(navigable_id("frame-1"sv), Utf16String::from_utf8("child-1"sv), [&](auto& entry) {
+        entry.scroll_restoration_mode = Web::HTML::ScrollRestorationMode::Manual;
+    }));
 
     auto expect_copied_nested_histories_were_updated = [](Vector<Web::HTML::SessionHistoryEntryDescriptor> const& copied_entries) {
         VERIFY(copied_entries.size() == 2);
@@ -1765,8 +1769,9 @@ TEST_CASE(clear_current_entry_reload_pending)
     auto update_result = history.update_from_web_content({
                                                              entry(0, "https://a.example/"sv),
                                                              entry_with_reload_pending(1, "https://b.example/"sv, 7, "main"sv, {}),
+                                                             entry_with_reload_pending(2, "https://c.example/"sv, 7, "main"sv, {}),
                                                          },
-        { 0, 1 }, 1);
+        { 0, 1, 2 }, 1);
     EXPECT_EQ(update_result, WebView::TraversableSessionHistory::UpdateResult::CompleteSnapshot);
 
     auto current_entry = history.current_entry();
@@ -1778,6 +1783,10 @@ TEST_CASE(clear_current_entry_reload_pending)
     current_entry = history.current_entry();
     VERIFY(current_entry);
     EXPECT(!current_entry->document_state.reload_pending);
+
+    auto shared_document_state_entry = history.entry_at(2);
+    VERIFY(shared_document_state_entry);
+    EXPECT(!shared_document_state_entry->document_state.reload_pending);
 }
 
 TEST_CASE(mark_current_entry_reload_pending)

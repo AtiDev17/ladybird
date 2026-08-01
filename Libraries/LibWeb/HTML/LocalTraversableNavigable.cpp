@@ -98,7 +98,7 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_l
     }
 
     // 4. Let documentState be a new document state, with
-    auto document_state = DocumentState::create();
+    auto document_state = DocumentState::create(page->client().allocate_cross_process_id());
 
     // document: document (now owned by LocalNavigable::m_active_document, not DocumentState)
 
@@ -278,7 +278,7 @@ static void apply_session_history_entry_descriptor_from_ui_process(SessionHistor
 
 static void apply_session_history_document_state_descriptor_from_ui_process(DocumentState& document_state, SessionHistoryDocumentStateDescriptor const& document_state_descriptor)
 {
-    document_state.set_cross_process_id(document_state_descriptor.id);
+    document_state.adopt_cross_process_id_from_ui_process(document_state_descriptor.id);
     document_state.set_history_policy_container(document_state_descriptor.history_policy_container);
     document_state.set_request_referrer(document_state_descriptor.request_referrer);
     document_state.set_request_referrer_policy(document_state_descriptor.request_referrer_policy);
@@ -300,7 +300,7 @@ static RefPtr<DocumentState> get_or_create_document_state_from_ui_process(Sessio
         document_state = *existing_document_state;
 
     if (!document_state) {
-        document_state = DocumentState::create();
+        document_state = DocumentState::create(document_state_descriptor.id);
         reconstruction_state.document_states.set(document_state_descriptor.id, document_state);
     }
 
@@ -1183,6 +1183,8 @@ void ApplyHistoryStepState::start()
 
                 // 5. Set targetEntry's document state's reload pending to false.
                 target_entry->document_state()->set_reload_pending(false);
+                m_traversable->page().client().page_did_set_session_history_entry_document_state_reload_pending(
+                    navigable->id(), target_entry->navigation_api_key(), false);
 
                 // 6. Let allowPOST be targetEntry's document state's reload pending.
                 auto allow_POST = target_entry->document_state()->reload_pending();
@@ -1483,11 +1485,8 @@ LocalTraversableNavigable::SessionHistorySnapshot LocalTraversableNavigable::cre
 
     Vector<SessionHistoryEntryDescriptor> top_level_session_history_entries;
     top_level_session_history_entries.ensure_capacity(session_history_entries().size());
-    SessionHistoryEntryDescriptorCreationState creation_state { [this] {
-        return page().client().allocate_cross_process_id();
-    } };
     for (auto const& entry : session_history_entries())
-        top_level_session_history_entries.unchecked_append(create_session_history_entry_descriptor(entry, creation_state));
+        top_level_session_history_entries.unchecked_append(create_session_history_entry_descriptor(entry));
 
     auto used_history_steps = get_all_used_history_steps();
     Vector<i32> used_session_history_steps;
@@ -2324,9 +2323,8 @@ void LocalTraversableNavigable::apply_the_reload_history_step(UserNavigationInvo
                 //     session history entry as an in-flight reload.
                 if (auto current_entry = current_session_history_entry(); current_entry && current_entry->document_state()->reload_pending()) {
                     current_entry->document_state()->set_reload_pending(false);
-
-                    auto session_history_snapshot = create_session_history_snapshot();
-                    page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
+                    page().client().page_did_set_session_history_entry_document_state_reload_pending(
+                        id(), current_entry->navigation_api_key(), false);
                 }
             }
             on_complete->function()(result);

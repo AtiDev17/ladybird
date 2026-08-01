@@ -674,6 +674,15 @@ Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navi
         .entries { history_entry },
     };
     parent_doc_state->nested_histories().append(move(nested_history));
+
+    if (auto traversable = parent_navigable.traversable_navigable()) {
+        SessionHistoryNestedHistoryDescriptor nested_history_descriptor {
+            .id = child_navigable.id(),
+            .entries { create_session_history_entry_descriptor(history_entry) },
+        };
+        traversable->page().client().page_did_append_nested_history(parent_navigable.id(), nested_history_descriptor);
+    }
+
     return &parent_doc_state->nested_histories().last().entries;
 }
 
@@ -1001,6 +1010,11 @@ void LocalNavigable::save_persisted_state_to_active_session_history_entry()
     auto scroll_position_data = entry->scroll_position_data();
     scroll_position_data.viewport_scroll_position = viewport_scroll_offset();
     entry->set_scroll_position_data(move(scroll_position_data));
+
+    if (auto traversable = traversable_navigable()) {
+        traversable->page().client().page_did_update_session_history_entry_scroll_position_data(
+            id(), entry->navigation_api_key(), entry->scroll_position_data());
+    }
 
     // FIXME: 2. Optionally, update entry's persisted user state.
 }
@@ -1812,7 +1826,7 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
         // resource: oldDocState's resource
         // ever populated: oldDocState's ever populated
         // navigable target name: oldDocState's navigable target name
-        auto new_doc_state = DocumentState::create();
+        auto new_doc_state = DocumentState::create(state_holder->navigable->page().client().allocate_cross_process_id());
         new_doc_state->set_history_policy_container(state_holder->history_policy_container);
         new_doc_state->set_request_referrer(state_holder->request_referrer);
         new_doc_state->set_request_referrer_policy(state_holder->request_referrer_policy);
@@ -2855,7 +2869,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                 //    initiator origin: initiatorOriginSnapshot
                 //    resource: documentResource
                 //    navigable target name: navigable's target name
-                auto document_state = DocumentState::create();
+                auto document_state = DocumentState::create(page().client().allocate_cross_process_id());
                 document_state->set_request_referrer_policy(referrer_policy);
                 document_state->set_initiator_origin(initiator_origin_snapshot);
                 document_state->set_resource(document_resource);
@@ -3302,7 +3316,7 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
     //     resource: null
     //     ever populated: true
     //     navigable target name: oldDocState's navigable target name
-    auto document_state = DocumentState::create();
+    auto document_state = DocumentState::create(page().client().allocate_cross_process_id());
     document_state->set_history_policy_container(old_doc_state->history_policy_container());
     document_state->set_request_referrer(old_doc_state->request_referrer());
     document_state->set_request_referrer_policy(old_doc_state->request_referrer_policy());
@@ -3367,10 +3381,8 @@ void LocalNavigable::reload(Optional<StorageSerializationRecord> navigation_api_
     // 3. Let traversable be navigable's traversable navigable.
     auto traversable = traversable_navigable();
 
-    // AD-HOC: Report the reload-pending document state to the UI process before the reload history step finishes,
-    //         so the UI-owned session history mirror remains synchronized during an in-flight reload.
-    auto session_history_snapshot = traversable->create_session_history_snapshot();
-    traversable->page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
+    traversable->page().client().page_did_set_session_history_entry_document_state_reload_pending(
+        id(), active_session_history_entry()->navigation_api_key(), true);
 
     // 4. Append the following session history traversal steps to traversable:
     traversable->append_session_history_traversal_steps(GC::create_function(heap(), [traversable, user_involvement](NonnullRefPtr<Core::Promise<Empty>> signal) {

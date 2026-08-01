@@ -90,7 +90,7 @@ void NavigableContainer::create_new_child_navigable()
     //  - origin: document's origin
     //  - navigable target name: targetName
     //  - about base URL: document's about base URL
-    auto document_state = HTML::DocumentState::create();
+    auto document_state = HTML::DocumentState::create(document->page().client().allocate_cross_process_id());
     document_state->set_initiator_origin(document->origin());
     document_state->set_origin(document->origin());
     if (target_name.has_value())
@@ -345,6 +345,8 @@ void NavigableContainer::destroy_the_child_navigable()
 
         // 8. Let traversable be container's node navigable's traversable navigable.
         auto traversable = this->navigable()->traversable_navigable();
+
+        traversable->page().client().page_did_remove_nested_history(this->navigable()->id(), navigable->id());
 
         // 9. Append the following session history traversal steps to traversable:
         traversable->append_session_history_traversal_steps(GC::create_function(heap(), [traversable](NonnullRefPtr<Core::Promise<Empty>> signal) {

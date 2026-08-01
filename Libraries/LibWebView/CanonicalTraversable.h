@@ -237,6 +237,11 @@ public:
     WebContentSessionHistoryUpdateDecision did_receive_web_content_session_history_update_for_testing(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index, URL::URL const& current_url);
     bool update_session_history_entry_navigation_api_state(CanonicalNavigable const&, Utf16String const& navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state);
     bool update_session_history_entry_scroll_restoration_mode(CanonicalNavigable const&, Utf16String const& navigation_api_key, Web::HTML::ScrollRestorationMode scroll_restoration_mode);
+    bool update_session_history_entry_scroll_position_data(CanonicalNavigable const&, Utf16String const& navigation_api_key, Web::HTML::SessionHistoryEntryScrollPositionData scroll_position_data);
+    bool update_session_history_entry_document_state_navigable_target_name(CanonicalNavigable const&, Utf16String const& navigation_api_key, Utf16String navigable_target_name);
+    bool set_session_history_entry_document_state_reload_pending(CanonicalNavigable const&, Utf16String const& navigation_api_key, bool reload_pending);
+    bool append_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::SessionHistoryNestedHistoryDescriptor nested_history);
+    bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId child_navigable_id);
     Optional<i32> navigation_api_traversal_target(CanonicalNavigable const&, Utf16String const& navigation_api_key) const;
     WebContentSessionHistorySeedAckResult did_receive_web_content_session_history_seed_ack(bool accepted, Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index, URL::URL const& current_url);
     NavigationStartResult did_start_navigation(URL::URL const&, Web::HTML::DocumentResource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior, bool is_showing_crash_page);
@@ -260,6 +265,7 @@ public:
     static StringView pending_session_history_traversal_stage_to_string(PendingSessionHistoryTraversal::Stage);
 
 private:
+    Optional<Web::HTML::CrossProcessId> nested_history_id_for(CanonicalNavigable const&) const;
     HistoryTraversalDecision traverse_the_history(TraversableSessionHistory::TraversalTarget const&, CheckForCancelation, URL::URL const& current_url, Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete);
     void abandon_pending_web_content_session_history_seed();
     void remove_from_index(CanonicalNavigable&);
