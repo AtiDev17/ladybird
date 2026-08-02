@@ -1080,6 +1080,8 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
         return length_percentage_style_value(cx());
     case PropertyID::Cy:
         return length_percentage_style_value(cy());
+    case PropertyID::D:
+        return d();
     case PropertyID::Direction:
         return KeywordStyleValue::create(to_keyword(direction()));
     case PropertyID::EmptyCells:
@@ -2293,6 +2295,19 @@ Optional<SVGPaint> ComputedProperties::stroke(ColorResolutionContext const& colo
     return SVGPaint::from_style_value(value, color_resolution_context);
 }
 
+LengthPercentage ComputedProperties::stroke_width() const
+{
+    auto const& value = property(PropertyID::StrokeWidth);
+
+    if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number())) {
+        // FIXME: Converting to pixels isn't really correct - values should be in "user units"
+        //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+        return CSS::Length::make_px(CSSPixels::nearest_value_for(number_from_style_value(value, {})));
+    }
+
+    return CSS::LengthPercentage::from_style_value(value);
+}
+
 Vector<Variant<LengthPercentage, float>> ComputedProperties::stroke_dasharray() const
 {
     auto const& value = property(PropertyID::StrokeDasharray);
@@ -2327,6 +2342,19 @@ Vector<Variant<LengthPercentage, float>> ComputedProperties::stroke_dasharray() 
     }
 
     return dashes;
+}
+
+LengthPercentage ComputedProperties::stroke_dashoffset() const
+{
+    auto const& value = property(PropertyID::StrokeDashoffset);
+
+    if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number())) {
+        // FIXME: Converting to pixels isn't really correct - values should be in "user units"
+        //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+        return CSS::Length::make_px(CSSPixels::nearest_value_for(number_from_style_value(value, {})));
+    }
+
+    return CSS::LengthPercentage::from_style_value(value);
 }
 
 StrokeLinecap ComputedProperties::stroke_linecap() const
@@ -2535,15 +2563,15 @@ BorderImageData ComputedProperties::border_image() const
         .source = source.is_abstract_image() ? RefPtr { source.as_abstract_image() } : nullptr,
         .slice = { convert_slice(slice.top()), convert_slice(slice.right()), convert_slice(slice.bottom()), convert_slice(slice.left()) },
         .width = expand_sides(property(PropertyID::BorderImageWidth), [](StyleValue const& value) -> BorderImageWidthValue {
-            if (value.is_number())
-                return value.as_number().number();
+            if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number()))
+                return number_from_style_value(value, {});
             if (value.to_keyword() == Keyword::Auto)
                 return BorderImageWidthAuto {};
             return LengthPercentage::from_style_value(value);
         }),
         .outset = expand_sides(property(PropertyID::BorderImageOutset), [](StyleValue const& value) -> BorderImageOutsetValue {
-            if (value.is_number())
-                return value.as_number().number();
+            if (value.is_number() || (value.is_calculated() && value.as_calculated().resolves_to_number()))
+                return number_from_style_value(value, {});
             return Length::from_style_value(value, {});
         }),
         .width_value_count = component_count(property(PropertyID::BorderImageWidth)),

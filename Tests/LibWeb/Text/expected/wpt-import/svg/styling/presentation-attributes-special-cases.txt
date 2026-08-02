@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 24 tests
+Found 26 tests
 
-19 Pass
+21 Pass
 5 Fail
 Pass	cx and cy presentation attributes supported on circle element
 Pass	cx and cy presentation attributes supported on ellipse element
@@ -13,10 +13,12 @@ Pass	x, y, width, and height presentation attributes supported on svg element
 Pass	r presentation attribute supported on circle element
 Pass	rx and ry presentation attributes supported on ellipse element
 Pass	rx and ry presentation attributes supported on rect element
+Pass	d presentation attribute supported on path element
 Pass	cx and cy presentation attributes not supported on other elements
 Pass	x, y, width, and height presentation attributes not supported on other elements
 Pass	r presentation attribute not supported on other elements
 Pass	rx and ry presentation attributes not supported on other elements
+Pass	d presentation attribute not supported on other elements
 Fail	fill presentation attribute not supported on animate
 Fail	fill presentation attribute not supported on animateMotion
 Fail	fill presentation attribute not supported on animateTransform

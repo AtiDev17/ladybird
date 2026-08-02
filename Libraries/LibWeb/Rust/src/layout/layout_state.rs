@@ -344,16 +344,16 @@ impl<'pass> NodeFacts<'pass> {
         self.state.style_facts(self.callbacks, self.node)
     }
 
-    fn style_reader_if_styled(&self) -> Option<StyleReader<'pass>> {
-        self.callbacks.style_reader_if_styled(self.node)
+    fn computed_values_view_if_styled(&self) -> Option<ComputedValuesView<'pass>> {
+        self.callbacks.computed_values_view_if_styled(self.node)
     }
 
-    fn parent_style_reader_if_styled(&self) -> Option<StyleReader<'pass>> {
+    fn parent_computed_values_view_if_styled(&self) -> Option<ComputedValuesView<'pass>> {
         let parent = self.data().parent;
         if parent.is_invalid() {
             return None;
         }
-        self.callbacks.style_reader_if_styled(parent)
+        self.callbacks.computed_values_view_if_styled(parent)
     }
 
     fn replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
@@ -390,18 +390,18 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn is_floating(&self) -> bool {
-        self.style_reader_if_styled().is_some_and(|style| style.is_floating())
+        self.computed_values_view_if_styled().is_some_and(|style| style.is_floating())
     }
 
     pub(crate) fn is_absolutely_positioned(&self) -> bool {
-        self.style_reader_if_styled()
+        self.computed_values_view_if_styled()
             .is_some_and(|style| style.is_absolutely_positioned())
     }
 
     pub(crate) fn is_inline(&self) -> bool {
         crate::layout::kind_is_text(self.data().kind)
             || self
-                .style_reader_if_styled()
+                .computed_values_view_if_styled()
                 .is_some_and(|style| style.display().is_inline_outside())
     }
 
@@ -409,7 +409,7 @@ impl<'pass> NodeFacts<'pass> {
         let data = self.data();
         crate::layout::has_flag(data, NodeFlag::IsReplacedElement)
             || data.kind == NodeKind::ListItemMarkerBox
-            || self.style_reader_if_styled().is_some_and(|style| {
+            || self.computed_values_view_if_styled().is_some_and(|style| {
                 let display = style.display();
                 display.is_inline_outside() && !display.is_flow_inside()
             })
@@ -431,7 +431,7 @@ impl<'pass> NodeFacts<'pass> {
         let data = self.data();
         data.kind == NodeKind::InlineNode
             || (data.kind == NodeKind::ListItemBox
-                && self.style_reader_if_styled().is_some_and(|style| {
+                && self.computed_values_view_if_styled().is_some_and(|style| {
                     let display = style.display();
                     display.is_inline_outside() && display.is_flow_inside()
                 }))
@@ -445,14 +445,14 @@ impl<'pass> NodeFacts<'pass> {
         let Some(parent) = self.parent_data() else {
             return false;
         };
-        let parent_is_inline_flow = self.parent_style_reader_if_styled().is_some_and(|style| {
+        let parent_is_inline_flow = self.parent_computed_values_view_if_styled().is_some_and(|style| {
             let display = style.display();
             display.is_inline_outside() && display.is_flow_inside()
         });
         if !parent_is_inline_flow {
             return false;
         }
-        let style = self.style_reader_if_styled();
+        let style = self.computed_values_view_if_styled();
         if style.is_some_and(|style| style.display().is_inline_outside())
             || crate::layout::node_is_out_of_flow(data, style)
         {
@@ -499,7 +499,7 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn display_before_box_type_transformation_is_block_outside(&self) -> bool {
-        self.style_reader_if_styled()
+        self.computed_values_view_if_styled()
             .is_some_and(|style| style.display_before_box_type_transformation().is_block_outside())
     }
 
@@ -538,7 +538,7 @@ impl<'pass> NodeFacts<'pass> {
     pub(crate) fn has_replaced_element_table_display_adjustment(&self) -> bool {
         crate::layout::has_flag(self.data(), NodeFlag::IsReplacedElement)
             && self
-                .style_reader_if_styled()
+                .computed_values_view_if_styled()
                 .is_some_and(|style| {
                     let display = style.display_before_box_type_transformation();
                     display.is_table_inside() || display.is_internal_table() || display.is_table_caption()
@@ -548,8 +548,8 @@ impl<'pass> NodeFacts<'pass> {
     pub(crate) fn creates_block_formatting_context(&self) -> bool {
         crate::layout::node_creates_block_formatting_context(
             self.data(),
-            self.style_reader_if_styled(),
-            self.parent_style_reader_if_styled(),
+            self.computed_values_view_if_styled(),
+            self.parent_computed_values_view_if_styled(),
         )
     }
 
@@ -559,6 +559,10 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn is_editing_host(&self) -> bool {
         crate::layout::has_flag(self.data(), NodeFlag::IsEditingHost)
+    }
+
+    pub(crate) fn produces_line_box_fragment_when_empty(&self) -> bool {
+        crate::layout::has_flag(self.data(), NodeFlag::ProducesLineBoxFragmentWhenEmpty)
     }
 
     pub(crate) fn uses_button_layout(&self) -> bool {
@@ -589,7 +593,7 @@ impl<'pass> NodeFacts<'pass> {
         while !child.is_invalid() {
             let child_data = self.callbacks.node_data(child);
             if child_data.kind == NodeKind::LegendBox
-                && !crate::layout::node_is_out_of_flow(child_data, self.callbacks.style_reader_if_styled(child))
+                && !crate::layout::node_is_out_of_flow(child_data, self.callbacks.computed_values_view_if_styled(child))
             {
                 return child;
             }
@@ -931,7 +935,7 @@ impl LayoutState {
             Axis::Block => percentage_basis_block_size.is_some(),
         };
 
-        let adjust_for_box_sizing = |unadjusted: crate::layout::CssPixels, computed_size: crate::layout::FfiSizeValue, axis: Axis| {
+        let adjust_for_box_sizing = |unadjusted: crate::layout::CssPixels, computed_size: &ComputedSize, axis: Axis| {
             // box-sizing: content-box and automatic sizes need no
             // adjustment.
             if style.box_sizing() == box_sizing::CONTENT_BOX || computed_size.is_auto() {
@@ -961,7 +965,7 @@ impl LayoutState {
 
         let parent = callbacks.parent(node);
         let parent_facts = (!parent.is_invalid()).then(|| self.node_facts(callbacks, parent));
-        let is_definite_size = |size: crate::layout::FfiSizeValue, axis: Axis| -> Option<crate::layout::CssPixels> {
+        let is_definite_size = |size: &ComputedSize, axis: Axis| -> Option<crate::layout::CssPixels> {
             // A definite size can be determined without performing
             // layout: a length, an initial-containing-block size, or a
             // percentage/formula resolved solely against definite sizes.
@@ -998,10 +1002,10 @@ impl LayoutState {
             if !size.is_length_percentage() {
                 return None;
             }
-            if size.contains_percentage && !containing_block_has_definite_size(axis) {
+            if size.contains_percentage() && !containing_block_has_definite_size(axis) {
                 return None;
             }
-            let basis = if size.contains_percentage {
+            let basis = if size.contains_percentage() {
                 containing_block_size_for_axis(axis)
             } else {
                 crate::layout::CssPixels::default()
@@ -1140,7 +1144,7 @@ impl LayoutState {
         node: Node,
     ) -> StyleValues<'pass> {
         StyleValues::new(
-            StyleReader::new(callbacks.style_payloads(node)),
+            callbacks.style_payloads(node),
             &self.anchor_inset_store,
             callbacks.slot_index(node),
         )
@@ -1153,25 +1157,21 @@ impl LayoutState {
         resolved: crate::layout::FfiResolvedAnchorInsets,
     ) {
         let slot_index = callbacks.slot_index(node);
-        let replace = |field: SizeField, is_auto: bool, value: crate::layout::CssPixels| {
-            let value = if is_auto {
-                crate::layout::FfiSizeValue::auto_value()
-            } else {
-                crate::layout::FfiSizeValue::px_value(value)
-            };
-            self.anchor_inset_store.set_override(slot_index, field, value);
+        let replace = |field: InsetField, is_auto: bool, px: crate::layout::CssPixels| {
+            self.anchor_inset_store
+                .set_override(slot_index, field, ResolvedInsetOverride { is_auto, px });
         };
         if resolved.resolves_top {
-            replace(SizeField::InsetTop, resolved.top_is_auto, resolved.top);
+            replace(InsetField::Top, resolved.top_is_auto, resolved.top);
         }
         if resolved.resolves_right {
-            replace(SizeField::InsetRight, resolved.right_is_auto, resolved.right);
+            replace(InsetField::Right, resolved.right_is_auto, resolved.right);
         }
         if resolved.resolves_bottom {
-            replace(SizeField::InsetBottom, resolved.bottom_is_auto, resolved.bottom);
+            replace(InsetField::Bottom, resolved.bottom_is_auto, resolved.bottom);
         }
         if resolved.resolves_left {
-            replace(SizeField::InsetLeft, resolved.left_is_auto, resolved.left);
+            replace(InsetField::Left, resolved.left_is_auto, resolved.left);
         }
     }
 

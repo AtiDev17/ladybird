@@ -214,50 +214,32 @@ pub(crate) fn align_item(
 }
 
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum GridTrackBreadthKind {
+/// The pass-facing view of one stored track sizing function; sized breadths
+/// borrow the computed size from the style group payload, which outlives the
+/// pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GridTrackBreadth {
     Auto,
-    LengthPercentage,
-    Flex,
+    LengthPercentage(&'static ComputedSize),
+    Flex(f64),
     MinContent,
     MaxContent,
-    FitContent,
+    FitContent(&'static ComputedSize),
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GridTrackBreadth {
-    pub(crate) kind: u8,
-    pub(crate) value: FfiSizeValue,
-    pub(crate) flex_factor: f64,
-}
-
-/// The pass-facing view of one stored track sizing function: the breadth kind
-/// is derived from the flex flag and the computed size, and calc-bearing
-/// values borrow their pointer from the style group payload, which outlives
-/// the pass.
-fn grid_track_breadth_view(breadth: &ComputedGridTrackBreadth) -> GridTrackBreadth {
+fn grid_track_breadth_view(breadth: &'static ComputedGridTrackBreadth) -> GridTrackBreadth {
     if breadth.is_flex {
-        return GridTrackBreadth {
-            kind: GridTrackBreadthKind::Flex as u8,
-            value: FfiSizeValue::auto_value(),
-            flex_factor: breadth.flex_factor,
-        };
+        return GridTrackBreadth::Flex(breadth.flex_factor);
     }
-    let kind = match breadth.size.kind {
-        ComputedSizeKind::Auto => GridTrackBreadthKind::Auto,
+    match breadth.size.kind {
+        ComputedSizeKind::Auto => GridTrackBreadth::Auto,
         ComputedSizeKind::Calculated | ComputedSizeKind::Length | ComputedSizeKind::Percentage => {
-            GridTrackBreadthKind::LengthPercentage
+            GridTrackBreadth::LengthPercentage(&breadth.size)
         }
-        ComputedSizeKind::MinContent => GridTrackBreadthKind::MinContent,
-        ComputedSizeKind::MaxContent => GridTrackBreadthKind::MaxContent,
-        ComputedSizeKind::FitContent => GridTrackBreadthKind::FitContent,
+        ComputedSizeKind::MinContent => GridTrackBreadth::MinContent,
+        ComputedSizeKind::MaxContent => GridTrackBreadth::MaxContent,
+        ComputedSizeKind::FitContent => GridTrackBreadth::FitContent(&breadth.size),
         ComputedSizeKind::None => unreachable!("grid track sizes cannot be none"),
-    };
-    GridTrackBreadth {
-        kind: kind as u8,
-        value: decode_computed_size(&breadth.size),
-        flex_factor: 0.0,
     }
 }
 
@@ -1180,7 +1162,7 @@ impl<'pass> GridFormattingContext<'pass> {
     /// outlives the pass because the node's ComputedValues keep it alive and
     /// style containers are only replaced between passes.
     fn grid_style(&self, node: Node) -> &'static GridValues {
-        StyleReader::new(self.callbacks.style_payloads(node)).grid_values()
+        ComputedValuesView::new(&self.callbacks.style_payloads(node).groups).grid_values()
     }
 
     fn sizing(&self) -> SizingContext<'_> {
@@ -1237,7 +1219,7 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn axis_gap_value(&self, axis: Axis) -> FfiSizeValue {
+    fn axis_gap_value(&self, axis: Axis) -> &'pass ComputedGap {
         let style = self.style(self.grid_container);
         if axis.is_column() {
             style.column_gap()
@@ -1289,7 +1271,7 @@ impl<'pass> GridFormattingContext<'pass> {
             return CssPixels::default();
         }
         let gap = self.axis_gap_value(axis);
-        if gap.is_auto() {
+        if gap.is_normal() {
             // https://drafts.csswg.org/css-grid-2/#subgrid-gaps
             // A value of normal indicates that the subgrid has the same size gutters
             // as its parent grid, i.e. the applied difference is zero.
@@ -1450,7 +1432,7 @@ impl<'pass> GridFormattingContext<'pass> {
 
     fn automatic_repeat_count(
         &self,
-        source: TrackListSource<'_>,
+        source: TrackListSource,
         entry: &crate::layout::ComputedGridTrackEntry,
         axis: Axis,
     ) -> usize {
@@ -1509,7 +1491,7 @@ impl<'pass> GridFormattingContext<'pass> {
         1
     }
 
-    fn expand_axis(&self, axis: Axis, grid_style: &GridValues) -> ExpandedTrackList {
+    fn expand_axis(&self, axis: Axis, grid_style: &'static GridValues) -> ExpandedTrackList {
         let list = if axis.is_column() {
             grid_style.template_columns
         } else {
@@ -1543,7 +1525,7 @@ impl<'pass> GridFormattingContext<'pass> {
         })
     }
 
-    fn initialize_lines(&mut self, grid_style: &GridValues) -> (ExpandedTrackList, ExpandedTrackList) {
+    fn initialize_lines(&mut self, grid_style: &'static GridValues) -> (ExpandedTrackList, ExpandedTrackList) {
         let mut columns = self.expand_axis(Axis::Column, grid_style);
         let mut rows = self.expand_axis(Axis::Row, grid_style);
         self.project_parent_grid_areas(
@@ -1754,7 +1736,7 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn expanded_auto_tracks(&self, grid_style: &GridValues, axis: Axis) -> Vec<TrackDefinition> {
+    fn expanded_auto_tracks(&self, grid_style: &'static GridValues, axis: Axis) -> Vec<TrackDefinition> {
         let list = if axis.is_column() {
             grid_style.auto_columns
         } else {
@@ -1766,7 +1748,7 @@ impl<'pass> GridFormattingContext<'pass> {
     fn initialize_tracks_for_axis(
         &self,
         axis: Axis,
-        grid_style: &GridValues,
+        grid_style: &'static GridValues,
         explicit: &ExpandedTrackList,
         total_count: usize,
         explicit_start: usize,
@@ -1896,7 +1878,7 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn initialize_tracks(&mut self, grid_style: &GridValues, columns: &ExpandedTrackList, rows: &ExpandedTrackList) {
+    fn initialize_tracks(&mut self, grid_style: &'static GridValues, columns: &ExpandedTrackList, rows: &ExpandedTrackList) {
         self.columns = self.initialize_tracks_for_axis(
             Axis::Column,
             grid_style,
@@ -2068,7 +2050,7 @@ impl<'pass> GridFormattingContext<'pass> {
         size + self.outer_edges(item, axis)
     }
 
-    fn preferred_size(&self, item: GridItem, axis: Axis) -> FfiSizeValue {
+    fn preferred_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
         let style = self.style(item.box_);
         if axis.is_column() {
             style.width()
@@ -2077,7 +2059,7 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn minimum_size(&self, item: GridItem, axis: Axis) -> FfiSizeValue {
+    fn minimum_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
         let style = self.style(item.box_);
         if axis.is_column() {
             style.min_width()
@@ -2086,7 +2068,7 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn maximum_size(&self, item: GridItem, axis: Axis) -> FfiSizeValue {
+    fn maximum_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
         let style = self.style(item.box_);
         if axis.is_column() {
             style.max_width()
@@ -2112,7 +2094,7 @@ impl<'pass> GridFormattingContext<'pass> {
         // sizing tracks in the same axis, the percentage is cyclic and behaves as
         // the property's initial value for intrinsic contribution calculations.
         behaves_as_auto
-            || (!self.facts(item.box_).is_replaced_box() && self.preferred_size(item, axis).contains_percentage)
+            || (!self.facts(item.box_).is_replaced_box() && self.preferred_size(item, axis).contains_percentage())
     }
 
     fn min_content_size(&self, item: GridItem, axis: Axis) -> CssPixels {
@@ -2130,7 +2112,7 @@ impl<'pass> GridFormattingContext<'pass> {
 
     fn min_content_contribution(&self, item: GridItem, axis: Axis) -> CssPixels {
         let max = self.maximum_size(item, axis);
-        let maximum = if max.is_length_percentage() && !max.contains_percentage {
+        let maximum = if max.is_length_percentage() && !max.contains_percentage() {
             max.to_px(CssPixels::default())
         } else {
             CssPixels::from_raw(i32::MAX)
@@ -2168,7 +2150,7 @@ impl<'pass> GridFormattingContext<'pass> {
 
     fn max_content_contribution(&self, item: GridItem, axis: Axis) -> CssPixels {
         let max = self.maximum_size(item, axis);
-        let maximum = if max.is_length_percentage() && !max.contains_percentage {
+        let maximum = if max.is_length_percentage() && !max.contains_percentage() {
             max.to_px(CssPixels::default())
         } else {
             CssPixels::from_raw(i32::MAX)
@@ -2225,7 +2207,7 @@ impl<'pass> GridFormattingContext<'pass> {
         // If the item’s preferred size in the relevant axis is definite, then the specified size suggestion is that size.
         // It is otherwise undefined.
         let preferred_size = self.preferred_size(item, axis);
-        if !self.facts(item.box_).is_replaced_box() && preferred_size.contains_percentage {
+        if !self.facts(item.box_).is_replaced_box() && preferred_size.contains_percentage() {
             return None;
         }
 
@@ -2303,7 +2285,7 @@ impl<'pass> GridFormattingContext<'pass> {
 
         // In all cases, the size suggestion is additionally clamped by the maximum size in the affected axis, if it’s definite.
         let maximum_size = self.maximum_size(item, axis);
-        if maximum_size.is_length_percentage() && !maximum_size.contains_percentage {
+        if maximum_size.is_length_percentage() && !maximum_size.contains_percentage() {
             result = result.min(maximum_size.to_px(CssPixels::default()));
         }
 
@@ -2312,10 +2294,7 @@ impl<'pass> GridFormattingContext<'pass> {
         // against zero (and considered definite).
         // FIXME: "compressible replaced element" includes more elements than is_replaced_box().
         let preferred_size = self.preferred_size(item, axis);
-        if self.facts(item.box_).is_replaced_box()
-            && (preferred_size.kind() == crate::layout::FfiSizeKind::Percentage
-                || maximum_size.kind() == crate::layout::FfiSizeKind::Percentage)
-        {
+        if self.facts(item.box_).is_replaced_box() && (preferred_size.is_percentage() || maximum_size.is_percentage()) {
             // NOTE: Implements "for this purpose, any indefinite percentages in these sizes are resolved
             //       against zero (and considered definite)." part.
             result = CssPixels::default();
@@ -2369,7 +2348,7 @@ impl<'pass> GridFormattingContext<'pass> {
             return self.max_content_contribution(item, axis);
         } else {
             let mut available = self.item_available_space(item);
-            if axis.is_column() && self.facts(item.box_).is_table_wrapper() && minimum.contains_percentage {
+            if axis.is_column() && self.facts(item.box_).is_table_wrapper() && minimum.contains_percentage() {
                 // Percentage minimum sizes on a table wrapper resolve against the same non-cyclic
                 // inline size that the wrapper's own inline-size resolution uses.
                 let containing = self.containing_block_size(item, Axis::Column);
@@ -2416,7 +2395,7 @@ impl<'pass> GridFormattingContext<'pass> {
         for (index, track) in tracks.iter().enumerate().take(end).skip(start) {
             let max = track.max_sizing;
             if max.is_fixed(available)
-                || matches!(max, TrackSizingFunction::FitContent(value) if !value.contains_percentage || matches!(available, AvailableSize::Definite(_)))
+                || matches!(max, TrackSizingFunction::FitContent(value) if !value.contains_percentage() || matches!(available, AvailableSize::Definite(_)))
             {
                 result += max.resolve(available);
             } else {
@@ -2759,12 +2738,12 @@ impl<'pass> GridFormattingContext<'pass> {
         let table_box = self.sizing().table_box_inside_wrapper(item.box_);
         let table_style = self.style(table_box);
         let wrapper_style = self.style(item.box_);
-        if !wrapper_style.width().contains_percentage
-            && !wrapper_style.min_width().contains_percentage
-            && !wrapper_style.max_width().contains_percentage
-            && !table_style.width().contains_percentage
-            && !table_style.min_width().contains_percentage
-            && !table_style.max_width().contains_percentage
+        if !wrapper_style.width().contains_percentage()
+            && !wrapper_style.min_width().contains_percentage()
+            && !wrapper_style.max_width().contains_percentage()
+            && !table_style.width().contains_percentage()
+            && !table_style.min_width().contains_percentage()
+            && !table_style.max_width().contains_percentage()
         {
             return containing;
         }
@@ -4461,14 +4440,14 @@ pub(crate) struct ExpandedTrackList {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TrackListSource<'a> {
-    pub(crate) names: &'a [usize],
-    pub(crate) entries: &'a [ComputedGridTrackEntry],
-    pub(crate) name_indices: &'a [u32],
+pub(crate) struct TrackListSource {
+    pub(crate) names: &'static [usize],
+    pub(crate) entries: &'static [ComputedGridTrackEntry],
+    pub(crate) name_indices: &'static [u32],
 }
 
-impl<'a> TrackListSource<'a> {
-    fn from_grid_style(grid_style: &'a GridValues) -> Self {
+impl TrackListSource {
+    fn from_grid_style(grid_style: &'static GridValues) -> Self {
         Self {
             names: grid_style.names.raws(),
             entries: grid_style.entries.as_slice(),
@@ -4476,12 +4455,12 @@ impl<'a> TrackListSource<'a> {
         }
     }
 
-    fn entry(&self, index: u32) -> &'a ComputedGridTrackEntry {
+    fn entry(&self, index: u32) -> &'static ComputedGridTrackEntry {
         assert_ne!(index, GRID_NO_INDEX);
         &self.entries[index as usize]
     }
 
-    fn names(&self, entry: &ComputedGridTrackEntry) -> impl Iterator<Item = LineName> + 'a {
+    fn names(&self, entry: &ComputedGridTrackEntry) -> impl Iterator<Item = LineName> + 'static {
         let end = entry
             .name_index_start
             .checked_add(entry.name_index_count)
@@ -4493,7 +4472,11 @@ impl<'a> TrackListSource<'a> {
             .map(move |name_index| LineName::explicit(name_index, name_raws[name_index as usize]))
     }
 
-    fn for_each_entry(&self, list: ComputedGridTrackList, mut callback: impl FnMut(u32, &'a ComputedGridTrackEntry)) {
+    fn for_each_entry(
+        &self,
+        list: ComputedGridTrackList,
+        mut callback: impl FnMut(u32, &'static ComputedGridTrackEntry),
+    ) {
         let mut index = list.first_entry;
         let mut visited = 0usize;
         while index != GRID_NO_INDEX {
@@ -4506,15 +4489,7 @@ impl<'a> TrackListSource<'a> {
     }
 }
 
-fn auto_breadth() -> GridTrackBreadth {
-    GridTrackBreadth {
-        kind: GridTrackBreadthKind::Auto as u8,
-        value: FfiSizeValue::auto_value(),
-        flex_factor: 0.0,
-    }
-}
-
-fn definition_for(entry: &ComputedGridTrackEntry, auto_fit: bool, auto_repeat: bool) -> TrackDefinition {
+fn definition_for(entry: &'static ComputedGridTrackEntry, auto_fit: bool, auto_repeat: bool) -> TrackDefinition {
     match entry.kind {
         kind if kind == ComputedGridTrackEntryKind::TrackSize as u8 => {
             let size = grid_track_breadth_view(&entry.size);
@@ -4522,12 +4497,8 @@ fn definition_for(entry: &ComputedGridTrackEntry, auto_fit: bool, auto_repeat: b
             // min track sizing function:
             // If the track was sized with a minmax() function, this is the first argument to that function.
             // If the track was sized with a <flex> value or fit-content() function, auto. Otherwise, the track’s sizing function.
-            let min = if matches!(
-                size.kind,
-                kind if kind == GridTrackBreadthKind::Flex as u8
-                    || kind == GridTrackBreadthKind::FitContent as u8
-            ) {
-                auto_breadth()
+            let min = if matches!(size, GridTrackBreadth::Flex(_) | GridTrackBreadth::FitContent(_)) {
+                GridTrackBreadth::Auto
             } else {
                 size
             };
@@ -4550,7 +4521,7 @@ fn definition_for(entry: &ComputedGridTrackEntry, auto_fit: bool, auto_repeat: b
 
 #[allow(clippy::too_many_arguments)]
 fn expand_standalone_list(
-    source: TrackListSource<'_>,
+    source: TrackListSource,
     list: ComputedGridTrackList,
     lines: &mut Vec<Vec<LineName>>,
     tracks: &mut Vec<TrackDefinition>,
@@ -4596,7 +4567,7 @@ fn expand_standalone_list(
 /// by placement. `auto_repeat_count` performs the container-size-dependent
 /// auto-fill/auto-fit calculation.
 pub(crate) fn expand_standalone(
-    source: TrackListSource<'_>,
+    source: TrackListSource,
     list: ComputedGridTrackList,
     mut auto_repeat_count: impl FnMut(u32, &ComputedGridTrackEntry) -> usize,
 ) -> ExpandedTrackList {
@@ -4628,7 +4599,7 @@ pub(crate) fn expand_standalone(
     result
 }
 
-pub(crate) fn count_subgrid_line_name_lists(source: TrackListSource<'_>, list: ComputedGridTrackList) -> usize {
+pub(crate) fn count_subgrid_line_name_lists(source: TrackListSource, list: ComputedGridTrackList) -> usize {
     let mut count = 0usize;
     source.for_each_entry(list, |_index, entry| match entry.kind {
         kind if kind == ComputedGridTrackEntryKind::LineNames as u8 => count += 1,
@@ -4645,12 +4616,12 @@ pub(crate) fn count_subgrid_line_name_lists(source: TrackListSource<'_>, list: C
     count
 }
 
-pub(crate) fn automatic_subgrid_span(source: TrackListSource<'_>, list: ComputedGridTrackList) -> usize {
+pub(crate) fn automatic_subgrid_span(source: TrackListSource, list: ComputedGridTrackList) -> usize {
     count_subgrid_line_name_lists(source, list).saturating_sub(1).max(1)
 }
 
 fn expand_subgrid_names(
-    source: TrackListSource<'_>,
+    source: TrackListSource,
     list: ComputedGridTrackList,
     lines: &mut [Vec<LineName>],
     line_index: &mut usize,
@@ -4713,7 +4684,7 @@ fn expand_subgrid_names(
 }
 
 pub(crate) fn expand_subgrid(
-    source: TrackListSource<'_>,
+    source: TrackListSource,
     list: ComputedGridTrackList,
     track_count: usize,
     inherited_lines: &[Vec<LineName>],
@@ -4819,36 +4790,42 @@ pub(crate) fn nth_named_line(lines: &[Vec<LineName>], name_raw: usize, nth_line:
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TrackSizingFunction {
     Auto,
-    Fixed(FfiSizeValue),
+    Fixed(&'static ComputedSize),
+    /// A synthesized fixed track with no backing style value: collapsed
+    /// tracks, gap tracks, and fixed subgrid tracks carry a resolved px size.
+    FixedPx(CssPixels),
     Flex(f64),
     MinContent,
     MaxContent,
-    FitContent(FfiSizeValue),
+    FitContent(&'static ComputedSize),
 }
 
 impl TrackSizingFunction {
     pub(crate) fn from_breadth(value: GridTrackBreadth) -> Self {
-        match value.kind {
-            kind if kind == GridTrackBreadthKind::Auto as u8 => Self::Auto,
-            kind if kind == GridTrackBreadthKind::LengthPercentage as u8 => Self::Fixed(value.value),
-            kind if kind == GridTrackBreadthKind::Flex as u8 => Self::Flex(value.flex_factor),
-            kind if kind == GridTrackBreadthKind::MinContent as u8 => Self::MinContent,
-            kind if kind == GridTrackBreadthKind::MaxContent as u8 => Self::MaxContent,
-            kind if kind == GridTrackBreadthKind::FitContent as u8 => Self::FitContent(value.value),
-            _ => unreachable!("invalid grid track breadth"),
+        match value {
+            GridTrackBreadth::Auto => Self::Auto,
+            GridTrackBreadth::LengthPercentage(size) => Self::Fixed(size),
+            GridTrackBreadth::Flex(factor) => Self::Flex(factor),
+            GridTrackBreadth::MinContent => Self::MinContent,
+            GridTrackBreadth::MaxContent => Self::MaxContent,
+            GridTrackBreadth::FitContent(size) => Self::FitContent(size),
         }
     }
 
     pub(crate) fn is_auto(self, available: AvailableSize) -> bool {
         match self {
             Self::Auto => true,
-            Self::Fixed(value) => value.contains_percentage && !matches!(available, AvailableSize::Definite(_)),
+            Self::Fixed(value) => value.contains_percentage() && !matches!(available, AvailableSize::Definite(_)),
             _ => false,
         }
     }
 
     pub(crate) fn is_fixed(self, available: AvailableSize) -> bool {
-        matches!(self, Self::Fixed(value) if !value.contains_percentage || matches!(available, AvailableSize::Definite(_)))
+        match self {
+            Self::Fixed(value) => !value.contains_percentage() || matches!(available, AvailableSize::Definite(_)),
+            Self::FixedPx(_) => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn is_intrinsic(self, available: AvailableSize) -> bool {
@@ -4877,6 +4854,7 @@ impl TrackSizingFunction {
     pub(crate) fn resolve(self, available: AvailableSize) -> CssPixels {
         match self {
             Self::Fixed(value) | Self::FitContent(value) => value.to_px(available.to_px_or_zero()),
+            Self::FixedPx(px) => px,
             _ => CssPixels::default(),
         }
     }
@@ -4904,10 +4882,9 @@ pub(crate) struct Track {
 
 impl Track {
     pub(crate) fn fixed(base_size: CssPixels) -> Self {
-        let value = fixed_size_value(base_size);
         Self {
-            min_sizing: TrackSizingFunction::Fixed(value),
-            max_sizing: TrackSizingFunction::Fixed(value),
+            min_sizing: TrackSizingFunction::FixedPx(base_size),
+            max_sizing: TrackSizingFunction::FixedPx(base_size),
             base_size,
             growth_limit: Some(base_size),
             flex_factor: None,
@@ -4978,24 +4955,10 @@ impl Track {
     }
 
     pub(crate) fn collapse(&mut self) {
-        let zero = fixed_size_value(CssPixels::default());
-        self.min_sizing = TrackSizingFunction::Fixed(zero);
-        self.max_sizing = TrackSizingFunction::Fixed(zero);
+        self.min_sizing = TrackSizingFunction::FixedPx(CssPixels::default());
+        self.max_sizing = TrackSizingFunction::FixedPx(CssPixels::default());
         self.flex_factor = None;
         self.is_collapsed = true;
-    }
-}
-
-fn fixed_size_value(value: CssPixels) -> FfiSizeValue {
-    use crate::layout::FfiSizeKind;
-    FfiSizeValue {
-        kind: FfiSizeKind::Px as u8,
-        px: value,
-        fraction: 0.0,
-        calc: std::ptr::null(),
-        contains_percentage: false,
-        contains_anchor_function: false,
-        fit_content_has_argument: false,
     }
 }
 
@@ -5015,7 +4978,7 @@ pub(crate) fn initialize_track_sizes(tracks: &mut [Track], available: AvailableS
         }
 
         if !matches!(available, AvailableSize::Definite(_))
-            && matches!(track.max_sizing, TrackSizingFunction::FitContent(value) if value.contains_percentage)
+            && matches!(track.max_sizing, TrackSizingFunction::FitContent(value) if value.contains_percentage())
         {
             // Normalize fit-content tracks with unresolvable percentage arguments to max-content,
             // since the percentage cannot be resolved against an indefinite available size.
