@@ -6,6 +6,7 @@
 
 #include <LibWeb/Bindings/InputEvent.h>
 #include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/HTML/DataTransfer.h>
 #include <LibWeb/UIEvents/InputEvent.h>
 
 namespace Web::UIEvents {
@@ -25,7 +26,7 @@ GC::Ref<InputEvent> InputEvent::create_from_platform_event(JS::Realm& realm, Utf
 
 WebIDL::ExceptionOr<GC::Ref<InputEvent>> InputEvent::construct_impl(JS::Realm& realm, Utf16FlyString const& event_name, Bindings::InputEventInit const& event_init)
 {
-    return realm.create<InputEvent>(realm, event_name, event_init);
+    return realm.create<InputEvent>(realm, event_name, event_init, event_init.target_ranges);
 }
 
 InputEvent::InputEvent(JS::Realm& realm, Utf16FlyString const& event_name, Bindings::InputEventInit const& event_init, Vector<GC::Ref<DOM::StaticRange>> const& target_ranges)
@@ -33,6 +34,7 @@ InputEvent::InputEvent(JS::Realm& realm, Utf16FlyString const& event_name, Bindi
     , m_data(event_init.data)
     , m_is_composing(event_init.is_composing)
     , m_input_type(event_init.input_type)
+    , m_data_transfer(event_init.data_transfer)
     , m_target_ranges(target_ranges)
 {
 }
@@ -48,6 +50,7 @@ void InputEvent::initialize(JS::Realm& realm)
 void InputEvent::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
+    visitor.visit(m_data_transfer);
     visitor.visit(m_target_ranges);
 }
 
