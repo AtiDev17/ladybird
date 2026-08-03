@@ -444,6 +444,17 @@
       "none"
     ]
   },
+  "backface-visibility": {
+    "affects-accumulated-visual-contexts": true,
+    "affects-stacking-context": true,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "visible",
+    "requires-computation": "never",
+    "valid-types": [
+      "backface-visibility"
+    ]
+  },
   "background": {
     "affects-layout": false,
     "initial": "transparent",
@@ -4620,6 +4631,7 @@
     "percentages-resolve-to": "length"
   },
   "transform-style": {
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "initial": "flat",
