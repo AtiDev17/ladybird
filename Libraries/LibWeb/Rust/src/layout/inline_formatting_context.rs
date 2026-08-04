@@ -750,7 +750,7 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
     pub(crate) fn dimension_box_on_line(&mut self, node: Node) {
         let available_space = self.input.available_space;
         let facts = self.facts(node);
-        if facts.is_list_item_marker_box() {
+        if facts.is_list_item_marker_box() && facts.marker_is_symbolic() {
             SizingContext::new(self.state, self.callbacks)
                 .resolve_box_model_metrics_against_inline_basis(node, available_space.inline_size.to_px_or_zero());
             self.parent.dimension_list_item_marker(node);
@@ -1059,7 +1059,15 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
         self.automatic_content_inline_size = self
             .parent
             .greatest_child_inline_size_including_floats(self.containing_block);
-        crate::layout::compute_and_store_baselines(self.state, &self.callbacks, self.containing_block, false);
+        let baselines = crate::layout::derive_baselines(self.state, &self.callbacks, self.containing_block, false);
+        if self.containing_block == self.parent.root_box() {
+            self.parent.record_derived_baselines_of_root_box(baselines);
+        } else {
+            crate::layout::store_derived_baselines(
+                self.state.used_values(&self.callbacks, self.containing_block),
+                baselines,
+            );
+        }
     }
 
     fn compute_inline_box_pieces(&mut self) {
