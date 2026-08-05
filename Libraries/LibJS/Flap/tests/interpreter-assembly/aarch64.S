@@ -82,6 +82,7 @@ asm_dispatch_table:
     .quad asm_handler_ThrowIfNullish
     .quad asm_handler_ThrowConstAssignment
     .quad asm_handler_Throw
+    .quad asm_handler_Debugger
     .quad asm_handler_Await
     .quad asm_handler_Yield
     .quad asm_handler_YieldIteratorResult
@@ -266,7 +267,264 @@ asm_dispatch_table:
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
-    .quad asm_handler_fallback
+
+asm_debug_dispatch_table:
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
 
 .globl CSYM(js_interpreter_handler_ranges)
 .p2align 3
@@ -555,6 +813,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_Throw_hot_end
     .quad asm_handler_Throw_cold
     .quad asm_handler_Throw_cold_end
+    .quad asm_handler_Debugger
+    .quad asm_handler_Debugger_hot_end
+    .quad asm_handler_Debugger_cold
+    .quad asm_handler_Debugger_cold_end
     .quad asm_handler_Await
     .quad asm_handler_Await_hot_end
     .quad asm_handler_Await_cold
@@ -1291,10 +1553,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
     .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
 
 .text
 
@@ -1330,8 +1588,15 @@ CSYM(js_interpreter):
     mov x20, x3              // vm = VM*
     ldr x28, [x3, #15288]
     // x28 = exec_ctx
+    ldr x9, [x3, #16664]
+    cbz x9, .Lnormal_dispatch_table
+    adrp x19, asm_debug_dispatch_table
+    add x19, x19, :lo12:asm_debug_dispatch_table
+    b .Ldispatch_table_ready
+.Lnormal_dispatch_table:
     adrp x19, asm_dispatch_table
     add x19, x19, :lo12:asm_dispatch_table
+.Ldispatch_table_ready:
     // x19 = dispatch table
     movz x9, #0x7ff8, lsl #48
     fmov d8, x9              // d8 = CANON_NAN_BITS
@@ -1344,6 +1609,24 @@ CSYM(js_interpreter):
     add x21, x26, w1, uxtw   // x21 = pb + entry_point
     ldrb w9, [x21]           // w9 = opcode byte
     ldr x10, [x19, x9, lsl #3]
+    br x10
+
+.p2align 4
+asm_debugger_trampoline:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #56]
+    bl CSYM(asm_debugger_check_breakpoint)
+    ldr x28, [x20, #15288]
+    ldr x9, [x28, #80]
+    ldr x26, [x9, #104]
+    add x27, x28, #120
+    ldr w9, [x28, #56]
+    add x21, x26, w9, uxtw
+    ldrb w9, [x21]
+    adrp x10, asm_dispatch_table
+    add x10, x10, :lo12:asm_dispatch_table
+    ldr x10, [x10, x9, lsl #3]
     br x10
 
 .p2align 4
@@ -8071,6 +8354,26 @@ asm_handler_Throw:
 asm_handler_Throw_hot_end:
 asm_handler_Throw_cold:
 asm_handler_Throw_cold_end:
+
+.p2align 4
+asm_handler_Debugger:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #56]
+    mov x2, x21
+    bl CSYM(asm_slow_path_debugger)
+    tbnz x0, #63, .Lexit_veneer
+    ldr x28, [x20, #15288]
+    ldr x9, [x28, #80]
+    ldr x26, [x9, #104]
+    add x27, x28, #120
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_Debugger_hot_end:
+asm_handler_Debugger_cold:
+asm_handler_Debugger_cold_end:
 
 .p2align 4
 asm_handler_Await:

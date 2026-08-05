@@ -12,6 +12,7 @@
 #include <LibJS/Bytecode/Op.h>
 #include <LibJS/Bytecode/PropertyAccess.h>
 #include <LibJS/Bytecode/PropertyNameIterator.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/AsyncFromSyncIteratorPrototype.h>
@@ -561,6 +562,7 @@ static i64 finish_binary_slow_path(VM& vm, u32 pc, Operand destination, ThrowCom
 extern "C" {
 
 // Forward declarations for all functions called from assembly.
+void asm_debugger_check_breakpoint(VM*, u32 pc);
 i64 asm_fallback_handler(VM*, u32 pc, u8 const* instruction);
 i64 asm_slow_path_jump_less_than_values(VM*, u32 pc, Value, Value, u32, u32);
 i64 asm_slow_path_jump_greater_than_values(VM*, u32 pc, Value, Value, u32, u32);
@@ -710,6 +712,7 @@ i64 asm_slow_path_throw(VM*, u32 pc, Op::Throw const*);
 i64 asm_slow_path_throw_if_tdz(VM*, u32 pc, Op::ThrowIfTDZ const*);
 i64 asm_slow_path_throw_if_not_object(VM*, u32 pc, Op::ThrowIfNotObject const*);
 i64 asm_slow_path_throw_if_nullish(VM*, u32 pc, Op::ThrowIfNullish const*);
+i64 asm_slow_path_debugger(VM*, u32 pc, Op::Debugger const*);
 i64 asm_slow_path_yield(VM*, u32 pc, Op::Yield const*);
 i64 asm_slow_path_yield_iterator_result(VM*, u32 pc, Op::YieldIteratorResult const*);
 i64 asm_slow_path_instance_of(VM*, u32 pc, Op::InstanceOf const*);
@@ -735,6 +738,30 @@ i64 asm_try_put_by_value_typed_array(VM*, u32 pc, Op::PutByValue const*);
 
 // ===== Fallback handler for invalid dispatch table entries =====
 // NB: Every bytecode opcode has a DSL handler, so this should never run.
+void asm_debugger_check_breakpoint(VM* vm, u32 pc)
+{
+    // NB: The dispatch table is chosen when entering the interpreter, so we keep getting called
+    //     for the rest of the frame even if the host detaches its debugger in the meantime.
+    auto* debugger = vm->debugger();
+    if (!debugger)
+        return;
+
+    auto& executable = vm->current_executable();
+    debugger->register_executable(executable);
+    auto reason = [&]() -> Optional<Debugger::PauseReason> {
+        if (debugger->should_pause_on_next_bytecode_execution(executable, pc))
+            return Debugger::PauseReason::Entry;
+        if (executable.has_debugger_breakpoint_at(pc))
+            return Debugger::PauseReason::Breakpoint;
+        return {};
+    }();
+
+    bool did_pause = false;
+    if (reason.has_value())
+        did_pause = debugger->pause_execution(executable, pc, *reason);
+    debugger->set_did_pause_before_current_instruction(did_pause);
+}
+
 i64 asm_fallback_handler(VM*, u32, u8 const*)
 {
     VERIFY_NOT_REACHED();
@@ -2796,6 +2823,14 @@ i64 asm_slow_path_throw_const_assignment(VM* vm, u32 pc, Op::ThrowConstAssignmen
 {
     auto completion = vm->throw_completion<TypeError>(ErrorType::InvalidAssignToConst);
     return handle_asm_exception(*vm, pc, completion.value());
+}
+
+i64 asm_slow_path_debugger(VM* vm, u32 pc, Op::Debugger const*)
+{
+    // NB: Don't pause twice if the debugger trampoline already paused before this instruction.
+    if (auto* debugger = vm->debugger(); debugger && !debugger->did_pause_before_current_instruction())
+        debugger->pause_execution(vm->current_executable(), pc, Debugger::PauseReason::DebuggerStatement);
+    return static_cast<i64>(pc + sizeof(Op::Debugger));
 }
 
 i64 asm_slow_path_yield(VM* vm, [[maybe_unused]] u32 pc, Op::Yield const* instruction)

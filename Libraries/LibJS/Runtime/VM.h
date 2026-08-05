@@ -133,6 +133,15 @@ public:
 
     [[nodiscard]] PropertyKey const& get_property_key(Bytecode::PropertyKeyTableIndex) const;
 
+    // NB: The interpreter picks its dispatch table when it starts running an outermost executable.
+    //     Enabling debugging therefore only takes effect for later interpreter invocations, not
+    //     code that is already running.
+    void enable_debugging();
+    void disable_debugging();
+    [[nodiscard]] bool debugging_enabled() const { return m_debugger; }
+    [[nodiscard]] Debugger* debugger() { return m_debugger; }
+    [[nodiscard]] Debugger const* debugger() const { return m_debugger; }
+
     enum class HandleExceptionResponse {
         ExitFromExecutable,
         ContinueInThisExecutable,
@@ -568,6 +577,7 @@ private:
     u32 m_module_execution_depth { 0 };
     u64 m_module_async_evaluation_count { 0 }; // [[ModuleAsyncEvaluationCount]]
 
+    OwnPtr<Debugger> m_debugger;
     OwnPtr<Agent> m_agent;
 
     bool m_dynamic_imports_allowed { false };

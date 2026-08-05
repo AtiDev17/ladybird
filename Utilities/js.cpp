@@ -7,8 +7,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/LexicalPath.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Platform.h>
+#include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf16String.h>
@@ -19,6 +21,7 @@
 #include <LibJS/Bytecode/Debug.h>
 #include <LibJS/Console.h>
 #include <LibJS/Contrib/Test262/GlobalObject.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Print.h>
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/DeclarativeEnvironment.h>
@@ -109,6 +112,197 @@ static String s_history_path = String {};
 [[maybe_unused]] static int s_repl_line_level = 0;
 [[maybe_unused]] static bool s_keep_running_repl = true;
 static int s_exit_code = 0;
+
+static StringView debugger_pause_reason(JS::Debugger::PauseReason reason)
+{
+    switch (reason) {
+    case JS::Debugger::PauseReason::Entry:
+        return "entry"sv;
+    case JS::Debugger::PauseReason::Breakpoint:
+        return "breakpoint"sv;
+    case JS::Debugger::PauseReason::DebuggerStatement:
+        return "debugger statement"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+struct BreakpointLocation {
+    Utf16String filename;
+    u32 line { 0 };
+    Optional<u32> column;
+};
+
+static Utf16String breakpoint_filename(StringView filename, Utf16View current_filename)
+{
+    if (!current_filename.is_empty()) {
+        auto canonical_filename = LexicalPath::canonicalized_path(filename);
+        auto canonical_current_filename = LexicalPath::canonicalized_path(current_filename.to_utf8_but_should_be_ported_to_utf16().to_byte_string());
+        if (canonical_filename == canonical_current_filename)
+            return Utf16String::from_utf16(current_filename);
+    }
+    return Utf16String::from_utf8_with_replacement_character(filename);
+}
+
+static Optional<BreakpointLocation> parse_breakpoint_location(StringView input, Utf16View current_filename)
+{
+    input = input.trim_whitespace();
+    if (auto line = input.to_number<u32>(); line.has_value()) {
+        if (*line == 0)
+            return {};
+        return BreakpointLocation { Utf16String::from_utf16(current_filename), *line, {} };
+    }
+
+    auto last_colon = input.find_last(':');
+    if (!last_colon.has_value())
+        return {};
+
+    auto final_component = input.substring_view(*last_colon + 1).to_number<u32>();
+    if (!final_component.has_value())
+        return {};
+
+    auto prefix = input.substring_view(0, *last_colon);
+    if (auto line = prefix.to_number<u32>(); line.has_value()) {
+        if (*line == 0)
+            return {};
+        return BreakpointLocation { Utf16String::from_utf16(current_filename), *line, *final_component };
+    }
+
+    if (auto preceding_colon = prefix.find_last(':'); preceding_colon.has_value()) {
+        if (auto line = prefix.substring_view(*preceding_colon + 1).to_number<u32>(); line.has_value()) {
+            auto filename = prefix.substring_view(0, *preceding_colon);
+            if (filename.is_empty() || *line == 0)
+                return {};
+            return BreakpointLocation { breakpoint_filename(filename, current_filename), *line, *final_component };
+        }
+    }
+
+    if (prefix.is_empty() || *final_component == 0)
+        return {};
+    return BreakpointLocation { breakpoint_filename(prefix, current_filename), *final_component, {} };
+}
+
+static void print_breakpoint(JS::Breakpoint const& breakpoint)
+{
+    auto const* state = g_vm->debugger()->is_breakpoint_resolved(breakpoint.id) ? "resolved" : "pending";
+    if (breakpoint.column.has_value())
+        outln("{}: {}:{}:{} ({})", breakpoint.id, breakpoint.filename, breakpoint.line, *breakpoint.column, state);
+    else
+        outln("{}: {}:{} ({})", breakpoint.id, breakpoint.filename, breakpoint.line, state);
+}
+
+static void print_debugger_help()
+{
+    outln("Debugger commands:");
+    outln("    .break <line>[:column]");
+    outln("    .break <file>:<line>[:column]");
+    outln("    .breakpoints");
+    outln("    .continue");
+    outln("    .delete <id>");
+    outln("    .help");
+}
+
+static void run_debugger_prompt(JS::Debugger::PauseInfo const& pause_info)
+{
+    if (pause_info.source_range.has_value()) {
+        auto const& range = *pause_info.source_range;
+        if (range.start.line > 0)
+            outln("Paused at {}:{}:{} ({})", range.filename(), range.start.line, range.start.column, debugger_pause_reason(pause_info.reason));
+        else
+            outln("Paused in {} ({})", range.filename(), debugger_pause_reason(pause_info.reason));
+    } else {
+        outln("Paused at bytecode offset {} ({})", pause_info.bytecode_offset, debugger_pause_reason(pause_info.reason));
+    }
+
+    for (;;) {
+#if defined(AK_OS_WINDOWS) || defined(AK_OS_ANDROID)
+        out("(debug) ");
+        (void)fflush(stdout);
+
+        Array<char, 4096> buffer;
+        auto* raw_line = fgets(buffer.data(), buffer.size(), stdin);
+        if (!raw_line) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+        auto command = StringView { raw_line, strlen(raw_line) }.trim_whitespace();
+#else
+        auto* raw_line = readline("(debug) ");
+        if (!raw_line) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+        ArmedScopeGuard free_raw_line = [&] {
+            free(raw_line);
+        };
+        auto command = StringView { raw_line, strlen(raw_line) }.trim_whitespace();
+#endif
+
+        if (command == ".continue"sv) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+
+        if (command == ".help"sv) {
+            print_debugger_help();
+            continue;
+        }
+
+        if (command == ".breakpoints"sv) {
+            auto breakpoints = g_vm->debugger()->breakpoints();
+            if (breakpoints.is_empty()) {
+                outln("No breakpoints.");
+                continue;
+            }
+            quick_sort(breakpoints, [](auto const& lhs, auto const& rhs) {
+                return lhs.id < rhs.id;
+            });
+            for (auto const& breakpoint : breakpoints)
+                print_breakpoint(breakpoint);
+            continue;
+        }
+
+        if (command.starts_with(".break "sv)) {
+            Utf16String current_filename;
+            if (pause_info.source_range.has_value())
+                current_filename = pause_info.source_range->filename();
+
+            auto location = parse_breakpoint_location(command.substring_view(7), current_filename);
+            if (!location.has_value() || location->filename.is_empty()) {
+                warnln("Usage: .break <line>[:column] or .break <file>:<line>[:column]");
+                continue;
+            }
+
+            auto breakpoint_id = g_vm->debugger()->add_breakpoint(location->filename, location->line, location->column);
+            if (breakpoint_id.is_error()) {
+                warnln("Unable to set breakpoint: {}", breakpoint_id.error());
+                continue;
+            }
+
+            auto breakpoint = g_vm->debugger()->breakpoints().find_if([&](auto const& breakpoint) {
+                return breakpoint.id == breakpoint_id.value();
+            });
+            VERIFY(!breakpoint.is_end());
+            print_breakpoint(*breakpoint);
+            continue;
+        }
+
+        if (command.starts_with(".delete "sv)) {
+            auto breakpoint_id = command.substring_view(8).trim_whitespace().to_number<JS::BreakpointID>();
+            if (!breakpoint_id.has_value()) {
+                warnln("Usage: .delete <id>");
+                continue;
+            }
+            if (!g_vm->debugger()->remove_breakpoint(*breakpoint_id)) {
+                warnln("No breakpoint with id {}.", *breakpoint_id);
+                continue;
+            }
+            outln("Deleted breakpoint {}.", *breakpoint_id);
+            continue;
+        }
+
+        warnln("Unknown debugger command '{}'. Enter .help for a list of commands.", command);
+    }
+}
 
 static ErrorOr<void> print_inline(JS::Value value, Stream& stream)
 {
@@ -836,6 +1030,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     bool disable_debug_printing = false;
     bool use_test262_global = false;
     bool parse_only = false;
+    bool debug = false;
     StringView evaluate_script;
     Vector<StringView> script_paths;
 
@@ -852,6 +1047,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(s_raw_strings, "Display strings without quotes or escape sequences", "raw-strings", 'r');
     args_parser.add_option(disable_syntax_highlight, "Disable live syntax highlighting", "no-syntax-highlight", 's');
     args_parser.add_option(disable_debug_printing, "Disable debug output", "disable-debug-output", {});
+    args_parser.add_option(debug, "Run with the JavaScript debugger", "debug", {});
     args_parser.add_option(evaluate_script, "Evaluate argument as a script", "evaluate", 'c', "script");
     args_parser.add_option(use_test262_global, "Use test262 global ($262)", "use-test262-global", {});
     args_parser.add_positional_argument(script_paths, "Path to script files", "scripts", Core::ArgsParser::Required::No);
@@ -868,6 +1064,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     g_vm_storage.get() = JS::VM::create();
     g_vm = g_vm_storage->ptr();
     g_vm->set_dynamic_imports_allowed(true);
+
+    if (debug) {
+        g_vm->enable_debugging();
+        g_vm->debugger()->set_pause_callback(run_debugger_prompt);
+        g_vm->debugger()->request_pause_on_next_bytecode_execution();
+    }
 
     if (!disable_debug_printing) {
         // NOTE: These will print out both warnings when using something like Promise.reject().catch(...) -
