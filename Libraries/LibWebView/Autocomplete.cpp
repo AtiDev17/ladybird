@@ -34,6 +34,7 @@ static constexpr auto about_url_prefix = "about:"sv;
 static constexpr auto builtin_autocomplete_engines = to_array<AutocompleteEngine>({
     { "DuckDuckGo"sv, "https://duckduckgo.com/ac/?q={}"sv },
     { "Google"sv, "https://www.google.com/complete/search?client=chrome&q={}"sv },
+    { "Kagi"sv, "https://kagisuggest.com/api/autosuggest?q={}"sv },
     { "Yahoo"sv, "https://search.yahoo.com/sugg/gossip/gossip-us-ura/?output=sd1&command={}"sv },
 });
 
@@ -373,7 +374,7 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, Autocomplete
 
             auto content_type = response_headers.get("Content-Type"sv);
 
-            if (auto result = received_autocomplete_respsonse(engine, content_type, payload.bytes()); result.is_error()) {
+            if (auto result = received_autocomplete_response(engine, content_type, payload.bytes()); result.is_error()) {
                 warnln("Unable to handle autocomplete response: {}", result.error());
                 deliver_current_result();
             } else {
@@ -472,6 +473,34 @@ static ErrorOr<Vector<String>> parse_google_autocomplete(JsonValue const& json)
     return results;
 }
 
+static ErrorOr<Vector<String>> parse_kagi_autocomplete(JsonValue const& json)
+{
+    if (!json.is_array())
+        return Error::from_string_literal("Expected Kagi autocomplete response to be a JSON array");
+
+    auto const& values = json.as_array();
+
+    if (values.size() != 2)
+        return Error::from_string_literal("Invalid Kagi autocomplete response, expected 2 elements in array");
+    if (!values[1].is_array())
+        return Error::from_string_literal("Invalid Kagi autocomplete response, expected second element to be an array");
+
+    auto const& suggestions = values[1].as_array();
+
+    Vector<String> results;
+    results.ensure_capacity(suggestions.size());
+
+    TRY(suggestions.try_for_each([&](JsonValue const& suggestion) -> ErrorOr<void> {
+        if (!suggestion.is_string())
+            return Error::from_string_literal("Invalid Kagi autocomplete response, expected value to be a string");
+
+        results.unchecked_append(suggestion.as_string());
+        return {};
+    }));
+
+    return results;
+}
+
 static ErrorOr<Vector<String>> parse_yahoo_autocomplete(JsonValue const& json)
 {
     if (!json.is_object())
@@ -499,7 +528,7 @@ static ErrorOr<Vector<String>> parse_yahoo_autocomplete(JsonValue const& json)
     return results;
 }
 
-ErrorOr<Vector<String>> Autocomplete::received_autocomplete_respsonse(AutocompleteEngine const& engine, Optional<ByteString const&> content_type, StringView response)
+ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(AutocompleteEngine const& engine, Optional<ByteString const&> content_type, StringView response)
 {
     auto decoder = [&]() -> Optional<TextCodec::Decoder&> {
         if (!content_type.has_value())
@@ -526,6 +555,8 @@ ErrorOr<Vector<String>> Autocomplete::received_autocomplete_respsonse(Autocomple
         return parse_duckduckgo_autocomplete(json);
     if (engine.name == "Google")
         return parse_google_autocomplete(json);
+    if (engine.name == "Kagi")
+        return parse_kagi_autocomplete(json);
     if (engine.name == "Yahoo")
         return parse_yahoo_autocomplete(json);
 
