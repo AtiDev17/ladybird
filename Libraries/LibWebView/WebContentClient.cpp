@@ -1476,7 +1476,14 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_r
             handle = view->on_new_web_view(activate_tab, hints, new_page_id);
     }
 
-    return { new_page_id, move(handle) };
+    auto view = view_for_page_id(new_page_id);
+    if (!view.has_value())
+        return { {}, {}, move(handle) };
+
+    auto root_navigable_id = Application::the().allocate_ui_process_cross_process_id();
+    view->traversable().set_id(root_navigable_id);
+
+    return { new_page_id, root_navigable_id, move(handle) };
 }
 
 void WebContentClient::did_request_activate_tab(u64 page_id)
@@ -1894,6 +1901,18 @@ void WebContentClient::did_change_screen_wake_lock_state(u64 page_id, Web::Scree
         view->did_change_screen_wake_lock_state({}, wake_lock_state);
 }
 
+void WebContentClient::did_create_top_level_traversable(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry)
+{
+    auto navigable = hosted_navigable_for_page(page_id, navigable_id);
+    if (!navigable.has_value() || !navigable->is_top_level_traversable())
+        return;
+
+    auto view = ViewImplementation::find_view_for_traversable(navigable->top_level_traversable());
+    if (!view.has_value())
+        return;
+    view->did_create_top_level_traversable({}, move(initial_history_entry));
+}
+
 void WebContentClient::did_update_session_history_entry_navigation_api_state(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key, Web::HTML::StorageSerializationRecord navigation_api_state)
 {
     auto navigable = hosted_navigable_for_page(page_id, navigable_id);
@@ -1950,12 +1969,30 @@ void WebContentClient::did_remove_nested_history(u64 page_id, Web::HTML::CrossPr
     parent_navigable->top_level_traversable().remove_nested_history(*parent_navigable, child_navigable_id);
 }
 
-void WebContentClient::did_finalize_same_document_navigation(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Utf16String> entry_to_replace_navigation_api_key)
+void WebContentClient::did_request_finalize_same_document_navigation(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement)
 {
-    auto navigable = hosted_navigable_for_page(page_id, navigable_id);
-    if (!navigable.has_value())
+    Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> finalization;
+    if (auto navigable = hosted_navigable_for_page(page_id, navigable_id); navigable.has_value()) {
+        finalization = navigable->top_level_traversable().request_to_finalize_same_document_navigation(
+            *navigable, move(target_entry), replaces_current_entry, history_handling, user_involvement);
+    }
+
+    if (!finalization.has_value()) {
+        async_complete_finalize_same_document_navigation(page_id, operation_id, false, 0, 0, 0, 0);
         return;
-    navigable->top_level_traversable().finalize_same_document_navigation(*navigable, move(target_entry), move(entry_to_replace_navigation_api_key));
+    }
+
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_finalize_same_document_navigation({});
+
+    async_complete_finalize_same_document_navigation(
+        page_id,
+        operation_id,
+        true,
+        finalization->entry_step,
+        finalization->target_step,
+        finalization->script_history_length,
+        finalization->script_history_index);
 }
 
 void WebContentClient::did_finalize_cross_document_navigation(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key)

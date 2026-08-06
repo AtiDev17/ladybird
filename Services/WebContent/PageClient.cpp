@@ -1156,7 +1156,11 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
         Core::Process::terminate_immediately(0);
     }
 
-    auto& new_client = m_owner.create_page(response->new_page_id());
+    if (!response->new_page_id().has_value())
+        return {};
+    VERIFY(response->root_navigable_id().has_value());
+
+    auto& new_client = m_owner.create_page(*response->new_page_id(), *response->root_navigable_id());
     return { &new_client.page(), response->take_handle() };
 }
 
@@ -1178,6 +1182,11 @@ void PageClient::page_did_close_top_level_traversable()
     // NOTE: This only removes the strong reference the PageHost has for this PageClient.
     //       It will be GC'd 'later'.
     m_owner.remove_page({}, m_id);
+}
+
+void PageClient::page_did_create_top_level_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& initial_history_entry)
+{
+    client().async_did_create_top_level_traversable(m_id, navigable_id, initial_history_entry);
 }
 
 void PageClient::page_did_change_needs_beforeunload_check(bool needs_beforeunload_check)
@@ -1225,9 +1234,17 @@ void PageClient::page_did_remove_nested_history(Web::HTML::CrossProcessId parent
     client().async_did_remove_nested_history(m_id, parent_navigable_id, child_navigable_id);
 }
 
-void PageClient::page_did_finalize_same_document_navigation(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& target_entry, Optional<Utf16String> const& entry_to_replace_navigation_api_key)
+void PageClient::page_did_request_finalize_same_document_navigation(u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry const& target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement)
 {
-    client().async_did_finalize_same_document_navigation(m_id, navigable_id, target_entry, entry_to_replace_navigation_api_key);
+    client().async_did_request_finalize_same_document_navigation(m_id, operation_id, navigable_id, target_entry, replaces_current_entry, history_handling, user_involvement);
+}
+
+void PageClient::did_complete_finalize_same_document_navigation(u64 operation_id, bool committed, int entry_step, int target_step, u64 script_history_length, u64 script_history_index)
+{
+    page().top_level_traversable()->did_complete_finalize_same_document_navigation(operation_id, committed, entry_step, target_step, {
+                                                                                                                                         .script_history_length = script_history_length,
+                                                                                                                                         .script_history_index = script_history_index,
+                                                                                                                                     });
 }
 
 void PageClient::page_did_finalize_cross_document_navigation(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& history_entry, Optional<Utf16String> const& entry_to_replace_navigation_api_key)
