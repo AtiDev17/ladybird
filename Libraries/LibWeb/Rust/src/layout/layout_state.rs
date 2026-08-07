@@ -397,6 +397,11 @@ impl<'pass> NodeFacts<'pass> {
         !crate::layout::node_is_out_of_flow(self.data(), self.computed_values_view_if_styled())
     }
 
+    pub(crate) fn is_floating_or_absolutely_positioned(&self) -> bool {
+        self.computed_values_view_if_styled()
+            .is_some_and(|style| style.is_floating() || style.is_absolutely_positioned())
+    }
+
     pub(crate) fn is_inline(&self) -> bool {
         crate::layout::kind_is_text(self.data().kind)
             || self
@@ -497,6 +502,14 @@ impl<'pass> NodeFacts<'pass> {
         self.data().kind == NodeKind::SVGClipBox
     }
 
+    pub(crate) fn is_flow_layout_participant(&self) -> bool {
+        self.is_box()
+            && !self.is_absolutely_positioned()
+            && !self.is_list_item_marker_box()
+            && !self.is_svg_mask_box()
+            && !self.is_svg_clip_box()
+    }
+
     pub(crate) fn display_before_box_type_transformation_is_block_outside(&self) -> bool {
         self.computed_values_view_if_styled()
             .is_some_and(|style| style.display_before_box_type_transformation().is_block_outside())
@@ -528,6 +541,10 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn is_anonymous(&self) -> bool {
         crate::layout::has_flag(self.data(), NodeFlag::Anonymous)
+    }
+
+    pub(crate) fn has_anchor_names(&self) -> bool {
+        crate::layout::has_flag(self.data(), NodeFlag::HasAnchorNames)
     }
 
     pub(crate) fn can_have_children(&self) -> bool {
@@ -763,6 +780,10 @@ impl<'pass> NodeFacts<'pass> {
         self.display().is_table_footer_group()
     }
 
+    pub(crate) fn is_table_row_group_kind(&self) -> bool {
+        self.display().is_table_row_group_kind()
+    }
+
     pub(crate) fn is_table_row(&self) -> bool {
         self.display().is_table_row()
     }
@@ -811,9 +832,8 @@ pub(crate) struct LayoutState {
     abspos_layout_pass_is_active: Cell<bool>,
     anchor_inset_store: AnchorInsetStore,
     replaced_content_facts: PagedStore<crate::layout::FfiReplacedContentFacts>,
-    line_data: PagedStore<RefCell<LineData>>,
-    used_values_rare_data: PagedStore<RefCell<UsedValuesRareData>>,
     inline_containing_blocks: RefCell<HashSet<Node>>,
+    anchor_candidate_shells: RefCell<Vec<*mut c_void>>,
     purpose: LayoutStatePurpose,
 }
 
@@ -859,9 +879,8 @@ impl LayoutState {
             abspos_layout_pass_is_active: Cell::new(false),
             anchor_inset_store: AnchorInsetStore::default(),
             replaced_content_facts: PagedStore::default(),
-            line_data: PagedStore::default(),
-            used_values_rare_data: PagedStore::default(),
             inline_containing_blocks: RefCell::new(HashSet::new()),
+            anchor_candidate_shells: RefCell::new(Vec::new()),
             purpose,
         }
     }
@@ -1038,7 +1057,9 @@ impl LayoutState {
         used.content_inline_size.set(content_inline_size.unwrap_or_default());
         used.content_block_size.set(content_block_size.unwrap_or_default());
 
-        self.used_values.allocate(slot_index, used)
+        let used = self.used_values.allocate(slot_index, used);
+        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
+        used
     }
 
     pub(crate) fn populate_from_paintable(
@@ -1071,7 +1092,6 @@ impl LayoutState {
         used.set_content_block_size(geometry.content_block_size);
         used.has_definite_inline_size.set(true);
         used.has_definite_block_size.set(true);
-        used.has_content_offset.set(true);
         used.content_offset.set(geometry.content_offset);
         used.margin_left.set(geometry.margin_left);
         used.margin_right.set(geometry.margin_right);
@@ -1089,11 +1109,17 @@ impl LayoutState {
         used.inset_right.set(geometry.inset_right);
         used.inset_top.set(geometry.inset_top);
         used.inset_bottom.set(geometry.inset_bottom);
+        // Materialization is this box's placement: the previous paintable's
+        // committed geometry is final from the moment it is adopted.
+        used.has_content_offset.set(true);
+        used.seal_committed_box_metrics();
+
+        let used = self.used_values.allocate(slot_index, used);
         if self.node_facts(callbacks, node).is_svg_svg_box() {
             self.used_values_rare_data_mut(slot_index).svg_viewport_size = Some(geometry.svg_viewport_size);
         }
-
-        Some(self.used_values.allocate(slot_index, used))
+        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
+        Some(used)
     }
 
     pub(crate) fn note_inline_containing_block(&self, inline_containing_block: Node) {
@@ -1112,10 +1138,15 @@ impl LayoutState {
         self.used_values_rare_data(slot_index)?.inline_containing_block_first_last_rect
     }
 
-    pub(crate) fn used_value_nodes(&self) -> Vec<Node> {
-        let mut nodes = Vec::new();
-        self.used_values.for_each(|used| nodes.push(used.node));
-        nodes
+    fn register_anchor_candidate_if_carries_anchor_names(&self, callbacks: &FfiLayoutFcCallbacks, node: Node) {
+        if !self.node_facts(callbacks, node).has_anchor_names() {
+            return;
+        }
+        self.anchor_candidate_shells.borrow_mut().push(callbacks.shell(node));
+    }
+
+    pub(crate) fn anchor_candidate_shells(&self) -> Ref<'_, Vec<*mut c_void>> {
+        self.anchor_candidate_shells.borrow()
     }
 
     pub(crate) fn set_box_is_grid_item(&self, callbacks: &FfiLayoutFcCallbacks, node: Node, is_grid_item: bool) {
@@ -1224,30 +1255,38 @@ impl LayoutState {
     }
 
     pub(crate) fn line_data_cell(&self, slot_index: u32) -> &RefCell<LineData> {
-        self.line_data
-            .get(slot_index)
-            .unwrap_or_else(|| self.line_data.allocate(slot_index, RefCell::new(LineData::default())))
+        self.used_values_by_slot(slot_index)
+            .expect("missing used values")
+            .line_data
+            .get_or_init(LineData::default)
     }
 
     pub(crate) fn line_data(&self, slot_index: u32) -> Option<Ref<'_, LineData>> {
-        self.line_data.get(slot_index).map(RefCell::borrow)
+        self.used_values_by_slot(slot_index)?
+            .line_data
+            .get()
+            .map(RefCell::borrow)
     }
 
     pub(crate) fn line_data_mut_if_present(&self, slot_index: u32) -> Option<RefMut<'_, LineData>> {
-        self.line_data.get(slot_index).map(RefCell::borrow_mut)
+        self.used_values_by_slot(slot_index)?
+            .line_data
+            .get()
+            .map(RefCell::borrow_mut)
     }
 
     pub(crate) fn used_values_rare_data(&self, slot_index: u32) -> Option<Ref<'_, UsedValuesRareData>> {
-        self.used_values_rare_data.get(slot_index).map(RefCell::borrow)
+        self.used_values_by_slot(slot_index)?
+            .rare_data
+            .get()
+            .map(RefCell::borrow)
     }
 
     pub(crate) fn used_values_rare_data_mut(&self, slot_index: u32) -> RefMut<'_, UsedValuesRareData> {
-        self.used_values_rare_data
-            .get(slot_index)
-            .unwrap_or_else(|| {
-                self.used_values_rare_data
-                    .allocate(slot_index, RefCell::new(UsedValuesRareData::default()))
-            })
+        self.used_values_by_slot(slot_index)
+            .expect("missing used values")
+            .rare_data
+            .get_or_init(UsedValuesRareData::default)
             .borrow_mut()
     }
 
@@ -1259,7 +1298,7 @@ impl LayoutState {
         self.used_values_rare_data_mut(callbacks.slot_index(node))
     }
 
-    pub(crate) fn used_values_by_slot(&self, slot_index: u32) -> Option<&UsedValues> {
+    fn used_values_by_slot(&self, slot_index: u32) -> Option<&UsedValues> {
         self.used_values.get(slot_index)
     }
 
@@ -1267,14 +1306,6 @@ impl LayoutState {
         self.used_values
             .get(callbacks.slot_index(node))
             .expect("missing used values")
-    }
-
-    pub(crate) fn try_used_values(
-        &self,
-        callbacks: &FfiLayoutFcCallbacks,
-        node: Node,
-    ) -> Option<&UsedValues> {
-        self.used_values.get(callbacks.slot_index(node))
     }
 
     pub(crate) fn register_contained_abspos_child(
@@ -1387,13 +1418,13 @@ impl LayoutState {
             }
             result.found_fragmented_inline_node |= facts.is_fragmented_inline();
             if facts.is_relatively_positioned() {
-                // An inline that never went through inline layout this pass has
-                // no used values; its committed box model is zeroed, so it
-                // contributes no inset.
-                if let Some(used) = self.try_used_values(callbacks, ancestor) {
-                    result.offset_x += used.inset_left.get();
-                    result.offset_y += used.inset_top.get();
-                }
+                // A relatively positioned inline-flow ancestor reachable from a
+                // committed fragment or piece was entered by its inline
+                // formatting context this pass, which created its used values
+                // and resolved its insets.
+                let used = self.used_values(callbacks, ancestor);
+                result.offset_x += used.inset_left.get();
+                result.offset_y += used.inset_top.get();
             }
             ancestor = callbacks.parent(ancestor);
         }
@@ -1555,7 +1586,13 @@ impl LayoutState {
                         emit_fragment: sink.emit_fragment,
                         emit_inline_box_piece: sink.emit_inline_box_piece,
                     };
-                    assert!(push_line_data(self, slot_index, callbacks, line_sink));
+                    assert!(push_line_data(
+                        self,
+                        slot_index,
+                        used.content_inline_size.get(),
+                        callbacks,
+                        line_sink
+                    ));
                     unsafe {
                         (sink.finish_line_data)(sink.context);
                     }
@@ -1664,6 +1701,9 @@ impl LayoutState {
 
 impl LayoutState {
     fn used_values_rare_data_mut_if_present(&self, slot_index: u32) -> Option<RefMut<'_, UsedValuesRareData>> {
-        self.used_values_rare_data.get(slot_index).map(RefCell::borrow_mut)
+        self.used_values_by_slot(slot_index)?
+            .rare_data
+            .get()
+            .map(RefCell::borrow_mut)
     }
 }

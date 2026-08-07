@@ -1618,17 +1618,6 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn create_item_used_values(&self, node: Node) -> &'pass UsedValues {
-        // Intrinsic subgrid contribution contexts revisit descendants that
-        // already have pass-local used values instead of allocating the same
-        // state entry twice.
-        let existing = self.state.try_used_values(&self.callbacks, node);
-        if let Some(existing) = existing {
-            return existing;
-        }
-        self.state
-            .create_used_values(&self.callbacks, node, ContainingBlockConstraints::default())
-    }
 
     fn clamp_area_to_subgrid(start: &mut i32, span: &mut usize, track_count: usize) {
         if track_count == 0 {
@@ -1703,7 +1692,10 @@ impl<'pass> GridFormattingContext<'pass> {
                             child_grid_style.names.raws(),
                         ),
                     });
-                    nodes.push((child, self.create_item_used_values(child)));
+                    let item_used_values =
+                        self.state
+                            .create_used_values(&self.callbacks, child, ContainingBlockConstraints::default());
+                    nodes.push((child, item_used_values));
                 }
             }
             child = next;
@@ -3448,14 +3440,18 @@ impl<'pass> GridFormattingContext<'pass> {
                 x: area.offset.inline_offset + self.item_margin_box_start(item, Axis::Column),
                 y: area.offset.block_offset + self.item_margin_box_start(item, Axis::Row),
             };
-            crate::layout::place_child(self.state, &self.callbacks, item.box_, offset);
+            // Resolve relative-position insets before placement seals the
+            // item's committed metrics.
             crate::layout::compute_inset_native(
                 self.state,
                 self.callbacks,
                 item.box_,
                 area.size.inline_size,
                 area.size.block_size,
+                self.grid_container,
+                run.treat_block_axis_percentage_insets_as_auto_beyond_root,
             );
+            crate::layout::place_child(self.state, &self.callbacks, item.box_, offset);
         }
         self.derived_baselines_of_root_box =
             crate::layout::derive_baselines(self.state, &self.callbacks, self.grid_container, false);
