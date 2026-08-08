@@ -6,6 +6,7 @@
 
 #include <AK/Error.h>
 #include <AK/StdLibExtras.h>
+#include <AK/StringBuilder.h>
 #include <AK/StringView.h>
 #include <LibWebView/DownloadPresentation.h>
 
@@ -60,12 +61,32 @@ static String download_size_text(u64 size)
     return MUST(String::formatted("{} {}", unitless_download_size_text(size, unit), unit.suffix));
 }
 
+String download_rate_text(u64 bytes_per_second)
+{
+    return MUST(String::formatted("{}/s", download_size_text(bytes_per_second)));
+}
+
+String download_time_remaining_text(AK::Duration time_remaining)
+{
+    auto seconds = time_remaining.to_seconds();
+
+    if (seconds < 60)
+        return MUST(String::formatted("{} sec left", max(seconds, static_cast<i64>(1))));
+
+    auto total_minutes = (seconds + 59) / 60;
+    if (total_minutes < 60)
+        return MUST(String::formatted("{} min left", total_minutes));
+
+    auto hours = total_minutes / 60;
+    auto minutes = total_minutes % 60;
+    return MUST(String::formatted("{} hr {} min left", hours, minutes));
+}
+
 String download_status_text(FileDownloader::Download const& download)
 {
     using DownloadStatus = FileDownloader::DownloadStatus;
 
-    switch (download.status) {
-    case DownloadStatus::InProgress:
+    auto downloaded_size_text = [&]() {
         if (auto progress = download.progress(); progress.has_value()) {
             auto unit = unit_for_download_size(*download.total_size);
             return MUST(String::formatted("{}/{} {} - {}",
@@ -75,6 +96,27 @@ String download_status_text(FileDownloader::Download const& download)
                 download_percent_text(*progress)));
         }
         return MUST(String::formatted("{} downloaded", download_size_text(download.downloaded_size)));
+    };
+
+    switch (download.status) {
+    case DownloadStatus::InProgress: {
+        if (download.is_waiting_to_retry)
+            return MUST(String::formatted("Waiting to retry - {}", downloaded_size_text()));
+
+        StringBuilder builder;
+        builder.append(downloaded_size_text());
+
+        if (download.bytes_per_second.has_value() && *download.bytes_per_second > 0)
+            builder.appendff(" - {}", download_rate_text(*download.bytes_per_second));
+        if (auto time_remaining = download.estimated_time_remaining(); time_remaining.has_value())
+            builder.appendff(" - {}", download_time_remaining_text(*time_remaining));
+
+        return MUST(builder.to_string());
+    }
+    case DownloadStatus::Paused:
+        if (download.error.has_value() && !download.error->is_empty())
+            return MUST(String::formatted("Paused - {}", *download.error));
+        return MUST(String::formatted("Paused - {}", downloaded_size_text()));
     case DownloadStatus::Completed:
         return MUST(String::formatted("Completed - {}", download_size_text(download.downloaded_size)));
     case DownloadStatus::Canceled:
@@ -118,6 +160,9 @@ DownloadsButtonState downloads_button_state(ReadonlySpan<FileDownloader::Downloa
                 ++unknown_active_download_count;
             }
             break;
+        case FileDownloader::DownloadStatus::Paused:
+            ++state.paused_download_count;
+            break;
         case FileDownloader::DownloadStatus::Completed:
         case FileDownloader::DownloadStatus::Canceled:
             break;
@@ -141,6 +186,8 @@ DownloadsButtonState downloads_button_state(ReadonlySpan<FileDownloader::Downloa
         }
     } else if (state.failed_download_count > 0) {
         state.tooltip = download_count_text(state.failed_download_count, "download failed"sv, "downloads failed"sv);
+    } else if (state.paused_download_count > 0) {
+        state.tooltip = download_count_text(state.paused_download_count, "download paused"sv, "downloads paused"sv);
     } else {
         state.tooltip = "Downloads"_string;
     }

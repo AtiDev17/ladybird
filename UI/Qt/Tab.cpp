@@ -269,6 +269,18 @@ public:
 
         row_layout->addLayout(details_layout, 1);
 
+        m_pause_button = new QPushButton("Pause", this);
+        m_pause_button->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(m_pause_button, &QPushButton::clicked, this, [this] {
+            if (m_is_paused) {
+                if (on_resume_download)
+                    on_resume_download(m_download_id);
+            } else if (on_pause_download) {
+                on_pause_download(m_download_id);
+            }
+        });
+        row_layout->addWidget(m_pause_button, 0, Qt::AlignTop);
+
         m_cancel_button = new QPushButton("Cancel", this);
         m_cancel_button->setFocusPolicy(Qt::NoFocus);
         QObject::connect(m_cancel_button, &QPushButton::clicked, this, [this] {
@@ -295,7 +307,7 @@ public:
 
         bool geometry_changed = false;
         auto progress = download.progress();
-        auto show_progress = download.status == WebView::FileDownloader::DownloadStatus::InProgress && progress.has_value();
+        auto show_progress = WebView::FileDownloader::status_is_active(download.status) && progress.has_value();
         auto progress_bar_is_visible = !m_progress_bar->isHidden();
         if (progress_bar_is_visible != show_progress) {
             m_progress_bar->setVisible(show_progress);
@@ -304,7 +316,17 @@ public:
         if (progress.has_value())
             m_progress_bar->setValue(static_cast<int>(*progress * 1000.0));
 
-        auto should_show_cancel = download.status == WebView::FileDownloader::DownloadStatus::InProgress;
+        m_is_paused = download.status == WebView::FileDownloader::DownloadStatus::Paused;
+        m_pause_button->setText(m_is_paused ? "Resume" : "Pause");
+
+        auto should_show_pause = download.can_resume && WebView::FileDownloader::status_is_active(download.status);
+        auto pause_button_is_visible = !m_pause_button->isHidden();
+        if (pause_button_is_visible != should_show_pause) {
+            m_pause_button->setVisible(should_show_pause);
+            geometry_changed = true;
+        }
+
+        auto should_show_cancel = WebView::FileDownloader::status_is_active(download.status);
         auto cancel_button_is_visible = !m_cancel_button->isHidden();
         if (cancel_button_is_visible != should_show_cancel) {
             m_cancel_button->setVisible(should_show_cancel);
@@ -315,12 +337,16 @@ public:
     }
 
     Function<void(u64)> on_cancel_download;
+    Function<void(u64)> on_pause_download;
+    Function<void(u64)> on_resume_download;
 
 private:
     u64 m_download_id { 0 };
+    bool m_is_paused { false };
     ElidedLabel* m_file_name_label { nullptr };
     ElidedLabel* m_status_label { nullptr };
     QProgressBar* m_progress_bar { nullptr };
+    QPushButton* m_pause_button { nullptr };
     QPushButton* m_cancel_button { nullptr };
 };
 
@@ -413,6 +439,8 @@ public:
     }
 
     Function<void(u64)> on_cancel_download;
+    Function<void(u64)> on_pause_download;
+    Function<void(u64)> on_resume_download;
     Function<void()> on_open_all_downloads;
 
 private:
@@ -439,6 +467,14 @@ private:
             row->on_cancel_download = [this](u64 id) {
                 if (on_cancel_download)
                     on_cancel_download(id);
+            };
+            row->on_pause_download = [this](u64 id) {
+                if (on_pause_download)
+                    on_pause_download(id);
+            };
+            row->on_resume_download = [this](u64 id) {
+                if (on_resume_download)
+                    on_resume_download(id);
             };
             m_rows_layout->addWidget(row);
             m_download_rows.append(row);
@@ -1380,8 +1416,16 @@ void Tab::show_downloads_popover()
         m_downloads_popover = new DownloadsPopover(this);
         m_downloads_popover->on_cancel_download = [this](u64 id) {
             auto& file_downloader = WebView::Application::the().file_downloader();
-            if (auto download = file_downloader.download(id); download.has_value() && download->status == WebView::FileDownloader::DownloadStatus::InProgress)
+            if (auto download = file_downloader.download(id); download.has_value() && WebView::FileDownloader::status_is_active(download->status))
                 file_downloader.cancel_download(id);
+            update_downloads_popover();
+        };
+        m_downloads_popover->on_pause_download = [this](u64 id) {
+            WebView::Application::the().file_downloader().pause_download(id);
+            update_downloads_popover();
+        };
+        m_downloads_popover->on_resume_download = [this](u64 id) {
+            WebView::Application::the().file_downloader().resume_download(id);
             update_downloads_popover();
         };
         m_downloads_popover->on_open_all_downloads = [this] {
