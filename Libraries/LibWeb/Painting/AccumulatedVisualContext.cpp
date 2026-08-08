@@ -5,7 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/AnyOf.h>
+#include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/HashTable.h>
 #include <AK/StringBuilder.h>
@@ -388,6 +390,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         VisualContextIndex normal_plane_root;
         VisualContextIndex absolute_position_plane_root;
         VisualContextIndex fixed_position_plane_root;
+        bool flattens_inherited_transform { false };
     };
 
     auto build_paintable_box = [&](Paintable& paintable_box, DescendantVisualContexts inherited_contexts, bool may_be_root_element) -> DescendantVisualContexts {
@@ -492,10 +495,15 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         if (auto effects = compute_effects_data(paintable_box, computed_values, pixel_ratio); effects.has_value())
             append_to_own_and_positioned_descendant_contexts(effects.value());
 
+        auto flattens_inherited_transform = inherited_contexts.flattens_inherited_transform;
+
+        bool appended_transform_node = false;
         if (computed_values_have_transform(computed_values)) {
             if (auto transform_data = compute_transform(paintable_box, computed_values, pixel_ratio); transform_data.has_value()) {
+                transform_data->flattens_inherited_transform = flattens_inherited_transform;
                 paintable_box.set_has_non_invertible_css_transform(!transform_data->matrix.is_invertible());
                 own_state = append_node(own_state, *transform_data);
+                appended_transform_node = true;
             } else {
                 paintable_box.set_has_non_invertible_css_transform(false);
             }
@@ -518,14 +526,26 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
                 return inherited_contexts.absolute_position_plane_root;
             return inherited_contexts.normal_plane_root;
         }();
-        if (computed_values.backface_visibility() == CSS::BackfaceVisibility::Hidden && layout_node.is_transformable())
-            own_state = append_node(own_state, BackfaceVisibilityData { inherited_plane_root });
+        bool appended_backface_marker = false;
+        if (computed_values.backface_visibility() == CSS::BackfaceVisibility::Hidden && layout_node.is_transformable()) {
+            own_state = append_node(own_state, BackfaceVisibilityData { inherited_plane_root, !appended_transform_node && flattens_inherited_transform });
+            appended_backface_marker = true;
+        }
 
         // https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts
-        // An element whose used value for transform-style is preserve-3d extends its 3D rendering context, so its
-        // descendants accumulate through this element's transform; any other element starts a new plane below its
-        // own transform.
-        auto plane_root_for_descendants = layout_node.establishes_or_extends_a_3d_rendering_context() ? inherited_plane_root : own_state;
+        // An element participates in a 3D rendering context if its parent establishes or extends a 3D rendering
+        // context. The position of each element in that three-dimensional space is determined by accumulating the
+        // transformation matrices up from the given element to the element that establishes the 3D rendering context.
+        // NB: Children of an element that neither establishes nor extends a 3D rendering context start a new plane
+        //     below the element's own transform. Anonymous boxes carry no element style and are invisible to 3D
+        //     rendering contexts, so they pass the inherited plane through unchanged. Pseudo-element boxes carry
+        //     their own style and participate normally. An inherited flatten is only materialized by an appended
+        //     node, so an element that appends none keeps it pending for its descendants.
+        auto establishes_or_extends_3d_rendering_context = layout_node.establishes_or_extends_a_3d_rendering_context();
+        bool invisible_to_3d_rendering_contexts = layout_node.is_anonymous() && !layout_node.is_generated_for_pseudo_element();
+        auto plane_root_for_descendants = establishes_or_extends_3d_rendering_context || invisible_to_3d_rendering_contexts ? inherited_plane_root : own_state;
+        bool inherited_flatten_still_pending = flattens_inherited_transform && !appended_transform_node && !appended_backface_marker;
+        auto descendants_flatten_inherited_transform = invisible_to_3d_rendering_contexts ? flattens_inherited_transform : (!establishes_or_extends_3d_rendering_context || inherited_flatten_still_pending);
 
         if (computed_values.clip().is_rect()) {
             if (auto css_clip = compute_css_clip_data(paintable_box, computed_values, converter); css_clip.has_value())
@@ -591,8 +611,11 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         VisualContextIndex state_for_descendants = own_state;
 
         if (computed_values.perspective().has_value()) {
-            if (auto perspective_data = compute_perspective_data(paintable_box, computed_values, scale); perspective_data.has_value())
+            if (auto perspective_data = compute_perspective_data(paintable_box, computed_values, scale); perspective_data.has_value()) {
+                perspective_data->flattens_inherited_transform = descendants_flatten_inherited_transform;
+                descendants_flatten_inherited_transform = false;
                 state_for_descendants = append_node(state_for_descendants, *perspective_data);
+            }
         }
 
         auto may_have_clip = computed_values.overflow_x() != CSS::Overflow::Visible
@@ -640,6 +663,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
             plane_root_for_descendants,
             absolute_position_plane_root,
             fixed_position_plane_root,
+            descendants_flatten_inherited_transform,
         };
     };
 
@@ -654,6 +678,7 @@ AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaint
         viewport_state_for_descendants,
         viewport_state_for_descendants,
         visual_viewport_context_index,
+        true,
     };
 
     struct PendingPaintable {
@@ -763,6 +788,7 @@ bool update_accumulated_visual_context_values(ViewportPaintable& viewport_painta
         if (auto* transform_data = node.data.get_pointer<TransformData>()) {
             if (!transform.has_value())
                 return false;
+            transform->flattens_inherited_transform = transform_data->flattens_inherited_transform;
             *transform_data = *transform;
             found_transform = true;
         } else if (auto* effects_data = node.data.get_pointer<EffectsData>()) {
@@ -773,6 +799,7 @@ bool update_accumulated_visual_context_values(ViewportPaintable& viewport_painta
         } else if (auto* perspective_data = node.data.get_pointer<PerspectiveData>()) {
             if (!perspective.has_value())
                 return false;
+            perspective->flattens_inherited_transform = perspective_data->flattens_inherited_transform;
             *perspective_data = *perspective;
             found_perspective = true;
         }
@@ -863,6 +890,88 @@ Vector<size_t, 8> AccumulatedVisualContextTree::build_ancestor_chain(VisualConte
     return chain;
 }
 
+struct LocalSpatialMatrix {
+    Gfx::FloatMatrix4x4 matrix;
+    bool flattens_inherited_transform { false };
+};
+
+static LocalSpatialMatrix local_spatial_matrix(AccumulatedVisualContextNode const& node, VisualContextIndex node_index, ScrollStateSnapshot const& scroll_state)
+{
+    return node.data.visit(
+        [&](TransformData const& transform) {
+            return LocalSpatialMatrix { transform.matrix_including_origin(), transform.flattens_inherited_transform };
+        },
+        [&](PerspectiveData const& perspective) {
+            return LocalSpatialMatrix { perspective.matrix, perspective.flattens_inherited_transform };
+        },
+        [&](ScrollData const&) {
+            auto offset = scroll_state.device_offset_for_index(node_index);
+            return LocalSpatialMatrix { Gfx::translation_matrix(Vector3 { offset.x(), offset.y(), 0.f }) };
+        },
+        [&](ScrollCompensation const& compensation) {
+            auto offset = scroll_state.device_offset_for_index(compensation.scroll_node_index);
+            return LocalSpatialMatrix { Gfx::translation_matrix(Vector3 { -offset.x(), -offset.y(), 0.f }) };
+        },
+        [&](AnchorScrollShift const& shift) {
+            auto offset = shift.masked_offset(scroll_state);
+            return LocalSpatialMatrix { Gfx::translation_matrix(Vector3 { offset.x(), offset.y(), 0.f }) };
+        },
+        [&](BackfaceVisibilityData const& backface) { return LocalSpatialMatrix { Gfx::FloatMatrix4x4::identity(), backface.flattens_inherited_transform }; },
+        [&](ClipData const&) { return LocalSpatialMatrix { Gfx::FloatMatrix4x4::identity() }; },
+        [&](ClipPathData const&) { return LocalSpatialMatrix { Gfx::FloatMatrix4x4::identity() }; },
+        [&](EffectsData const&) { return LocalSpatialMatrix { Gfx::FloatMatrix4x4::identity() }; },
+        [&](MaskData const&) { return LocalSpatialMatrix { Gfx::FloatMatrix4x4::identity() }; });
+}
+
+bool AccumulatedVisualContextTree::chain_contains_3d_transform(VisualContextIndex index) const
+{
+    for (size_t i = index.value();; i = m_nodes[i].parent_index.value()) {
+        auto const& node = m_nodes[i];
+        if (auto const* transform = node.data.get_pointer<TransformData>()) {
+            if (!Gfx::is_2d_affine_transform(transform->matrix))
+                return true;
+        } else if (node.data.has<PerspectiveData>()) {
+            return true;
+        }
+        if (i == VISUAL_VIEWPORT_NODE_INDEX.value())
+            break;
+    }
+    return false;
+}
+
+// Homogeneous coordinates this close to the eye plane have no meaningful projection.
+static constexpr float minimum_projection_w = 0.0001f;
+
+static Gfx::FloatRect map_rect_through_matrix(Gfx::FloatMatrix4x4 const& matrix, Gfx::FloatRect const& rect)
+{
+    auto map_corner = [&](Gfx::FloatPoint point) {
+        return matrix * Gfx::FloatVector4 { point.x(), point.y(), 0, 1 };
+    };
+    Array<Gfx::FloatVector4, 4> mapped_corners {
+        map_corner(rect.top_left()),
+        map_corner(rect.top_right()),
+        map_corner(rect.bottom_left()),
+        map_corner(rect.bottom_right()),
+    };
+    bool all_corners_behind_eye_plane = all_of(mapped_corners, [](auto const& corner) { return corner.w() <= 0; });
+    // A rect entirely behind the eye plane divides through its negative homogeneous coordinates, matching the
+    // geometry other engines report. A rect that crosses the eye plane projects without bound, so the corners
+    // behind it are clamped to keep the result conservatively covering the rendered region.
+    auto project_corner = [&](Gfx::FloatVector4 const& corner) -> Gfx::FloatPoint {
+        auto w = all_corners_behind_eye_plane ? min(corner.w(), -minimum_projection_w) : max(corner.w(), minimum_projection_w);
+        return { corner.x() / w, corner.y() / w };
+    };
+    auto top_left = project_corner(mapped_corners[0]);
+    auto top_right = project_corner(mapped_corners[1]);
+    auto bottom_left = project_corner(mapped_corners[2]);
+    auto bottom_right = project_corner(mapped_corners[3]);
+    auto left = min(min(top_left.x(), top_right.x()), min(bottom_left.x(), bottom_right.x()));
+    auto right = max(max(top_left.x(), top_right.x()), max(bottom_left.x(), bottom_right.x()));
+    auto top = min(min(top_left.y(), top_right.y()), min(bottom_left.y(), bottom_right.y()));
+    auto bottom = max(max(top_left.y(), top_right.y()), max(bottom_left.y(), bottom_right.y()));
+    return { left, top, right - left, bottom - top };
+}
+
 Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_test(VisualContextIndex index, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state, ClipBehavior clip_behavior) const
 {
     auto chain = build_ancestor_chain(index);
@@ -873,8 +982,10 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
     bool chain_has_backface_marker = any_of(chain, [&](size_t chain_index) {
         return m_nodes[chain_index].data.has<BackfaceVisibilityData>();
     });
+    bool chain_has_3d_transform = chain_contains_3d_transform(index);
+    bool needs_accumulated_matrices = chain_has_backface_marker || chain_has_3d_transform;
     Vector<Gfx::FloatMatrix4x4, 8> accumulated_matrices;
-    if (chain_has_backface_marker)
+    if (needs_accumulated_matrices)
         accumulated_matrices.ensure_capacity(chain.size());
 
     auto point = screen_point;
@@ -882,32 +993,27 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
         auto node_index = VisualContextIndex { chain[i - 1] };
         auto const& node = m_nodes[node_index.value()];
 
-        if (chain_has_backface_marker) {
-            auto local_matrix = node.data.visit(
-                [&](TransformData const& transform) {
-                    return transform.matrix_including_origin();
-                },
-                [&](PerspectiveData const& perspective) {
-                    return perspective.matrix;
-                },
-                [&](ScrollData const&) {
-                    auto offset = scroll_state.device_offset_for_index(node_index);
-                    return Gfx::translation_matrix(Vector3 { offset.x(), offset.y(), 0.f });
-                },
-                [&](ScrollCompensation const& compensation) {
-                    auto offset = scroll_state.device_offset_for_index(compensation.scroll_node_index);
-                    return Gfx::translation_matrix(Vector3 { -offset.x(), -offset.y(), 0.f });
-                },
-                [&](AnchorScrollShift const& shift) {
-                    auto offset = shift.masked_offset(scroll_state);
-                    return Gfx::translation_matrix(Vector3 { offset.x(), offset.y(), 0.f });
-                },
-                [&](BackfaceVisibilityData const&) { return Gfx::FloatMatrix4x4::identity(); },
-                [&](ClipData const&) { return Gfx::FloatMatrix4x4::identity(); },
-                [&](ClipPathData const&) { return Gfx::FloatMatrix4x4::identity(); },
-                [&](EffectsData const&) { return Gfx::FloatMatrix4x4::identity(); },
-                [&](MaskData const&) { return Gfx::FloatMatrix4x4::identity(); });
-            accumulated_matrices.unchecked_append(i == chain.size() ? local_matrix : accumulated_matrices.last() * local_matrix);
+        if (needs_accumulated_matrices) {
+            auto local = local_spatial_matrix(node, node_index, scroll_state);
+            if (i == chain.size()) {
+                accumulated_matrices.unchecked_append(local.matrix);
+            } else {
+                auto const& parent_matrix = accumulated_matrices.last();
+                accumulated_matrices.unchecked_append((local.flattens_inherited_transform ? Gfx::flattened(parent_matrix) : parent_matrix) * local.matrix);
+            }
+        }
+
+        if (chain_has_3d_transform
+            && (node.data.has<TransformData>() || node.data.has<PerspectiveData>() || node.data.has<ScrollData>()
+                || node.data.has<ScrollCompensation>() || node.data.has<AnchorScrollShift>())) {
+            auto inverse = Gfx::flattened(accumulated_matrices.last()).inverse();
+            if (!inverse.has_value())
+                return {};
+            auto mapped = *inverse * Gfx::FloatVector4 { screen_point.x(), screen_point.y(), 0, 1 };
+            if (mapped.w() < minimum_projection_w)
+                return {};
+            point = { mapped.x() / mapped.w(), mapped.y() / mapped.w() };
+            continue;
         }
 
         auto result = node.data.visit(
@@ -988,6 +1094,32 @@ Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(VisualCont
 {
     auto chain = build_ancestor_chain(index);
 
+    // This walk deliberately skips translation-only nodes. Callers resolve offsets and scroll positions
+    // themselves. The per-node inverses below are only exact for chains of 2D transforms, so a chain containing a
+    // 3D transform inverts the flattened accumulated matrix, mapping the screen point onto the plane the content
+    // was rendered into.
+    if (chain_contains_3d_transform(index)) {
+        auto matrix = Gfx::FloatMatrix4x4::identity();
+        for (size_t i = chain.size(); i > 0; --i) {
+            auto const& node = m_nodes[chain[i - 1]];
+            node.data.visit(
+                [&](TransformData const& transform) {
+                    matrix = (transform.flattens_inherited_transform ? Gfx::flattened(matrix) : matrix) * transform.matrix_including_origin();
+                },
+                [&](PerspectiveData const& perspective) {
+                    matrix = (perspective.flattens_inherited_transform ? Gfx::flattened(matrix) : matrix) * perspective.matrix;
+                },
+                [&](auto const&) {});
+        }
+        auto inverse = Gfx::flattened(matrix).inverse();
+        if (!inverse.has_value())
+            return screen_point;
+        auto mapped = *inverse * Gfx::FloatVector4 { screen_point.x(), screen_point.y(), 0, 1 };
+        if (mapped.w() < minimum_projection_w)
+            return screen_point;
+        return { mapped.x() / mapped.w(), mapped.y() / mapped.w() };
+    }
+
     auto point = screen_point;
     for (size_t i = chain.size(); i > 0; --i) {
         auto const& node = m_nodes[chain[i - 1]];
@@ -1016,6 +1148,20 @@ Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(VisualCont
 
 Gfx::FloatRect AccumulatedVisualContextTree::transform_rect_to_viewport(VisualContextIndex index, Gfx::FloatRect const& source_rect, ScrollStateSnapshot const& scroll_state, IncludeVisualViewportTransform include_visual_viewport_transform) const
 {
+    // A chain with three-dimensional transforms cannot be applied one two-dimensional projection at a time.
+    if (chain_contains_3d_transform(index)) {
+        auto chain = build_ancestor_chain(index);
+        auto matrix = Gfx::FloatMatrix4x4::identity();
+        for (size_t i = chain.size(); i > 0; --i) {
+            auto node_index = VisualContextIndex { chain[i - 1] };
+            if (node_index == VISUAL_VIEWPORT_NODE_INDEX && include_visual_viewport_transform == IncludeVisualViewportTransform::No)
+                continue;
+            auto local = local_spatial_matrix(m_nodes[node_index.value()], node_index, scroll_state);
+            matrix = (local.flattens_inherited_transform ? Gfx::flattened(matrix) : matrix) * local.matrix;
+        }
+        return map_rect_through_matrix(matrix, source_rect);
+    }
+
     auto rect = source_rect;
     for (size_t i = index.value();; i = m_nodes[i].parent_index.value()) {
         auto const& node = m_nodes[i];
@@ -1062,7 +1208,7 @@ Gfx::FloatMatrix4x4 TransformData::matrix_including_origin() const
 
 bool should_cull_back_face(Gfx::FloatMatrix4x4 const& accumulated_matrix, Gfx::FloatMatrix4x4 const& plane_root_matrix)
 {
-    auto inverse_plane_root_matrix = plane_root_matrix.inverse();
+    auto inverse_plane_root_matrix = Gfx::flattened(plane_root_matrix).inverse();
     if (!inverse_plane_root_matrix.has_value())
         return false;
     return Gfx::is_back_face_visible(*inverse_plane_root_matrix * accumulated_matrix);
@@ -1200,6 +1346,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::TransformData const& data)
 {
     TRY(encoder.encode(data.matrix));
     TRY(encoder.encode(data.origin));
+    TRY(encoder.encode(data.flattens_inherited_transform));
     return {};
 }
 
@@ -1209,6 +1356,7 @@ ErrorOr<Web::Painting::TransformData> decode(Decoder& decoder)
     return Web::Painting::TransformData {
         .matrix = TRY(decoder.decode<Gfx::FloatMatrix4x4>()),
         .origin = TRY(decoder.decode<Gfx::FloatPoint>()),
+        .flattens_inherited_transform = TRY(decoder.decode<bool>()),
     };
 }
 
@@ -1216,6 +1364,7 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Web::Painting::PerspectiveData const& data)
 {
     TRY(encoder.encode(data.matrix));
+    TRY(encoder.encode(data.flattens_inherited_transform));
     return {};
 }
 
@@ -1224,6 +1373,7 @@ ErrorOr<Web::Painting::PerspectiveData> decode(Decoder& decoder)
 {
     return Web::Painting::PerspectiveData {
         .matrix = TRY(decoder.decode<Gfx::FloatMatrix4x4>()),
+        .flattens_inherited_transform = TRY(decoder.decode<bool>()),
     };
 }
 
@@ -1231,6 +1381,7 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Web::Painting::BackfaceVisibilityData const& data)
 {
     TRY(encoder.encode(data.plane_root_index));
+    TRY(encoder.encode(data.flattens_inherited_transform));
     return {};
 }
 
@@ -1239,6 +1390,7 @@ ErrorOr<Web::Painting::BackfaceVisibilityData> decode(Decoder& decoder)
 {
     return Web::Painting::BackfaceVisibilityData {
         .plane_root_index = TRY(decoder.decode<Web::Painting::VisualContextIndex>()),
+        .flattens_inherited_transform = TRY(decoder.decode<bool>()),
     };
 }
 

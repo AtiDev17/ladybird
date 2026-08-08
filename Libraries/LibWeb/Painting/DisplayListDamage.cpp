@@ -123,15 +123,18 @@ static bool visual_context_data_is_equal(VisualContextIndex a_index, VisualConte
         },
         [&](TransformData const& data) {
             auto const* other = b.get_pointer<TransformData>();
-            return other && matrices_are_equal(data.matrix, other->matrix) && data.origin == other->origin;
+            return other && matrices_are_equal(data.matrix, other->matrix) && data.origin == other->origin
+                && data.flattens_inherited_transform == other->flattens_inherited_transform;
         },
         [&](PerspectiveData const& data) {
             auto const* other = b.get_pointer<PerspectiveData>();
-            return other && matrices_are_equal(data.matrix, other->matrix);
+            return other && matrices_are_equal(data.matrix, other->matrix)
+                && data.flattens_inherited_transform == other->flattens_inherited_transform;
         },
         [&](BackfaceVisibilityData const& data) {
             auto const* other = b.get_pointer<BackfaceVisibilityData>();
-            return other && data.plane_root_index == other->plane_root_index;
+            return other && data.plane_root_index == other->plane_root_index
+                && data.flattens_inherited_transform == other->flattens_inherited_transform;
         },
         [&](ClipPathData const& data) {
             auto const* other = b.get_pointer<ClipPathData>();
@@ -248,6 +251,12 @@ Optional<Gfx::IntRect> compute_display_list_damage(
             return;
         }
         auto transformed_rect = visual_context_tree.transform_rect_to_viewport(command.header.context_index, command.header.bounding_rect.to_type<float>(), scroll_state);
+        // Eye-plane clamping in the projection can produce coordinates beyond integer range, and converting
+        // such a float to int is undefined.
+        constexpr float damage_coordinate_limit = 16777216.0f;
+        transformed_rect.intersect({ -damage_coordinate_limit, -damage_coordinate_limit, 2 * damage_coordinate_limit, 2 * damage_coordinate_limit });
+        if (transformed_rect.is_empty())
+            return;
         auto command_damage = Gfx::enclosing_int_rect(transformed_rect);
         if (damage_rect.has_value())
             damage_rect->unite(command_damage);
