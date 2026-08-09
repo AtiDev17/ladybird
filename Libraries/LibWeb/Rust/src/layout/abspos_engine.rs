@@ -90,10 +90,6 @@ impl<'pass> AbsposEngine<'pass> {
         self.state.used_values(&self.callbacks, node)
     }
 
-    fn used_mut(&self, node: Node) -> &'pass UsedValues {
-        self.used(node)
-    }
-
     fn static_position_containing_block(&self, node: Node) -> Node {
         self.callbacks.static_position_containing_block(node)
     }
@@ -245,6 +241,47 @@ struct AnchorResolutionState {
     compensates_for_vertical_scroll: bool,
 }
 
+/// The interpreted <anchor-side> argument of an anchor() function; the
+/// percentage carries its value as a fraction.
+#[derive(Clone, Copy, PartialEq)]
+enum AnchorSide {
+    Invalid,
+    Top,
+    Right,
+    Bottom,
+    Left,
+    Center,
+    Start,
+    End,
+    SelfStart,
+    SelfEnd,
+    Inside,
+    Outside,
+    Percentage(f64),
+}
+
+fn anchor_side_from_style_value(side: &crate::css::style_value::StyleValueData) -> AnchorSide {
+    use crate::css::style_value::StyleValueData;
+    match side {
+        StyleValueData::Keyword { keyword } => match *keyword {
+            keyword::TOP => AnchorSide::Top,
+            keyword::RIGHT => AnchorSide::Right,
+            keyword::BOTTOM => AnchorSide::Bottom,
+            keyword::LEFT => AnchorSide::Left,
+            keyword::CENTER => AnchorSide::Center,
+            keyword::START => AnchorSide::Start,
+            keyword::END => AnchorSide::End,
+            keyword::SELF_START => AnchorSide::SelfStart,
+            keyword::SELF_END => AnchorSide::SelfEnd,
+            keyword::INSIDE => AnchorSide::Inside,
+            keyword::OUTSIDE => AnchorSide::Outside,
+            _ => AnchorSide::Invalid,
+        },
+        StyleValueData::Percentage { value } => AnchorSide::Percentage(value / 100.0),
+        _ => AnchorSide::Invalid,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AnchorValueAxis {
     is_from_end: bool,
@@ -307,7 +344,7 @@ impl AbsposEngine<'_> {
 
     fn anchor_side(
         &self,
-        facts: FfiAnchorFunctionFacts,
+        side: AnchorSide,
         rect: PhysicalRect,
         positioned_box: Node,
         containing_block: Node,
@@ -316,19 +353,19 @@ impl AbsposEngine<'_> {
     ) -> Option<CssPixels> {
         let containing_block_direction = self.style(containing_block).direction();
         let box_direction = self.style(positioned_box).direction();
-        match facts.side_kind {
-            FfiAnchorSideKind::Invalid => None,
-            FfiAnchorSideKind::Top => (!is_horizontal_axis).then_some(rect.top()),
-            FfiAnchorSideKind::Bottom => (!is_horizontal_axis).then_some(rect.bottom()),
-            FfiAnchorSideKind::Left => is_horizontal_axis.then_some(rect.left()),
-            FfiAnchorSideKind::Right => is_horizontal_axis.then_some(rect.right()),
-            FfiAnchorSideKind::Center => Some(if is_horizontal_axis {
+        match side {
+            AnchorSide::Invalid => None,
+            AnchorSide::Top => (!is_horizontal_axis).then_some(rect.top()),
+            AnchorSide::Bottom => (!is_horizontal_axis).then_some(rect.bottom()),
+            AnchorSide::Left => is_horizontal_axis.then_some(rect.left()),
+            AnchorSide::Right => is_horizontal_axis.then_some(rect.right()),
+            AnchorSide::Center => Some(if is_horizontal_axis {
                 rect.left() + rect.width / 2
             } else {
                 rect.top() + rect.height / 2
             }),
-            FfiAnchorSideKind::Start | FfiAnchorSideKind::End => {
-                let is_start = facts.side_kind == FfiAnchorSideKind::Start;
+            AnchorSide::Start | AnchorSide::End => {
+                let is_start = side == AnchorSide::Start;
                 if is_horizontal_axis {
                     let use_left = (containing_block_direction == direction::LTR) == is_start;
                     Some(if use_left { rect.left() } else { rect.right() })
@@ -336,8 +373,8 @@ impl AbsposEngine<'_> {
                     Some(if is_start { rect.top() } else { rect.bottom() })
                 }
             }
-            FfiAnchorSideKind::SelfStart | FfiAnchorSideKind::SelfEnd => {
-                let is_start = facts.side_kind == FfiAnchorSideKind::SelfStart;
+            AnchorSide::SelfStart | AnchorSide::SelfEnd => {
+                let is_start = side == AnchorSide::SelfStart;
                 if is_horizontal_axis {
                     let use_left = (box_direction == direction::LTR) == is_start;
                     Some(if use_left { rect.left() } else { rect.right() })
@@ -345,8 +382,8 @@ impl AbsposEngine<'_> {
                     Some(if is_start { rect.top() } else { rect.bottom() })
                 }
             }
-            FfiAnchorSideKind::Inside | FfiAnchorSideKind::Outside => {
-                let same_side = facts.side_kind == FfiAnchorSideKind::Inside;
+            AnchorSide::Inside | AnchorSide::Outside => {
+                let same_side = side == AnchorSide::Inside;
                 if is_horizontal_axis {
                     Some(if is_from_end == same_side {
                         rect.right()
@@ -361,16 +398,16 @@ impl AbsposEngine<'_> {
                     })
                 }
             }
-            FfiAnchorSideKind::Percentage => {
+            AnchorSide::Percentage(fraction) => {
                 if is_horizontal_axis {
                     let (start, end) = if containing_block_direction == direction::LTR {
                         (rect.left(), rect.right())
                     } else {
                         (rect.right(), rect.left())
                     };
-                    Some(start + CssPixels::nearest_value_for((end - start).to_double() * facts.side_percentage))
+                    Some(start + CssPixels::nearest_value_for((end - start).to_double() * fraction))
                 } else {
-                    Some(rect.top() + CssPixels::nearest_value_for(rect.height.to_double() * facts.side_percentage))
+                    Some(rect.top() + CssPixels::nearest_value_for(rect.height.to_double() * fraction))
                 }
             }
         }
@@ -563,30 +600,38 @@ impl AbsposEngine<'_> {
 }
 
 unsafe extern "C" fn resolve_anchor_non_math_function(context: *mut c_void, shell: *const c_void) -> *const c_void {
+    use crate::css::style_value::StyleValueData;
     // SAFETY: The CSS calc engine calls this only during resolve_anchor_value,
     // whose stack owns this callback context.
     let context = unsafe { &mut *context.cast::<AnchorCalcCallbackContext<'_>>() };
     // SAFETY: The engine pointer is live for the enclosing resolution.
     let engine = unsafe { &*context.engine };
-    // SAFETY: `shell` is the live Rust style-value handle supplied by the
-    // CSS calc core.
-    let facts = unsafe { (engine.callbacks.build_anchor_function_facts)(engine.callbacks.context, shell) };
+    // SAFETY: `shell` is the live Rust style-value data retained by the CSS
+    // calc core's non-math-function node for this synchronous resolution.
+    let StyleValueData::Anchor {
+        has_anchor_name,
+        anchor_name: explicit_anchor_name,
+        anchor_side,
+        fallback_value,
+    } = (unsafe { &*shell.cast::<StyleValueData>() })
+    else {
+        return std::ptr::null();
+    };
     let style = engine.style(context.positioned_box);
-    let anchor_name = if facts.has_anchor_name {
-        Some(facts.anchor_name)
+    let anchor_name = if *has_anchor_name {
+        Some(explicit_anchor_name.raw())
     } else if style.has_position_anchor() {
         Some(style.position_anchor_name())
     } else {
         None
     };
-    let mut resolved_node = std::ptr::null();
     if engine.facts(context.positioned_box).is_absolutely_positioned()
         && let Some(anchor_name) = anchor_name
         && let Some(anchor_box) = engine.anchor_lookup(context.positioned_box, anchor_name)
     {
         let rect = engine.anchor_rect(anchor_box, context.containing_block);
         if let Some(side) = engine.anchor_side(
-            facts,
+            anchor_side_from_style_value(anchor_side.data()),
             rect,
             context.positioned_box,
             context.containing_block,
@@ -605,35 +650,29 @@ unsafe extern "C" fn resolve_anchor_non_math_function(context: *mut c_void, shel
             // SAFETY: This CSS crate export transfers one Arc reference to
             // the external-resolution snapshot, which releases it after
             // calc resolution.
-            resolved_node = calc_node_create_px_dimension(inset.to_double());
+            return calc_node_create_px_dimension(inset.to_double());
         }
-    }
-    if facts.has_anchor_name {
-        // SAFETY: The C++ facts callback transferred one raw fly-string
-        // reference for this explicit anchor name.
-        unsafe {
-            (engine.callbacks.release_anchor_name_handle)(facts.anchor_name);
-        }
-    }
-    if !resolved_node.is_null() {
-        return resolved_node;
     }
 
-    // SAFETY: The callback borrows fallback data from the live anchor style
-    // value for this synchronous resolution.
-    let fallback = unsafe { (engine.callbacks.anchor_function_fallback)(engine.callbacks.context, shell) };
-    match fallback.kind {
-        FfiAnchorFallbackKind::None => std::ptr::null(),
-        FfiAnchorFallbackKind::Px => calc_node_create_px_dimension(fallback.px.to_double()),
-        FfiAnchorFallbackKind::Percentage => {
-            calc_node_create_px_dimension(context.containing_block_extent.to_double() * fallback.fraction)
+    match fallback_value.optional_data() {
+        None => std::ptr::null(),
+        Some(StyleValueData::Length { value, unit }) => {
+            // Computed anchor() fallbacks hold absolute lengths only; relative
+            // units carry NaN canonical ratios.
+            let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
+            assert!(ratio.is_finite());
+            calc_node_create_px_dimension(CssPixels::nearest_value_for(*value * ratio).to_double())
         }
-        FfiAnchorFallbackKind::Calculated => {
-            assert!(!fallback.value.is_null());
+        Some(StyleValueData::Percentage { value }) => {
+            calc_node_create_px_dimension(context.containing_block_extent.to_double() * (value / 100.0))
+        }
+        Some(StyleValueData::Calculated { .. }) => {
             let mut nested_context = *context;
+            // SAFETY: The anchor() shell retains the fallback calculation for
+            // this synchronous resolution.
             let resolved = unsafe {
                 resolve_calc_with_external_resolutions(
-                    fallback.value,
+                    fallback_value.pointer().cast(),
                     context.containing_block_extent,
                     (&raw mut nested_context).cast(),
                     Some(resolve_anchor_non_math_function),
@@ -644,11 +683,13 @@ unsafe extern "C" fn resolve_anchor_non_math_function(context: *mut c_void, shel
             }
             calc_node_create_px_dimension(resolved.value)
         }
-        FfiAnchorFallbackKind::Anchor => {
-            assert!(!fallback.value.is_null());
+        Some(StyleValueData::Anchor { .. }) => {
             let mut nested_context = *context;
-            unsafe { resolve_anchor_non_math_function((&raw mut nested_context).cast(), fallback.value) }
+            // SAFETY: The outer anchor() shell retains the nested anchor()
+            // for this synchronous resolution.
+            unsafe { resolve_anchor_non_math_function((&raw mut nested_context).cast(), fallback_value.pointer().cast()) }
         }
+        Some(_) => unreachable!("anchor() fallback must be a length, percentage, calculation or nested anchor()"),
     }
 }
 
@@ -696,6 +737,24 @@ pub(crate) fn solve_abspos_axis_for(
         value.max(CssPixels::default())
     } else {
         value
+    }
+}
+
+// The block-axis unknowns of the absolute positioning equation. Each field is `None` while it is
+// still unresolved, and holds its used value once solved for.
+#[derive(Clone, Copy)]
+struct BlockAxisSolution {
+    block_size: AutoPx,
+    top: AutoPx,
+    bottom: AutoPx,
+    margin_top: AutoPx,
+    margin_bottom: AutoPx,
+}
+
+impl BlockAxisSolution {
+    fn zero_out_auto_margins(&mut self) {
+        self.margin_top = Some(auto_px_value(self.margin_top));
+        self.margin_bottom = Some(auto_px_value(self.margin_bottom));
     }
 }
 
@@ -860,7 +919,7 @@ impl AbsposEngine<'_> {
             }
             let content_inline_size = shrink_to_fit(left, margin_left, margin_right, right);
             inline_size = Some(content_inline_size);
-            self.used_mut(node).set_content_inline_size(content_inline_size);
+            self.used(node).set_content_inline_size(content_inline_size);
             left = self.static_offset(node, static_position_rect).inline_offset;
             right = solve_for_right(left, inline_size, margin_left, margin_right);
         }
@@ -980,7 +1039,7 @@ impl AbsposEngine<'_> {
             }
         }
 
-        let used = self.used_mut(node);
+        let used = self.used(node);
         used.set_content_inline_size(auto_px_value(used_inline_size));
         used.inset_left.set(left);
         used.inset_right.set(right);
@@ -1019,7 +1078,7 @@ impl AbsposEngine<'_> {
             },
         );
 
-        let used = self.used_mut(node);
+        let used = self.used(node);
         used.inset_left.set(solution.start);
         used.inset_right.set(solution.end);
         used.margin_left.set(solution.margin_start);
@@ -1111,191 +1170,92 @@ impl AbsposEngine<'_> {
         constraints: ContainingBlockConstraints,
         static_position_rect: StaticPositionRect,
         pass: BlockSizePass,
-        mut block_size: AutoPx,
-    ) -> (AutoPx, AutoPx, AutoPx, AutoPx, AutoPx) {
+        block_size: AutoPx,
+    ) -> BlockAxisSolution {
         let style = self.style(node);
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
         let containing_block_block_size = available_space.block_size.to_px_or_zero();
-        let mut margin_top = resolve_margin_or_auto(style.margin_top(), containing_block_inline_size);
-        let mut margin_bottom = resolve_margin_or_auto(style.margin_bottom(), containing_block_inline_size);
-        let mut top = resolve_or_auto(style.inset_top(), containing_block_block_size);
-        let mut bottom = resolve_or_auto(style.inset_bottom(), containing_block_block_size);
         let used = self.used(node);
         let padding_top = used.padding_top.get();
         let padding_bottom = used.padding_bottom.get();
+        let mut solution = BlockAxisSolution {
+            block_size,
+            top: resolve_or_auto(style.inset_top(), containing_block_block_size),
+            bottom: resolve_or_auto(style.inset_bottom(), containing_block_block_size),
+            margin_top: resolve_margin_or_auto(style.margin_top(), containing_block_inline_size),
+            margin_bottom: resolve_margin_or_auto(style.margin_bottom(), containing_block_inline_size),
+        };
 
-        let solve_for = |length: AutoPx,
-                         clamp_to_zero: bool,
-                         top: AutoPx,
-                         margin_top: AutoPx,
-                         block_size: AutoPx,
-                         margin_bottom: AutoPx,
-                         bottom: AutoPx| {
+        // Solves the block axis equation for `target`, which must be one of the solution's own
+        // fields; every other field contributes its current value.
+        let solve_for = |target: AutoPx, clamp_to_zero: bool, solution: BlockAxisSolution| {
             solve_abspos_axis_for(
                 containing_block_block_size,
-                length,
+                target,
                 clamp_to_zero,
-                top,
-                margin_top,
+                solution.top,
+                solution.margin_top,
                 style.border_top_width(),
                 padding_top,
-                block_size,
+                solution.block_size,
                 padding_bottom,
                 style.border_bottom_width(),
-                margin_bottom,
-                bottom,
+                solution.margin_bottom,
+                solution.bottom,
             )
         };
 
-        if top.is_none() && block_size.is_none() && bottom.is_none() {
-            if margin_top.is_none() {
-                margin_top = Some(CssPixels::default());
-            }
-            if margin_bottom.is_none() {
-                margin_bottom = Some(CssPixels::default());
-            }
+        if solution.top.is_none() && solution.block_size.is_none() && solution.bottom.is_none() {
+            solution.zero_out_auto_margins();
             let Some(automatic) = self.automatic_block_size(node, available_space, constraints, pass) else {
-                return (block_size, top, bottom, margin_top, margin_bottom);
+                return solution;
             };
-            block_size = Some(automatic);
-            let constrained = self.apply_min_max_block_size_constraints(node, available_space, constraints, block_size);
-            self.used_mut(node).set_content_block_size(auto_px_value(constrained));
-            top = Some(self.static_offset(node, static_position_rect).block_offset);
-            bottom = Some(solve_for(
-                bottom,
-                false,
-                top,
-                margin_top,
-                block_size,
-                margin_bottom,
-                bottom,
-            ));
-        } else if top.is_some() && block_size.is_some() && bottom.is_some() {
-            if margin_top.is_none() && margin_bottom.is_none() {
-                let remainder = solve_for(
-                    Some(auto_px_value(margin_top) + auto_px_value(margin_bottom)),
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                );
-                margin_top = Some(remainder / 2);
-                margin_bottom = Some(remainder / 2);
-            } else if margin_top.is_none() || margin_bottom.is_none() {
-                if margin_top.is_none() {
-                    margin_top = Some(solve_for(
-                        margin_top,
-                        false,
-                        top,
-                        margin_top,
-                        block_size,
-                        margin_bottom,
-                        bottom,
-                    ));
-                } else {
-                    margin_bottom = Some(solve_for(
-                        margin_bottom,
-                        false,
-                        top,
-                        margin_top,
-                        block_size,
-                        margin_bottom,
-                        bottom,
-                    ));
-                }
+            solution.block_size = Some(automatic);
+            let constrained =
+                self.apply_min_max_block_size_constraints(node, available_space, constraints, solution.block_size);
+            self.used(node).set_content_block_size(auto_px_value(constrained));
+            solution.top = Some(self.static_offset(node, static_position_rect).block_offset);
+            solution.bottom = Some(solve_for(solution.bottom, false, solution));
+        } else if solution.top.is_some() && solution.block_size.is_some() && solution.bottom.is_some() {
+            if solution.margin_top.is_none() && solution.margin_bottom.is_none() {
+                let total = Some(auto_px_value(solution.margin_top) + auto_px_value(solution.margin_bottom));
+                let remainder = solve_for(total, false, solution);
+                solution.margin_top = Some(remainder / 2);
+                solution.margin_bottom = Some(remainder / 2);
+            } else if solution.margin_top.is_none() {
+                solution.margin_top = Some(solve_for(solution.margin_top, false, solution));
+            } else if solution.margin_bottom.is_none() {
+                solution.margin_bottom = Some(solve_for(solution.margin_bottom, false, solution));
             } else {
-                bottom = Some(solve_for(
-                    bottom,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
+                solution.bottom = Some(solve_for(solution.bottom, false, solution));
             }
         } else {
-            if margin_top.is_none() {
-                margin_top = Some(CssPixels::default());
-            }
-            if margin_bottom.is_none() {
-                margin_bottom = Some(CssPixels::default());
-            }
+            solution.zero_out_auto_margins();
 
-            if top.is_none() && block_size.is_none() && bottom.is_some() {
+            if solution.top.is_none() && solution.block_size.is_none() && solution.bottom.is_some() {
                 let Some(automatic) = self.automatic_block_size(node, available_space, constraints, pass) else {
-                    return (block_size, top, bottom, margin_top, margin_bottom);
+                    return solution;
                 };
-                block_size = Some(automatic);
-                top = Some(solve_for(
-                    top,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
-            } else if top.is_none() && bottom.is_none() && block_size.is_some() {
-                top = Some(self.static_offset(node, static_position_rect).block_offset);
-                bottom = Some(solve_for(
-                    bottom,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
-            } else if block_size.is_none() && bottom.is_none() && top.is_some() {
+                solution.block_size = Some(automatic);
+                solution.top = Some(solve_for(solution.top, false, solution));
+            } else if solution.top.is_none() && solution.bottom.is_none() && solution.block_size.is_some() {
+                solution.top = Some(self.static_offset(node, static_position_rect).block_offset);
+                solution.bottom = Some(solve_for(solution.bottom, false, solution));
+            } else if solution.block_size.is_none() && solution.bottom.is_none() && solution.top.is_some() {
                 let Some(automatic) = self.automatic_block_size(node, available_space, constraints, pass) else {
-                    return (block_size, top, bottom, margin_top, margin_bottom);
+                    return solution;
                 };
-                block_size = Some(automatic);
-                bottom = Some(solve_for(
-                    bottom,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
-            } else if top.is_none() && block_size.is_some() && bottom.is_some() {
-                top = Some(solve_for(
-                    top,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
-            } else if block_size.is_none() && top.is_some() && bottom.is_some() {
-                block_size = Some(solve_for(
-                    block_size,
-                    true,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
-            } else if bottom.is_none() && top.is_some() && block_size.is_some() {
-                bottom = Some(solve_for(
-                    bottom,
-                    false,
-                    top,
-                    margin_top,
-                    block_size,
-                    margin_bottom,
-                    bottom,
-                ));
+                solution.block_size = Some(automatic);
+                solution.bottom = Some(solve_for(solution.bottom, false, solution));
+            } else if solution.top.is_none() && solution.block_size.is_some() && solution.bottom.is_some() {
+                solution.top = Some(solve_for(solution.top, false, solution));
+            } else if solution.block_size.is_none() && solution.top.is_some() && solution.bottom.is_some() {
+                solution.block_size = Some(solve_for(solution.block_size, true, solution));
+            } else if solution.bottom.is_none() && solution.top.is_some() && solution.block_size.is_some() {
+                solution.bottom = Some(solve_for(solution.bottom, false, solution));
             }
         }
-        (block_size, top, bottom, margin_top, margin_bottom)
+        solution
     }
 
     fn compute_block_size_for_non_replaced(
@@ -1325,18 +1285,18 @@ impl AbsposEngine<'_> {
                     .calculate_inner_block_size(node, intrinsic_available_space, style.height(), constraints),
             )
         };
-        let (mut used_block_size, mut top, mut bottom, mut margin_top, mut margin_bottom) =
+        let mut solution =
             self.solve_non_replaced_block_once(node, available_space, constraints, static_position_rect, pass, initial);
 
-        if used_block_size.is_some() && !style.max_height().is_none() {
+        if solution.block_size.is_some() && !style.max_height().is_none() {
             let max_block_size = self.sizing().calculate_inner_block_size(
                 node,
                 intrinsic_available_space,
                 style.max_height(),
                 constraints,
             );
-            if auto_px_value(used_block_size) > max_block_size {
-                (used_block_size, top, bottom, margin_top, margin_bottom) = self.solve_non_replaced_block_once(
+            if auto_px_value(solution.block_size) > max_block_size {
+                solution = self.solve_non_replaced_block_once(
                     node,
                     available_space,
                     constraints,
@@ -1346,15 +1306,15 @@ impl AbsposEngine<'_> {
                 );
             }
         }
-        if used_block_size.is_some() && !style.min_height().is_auto() {
+        if solution.block_size.is_some() && !style.min_height().is_auto() {
             let min_block_size = self.sizing().calculate_inner_block_size(
                 node,
                 intrinsic_available_space,
                 style.min_height(),
                 constraints,
             );
-            if auto_px_value(used_block_size) < min_block_size {
-                (used_block_size, top, bottom, margin_top, margin_bottom) = self.solve_non_replaced_block_once(
+            if auto_px_value(solution.block_size) < min_block_size {
+                solution = self.solve_non_replaced_block_once(
                     node,
                     available_space,
                     constraints,
@@ -1364,28 +1324,25 @@ impl AbsposEngine<'_> {
                 );
             }
         }
-        if used_block_size.is_none() {
-            used_block_size =
-                self.apply_min_max_block_size_constraints(node, available_space, constraints, used_block_size);
+        if solution.block_size.is_none() {
+            solution.block_size =
+                self.apply_min_max_block_size_constraints(node, available_space, constraints, solution.block_size);
         }
 
-        let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
-        let containing_block_block_size = available_space.block_size.to_px_or_zero();
-        let used = self.used_mut(node);
-        used.set_content_block_size(auto_px_value(used_block_size));
+        let used = self.used(node);
+        used.set_content_block_size(auto_px_value(solution.block_size));
         if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
             return;
         }
         if !style.height().is_intrinsic_sizing_constraint() {
             used.has_definite_block_size.set(true);
         }
-        used.inset_top.set(auto_px_value(top));
-        used.inset_bottom.set(auto_px_value(bottom));
-        // The local values are already resolved against these bases. Keep the
-        // variables to document and pin the C++ basis distinction.
-        let _ = (containing_block_inline_size, containing_block_block_size);
-        used.margin_top.set(auto_px_value(margin_top));
-        used.margin_bottom.set(auto_px_value(margin_bottom));
+        used.inset_top.set(auto_px_value(solution.top));
+        used.inset_bottom.set(auto_px_value(solution.bottom));
+        // NOTE: solve_non_replaced_block_once() already resolved these against the bases the C++ layout code used:
+        //       the insets against the containing block's block size, but the margins against its inline size.
+        used.margin_top.set(auto_px_value(solution.margin_top));
+        used.margin_bottom.set(auto_px_value(solution.margin_bottom));
     }
 
     fn compute_block_size_for_replaced(
@@ -1423,7 +1380,7 @@ impl AbsposEngine<'_> {
             },
         );
 
-        let used = self.used_mut(node);
+        let used = self.used(node);
         used.set_content_block_size(block_size);
         if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
             return;
@@ -1465,7 +1422,7 @@ impl<'pass> AbsposEngine<'pass> {
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
         let style = self.style(node);
         {
-            let used = self.used_mut(node);
+            let used = self.used(node);
             used.border_left.set(style.border_left_width());
             used.border_right.set(style.border_right_width());
             used.border_top.set(style.border_top_width());
@@ -1490,7 +1447,7 @@ impl<'pass> AbsposEngine<'pass> {
         );
 
         {
-            let used = self.used_mut(node);
+            let used = self.used(node);
             if !style.inset_left().is_auto() && !style.inset_right().is_auto() {
                 used.has_definite_inline_size.set(true);
             }
@@ -1505,7 +1462,7 @@ impl<'pass> AbsposEngine<'pass> {
             let block_size_resolved_from_aspect_ratio = style.height().is_auto()
                 && self.facts(node).has_preferred_aspect_ratio()
                 && self.used(node).has_definite_inline_size();
-            let used = self.used_mut(node);
+            let used = self.used(node);
             used.has_definite_inline_size.set(true);
             if (!style.height().is_auto() && !style.height().is_intrinsic_sizing_constraint())
                 || block_size_resolved_from_aspect_ratio
@@ -1543,7 +1500,7 @@ impl<'pass> AbsposEngine<'pass> {
         }
 
         {
-            let used = self.used_mut(node);
+            let used = self.used(node);
             let collapsed = used.uses_collapsing_borders_model.get();
             if let Some(inline_alignment) = inputs.containing_block_info.inline_alignment
                 && style.inset_left().is_auto()
@@ -1743,7 +1700,7 @@ impl<'pass> AbsposEngine<'pass> {
             block_axis_inset_value(style.inset_bottom()),
             containing_block_size.block_size,
         );
-        let used = self.used_mut(node);
+        let used = self.used(node);
         used.inset_left.set(left);
         used.inset_right.set(right);
         used.inset_top.set(top);

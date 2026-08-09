@@ -422,6 +422,19 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
+    // The input a nested viewport or resource context is laid out with: it inherits this context's
+    // available space and quirks-mode percentage basis, and participates as an item.
+    fn nested_layout_input(&self) -> LayoutInput {
+        LayoutInput::new(
+            self.available_space.unwrap(),
+            ContainingBlockConstraints {
+                quirks_mode_percentage_basis_block_size: self.quirks_mode_percentage_basis_block_size,
+                ..Default::default()
+            },
+            ParticipationInParentFormattingContext::Item,
+        )
+    }
+
     fn first_child(&self, node: Node) -> Node {
         self.callbacks.node_data(node).first_child
     }
@@ -816,19 +829,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             parent_viewbox_transform,
             Some(parent_svg_transform),
         );
-        nested_context.run(
-            run,
-            LayoutInput {
-                available_space: self.available_space.unwrap(),
-                containing_block_constraints: ContainingBlockConstraints {
-                    quirks_mode_percentage_basis_block_size: self.quirks_mode_percentage_basis_block_size,
-                    ..Default::default()
-                },
-                content_box_position_in_bfc_root: None,
-                sizing: RootSizingDirectives::default(),
-                participation: ParticipationInParentFormattingContext::Item,
-            },
-        );
+        nested_context.run(run, self.nested_layout_input());
         self.set_svg_viewport_size(
             viewport,
             FfiCssPixelSize {
@@ -918,7 +919,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         let facts = self.svg_facts(graphics_box);
         // SAFETY: The callback computes geometry synchronously and transfers
-        // one retained path handle into the result.
+        // sole ownership of a heap-allocated path into the result.
         let result = unsafe {
             (self.callbacks.compute_svg_path)(
                 self.callbacks.context,
@@ -930,7 +931,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                 },
             )
         };
-        assert!(!result.path_handle.is_null());
+        // SAFETY: The callback just handed over its one owning pointer.
+        let path = unsafe { libgfx_rust::path::OwnedPath::adopt(result.path_handle) };
 
         if self.node_kind(graphics_box) == NodeKind::SVGTextBox {
             // Descendant and following text elements continue from the text position after this element's own text run.
@@ -961,11 +963,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         used.has_definite_block_size.set(true);
         self.state
             .used_values_rare_data_for_node_mut(&self.callbacks, graphics_box)
-            .computed_svg_path = Some(crate::layout::RetainedLayoutHandle::new(
-            result.path_handle,
-            self.callbacks.context,
-            self.callbacks.release_svg_path,
-        ));
+            .computed_svg_path = Some(path);
     }
 
     fn layout_image_element(&self, image_box: Node) {
@@ -1071,19 +1069,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             parent_viewbox_transform,
             Some(FfiAffineTransform::default()),
         );
-        nested_context.run(
-            run,
-            LayoutInput {
-                available_space: self.available_space.unwrap(),
-                containing_block_constraints: ContainingBlockConstraints {
-                    quirks_mode_percentage_basis_block_size: self.quirks_mode_percentage_basis_block_size,
-                    ..Default::default()
-                },
-                content_box_position_in_bfc_root: None,
-                sizing: RootSizingDirectives::default(),
-                participation: ParticipationInParentFormattingContext::Item,
-            },
-        );
+        nested_context.run(run, self.nested_layout_input());
 
         let used = used_pointer;
         let mapped_rect = parent_viewbox_transform.map_rect(FfiFloatRect {

@@ -5,7 +5,6 @@
  */
 
 #include <AK/Array.h>
-#include <AK/Atomic.h>
 #include <AK/Debug.h>
 #include <AK/GenericShorthands.h>
 #include <AK/Math.h>
@@ -71,9 +70,6 @@
 #include <LibWeb/SVG/SVGTextElement.h>
 
 namespace Web::Layout {
-
-static Atomic<size_t> s_outstanding_anchor_name_handles;
-static Atomic<size_t> s_outstanding_svg_path_handles;
 
 static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP_COUNT);
 static_assert(to_underlying(CSS::StyleGroupIndex::GridValues) == RustFFI::STYLE_GROUP_INDEX_GRID);
@@ -582,8 +578,8 @@ static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, Rus
     }
 
     auto bounding_box = path.bounding_box();
+    // Rust adopts this heap-allocated path and destroys it via ladybird_gfx_path_destroy().
     auto* path_handle = new Gfx::Path(move(path));
-    ++s_outstanding_svg_path_handles;
     return {
         .path_handle = path_handle,
         .bounding_box = {
@@ -597,14 +593,6 @@ static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, Rus
             .y = text_position.y(),
         },
     };
-}
-
-static void release_svg_path_handle(void const* handle)
-{
-    VERIFY(handle);
-    VERIFY(s_outstanding_svg_path_handles.load() > 0);
-    --s_outstanding_svg_path_handles;
-    delete static_cast<Gfx::Path const*>(handle);
 }
 
 Optional<RustFFI::FfiFormattingContextType> formatting_context_type_created_by_box(Box const& box)
@@ -957,10 +945,10 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
         .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer) {
             VERIFY(path_pointer);
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
+            // The path stays owned by the Rust layout state; only its contents move out.
             auto* path = static_cast<Gfx::Path*>(path_pointer);
             if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable))
-                svg_path_paintable->set_computed_path(move(*path));
-            release_svg_path_handle(path); },
+                svg_path_paintable->set_computed_path(move(*path)); },
         .set_grid_layout_data = [](void*, void* paintable_pointer, RustFFI::FfiGridLayoutData const* data) {
             VERIFY(data);
             static_cast<Painting::Paintable*>(paintable_pointer)->set_grid_layout_data(build_grid_layout_data(*data)); },
@@ -1108,19 +1096,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
     static_assert(to_underlying(SVG::PreserveAspectRatio::MeetOrSlice::Slice) == 1);
     static_assert(to_underlying(SVG::SVGUnits::ObjectBoundingBox) == 0);
     static_assert(to_underlying(SVG::SVGUnits::UserSpaceOnUse) == 1);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Invalid) == 0);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Top) == 1);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Right) == 2);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Bottom) == 3);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Left) == 4);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Center) == 5);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Start) == 6);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::End) == 7);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::SelfStart) == 8);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::SelfEnd) == 9);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Inside) == 10);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Outside) == 11);
-    static_assert(to_underlying(RustFFI::FfiAnchorSideKind::Percentage) == 12);
     static_assert(to_underlying(Gfx::GlyphRun::TextType::Common) == 0);
     static_assert(to_underlying(Gfx::GlyphRun::TextType::ContextDependent) == 1);
     static_assert(to_underlying(Gfx::GlyphRun::TextType::EndPadding) == 2);
@@ -1154,7 +1129,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             auto const& box = *static_cast<Box const*>(node);
             dbgln("FIXME: InlineFormattingContext::dimension_box_on_line got unexpected box in inline context:");
             dump_tree(box); },
-        .release_anchor_name_handle = ladybird_layout_release_anchor_name_handle,
         .build_svg_facts = [](void*, void* node) {
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
             VERIFY(node_with_style);
@@ -1221,7 +1195,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
             VERIFY(node_with_style);
             return compute_svg_path(*node_with_style, request); },
-        .release_svg_path = [](void*, void* path_handle) { release_svg_path_handle(path_handle); },
         .svg_image_bounding_box = [](void*, void* node, i32 viewport_width, i32 viewport_height) {
             auto const& image_box = as<SVGImageBox>(*static_cast<Node const*>(node));
             auto bounding_box = image_box.dom_node().bounding_box({
@@ -1271,126 +1244,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             if (!anchor_box)
                 return RustFFI::NodeSlotId_INVALID;
             return Node::slot_id(anchor_box); },
-        .build_anchor_function_facts = [](void*, void const* shell) {
-            auto value = CSS::StyleValue::adopt_rust_style_value_data(
-                CSS::StyleValueFFI::rust_style_value_retain(
-                    static_cast<CSS::StyleValueFFI::StyleValueData const*>(shell)));
-            if (!value->is_anchor()) {
-                return RustFFI::FfiAnchorFunctionFacts {
-                    .has_anchor_name = false,
-                    .anchor_name = 0,
-                    .side_kind = RustFFI::FfiAnchorSideKind::Invalid,
-                    .side_percentage = 0,
-                };
-            }
-            auto const& anchor = value->as_anchor();
-            auto const& side = *anchor.anchor_side();
-            auto side_kind = RustFFI::FfiAnchorSideKind::Invalid;
-            double side_percentage = 0;
-            if (side.is_keyword()) {
-                switch (side.to_keyword()) {
-                case CSS::Keyword::Top:
-                    side_kind = RustFFI::FfiAnchorSideKind::Top;
-                    break;
-                case CSS::Keyword::Right:
-                    side_kind = RustFFI::FfiAnchorSideKind::Right;
-                    break;
-                case CSS::Keyword::Bottom:
-                    side_kind = RustFFI::FfiAnchorSideKind::Bottom;
-                    break;
-                case CSS::Keyword::Left:
-                    side_kind = RustFFI::FfiAnchorSideKind::Left;
-                    break;
-                case CSS::Keyword::Center:
-                    side_kind = RustFFI::FfiAnchorSideKind::Center;
-                    break;
-                case CSS::Keyword::Start:
-                    side_kind = RustFFI::FfiAnchorSideKind::Start;
-                    break;
-                case CSS::Keyword::End:
-                    side_kind = RustFFI::FfiAnchorSideKind::End;
-                    break;
-                case CSS::Keyword::SelfStart:
-                    side_kind = RustFFI::FfiAnchorSideKind::SelfStart;
-                    break;
-                case CSS::Keyword::SelfEnd:
-                    side_kind = RustFFI::FfiAnchorSideKind::SelfEnd;
-                    break;
-                case CSS::Keyword::Inside:
-                    side_kind = RustFFI::FfiAnchorSideKind::Inside;
-                    break;
-                case CSS::Keyword::Outside:
-                    side_kind = RustFFI::FfiAnchorSideKind::Outside;
-                    break;
-                default:
-                    break;
-                }
-            } else if (side.is_percentage()) {
-                side_kind = RustFFI::FfiAnchorSideKind::Percentage;
-                side_percentage = side.as_percentage().percentage().as_fraction();
-            }
-            size_t anchor_name = 0;
-            if (auto name = anchor.anchor_name(); name.has_value()) {
-                anchor_name = name->to_raw_leaked();
-                ++s_outstanding_anchor_name_handles;
-            }
-            return RustFFI::FfiAnchorFunctionFacts {
-                .has_anchor_name = anchor_name != 0,
-                .anchor_name = anchor_name,
-                .side_kind = side_kind,
-                .side_percentage = side_percentage,
-            }; },
-        .anchor_function_fallback = [](void*, void const* shell) {
-            auto value = CSS::StyleValue::adopt_rust_style_value_data(
-                CSS::StyleValueFFI::rust_style_value_retain(
-                    static_cast<CSS::StyleValueFFI::StyleValueData const*>(shell)));
-            if (!value->is_anchor())
-                return RustFFI::FfiAnchorFallbackFacts {
-                    .kind = RustFFI::FfiAnchorFallbackKind::None,
-                    .px = 0,
-                    .fraction = 0,
-                    .value = nullptr,
-                };
-            auto fallback = value->as_anchor().fallback_value();
-            if (!fallback)
-                return RustFFI::FfiAnchorFallbackFacts {
-                    .kind = RustFFI::FfiAnchorFallbackKind::None,
-                    .px = 0,
-                    .fraction = 0,
-                    .value = nullptr,
-                };
-            if (fallback->is_length()) {
-                VERIFY(fallback->as_length().length().is_absolute());
-                return RustFFI::FfiAnchorFallbackFacts {
-                    .kind = RustFFI::FfiAnchorFallbackKind::Px,
-                    .px = fallback->as_length().length().absolute_length_to_px().raw_value(),
-                    .fraction = 0,
-                    .value = nullptr,
-                };
-            }
-            if (fallback->is_percentage()) {
-                return RustFFI::FfiAnchorFallbackFacts {
-                    .kind = RustFFI::FfiAnchorFallbackKind::Percentage,
-                    .px = 0,
-                    .fraction = fallback->as_percentage().percentage().as_fraction(),
-                    .value = nullptr,
-                };
-            }
-            if (fallback->is_calculated()) {
-                return RustFFI::FfiAnchorFallbackFacts {
-                    .kind = RustFFI::FfiAnchorFallbackKind::Calculated,
-                    .px = 0,
-                    .fraction = 0,
-                    .value = fallback->as_calculated().rust_style_value_data(),
-                };
-            }
-            VERIFY(fallback->is_anchor());
-            return RustFFI::FfiAnchorFallbackFacts {
-                .kind = RustFFI::FfiAnchorFallbackKind::Anchor,
-                .px = 0,
-                .fraction = 0,
-                .value = fallback->rust_style_value_data(),
-            }; },
         .set_default_scroll_shift = [](void*, void* node, void* anchor, bool horizontal, bool vertical) {
             auto& box = *static_cast<Box*>(node);
             if (!anchor) {
@@ -1401,13 +1254,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
     };
 }
 
-}
-
-extern "C" WEB_API void ladybird_layout_release_anchor_name_handle(size_t raw)
-{
-    VERIFY(Web::Layout::s_outstanding_anchor_name_handles.load() > 0);
-    --Web::Layout::s_outstanding_anchor_name_handles;
-    Utf16FlyString::unref_raw(raw);
 }
 
 extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32 code_point)

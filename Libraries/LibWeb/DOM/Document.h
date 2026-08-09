@@ -561,6 +561,13 @@ public:
         bump_dom_tree_version();
     }
 
+    // The used `color-scheme` of the element referencing this document, when it is an SVG being
+    // used as an image. `prefers-color-scheme` inside such a document answers with it rather than
+    // with the page's preference, and the same image can be referenced twice with different
+    // answers.
+    Optional<CSS::PreferredColorScheme> svg_image_color_scheme() const { return m_svg_image_color_scheme; }
+    void set_svg_image_color_scheme(CSS::PreferredColorScheme color_scheme) { m_svg_image_color_scheme = color_scheme; }
+
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
 
@@ -618,8 +625,8 @@ public:
 
     void set_window(HTML::Window&);
 
-    WebIDL::ExceptionOr<void> write(StringView text);
-    WebIDL::ExceptionOr<void> writeln(StringView text);
+    WebIDL::ExceptionOr<void> write(Utf16View text);
+    WebIDL::ExceptionOr<void> writeln(Utf16View text);
 
     WebIDL::ExceptionOr<Document*> open(Optional<Utf16String> const& = {}, Optional<Utf16String> const& = {});
     WebIDL::ExceptionOr<GC::Ptr<HTML::WindowProxy>> open(Utf16View url, Utf16View name, Utf16View features);
@@ -1380,7 +1387,7 @@ private:
         Yes,
         No,
     };
-    WebIDL::ExceptionOr<void> run_the_document_write_steps(StringView text, AddLineFeed line_feed);
+    WebIDL::ExceptionOr<void> run_the_document_write_steps(Utf16View text, AddLineFeed line_feed);
 
     void queue_intersection_observer_task();
     void queue_an_intersection_observer_entry(IntersectionObserver::IntersectionObserver&, HighResolutionTime::DOMHighResTimeStamp time, GC::Ref<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<Element> target);
@@ -1481,6 +1488,7 @@ private:
 
     QuirksMode m_quirks_mode { QuirksMode::No };
 
+    Optional<CSS::PreferredColorScheme> m_svg_image_color_scheme;
     bool m_parser_cannot_change_the_mode { false };
 
     // https://dom.spec.whatwg.org/#concept-document-type
