@@ -350,7 +350,21 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     fn replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
-        self.state.replaced_content_facts(self.callbacks, self.node)
+        let Some(facts) = self.callbacks.replaced_content_facts(self.node) else {
+            // The kind check is cheap enough for release builds; the style
+            // half of the enrollment predicate is debug-only because this
+            // miss path is the steady state for ordinary boxes.
+            assert!(
+                !crate::layout::node_may_have_replaced_content_facts(self.data()),
+                "replaced content facts were not synced to the arena before layout"
+            );
+            debug_assert!(
+                !crate::layout::node_may_have_replaced_content_facts_including_size_containment(self.data()),
+                "replaced content facts were not synced to the arena before layout"
+            );
+            return crate::layout::FfiReplacedContentFacts::default();
+        };
+        facts
     }
 
     pub(crate) fn is_text_node(&self) -> bool {
@@ -833,10 +847,7 @@ impl<'pass> NodeFacts<'pass> {
 pub(crate) struct LayoutState {
     used_values: PagedStore<UsedValues>,
     contained_abspos_children: PagedStore<RefCell<VecDeque<PendingAbsposChild>>>,
-    abspos_layout_pass_queue_in_completion_order: RefCell<VecDeque<Node>>,
-    abspos_layout_pass_is_active: Cell<bool>,
     anchor_inset_store: AnchorInsetStore,
-    replaced_content_facts: PagedStore<crate::layout::FfiReplacedContentFacts>,
     inline_containing_blocks: RefCell<HashSet<Node>>,
     anchor_candidate_shells: RefCell<Vec<*mut c_void>>,
     purpose: LayoutStatePurpose,
@@ -880,10 +891,7 @@ impl LayoutState {
         Self {
             used_values: PagedStore::default(),
             contained_abspos_children: PagedStore::default(),
-            abspos_layout_pass_queue_in_completion_order: RefCell::new(VecDeque::new()),
-            abspos_layout_pass_is_active: Cell::new(false),
             anchor_inset_store: AnchorInsetStore::default(),
-            replaced_content_facts: PagedStore::default(),
             inline_containing_blocks: RefCell::new(HashSet::new()),
             anchor_candidate_shells: RefCell::new(Vec::new()),
             purpose,
@@ -1199,33 +1207,6 @@ impl LayoutState {
         }
     }
 
-    pub(crate) fn replaced_content_facts(
-        &self,
-        callbacks: &FfiLayoutFcCallbacks,
-        node: Node,
-    ) -> crate::layout::FfiReplacedContentFacts {
-        let slot_index = callbacks.slot_index(node);
-        if let Some(facts) = self.replaced_content_facts.get(slot_index) {
-            return *facts;
-        }
-        let data = callbacks.node_data(node);
-        // Size containment gives any box an auto content box size of zero, so
-        // size-contained boxes join the replaced kinds in fetching real facts.
-        let size_containment_may_apply = crate::layout::kind_is_box(data.kind) && !data.style.is_null() && {
-            let style = self.style_facts(callbacks, node);
-            style.has_size_containment() || style.is_size_container()
-        };
-        let facts = if crate::layout::node_may_have_replaced_content_facts(data) || size_containment_may_apply {
-            // SAFETY: The callback table and node are supplied by the live C++
-            // formatting-context shim and remain valid for this layout pass.
-            unsafe { (callbacks.build_replaced_content_facts)(callbacks.context, callbacks.shell(node)) }
-        } else {
-            crate::layout::FfiReplacedContentFacts::default()
-        };
-        self.replaced_content_facts.allocate(slot_index, facts);
-        facts
-    }
-
     pub(crate) fn text_chunks(
         &self,
         callbacks: &FfiLayoutFcCallbacks,
@@ -1356,27 +1337,6 @@ impl LayoutState {
             all_laid_out &= children.borrow().is_empty();
         });
         all_laid_out
-    }
-
-    /// Every completed root enqueues even when its queue is still empty:
-    /// fixed-position descendants of abspos subtrees register against the
-    /// viewport only while the pass lays those subtrees out.
-    pub(crate) fn enqueue_for_abspos_layout_pass(&self, target_box: Node) {
-        self.abspos_layout_pass_queue_in_completion_order
-            .borrow_mut()
-            .push_back(target_box);
-    }
-
-    pub(crate) fn pop_from_abspos_layout_pass_queue(&self) -> Option<Node> {
-        self.abspos_layout_pass_queue_in_completion_order.borrow_mut().pop_front()
-    }
-
-    pub(crate) fn abspos_layout_pass_is_active(&self) -> bool {
-        self.abspos_layout_pass_is_active.get()
-    }
-
-    pub(crate) fn set_abspos_layout_pass_is_active(&self, is_active: bool) {
-        self.abspos_layout_pass_is_active.set(is_active);
     }
 
     /// By completion time the grid-area geometry is final and every abspos

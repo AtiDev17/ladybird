@@ -196,6 +196,7 @@ pub(crate) struct BlockFormattingContext<'pass> {
     lowest_floating_descendant_bottom_margin_edge: Cell<Option<CssPixels>>,
     derived_baselines_of_root_box: Cell<DerivedBaselines>,
     trailing_collapsed_margin: Cell<Option<(Node, CssPixels)>>,
+    table_box_in_wrapper_border_box_block_size: Cell<Option<CssPixels>>,
 }
 
 impl<'pass> BlockFormattingContext<'pass> {
@@ -215,7 +216,12 @@ impl<'pass> BlockFormattingContext<'pass> {
             lowest_floating_descendant_bottom_margin_edge: Cell::new(None),
             derived_baselines_of_root_box: Cell::new(DerivedBaselines::default()),
             trailing_collapsed_margin: Cell::new(None),
+            table_box_in_wrapper_border_box_block_size: Cell::new(None),
         }
+    }
+
+    pub(crate) fn table_box_in_wrapper_border_box_block_size(&self) -> Option<CssPixels> {
+        self.table_box_in_wrapper_border_box_block_size.get()
     }
 
     fn facts(&self, node: Node) -> NodeFacts<'_> {
@@ -514,6 +520,25 @@ impl<'pass> BlockFormattingContext<'pass> {
         //       as the preferred inline size and min/max constraints are irrelevant for intrinsic sizing.
         if self.used(node).inline_size_constraint.get() != SizeConstraint::None {
             return None;
+        }
+
+        // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+        // A rendered legend with a computed inline size of auto uses the
+        // fit-content size, resolved here so the legend's children are laid
+        // out against the used size rather than a provisional stretch size.
+        if style.width().is_auto() {
+            let container = self.containing_block(node);
+            if !container.is_invalid()
+                && self.facts(container).is_fieldset_box()
+                && self.facts(container).rendered_legend() == node
+            {
+                return Some(sizing.calculate_fit_content_size(
+                    node,
+                    SizingAxis::Inline,
+                    remaining_available_space,
+                    constraints,
+                ));
+            }
         }
 
         let remaining_inline_size = remaining_available_space.inline_size.to_px_or_zero();
@@ -1771,7 +1796,13 @@ impl<'pass> BlockFormattingContext<'pass> {
                 },
                 participation: ParticipationInParentFormattingContext::BlockLevel,
             };
-            self.layout_inside(run, node, inside_layout_input, true)
+            let child_layout = self.layout_inside(run, node, inside_layout_input, true);
+            if container_facts.is_table_wrapper() && style.display().is_table_inside() && child_layout.is_some() {
+                let used = self.used(node);
+                self.table_box_in_wrapper_border_box_block_size
+                    .set(Some(used.border_box_block_size(used.uses_collapsing_borders_model.get())));
+            }
+            child_layout
         } else {
             // This box participates in the current block container's flow.
             let space_available_for_children = if facts.is_anonymous() {
@@ -2030,17 +2061,6 @@ impl<'pass> BlockFormattingContext<'pass> {
             let mut dummy_bottom = CssPixels::default();
             self.layout_block_level_box(run, legend, fieldset, &mut dummy_bottom, child_input, None);
             self.block_offset_of_current_block_container.set(saved);
-        }
-
-        // If the computed value of 'inline-size' is 'auto', then the used value is the fit-content inline size.
-        if self.style(legend).width().is_auto() {
-            let inline_size = self.sizing().calculate_fit_content_size(
-                legend,
-                SizingAxis::Inline,
-                available_space,
-                child_input.containing_block_constraints,
-            );
-            self.used_mut(legend).set_content_inline_size(inline_size);
         }
 
         // The space allocated for the element's border on the block-start side is expected to be the element's

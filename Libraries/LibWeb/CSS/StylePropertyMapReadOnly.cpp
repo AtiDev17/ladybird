@@ -5,9 +5,9 @@
  */
 
 #include "StylePropertyMapReadOnly.h"
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/StylePropertyMapReadOnly.h>
+#include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
+#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSStyleValue.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
@@ -20,26 +20,19 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(StylePropertyMapReadOnly);
 
-GC::Ref<StylePropertyMapReadOnly> StylePropertyMapReadOnly::create_computed_style(JS::Realm& realm, DOM::AbstractElement element)
+GC::Ref<StylePropertyMapReadOnly> StylePropertyMapReadOnly::create_computed_style(DOM::AbstractElement element)
 {
-    return realm.create<StylePropertyMapReadOnly>(realm, element);
+    return GC::Heap::the().allocate<StylePropertyMapReadOnly>(element);
 }
 
-StylePropertyMapReadOnly::StylePropertyMapReadOnly(JS::Realm& realm, Source source)
-    : Bindings::PlatformObject(realm)
-    , m_declarations(move(source))
+StylePropertyMapReadOnly::StylePropertyMapReadOnly(Source source)
+    : m_declarations(move(source))
 {
 }
 
 StylePropertyMapReadOnly::~StylePropertyMapReadOnly() = default;
 
-void StylePropertyMapReadOnly::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(StylePropertyMapReadOnly);
-    Base::initialize(realm);
-}
-
-void StylePropertyMapReadOnly::visit_edges(Cell::Visitor& visitor)
+void StylePropertyMapReadOnly::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
 
@@ -48,14 +41,23 @@ void StylePropertyMapReadOnly::visit_edges(Cell::Visitor& visitor)
         [&visitor](GC::Ref<CSSStyleDeclaration>& declaration) { visitor.visit(declaration); });
 }
 
+// A computed style map describes an element's computed style, and a disconnected element has none.
+// `getComputedStyle` refuses one outright rather than reporting a style nothing decided, and the map
+// answers the same way: empty, with every property absent.
+static bool has_computed_style(DOM::AbstractElement const& abstract_element)
+{
+    return abstract_element.element().is_connected();
+}
+
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymapreadonly-get
-WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, Empty>> StylePropertyMapReadOnly::get(Utf16FlyString property_name)
+WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, Empty>> StylePropertyMapReadOnly::get(Utf16String property_name)
 {
     // The get(property) method, when called on a StylePropertyMapReadOnly this, must perform the following steps:
 
     // 1. If property is not a custom property name string, set property to property ASCII lowercased.
     // 2. If property is not a valid CSS property, throw a TypeError.
-    auto property = PropertyNameAndID::from_name(property_name);
+    auto property_name_utf16 = Utf16FlyString::from_utf16(property_name.utf16_view());
+    auto property = PropertyNameAndID::from_name(property_name_utf16);
     if (!property.has_value())
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, Utf16String::formatted("'{}' is not a valid CSS property", property_name) };
 
@@ -65,7 +67,7 @@ WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, Empty>> StylePropertyMapRead
     // 4. If props[property] exists, subdivide into iterations props[property], then reify the first item of the result and return it.
     if (auto property_value = get_style_value(props, property.value())) {
         auto iterations = property_value->subdivide_into_iterations(property.value());
-        return iterations.first()->reify(realm(), property->name());
+        return iterations.first()->reify(property->name());
     }
 
     // 5. Otherwise, return undefined.
@@ -73,13 +75,14 @@ WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, Empty>> StylePropertyMapRead
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymapreadonly-getall
-WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> StylePropertyMapReadOnly::get_all(Utf16FlyString property_name)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> StylePropertyMapReadOnly::get_all(Utf16String property_name)
 {
     // The getAll(property) method, when called on a StylePropertyMap this, must perform the following steps:
 
     // 1. If property is not a custom property name string, set property to property ASCII lowercased.
     // 2. If property is not a valid CSS property, throw a TypeError.
-    auto property = PropertyNameAndID::from_name(property_name);
+    auto property_name_utf16 = Utf16FlyString::from_utf16(property_name.utf16_view());
+    auto property = PropertyNameAndID::from_name(property_name_utf16);
     if (!property.has_value())
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, Utf16String::formatted("'{}' is not a valid CSS property", property_name) };
 
@@ -92,7 +95,7 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> StylePropertyMapRead
     if (auto property_value = get_style_value(props, property.value())) {
         auto iterations = property_value->subdivide_into_iterations(property.value());
         for (auto const& style_value : iterations)
-            results.append(style_value->reify(realm(), property->name()));
+            results.append(style_value->reify(property->name()));
         return results;
     }
 
@@ -101,13 +104,14 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<CSSStyleValue>>> StylePropertyMapRead
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymapreadonly-has
-WebIDL::ExceptionOr<bool> StylePropertyMapReadOnly::has(Utf16FlyString property_name)
+WebIDL::ExceptionOr<bool> StylePropertyMapReadOnly::has(Utf16String property_name)
 {
     // The has(property) method, when called on a StylePropertyMapReadOnly this, must perform the following steps:
 
     // 1. If property is not a custom property name string, set property to property ASCII lowercased.
     // 2. If property is not a valid CSS property, throw a TypeError.
-    auto property = PropertyNameAndID::from_name(property_name);
+    auto property_name_utf16 = Utf16FlyString::from_utf16(property_name.utf16_view());
+    auto property = PropertyNameAndID::from_name(property_name_utf16);
     if (!property.has_value())
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, Utf16String::formatted("'{}' is not a valid CSS property", property_name) };
 
@@ -117,6 +121,8 @@ WebIDL::ExceptionOr<bool> StylePropertyMapReadOnly::has(Utf16FlyString property_
     // 4. If props[property] exists, return true. Otherwise, return false.
     return props.visit(
         [&property](DOM::AbstractElement& element) {
+            if (!has_computed_style(element))
+                return false;
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial
@@ -130,7 +136,7 @@ WebIDL::ExceptionOr<bool> StylePropertyMapReadOnly::has(Utf16FlyString property_
             }
             return true;
         },
-        [&property](GC::Ref<CSSStyleDeclaration>& declaration) {
+        [&property](GC::Ref<CSSStyleDeclaration> const& declaration) {
             return declaration->has_property(property.value());
         });
 }
@@ -143,6 +149,8 @@ WebIDL::UnsignedLong StylePropertyMapReadOnly::size() const
     // 1. Return the size of the value of this’s [[declarations]] internal slot.
     return m_declarations.visit(
         [](DOM::AbstractElement const& element) {
+            if (!has_computed_style(element))
+                return size_t { 0 };
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial
@@ -170,6 +178,8 @@ RefPtr<StyleValue const> StylePropertyMapReadOnly::get_style_value(Source& sourc
 {
     return source.visit(
         [&property](DOM::AbstractElement& element) -> RefPtr<StyleValue const> {
+            if (!has_computed_style(element))
+                return nullptr;
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial

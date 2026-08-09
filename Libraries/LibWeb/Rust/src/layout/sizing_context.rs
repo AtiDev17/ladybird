@@ -1275,7 +1275,7 @@ impl<'pass> SizingContext<'pass> {
         available_inline_size: AvailableSize,
         available_block_size: AvailableSize,
         constraints: ContainingBlockConstraints,
-    ) -> Option<CssPixels> {
+    ) -> Option<(CssPixels, DerivedBaselines)> {
         // OPTIMIZATION: Calculating an intrinsic inline size already performs a complete measurement layout.
         // A later equivalent intrinsic line build only consumes the atomic box's measured dimensions and
         // baselines, so retain that summary instead of formatting the same descendants again. Commit layout
@@ -1304,7 +1304,11 @@ impl<'pass> SizingContext<'pass> {
         used.first_baseline.set(measurement.first_baseline);
         used.has_last_baseline.set(measurement.has_last_baseline);
         used.last_baseline.set(measurement.last_baseline);
-        Some(measurement.automatic_content_block_size)
+        let baselines = DerivedBaselines {
+            first: measurement.has_first_baseline.then_some(measurement.first_baseline),
+            last: measurement.has_last_baseline.then_some(measurement.last_baseline),
+        };
+        Some((measurement.automatic_content_block_size, baselines))
     }
 
     fn calculate_transferred_inline_size_for_replaced_element(
@@ -1850,7 +1854,7 @@ impl<'pass> SizingContext<'pass> {
     ) -> &UsedValues {
         let callbacks = *measurement.callbacks();
         measurement
-            .rust_state()
+            .layout_state()
             .create_used_values(&callbacks, node, constraints)
     }
 
@@ -1896,7 +1900,7 @@ impl<'pass> SizingContext<'pass> {
             .set(table_style.padding_right().to_px(containing_block_inline_size));
 
         let table_run = crate::layout::FormattingContextRun::new(
-            measurement.rust_state(),
+            measurement.layout_state(),
             table_box,
             LayoutMode::IntrinsicSizing,
             *measurement.callbacks(),
@@ -1943,10 +1947,9 @@ impl<'pass> SizingContext<'pass> {
 
         // table-wrapper can't have borders or paddings but it might have margin taken from table-root.
         let available_block_size = containing_block_block_size - margin_top - margin_bottom;
-        let table_box = self.table_box_inside_wrapper(wrapper);
 
         let measurement = MeasurementState::create(self.callbacks, wrapper, table_wrapper_constraints);
-        measurement.run_with_layout_mode(
+        let wrapper_result = measurement.run_with_layout_mode(
             wrapper,
             LayoutMode::IntrinsicSizing,
             LayoutInput {
@@ -1960,8 +1963,9 @@ impl<'pass> SizingContext<'pass> {
             },
         );
 
-        let table_used = measurement.rust_state().used_values(measurement.callbacks(), table_box);
-        let table_used_block_size = table_used.border_box_block_size(table_used.uses_collapsing_borders_model.get());
+        let table_used_block_size = wrapper_result
+            .table_box_in_wrapper_border_box_block_size
+            .expect("a table wrapper's measurement run lays out the table box inside it");
         if matches!(available_space.block_size, AvailableSize::Definite(_)) {
             table_used_block_size.min(available_block_size)
         } else {

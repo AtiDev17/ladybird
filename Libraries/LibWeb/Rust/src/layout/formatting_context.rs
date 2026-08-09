@@ -230,10 +230,10 @@ impl MeasurementState {
         layout_mode: LayoutMode,
         input: LayoutInput,
     ) -> crate::layout::ChildLayoutResult {
-        let rust_state = self.rust_state();
-        let fc_type = crate::layout::independent_formatting_context_type(rust_state, node, &self.callbacks);
+        let layout_state = self.layout_state();
+        let fc_type = crate::layout::independent_formatting_context_type(layout_state, node, &self.callbacks);
         crate::layout::run_formatting_context(
-            rust_state,
+            layout_state,
             node,
             None,
             fc_type,
@@ -245,7 +245,7 @@ impl MeasurementState {
         )
     }
 
-    pub(crate) fn rust_state(&self) -> &LayoutState {
+    pub(crate) fn layout_state(&self) -> &LayoutState {
         &self.state
     }
 
@@ -456,7 +456,10 @@ pub(crate) fn register_contained_abspos_child(
     loop {
         let containing_block = callbacks.containing_block(target);
         let facts = state.node_facts(callbacks, target);
-        if containing_block.is_invalid() || formatting_context_type_created_by_box(facts).is_some() {
+        if containing_block.is_invalid()
+            || (formatting_context_type_created_by_box(facts).is_some()
+                && !containing_block_geometry_is_finalized_by_the_table_run(state, callbacks, target))
+        {
             break;
         }
         target = containing_block;
@@ -464,16 +467,39 @@ pub(crate) fn register_contained_abspos_child(
     state.register_contained_abspos_child(callbacks, target, child, static_position_rect);
 }
 
+fn containing_block_geometry_is_finalized_by_the_table_run(
+    state: &LayoutState,
+    callbacks: &FfiLayoutFcCallbacks,
+    containing_block: Node,
+) -> bool {
+    let facts = state.node_facts(callbacks, containing_block);
+    facts.is_table_cell()
+        || facts.is_table_row()
+        || facts.is_table_row_group()
+        || facts.is_table_header_group()
+        || facts.is_table_footer_group()
+}
+
 pub(crate) fn box_baseline(
     state: &LayoutState,
     callbacks: &FfiLayoutFcCallbacks,
     box_: Node,
+    used: &UsedValues,
+    baseline_set: BaselineSet,
+) -> CssPixels {
+    box_baseline_with_content_baselines(state, callbacks, box_, used, baseline_set, used.content_baselines_from_cells())
+}
+
+pub(crate) fn box_baseline_with_content_baselines(
+    state: &LayoutState,
+    callbacks: &FfiLayoutFcCallbacks,
+    box_: Node,
+    used: &UsedValues,
     mut baseline_set: BaselineSet,
+    content_baselines: DerivedBaselines,
 ) -> CssPixels {
     let facts = state.node_facts(callbacks, box_);
     let style = state.style_facts(callbacks, box_);
-    let used_pointer = state.used_values(callbacks, box_);
-    let used = used_pointer;
     let collapsed = used.uses_collapsing_borders_model.get();
 
     // https://drafts.csswg.org/css2/#propdef-vertical-align
@@ -543,9 +569,8 @@ pub(crate) fn box_baseline(
     let input_derives_from_children = facts.is_html_input_element() && !facts.children_are_inline();
 
     let content_baseline = match baseline_set {
-        BaselineSet::First if used.has_first_baseline.get() => Some(used.first_baseline.get()),
-        BaselineSet::Last if used.has_last_baseline.get() => Some(used.last_baseline.get()),
-        _ => None,
+        BaselineSet::First => content_baselines.first,
+        BaselineSet::Last => content_baselines.last,
     };
     if let Some(content_baseline) = content_baseline
         && (derive_baseline_from_content || input_derives_from_children)
@@ -614,7 +639,7 @@ pub(crate) fn derive_baselines(
             let block_child_state = state.used_values(callbacks, fragment_node);
             let child_offset_from_margin_edge = block_child_state.content_offset.get().y
                 - block_child_state.margin_box_top(block_child_state.uses_collapsing_borders_model.get());
-            child_offset_from_margin_edge + box_baseline(state, callbacks, fragment_node, baseline_set)
+            child_offset_from_margin_edge + box_baseline(state, callbacks, fragment_node, block_child_state, baseline_set)
         };
 
         let mut first_line_index = 0;
@@ -690,7 +715,7 @@ pub(crate) fn derive_baselines(
             }
             let child_offset_from_margin_edge = child_state.content_offset.get().y
                 - child_state.margin_box_top(child_state.uses_collapsing_borders_model.get());
-            return Some(child_offset_from_margin_edge + box_baseline(state, callbacks, child, baseline_set));
+            return Some(child_offset_from_margin_edge + box_baseline(state, callbacks, child, child_state, baseline_set));
         }
         None
     };
@@ -746,6 +771,8 @@ pub struct FfiBordersData {
 pub(crate) struct ChildLayoutResult {
     pub automatic_content_inline_size: CssPixels,
     pub automatic_content_block_size: CssPixels,
+    pub baselines: DerivedBaselines,
+    pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
 }
 
 pub(crate) enum ChildLayoutOutcome {
@@ -898,7 +925,6 @@ pub struct FfiLayoutFcCallbacks {
     pub needs_inset_resolution: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub release_anchor_name_handle: crate::layout::FfiReleaseAnchorNameHandleCallback,
-    pub build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::FfiReplacedContentFacts,
     pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgElementFacts,
     pub read_paintable_geometry:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut crate::layout::FfiPaintableGeometry) -> bool,
@@ -946,6 +972,10 @@ impl FfiLayoutFcCallbacks {
         // set_computed_values verifies no pass is running and no layout node
         // is created mid-pass.
         unsafe { &*std::ptr::from_ref(payloads) }
+    }
+
+    pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<crate::layout::FfiReplacedContentFacts> {
+        self.arena().replaced_content_facts(node)
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'static>> {
@@ -1470,9 +1500,10 @@ fn run_formatting_context<'pass>(
         None
     };
     let mut implementation = None;
-    let result = if let Some(cached_block_size) = cached_atomic_block_size {
+    let result = if let Some((cached_block_size, cached_baselines)) = cached_atomic_block_size {
         ChildLayoutResult {
             automatic_content_block_size: cached_block_size,
+            baselines: cached_baselines,
             ..ChildLayoutResult::default()
         }
     } else {
@@ -1480,47 +1511,46 @@ fn run_formatting_context<'pass>(
         let result = match &mut context_implementation {
             FormattingContextImplementation::Block(context) => {
                 context.run(run, body_input);
-                let result = ChildLayoutResult {
-                    automatic_content_inline_size: context.automatic_content_inline_size(),
-                    automatic_content_block_size: context.automatic_content_block_size(),
-                };
-                store_derived_baselines(
-                    run.state.used_values(&run.callbacks, run.box_),
-                    context.derived_baselines_of_root_box(),
-                );
-                result
-            }
-            FormattingContextImplementation::Flex(context) => {
-                context.run(run, body_input);
-                store_derived_baselines(
-                    run.state.used_values(&run.callbacks, run.box_),
-                    context.derived_baselines_of_root_box(),
-                );
+                let baselines = context.derived_baselines_of_root_box();
+                store_derived_baselines(run.state.used_values(&run.callbacks, run.box_), baselines);
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size(),
+                    baselines,
+                    table_box_in_wrapper_border_box_block_size: context.table_box_in_wrapper_border_box_block_size(),
+                }
+            }
+            FormattingContextImplementation::Flex(context) => {
+                context.run(run, body_input);
+                let baselines = context.derived_baselines_of_root_box();
+                store_derived_baselines(run.state.used_values(&run.callbacks, run.box_), baselines);
+                ChildLayoutResult {
+                    automatic_content_inline_size: context.automatic_content_inline_size(),
+                    automatic_content_block_size: context.automatic_content_block_size(),
+                    baselines,
+                    ..ChildLayoutResult::default()
                 }
             }
             FormattingContextImplementation::Grid(context) => {
                 context.run(run, body_input);
-                store_derived_baselines(
-                    run.state.used_values(&run.callbacks, run.box_),
-                    context.derived_baselines_of_root_box(),
-                );
+                let baselines = context.derived_baselines_of_root_box();
+                store_derived_baselines(run.state.used_values(&run.callbacks, run.box_), baselines);
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size(),
+                    baselines,
+                    ..ChildLayoutResult::default()
                 }
             }
             FormattingContextImplementation::Table(context) => {
                 context.run(run, body_input);
-                store_derived_baselines(
-                    run.state.used_values(&run.callbacks, run.box_),
-                    context.derived_baselines_of_root_box(),
-                );
+                let baselines = context.derived_baselines_of_root_box();
+                store_derived_baselines(run.state.used_values(&run.callbacks, run.box_), baselines);
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size,
+                    baselines,
+                    ..ChildLayoutResult::default()
                 }
             }
             FormattingContextImplementation::Svg(context) => {
@@ -1553,7 +1583,7 @@ fn run_formatting_context<'pass>(
             finalize_atomic_root_block_size(
                 run,
                 &input,
-                cached_atomic_block_size,
+                cached_atomic_block_size.map(|(block_size, _)| block_size),
                 automatic_content_block_size_of_completed_body_run,
                 parent_block,
             );
@@ -1595,12 +1625,7 @@ fn run_formatting_context<'pass>(
         FormattingContextImplementation::Svg(_) | FormattingContextImplementation::ReplacedWithChildren => {}
         FormattingContextImplementation::InternalReplaced | FormattingContextImplementation::InternalDummy => return result,
     }
-    let box_ = run.box_;
-    if run.state.abspos_layout_pass_is_active() {
-        layout_contained_abspos_children(run);
-    } else {
-        run.state.enqueue_for_abspos_layout_pass(box_);
-    }
+    layout_contained_abspos_children(run);
     result
 }
 
@@ -1843,7 +1868,12 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             None,
         );
         place_child(&state, &callbacks, root_for_layout, FfiCssPixelPoint::default());
-        run_abspos_layout_pass(state_ref, callbacks, should_collect_devtools_layout_data);
+        drain_remaining_abspos_targets(
+            state_ref,
+            callbacks,
+            should_collect_devtools_layout_data,
+            &[root, root_for_layout],
+        );
         state.commit_replacing(root, std::ptr::null_mut(), &callbacks, sink);
     });
 }
@@ -1904,7 +1934,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         let fc_type = formatting_context_type_created_by_box(facts)
             .expect("partial relayout root must establish an independent formatting context");
         run_formatting_context(state_ref, root, None, fc_type, LayoutMode::Normal, false, callbacks, input, None);
-        run_abspos_layout_pass(state_ref, callbacks, false);
+        drain_remaining_abspos_targets(state_ref, callbacks, false, &[viewport, root]);
         state.commit_replacing(root, paintable_to_replace, &callbacks, sink);
     });
 }
@@ -1934,7 +1964,7 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
         assert!(!containing_block.is_invalid());
         let run = crate::layout::FormattingContextRun::new(state_ref, containing_block, LayoutMode::Normal, callbacks, false, false);
         AbsposEngine::new(state_ref, callbacks).replay(&run, box_);
-        run_abspos_layout_pass(state_ref, callbacks, false);
+        drain_remaining_abspos_targets(state_ref, callbacks, false, &[containing_block]);
         state.commit_replacing(box_, paintable_to_replace, &callbacks, sink);
     });
 }
