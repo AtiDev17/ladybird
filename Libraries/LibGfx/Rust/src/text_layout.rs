@@ -50,6 +50,8 @@ pub struct ShapedRunView {
     pub glyphs: *const DrawGlyph,
     pub glyph_count: usize,
     pub width: f32,
+    pub trailing_whitespace_length_in_code_units: usize,
+    pub trailing_whitespace_advance: f32,
     pub retained: *mut c_void,
 }
 
@@ -61,6 +63,7 @@ unsafe extern "C" {
         text_type: TextType,
         baseline_start_x: f32,
         letter_spacing: f32,
+        word_spacing: f32,
     ) -> ShapedRunView;
 
     fn ladybird_gfx_glyph_run_unref(retained: *mut c_void);
@@ -82,6 +85,8 @@ impl Drop for RetainedGlyphRun {
 pub struct ShapedText {
     glyphs: Vec<DrawGlyph>,
     width: f32,
+    trailing_whitespace_length_in_code_units: usize,
+    trailing_whitespace_advance: f32,
 }
 
 impl ShapedText {
@@ -94,6 +99,16 @@ impl ShapedText {
     pub fn width(&self) -> f32 {
         self.width
     }
+
+    #[inline]
+    pub fn trailing_whitespace_length_in_code_units(&self) -> usize {
+        self.trailing_whitespace_length_in_code_units
+    }
+
+    #[inline]
+    pub fn trailing_whitespace_advance(&self) -> f32 {
+        self.trailing_whitespace_advance
+    }
 }
 
 pub fn shape_text(
@@ -102,6 +117,7 @@ pub fn shape_text(
     text_type: TextType,
     baseline_start_x: f32,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> ShapedText {
     // SAFETY: FontRef keeps the font live, and the text slice remains valid
     // for the duration of the synchronous shaping call.
@@ -113,6 +129,7 @@ pub fn shape_text(
             text_type,
             baseline_start_x,
             letter_spacing,
+            word_spacing,
         )
     };
     let retained = RetainedGlyphRun {
@@ -127,6 +144,13 @@ pub fn shape_text(
         unsafe { std::slice::from_raw_parts(view.glyphs, view.glyph_count) }.to_vec()
     };
     let width = view.width;
+    let trailing_whitespace_length_in_code_units = view.trailing_whitespace_length_in_code_units;
+    let trailing_whitespace_advance = view.trailing_whitespace_advance;
     drop(retained);
-    ShapedText { glyphs, width }
+    ShapedText {
+        glyphs,
+        width,
+        trailing_whitespace_length_in_code_units,
+        trailing_whitespace_advance,
+    }
 }
