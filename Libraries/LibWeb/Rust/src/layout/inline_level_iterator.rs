@@ -209,6 +209,9 @@ impl<'iterator, 'context, 'pass> InlineLevelIteratorGenerator<'iterator, 'contex
         leading.border += used.border_left.get();
         leading.padding += used.padding_left.get();
         self.context().compute_inset(node);
+        if self.context().run.fragments.is_some() {
+            crate::layout::place_child(self.context().run, node, FfiCssPixelPoint::default(), None);
+        }
         self.box_model_node_stack.push(node);
     }
 

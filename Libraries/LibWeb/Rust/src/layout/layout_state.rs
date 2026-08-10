@@ -63,34 +63,6 @@ impl<T> PagedStore<T> {
         assert!(entry_was_vacant, "PagedStore index {index} allocated twice");
         entry.get().unwrap()
     }
-
-    fn for_each_indexed(&self, mut callback: impl FnMut(u32, &T)) {
-        let Some(directory) = self.page_table_directory.get() else {
-            return;
-        };
-        for (directory_index, page_table) in directory.iter().enumerate() {
-            let Some(page_table) = page_table.get() else {
-                continue;
-            };
-            for (page_index, page) in page_table.iter().enumerate() {
-                let Some(page) = page.get() else {
-                    continue;
-                };
-                for (entry_index, entry) in page.iter().enumerate() {
-                    if let Some(entry) = entry.get() {
-                        let index = (directory_index << (PAGE_TABLE_BITS + PAGE_BITS))
-                            | (page_index << PAGE_BITS)
-                            | entry_index;
-                        callback(index as u32, entry);
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn for_each(&self, mut callback: impl FnMut(&T)) {
-        self.for_each_indexed(|_, value| callback(value));
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,13 +154,6 @@ pub struct FfiCommittedBoxMetrics {
     pub has_containing_line_box_index: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum LineFragmentLookup {
-    NotFound,
-    LineOnly,
-    Found(crate::layout::FfiCssPixelPoint),
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InlineAncestorChainRelativeOffset {
     pub(crate) offset_x: crate::layout::CssPixels,
@@ -263,18 +228,108 @@ pub struct FfiCommitSink {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContainingBlockGeometry {
+    pub(crate) content_origin_in_entry_space: FfiCssPixelPoint,
+    pub(crate) padding_left: CssPixels,
+    pub(crate) padding_right: CssPixels,
+    pub(crate) padding_top: CssPixels,
+    pub(crate) padding_bottom: CssPixels,
+    pub(crate) content_inline_size: CssPixels,
+    pub(crate) content_block_size: CssPixels,
+}
+
+impl ContainingBlockGeometry {
+    pub(crate) fn from_used_values(used: &UsedValues, content_origin_in_entry_space: FfiCssPixelPoint) -> Self {
+        Self {
+            content_origin_in_entry_space,
+            padding_left: used.padding_left.get(),
+            padding_right: used.padding_right.get(),
+            padding_top: used.padding_top.get(),
+            padding_bottom: used.padding_bottom.get(),
+            content_inline_size: used.content_inline_size.get(),
+            content_block_size: used.content_block_size.get(),
+        }
+    }
+
+    pub(crate) fn padding_box_inline_size(&self) -> CssPixels {
+        self.content_inline_size + self.padding_left + self.padding_right
+    }
+
+    pub(crate) fn padding_box_block_size(&self) -> CssPixels {
+        self.content_block_size + self.padding_top + self.padding_bottom
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAbsposChild {
     pub(crate) child_box: Node,
+    pub(crate) coordinate_space_box: Node,
     pub(crate) static_position_rect: StaticPositionRect,
     pub(crate) containing_block_info_override: Option<AbsposContainingBlockInfo>,
+    pub(crate) inline_containing_block: Node,
+    pub(crate) inline_containing_block_rect: Option<PhysicalRect>,
 }
 pub(crate) struct LayoutState {
-    used_values: PagedStore<UsedValues>,
-    contained_abspos_children: PagedStore<RefCell<VecDeque<PendingAbsposChild>>>,
     anchor_inset_store: AnchorInsetStore,
-    inline_containing_blocks: RefCell<HashSet<Node>>,
-    anchor_candidate_shells: RefCell<Vec<*mut c_void>>,
     purpose: LayoutStatePurpose,
+}
+
+pub(crate) struct RunRecords {
+    root: Node,
+    map: RefCell<HashMap<u32, std::rc::Rc<UsedValues>>>,
+}
+
+impl RunRecords {
+    pub(crate) fn new(root: Node, root_used: std::rc::Rc<UsedValues>) -> Self {
+        let records = Self::new_unrooted(root);
+        records.register(root, root_used);
+        records
+    }
+
+    pub(crate) fn new_unrooted(root: Node) -> Self {
+        Self {
+            root,
+            map: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn register(&self, node: Node, used: std::rc::Rc<UsedValues>) {
+        let previous = self.map.borrow_mut().insert(node.slot_index(), used);
+        assert!(
+            previous.is_none(),
+            "slot {} registered twice in the run rooted at slot {}",
+            node.slot_index(),
+            self.root.slot_index()
+        );
+    }
+
+    pub(crate) fn create_used_values(
+        &self,
+        state: &LayoutState,
+        callbacks: &FfiLayoutFcCallbacks,
+        node: Node,
+        constraints: ContainingBlockConstraints,
+    ) -> std::rc::Rc<UsedValues> {
+        let used = state.create_used_values(callbacks, node, constraints);
+        self.register(node, used.clone());
+        used
+    }
+
+    #[track_caller]
+    pub(crate) fn used_values(&self, node: Node) -> std::rc::Rc<UsedValues> {
+        let caller = std::panic::Location::caller();
+        self.used_values_if_owned(node).unwrap_or_else(|| {
+            panic!(
+                "the run rooted at slot {} does not own the record for slot {} (read at {caller})",
+                self.root.slot_index(),
+                node.slot_index(),
+            )
+        })
+    }
+
+    pub(crate) fn used_values_if_owned(&self, node: Node) -> Option<std::rc::Rc<UsedValues>> {
+        self.map.borrow().get(&node.slot_index()).cloned()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,7 +343,6 @@ impl Default for LayoutState {
         Self::new(LayoutStatePurpose::Commit)
     }
 }
-
 
 #[derive(Default)]
 pub(crate) struct LineData {
@@ -307,17 +361,12 @@ pub(crate) struct UsedValuesRareData {
     pub(crate) used_grid_tracks: Option<OwnedUsedGridTracks>,
     pub(crate) override_borders_data: Option<FfiBordersData>,
     pub(crate) abspos_layout_inputs: Option<AbsposLayoutInputs>,
-    pub(crate) inline_containing_block_first_last_rect: Option<PhysicalRect>,
 }
 
 impl LayoutState {
     pub(crate) fn new(purpose: LayoutStatePurpose) -> Self {
         Self {
-            used_values: PagedStore::default(),
-            contained_abspos_children: PagedStore::default(),
             anchor_inset_store: AnchorInsetStore::default(),
-            inline_containing_blocks: RefCell::new(HashSet::new()),
-            anchor_candidate_shells: RefCell::new(Vec::new()),
             purpose,
         }
     }
@@ -344,11 +393,9 @@ impl LayoutState {
         callbacks: &FfiLayoutFcCallbacks,
         node: Node,
         constraints: ContainingBlockConstraints,
-    ) -> &UsedValues {
+    ) -> std::rc::Rc<UsedValues> {
         assert!(!node.is_invalid());
         let facts = self.node_facts(callbacks, node);
-        let slot_index = callbacks.slot_index(node);
-        assert!(self.used_values.get(slot_index).is_none());
 
         let style = self.style_facts(callbacks, node);
         let percentage_basis_inline_size = constraints.percentage_basis_inline_size;
@@ -364,10 +411,7 @@ impl LayoutState {
         // definite. We model all of those by considering sizes definite once
         // they are assigned through set_content_inline_size() or
         // set_content_block_size().
-        let used = UsedValues {
-            node,
-            ..UsedValues::default()
-        };
+        let used = UsedValues::default();
 
         #[derive(Clone, Copy)]
         enum Axis {
@@ -494,9 +538,7 @@ impl LayoutState {
         used.content_inline_size.set(content_inline_size.unwrap_or_default());
         used.content_block_size.set(content_block_size.unwrap_or_default());
 
-        let used = self.used_values.allocate(slot_index, used);
-        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
-        used
+        std::rc::Rc::new(used)
     }
 
     pub(crate) fn populate_from_paintable(
@@ -504,10 +546,7 @@ impl LayoutState {
         callbacks: &FfiLayoutFcCallbacks,
         node: Node,
         paintable: *mut c_void,
-    ) -> Option<&UsedValues> {
-        let slot_index = callbacks.slot_index(node);
-        assert!(self.used_values.get(slot_index).is_none());
-
+    ) -> Option<std::rc::Rc<UsedValues>> {
         let mut geometry = FfiPaintableGeometry::default();
         let found =
             unsafe {
@@ -520,11 +559,7 @@ impl LayoutState {
         // Skip normal node initialization: resolving computed sizes requires
         // percentage bases, and every resulting geometry field is replaced by
         // the previous paintable's committed value immediately.
-        let used = UsedValues {
-            node,
-            ..UsedValues::default()
-        };
-        used.materialized_from_paintable.set(true);
+        let used = UsedValues::default();
         used.set_content_inline_size(geometry.content_inline_size);
         used.set_content_block_size(geometry.content_block_size);
         used.has_definite_inline_size.set(true);
@@ -551,39 +586,10 @@ impl LayoutState {
         used.has_content_offset.set(true);
         used.seal_committed_box_metrics();
 
-        let used = self.used_values.allocate(slot_index, used);
         if self.node_facts(callbacks, node).is_svg_svg_box() {
-            self.used_values_rare_data_mut(slot_index).svg_viewport_size = Some(geometry.svg_viewport_size);
+            used.rare_data_mut().svg_viewport_size = Some(geometry.svg_viewport_size);
         }
-        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
-        Some(used)
-    }
-
-    pub(crate) fn note_inline_containing_block(&self, inline_containing_block: Node) {
-        self.inline_containing_blocks.borrow_mut().insert(inline_containing_block);
-    }
-
-    pub(crate) fn has_inline_containing_blocks(&self) -> bool {
-        !self.inline_containing_blocks.borrow().is_empty()
-    }
-
-    pub(crate) fn is_inline_containing_block(&self, node: Node) -> bool {
-        self.inline_containing_blocks.borrow().contains(&node)
-    }
-
-    pub(crate) fn inline_containing_block_first_last_rect(&self, slot_index: u32) -> Option<PhysicalRect> {
-        self.used_values_rare_data(slot_index)?.inline_containing_block_first_last_rect
-    }
-
-    fn register_anchor_candidate_if_carries_anchor_names(&self, callbacks: &FfiLayoutFcCallbacks, node: Node) {
-        if !self.node_facts(callbacks, node).has_anchor_names() {
-            return;
-        }
-        self.anchor_candidate_shells.borrow_mut().push(callbacks.shell(node));
-    }
-
-    pub(crate) fn anchor_candidate_shells(&self) -> Ref<'_, Vec<*mut c_void>> {
-        self.anchor_candidate_shells.borrow()
+        Some(std::rc::Rc::new(used))
     }
 
     pub(crate) fn set_box_is_grid_item(&self, callbacks: &FfiLayoutFcCallbacks, node: Node, is_grid_item: bool) {
@@ -664,132 +670,12 @@ impl LayoutState {
         })
     }
 
-    pub(crate) fn line_data_cell(&self, slot_index: u32) -> &RefCell<LineData> {
-        self.used_values_by_slot(slot_index)
-            .expect("missing used values")
-            .line_data
-            .get_or_init(LineData::default)
-    }
-
-    pub(crate) fn line_data(&self, slot_index: u32) -> Option<Ref<'_, LineData>> {
-        self.used_values_by_slot(slot_index)?
-            .line_data
-            .get()
-            .map(RefCell::borrow)
-    }
-
-    pub(crate) fn line_data_mut_if_present(&self, slot_index: u32) -> Option<RefMut<'_, LineData>> {
-        self.used_values_by_slot(slot_index)?
-            .line_data
-            .get()
-            .map(RefCell::borrow_mut)
-    }
-
-    pub(crate) fn used_values_rare_data(&self, slot_index: u32) -> Option<Ref<'_, UsedValuesRareData>> {
-        self.used_values_by_slot(slot_index)?
-            .rare_data
-            .get()
-            .map(RefCell::borrow)
-    }
-
-    pub(crate) fn used_values_rare_data_mut(&self, slot_index: u32) -> RefMut<'_, UsedValuesRareData> {
-        self.used_values_by_slot(slot_index)
-            .expect("missing used values")
-            .rare_data
-            .get_or_init(UsedValuesRareData::default)
-            .borrow_mut()
-    }
-
-    pub(crate) fn used_values_rare_data_for_node_mut(
-        &self,
-        callbacks: &FfiLayoutFcCallbacks,
-        node: Node,
-    ) -> RefMut<'_, UsedValuesRareData> {
-        self.used_values_rare_data_mut(callbacks.slot_index(node))
-    }
-
-    fn used_values_by_slot(&self, slot_index: u32) -> Option<&UsedValues> {
-        self.used_values.get(slot_index)
-    }
-
-    pub(crate) fn used_values(&self, callbacks: &FfiLayoutFcCallbacks, node: Node) -> &UsedValues {
-        self.used_values
-            .get(callbacks.slot_index(node))
-            .expect("missing used values")
-    }
-
-    pub(crate) fn register_contained_abspos_child(
-        &self,
-        callbacks: &FfiLayoutFcCallbacks,
-        target_box: Node,
-        child_box: Node,
-        static_position_rect: StaticPositionRect,
-    ) {
-        let slot_index = target_box.slot_index();
-        let children = self.contained_abspos_children.get(slot_index).unwrap_or_else(|| {
-            self.contained_abspos_children
-                .allocate(slot_index, RefCell::new(VecDeque::new()))
-        });
-        let mut children = children.borrow_mut();
-        if cfg!(debug_assertions) {
-            for entry in children.iter() {
-                // Every box is laid out at most once per state, so it can only be registered once.
-                assert_ne!(entry.child_box, child_box);
-            }
-        }
-        // Entries are kept in tree order so consumption follows document order.
-        let insertion_index = children.partition_point(|entry| callbacks.is_before(entry.child_box, child_box));
-        children.insert(
-            insertion_index,
-            PendingAbsposChild {
-                child_box,
-                static_position_rect,
-                containing_block_info_override: None,
-            },
-        );
-    }
-
-    pub(crate) fn has_contained_abspos_children(&self, target_box: Node) -> bool {
-        self.contained_abspos_children
-            .get(target_box.slot_index())
-            .is_some_and(|children| !children.borrow().is_empty())
-    }
-
-    pub(crate) fn all_registered_contained_abspos_children_are_laid_out(&self) -> bool {
-        let mut all_laid_out = true;
-        self.contained_abspos_children.for_each(|children| {
-            all_laid_out &= children.borrow().is_empty();
-        });
-        all_laid_out
-    }
-
-    /// By completion time the grid-area geometry is final and every abspos
-    /// child registering against this containing block has done so.
-    pub(crate) fn override_contained_abspos_child_containing_blocks(
-        &self,
-        target_box: Node,
-        containing_block_info_for_child: impl Fn(Node) -> AbsposContainingBlockInfo,
-    ) {
-        let Some(children) = self.contained_abspos_children.get(target_box.slot_index()) else {
-            return;
-        };
-        for entry in children.borrow_mut().iter_mut() {
-            entry.containing_block_info_override = Some(containing_block_info_for_child(entry.child_box));
-        }
-    }
-
-    pub(crate) fn take_next_contained_abspos_child(&self, target_box: Node) -> Option<PendingAbsposChild> {
-        self.contained_abspos_children
-            .get(target_box.slot_index())?
-            .borrow_mut()
-            .pop_front()
-    }
-
     /// Accumulates relative-position insets from a chain of inline-flow
     /// ancestors, starting at first_ancestor and walking up until stop_at or
     /// the first ancestor that is not inline-flow.
     pub(crate) fn accumulated_relative_insets_from_inline_ancestor_chain(
         &self,
+        records: &RunRecords,
         callbacks: &FfiLayoutFcCallbacks,
         first_ancestor: Node,
         stop_at: Node,
@@ -811,7 +697,7 @@ impl LayoutState {
                 // committed fragment or piece was entered by its inline
                 // formatting context this pass, which created its used values
                 // and resolved its insets.
-                let used = self.used_values(callbacks, ancestor);
+                let used = records.used_values(ancestor);
                 result.offset_x += used.inset_left.get();
                 result.offset_y += used.inset_top.get();
             }
@@ -822,55 +708,34 @@ impl LayoutState {
 
     /// The line box index to record for atomic inlines whose containing line
     /// survived line post-processing.
-    fn containing_line_box_index(
+    fn resolve_containing_line_box_index(
         &self,
+        records: &RunRecords,
         callbacks: &FfiLayoutFcCallbacks,
         node: Node,
-        used: &UsedValues,
+        containing_block: Node,
+        coordinate: Option<LineBoxFragmentCoordinate>,
+        placed_offset: FfiCssPixelPoint,
     ) -> Option<usize> {
-        if used.materialized_from_paintable.get() {
-            return None;
-        }
+        let coordinate = coordinate?;
         let facts = self.node_facts(callbacks, node);
         if !facts.is_non_fragmented_box() {
             return None;
         }
-        match self.line_fragment_lookup(callbacks, used) {
-            LineFragmentLookup::NotFound => None,
-            LineFragmentLookup::LineOnly => Some(used.containing_line_box_fragment.get().line_box_index),
-            LineFragmentLookup::Found(line_fragment_offset) => {
-                debug_assert_eq!(
-                    line_fragment_offset,
-                    used.content_offset.get(),
-                    "stored line fragment offset diverged from the placed offset (is_block_outside={})",
-                    facts.display().is_block_outside()
-                );
-                Some(used.containing_line_box_fragment.get().line_box_index)
-            }
-        }
-    }
-
-    fn line_fragment_lookup(&self, callbacks: &FfiLayoutFcCallbacks, used: &UsedValues) -> LineFragmentLookup {
-        if !used.has_containing_line_box_fragment.get() {
-            return LineFragmentLookup::NotFound;
-        }
-        // SAFETY: Commit traverses the still-live C++ layout tree
-        // synchronously with the pass callback table.
-        let containing_block = callbacks.containing_block(used.node);
         assert!(!containing_block.is_invalid());
-        let slot_index = callbacks.slot_index(containing_block);
-        let Some(data) = self.line_data(slot_index) else {
-            return LineFragmentLookup::NotFound;
-        };
-        let coordinate = used.containing_line_box_fragment.get();
-        let Some(line) = data.line_boxes.get(coordinate.line_box_index) else {
-            return LineFragmentLookup::NotFound;
-        };
-        let Some(fragment) = line.fragments.get(coordinate.fragment_index) else {
-            return LineFragmentLookup::LineOnly;
-        };
-        let (x, y) = fragment.offset();
-        LineFragmentLookup::Found(crate::layout::FfiCssPixelPoint { x, y })
+        let containing_block_used = records.used_values(containing_block);
+        let data = containing_block_used.line_data_ref()?;
+        let line = data.line_boxes.get(coordinate.line_box_index)?;
+        if let Some(fragment) = line.fragments.get(coordinate.fragment_index) {
+            let (x, y) = fragment.offset();
+            debug_assert_eq!(
+                crate::layout::FfiCssPixelPoint { x, y },
+                placed_offset,
+                "stored line fragment offset diverged from the placed offset (is_block_outside={})",
+                facts.display().is_block_outside()
+            );
+        }
+        Some(coordinate.line_box_index)
     }
 
     fn commit_subtree(
@@ -880,26 +745,23 @@ impl LayoutState {
         insert_before_paintable: *mut c_void,
         callbacks: &FfiLayoutFcCallbacks,
         sink: &FfiCommitSink,
+        scopes: &mut crate::layout::CommitScopes<'_>,
     ) {
         let slot_index = callbacks.slot_index(node);
-        let used = self.used_values_by_slot(slot_index);
-        let abspos_layout_inputs = self
-            .used_values_rare_data(slot_index)
-            .and_then(|rare| rare.abspos_layout_inputs);
-        if used.is_some() {
-            callbacks.set_saved_abspos_layout_inputs(node, abspos_layout_inputs);
+        let entry = scopes.link_for_slot(slot_index);
+        if let Some(link) = entry {
+            callbacks.set_saved_abspos_layout_inputs(node, link.abspos_layout_inputs);
         }
         // SAFETY: The C++ sink owns paintables and copies every plain-data
         // input synchronously.
         let node_shell = callbacks.shell(node);
-        let paintable = unsafe { (sink.prepare_node)(sink.context, node_shell, used.is_some()) };
+        let paintable = unsafe { (sink.prepare_node)(sink.context, node_shell, entry.is_some()) };
 
         let mut has_pending_inline_box_geometry = false;
-        if let Some(used) = used
+        if let Some(link) = entry
             && !paintable.is_null()
         {
-            let content_offset = point_add(used.content_offset.get(), used.committed_offset_delta.get());
-            let containing_line_box_index = self.containing_line_box_index(callbacks, node, used);
+            let fragment = &link.fragment;
             // SAFETY: Every callback below copies its plain-data argument or
             // consumes one retained handle synchronously.
             unsafe {
@@ -907,46 +769,41 @@ impl LayoutState {
                     sink.context,
                     paintable,
                     FfiCommittedBoxMetrics {
-                        content_offset,
-                        content_inline_size: used.content_inline_size.get(),
-                        content_block_size: used.content_block_size.get(),
-                        margin_left: used.margin_left.get(),
-                        margin_right: used.margin_right.get(),
-                        margin_top: used.margin_top.get(),
-                        margin_bottom: used.margin_bottom.get(),
-                        border_left: used.border_left.get(),
-                        border_right: used.border_right.get(),
-                        border_top: used.border_top.get(),
-                        border_bottom: used.border_bottom.get(),
-                        padding_left: used.padding_left.get(),
-                        padding_right: used.padding_right.get(),
-                        padding_top: used.padding_top.get(),
-                        padding_bottom: used.padding_bottom.get(),
-                        inset_left: used.inset_left.get(),
-                        inset_right: used.inset_right.get(),
-                        inset_top: used.inset_top.get(),
-                        inset_bottom: used.inset_bottom.get(),
-                        containing_line_box_index: containing_line_box_index.unwrap_or(0),
-                        has_containing_line_box_index: containing_line_box_index.is_some(),
+                        content_offset: link.committed_offset,
+                        content_inline_size: fragment.content_inline_size,
+                        content_block_size: fragment.content_block_size,
+                        margin_left: fragment.margin_left,
+                        margin_right: fragment.margin_right,
+                        margin_top: fragment.margin_top,
+                        margin_bottom: fragment.margin_bottom,
+                        border_left: fragment.border_left,
+                        border_right: fragment.border_right,
+                        border_top: fragment.border_top,
+                        border_bottom: fragment.border_bottom,
+                        padding_left: fragment.padding_left,
+                        padding_right: fragment.padding_right,
+                        padding_top: fragment.padding_top,
+                        padding_bottom: fragment.padding_bottom,
+                        inset_left: link.inset_left,
+                        inset_right: link.inset_right,
+                        inset_top: link.inset_top,
+                        inset_bottom: link.inset_bottom,
+                        containing_line_box_index: link.containing_line_box_index.unwrap_or(0),
+                        has_containing_line_box_index: link.containing_line_box_index.is_some(),
                     },
                 );
             }
 
-            let (override_borders, table_cell_coordinates) =
-                self.used_values_rare_data(slot_index).map_or((None, None), |rare| {
-                    (rare.override_borders_data, rare.table_cell_coordinates)
-                });
             unsafe {
-                if let Some(borders) = override_borders {
+                if let Some(borders) = fragment.override_borders_data {
                     (sink.set_override_borders)(sink.context, paintable, borders);
                 }
-                if let Some(coordinates) = table_cell_coordinates {
+                if let Some(coordinates) = fragment.table_cell_coordinates {
                     (sink.set_table_cell_coordinates)(sink.context, paintable, coordinates);
                 }
             }
 
-            let has_line_data = self.line_data(slot_index).is_some();
-            if has_line_data {
+            if let Some(line_data) = &fragment.line_data {
                 // SAFETY: The sink keeps one line accumulator live between
                 // begin_line_data() and finish_line_data().
                 let accepts_lines = unsafe { (sink.begin_line_data)(sink.context, paintable) };
@@ -957,66 +814,39 @@ impl LayoutState {
                         emit_fragment: sink.emit_fragment,
                         emit_inline_box_piece: sink.emit_inline_box_piece,
                     };
-                    assert!(push_line_data(
-                        self,
-                        slot_index,
-                        used.content_inline_size.get(),
-                        callbacks,
-                        line_sink
-                    ));
+                    push_line_data(line_data, fragment.content_inline_size, callbacks, line_sink);
                     unsafe {
                         (sink.finish_line_data)(sink.context);
                     }
-                    has_pending_inline_box_geometry = self
-                        .line_data(slot_index)
-                        .is_some_and(|data| !data.inline_box_pieces.is_empty());
+                    has_pending_inline_box_geometry = !line_data.inline_box_pieces.is_empty();
                 }
             }
 
-            let (transforms, viewport_size, path) = self
-                .used_values_rare_data(slot_index)
-                .map_or((None, None, None), |rare| {
-                    (
-                        rare.computed_svg_transforms,
-                        rare.svg_viewport_size,
-                        rare.computed_svg_path.as_ref().map(libgfx_rust::path::OwnedPath::as_raw),
-                    )
-                });
             unsafe {
-                if let Some(transforms) = transforms {
+                if let Some(transforms) = fragment.computed_svg_transforms {
                     (sink.set_computed_svg_transforms)(sink.context, paintable, transforms);
                 }
-                if let Some(viewport_size) = viewport_size {
+                if let Some(viewport_size) = fragment.svg_viewport_size {
                     (sink.set_svg_viewport_size)(sink.context, paintable, viewport_size);
                 }
-                if let Some(path) = path {
-                    // The sink only borrows the path and moves its contents
-                    // out; the rare data keeps ownership until state teardown.
-                    (sink.set_computed_svg_path)(sink.context, paintable, path);
+                if let Some(path) = fragment.computed_svg_path.take() {
+                    (sink.set_computed_svg_path)(sink.context, paintable, path.as_raw());
                 }
             }
-            if let Some(rare) = self.used_values_rare_data(slot_index) {
-                if let Some(data) = &rare.grid_layout_data {
-                    data.with_ffi_view(|view| {
-                        // SAFETY: The Rust-owned nested vectors remain live
-                        // while the commit sink copies this borrowed view.
-                        unsafe { (sink.set_grid_layout_data)(sink.context, paintable, view) };
-                    });
-                }
-                if let Some(data) = &rare.flex_layout_data {
-                    data.with_ffi_view(|view| {
-                        // SAFETY: The Rust-owned lines and items remain live
-                        // while the commit sink copies this borrowed view.
-                        unsafe { (sink.set_flex_layout_data)(sink.context, paintable, view) };
-                    });
-                }
-                if let Some(tracks) = &rare.used_grid_tracks {
-                    tracks.with_ffi_views(|columns, rows| {
-                        // SAFETY: Both Rust-owned track lists remain live
-                        // while the commit sink copies these borrowed views.
-                        unsafe { (sink.set_used_grid_tracks)(sink.context, paintable, columns, rows) };
-                    });
-                }
+            if let Some(data) = &fragment.grid_layout_data {
+                data.with_ffi_view(|view| {
+                    unsafe { (sink.set_grid_layout_data)(sink.context, paintable, view) };
+                });
+            }
+            if let Some(data) = &fragment.flex_layout_data {
+                data.with_ffi_view(|view| {
+                    unsafe { (sink.set_flex_layout_data)(sink.context, paintable, view) };
+                });
+            }
+            if let Some(tracks) = &fragment.used_grid_tracks {
+                tracks.with_ffi_views(|columns, rows| {
+                    unsafe { (sink.set_used_grid_tracks)(sink.context, paintable, columns, rows) };
+                });
             }
         }
 
@@ -1033,11 +863,17 @@ impl LayoutState {
         };
         assert_eq!(result.paintable, paintable);
 
+        if let Some(link) = entry {
+            scopes.open_scope(&link.fragment.children);
+        }
         let mut child = callbacks.first_child(node);
         while !child.is_invalid() {
             let next = callbacks.next_sibling(child);
-            self.commit_subtree(child, result.paintable_for_children, null_mut(), callbacks, sink);
+            self.commit_subtree(child, result.paintable_for_children, null_mut(), callbacks, sink, scopes);
             child = next;
+        }
+        if entry.is_some() {
+            scopes.close_scope();
         }
 
         if has_pending_inline_box_geometry {
@@ -1054,7 +890,9 @@ impl LayoutState {
         paintable_to_replace: *mut c_void,
         callbacks: &FfiLayoutFcCallbacks,
         sink: &FfiCommitSink,
+        pass_fragments: &crate::layout::CompletedPassFragments,
     ) {
+        let mut scopes = crate::layout::CommitScopes::for_pass(pass_fragments);
         // SAFETY: The sink retains the replaced paintable, detaches it, and
         // returns borrowed insertion pointers that stay live until
         // finish_commit().
@@ -1065,6 +903,7 @@ impl LayoutState {
             position.insert_before_paintable,
             callbacks,
             sink,
+            &mut scopes,
         );
         unsafe {
             (sink.finish_commit)(sink.context);

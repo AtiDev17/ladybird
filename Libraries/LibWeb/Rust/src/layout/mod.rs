@@ -15,6 +15,7 @@ pub(crate) use crate::css::css_pixels::*;
 pub(crate) use crate::css::display::*;
 
 include!("node_facts.rs");
+include!("fragment_tree.rs");
 
 include!("formatting_context.rs");
 include!("sizing_context.rs");
@@ -60,6 +61,5 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::null_mut;

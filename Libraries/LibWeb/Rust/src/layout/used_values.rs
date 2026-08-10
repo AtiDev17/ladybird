@@ -101,10 +101,7 @@ impl<T: Copy> SealableCell<T> {
     #[track_caller]
     #[inline]
     pub(crate) fn set(&self, value: T) {
-        assert!(
-            !self.sealed.get(),
-            "write to a sealed committed box metric after placement"
-        );
+        assert!(!self.sealed.get(), "write to a sealed committed box metric");
         self.value.set(value);
     }
 
@@ -116,8 +113,6 @@ impl<T: Copy> SealableCell<T> {
 /// The per-box geometry stored in a Rust-owned layout pass.
 #[derive(Debug)]
 pub(crate) struct UsedValues {
-    pub node: crate::layout::node_data::NodeSlotId,
-
     pub content_inline_size: SealableCell<CssPixels>,
     pub content_block_size: SealableCell<CssPixels>,
 
@@ -143,7 +138,6 @@ pub(crate) struct UsedValues {
 
     pub has_definite_inline_size: Cell<bool>,
     pub has_definite_block_size: Cell<bool>,
-    pub materialized_from_paintable: Cell<bool>,
     pub uses_collapsing_borders_model: Cell<bool>,
 
     pub inline_size_constraint: Cell<SizeConstraint>,
@@ -154,8 +148,6 @@ pub(crate) struct UsedValues {
     pub has_content_offset: SealableCell<bool>,
     pub content_offset: SealableCell<FfiCssPixelPoint>,
 
-    pub committed_offset_delta: SealableCell<FfiCssPixelPoint>,
-
     // Keep baseline payloads separate so resetting the presence bits does not
     // perturb the payloads observed by the existing derivation flow.
     pub has_first_baseline: Cell<bool>,
@@ -163,10 +155,6 @@ pub(crate) struct UsedValues {
     pub has_last_baseline: Cell<bool>,
     pub last_baseline: Cell<CssPixels>,
 
-    // Commit copies the coordinate payload even when the presence bit is
-    // false, so this cannot be represented as Cell<Option<_>>.
-    pub has_containing_line_box_fragment: SealableCell<bool>,
-    pub containing_line_box_fragment: SealableCell<LineBoxFragmentCoordinate>,
 
     pub(crate) line_data: LazyRefCell<LineData>,
     pub(crate) rare_data: LazyRefCell<UsedValuesRareData>,
@@ -176,7 +164,6 @@ impl Default for UsedValues {
     fn default() -> Self {
         let zero = CssPixels::from_raw(0);
         Self {
-            node: crate::layout::node_data::NodeSlotId::INVALID,
             content_inline_size: SealableCell::new(zero),
             content_block_size: SealableCell::new(zero),
             margin_left: SealableCell::new(zero),
@@ -197,19 +184,15 @@ impl Default for UsedValues {
             inset_bottom: SealableCell::new(zero),
             has_definite_inline_size: Cell::new(false),
             has_definite_block_size: Cell::new(false),
-            materialized_from_paintable: Cell::new(false),
             uses_collapsing_borders_model: Cell::new(false),
             inline_size_constraint: Cell::new(SizeConstraint::None),
             block_size_constraint: Cell::new(SizeConstraint::None),
             has_content_offset: SealableCell::new(false),
             content_offset: SealableCell::new(FfiCssPixelPoint::default()),
-            committed_offset_delta: SealableCell::new(FfiCssPixelPoint::default()),
             has_first_baseline: Cell::new(false),
             first_baseline: Cell::new(zero),
             has_last_baseline: Cell::new(false),
             last_baseline: Cell::new(zero),
-            has_containing_line_box_fragment: SealableCell::new(false),
-            containing_line_box_fragment: SealableCell::new(LineBoxFragmentCoordinate::default()),
             line_data: LazyRefCell::new(),
             rare_data: LazyRefCell::new(),
         }
@@ -217,6 +200,18 @@ impl Default for UsedValues {
 }
 
 impl UsedValues {
+    pub(crate) fn rare_data_mut(&self) -> RefMut<'_, UsedValuesRareData> {
+        self.rare_data.get_or_init(UsedValuesRareData::default).borrow_mut()
+    }
+
+    pub(crate) fn line_data_ref(&self) -> Option<Ref<'_, LineData>> {
+        self.line_data.get().map(RefCell::borrow)
+    }
+
+    pub(crate) fn line_data_cell(&self) -> &RefCell<LineData> {
+        self.line_data.get_or_init(LineData::default)
+    }
+
     pub(crate) fn content_baselines_from_cells(&self) -> crate::layout::DerivedBaselines {
         crate::layout::DerivedBaselines {
             first: self.has_first_baseline.get().then(|| self.first_baseline.get()),
@@ -248,9 +243,23 @@ impl UsedValues {
         self.inset_bottom.seal();
         self.has_content_offset.seal();
         self.content_offset.seal();
-        self.committed_offset_delta.seal();
-        self.has_containing_line_box_fragment.seal();
-        self.containing_line_box_fragment.seal();
+    }
+
+    pub(crate) fn seal_own_metrics(&self) {
+        self.content_inline_size.seal();
+        self.content_block_size.seal();
+        self.margin_left.seal();
+        self.margin_right.seal();
+        self.margin_top.seal();
+        self.margin_bottom.seal();
+        self.border_left.seal();
+        self.border_right.seal();
+        self.border_top.seal();
+        self.border_bottom.seal();
+        self.padding_left.seal();
+        self.padding_right.seal();
+        self.padding_top.seal();
+        self.padding_bottom.seal();
     }
 }
 
