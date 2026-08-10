@@ -18,7 +18,9 @@ include!("node_facts.rs");
 include!("fragment_tree.rs");
 
 include!("formatting_context.rs");
+include!("commit.rs");
 include!("sizing_context.rs");
+include!("abspos_inputs.rs");
 include!("abspos_engine.rs");
 include!("block_formatting_context.rs");
 include!("flex_formatting_context.rs");
@@ -36,8 +38,8 @@ include!("table_formatting_context.rs");
 include!("geometry.rs");
 mod layout_node_arena;
 pub mod node_data;
-include!("layout_state.rs");
-include!("style_facts.rs");
+include!("run_records.rs");
+include!("style_values.rs");
 
 mod tree_builder;
 

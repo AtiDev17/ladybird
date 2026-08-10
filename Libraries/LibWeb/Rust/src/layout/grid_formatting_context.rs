@@ -1042,8 +1042,8 @@ impl GridItem {
     }
 }
 
-pub(crate) struct GridFormattingContext<'pass> {
-    state: &'pass LayoutState,
+pub(crate) struct GridFormattingContext {
+    purpose: LayoutPurpose,
     records: std::rc::Rc<RunRecords>,
     grid_container: Node,
     derived_baselines_of_root_box: DerivedBaselines,
@@ -1107,7 +1107,7 @@ struct ParentGridData {
 }
 
 impl ParentGridData {
-    fn for_child_container(parent: &GridFormattingContext<'_>, child_container: Node) -> Self {
+    fn for_child_container(parent: &GridFormattingContext, child_container: Node) -> Self {
         Self {
             placement_of_this_container: parent
                 .items
@@ -1124,11 +1124,11 @@ impl ParentGridData {
     }
 }
 
-impl<'pass> GridFormattingContext<'pass> {
-    pub(crate) fn new(run: &FormattingContextRun<'pass>, parent_grid: Option<&GridFormattingContext<'_>>) -> Self {
+impl GridFormattingContext {
+    pub(crate) fn new(run: &FormattingContextRun, parent_grid: Option<&GridFormattingContext>) -> Self {
         let grid_container = run.box_;
         Self {
-            state: run.state,
+            purpose: run.purpose,
             records: run.records.clone(),
             grid_container,
             derived_baselines_of_root_box: DerivedBaselines::default(),
@@ -1159,9 +1159,9 @@ impl<'pass> GridFormattingContext<'pass> {
         }
     }
 
-    fn formatting_context_run(&self) -> FormattingContextRun<'pass> {
+    fn formatting_context_run(&self) -> FormattingContextRun {
         FormattingContextRun {
-            state: self.state,
+            purpose: self.purpose,
             records: self.records.clone(),
             box_: self.grid_container,
             layout_mode: self.layout_mode,
@@ -1200,12 +1200,12 @@ impl<'pass> GridFormattingContext<'pass> {
     fn used(&self, item: GridItem) -> std::rc::Rc<UsedValues> {
         self.records.used_values(item.box_)
     }
-    fn style(&self, node: Node) -> StyleValues<'pass> {
-        self.state.style_facts(&self.callbacks, node)
+    fn style(&self, node: Node) -> StyleValues<'static> {
+        StyleValues::for_node(&self.callbacks, node)
     }
 
     fn facts(&self, node: Node) -> NodeFacts<'_> {
-        self.state.node_facts(&self.callbacks, node)
+        NodeFacts::new(&self.callbacks, node)
     }
 
     /// The node's computed grid style group, read in place. The payload
@@ -1215,8 +1215,8 @@ impl<'pass> GridFormattingContext<'pass> {
         ComputedValuesView::new(&self.callbacks.style_payloads(node).groups).grid_values()
     }
 
-    fn sizing(&self) -> SizingContext<'pass> {
-        SizingContext::new(self.state, self.records.clone(), self.callbacks)
+    fn sizing(&self) -> SizingContext {
+        SizingContext::new(self.purpose, self.records.clone(), self.callbacks)
     }
 
     fn parent_grid(&self) -> Option<&ParentGridData> {
@@ -1253,7 +1253,7 @@ impl<'pass> GridFormattingContext<'pass> {
         axis.select(space.inline_size, space.block_size)
     }
 
-    fn axis_gap_value(&self, axis: Axis) -> &'pass ComputedGap {
+    fn axis_gap_value(&self, axis: Axis) -> &'static ComputedGap {
         let style = self.style(self.grid_container);
         axis.select(style.column_gap(), style.row_gap())
     }
@@ -1615,7 +1615,7 @@ impl<'pass> GridFormattingContext<'pass> {
             if box_facts.is_box() && !box_facts.is_absolutely_positioned() {
                 let skip = self.callbacks.can_skip_is_anonymous_text_run(child);
                 if !skip {
-                    self.state.set_box_is_grid_item(&self.callbacks, child, true);
+                    self.callbacks.arena().set_node_flag(child, NodeFlag::IsGridItem, true);
                     let child_grid_style = self.grid_style(child);
                     let source = TrackListSource::from_grid_style(child_grid_style);
                     let column_subgrid_span = child_grid_style
@@ -1645,7 +1645,7 @@ impl<'pass> GridFormattingContext<'pass> {
                         ),
                     });
                     self.records
-                        .create_used_values(self.state, &self.callbacks, child, ContainingBlockConstraints::default());
+                        .create_used_values(&self.callbacks, child, ContainingBlockConstraints::default());
                     nodes.push(child);
                 }
             }
@@ -2025,17 +2025,17 @@ impl<'pass> GridFormattingContext<'pass> {
         size + self.outer_edges(item, axis)
     }
 
-    fn preferred_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
+    fn preferred_size(&self, item: GridItem, axis: Axis) -> &'static ComputedSize {
         let style = self.style(item.box_);
         axis.select(style.width(), style.height())
     }
 
-    fn minimum_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
+    fn minimum_size(&self, item: GridItem, axis: Axis) -> &'static ComputedSize {
         let style = self.style(item.box_);
         axis.select(style.min_width(), style.min_height())
     }
 
-    fn maximum_size(&self, item: GridItem, axis: Axis) -> &'pass ComputedSize {
+    fn maximum_size(&self, item: GridItem, axis: Axis) -> &'static ComputedSize {
         let style = self.style(item.box_);
         axis.select(style.max_width(), style.max_height())
     }
@@ -2487,7 +2487,7 @@ impl<'pass> GridFormattingContext<'pass> {
         scratch_root.has_definite_inline_size.set(live.has_definite_inline_size.get());
         scratch_root.has_definite_block_size.set(live.has_definite_block_size.get());
         let scratch_run = FormattingContextRun {
-            state: scratch.layout_state(),
+            purpose: LayoutPurpose::Measurement,
             records: std::rc::Rc::new(RunRecords::new(subgrid.box_, scratch_root)),
             box_: subgrid.box_,
             layout_mode: LayoutMode::IntrinsicSizing,
@@ -3182,7 +3182,7 @@ impl<'pass> GridFormattingContext<'pass> {
         rect
     }
 
-    fn layout_items(&mut self, run: &FormattingContextRun<'pass>) {
+    fn layout_items(&mut self, run: &FormattingContextRun) {
         for item_index in 0..self.items.len() {
             let item = self.items[item_index];
             let area = self.grid_area(item);
@@ -3246,7 +3246,7 @@ impl<'pass> GridFormattingContext<'pass> {
             crate::layout::place_child(&self.formatting_context_run(), item.box_, offset, None);
         }
         self.derived_baselines_of_root_box =
-            crate::layout::derive_baselines(self.state, &self.records, &self.callbacks, self.grid_container, false);
+            crate::layout::derive_baselines(&self.records, &self.callbacks, self.grid_container, false);
     }
 
     fn used_track_list_data(&self, axis: Axis, subgrid: bool) -> OwnedUsedGridTrackList {
@@ -3396,7 +3396,7 @@ impl<'pass> GridFormattingContext<'pass> {
             .grid_layout_data = Some(data);
     }
 
-    pub(crate) fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
+    pub(crate) fn run(&mut self, run: &FormattingContextRun, input: LayoutInput) {
         let available = input.available_space;
         // OPTIMIZATION: If we're in intrinsic sizing layout, but the grid container is not the
         //               box being measured, we can skip everything here.
@@ -3525,6 +3525,9 @@ impl<'pass> GridFormattingContext<'pass> {
                 let grid_area_is_childs_static_position =
                     self.callbacks.static_position_containing_block(child) == self.grid_container;
                 if !grid_area_is_childs_static_position {
+                    // Registration-time axis modes read raw style: anchor()
+                    // insets resolve later in layout_pending_child, and an
+                    // anchor-bearing inset is never auto either way.
                     let (inline_axis_mode, block_axis_mode) = axis_modes(self.style(child));
                     info.inline_axis_mode = inline_axis_mode;
                     info.block_axis_mode = block_axis_mode;

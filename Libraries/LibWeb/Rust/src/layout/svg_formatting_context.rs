@@ -378,8 +378,8 @@ pub(crate) fn scale_and_align_viewbox_content(
     result
 }
 
-struct SvgFormattingContext<'pass> {
-    state: &'pass LayoutState,
+struct SvgFormattingContext {
+    purpose: LayoutPurpose,
     records: std::rc::Rc<RunRecords>,
     box_: Node,
     layout_mode: LayoutMode,
@@ -397,19 +397,19 @@ struct SvgFormattingContext<'pass> {
     treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
 }
 
-impl<'pass> SvgFormattingContext<'pass> {
-    fn new(run: &FormattingContextRun<'pass>) -> Self {
+impl SvgFormattingContext {
+    fn new(run: &FormattingContextRun) -> Self {
         Self::new_nested(run, run.box_, FfiAffineTransform::default(), None)
     }
 
     fn new_nested(
-        run: &FormattingContextRun<'pass>,
+        run: &FormattingContextRun,
         box_: Node,
         parent_viewbox_transform: FfiAffineTransform,
         parent_svg_transform: Option<FfiAffineTransform>,
     ) -> Self {
         Self {
-            state: run.state,
+            purpose: run.purpose,
             records: run.records.clone(),
             box_,
             layout_mode: run.layout_mode,
@@ -428,9 +428,9 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn formatting_context_run(&self) -> FormattingContextRun<'pass> {
+    fn formatting_context_run(&self) -> FormattingContextRun {
         FormattingContextRun {
-            state: self.state,
+            purpose: self.purpose,
             records: self.records.clone(),
             box_: self.box_,
             layout_mode: self.layout_mode,
@@ -476,8 +476,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         unsafe { (self.callbacks.build_svg_facts)(self.callbacks.context, self.callbacks.shell(node)) }
     }
 
-    fn style_facts(&self, node: Node) -> StyleValues<'_> {
-        self.state.style_facts(&self.callbacks, node)
+    fn style(&self, node: Node) -> StyleValues<'_> {
+        StyleValues::for_node(&self.callbacks, node)
     }
 
     #[track_caller]
@@ -490,7 +490,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         // SVG layout resolves percentages against the SVG viewport, not a CSS containing
         // block, so boxes inside the SVG subtree carry no percentage basis.
         self.records
-            .create_used_values(self.state, &self.callbacks, node, crate::layout::ContainingBlockConstraints::default())
+            .create_used_values(&self.callbacks, node, crate::layout::ContainingBlockConstraints::default())
     }
 
     fn computed_transforms(&self, node: Node) -> Option<FfiSvgComputedTransforms> {
@@ -554,7 +554,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         result
     }
 
-    fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
+    fn run(&mut self, run: &FormattingContextRun, input: LayoutInput) {
         // NOTE: SVG doesn't have a "formatting context" in the spec, but this is the most
         //       obvious way to drive SVG layout in our engine at the moment.
         let kind = self.node_kind(self.box_);
@@ -566,7 +566,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             // Overwrite the content width/height with the styled node width/height (from <svg width height ...>)
             //
             // NOTE: If a height had not been provided by the svg element, it was set to the height of the container
-            let style = self.style_facts(self.box_);
+            let style = self.style(self.box_);
             if style.width().is_length() {
                 used.set_content_inline_size(style.width().to_px(CssPixels::default()));
             }
@@ -687,7 +687,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         let mut child = self.first_child(self.box_);
         while !child.is_invalid() {
             let next = self.next_sibling(child);
-            if self.state.node_facts(&self.callbacks, child).is_box() {
+            if NodeFacts::new(&self.callbacks, child).is_box() {
                 self.layout_svg_element(run, child, input, svg_transform_for_children);
             }
             child = next;
@@ -696,7 +696,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     fn layout_svg_element(
         &mut self,
-        run: &FormattingContextRun<'pass>,
+        run: &FormattingContextRun,
         child: Node,
         input: LayoutInput,
         parent_svg_transform: FfiAffineTransform,
@@ -707,7 +707,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             self.layout_nested_viewport(run, child, parent_svg_transform);
         } else if kind == NodeKind::SVGForeignObjectBox {
             let child_used_pointer = self.create_used_values(child);
-            let style = self.style_facts(child);
+            let style = self.style(child);
             let available_space = self.available_space.unwrap();
             let rect = SvgCssPixelRect {
                 x: style.x().to_px(available_space.inline_size.to_px_or_zero()),
@@ -772,14 +772,14 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     fn layout_nested_viewport(
         &mut self,
-        run: &FormattingContextRun<'pass>,
+        run: &FormattingContextRun,
         viewport: Node,
         parent_svg_transform: FfiAffineTransform,
     ) {
         // Layout for a nested SVG viewport.
         // https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport.
         let used_pointer = self.create_used_values(viewport);
-        let style = self.style_facts(viewport);
+        let style = self.style(viewport);
         let kind = self.node_kind(viewport);
         let facts = self.svg_facts(viewport);
         let nested_viewport_x = style.x().to_px(self.viewport_width);
@@ -877,7 +877,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     fn layout_graphics_element(
         &mut self,
-        run: &FormattingContextRun<'pass>,
+        run: &FormattingContextRun,
         graphics_box: Node,
         input: LayoutInput,
         parent_svg_transform: FfiAffineTransform,
@@ -927,7 +927,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn layout_path_like_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node, input: LayoutInput) {
+    fn layout_path_like_element(&mut self, run: &FormattingContextRun, graphics_box: Node, input: LayoutInput) {
         let transforms = self
             .computed_transforms(graphics_box)
             .expect("SVG graphics box must have computed transforms");
@@ -1008,7 +1008,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         used.has_definite_block_size.set(true);
     }
 
-    fn layout_mask_or_clip(&mut self, run: &FormattingContextRun<'pass>, resource: Node) {
+    fn layout_mask_or_clip(&mut self, run: &FormattingContextRun, resource: Node) {
         let kind = self.node_kind(resource);
         let facts = self.svg_facts(resource);
         assert!(kind_is_svg_resource_box(kind));
@@ -1098,7 +1098,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     fn layout_container_element(
         &mut self,
-        run: &FormattingContextRun<'pass>,
+        run: &FormattingContextRun,
         container: Node,
         input: LayoutInput,
         container_svg_transform: FfiAffineTransform,
@@ -1112,7 +1112,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         while !child.is_invalid() {
             let next = self.next_sibling(child);
             // Masks/clips/patterns do not change the bounding box of their parents.
-            if self.state.node_facts(&self.callbacks, child).is_box()
+            if NodeFacts::new(&self.callbacks, child).is_box()
                 && !kind_is_svg_resource_box(self.node_kind(child))
             {
                 self.layout_svg_element(run, child, input, container_svg_transform);
