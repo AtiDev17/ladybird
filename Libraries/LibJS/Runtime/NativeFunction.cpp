@@ -24,7 +24,7 @@ class CapturingNativeFunction final : public NativeFunction {
     GC_DECLARE_ALLOCATOR(CapturingNativeFunction);
 
 public:
-    CapturingNativeFunction(Function<ThrowCompletionOr<Value>(VM&)> native_function, Object* prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
+    CapturingNativeFunction(Function<ThrowCompletionOr<Value>(VM&)> native_function, GC::Ptr<Object> prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
         : NativeFunction(prototype, realm, builtin)
         , m_native_function(move(native_function))
     {
@@ -64,7 +64,7 @@ void NativeFunction::visit_edges(Cell::Visitor& visitor)
 
 // 10.3.3 CreateBuiltinFunction ( behaviour, length, name, additionalInternalSlotsList [ , realm [ , prototype [ , prefix ] ] ] ), https://tc39.es/ecma262/#sec-createbuiltinfunction
 // NOTE: This doesn't consider additionalInternalSlotsList, which is rarely used, and can either be implemented using only the `function` lambda, or needs a NativeFunction subclass.
-GC::Ref<NativeFunction> NativeFunction::create(Realm& allocating_realm, Function<ThrowCompletionOr<Value>(VM&)> behaviour, i32 length, PropertyKey const& name, Optional<Realm*> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
+GC::Ref<NativeFunction> NativeFunction::create(Realm& allocating_realm, Function<ThrowCompletionOr<Value>(VM&)> behaviour, i32 length, PropertyKey const& name, Optional<GC::Ptr<Realm>> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
 {
     auto& vm = allocating_realm.vm();
 
@@ -100,7 +100,7 @@ GC::Ref<NativeFunction> NativeFunction::create(Realm& allocating_realm, Function
     return function;
 }
 
-GC::Ref<NativeFunction> NativeFunction::create(Realm& allocating_realm, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name, Optional<Realm*> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
+GC::Ref<NativeFunction> NativeFunction::create(Realm& allocating_realm, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name, Optional<GC::Ptr<Realm>> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
 {
     return RawNativeFunction::create(allocating_realm, behaviour, length, name, realm, prefix, builtin);
 }
@@ -115,7 +115,7 @@ GC::Ref<NativeFunction> NativeFunction::create(Realm& realm, Utf16FlyString cons
     return RawNativeFunction::create(realm, name, function);
 }
 
-GC::Ref<RawNativeFunction> RawNativeFunction::create(Realm& allocating_realm, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name, Optional<Realm*> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
+GC::Ref<RawNativeFunction> RawNativeFunction::create(Realm& allocating_realm, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name, Optional<GC::Ptr<Realm>> realm, Optional<StringView> const& prefix, Optional<Bytecode::Builtin> builtin)
 {
     auto& vm = allocating_realm.vm();
 
@@ -135,7 +135,7 @@ GC::Ref<RawNativeFunction> RawNativeFunction::create(Realm& realm, Utf16FlyStrin
     return realm.create<RawNativeFunction>(name, function, realm.intrinsics().function_prototype());
 }
 
-NativeFunction::NativeFunction(Object* prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
+NativeFunction::NativeFunction(GC::Ptr<Object> prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
     : FunctionObject(realm, prototype)
     , m_realm(realm)
 {
@@ -159,16 +159,16 @@ NativeFunction::NativeFunction(Utf16FlyString name, Object& prototype)
 {
 }
 
-RawNativeFunction::RawNativeFunction(NativeFunctionPointer native_function, Object* prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
+RawNativeFunction::RawNativeFunction(NativeFunctionPointer native_function, GC::Ptr<Object> prototype, Realm& realm, Optional<Bytecode::Builtin> builtin)
     : NativeFunction(prototype, realm, builtin)
-    , m_native_function(native_function)
+    , m_native_function_index(realm.vm().register_native_function(native_function, NativeFunctionType::RawNativeFunction))
 {
     set_is_raw_native_function();
 }
 
 RawNativeFunction::RawNativeFunction(Utf16FlyString name, NativeFunctionPointer native_function, Object& prototype)
     : NativeFunction(move(name), prototype)
-    , m_native_function(native_function)
+    , m_native_function_index(prototype.vm().register_native_function(native_function, NativeFunctionType::RawNativeFunction))
 {
     set_is_raw_native_function();
 }
@@ -299,8 +299,12 @@ ThrowCompletionOr<Value> NativeFunction::call()
 
 ThrowCompletionOr<Value> RawNativeFunction::call()
 {
-    VERIFY(m_native_function);
-    return m_native_function(vm());
+    return native_function()(vm());
+}
+
+NativeFunctionPointer RawNativeFunction::native_function() const
+{
+    return vm().native_function(m_native_function_index, NativeFunctionType::RawNativeFunction);
 }
 
 ThrowCompletionOr<GC::Ref<Object>> NativeFunction::construct(FunctionObject&)

@@ -82,8 +82,8 @@ class JS_API Object : public Cell {
     GC_DECLARE_ALLOCATOR(Object);
 
 public:
-    static GC::Ref<Object> create_prototype(Realm&, Object* prototype);
-    static GC::Ref<Object> create(Realm&, Object* prototype);
+    static GC::Ref<Object> create_prototype(Realm&, GC::Ptr<Object> prototype);
+    static GC::Ref<Object> create(Realm&, GC::Ptr<Object> prototype);
     static GC::Ref<Object> create_with_premade_shape(Shape&);
 
     virtual void initialize(Realm&) override;
@@ -233,7 +233,7 @@ public:
     Value get_without_side_effects(PropertyKey const&) const;
 
     void define_direct_property(PropertyKey const& property_key, Value value, PropertyAttributes attributes) { (void)storage_set(property_key, { value, attributes }); }
-    void define_direct_accessor(PropertyKey const&, FunctionObject* getter, FunctionObject* setter, PropertyAttributes attributes);
+    void define_direct_accessor(PropertyKey const&, GC::Ptr<FunctionObject> getter, GC::Ptr<FunctionObject> setter, PropertyAttributes attributes);
 
     using IntrinsicAccessor = Value (*)(Realm&);
     void define_intrinsic_accessor(PropertyKey const&, PropertyAttributes attributes, IntrinsicAccessor accessor);
@@ -360,7 +360,7 @@ public:
     template<typename T>
     bool fast_is() const = delete;
 
-    void set_prototype(Object*);
+    void set_prototype(GC::Ptr<Object>);
 
     [[nodiscard]] bool has_magical_length_property() const { return m_flags & Flag::HasMagicalLengthProperty; }
     void set_has_magical_length_property() { m_flags |= Flag::HasMagicalLengthProperty; }
@@ -380,11 +380,46 @@ protected:
 
     Object(GlobalObjectTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     Object(ConstructWithoutPrototypeTag, Realm&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
-    Object(Realm&, Object* prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
+    Object(Realm&, GC::Ptr<Object> prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     Object(ConstructWithPrototypeTag, Object& prototype, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
     explicit Object(Shape&, MayInterfereWithIndexedPropertyAccess = MayInterfereWithIndexedPropertyAccess::No);
 
 private:
+    class StoragePointer {
+    public:
+        constexpr StoragePointer() = default;
+        constexpr StoragePointer(Value* storage)
+            : m_storage(storage)
+        {
+        }
+
+        ALWAYS_INLINE Value* data() { return m_storage; }
+        ALWAYS_INLINE Value const* data() const { return m_storage; }
+
+        ALWAYS_INLINE Value& operator[](size_t index) { return m_storage[index]; }
+        ALWAYS_INLINE Value const& operator[](size_t index) const { return m_storage[index]; }
+
+        ALWAYS_INLINE explicit operator bool() const { return m_storage != nullptr; }
+        ALWAYS_INLINE bool operator==(Value const* other) const { return m_storage == other; }
+
+        template<typename T>
+        ALWAYS_INLINE T* as() const
+        {
+            return reinterpret_cast<T*>(m_storage);
+        }
+
+        ALWAYS_INLINE StoragePointer& operator=(Value* storage)
+        {
+            m_storage = storage;
+            return *this;
+        }
+
+    private:
+        Value* m_storage { nullptr };
+    };
+
+    static_assert(sizeof(StoragePointer) == sizeof(Value*));
+
     struct Flag {
         static constexpr u16 IsExtensible = 1 << 0;
         static constexpr u16 IsRawNativeFunction = 1 << 1;
@@ -412,7 +447,7 @@ private:
     void transition_to_dictionary();
     void free_indexed_elements();
     void ensure_named_storage_capacity(u32 needed);
-    bool named_storage_is_inline() const { return m_named_properties == const_cast<Object*>(this)->m_inline_named_storage; }
+    bool named_storage_is_inline() const { return m_named_properties == m_inline_named_storage; }
     size_t named_storage_external_memory_size() const;
     size_t indexed_storage_external_memory_size() const;
 
@@ -421,8 +456,8 @@ public:
 
 private:
     GC::Ptr<Shape> m_shape;
-    Value* m_named_properties { m_inline_named_storage };
-    Value* m_indexed_elements { nullptr };
+    StoragePointer m_named_properties { m_inline_named_storage };
+    StoragePointer m_indexed_elements;
     OwnPtr<Vector<PrivateElement>> m_private_elements; // [[PrivateElements]]
     Value m_inline_named_storage[INLINE_NAMED_PROPERTY_CAPACITY] {};
 };

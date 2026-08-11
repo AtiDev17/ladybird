@@ -64,6 +64,7 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::TraverseByDeltaHistoryOperation
 {
     TRY(encoder.encode(parameters.traversable_id));
     TRY(encoder.encode(parameters.delta));
+    TRY(encoder.encode(parameters.initiator_to_check));
     TRY(encoder.encode(parameters.user_involvement));
     return {};
 }
@@ -74,6 +75,7 @@ ErrorOr<Web::TraverseByDeltaHistoryOperationParameters> IPC::decode(Decoder& dec
     return Web::TraverseByDeltaHistoryOperationParameters {
         .traversable_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
         .delta = TRY(decoder.decode<i32>()),
+        .initiator_to_check = TRY(decoder.decode<Optional<Web::HTML::CrossProcessId>>()),
         .user_involvement = TRY(decoder.decode<Web::HTML::UserNavigationInvolvement>()),
     };
 }
@@ -196,6 +198,34 @@ template<>
 ErrorOr<Web::CloseTopLevelTraversableHistoryOperationParameters> IPC::decode(Decoder& decoder)
 {
     return Web::CloseTopLevelTraversableHistoryOperationParameters {
+        .traversable_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
+    };
+}
+
+template<>
+ErrorOr<void> IPC::encode(Encoder& encoder, Web::ResetSessionHistoryForTestingOperationParameters const& parameters)
+{
+    return encoder.encode(parameters.traversable_id);
+}
+
+template<>
+ErrorOr<Web::ResetSessionHistoryForTestingOperationParameters> IPC::decode(Decoder& decoder)
+{
+    return Web::ResetSessionHistoryForTestingOperationParameters {
+        .traversable_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
+    };
+}
+
+template<>
+ErrorOr<void> IPC::encode(Encoder& encoder, Web::FlushSessionHistoryTraversalQueueOperationParameters const& parameters)
+{
+    return encoder.encode(parameters.traversable_id);
+}
+
+template<>
+ErrorOr<Web::FlushSessionHistoryTraversalQueueOperationParameters> IPC::decode(Decoder& decoder)
+{
+    return Web::FlushSessionHistoryTraversalQueueOperationParameters {
         .traversable_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
     };
 }

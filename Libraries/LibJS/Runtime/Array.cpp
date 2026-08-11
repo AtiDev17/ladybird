@@ -20,7 +20,7 @@ namespace JS {
 GC_DEFINE_ALLOCATOR(Array);
 
 // 10.4.2.2 ArrayCreate ( length [ , proto ] ), https://tc39.es/ecma262/#sec-arraycreate
-ThrowCompletionOr<GC::Ref<Array>> Array::create(Realm& realm, u64 length, Object* prototype)
+ThrowCompletionOr<GC::Ref<Array>> Array::create(Realm& realm, u64 length, GC::Ptr<Object> prototype)
 {
     auto& vm = realm.vm();
 

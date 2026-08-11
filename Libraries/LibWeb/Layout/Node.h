@@ -108,8 +108,8 @@ public:
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
 
-    DOM::Element const* pseudo_element_generator() const;
-    DOM::Element* pseudo_element_generator();
+    GC::Ptr<DOM::Element const> pseudo_element_generator() const;
+    GC::Ptr<DOM::Element> pseudo_element_generator();
 
     bool needs_layout_update() const { return has_flag(RustFFI::NodeFlag::NeedsLayoutUpdate); }
 
@@ -242,9 +242,6 @@ public:
 
     void recompute_containing_block(Badge<DOM::Document>);
 
-    [[nodiscard]] Box const* static_position_containing_block() const;
-    [[nodiscard]] Box* static_position_containing_block() { return const_cast<Box*>(const_cast<Node const*>(this)->static_position_containing_block()); }
-
     // Closest non-anonymous ancestor box, to be used when resolving percentage values.
     // Anonymous block boxes are ignored when resolving percentage values that would refer to it:
     // the closest non-anonymous ancestor box is used instead.
@@ -279,7 +276,7 @@ public:
     };
 
 protected:
-    Node(DOM::Document&, DOM::Node*, AttachToDOMNode = AttachToDOMNode::Yes);
+    Node(DOM::Document&, GC::Ptr<DOM::Node>, AttachToDOMNode = AttachToDOMNode::Yes);
 
     bool has_flag(RustFFI::NodeFlag flag) const
     {
@@ -448,7 +445,7 @@ public:
     void set_overflow(CSS::Overflow overflow_x, CSS::Overflow overflow_y);
 
 protected:
-    NodeWithStyle(DOM::Document&, DOM::Node*, NonnullRefPtr<CSS::ComputedValues const>);
+    NodeWithStyle(DOM::Document&, GC::Ptr<DOM::Node>, NonnullRefPtr<CSS::ComputedValues const>);
 
 private:
     virtual bool is_node_with_style() const final { return true; }

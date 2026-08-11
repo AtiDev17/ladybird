@@ -32,7 +32,7 @@ public:
     virtual Object* with_base_object() const override
     {
         if (is_with_environment())
-            return m_binding_object;
+            return m_binding_object.ptr();
         return nullptr;
     }
 
@@ -43,7 +43,7 @@ public:
     bool is_with_environment() const { return m_with_environment; }
 
 private:
-    ObjectEnvironment(Object& binding_object, IsWithEnvironment, Environment* outer_environment);
+    ObjectEnvironment(Object& binding_object, IsWithEnvironment, GC::Ptr<Environment> outer_environment);
 
     virtual void visit_edges(Visitor&) override;
 

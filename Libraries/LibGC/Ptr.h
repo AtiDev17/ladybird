@@ -67,8 +67,6 @@ public:
 
     RETURNS_NONNULL T* ptr() const { return m_ptr; }
 
-    RETURNS_NONNULL operator T*() const { return m_ptr; }
-
     operator T&() const { return *m_ptr; }
 
     operator bool() const = delete;
@@ -184,8 +182,6 @@ public:
     explicit operator bool() const { return !!m_ptr; }
     bool operator!() const { return !m_ptr; }
 
-    operator T*() const { return m_ptr; }
-
     Ref<T> as_nonnull() const
     {
         VERIFY(m_ptr);
@@ -226,6 +222,18 @@ template<typename T, typename U>
 inline bool operator==(Ref<T> const& a, Ptr<U> const& b)
 {
     return a.ptr() == b.ptr();
+}
+
+template<typename T>
+inline bool operator==(Ptr<T> const& ptr, nullptr_t)
+{
+    return ptr.ptr() == nullptr;
+}
+
+template<typename T>
+inline bool operator==(nullptr_t, Ptr<T> const& ptr)
+{
+    return ptr.ptr() == nullptr;
 }
 
 }

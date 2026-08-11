@@ -770,7 +770,7 @@ static bool append_or_replace_session_history_entry(Vector<TraversableSessionHis
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-same-document-navigation
-Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> TraversableSessionHistory::finalize_same_document_navigation(CanonicalNavigable const& target_navigable, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement)
+Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> TraversableSessionHistory::finalize_same_document_navigation(CanonicalNavigable const& target_navigable, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement, Optional<i32> maximum_claimed_step)
 {
     // 1. Assert: this is running on traversable's session history traversal queue.
     // NB: WebContent still owns the traversal queue, and only sends this request once the synchronous navigation steps
@@ -822,13 +822,19 @@ Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> Traversa
 
     // 5. If entryToReplace is null:
     if (!replaces_current_entry) {
+        // AD-HOC: The specification allows a synchronous navigation to jump ahead of an apply-history-step run that
+        //         has appended an entry but not committed its step. Preserve that entry when clearing forward history,
+        //         and allocate this entry after the outstanding run's claimed step.
+        //         See https://github.com/whatwg/html/issues/12576.
+        auto step_to_clear_through = max(current_step, maximum_claimed_step.value_or(current_step));
+
         // 1. Clear the forward session history of traversable.
-        clear_forward_session_history_entries(m_entries, current_step);
+        clear_forward_session_history_entries(m_entries, step_to_clear_through);
         if (can_update_web_content_entries)
-            clear_forward_session_history_entries(m_web_content_known_entries, current_step);
+            clear_forward_session_history_entries(m_web_content_known_entries, step_to_clear_through);
 
         // 2. Set targetStep to traversable's current session history step + 1.
-        target_step = current_step + 1;
+        target_step = step_to_clear_through + 1;
 
         // 3. Set targetEntry's step to targetStep.
         canonical_target_entry.step = target_step;
@@ -884,20 +890,29 @@ Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> Traversa
     };
 }
 
-bool TraversableSessionHistory::finalize_cross_document_navigation(Optional<Web::HTML::CrossProcessId> nested_history_id, Entry history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key)
+bool TraversableSessionHistory::finalize_cross_document_navigation(Optional<Web::HTML::CrossProcessId> nested_history_id, Entry history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key, Optional<i32> maximum_claimed_step)
 {
     if (!m_current_used_step_index.has_value())
         return false;
 
     auto current_step = m_used_steps[*m_current_used_step_index];
     auto current_entry_index = nested_history_id.has_value() ? Optional<size_t> {} : current_top_level_entry_index();
-    auto replaces_provisional_entry = current_entry_index.has_value() && m_entries[*current_entry_index].document_state.is_provisional;
+    // A finalization whose step matches the current UI-created provisional entry completes that entry. A push with a
+    // later claimed step is a new entry, even if its currently displayed predecessor is still marked provisional.
+    auto replaces_provisional_entry = current_entry_index.has_value()
+        && m_entries[*current_entry_index].document_state.is_provisional
+        && (!maximum_claimed_step.has_value() || history_entry.step == m_entries[*current_entry_index].step);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
     if (!entry_to_replace_navigation_api_key.has_value() && !replaces_provisional_entry) {
-        clear_forward_session_history_entries(m_entries, current_step);
-        clear_forward_session_history_entries(m_web_content_known_entries, m_web_content_current_step.value_or(current_step));
-        history_entry.step = current_step + 1;
+        auto step_to_clear_through = max(current_step, maximum_claimed_step.value_or(current_step));
+        clear_forward_session_history_entries(m_entries, step_to_clear_through);
+        clear_forward_session_history_entries(m_web_content_known_entries, max(m_web_content_current_step.value_or(current_step), step_to_clear_through));
+
+        // WebContent claims a step while finalizing the entry, before asking the UI process to apply it. Once the UI
+        // process knows about that claim, retain its step so both sides address the same entry during the operation.
+        if (!maximum_claimed_step.has_value())
+            history_entry.step = current_step + 1;
     }
 
     auto did_update = false;
@@ -1600,6 +1615,266 @@ void TraversableSessionHistory::traverse_to(size_t index)
     VERIFY(index < m_used_steps.size());
     m_current_used_step_index = index;
     forget_web_content_state();
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
+Optional<i32> TraversableSessionHistory::get_the_used_step(i32 step) const
+{
+    // 1. Let steps be the result of getting all used history steps within traversable.
+    // 2. Return the greatest item in steps that is less than or equal to step.
+    Optional<i32> used_step;
+    for (auto candidate : m_used_steps) {
+        if (candidate <= step && (!used_step.has_value() || candidate > *used_step))
+            used_step = candidate;
+    }
+    return used_step;
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-target-history-entry
+TraversableSessionHistory::Entry const* TraversableSessionHistory::get_the_target_history_entry(CanonicalNavigable const& navigable, i32 step) const
+{
+    // 1. Let entries be the result of getting session history entries for navigable.
+    auto entries = get_session_history_entries(navigable);
+    if (!entries.has_value())
+        return nullptr;
+
+    // 2. Return the item in entries that has the greatest step less than or equal to step.
+    Entry const* target_entry = nullptr;
+    for (auto const& entry : *entries) {
+        if (entry.step <= step && (!target_entry || entry.step > target_entry->step))
+            target_entry = &entry;
+    }
+    return target_entry;
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-history-object-length-and-index
+Optional<Web::HTML::HistoryObjectLengthAndIndex> TraversableSessionHistory::get_the_history_object_length_and_index(i32 step) const
+{
+    // 1. Let steps be the result of getting all used history steps within traversable.
+    // 2. Let scriptHistoryLength be the size of steps.
+    auto script_history_length = m_used_steps.size();
+
+    // 3. Assert: steps contains step.
+    // AD-HOC: The canonical mirror can be reconciling a removed child navigable, so answer nothing instead of
+    //         asserting; the caller treats it as a failed job.
+    auto script_history_index = m_used_steps.find_first_index(step);
+    if (!script_history_index.has_value())
+        return {};
+
+    // 4. Let scriptHistoryIndex be the index of step in steps.
+    // 5. Return (scriptHistoryLength, scriptHistoryIndex).
+    return Web::HTML::HistoryObjectLengthAndIndex {
+        .script_history_length = script_history_length,
+        .script_history_index = *script_history_index,
+    };
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries-for-the-navigation-api
+Optional<Vector<TraversableSessionHistory::Entry>> TraversableSessionHistory::get_session_history_entries_for_the_navigation_api(CanonicalNavigable const& navigable, i32 target_step) const
+{
+    // 1. Let rawEntries be the result of getting session history entries for navigable.
+    auto raw_entries = get_session_history_entries(navigable);
+    if (!raw_entries.has_value())
+        return {};
+
+    // 2. Let entriesForNavigationAPI be a new empty list.
+    Vector<Entry> entries_for_navigation_api;
+
+    // 3. Let startingIndex be the index of the session history entry in rawEntries who has the greatest step less
+    //    than or equal to targetStep.
+    Optional<size_t> starting_index;
+    Optional<i32> greatest_step;
+    for (size_t i = 0; i < raw_entries->size(); ++i) {
+        auto const& entry = raw_entries->at(i);
+        if (entry.step <= target_step && (!greatest_step.has_value() || entry.step > *greatest_step)) {
+            starting_index = i;
+            greatest_step = entry.step;
+        }
+    }
+    if (!starting_index.has_value())
+        return entries_for_navigation_api;
+
+    // 4. Append rawEntries[startingIndex] to entriesForNavigationAPI.
+    entries_for_navigation_api.append(raw_entries->at(*starting_index));
+
+    // 5. Let startingOrigin be rawEntries[startingIndex]'s document state's origin.
+    auto const& starting_entry = raw_entries->at(*starting_index);
+    auto const& starting_origin = starting_entry.document_state.origin;
+
+    // 6. Let i be startingIndex − 1.
+    auto i = static_cast<i64>(*starting_index) - 1;
+
+    // 7. While i > 0:
+    // AD-HOC: Implement "while i >= 0" to avoid dropping a same-origin rawEntries[0].
+    //         https://github.com/whatwg/html/issues/12644
+    while (i >= 0) {
+        auto const& entry = raw_entries->at(static_cast<size_t>(i));
+
+        // 1. If rawEntries[i]'s document state's origin is not same origin with startingOrigin, then break.
+        auto const& entry_origin = entry.document_state.origin;
+        if (entry.document_state.id != starting_entry.document_state.id
+            && (starting_origin.has_value() && entry_origin.has_value()
+                    ? !entry_origin->is_same_origin(*starting_origin)
+                    : entry.document_state.is_provisional || starting_entry.document_state.is_provisional)) {
+            break;
+        }
+
+        // 2. Prepend rawEntries[i] to entriesForNavigationAPI.
+        entries_for_navigation_api.prepend(entry);
+
+        // 3. Set i to i − 1.
+        --i;
+    }
+
+    // 8. Set i to startingIndex + 1.
+    i = static_cast<i64>(*starting_index) + 1;
+
+    // 9. While i < rawEntries's size:
+    while (i < static_cast<i64>(raw_entries->size())) {
+        auto const& entry = raw_entries->at(static_cast<size_t>(i));
+
+        // 1. If rawEntries[i]'s document state's origin is not same origin with startingOrigin, then break.
+        auto const& entry_origin = entry.document_state.origin;
+        if (entry.document_state.id != starting_entry.document_state.id
+            && (starting_origin.has_value() && entry_origin.has_value()
+                    ? !entry_origin->is_same_origin(*starting_origin)
+                    : entry.document_state.is_provisional || starting_entry.document_state.is_provisional)) {
+            break;
+        }
+
+        // 2. Append rawEntries[i] to entriesForNavigationAPI.
+        entries_for_navigation_api.append(entry);
+
+        // 3. Set i to i + 1.
+        ++i;
+    }
+
+    // 10. Return entriesForNavigationAPI.
+    return entries_for_navigation_api;
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#get-all-navigables-whose-current-session-history-entry-will-change-or-reload
+Vector<Web::HTML::CrossProcessId> TraversableSessionHistory::get_all_navigables_whose_current_session_history_entry_will_change_or_reload(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step) const
+{
+    // 1. Let results be an empty list.
+    Vector<Web::HTML::CrossProcessId> results;
+
+    if (!m_current_used_step_index.has_value())
+        return results;
+    if (!current_step.has_value())
+        current_step = m_used_steps[*m_current_used_step_index];
+
+    // 2. Let navigablesToCheck be « traversable ».
+    Vector<CanonicalNavigable const*> navigables_to_check { &traversable };
+
+    // 3. For each navigable of navigablesToCheck:
+    while (!navigables_to_check.is_empty()) {
+        auto const* navigable = navigables_to_check.take_first();
+
+        // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        // NB: The navigable's current session history entry lives in its own process; the canonical equivalent is the
+        //     target history entry at the traversable's current session history step.
+        auto const* target_entry = get_the_target_history_entry(*navigable, target_step);
+        auto const* current_entry = get_the_target_history_entry(*navigable, *current_step);
+        if (!target_entry || !current_entry)
+            continue;
+
+        // 2. If targetEntry is not navigable's current session history entry or targetEntry's document state's reload
+        //    pending is true, then append navigable to results.
+        if (target_entry != current_entry || target_entry->document_state.reload_pending)
+            results.append(navigable->id());
+
+        // 3. If targetEntry's document is navigable's document, and targetEntry's document state's reload pending is
+        //    false, then extend navigablesToCheck with the child navigables of navigable.
+        if (target_entry->document_state.id == current_entry->document_state.id && !target_entry->document_state.reload_pending) {
+            for (auto const& child : navigable->children())
+                navigables_to_check.append(child.ptr());
+        }
+    }
+
+    // 4. Return results.
+    return results;
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-navigables-that-might-experience-a-cross-document-traversal
+Vector<Web::HTML::CrossProcessId> TraversableSessionHistory::get_all_navigables_that_might_experience_a_cross_document_traversal(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step) const
+{
+    // 1. Let results be an empty list.
+    Vector<Web::HTML::CrossProcessId> results;
+
+    if (!m_current_used_step_index.has_value())
+        return results;
+    if (!current_step.has_value())
+        current_step = m_used_steps[*m_current_used_step_index];
+
+    // 2. Let navigablesToCheck be « traversable ».
+    Vector<CanonicalNavigable const*> navigables_to_check { &traversable };
+
+    // 3. For each navigable of navigablesToCheck:
+    while (!navigables_to_check.is_empty()) {
+        auto const* navigable = navigables_to_check.take_first();
+
+        // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        auto const* target_entry = get_the_target_history_entry(*navigable, target_step);
+        auto const* current_entry = get_the_target_history_entry(*navigable, *current_step);
+        if (!target_entry || !current_entry)
+            continue;
+
+        // 2. If targetEntry's document is not navigable's document or targetEntry's document state's reload pending
+        //    is true, then append navigable to results.
+        if (target_entry->document_state.id != current_entry->document_state.id || target_entry->document_state.reload_pending) {
+            results.append(navigable->id());
+        }
+
+        // 3. Otherwise, extend navigablesToCheck with navigable's child navigables.
+        else {
+            for (auto const& child : navigable->children())
+                navigables_to_check.append(child.ptr());
+        }
+    }
+
+    // 4. Return results.
+    return results;
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-navigables-that-only-need-history-object-length/index-update
+Vector<Web::HTML::CrossProcessId> TraversableSessionHistory::get_all_navigables_that_only_need_history_object_length_index_update(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step) const
+{
+    // 1. Let results be an empty list.
+    Vector<Web::HTML::CrossProcessId> results;
+
+    if (!m_current_used_step_index.has_value())
+        return results;
+    if (!current_step.has_value())
+        current_step = m_used_steps[*m_current_used_step_index];
+
+    // 2. Let navigablesToCheck be « traversable ».
+    Vector<CanonicalNavigable const*> navigables_to_check { &traversable };
+
+    // 3. For each navigable of navigablesToCheck:
+    while (!navigables_to_check.is_empty()) {
+        auto const* navigable = navigables_to_check.take_first();
+
+        // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        auto const* target_entry = get_the_target_history_entry(*navigable, target_step);
+        auto const* current_entry = get_the_target_history_entry(*navigable, *current_step);
+        if (!target_entry || !current_entry)
+            continue;
+
+        // 2. If targetEntry is navigable's current session history entry and targetEntry's document state's reload
+        //    pending is false:
+        if (target_entry == current_entry && !target_entry->document_state.reload_pending) {
+            // 1. Append navigable to results.
+            results.append(navigable->id());
+
+            // 2. Extend navigablesToCheck with navigable's child navigables.
+            for (auto const& child : navigable->children())
+                navigables_to_check.append(child.ptr());
+        }
+    }
+
+    // 4. Return results.
+    return results;
 }
 
 }

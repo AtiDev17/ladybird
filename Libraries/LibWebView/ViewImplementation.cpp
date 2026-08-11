@@ -385,7 +385,7 @@ HistoryTraversalOutcome ViewImplementation::traverse_the_history_by_delta(
     CheckForCancelation check_for_cancelation,
     Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete)
 {
-    return start_history_traversal(m_top_level_traversable.traverse_the_history_by_delta(delta, check_for_cancelation, m_url, move(on_cancelation_check_complete)));
+    return start_history_traversal(m_top_level_traversable.traverse_the_history_by_delta(delta, check_for_cancelation, m_url, move(on_cancelation_check_complete), make_top_level_history_traversal_applied_callback()));
 }
 
 HistoryTraversalOutcome ViewImplementation::traverse_the_history_to_step(
@@ -393,7 +393,20 @@ HistoryTraversalOutcome ViewImplementation::traverse_the_history_to_step(
     CheckForCancelation check_for_cancelation,
     Function<void(HistoryTraversalOutcome)> on_cancelation_check_complete)
 {
-    return start_history_traversal(m_top_level_traversable.traverse_the_history_to_step(step, check_for_cancelation, m_url, move(on_cancelation_check_complete)));
+    return start_history_traversal(m_top_level_traversable.traverse_the_history_to_step(step, check_for_cancelation, m_url, move(on_cancelation_check_complete), make_top_level_history_traversal_applied_callback()));
+}
+
+Function<void()> ViewImplementation::make_top_level_history_traversal_applied_callback() const
+{
+    auto view_id = m_view_id;
+    return [view_id] {
+        Core::deferred_invoke([view_id] {
+            auto view = ViewImplementation::find_view_by_id(view_id);
+            if (!view.has_value())
+                return;
+            view->complete_webdriver_pending_navigation_if_url_matches(view->m_url);
+        });
+    };
 }
 
 HistoryTraversalOutcome ViewImplementation::start_history_traversal(HistoryTraversalDecision decision)
@@ -416,11 +429,30 @@ HistoryTraversalOutcome ViewImplementation::start_history_traversal(HistoryTrave
     case HistoryTraversalAction::None:
         return decision.outcome;
     case HistoryTraversalAction::TraverseInWebContent:
-        dump_session_history("traverse-delegate-to-webcontent"sv);
-        client().async_traverse_the_history_to_step(page_id(), *decision.target_step);
+        dump_session_history("traverse-apply-history-step"sv);
+        m_top_level_traversable.enqueue_history_operation(
+            CanonicalTraversable::BrowserHistoryTraversalOperation {
+                .target_step = *decision.target_step,
+            },
+            [this, step = *decision.target_step](Web::HTML::HistoryStepResult result, Optional<i32>) {
+                if (result == Web::HTML::HistoryStepResult::NoMatchingEntry)
+                    apply_history_traversal_step_result(step, false, Web::HTML::HistoryStepResult::Applied);
+                else
+                    apply_history_traversal_step_result(step, true, result);
+            });
         return decision.outcome;
     case HistoryTraversalAction::CheckForCancelation:
-        client().async_check_if_traverse_history_step_is_canceled(page_id(), *decision.cancelation_check_request_id, *decision.target_step);
+        m_top_level_traversable.enqueue_history_operation(
+            CanonicalTraversable::HistoryStepCancelationCheckOperation {
+                .target_step = *decision.target_step,
+            },
+            [this, request_id = *decision.cancelation_check_request_id, step = *decision.target_step](Web::HTML::HistoryStepResult result, Optional<i32>) {
+                // NB: The cancelation check runs precisely because the target may not be applicable in the current
+                //     process; a step it cannot address locally still means unloading was not canceled.
+                if (result == Web::HTML::HistoryStepResult::NoMatchingEntry)
+                    result = Web::HTML::HistoryStepResult::Applied;
+                apply_history_step_cancelation_check_result(request_id, step, result);
+            });
         dump_session_history("traverse-fallback-check-cancelation"sv);
         return decision.outcome;
     case HistoryTraversalAction::LoadCurrentEntryFromUIProcess:
@@ -1373,16 +1405,6 @@ void ViewImplementation::did_finalize_same_document_navigation(Badge<WebContentC
     dump_session_history("finalized-same-document-navigation"sv);
 }
 
-void ViewImplementation::did_set_current_session_history_step(Badge<WebContentClient>, i32 current_session_history_step)
-{
-    if (!m_top_level_traversable.did_set_current_session_history_step(current_session_history_step))
-        return;
-
-    if (auto const* current_entry = m_top_level_traversable.session_history().current_entry())
-        apply_web_content_session_history_update({ .current_url = current_entry->url });
-    dump_session_history("did-set-current-session-history-step"sv);
-}
-
 void ViewImplementation::did_update_session_history_for_testing(Badge<WebContentClient>, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index)
 {
     auto update = m_top_level_traversable.did_receive_web_content_session_history_update_for_testing(move(entries), move(used_steps), current_used_step_index, m_url);
@@ -1492,6 +1514,10 @@ void ViewImplementation::initialize_client(CreateNewClient create_new_client)
     m_needs_beforeunload_check = true;
 
     if (create_new_client == CreateNewClient::Yes) {
+        // NB: Replies from the previous process will never arrive; complete the in-flight operations so the
+        //     traversal queue can serve the new process.
+        m_top_level_traversable.abandon_history_operations();
+
         cancel_all_native_geolocation_requests();
 
         auto client_handle = m_client_state.client_handle;
@@ -1820,7 +1846,8 @@ void ViewImplementation::wait_for_webdriver_navigation_completion(Badge<WebConte
     auto listener_id = add_navigation_listener({
         .on_load_start = nullptr,
         .on_load_finish = [this](URL::URL const& url) {
-            complete_webdriver_pending_navigation_if_url_matches(url);
+            if (!m_webdriver_pending_navigation_completes_with_session_history_update)
+                complete_webdriver_pending_navigation_if_url_matches(url);
         },
     });
     m_pending_webdriver_navigation_completion_requests.get(request_id).value()->navigation_listener_id = listener_id;
@@ -2052,9 +2079,20 @@ void ViewImplementation::did_set_top_level_session_history(Badge<WebContentClien
         apply_web_content_session_history_update(update);
     }
 
-    if (ack.step_to_traverse.has_value())
-        client().async_traverse_the_history_to_step(page_id(), *ack.step_to_traverse);
-    else if (ack.should_complete_webdriver_pending_navigation)
+    if (ack.step_to_traverse.has_value()) {
+        m_top_level_traversable.enqueue_history_operation(
+            CanonicalTraversable::BrowserHistoryTraversalOperation {
+                .target_step = *ack.step_to_traverse,
+                .current_step = ack.current_step,
+                .navigables_to_restore = move(ack.navigables_to_restore),
+            },
+            [this, step = *ack.step_to_traverse](Web::HTML::HistoryStepResult result, Optional<i32>) {
+                if (result == Web::HTML::HistoryStepResult::NoMatchingEntry)
+                    apply_history_traversal_step_result(step, false, Web::HTML::HistoryStepResult::Applied);
+                else
+                    apply_history_traversal_step_result(step, true, result);
+            });
+    } else if (ack.should_complete_webdriver_pending_navigation)
         complete_webdriver_pending_navigation_if_url_matches(m_url);
 
     if (ack.should_update_navigation_action_state)
@@ -2062,7 +2100,7 @@ void ViewImplementation::did_set_top_level_session_history(Badge<WebContentClien
     dump_session_history(ack.dump_reason);
 }
 
-void ViewImplementation::did_traverse_the_history_to_step(Badge<WebContentClient>, i32 step, bool step_was_available, Web::HTML::HistoryStepResult result)
+void ViewImplementation::apply_history_traversal_step_result(i32 step, bool step_was_available, Web::HTML::HistoryStepResult result)
 {
     auto step_result = m_top_level_traversable.did_traverse_the_history_to_step(step, step_was_available, result);
     if (step_result.should_update_webdriver_pending_navigation_to_current_url && m_webdriver_pending_navigation_url.has_value())
@@ -2095,8 +2133,7 @@ void ViewImplementation::did_traverse_the_history_to_step(Badge<WebContentClient
     dump_session_history(step_result.dump_reason);
 }
 
-void ViewImplementation::did_check_if_traverse_history_step_is_canceled(
-    Badge<WebContentClient>, u64 request_id, i32 step, Web::HTML::HistoryStepResult result)
+void ViewImplementation::apply_history_step_cancelation_check_result(u64 request_id, i32 step, Web::HTML::HistoryStepResult result)
 {
     auto check_result = m_top_level_traversable.did_check_if_traverse_history_step_is_canceled(request_id, step, result);
     if (check_result.should_update_webdriver_pending_navigation_to_current_url && m_webdriver_pending_navigation_url.has_value())
@@ -2133,6 +2170,146 @@ void ViewImplementation::did_check_if_traverse_history_step_is_canceled(
     dump_session_history(check_result.dump_reason);
     if (check_result.on_cancelation_check_complete)
         check_result.on_cancelation_check_complete(move(check_result.outcome));
+}
+
+void ViewImplementation::request_history_operation(Badge<WebContentClient>, u64 initiation_id, Web::HistoryOperationParameters parameters)
+{
+    auto requested_operation_completion = [this](Web::HTML::HistoryStepResult, Optional<i32> committed_step) {
+        if (committed_step.has_value())
+            update_navigation_action_state();
+        dump_session_history("requested-history-operation-complete"sv);
+    };
+
+    parameters.visit(
+        [&](Web::TraverseByDeltaHistoryOperationParameters& parameters) {
+            // The traversal target is resolved once the queue reaches these steps, so navigations queued ahead of the
+            // traversal are part of the session history it resolves against.
+            m_top_level_traversable.append_history_queue_steps(
+                [this, initiation_id, parameters = move(parameters)](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
+                    start_requested_history_traversal(initiation_id, move(parameters), move(promise));
+                });
+        },
+        [&](Web::NavigationAPITraverseHistoryOperationParameters& parameters) {
+            // As with delta traversal, resolve the key only after earlier queued operations have completed.
+            m_top_level_traversable.append_history_queue_steps(
+                [this, initiation_id, parameters = move(parameters)](NonnullRefPtr<Core::Promise<Empty>> promise) mutable {
+                    start_requested_history_traversal(initiation_id, move(parameters), move(promise));
+                });
+        },
+        [&](auto&) {
+            m_top_level_traversable.enqueue_history_operation(initiation_id, move(parameters), client(), page_id(), move(requested_operation_completion));
+        });
+}
+
+void ViewImplementation::start_requested_history_traversal(u64 initiation_id, Web::TraverseByDeltaHistoryOperationParameters parameters, NonnullRefPtr<Core::Promise<Empty>> promise)
+{
+    auto target = m_top_level_traversable.session_history().traversal_target_for_delta(parameters.delta);
+    if (!target.has_value()) {
+        client().async_complete_history_operation(page_id(), 0, Web::HTML::HistoryStepResult::Applied, {}, initiation_id);
+        promise->resolve({});
+        return;
+    }
+    start_requested_history_traversal(initiation_id, move(parameters), target.release_value(), move(promise));
+}
+
+void ViewImplementation::start_requested_history_traversal(u64 initiation_id, Web::NavigationAPITraverseHistoryOperationParameters parameters, NonnullRefPtr<Core::Promise<Empty>> promise)
+{
+    auto navigable = m_top_level_traversable.find(parameters.navigable_id);
+    Optional<i32> target_step;
+    if (navigable.has_value())
+        target_step = m_top_level_traversable.navigation_api_traversal_target(*navigable, parameters.key);
+    auto target = target_step.has_value()
+        ? m_top_level_traversable.session_history().traversal_target_for_step(*target_step)
+        : Optional<TraversableSessionHistory::TraversalTarget> {};
+    if (!target.has_value()) {
+        client().async_complete_history_operation(page_id(), 0, Web::HTML::HistoryStepResult::NoMatchingEntry, {}, initiation_id);
+        promise->resolve({});
+        return;
+    }
+    start_requested_history_traversal(initiation_id, move(parameters), target.release_value(), move(promise));
+}
+
+void ViewImplementation::start_requested_history_traversal(u64 initiation_id, Web::HistoryOperationParameters parameters, TraversableSessionHistory::TraversalTarget target, NonnullRefPtr<Core::Promise<Empty>> promise)
+{
+    if (!m_top_level_traversable.traversal_requires_process_replacement(target, m_url)) {
+        m_top_level_traversable.run_history_operation_at_queue_position(
+            initiation_id,
+            move(parameters),
+            client(),
+            page_id(),
+            target.target_step,
+            [this, step = target.target_step](Web::HTML::HistoryStepResult result, Optional<i32> committed_step) {
+                if (result == Web::HTML::HistoryStepResult::NoMatchingEntry) {
+                    apply_history_traversal_step_result(step, false, Web::HTML::HistoryStepResult::Applied);
+                    return;
+                }
+                if (committed_step.has_value())
+                    update_navigation_action_state();
+                dump_session_history("requested-history-traversal-complete"sv);
+            },
+            move(promise));
+        return;
+    }
+
+    Optional<Web::HTML::CrossProcessId> initiator_to_check;
+    Web::HTML::UserNavigationInvolvement user_involvement { Web::HTML::UserNavigationInvolvement::None };
+    parameters.visit(
+        [&](Web::TraverseByDeltaHistoryOperationParameters const& parameters) {
+            initiator_to_check = parameters.initiator_to_check;
+            user_involvement = parameters.user_involvement;
+        },
+        [&](Web::NavigationAPITraverseHistoryOperationParameters const& parameters) {
+            initiator_to_check = parameters.navigable_id;
+            user_involvement = parameters.user_involvement;
+        },
+        [](auto const&) {
+            VERIFY_NOT_REACHED();
+        });
+
+    m_top_level_traversable.run_history_operation_at_queue_position(
+        initiation_id,
+        CanonicalTraversable::HistoryStepCancelationCheckOperation {
+            .target_step = target.target_step,
+            .initiator_to_check = initiator_to_check,
+            .user_involvement = user_involvement,
+        },
+        client(),
+        page_id(),
+        [this, step = target.target_step](Web::HTML::HistoryStepResult result, Optional<i32>) {
+            if (result == Web::HTML::HistoryStepResult::Applied)
+                (void)traverse_the_history_to_step(step, CheckForCancelation::No, nullptr);
+        },
+        move(promise));
+}
+
+void ViewImplementation::did_receive_history_operation_ready(Badge<WebContentClient>, u64 operation_id, bool proceed, Optional<i32> step_override, Web::HTML::HistoryStepResult abandon_result)
+{
+    m_top_level_traversable.did_receive_history_operation_ready(operation_id, proceed, step_override, abandon_result);
+}
+
+void ViewImplementation::did_receive_initiator_sandboxing_check_result(Badge<WebContentClient>, u64 operation_id, bool allowed)
+{
+    m_top_level_traversable.did_receive_initiator_sandboxing_check_result(operation_id, allowed);
+}
+
+void ViewImplementation::did_receive_history_step_unload_cancelation_result(Badge<WebContentClient>, u64 operation_id, Web::HTML::HistoryStepResult result)
+{
+    m_top_level_traversable.did_receive_history_step_unload_cancelation_result(operation_id, result);
+}
+
+void ViewImplementation::did_receive_changing_navigable_history_job_ready(Badge<WebContentClient>, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition)
+{
+    m_top_level_traversable.did_receive_changing_navigable_history_job_ready(operation_id, navigable_id, disposition);
+}
+
+void ViewImplementation::did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
+{
+    m_top_level_traversable.did_receive_changing_navigable_continuation_applied(operation_id, navigable_id);
+}
+
+void ViewImplementation::did_receive_nonchanging_navigable_history_state_updated(Badge<WebContentClient>, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
+{
+    m_top_level_traversable.did_receive_nonchanging_navigable_history_state_updated(operation_id, navigable_id);
 }
 
 void ViewImplementation::did_reset_session_history_for_testing(Badge<WebContentClient>)

@@ -1514,13 +1514,6 @@ void WebContentClient::did_change_needs_beforeunload_check(u64 page_id, bool nee
         view->did_change_needs_beforeunload_check({}, needs_beforeunload_check);
 }
 
-void WebContentClient::did_check_if_traverse_history_step_is_canceled(
-    u64 page_id, u64 request_id, i32 step, Web::HTML::HistoryStepResult result)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_check_if_traverse_history_step_is_canceled({}, request_id, step, result);
-}
-
 void WebContentClient::did_request_traverse_the_history_by_delta(u64 page_id, i32 delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
 {
     auto* page_host = navigable_for_page(page_id);
@@ -1535,43 +1528,6 @@ void WebContentClient::did_request_traverse_the_history_by_delta(u64 page_id, i3
         ? CheckForCancelation::Yes
         : CheckForCancelation::IfWebContentCannotTraverseTarget;
     (void)view->traverse_the_history_by_delta(delta, check_for_cancelation);
-}
-
-void WebContentClient::did_request_history_traversal_target_by_delta(u64 page_id, u64 request_id, i32 delta)
-{
-    Optional<i32> target_step;
-    if (auto* page_host = navigable_for_page(page_id)) {
-        auto target = page_host->top_level_traversable().session_history().traversal_target_for_delta(delta);
-        if (target.has_value())
-            target_step = target->target_step;
-    }
-
-    async_resolve_session_history_traversal_target(page_id, request_id, target_step);
-}
-
-void WebContentClient::did_request_traverse_the_history_to_step(u64 page_id, i32 step, Web::HistoryTraversalPrecheck history_traversal_precheck)
-{
-    auto* page_host = navigable_for_page(page_id);
-    if (!page_host)
-        return;
-
-    auto view = ViewImplementation::find_view_for_traversable(page_host->top_level_traversable());
-    if (!view.has_value())
-        return;
-
-    auto check_for_cancelation = history_traversal_precheck == Web::HistoryTraversalPrecheck::Needed
-        ? CheckForCancelation::Yes
-        : CheckForCancelation::IfWebContentCannotTraverseTarget;
-    (void)view->traverse_the_history_to_step(step, check_for_cancelation);
-}
-
-void WebContentClient::did_request_navigation_api_traversal_target(u64 page_id, u64 request_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_api_key)
-{
-    Optional<i32> target_step;
-    if (auto navigable = hosted_navigable_for_page(page_id, navigable_id); navigable.has_value())
-        target_step = navigable->top_level_traversable().navigation_api_traversal_target(*navigable, navigation_api_key);
-
-    async_resolve_session_history_traversal_target(page_id, request_id, target_step);
 }
 
 void WebContentClient::did_request_webdriver_history_traversal(u64 page_id, u64 request_id, i32 delta)
@@ -1969,12 +1925,12 @@ void WebContentClient::did_remove_nested_history(u64 page_id, Web::HTML::CrossPr
     parent_navigable->top_level_traversable().remove_nested_history(*parent_navigable, child_navigable_id);
 }
 
-void WebContentClient::did_request_finalize_same_document_navigation(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement)
+void WebContentClient::did_request_finalize_same_document_navigation(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement, bool applies_history_step_in_coordinator)
 {
     Optional<TraversableSessionHistory::SameDocumentNavigationFinalization> finalization;
     if (auto navigable = hosted_navigable_for_page(page_id, navigable_id); navigable.has_value()) {
         finalization = navigable->top_level_traversable().request_to_finalize_same_document_navigation(
-            *navigable, move(target_entry), replaces_current_entry, history_handling, user_involvement);
+            *navigable, move(target_entry), replaces_current_entry, history_handling, user_involvement, applies_history_step_in_coordinator);
     }
 
     if (!finalization.has_value()) {
@@ -2001,18 +1957,6 @@ void WebContentClient::did_finalize_cross_document_navigation(u64 page_id, Web::
     if (!navigable.has_value())
         return;
     navigable->top_level_traversable().finalize_cross_document_navigation(*navigable, move(history_entry), move(entry_to_replace_navigation_api_key));
-}
-
-void WebContentClient::did_set_current_session_history_step(u64 page_id, i32 current_session_history_step)
-{
-    auto* page_host = navigable_for_page(page_id);
-    if (!page_host)
-        return;
-
-    auto view = ViewImplementation::find_view_for_traversable(page_host->top_level_traversable());
-    if (!view.has_value())
-        return;
-    view->did_set_current_session_history_step({}, current_session_history_step);
 }
 
 Messages::WebContentClient::DidRequestUiProcessSessionHistoryForTestingResponse WebContentClient::did_request_ui_process_session_history_for_testing(u64 page_id)
@@ -2044,16 +1988,52 @@ void WebContentClient::did_set_top_level_session_history(u64 page_id, bool accep
         view->did_set_top_level_session_history({}, accepted, move(entries), move(used_steps), current_used_step_index);
 }
 
-void WebContentClient::did_traverse_the_history_to_step(u64 page_id, i32 step, bool step_was_available, Web::HTML::HistoryStepResult result)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_traverse_the_history_to_step({}, step, step_was_available, result);
-}
-
 void WebContentClient::did_reset_session_history_for_testing(u64 page_id)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
         view->did_reset_session_history_for_testing({});
+}
+
+void WebContentClient::request_history_operation(u64 page_id, u64 initiation_id, Web::HistoryOperationParameters parameters)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->request_history_operation({}, initiation_id, move(parameters));
+}
+
+void WebContentClient::history_operation_ready(u64 page_id, u64 operation_id, bool proceed, Optional<i32> step_override, Web::HTML::HistoryStepResult abandon_result)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_history_operation_ready({}, operation_id, proceed, step_override, abandon_result);
+}
+
+void WebContentClient::initiator_sandboxing_check_result(u64 page_id, u64 operation_id, bool allowed)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_initiator_sandboxing_check_result({}, operation_id, allowed);
+}
+
+void WebContentClient::history_step_unload_cancelation_result(u64 page_id, u64 operation_id, Web::HTML::HistoryStepResult result)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_history_step_unload_cancelation_result({}, operation_id, result);
+}
+
+void WebContentClient::changing_navigable_history_job_ready(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_changing_navigable_history_job_ready({}, operation_id, navigable_id, disposition);
+}
+
+void WebContentClient::changing_navigable_continuation_applied(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_changing_navigable_continuation_applied({}, operation_id, navigable_id);
+}
+
+void WebContentClient::nonchanging_navigable_history_state_updated(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_receive_nonchanging_navigable_history_state_updated({}, operation_id, navigable_id);
 }
 
 void WebContentClient::did_present_backing_stores(u64 page_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)

@@ -21,8 +21,8 @@ class JS_API NativeFunction : public FunctionObject {
     GC_DECLARE_ALLOCATOR(NativeFunction);
 
 public:
-    static GC::Ref<NativeFunction> create(Realm&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<Realm*> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
-    static GC::Ref<NativeFunction> create(Realm&, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<Realm*> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
+    static GC::Ref<NativeFunction> create(Realm&, ESCAPING Function<ThrowCompletionOr<Value>(VM&)> behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<GC::Ptr<Realm>> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
+    static GC::Ref<NativeFunction> create(Realm&, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<GC::Ptr<Realm>> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
     static GC::Ref<NativeFunction> create(Realm&, Utf16FlyString const& name, ESCAPING Function<ThrowCompletionOr<Value>(VM&)>);
     static GC::Ref<NativeFunction> create(Realm&, Utf16FlyString const& name, NativeFunctionPointer);
 
@@ -40,7 +40,7 @@ public:
     Utf16FlyString const& name() const { return m_name; }
     virtual bool is_strict_mode() const override;
     virtual bool has_constructor() const override { return false; }
-    virtual Realm* realm() const override { return m_realm; }
+    virtual Realm* realm() const override { return m_realm.ptr(); }
 
     Optional<Utf16FlyString> const& initial_name() const { return m_initial_name; }
     void set_initial_name(Badge<FunctionObject>, Utf16FlyString initial_name) { m_initial_name = move(initial_name); }
@@ -49,7 +49,7 @@ public:
     virtual size_t function_environment_bindings_count() const { return 0; }
 
 protected:
-    NativeFunction(Object* prototype, Realm& realm, Optional<Bytecode::Builtin> builtin);
+    NativeFunction(GC::Ptr<Object> prototype, Realm& realm, Optional<Bytecode::Builtin> builtin);
     NativeFunction(Utf16FlyString name, Object& prototype);
     explicit NativeFunction(Object& prototype);
 
@@ -71,20 +71,20 @@ class JS_API RawNativeFunction final : public NativeFunction {
     GC_DECLARE_ALLOCATOR(RawNativeFunction);
 
 public:
-    static GC::Ref<RawNativeFunction> create(Realm&, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<Realm*> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
+    static GC::Ref<RawNativeFunction> create(Realm&, NativeFunctionPointer behaviour, i32 length, PropertyKey const& name = Utf16FlyString {}, Optional<GC::Ptr<Realm>> = {}, Optional<StringView> const& prefix = {}, Optional<Bytecode::Builtin> builtin = {});
     static GC::Ref<RawNativeFunction> create(Realm&, Utf16FlyString const& name, NativeFunctionPointer);
 
     virtual ~RawNativeFunction() override = default;
 
     virtual ThrowCompletionOr<Value> call() override;
 
-    NativeFunctionPointer native_function() const { return m_native_function; }
+    NativeFunctionPointer native_function() const;
 
 private:
-    RawNativeFunction(NativeFunctionPointer, Object* prototype, Realm& realm, Optional<Bytecode::Builtin> builtin);
+    RawNativeFunction(NativeFunctionPointer, GC::Ptr<Object> prototype, Realm& realm, Optional<Bytecode::Builtin> builtin);
     RawNativeFunction(Utf16FlyString name, NativeFunctionPointer, Object& prototype);
 
-    NativeFunctionPointer m_native_function { nullptr };
+    u32 m_native_function_index { 0 };
 };
 
 template<>

@@ -1760,23 +1760,55 @@ impl AbsposEngine {
         let containing_block_geometry = self.containing_block_geometry_for_pending_child(&child);
         let resolved =
             self.resolve_anchor_insets(child_box, Some(&containing_block_geometry), child.coordinate_space_box);
+        let inline_containing_block_rect =
+            self.inline_containing_block_rect_for_pending_child(&child, &containing_block_geometry);
         let translation_into_containing_block_space =
             point_sub(FfiCssPixelPoint::default(), containing_block_geometry.content_origin_in_entry_space);
-        crate::layout::translate_pending_abspos_payloads(&mut child, translation_into_containing_block_space);
+        child.static_position_rect =
+            crate::layout::translate_static_position_rect(child.static_position_rect, translation_into_containing_block_space);
         let inputs = AbsposLayoutInputs {
             static_position_rect: child.static_position_rect,
-            containing_block_info: child.containing_block_info_override.unwrap_or_else(|| {
-                let inline_containing_block_rect = child.inline_containing_block_rect;
-                self.base_containing_block_info(
-                    child_box,
-                    inline_containing_block_rect,
-                    &containing_block_geometry,
-                    resolved.as_ref(),
-                )
-            }),
+            containing_block_info: child
+                .containing_block_info_override
+                .or_else(|| {
+                    self.fragments
+                        .as_deref()
+                        .and_then(|fragments| fragments.find_abspos_containing_block_info(child_box))
+                })
+                .unwrap_or_else(|| {
+                    self.base_containing_block_info(
+                        child_box,
+                        inline_containing_block_rect,
+                        &containing_block_geometry,
+                        resolved.as_ref(),
+                    )
+                }),
             resolved_anchor_insets: resolved,
         };
         self.layout_element(run, child_box, inputs);
+    }
+
+    /// Joins the entry against the inline containing block rect its IFC
+    /// contributed, folding the payload's resting space into the containing
+    /// block's content-box space (no padding term, unlike anchor rects).
+    fn inline_containing_block_rect_for_pending_child(
+        &self,
+        child: &PendingAbsposChild,
+        containing_block_geometry: &ContainingBlockGeometry,
+    ) -> Option<PhysicalRect> {
+        if child.inline_containing_block.is_invalid() {
+            return None;
+        }
+        let fragments = self.fragments.as_deref()?;
+        let (rect, payload_space) = fragments.find_inline_containing_block_rect(child.inline_containing_block)?;
+        let fold_into_entry_space =
+            self.translation_between_payload_resting_spaces(payload_space, child.coordinate_space_box);
+        Some(PhysicalRect {
+            x: rect.x + fold_into_entry_space.x - containing_block_geometry.content_origin_in_entry_space.x,
+            y: rect.y + fold_into_entry_space.y - containing_block_geometry.content_origin_in_entry_space.y,
+            width: rect.width,
+            height: rect.height,
+        })
     }
 
     fn replay(&self, run: &crate::layout::FormattingContextRun, node: Node) {
@@ -1805,25 +1837,24 @@ impl AbsposEngine {
         treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     ) {
         // Most boxes are neither relatively positioned nor carry anchor()
-        // insets. Preserve the old C++ fast path without populating the
-        // comprehensive Rust facts caches for those boxes.
-        // SAFETY: The callback only reads the live node's computed values.
-        if !unsafe {
-            (self.callbacks.needs_inset_resolution)(self.callbacks.context, self.callbacks.shell(node))
-        } {
-            return;
-        }
+        // insets, and both facts come straight from the node's style payload.
         let initial_style = self.style(node);
-        let resolved = if initial_style.inset_top().contains_anchor_function()
+        let has_anchor_insets = initial_style.inset_top().contains_anchor_function()
             || initial_style.inset_right().contains_anchor_function()
             || initial_style.inset_bottom().contains_anchor_function()
-            || initial_style.inset_left().contains_anchor_function()
-        {
+            || initial_style.inset_left().contains_anchor_function();
+        if !has_anchor_insets && initial_style.position() != positioning::RELATIVE {
+            return;
+        }
+        // Anchor resolution also refreshes the box's default scroll shift, so
+        // an anchor-bearing box resolves its insets even when it turns out not
+        // to be relatively positioned.
+        let resolved = if has_anchor_insets {
             self.resolve_anchor_insets(node, None, NodeSlotId::INVALID)
         } else {
             None
         };
-        let style = self.style(node).with_resolved_insets(resolved.as_ref());
+        let style = initial_style.with_resolved_insets(resolved.as_ref());
         if style.position() != positioning::RELATIVE {
             return;
         }

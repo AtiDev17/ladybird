@@ -159,8 +159,6 @@ void PageClient::visit_edges(JS::Cell::Visitor& visitor)
         visitor.visit(controller.value);
     for (auto& reader : m_download_readers)
         visitor.visit(reader.value);
-    for (auto& callback : m_pending_session_history_traversal_target_requests)
-        visitor.visit(callback.value);
     m_pending_dom_mutations.for_each([&](auto& pending_mutation) {
         visitor.visit(pending_mutation.target);
     });
@@ -1242,9 +1240,14 @@ void PageClient::page_did_remove_nested_history(Web::HTML::CrossProcessId parent
     client().async_did_remove_nested_history(m_id, parent_navigable_id, child_navigable_id);
 }
 
-void PageClient::page_did_request_finalize_same_document_navigation(u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry const& target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement)
+void PageClient::page_did_request_finalize_same_document_navigation(u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry const& target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement, bool applies_history_step_in_coordinator)
 {
-    client().async_did_request_finalize_same_document_navigation(m_id, operation_id, navigable_id, target_entry, replaces_current_entry, history_handling, user_involvement);
+    client().async_did_request_finalize_same_document_navigation(m_id, operation_id, navigable_id, target_entry, replaces_current_entry, history_handling, user_involvement, applies_history_step_in_coordinator);
+}
+
+void PageClient::page_did_request_history_operation(u64 initiation_id, Web::HistoryOperationParameters parameters)
+{
+    client().async_request_history_operation(m_id, initiation_id, move(parameters));
 }
 
 void PageClient::did_complete_finalize_same_document_navigation(u64 operation_id, bool committed, int entry_step, int target_step, u64 script_history_length, u64 script_history_index)
@@ -1258,11 +1261,6 @@ void PageClient::did_complete_finalize_same_document_navigation(u64 operation_id
 void PageClient::page_did_finalize_cross_document_navigation(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& history_entry, Optional<Utf16String> const& entry_to_replace_navigation_api_key)
 {
     client().async_did_finalize_cross_document_navigation(m_id, navigable_id, history_entry, entry_to_replace_navigation_api_key);
-}
-
-void PageClient::page_did_set_current_session_history_step(int current_session_history_step)
-{
-    client().async_did_set_current_session_history_step(m_id, current_session_history_step);
 }
 
 String PageClient::page_did_request_ui_process_session_history_for_testing()
@@ -1283,33 +1281,6 @@ String PageClient::page_did_update_session_history_and_request_ui_process_sessio
 void PageClient::page_did_request_traverse_the_history_by_delta(int delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
 {
     client().async_did_request_traverse_the_history_by_delta(m_id, delta, history_traversal_precheck);
-}
-
-void PageClient::page_did_request_history_traversal_target_by_delta(int delta, GC::Ref<GC::Function<void(Optional<int>)>> on_complete)
-{
-    auto request_id = m_next_session_history_traversal_target_request_id++;
-    m_pending_session_history_traversal_target_requests.set(request_id, on_complete);
-    client().async_did_request_history_traversal_target_by_delta(m_id, request_id, delta);
-}
-
-void PageClient::page_did_request_traverse_the_history_to_step(int step, Web::HistoryTraversalPrecheck history_traversal_precheck)
-{
-    client().async_did_request_traverse_the_history_to_step(m_id, step, history_traversal_precheck);
-}
-
-void PageClient::page_did_request_navigation_api_traversal_target(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, GC::Ref<GC::Function<void(Optional<int>)>> on_complete)
-{
-    auto request_id = m_next_session_history_traversal_target_request_id++;
-    m_pending_session_history_traversal_target_requests.set(request_id, on_complete);
-    client().async_did_request_navigation_api_traversal_target(m_id, request_id, navigable_id, navigation_api_key);
-}
-
-void PageClient::did_resolve_session_history_traversal_target(u64 request_id, Optional<i32> target_step)
-{
-    auto callback = m_pending_session_history_traversal_target_requests.take(request_id);
-    if (!callback.has_value())
-        return;
-    callback.value()->function()(target_step);
 }
 
 void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)

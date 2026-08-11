@@ -1,4 +1,5 @@
 set(TEST_SOURCES
+    TestApplyHistoryStep.cpp
     TestAutocompleteMuxer.cpp
     TestAutocompleteRanker.cpp
     TestCookieJar.cpp
@@ -9,6 +10,7 @@ set(TEST_SOURCES
     TestOmnibox.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
+    TestSessionHistoryTraversalQueue.cpp
     TestStorageJar.cpp
     TestWebViewURL.cpp
 )

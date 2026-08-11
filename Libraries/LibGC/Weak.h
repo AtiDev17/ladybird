@@ -89,6 +89,12 @@ public:
     Weak(Ref<U> const& other)
     requires(IsConvertible<U*, T*>);
 
+    Weak(Ptr<T> const& other);
+
+    template<typename U>
+    Weak(Ptr<U> const& other)
+    requires(IsConvertible<U*, T*>);
+
     Weak& operator=(Weak const& other) = default;
 
     template<typename U>
@@ -100,6 +106,12 @@ public:
     }
 
     Weak& operator=(Ref<T> const& other);
+
+    Weak& operator=(Ptr<T> const& other);
+
+    template<typename U>
+    Weak& operator=(Ptr<U> const& other)
+    requires(IsConvertible<U*, T*>);
 
     template<typename U>
     Weak& operator=(Ref<U> const& other)
@@ -120,7 +132,7 @@ public:
     T* operator->() const
     {
         ASSERT(ptr());
-        return ptr();
+        return ptr().ptr();
     }
 
     [[nodiscard]] T& operator*() const
@@ -134,7 +146,7 @@ public:
     explicit operator bool() const { return !!ptr(); }
     bool operator!() const { return !ptr(); }
 
-    operator T*() const { return ptr(); }
+    operator T*() const { return ptr().ptr(); }
 
     Ref<T> as_nonnull() const
     {
@@ -162,13 +174,13 @@ auto weak_callback(T& obj, Callback&& callback)
 template<typename T, typename U>
 inline bool operator==(Weak<T> const& a, Ptr<U> const& b)
 {
-    return a.ptr() == b.ptr();
+    return a.ptr() == b;
 }
 
 template<typename T, typename U>
 inline bool operator==(Weak<T> const& a, Ref<U> const& b)
 {
-    return a.ptr() == b.ptr();
+    return a.ptr() == b;
 }
 
 }
@@ -179,7 +191,7 @@ template<typename T>
 struct Formatter<GC::Weak<T>> : Formatter<T const*> {
     ErrorOr<void> format(FormatBuilder& builder, GC::Weak<T> const& value)
     {
-        return Formatter<T const*>::format(builder, value.ptr());
+        return Formatter<T const*>::format(builder, value.ptr().ptr());
     }
 };
 

@@ -1,5 +1,6 @@
 set(SOURCES
     Application.cpp
+    ApplyHistoryStep.cpp
     Attribute.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
@@ -39,6 +40,7 @@ set(SOURCES
     Profile.cpp
     SearchEngine.cpp
     SessionHistory.cpp
+    SessionHistoryTraversalQueue.cpp
     Settings.cpp
     SiteIsolation.cpp
     SiteIsolationManager.cpp

@@ -834,7 +834,9 @@ impl<'pass> FlexFormattingContext<'pass> {
             main_size =
                 main_size.min(self.main_size_from_cross_size_and_aspect_ratio(max_cross_size.to_px(reference), ratio));
         }
-        if !min_cross_size.is_auto() {
+        if !min_cross_size.is_auto()
+            && (!min_cross_size.contains_percentage() || self.has_definite_cross_size_used(&self.container_used()))
+        {
             main_size =
                 main_size.max(self.main_size_from_cross_size_and_aspect_ratio(min_cross_size.to_px(reference), ratio));
         }
@@ -1629,7 +1631,10 @@ impl<'pass> FlexFormattingContext<'pass> {
             //         to the flex container instead of transferring the used main size through the aspect ratio.
             let replaced_with_only_natural_ratio =
                 facts.is_replaced_box() && !(facts.has_auto_content_width() && facts.has_auto_content_height());
-            if replaced_with_only_natural_ratio && !self.flex_items[index].used_flex_basis_is_definite {
+            if replaced_with_only_natural_ratio
+                && !self.flex_items[index].used_flex_basis_is_definite
+                && self.has_definite_cross_size_used(&self.container_used())
+            {
                 self.flex_items[index].hypothetical_cross_size =
                     css_clamp(self.inner_cross_size_used(&self.container_used()), clamp_min, clamp_max);
                 return;
@@ -2707,6 +2712,64 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
+    fn resolve_own_auto_block_size_from_max_content_main_size(&mut self) {
+        let Some(resolution_space) = self.layout_input.unwrap().sizing.flex_self_block_size_resolution_space else {
+            return;
+        };
+        if self.main_axis_is_horizontal() {
+            return;
+        }
+        // https://drafts.csswg.org/css-flexbox-1/#algo-main-item
+        // If the used flex basis is content or depends on its available space, and the flex container
+        // is being sized under a min-content or max-content constraint (e.g. when performing automatic
+        // table layout [CSS2]), size the item under that constraint.
+        let real_space_for_items = self.available_space_for_items.unwrap().space;
+        self.determine_available_space_for_items(AvailableSpace {
+            inline_size: real_space_for_items.inline_size,
+            block_size: AvailableSize::MaxContent,
+        });
+        // https://drafts.csswg.org/css-align-3/#gap-percent
+        // In Flex Layout: Cyclic percentage sizes resolve against zero in all cases.
+        self.container_used().set_content_block_size(CssPixels::default());
+        for index in 0..self.flex_items.len() {
+            self.determine_flex_base_size(index);
+        }
+        let max_content_main_size = self.calculate_intrinsic_main_size_of_flex_container();
+        self.flex_lines.clear();
+        self.determine_available_space_for_items(real_space_for_items);
+        self.resolve_own_auto_block_size(max_content_main_size, resolution_space);
+    }
+
+    fn resolve_own_auto_block_size_from_line_cross_sizes(&mut self) {
+        let Some(resolution_space) = self.layout_input.unwrap().sizing.flex_self_block_size_resolution_space else {
+            return;
+        };
+        if self.cross_axis_is_horizontal() {
+            return;
+        }
+        // https://drafts.csswg.org/css-align-3/#gap-percent
+        // In Flex Layout: Cyclic percentage sizes resolve against zero in all cases.
+        let style = self.style(self.flex_container);
+        let gap = if self.is_row_layout() { style.row_gap() } else { style.column_gap() };
+        let cross_gap_resolved_against_zero = gap.to_px(CssPixels::default());
+        let mut line_cross_size_sum = self
+            .flex_lines
+            .iter()
+            .fold(CssPixels::default(), |sum, line| sum + line.cross_size);
+        line_cross_size_sum += cross_gap_resolved_against_zero * self.flex_lines.len().saturating_sub(1);
+        self.resolve_own_auto_block_size(line_cross_size_sum, resolution_space);
+    }
+
+    fn resolve_own_auto_block_size(&self, automatic_block_size: CssPixels, resolution_space: AvailableSpace) {
+        self.sizing().resolve_used_block_size_if_treated_as_auto(
+            self.flex_container,
+            resolution_space,
+            self.layout_input.unwrap().containing_block_constraints,
+            Some(automatic_block_size),
+            || automatic_block_size,
+        );
+    }
+
     // https://drafts.csswg.org/css-flexbox-1/#intrinsic-main-sizes
     fn calculate_intrinsic_main_size_of_flex_container(&mut self) -> CssPixels {
         // The min-content main size of a single-line flex container is calculated identically to the max-content main size,
@@ -2938,6 +3001,11 @@ impl<'pass> FlexFormattingContext<'pass> {
             }
         }
 
+        // 4. Determine the main size of the flex container
+        // Determine the main size of the flex container using the rules of the formatting context in which it participates.
+        // NOTE: The automatic block size of a block-level flex container is its max-content size.
+        self.resolve_own_auto_block_size_from_max_content_main_size();
+
         // 3. Determine the flex base size and hypothetical main size of each item
         for index in 0..self.flex_items.len() {
             self.determine_flex_base_size(index);
@@ -3000,14 +3068,6 @@ impl<'pass> FlexFormattingContext<'pass> {
                 css_clamp(self.flex_items[index].flex_base_size, clamp_min, clamp_max).max(CssPixels::default());
         }
 
-        // 4. Determine the main size of the flex container
-        // Determine the main size of the flex container using the rules of the formatting context in which it participates.
-        // NOTE: The automatic block size of a block-level flex container is its max-content size.
-
-        // NOTE: We've already handled this in the parent formatting context.
-        //       Specifically, all formatting contexts will have assigned inline and block sizes to the flex container
-        //       before this formatting context runs.
-
         // 5. Collect flex items into flex lines:
         // After this step no additional items are to be added to flex_lines or any of its items!
         self.collect_flex_items_into_flex_lines();
@@ -3035,7 +3095,10 @@ impl<'pass> FlexFormattingContext<'pass> {
         self.align_all_flex_items_along_the_cross_axis();
 
         // 15. Determine the flex container’s used cross size
-        // NOTE: This is handled by the parent formatting context.
+        // Determine the flex container's used cross size using the rules of the formatting context
+        // in which it participates. If a content-based cross size is needed, use the sum of the
+        // flex lines' cross sizes.
+        self.resolve_own_auto_block_size_from_line_cross_sizes();
 
         // https://drafts.csswg.org/css-flexbox-1/#definite-sizes
         // 4. Once the cross size of a flex line has been determined,
