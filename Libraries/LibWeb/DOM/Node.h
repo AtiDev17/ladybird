@@ -77,6 +77,7 @@ enum class RootNodeComposed {
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_REASONS(X)         \
     X(CharacterDataReplaceData)                       \
+    X(DefaultPreferredSizeAttributeChange)            \
     X(EditableStateChange)                            \
     X(FinalizeACrossDocumentNavigation)               \
     X(GeneratedContentImageFinishedLoading)           \
@@ -86,13 +87,15 @@ enum class RootNodeComposed {
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
     X(KeyframeEffect)                                 \
+    X(LanguageChangeUnderCasingTextTransform)         \
     X(LayoutTreeUpdate)                               \
     X(NavigableSetViewportSize)                       \
     X(SVGGraphicsElementTransformChange)              \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGImageFilterFetch)                            \
     X(SVGViewBoxChange)                               \
-    X(StyleChange)
+    X(StyleChange)                                    \
+    X(TableSpanAttributeChange)
 
 enum class SetNeedsLayoutReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_REASON(e) e,
@@ -111,6 +114,7 @@ enum class SetNeedsLayoutReason {
     X(HTMLInputElementSrcAttribute)                       \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
+    X(LanguageChangeUnderCasingTextTransform)             \
     X(ListItemCounters)                                   \
     X(NodeInsertBefore)                                   \
     X(NodeInsertBeforeWithDisplayContents)                \
