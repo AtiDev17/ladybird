@@ -983,9 +983,28 @@ void Page::invalidate_user_style()
         document.invalidate_content_blocker_style_sheet();
         document.style_scope().invalidate_user_style_sheet();
         document.for_each_shadow_root([](auto& shadow_root) {
-            shadow_root.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+            shadow_root.record_style_environment_change();
         });
-        document.invalidate_style(DOM::StyleInvalidationReason::StyleSheetReplace);
+        document.record_style_environment_change();
+    };
+
+    auto& active_document = *top_level_traversable()->active_document();
+    invalidate_document(active_document);
+
+    for (auto& navigable : active_document.descendant_navigables()) {
+        if (auto document = navigable->active_document())
+            invalidate_document(*document);
+    }
+}
+
+void Page::invalidate_style_for_preference_change()
+{
+    if (!top_level_traversable_is_initialized() || !top_level_traversable()->active_document())
+        return;
+
+    auto invalidate_document = [](DOM::Document& document) {
+        document.record_style_environment_change();
+        document.set_needs_media_query_evaluation();
     };
 
     auto& active_document = *top_level_traversable()->active_document();

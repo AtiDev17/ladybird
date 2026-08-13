@@ -6,6 +6,7 @@
 
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Invalidation/AdoptedStyleSheetInvalidator.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
@@ -26,7 +27,7 @@ GC::Ref<WebIDL::ObservableArray> create_adopted_style_sheets_list(Node& document
 {
     auto& realm = document_or_shadow_root.document().relevant_settings_object().realm();
     auto adopted_style_sheets = WebIDL::ObservableArray::create(realm);
-    adopted_style_sheets->set_on_set_an_indexed_value_callback([&document_or_shadow_root](JS::Value& value) -> WebIDL::ExceptionOr<void> {
+    adopted_style_sheets->set_on_set_an_indexed_value_callback([&document_or_shadow_root, adopted_style_sheets](u32 index, JS::Value& value) -> WebIDL::ExceptionOr<void> {
         auto& vm = document_or_shadow_root.vm();
         auto style_sheet = CSS::css_style_sheet_from_value(value);
         if (!style_sheet)
@@ -40,12 +41,22 @@ GC::Ref<WebIDL::ObservableArray> create_adopted_style_sheets_list(Node& document
         if (!style_sheet->constructed() || style_sheet->constructor_document().ptr() != &document_or_shadow_root.document())
             return WebIDL::NotAllowedError::create("Sharing a StyleSheet between documents is not allowed."_utf16);
 
+        // Adopted sheets are not in any StyleSheetList, so nothing else announces them to the
+        // engine. Observable array operations can write displaced entries before the insertion
+        // point, so preserve their final order by attaching before the entry currently following
+        // this index.
+        CSS::CSSStyleSheet* before = nullptr;
+        if (auto successor = adopted_style_sheets->indexed_get(index + 1); successor.has_value())
+            before = CSS::css_style_sheet_from_value(successor->value);
+        CSS::record_stylesheet_attached(*style_sheet, document_or_shadow_root, before);
         CSS::Invalidation::invalidate_style_after_adopting_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
     });
     adopted_style_sheets->set_on_delete_an_indexed_value_callback([&document_or_shadow_root](JS::Value value) -> WebIDL::ExceptionOr<void> {
-        if (auto style_sheet = CSS::css_style_sheet_from_value(value))
-            CSS::Invalidation::invalidate_style_after_removing_adopted_style_sheet(document_or_shadow_root, *style_sheet);
+        auto* style_sheet = CSS::css_style_sheet_from_value(value);
+        VERIFY(style_sheet);
+        CSS::record_stylesheet_detached(*style_sheet, document_or_shadow_root);
+        CSS::Invalidation::invalidate_style_after_removing_adopted_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
     });
 

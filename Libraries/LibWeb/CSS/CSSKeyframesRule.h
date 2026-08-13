@@ -33,11 +33,16 @@ public:
     [[nodiscard]] WebIDL::UnsignedLong length() const;
     GC::Ptr<CSSKeyframeRule> item(size_t index) const;
 
-    void set_name(Utf16String const& name) { m_name = Utf16FlyString { name }; }
+    void set_name(Utf16String const& name);
 
     void append_rule(Utf16String const& rule);
     void delete_rule(Utf16String const& select);
     GC::Ptr<CSSKeyframeRule> find_rule(Utf16String const& select);
+
+    // A keyframes rule holds rules without being a grouping rule, so its keyframes have to be handed
+    // the sheet themselves. A keyframe edited through the CSSOM reports against the sheet it belongs
+    // to, and one that never learned its sheet reports against nothing at all.
+    virtual void set_parent_style_sheet(CSSStyleSheet*) override;
 
 private:
     CSSKeyframesRule(Utf16FlyString name, GC::Ref<CSSRuleList> keyframes);

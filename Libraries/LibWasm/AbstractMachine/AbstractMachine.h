@@ -25,9 +25,11 @@
 namespace Wasm {
 
 constexpr inline size_t ArgumentsStaticSize = 3;
+constexpr inline size_t ResultsStaticSize = 1;
 
 class Configuration;
 class Result;
+struct BytecodeInterpreter;
 struct Interpreter;
 struct Trap;
 
@@ -344,7 +346,7 @@ struct Trap {
 
 class Result {
 public:
-    explicit Result(Vector<Value> values)
+    explicit Result(Vector<Value, ResultsStaticSize> values)
         : m_result(move(values))
     {
     }
@@ -355,18 +357,18 @@ public:
     }
 
     auto is_trap() const { return m_result.has<Trap>(); }
-    auto& values() const { return m_result.get<Vector<Value>>(); }
-    auto& values() { return m_result.get<Vector<Value>>(); }
+    auto& values() const { return m_result.get<Vector<Value, ResultsStaticSize>>(); }
+    auto& values() { return m_result.get<Vector<Value, ResultsStaticSize>>(); }
     auto& trap() const { return m_result.get<Trap>(); }
     auto& trap() { return m_result.get<Trap>(); }
 
 private:
-    explicit Result(Variant<Vector<Value>, Trap>&& result)
+    explicit Result(Variant<Vector<Value, ResultsStaticSize>, Trap>&& result)
         : m_result(move(result))
     {
     }
 
-    Variant<Vector<Value>, Trap> m_result;
+    Variant<Vector<Value, ResultsStaticSize>, Trap> m_result;
 };
 
 enum class InstantiationErrorSource : u8 {
@@ -963,11 +965,8 @@ struct HostVisitOps {
 
 class WASM_API AbstractMachine {
 public:
-    explicit AbstractMachine(GC::Heap* heap = nullptr)
-    {
-        if (heap)
-            adopt_heap(*heap);
-    }
+    explicit AbstractMachine(GC::Heap* heap = nullptr);
+    ~AbstractMachine();
 
     GC::Heap& heap()
     {
@@ -985,8 +984,8 @@ public:
     ErrorOr<void, ValidationError> validate(Module&, Optional<CompileCacheConfig> cache_config = {}, CompileToNative = CompileToNative::Yes);
     // Load and instantiate a module, and link it into this interpreter.
     InstantiationResult instantiate(Module const&, Vector<ExternValue>);
-    Result invoke(FunctionAddress, Vector<Value>);
-    Result invoke(Interpreter&, FunctionAddress, Vector<Value>);
+    Result invoke(FunctionAddress, Vector<Value, ArgumentsStaticSize>);
+    Result invoke(Interpreter&, FunctionAddress, Vector<Value, ArgumentsStaticSize>);
 
     auto& store() const { return m_store; }
     auto& store() { return m_store; }
@@ -1046,6 +1045,11 @@ private:
     StackInfo m_stack_info;
     HashTable<Interpreter*> m_active_interpreters;
     bool m_should_limit_instruction_count { false };
+
+    // Host functions may reenter Wasm, so retain typical nesting while bounding idle state.
+    static constexpr size_t MAX_AVAILABLE_EXECUTION_STATES = 32;
+    Vector<NonnullOwnPtr<BytecodeInterpreter>, MAX_AVAILABLE_EXECUTION_STATES> m_available_interpreters;
+    Vector<NonnullOwnPtr<Configuration>, MAX_AVAILABLE_EXECUTION_STATES> m_available_configurations;
 };
 
 class WASM_API Linker {

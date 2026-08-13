@@ -1,11 +1,10 @@
 set(TEST_SOURCES
-    TestCSSIDSpeed.cpp
     TestAccumulatedVisualContext.cpp
     TestContentBlocker.cpp
     TestControlMessageQueue.cpp
+    TestCSSIDSpeed.cpp
     TestCSSInheritedProperty.cpp
     TestCSSPixels.cpp
-    TestCSSStyleSheetInvalidation.cpp
     TestCSSSyntaxParser.cpp
     TestCSSTokenizer.cpp
     TestCSSTokenStream.cpp
@@ -14,9 +13,11 @@ set(TEST_SOURCES
     TestFetchURL.cpp
     TestHTMLTokenizer.cpp
     TestImageData.cpp
+    TestLengthAbsolutizeParity.cpp
     TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
+    TestNumericTypeParity.cpp
     TestPage.cpp
     TestRefCountedTreeNode.cpp
     TestSecureContexts.cpp
@@ -24,14 +25,20 @@ set(TEST_SOURCES
     TestSimpleRealm.cpp
     TestSmoothScrollAnimation.cpp
     TestSourceHighlighter.cpp
+    TestStrings.cpp
     TestStructuredSerializeCorpus.cpp
     TestStructuredSerializeDurability.cpp
     TestStructuredSerializeFormat.cpp
     TestStructuredSerializeHardening.cpp
-    TestStrings.cpp
-    TestWrapperWorld.cpp
-    TestWorldCallback.cpp
+    TestStyleEngineBridge.cpp
+    TestStylePropertyMetadataParity.cpp
+    TestStyleStructRef.cpp
+    TestTextureUpload.cpp
+    TestWebGLSpanWithStorage.cpp
+    TestWebIDLBuffers.cpp
     TestWindowProxyWorld.cpp
+    TestWorldCallback.cpp
+    TestWrapperWorld.cpp
 )
 
 if (NOT WIN32)
@@ -58,6 +65,8 @@ target_link_libraries(TestFetchURL PRIVATE LibURL)
 target_link_libraries(TestAccumulatedVisualContext PRIVATE LibGfx)
 target_link_libraries(TestImageData PRIVATE LibGC LibJS)
 target_link_libraries(TestPage PRIVATE LibGC LibJS)
+target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
+target_link_libraries(TestWebGLSpanWithStorage PRIVATE LibGC LibJS)
 target_link_libraries(TestStructuredSerializeCorpus PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeDurability PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)
 target_link_libraries(TestStructuredSerializeFormat PRIVATE LibGC LibJS LibCrypto LibGfx LibIPC)

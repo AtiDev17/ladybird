@@ -10,6 +10,7 @@
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/Segmenter.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/EditingHostManager.h>
 #include <LibWeb/DOM/Event.h>
@@ -173,8 +174,11 @@ void FormAssociatedElement::set_parser_inserted(Badge<HTMLParser>)
 void FormAssociatedElement::form_node_was_inserted()
 {
     // 1. If the form-associated element's parser inserted flag is set, then return.
-    if (m_parser_inserted)
+    if (m_parser_inserted) {
+        if (m_form)
+            m_form->default_button_state_maybe_changed();
         return;
+    }
 
     // 2. Reset the form owner of the form-associated element.
     reset_form_owner();
@@ -186,6 +190,8 @@ void FormAssociatedElement::form_node_was_removed()
     // 1. If the form-associated element has a form owner and the form-associated element and its form owner are no longer in the same tree, then reset the form owner of the form-associated element.
     if (m_form && &form_associated_element_to_html_element().root() != &m_form->root())
         reset_form_owner();
+    else if (m_form)
+        m_form->default_button_state_maybe_changed();
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#association-of-controls-and-forms:attr-fae-form-2
@@ -194,6 +200,8 @@ void FormAssociatedElement::form_node_was_moved()
     // When a listed form-associated element's form attribute is set, changed, or removed, then the user agent must reset the form owner of that element.
     if (m_form && &form_associated_element_to_html_element().root() != &m_form->root())
         reset_form_owner();
+    else if (m_form)
+        m_form->default_button_state_maybe_changed();
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#association-of-controls-and-forms:category-listed-3
@@ -235,6 +243,7 @@ void FormAssociatedElement::element_with_id_was_added_or_removed(Badge<DOM::Docu
 void FormAssociatedElement::reset_form_owner()
 {
     auto& html_element = form_associated_element_to_html_element();
+    GC::Ptr<HTMLFormElement> old_form { m_form.ptr() };
 
     // 1. Unset element's parser inserted flag.
     m_parser_inserted = false;
@@ -247,6 +256,7 @@ void FormAssociatedElement::reset_form_owner()
     if (m_form
         && (!is_listed() || !html_element.has_attribute(HTML::AttributeNames::form))
         && html_element.first_ancestor_of_type<HTMLFormElement>() == m_form.ptr().ptr()) {
+        m_form->default_button_state_maybe_changed();
         return;
     }
 
@@ -256,8 +266,6 @@ void FormAssociatedElement::reset_form_owner()
     //           argument.
     //         However, this is not specified as algorithmic steps, so we have to do this ourselves.
     //         Spec issue: https://github.com/whatwg/html/issues/12169
-    GC::Ptr<HTMLFormElement> old_form { m_form.ptr() };
-
     // 3. Set element's form owner to null.
     set_form(nullptr);
 
@@ -286,6 +294,11 @@ void FormAssociatedElement::reset_form_owner()
     // See the AD-HOC comment above.
     if (m_form != old_form && html_element.is_form_associated_custom_element())
         html_element.enqueue_a_form_associated_callback_reaction(m_form.ptr());
+
+    if (old_form)
+        old_form->default_button_state_maybe_changed();
+    if (m_form && m_form != old_form)
+        m_form->default_button_state_maybe_changed();
 }
 
 void FormAssociatedElement::form_associated_element_was_inserted()
@@ -665,6 +678,10 @@ void FormAssociatedElement::visit_edges(JS::Cell::Visitor& visitor)
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
 void FormAssociatedTextControlElement::relevant_value_was_changed()
 {
+    auto& element = text_control_to_html_element();
+    if (static_cast<DOM::Element&>(element).dir() == DOM::Element::Dir::Auto)
+        CSS::Invalidation::invalidate_style_after_directionality_change(element);
+
     auto the_relevant_value = relevant_value();
     auto relevant_value_length = the_relevant_value.length_in_code_units();
 
@@ -1128,8 +1145,6 @@ void FormAssociatedTextControlElement::handle_insert(Utf16FlyString const& input
     }
     history->end_recording();
 
-    text_node->invalidate_style(DOM::StyleInvalidationReason::EditingInsertion);
-
     // The input event's data attribute is only set for certain input types according to:
     // https://w3c.github.io/input-events/#overview
     Optional<Utf16String> data_for_input_event;
@@ -1186,7 +1201,6 @@ void FormAssociatedTextControlElement::handle_delete(Utf16FlyString const& input
     }
     history->end_recording();
 
-    text_node->invalidate_style(DOM::StyleInvalidationReason::EditingDeletion);
     did_edit_text_node(input_type, {});
     scroll_cursor_into_view();
 }
