@@ -785,10 +785,11 @@ pub(crate) struct ChildLayoutResult {
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
 }
 
+#[derive(Clone)]
 pub(crate) struct RunRootOutcome {
     cells: UsedValuesCellState,
     own_metrics_sealed: bool,
-    line_data: Option<LineData>,
+    line_data: Option<std::rc::Rc<LineData>>,
     rare: Option<UsedValuesRareData>,
 }
 
@@ -807,6 +808,7 @@ impl RunRootOutcome {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RunOutputs {
     pub(crate) result: ChildLayoutResult,
     pub(crate) root: Option<UnplacedRootFragment>,
@@ -866,7 +868,7 @@ pub enum FfiFlexLayoutGrowthState {
     Shrinking,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct FfiFlexLayoutItem {
     pub node: *mut c_void,
@@ -906,6 +908,7 @@ pub struct FfiFlexLayoutData {
     pub line_count: usize,
 }
 
+#[derive(PartialEq)]
 pub(crate) struct OwnedFlexLayoutLine {
     pub(crate) growth_state: FfiFlexLayoutGrowthState,
     pub(crate) cross_start: CssPixels,
@@ -913,6 +916,7 @@ pub(crate) struct OwnedFlexLayoutLine {
     pub(crate) items: Vec<FfiFlexLayoutItem>,
 }
 
+#[derive(PartialEq)]
 pub(crate) struct OwnedFlexLayoutData {
     pub(crate) align_content: u8,
     pub(crate) align_items: u8,
@@ -963,8 +967,6 @@ pub struct FfiLayoutFcCallbacks {
     pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgElementFacts,
     pub read_paintable_geometry:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut crate::layout::FfiPaintableGeometry) -> bool,
-    pub read_paintable_svg_transforms:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FfiSvgComputedTransforms) -> bool,
     pub compute_svg_path: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiSvgPathRequest) -> FfiSvgPathResult,
     pub svg_image_bounding_box: unsafe extern "C" fn(*mut c_void, *mut c_void, CssPixels, CssPixels) -> FfiFloatRect,
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
@@ -1617,6 +1619,20 @@ fn run_formatting_context(
     parent_block: Option<&BlockFormattingContext>,
 ) -> ChildLayoutResult {
     let root_cells = UsedValuesCellState::capture(parent_used);
+    let cache_attempt = match FcRunCacheAttempt::probe(
+        purpose,
+        box_,
+        parent_grid.is_some(),
+        fc_type,
+        layout_mode,
+        should_collect_devtools_layout_data,
+        &callbacks,
+        &input,
+        &root_cells,
+    ) {
+        Ok(attempt) => attempt,
+        Err(entry) => return absorb_run_outputs(parent_fragments, parent_used, box_, entry.outputs.clone()),
+    };
     let outputs = execute_formatting_context_run(
         purpose,
         root_cells,
@@ -1629,6 +1645,7 @@ fn run_formatting_context(
         input,
         parent_block,
     );
+    cache_attempt.conclude(&callbacks, box_, &outputs);
     absorb_run_outputs(parent_fragments, parent_used, box_, outputs)
 }
 
@@ -2096,6 +2113,7 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             std::ptr::null_mut(),
             sink,
         );
+        callbacks.arena().sweep_stale_fc_run_cache_entries();
     });
 }
 
@@ -2217,6 +2235,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
             paintable_to_replace,
             sink,
         );
+        callbacks.arena().sweep_stale_fc_run_cache_entries();
     });
 }
 
@@ -2263,5 +2282,6 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
             paintable_to_replace,
             sink,
         );
+        callbacks.arena().sweep_stale_fc_run_cache_entries();
     });
 }

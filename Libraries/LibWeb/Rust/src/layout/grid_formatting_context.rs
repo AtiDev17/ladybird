@@ -270,7 +270,7 @@ pub struct FfiGridLayoutLine {
     pub negative_number: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiGridLayoutTrack {
     pub start: crate::layout::CssPixels,
@@ -288,7 +288,7 @@ pub struct FfiGridLayoutDimension {
     pub track_count: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiGridLayoutArea {
     pub name: usize,
@@ -335,6 +335,7 @@ pub struct FfiUsedGridTrackList {
     pub track_count: usize,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedGridLayoutLine {
     pub(crate) names: Vec<usize>,
     pub(crate) start: crate::layout::CssPixels,
@@ -358,17 +359,20 @@ impl OwnedGridLayoutLine {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedGridLayoutDimension {
     pub(crate) lines: Vec<OwnedGridLayoutLine>,
     pub(crate) tracks: Vec<FfiGridLayoutTrack>,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedGridLayoutFragment {
     pub(crate) areas: Vec<FfiGridLayoutArea>,
     pub(crate) columns: OwnedGridLayoutDimension,
     pub(crate) rows: OwnedGridLayoutDimension,
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedGridLayoutData {
     pub(crate) direction: u8,
     pub(crate) writing_mode: u8,
@@ -435,6 +439,7 @@ impl OwnedGridLayoutData {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedUsedGridTrackList {
     pub(crate) is_subgrid: bool,
     pub(crate) lines: Vec<Vec<usize>>,
@@ -453,6 +458,7 @@ impl OwnedUsedGridTrackList {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct OwnedUsedGridTracks {
     pub(crate) columns: OwnedUsedGridTrackList,
     pub(crate) rows: OwnedUsedGridTrackList,
@@ -1122,6 +1128,14 @@ impl ParentGridData {
             row_gaps: parent.row_gaps.clone(),
         }
     }
+}
+
+/// Conservative superset of is_subgridded() for callers outside a live grid run
+/// (the fc-run-cache probe): a declared subgrid axis counts regardless of the
+/// parent-grid placement check only a run in progress can make.
+fn grid_template_declares_a_subgrid_axis(callbacks: &FfiLayoutFcCallbacks, box_: Node) -> bool {
+    let grid_style = ComputedValuesView::new(&callbacks.style_payloads(box_).groups).grid_values();
+    grid_style.template_columns.is_subgrid || grid_style.template_rows.is_subgrid
 }
 
 impl GridFormattingContext {
@@ -3298,7 +3312,7 @@ impl GridFormattingContext {
         };
         self.container_used()
             .rare_data_mut()
-            .used_grid_tracks = Some(tracks);
+            .used_grid_tracks = Some(std::rc::Rc::new(tracks));
     }
 
     fn save_devtools_data(&self, grid_style: &GridValues) {
@@ -3405,7 +3419,7 @@ impl GridFormattingContext {
         };
         self.container_used()
             .rare_data_mut()
-            .grid_layout_data = Some(data);
+            .grid_layout_data = Some(std::rc::Rc::new(data));
     }
 
     pub(crate) fn run(&mut self, run: &FormattingContextRun, input: LayoutInput) {

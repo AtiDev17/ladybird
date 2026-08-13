@@ -494,25 +494,10 @@ impl SvgFormattingContext {
     }
 
     fn computed_transforms(&self, node: Node) -> Option<FfiSvgComputedTransforms> {
-        if let Some(transforms) = self
-            .used_values(node)
+        self.used_values(node)
             .rare_data
             .get()
             .and_then(|cell| cell.borrow().computed_svg_transforms)
-        {
-            return Some(transforms);
-        }
-        let mut transforms = FfiSvgComputedTransforms::default();
-        // SAFETY: `transforms` is writable POD storage and the callback reads
-        // only paintable geometry retained by the C++ layout node.
-        let has_transforms = unsafe {
-            (self.callbacks.read_paintable_svg_transforms)(
-                self.callbacks.context,
-                self.callbacks.shell(node),
-                &raw mut transforms,
-            )
-        };
-        has_transforms.then_some(transforms)
     }
 
     fn set_computed_transforms(&self, node: Node, transforms: FfiSvgComputedTransforms) {
@@ -967,7 +952,7 @@ impl SvgFormattingContext {
         let used = &used_pointer;
         used.set_content_inline_size(transformed_bounding_box.width);
         used.set_content_block_size(transformed_bounding_box.height);
-        self.used_values(graphics_box).rare_data_mut().computed_svg_path = Some(path);
+        self.used_values(graphics_box).rare_data_mut().computed_svg_path = Some(std::rc::Rc::new(path));
         self.place_child(graphics_box, transformed_bounding_box.x, transformed_bounding_box.y);
         used.has_definite_inline_size.set(true);
         used.has_definite_block_size.set(true);

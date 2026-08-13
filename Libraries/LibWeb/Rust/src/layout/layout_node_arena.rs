@@ -229,6 +229,7 @@ pub(crate) struct LayoutNodeArena {
     raw_table_column_spans: HashMap<NodeSlotId, u32>,
     run_used_records: RefCell<Vec<RunRecordSlot>>,
     next_run_nonce: Cell<u64>,
+    fc_run_cache_store: crate::layout::FcRunCacheArenaStore,
     owner_thread: thread::ThreadId,
 }
 
@@ -249,8 +250,32 @@ impl LayoutNodeArena {
             raw_table_column_spans: HashMap::new(),
             run_used_records: RefCell::new(Vec::new()),
             next_run_nonce: Cell::new(1),
+            fc_run_cache_store: crate::layout::FcRunCacheArenaStore::default(),
             owner_thread: thread::current().id(),
         }
+    }
+
+    pub(crate) fn fc_run_cache_store(&self) -> &crate::layout::FcRunCacheArenaStore {
+        &self.fc_run_cache_store
+    }
+
+    /// Drops entries whose slot, epoch, or viewport stamp no longer match.
+    /// Runs at the end of every full pass so invalidated entries whose box
+    /// never probes again do not accumulate for the document's lifetime.
+    pub(crate) fn sweep_stale_fc_run_cache_entries(&self) {
+        let viewport = self.fc_run_cache_store.viewport_size();
+        self.fc_run_cache_store.retain_entries(|slot, validity| {
+            let Some(metadata) = self.slot_metadata.get(slot as usize) else {
+                return false;
+            };
+            if !metadata.occupied || metadata.generation != validity.slot_generation || viewport != validity.viewport {
+                return false;
+            }
+            let id = NodeSlotId::new(slot, metadata.generation);
+            // SAFETY: The slot is occupied at the matching generation, so the
+            // pointer addresses a live NodeData.
+            unsafe { (*self.data(id)).fragment_cache_epoch == validity.fragment_cache_epoch }
+        });
     }
 
     fn assert_owner_thread(&self) {
@@ -356,6 +381,7 @@ impl LayoutNodeArena {
             );
             *slot = RunRecordSlot::default();
         }
+        self.fc_run_cache_store.remove_entry(index);
         self.raw_table_column_spans.remove(&id);
         *self.data_mut(index) = NodeData::default();
 
@@ -689,12 +715,25 @@ impl LayoutNodeArena {
         text: Vec<u16>,
         untransformed_text_is_ascii_whitespace: bool,
         may_require_bidi_processing: bool,
-    ) {
+    ) -> bool {
         self.assert_owner_thread();
         self.data(id);
         let index = id.slot_index() as usize;
         if self.text_contents.len() <= index {
             self.text_contents.resize_with(index + 1, TextContentSlot::default);
+        }
+        let previous = &self.text_contents[index];
+        let changed = previous.generation != id.generation()
+            || match &previous.content {
+                Some(content) => {
+                    content.text != text
+                        || content.untransformed_text_is_ascii_whitespace != untransformed_text_is_ascii_whitespace
+                        || content.may_require_bidi_processing != may_require_bidi_processing
+                }
+                None => true,
+            };
+        if !changed {
+            return false;
         }
         self.text_contents[index] = TextContentSlot {
             generation: id.generation(),
@@ -707,9 +746,10 @@ impl LayoutNodeArena {
         if let Some(slot) = self.text_chunk_caches.get_mut().get_mut(index) {
             *slot = TextChunkCacheSlot::default();
         }
+        true
     }
 
-    pub(crate) fn set_replaced_content_facts(&mut self, id: NodeSlotId, facts: FfiReplacedContentFacts) {
+    pub(crate) fn set_replaced_content_facts(&mut self, id: NodeSlotId, facts: FfiReplacedContentFacts) -> bool {
         self.assert_owner_thread();
         self.data(id);
         let index = id.slot_index() as usize;
@@ -717,10 +757,13 @@ impl LayoutNodeArena {
             self.replaced_content_facts
                 .resize_with(index + 1, ReplacedContentFactsSlot::default);
         }
+        let previous = &self.replaced_content_facts[index];
+        let changed = previous.generation != id.generation() || previous.facts != Some(facts);
         self.replaced_content_facts[index] = ReplacedContentFactsSlot {
             generation: id.generation(),
             facts: Some(facts),
         };
+        changed
     }
 
     pub(crate) fn replaced_content_facts(&self, id: NodeSlotId) -> Option<FfiReplacedContentFacts> {
@@ -945,6 +988,23 @@ pub unsafe extern "C" fn layout_arena_free(arena: *mut c_void, id: NodeSlotId, g
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn layout_fc_run_cache_epochs_enabled() -> bool {
+    crate::layout::fc_run_cache_mode_from_environment() != crate::layout::FcRunCacheMode::Disabled
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_fc_run_cache_hit_count(arena: *mut c_void) -> u64 {
+    abort_on_panic(|| {
+        assert!(!arena.is_null(), "layout node arena handle is null");
+        // SAFETY: The C++ wrapper keeps the arena alive for this call and
+        // serializes all access on the document thread.
+        unsafe { &*arena.cast::<LayoutNodeArena>() }
+            .fc_run_cache_store()
+            .hit_count()
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_set_text_content(
     arena: *mut c_void,
     id: NodeSlotId,
@@ -953,7 +1013,7 @@ pub unsafe extern "C" fn layout_arena_set_text_content(
     length_in_code_units: usize,
     untransformed_text_is_ascii_whitespace: bool,
     may_require_bidi_processing: bool,
-) {
+) -> bool {
     abort_on_panic(|| {
         assert!(!arena.is_null(), "layout node arena handle is null");
         let text = if length_in_code_units == 0 {
@@ -978,8 +1038,8 @@ pub unsafe extern "C" fn layout_arena_set_text_content(
             text,
             untransformed_text_is_ascii_whitespace,
             may_require_bidi_processing,
-        );
-    });
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -987,12 +1047,28 @@ pub unsafe extern "C" fn layout_arena_set_replaced_content_facts(
     arena: *mut c_void,
     id: NodeSlotId,
     facts: FfiReplacedContentFacts,
+) -> bool {
+    abort_on_panic(|| {
+        assert!(!arena.is_null(), "layout node arena handle is null");
+        // SAFETY: The C++ wrapper keeps the arena alive for this call and
+        // serializes all access on the document thread.
+        unsafe { &mut *arena.cast::<LayoutNodeArena>() }.set_replaced_content_facts(id, facts)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_note_viewport_size(
+    arena: *mut c_void,
+    viewport_inline_size_raw: i32,
+    viewport_block_size_raw: i32,
 ) {
     abort_on_panic(|| {
         assert!(!arena.is_null(), "layout node arena handle is null");
         // SAFETY: The C++ wrapper keeps the arena alive for this call and
         // serializes all access on the document thread.
-        unsafe { &mut *arena.cast::<LayoutNodeArena>() }.set_replaced_content_facts(id, facts);
+        unsafe { &*arena.cast::<LayoutNodeArena>() }
+            .fc_run_cache_store()
+            .note_viewport_size(viewport_inline_size_raw, viewport_block_size_raw);
     });
 }
 
@@ -1033,8 +1109,8 @@ mod tests {
         // SAFETY: The first allocation is still live, and the comparison above
         // confirms that its pointer still addresses the arena slot.
         unsafe {
-            (*first_data).initial_quote_nesting_level = 42;
-            assert_eq!((*arena.data(first.slot)).initial_quote_nesting_level, 42);
+            (*first_data).table_column_span = 42;
+            assert_eq!((*arena.data(first.slot)).table_column_span, 42);
         }
         arena.free(first.slot, first.generation);
         for allocation in allocations {

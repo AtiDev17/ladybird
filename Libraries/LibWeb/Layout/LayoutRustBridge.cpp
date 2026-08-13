@@ -648,6 +648,18 @@ LayoutRustBridge::LayoutRustBridge() = default;
 
 LayoutRustBridge::~LayoutRustBridge() = default;
 
+// Stamps the store once per pass entry, so cache entries validate against the
+// viewport the pass actually laid out with; a new bridge entry method must call
+// this before entering Rust.
+static void note_viewport_size_for_pass(Box& pass_root)
+{
+    auto viewport_rect = pass_root.document().viewport_rect();
+    RustFFI::layout_arena_note_viewport_size(
+        pass_root.arena_handle(),
+        viewport_rect.width().raw_value(),
+        viewport_rect.height().raw_value());
+}
+
 void LayoutRustBridge::run_root_layout(Box& viewport, CSSPixels viewport_inline_size, CSSPixels viewport_block_size, bool should_collect_devtools_layout_data)
 {
     VERIFY(!m_commit_root);
@@ -657,6 +669,7 @@ void LayoutRustBridge::run_root_layout(Box& viewport, CSSPixels viewport_inline_
     };
 
     viewport.document().invalidate_stacking_context_tree();
+    note_viewport_size_for_pass(viewport);
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
     {
@@ -681,6 +694,7 @@ void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& pa
     };
 
     root.document().invalidate_stacking_context_tree();
+    note_viewport_size_for_pass(root);
     auto viewport_rect = root.document().viewport_rect();
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
@@ -707,6 +721,7 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box, Painting::Paintable&
     };
 
     box.document().invalidate_stacking_context_tree();
+    note_viewport_size_for_pass(box);
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
     {
@@ -942,13 +957,15 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                     CSSPixels::from_raw(viewport_size.height),
                 });
             } },
-        .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer) {
+        .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer, u64 path_identity) {
             VERIFY(path_pointer);
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            // The path stays owned by the Rust layout state; only its contents move out.
-            auto* path = static_cast<Gfx::Path*>(path_pointer);
+            // The path stays owned by the Rust fragment tree, which may emit it again on a
+            // later commit; the identity is process-unique per path allocation, so a match
+            // means the preserved copy is already this exact path and the copy can be skipped.
+            auto const* path = static_cast<Gfx::Path const*>(path_pointer);
             if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable))
-                svg_path_paintable->set_computed_path(move(*path)); },
+                svg_path_paintable->set_computed_path_if_identity_changed(*path, path_identity); },
         .set_grid_layout_data = [](void*, void* paintable_pointer, RustFFI::FfiGridLayoutData const* data) {
             VERIFY(data);
             static_cast<Painting::Paintable*>(paintable_pointer)->set_grid_layout_data(build_grid_layout_data(*data)); },
@@ -1012,41 +1029,6 @@ static Optional<DOM::AbstractElement> abstract_element_for_abspos_box(Box const&
     if (auto const* element = as_if<DOM::Element>(box.dom_node()))
         return DOM::AbstractElement { *element };
     return {};
-}
-
-static bool style_value_contains_anchor(CSS::StyleValue const& value)
-{
-    if (value.is_anchor())
-        return true;
-    if (value.is_calculated())
-        return value.as_calculated().contains_anchor_function();
-    return false;
-}
-
-bool box_inset_properties_contain_anchor_functions(Box const& box)
-{
-    auto abstract_element = abstract_element_for_abspos_box(box);
-    if (!abstract_element.has_value())
-        return false;
-
-    auto const* computed = abstract_element->computed_values();
-    if (!computed)
-        return false;
-    // Anchor functions in insets only survive to used-value time inside calculated values, so
-    // when no inset is calculated (the common case), skip reconstructing the style values.
-    auto const& inset = computed->inset();
-    if (!inset.top().is_calculated() && !inset.right().is_calculated() && !inset.bottom().is_calculated() && !inset.left().is_calculated())
-        return false;
-
-    auto top = computed->computed_style_value(CSS::PropertyID::Top);
-    auto right = computed->computed_style_value(CSS::PropertyID::Right);
-    auto bottom = computed->computed_style_value(CSS::PropertyID::Bottom);
-    auto left = computed->computed_style_value(CSS::PropertyID::Left);
-    VERIFY(top && right && bottom && left);
-    return style_value_contains_anchor(*top)
-        || style_value_contains_anchor(*right)
-        || style_value_contains_anchor(*bottom)
-        || style_value_contains_anchor(*left);
 }
 
 bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const& box)
@@ -1166,23 +1148,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
                     .height = svg_svg_paintable->svg_viewport_size().height().raw_value(),
                 };
             }
-            return true; },
-        .read_paintable_svg_transforms = [](void*, void* node, RustFFI::FfiSvgComputedTransforms* out) {
-            VERIFY(out);
-            auto const* paintable = static_cast<Node const*>(node)->paintable_ptr();
-            Painting::SVGGraphicsPaintable::ComputedTransforms const* transforms = nullptr;
-            if (auto const* svg_graphics_paintable = as_if<Painting::SVGGraphicsPaintable>(paintable))
-                transforms = &svg_graphics_paintable->computed_transforms();
-            if (auto const* svg_foreign_object_paintable = as_if<Painting::SVGForeignObjectPaintable>(paintable))
-                transforms = &svg_foreign_object_paintable->computed_transforms();
-            if (auto const* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable))
-                transforms = &svg_svg_paintable->computed_transforms();
-            if (!transforms)
-                return false;
-            *out = {
-                .viewbox_transform = to_ffi_affine_transform(transforms->svg_to_viewbox_transform()),
-                .svg_transform = to_ffi_affine_transform(transforms->svg_transform()),
-            };
             return true; },
         .compute_svg_path = [](void*, void* node, RustFFI::FfiSvgPathRequest request) {
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));

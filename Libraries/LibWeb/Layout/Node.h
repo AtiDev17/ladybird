@@ -42,7 +42,7 @@ static_assert(offsetof(RustFFI::NodeData, kind) == 28);
 static_assert(offsetof(RustFFI::NodeData, generated_for) == 29);
 static_assert(offsetof(RustFFI::NodeData, intrinsic_cache_epoch) == 30);
 static_assert(offsetof(RustFFI::NodeData, flags) == 32);
-static_assert(offsetof(RustFFI::NodeData, initial_quote_nesting_level) == 36);
+static_assert(offsetof(RustFFI::NodeData, fragment_cache_epoch) == 36);
 static_assert(offsetof(RustFFI::NodeData, slot_generation) == 40);
 static_assert(offsetof(RustFFI::NodeData, table_column_span) == 42);
 static_assert(offsetof(RustFFI::NodeData, table_row_span) == 44);
@@ -105,6 +105,7 @@ public:
     NodeArena& node_arena() const { return *m_arena; }
 
     bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
+    bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
 
@@ -112,6 +113,20 @@ public:
     GC::Ptr<DOM::Element> pseudo_element_generator();
 
     bool needs_layout_update() const { return has_flag(RustFFI::NodeFlag::NeedsLayoutUpdate); }
+
+    // The formatting-context run cache (LADYBIRD_FC_RUN_CACHE) validates its entries against
+    // these epochs; with the cache disabled nothing reads them, so the walks no-op.
+    static bool fragment_cache_epochs_enabled();
+
+    void bump_fragment_cache_epoch();
+
+    // Any invalidation or restructuring below a node must reach every ancestor's epoch: cached
+    // runs capture subtree structure, and unlike intrinsic-size invalidation there is no
+    // absolutely-positioned or SVG boundary — those descendants' fragments live in ancestor
+    // run trees. Layout tree restructuring in particular never funnels through
+    // set_needs_layout_update (a full pass lays out everything), so the tree mutation
+    // primitives call this on the parent of every structural change.
+    void bump_fragment_cache_epoch_of_self_and_ancestors();
 
     // Set when a style change altered geometry-determining properties of this node itself, so
     // a partial relayout must re-resolve its own size and position instead of reusing them.
@@ -260,9 +275,6 @@ public:
 
     bool is_editing_host() const { return has_flag(RustFFI::NodeFlag::IsEditingHost); }
     void set_is_editing_host(bool value) { set_flag(RustFFI::NodeFlag::IsEditingHost, value); }
-
-    u32 initial_quote_nesting_level() const { return m_data->initial_quote_nesting_level; }
-    void set_initial_quote_nesting_level(u32 value) { m_data->initial_quote_nesting_level = value; }
 
     // https://drafts.csswg.org/css-ui/#propdef-user-select
     CSS::UserSelect user_select_used_value() const;

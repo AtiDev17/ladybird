@@ -896,34 +896,42 @@ inline Gfx::InterpolationColorSpace to_interpolation_color_space(ColorInterpolat
     VERIFY_NOT_REACHED();
 }
 
-// The identity of every ComputedValues style value group, in vtable registration order.
-#define LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(G) \
-    G(InheritedTableValues)                             \
-    G(InheritedListValues)                              \
-    G(InheritedUIValues)                                \
-    G(InheritedSVGValues)                               \
-    G(InheritedTextValues)                              \
-    G(InheritedBoxValues)                               \
-    G(FontValues)                                       \
-    G(AnimationValues)                                  \
-    G(SVGResetValues)                                   \
-    G(GridValues)                                       \
-    G(AnchorValues)                                     \
-    G(EffectsValues)                                    \
-    G(MaskValues)                                       \
-    G(TextResetValues)                                  \
-    G(ContentValues)                                    \
-    G(TransformValues)                                  \
-    G(BackgroundValues)                                 \
-    G(BorderValues)                                     \
-    G(AlignmentValues)                                  \
-    G(MiscResetValues)                                  \
-    G(SizingValues)                                     \
-    G(SurroundValues)                                   \
-    G(BoxValues)
+// Every ComputedValues style value group, in vtable registration order:
+// G(enumerator, member path, sharing-info name, affects layout).
+// A group may be flagged as not affecting layout only when every one of its fields is
+// read exclusively at paint or display-list build time: background qualifies (paint;
+// resource-observer registration runs in apply_style regardless of layout), mask
+// qualifies (paint and hit-testing), and text_reset qualifies (text-decoration resolves
+// at display-list build; white-space-trim is unread by layout today, so implementing it
+// must revisit the flag). effects stays layout-affecting because filter/backdrop-filter
+// establish fixed-positioning containing blocks and re-parent abspos descendants.
+#define LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(G)                 \
+    G(InheritedTableValues, m_inherited.table, "inheritedTable", true)  \
+    G(InheritedListValues, m_inherited.list, "inheritedList", true)     \
+    G(InheritedUIValues, m_inherited.ui, "inheritedUI", true)           \
+    G(InheritedSVGValues, m_inherited.svg, "inheritedSVG", true)        \
+    G(InheritedTextValues, m_inherited.text, "inheritedText", true)     \
+    G(InheritedBoxValues, m_inherited.box, "inheritedBox", true)        \
+    G(FontValues, m_inherited.font, "font", true)                       \
+    G(AnimationValues, m_noninherited.animation, "animation", true)     \
+    G(SVGResetValues, m_noninherited.svg_reset, "svgReset", true)       \
+    G(GridValues, m_noninherited.grid, "grid", true)                    \
+    G(AnchorValues, m_noninherited.anchor, "anchor", true)              \
+    G(EffectsValues, m_noninherited.effects, "effects", true)           \
+    G(MaskValues, m_noninherited.mask_data, "mask", false)              \
+    G(TextResetValues, m_noninherited.text_reset, "textReset", false)   \
+    G(ContentValues, m_noninherited.content_data, "content", true)      \
+    G(TransformValues, m_noninherited.transform, "transform", true)     \
+    G(BackgroundValues, m_noninherited.background, "background", false) \
+    G(BorderValues, m_noninherited.border, "border", true)              \
+    G(AlignmentValues, m_noninherited.alignment, "alignment", true)     \
+    G(MiscResetValues, m_noninherited.misc, "miscReset", true)          \
+    G(SizingValues, m_noninherited.sizing, "sizing", true)              \
+    G(SurroundValues, m_noninherited.surround, "surround", true)        \
+    G(BoxValues, m_noninherited.box, "box", true)
 
 enum class StyleGroupIndex : size_t {
-#define LIBWEB_STYLE_GROUP_ENUMERATOR(name) name,
+#define LIBWEB_STYLE_GROUP_ENUMERATOR(name, ...) name,
     LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(LIBWEB_STYLE_GROUP_ENUMERATOR)
 #undef LIBWEB_STYLE_GROUP_ENUMERATOR
         Count,
@@ -1049,6 +1057,13 @@ public:
     AnimatedProperties const* animated_properties() const { return m_animated_properties.ptr(); }
     RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
 
+    // Animated values live outside the group payloads, so every group-based fast path or
+    // group-based diff must fall back to the slow path when either side carries them.
+    static bool either_carries_animated_overlay(ComputedValues const& a, ComputedValues const& b)
+    {
+        return a.has_animated_values() || b.has_animated_values() || a.animated_properties() || b.animated_properties();
+    }
+
     struct Statistics {
         u64 live_instance_count { 0 };
         u64 total_instances_created { 0 };
@@ -1061,6 +1076,7 @@ public:
     // restyled element keep sharing storage across style generations. Returns true when every
     // group ends up sharing its payload with `previous`.
     bool adopt_identical_group_payloads(ComputedValues const& previous) const;
+    bool differs_in_any_layout_affecting_group_payload_from(ComputedValues const& other) const;
 
     bool has_transform_style_grouping_property() const;
 
@@ -1075,30 +1091,9 @@ public:
     template<typename Callback>
     void for_each_style_group_sharing_state(ComputedValues const* parent, Callback callback) const
     {
-#define LIBWEB_VISIT_STYLE_GROUP(name, path) callback(name##sv, parent ? path.ptr_equals(parent->path) : false, path.is_default());
-        LIBWEB_VISIT_STYLE_GROUP("inheritedTable", m_inherited.table)
-        LIBWEB_VISIT_STYLE_GROUP("inheritedList", m_inherited.list)
-        LIBWEB_VISIT_STYLE_GROUP("inheritedUI", m_inherited.ui)
-        LIBWEB_VISIT_STYLE_GROUP("inheritedSVG", m_inherited.svg)
-        LIBWEB_VISIT_STYLE_GROUP("inheritedText", m_inherited.text)
-        LIBWEB_VISIT_STYLE_GROUP("inheritedBox", m_inherited.box)
-        LIBWEB_VISIT_STYLE_GROUP("font", m_inherited.font)
-        LIBWEB_VISIT_STYLE_GROUP("animation", m_noninherited.animation)
-        LIBWEB_VISIT_STYLE_GROUP("box", m_noninherited.box)
-        LIBWEB_VISIT_STYLE_GROUP("surround", m_noninherited.surround)
-        LIBWEB_VISIT_STYLE_GROUP("sizing", m_noninherited.sizing)
-        LIBWEB_VISIT_STYLE_GROUP("miscReset", m_noninherited.misc)
-        LIBWEB_VISIT_STYLE_GROUP("alignment", m_noninherited.alignment)
-        LIBWEB_VISIT_STYLE_GROUP("border", m_noninherited.border)
-        LIBWEB_VISIT_STYLE_GROUP("background", m_noninherited.background)
-        LIBWEB_VISIT_STYLE_GROUP("transform", m_noninherited.transform)
-        LIBWEB_VISIT_STYLE_GROUP("effects", m_noninherited.effects)
-        LIBWEB_VISIT_STYLE_GROUP("mask", m_noninherited.mask_data)
-        LIBWEB_VISIT_STYLE_GROUP("textReset", m_noninherited.text_reset)
-        LIBWEB_VISIT_STYLE_GROUP("content", m_noninherited.content_data)
-        LIBWEB_VISIT_STYLE_GROUP("anchor", m_noninherited.anchor)
-        LIBWEB_VISIT_STYLE_GROUP("grid", m_noninherited.grid)
-        LIBWEB_VISIT_STYLE_GROUP("svgReset", m_noninherited.svg_reset)
+#define LIBWEB_VISIT_STYLE_GROUP(name, path, sharing_name, affects_layout) \
+    callback(sharing_name##sv, parent ? path.ptr_equals(parent->path) : false, path.is_default());
+        LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS(LIBWEB_VISIT_STYLE_GROUP)
 #undef LIBWEB_VISIT_STYLE_GROUP
     }
 
@@ -1371,25 +1366,17 @@ public:
     ShapeRendering shape_rendering() const { return static_cast<ShapeRendering>(m_noninherited.svg_reset->shape_rendering); }
 
     LengthBox inset() const { return length_box(m_noninherited.surround->inset); }
+    bool has_anchor_inset(PropertyID property_id) const
+    {
+        auto const* handle = anchor_inset_handle(property_id);
+        return handle && handle->pointer != nullptr;
+    }
+    bool inset_properties_contain_anchor_functions() const;
     RefPtr<StyleValue const> anchor_inset(PropertyID property_id) const
     {
-        ComputedValuesFFI::ComputedStyleValueHandle const* handle = nullptr;
-        switch (property_id) {
-        case PropertyID::Top:
-            handle = &m_noninherited.surround->top_anchor_inset;
-            break;
-        case PropertyID::Right:
-            handle = &m_noninherited.surround->right_anchor_inset;
-            break;
-        case PropertyID::Bottom:
-            handle = &m_noninherited.surround->bottom_anchor_inset;
-            break;
-        case PropertyID::Left:
-            handle = &m_noninherited.surround->left_anchor_inset;
-            break;
-        default:
+        auto const* handle = anchor_inset_handle(property_id);
+        if (!handle)
             return {};
-        }
         static_assert(sizeof(RustStyleValueHandle) == sizeof(*handle));
         return style_value_from_handle(property_id, reinterpret_cast<RustStyleValueHandle const&>(*handle));
     }
@@ -1529,6 +1516,22 @@ private:
     ComputedValues();
 
     RefPtr<StyleValue const> style_value_from_handle(PropertyID, RustStyleValueHandle const&) const;
+
+    ComputedValuesFFI::ComputedStyleValueHandle const* anchor_inset_handle(PropertyID property_id) const
+    {
+        switch (property_id) {
+        case PropertyID::Top:
+            return &m_noninherited.surround->top_anchor_inset;
+        case PropertyID::Right:
+            return &m_noninherited.surround->right_anchor_inset;
+        case PropertyID::Bottom:
+            return &m_noninherited.surround->bottom_anchor_inset;
+        case PropertyID::Left:
+            return &m_noninherited.surround->left_anchor_inset;
+        default:
+            return nullptr;
+        }
+    }
 
     static LengthPercentageOrAuto length_percentage_or_auto(ComputedValuesFFI::ComputedLengthPercentageOrAuto const& value)
     {
@@ -3170,9 +3173,11 @@ public:
     }
     void copy_grid_placements_from(ComputedValues const& source)
     {
-        ComputedValuesFFI::rust_grid_values_copy_placements(
-            static_cast<ComputedValuesFFI::GridValues const*>(source.m_noninherited.grid.operator->()),
-            &m_values.m_noninherited.grid.access());
+        auto const* source_grid = static_cast<ComputedValuesFFI::GridValues const*>(source.m_noninherited.grid.operator->());
+        auto const* current_grid = static_cast<ComputedValuesFFI::GridValues const*>(m_values.m_noninherited.grid.operator->());
+        if (ComputedValuesFFI::rust_grid_values_placements_equal(source_grid, current_grid))
+            return;
+        ComputedValuesFFI::rust_grid_values_copy_placements(source_grid, &m_values.m_noninherited.grid.access());
     }
     void reset_grid_placements_to_auto()
     {
