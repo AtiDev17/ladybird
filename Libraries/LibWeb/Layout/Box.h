@@ -14,11 +14,6 @@
 
 namespace Web::Layout {
 
-enum class RequireExistingPaintable : u8 {
-    No,
-    Yes,
-};
-
 struct LineBoxFragmentCoordinate {
     size_t line_box_index { 0 };
     size_t fragment_index { 0 };
@@ -34,7 +29,7 @@ public:
     // A partial relayout boundary is a box whose subtree can be re-laid out in
     // isolation: its own used size and position are guaranteed not to change
     // when layout is invalidated somewhere inside its subtree.
-    bool is_partial_relayout_boundary(RequireExistingPaintable = RequireExistingPaintable::Yes) const;
+    bool is_partial_relayout_boundary() const;
 
     // https://www.w3.org/TR/css-images-3/#natural-dimensions
     virtual CSS::SizeWithAspectRatio natural_size() const { return {}; }
@@ -59,6 +54,7 @@ public:
     virtual RefPtr<Painting::Paintable> create_paintable() const override;
 
     bool has_saved_abspos_layout_inputs() const { return has_flag(RustFFI::NodeFlag::HasSavedAbsposLayoutInputs); }
+    bool has_saved_committed_geometry() const { return has_flag(RustFFI::NodeFlag::HasSavedCommittedGeometry); }
     bool saved_abspos_cb_derives_from_own_computed_values() const { return has_flag(RustFFI::NodeFlag::SavedAbsposCbDerivesFromOwnComputedValues); }
     bool saved_abspos_alignment_derives_from_own_computed_values() const { return has_flag(RustFFI::NodeFlag::SavedAbsposAlignmentDerivesFromOwnComputedValues); }
 

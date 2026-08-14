@@ -965,8 +965,6 @@ pub struct FfiLayoutFcCallbacks {
     pub document_in_quirks_mode: bool,
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgElementFacts,
-    pub read_paintable_geometry:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut crate::layout::FfiPaintableGeometry) -> bool,
     pub compute_svg_path: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiSvgPathRequest) -> FfiSvgPathResult,
     pub svg_image_bounding_box: unsafe extern "C" fn(*mut c_void, *mut c_void, CssPixels, CssPixels) -> FfiFloatRect,
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
@@ -1060,6 +1058,14 @@ impl FfiLayoutFcCallbacks {
         // SAFETY: node_data_pointer() returns a live arena slot.
         assert!(unsafe { crate::layout::kind_is_box((*data).kind) });
         self.arena().saved_abspos_layout_inputs(data)
+    }
+
+    pub(crate) fn saved_committed_geometry(&self, node: Node) -> Option<crate::layout::FfiPaintableGeometry> {
+        self.arena().saved_committed_geometry(self.arena().data(node))
+    }
+
+    pub(crate) fn set_saved_committed_geometry(&self, node: Node, geometry: crate::layout::FfiPaintableGeometry) {
+        self.arena().set_saved_committed_geometry(self.arena().data(node), geometry);
     }
 
     pub(crate) fn set_saved_abspos_layout_inputs(&self, node: Node, inputs: Option<crate::layout::AbsposLayoutInputs>) {
@@ -2110,7 +2116,6 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             &callbacks,
             should_collect_devtools_layout_data,
             root,
-            std::ptr::null_mut(),
             sink,
         );
         callbacks.arena().sweep_stale_fc_run_cache_entries();
@@ -2123,7 +2128,6 @@ fn drain_and_commit_entry_pass(
     callbacks: &FfiLayoutFcCallbacks,
     should_collect_devtools_layout_data: bool,
     commit_root: Node,
-    paintable_to_replace: *mut c_void,
     sink: &FfiCommitSink,
 ) {
     drain_abspos_with_placed_containing_blocks(
@@ -2134,7 +2138,7 @@ fn drain_and_commit_entry_pass(
     );
     let pass_fragments = entry_fragments.take_completed_pass(entry_records, callbacks);
     debug_assert!(!pass_fragments.roots.is_empty(), "an entry pass always produces the entry root's fragment");
-    commit_replacing(commit_root, paintable_to_replace, callbacks, sink, &pass_fragments);
+    commit_replacing(commit_root, callbacks, sink, &pass_fragments);
 }
 
 /// # Safety
@@ -2144,7 +2148,6 @@ fn drain_and_commit_entry_pass(
 pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
     root: NodeSlotId,
     viewport: NodeSlotId,
-    paintable_to_replace: *mut c_void,
     viewport_inline_size_raw: i32,
     viewport_block_size_raw: i32,
     callbacks: *const FfiLayoutFcCallbacks,
@@ -2152,7 +2155,6 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
 ) {
     abort_on_panic(|| {
         assert!(!root.is_invalid());
-        assert!(!paintable_to_replace.is_null());
         assert!(!callbacks.is_null());
         assert!(!sink.is_null());
         // SAFETY: The C++ pass host keeps both callback tables live for this
@@ -2161,7 +2163,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         let sink = unsafe { &*sink };
 
         let entry_records = std::rc::Rc::new(RunRecords::new_unrooted(callbacks.arena, root));
-        let root_used = used_values_from_paintable(&callbacks, root, paintable_to_replace)
+        let root_used = used_values_from_saved_committed_geometry(&callbacks, root)
             .expect("partial relayout root must have committed geometry");
         entry_records.register(root, root_used.clone());
         let entry_fragments = std::rc::Rc::new(RunFragmentBuilder::new_entry_accumulator(root));
@@ -2232,7 +2234,6 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
             &callbacks,
             false,
             root,
-            paintable_to_replace,
             sink,
         );
         callbacks.arena().sweep_stale_fc_run_cache_entries();
@@ -2245,13 +2246,11 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
     box_: NodeSlotId,
-    paintable_to_replace: *mut c_void,
     callbacks: *const FfiLayoutFcCallbacks,
     sink: *const FfiCommitSink,
 ) {
     abort_on_panic(|| {
         assert!(!box_.is_invalid());
-        assert!(!paintable_to_replace.is_null());
         assert!(!callbacks.is_null());
         assert!(!sink.is_null());
         // SAFETY: The C++ pass host keeps both callback tables live for this
@@ -2279,7 +2278,6 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
             &callbacks,
             false,
             box_,
-            paintable_to_replace,
             sink,
         );
         callbacks.arena().sweep_stale_fc_run_cache_entries();

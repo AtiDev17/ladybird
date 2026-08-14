@@ -810,7 +810,8 @@ void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool 
         ListOfAvailableImages::Key key;
         key.url = *url_string;
         key.mode = m_cors_setting;
-        key.origin = document().origin();
+        if (m_cors_setting != CORSSettingAttribute::NoCORS)
+            key.origin = document().origin();
 
         // 4. If the list of available images contains an entry for key, then:
         if (auto* entry = document().list_of_available_images().get(key)) {
@@ -995,6 +996,49 @@ after_step_7:
             return;
         }
 
+        // INTEROP: The cache shortcut in step 7 cannot handle responsive images because their source is not selected
+        //          until step 10. Reuse an already decoded selected source here so that replacing an img element does
+        //          not make the image disappear while the higher-layer cache processes the same resource again.
+        ListOfAvailableImages::Key key;
+        key.url = *url_string;
+        key.mode = m_cors_setting;
+        if (m_cors_setting != CORSSettingAttribute::NoCORS)
+            key.origin = document().origin();
+        if (auto* entry = document().list_of_available_images().get(key)) {
+            entry->ignore_higher_layer_caching = true;
+
+            unregister_with_decoded_image_data_if_needed();
+            abort_the_image_request(m_current_request);
+            abort_the_image_request(m_pending_request);
+            m_pending_request = nullptr;
+            m_load_event_delayer.clear();
+
+            m_current_request = ImageRequest::create();
+            m_current_request->set_image_data(entry->image_data);
+            m_current_request->set_state(ImageRequest::State::CompletelyAvailable);
+            m_current_request->set_current_pixel_density(pixel_density.value_or(1.0f));
+            register_with_decoded_image_data_if_needed();
+            m_current_request->prepare_for_presentation(*this);
+
+            document().style_computer().style_engine().record_element_style_input_change(style_node_id());
+            set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);
+
+            queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, restart_animations, maybe_omit_events, url_string, previous_url, update_the_image_data_count] {
+                if (update_the_image_data_count != m_update_the_image_data_count)
+                    return;
+                if (!document().is_fully_active()) {
+                    m_load_event_delayer.clear();
+                    return;
+                }
+                if (restart_animations)
+                    restart_the_animation();
+                m_current_request->set_current_url(document(), *url_string);
+                if (!maybe_omit_events || previous_url != *url_string)
+                    dispatch_event(DOM::Event::create(HTML::relevant_global_object(*this), HTML::EventNames::load));
+            });
+            return;
+        }
+
         // 14. If the pending request is not null and urlString is the same as the pending request's current URL, then return.
         if (m_pending_request && *url_string == m_pending_request->current_url())
             return;
@@ -1099,10 +1143,17 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
 {
     auto captured_url_string = Utf16String::from_utf16(url_string);
     auto captured_previous_url = Utf16String::from_utf16(previous_url);
+    auto originating_document = GC::Ref { document() };
+
+    ListOfAvailableImages::Key cache_key;
+    cache_key.url = captured_url_string;
+    cache_key.mode = m_cors_setting;
+    if (m_cors_setting != CORSSettingAttribute::NoCORS)
+        cache_key.origin = originating_document->origin();
 
     image_request->add_callbacks(
-        [this, image_request, maybe_omit_events, url_string = captured_url_string, previous_url = captured_previous_url]() {
-            batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [this, image_request, maybe_omit_events, url_string, previous_url] {
+        [this, image_request, maybe_omit_events, url_string = captured_url_string, previous_url = captured_previous_url, originating_document, cache_key]() {
+            batching_dispatcher().enqueue(GC::create_function(GC::Heap::the(), [this, image_request, maybe_omit_events, url_string, previous_url, originating_document, cache_key] {
                 // AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
                 //         between when the fetch completed and when this batched callback runs.
                 if (!document().is_fully_active()) {
@@ -1124,11 +1175,6 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 auto image_data = image_request->shared_resource_request()->image_data();
                 image_request->set_image_data(image_data);
 
-                ListOfAvailableImages::Key key;
-                key.url = url_string;
-                key.mode = m_cors_setting;
-                key.origin = document().origin();
-
                 // 1. If image request is the pending request, abort the image request for the current request,
                 //    upgrade the pending request to the current request
                 //    and prepare image request for presentation given the img element.
@@ -1145,8 +1191,8 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
                 image_request->set_state(ImageRequest::State::CompletelyAvailable);
 
                 // 3. Add the image to the list of available images using the key key, with the ignore higher-layer caching flag set.
-                document().list_of_available_images().add(key, *image_data, true);
-                document().prune_image_resource_caches();
+                originating_document->list_of_available_images().add(cache_key, *image_data, true);
+                originating_document->prune_image_resource_caches();
 
                 document().style_computer().style_engine().record_element_style_input_change(style_node_id());
                 set_needs_layout_update_or_repaint_after_image_data_change(DOM::SetNeedsLayoutReason::HTMLImageElementUpdateTheImageData);

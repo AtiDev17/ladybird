@@ -684,7 +684,7 @@ void LayoutRustBridge::run_root_layout(Box& viewport, CSSPixels viewport_inline_
     VERIFY(!m_line_commit_context);
 }
 
-void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& paintable_to_replace)
+void LayoutRustBridge::compute_subtree_layout(Box& root)
 {
     VERIFY(!m_commit_root);
     m_commit_root = &root;
@@ -702,7 +702,6 @@ void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& pa
         RustFFI::rust_layout_compute_subtree_layout(
             Node::slot_id(&root),
             Node::slot_id(&root.root()),
-            &paintable_to_replace,
             viewport_rect.width().raw_value(),
             viewport_rect.height().raw_value(),
             &callbacks,
@@ -711,7 +710,7 @@ void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& pa
     VERIFY(!m_line_commit_context);
 }
 
-void LayoutRustBridge::replay_saved_abspos_layout(Box& box, Painting::Paintable& paintable_to_replace)
+void LayoutRustBridge::replay_saved_abspos_layout(Box& box)
 {
     VERIFY(!m_commit_root);
     m_commit_root = &box;
@@ -725,7 +724,7 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box, Painting::Paintable&
     auto sink = commit_sink();
     {
         ActiveLayoutPassScope active_pass;
-        RustFFI::rust_layout_replay_saved_abspos_layout(Node::slot_id(&box), &paintable_to_replace, &callbacks, &sink);
+        RustFFI::rust_layout_replay_saved_abspos_layout(Node::slot_id(&box), &callbacks, &sink);
     }
     VERIFY(!m_line_commit_context);
 }
@@ -755,17 +754,20 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
 {
     return {
         .context = this,
-        .begin_commit = [](void* context, void* root_pointer, void* paintable_to_replace_pointer) {
+        .begin_commit = [](void* context, void* root_pointer) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             auto& root = *static_cast<Box*>(root_pointer);
             VERIFY(!bridge.m_replaced_paintable);
             VERIFY(!bridge.m_commit_parent_paintable);
             VERIFY(!bridge.m_commit_insert_before_paintable);
 
-            if (paintable_to_replace_pointer) {
-                bridge.m_replaced_paintable = *static_cast<Painting::Paintable*>(paintable_to_replace_pointer);
-            } else if (!root.is_viewport()) {
+            if (!root.is_viewport()) {
                 bridge.m_replaced_paintable = root.paintable();
+                if (!bridge.m_replaced_paintable && root.dom_node()) {
+                    // A rebuilt box has no paintable yet; the previous one stays referenced by
+                    // the DOM node (and alive in the paint tree) until this commit replaces it.
+                    bridge.m_replaced_paintable = root.dom_node()->unsafe_paintable();
+                }
             }
 
             if (bridge.m_replaced_paintable) {
@@ -1112,47 +1114,6 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
             VERIFY(node_with_style);
             return build_svg_element_facts(*node_with_style); },
-        .read_paintable_geometry = [](void*, void* node, void* paintable_pointer, RustFFI::FfiPaintableGeometry* out) {
-            VERIFY(out);
-            VERIFY(paintable_pointer);
-            auto const* paintable = static_cast<Painting::Paintable const*>(paintable_pointer);
-            auto const& box_model = paintable->box_model();
-            *out = {
-                .content_inline_size = paintable->content_width().raw_value(),
-                .content_block_size = paintable->content_height().raw_value(),
-                .content_offset = {
-                    .x = paintable->offset().x().raw_value(),
-                    .y = paintable->offset().y().raw_value(),
-                },
-                .svg_viewport_size = {},
-                .margin_left = box_model.margin.left.raw_value(),
-                .margin_right = box_model.margin.right.raw_value(),
-                .margin_top = box_model.margin.top.raw_value(),
-                .margin_bottom = box_model.margin.bottom.raw_value(),
-                .border_left = box_model.border.left.raw_value(),
-                .border_right = box_model.border.right.raw_value(),
-                .border_top = box_model.border.top.raw_value(),
-                .border_bottom = box_model.border.bottom.raw_value(),
-                .padding_left = box_model.padding.left.raw_value(),
-                .padding_right = box_model.padding.right.raw_value(),
-                .padding_top = box_model.padding.top.raw_value(),
-                .padding_bottom = box_model.padding.bottom.raw_value(),
-                .inset_left = box_model.inset.left.raw_value(),
-                .inset_right = box_model.inset.right.raw_value(),
-                .inset_top = box_model.inset.top.raw_value(),
-                .inset_bottom = box_model.inset.bottom.raw_value(),
-            };
-
-            // NB: We check the node type rather than the paintable type to mirror the rust-side logic.
-            if (is<SVGSVGBox>(*static_cast<Node const*>(node))) {
-                auto const* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable);
-                VERIFY(svg_svg_paintable);
-                out->svg_viewport_size = {
-                    .width = svg_svg_paintable->svg_viewport_size().width().raw_value(),
-                    .height = svg_svg_paintable->svg_viewport_size().height().raw_value(),
-                };
-            }
-            return true; },
         .compute_svg_path = [](void*, void* node, RustFFI::FfiSvgPathRequest request) {
             auto const* node_with_style = as_if<NodeWithStyle>(*static_cast<Node const*>(node));
             VERIFY(node_with_style);
