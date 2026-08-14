@@ -452,7 +452,16 @@ void StyleComputer::collect_animations_into(DOM::AbstractElement abstract_elemen
 
 void StyleComputer::collect_animations_into(DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedProperties& computed_properties) const
 {
+    m_keyframes_inherited_non_inherited_property = false;
     collect_animation_effects_into(abstract_element, effects, computed_properties, nullptr);
+    // An animation-only overlay update resolves keyframe values just like a full style computation does, so a
+    // keyframe-borne `inherit` on a non-inherited property discovered here must leave the same invalidation
+    // mark behind, or a later change to the parent's value never reaches this element's animated style.
+    if (m_keyframes_inherited_non_inherited_property) {
+        if (auto* parent = abstract_element.element().parent())
+            parent->set_children_may_depend_on_non_inherited_property_inheritance();
+        m_keyframes_inherited_non_inherited_property = false;
+    }
     adjust_animated_element_style_if_needed(computed_properties, abstract_element);
 }
 
@@ -1372,13 +1381,31 @@ Vector<GC::Ref<Animations::KeyframeEffect>> StyleComputer::start_needed_transiti
             delay = transition_attributes.delay;
             duration = transition_attributes.duration;
             allow_discrete = transition_attributes.transition_behavior == TransitionBehavior::AllowDiscrete;
-            before_change_value = stabilization_state.before_change_value;
-            after_change_value = after_change_style->computed_style_value(property_id, ComputedValues::WithAnimationsApplied::No);
+            // https://drafts.csswg.org/css-transitions-1/#starting
+            // The after-change style excludes styles from CSS Transitions but keeps animation-derived values, and the
+            // before-change style has declarative animations updated to the current time. A property that a
+            // non-transition animation currently applies to therefore carries the same animated value on both sides of
+            // the comparison, so a change to the underlying value cannot start a transition beneath a running
+            // animation.
+            RefPtr<StyleValue const> value_covered_by_animation;
+            if (auto const* animated_properties = after_change_style->animated_properties();
+                animated_properties && animated_properties->has_property(property_id)
+                && !animated_properties->is_property_result_of_transition(property_id))
+                value_covered_by_animation = animated_properties->property(property_id);
+
+            if (value_covered_by_animation) {
+                before_change_value = value_covered_by_animation;
+                after_change_value = value_covered_by_animation;
+                before_change_value_originates_from_current_color = value_covered_by_animation->to_keyword() == Keyword::Currentcolor;
+                after_change_value_originates_from_current_color = before_change_value_originates_from_current_color;
+            } else {
+                before_change_value = stabilization_state.before_change_value;
+                after_change_value = after_change_style->computed_style_value(property_id, ComputedValues::WithAnimationsApplied::No);
+                before_change_value_originates_from_current_color = stabilization_state.before_change_value_originates_from_current_color;
+                after_change_value_originates_from_current_color = originates_from_current_color(*after_change_style, property_id);
+            }
             VERIFY(before_change_value);
             VERIFY(after_change_value);
-
-            before_change_value_originates_from_current_color = stabilization_state.before_change_value_originates_from_current_color;
-            after_change_value_originates_from_current_color = originates_from_current_color(*after_change_style, property_id);
             if (existing_transition) {
                 old_reversing_shortening_factor = existing_transition->reversing_shortening_factor();
                 if (has_running_transition)
@@ -3894,7 +3921,15 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_animated_computed_value
 
 NonnullRefPtr<ComputedProperties> StyleComputer::reconstruct_computed_properties(ComputedValues const& computed_values) const
 {
-    auto style = ComputedProperties::create(ComputedProperties::create_builder_with_base_values_from(computed_values));
+    auto builder = ComputedProperties::create_builder_with_base_values_from(computed_values);
+    // The recorded pre-box-type-transformation display tracks the animated display while one is applied, on both
+    // the animated style and its base. When the animation stops covering `display`, re-adjustment must start over
+    // from the base style's display, or the sampled value the finished animation left behind is resurrected as
+    // the element's display. Box-type transformations are idempotent, so the adjusted base display is a sound
+    // transformation input.
+    if (auto const* animated_properties = computed_values.animated_properties(); animated_properties && animated_properties->has_property(PropertyID::Display))
+        builder.set_display_before_box_type_transformation(computed_values.base_values().display());
+    auto style = ComputedProperties::create(move(builder));
     apply_animated_properties_to_reconstruction(*style, computed_values);
     return style;
 }

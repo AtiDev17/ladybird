@@ -164,6 +164,12 @@ impl StyleEngine {
             change.new_properties = new_properties;
             return;
         }
+        // An incomplete inventory can hold custom properties, and those never reach the winner
+        // columns, so nothing downstream can prove such an edit inert. Capture that on the old
+        // side only: the first edit in a transaction reads the state every proof compares against.
+        if !self.current_declarations_are_complete_for(rule) {
+            self.rules_with_incomplete_old_declarations.push(rule);
+        }
         self.pending_rule_declaration_changes
             .push(PendingRuleDeclarationChange {
                 rule,
@@ -1066,6 +1072,14 @@ impl StyleEngine {
         root: StyleNodeID,
         arrival_regions: &ImpactRegions,
     ) -> TransactionFactView {
+        // Old-side workspace answers cached while planning an earlier transaction describe that
+        // transaction's before state. This transaction has a different before state, so stale
+        // old-side answers would let exact planning compare wrong old positions and miss changes.
+        let workspace_before = self.match_workspace.capacity_bytes();
+        self.match_workspace.clear_old_evaluation_sides();
+        let workspace_after = self.match_workspace.capacity_bytes();
+        self.memory
+            .release(MemoryCategory::BatchScratch, workspace_before - workspace_after);
         let plan_before_commit = self.facts.has_pending_input();
         let classification = self.classify_transaction_facts(transaction, arrival_regions);
         let before_facts = transaction.take_before_facts(&mut self.memory);
