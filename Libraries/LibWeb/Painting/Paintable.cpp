@@ -16,6 +16,7 @@
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
+#include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/BorderImageSliceStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
@@ -632,20 +633,6 @@ static bool is_nested_navigable_container(Paintable const& paintable_box)
     return node && node->is_navigable_container() && as<HTML::NavigableContainer const>(*node).content_navigable();
 }
 
-static CSSPixelPoint maximum_scroll_offset_for(Paintable const& paintable_box)
-{
-    CSSPixelPoint max_scroll_offset;
-    auto scrollable_overflow_rect = paintable_box.scrollable_overflow_rect();
-    if (!scrollable_overflow_rect.has_value())
-        return max_scroll_offset;
-
-    auto scrollport_rect = paintable_box.absolute_padding_box_rect();
-
-    max_scroll_offset.set_x(max(CSSPixels(0), scrollable_overflow_rect->width() - scrollport_rect.width()));
-    max_scroll_offset.set_y(max(CSSPixels(0), scrollable_overflow_rect->height() - scrollport_rect.height()));
-    return max_scroll_offset;
-}
-
 static void record_scroll_node(Paintable const& paintable_box, DisplayListRecordingContext& context)
 {
     auto scroll_node_kind = scroll_node_kind_for(paintable_box);
@@ -667,7 +654,8 @@ static void record_scroll_node(Paintable const& paintable_box, DisplayListRecord
         .scroll_node_index = paintable_box.own_scroll_node_index(),
         .parent_scroll_node_index = parent_scroll_node_index,
         .scrollport_rect = scrollport_rect,
-        .max_scroll_offset = css_point_to_device_point(maximum_scroll_offset_for(paintable_box), context.device_pixels_per_css_pixel()),
+        .min_scroll_offset = css_point_to_device_point(paintable_box.minimum_scroll_offset(), context.device_pixels_per_css_pixel()),
+        .max_scroll_offset = css_point_to_device_point(paintable_box.maximum_scroll_offset(), context.device_pixels_per_css_pixel()),
         .scroll_node_kind = *scroll_node_kind,
         .pseudo_element_type = pseudo_element_type_for(paintable_box),
         .is_viewport = paintable_box.is_viewport_paintable(),
@@ -811,7 +799,8 @@ static void record_viewport_scrollbar_state(Paintable const& paintable_box, Disp
         VERIFY(expanded_scrollbar_data.has_value());
 
         auto gutter_rect = context.rounded_device_rect(scrollbar_data->gutter_rect).to_type<int>();
-        auto max_scroll_offset = css_point_to_device_point(maximum_scroll_offset_for(paintable_box), context.device_pixels_per_css_pixel());
+        auto min_scroll_offset = css_point_to_device_point(paintable_box.minimum_scroll_offset(), context.device_pixels_per_css_pixel());
+        auto max_scroll_offset = css_point_to_device_point(paintable_box.maximum_scroll_offset(), context.device_pixels_per_css_pixel());
         auto orientation = direction == Paintable::ScrollDirection::Horizontal ? Gfx::Orientation::Horizontal : Gfx::Orientation::Vertical;
 
         context.display_list_recorder().compositor_viewport_scrollbar({
@@ -823,6 +812,7 @@ static void record_viewport_scrollbar_state(Paintable const& paintable_box, Disp
             .expanded_thumb_rect = context.rounded_device_rect(expanded_scrollbar_data->thumb_rect).to_type<int>(),
             .scroll_size = scrollbar_data->thumb_travel_to_scroll_ratio.to_double(),
             .expanded_scroll_size = expanded_scrollbar_data->thumb_travel_to_scroll_ratio.to_double(),
+            .min_scroll_offset = min_scroll_offset.primary_offset_for_orientation(orientation),
             .max_scroll_offset = max_scroll_offset.primary_offset_for_orientation(orientation),
             .thumb_color = scrollbar_colors.thumb_color,
             .track_color = scrollbar_colors.track_color,
@@ -1016,6 +1006,26 @@ void Paintable::invalidate_paint_cache() const
     m_cached_paint_data = nullptr;
 }
 
+void Paintable::invalidate_propagated_text_decoration_caches() const
+{
+    for_each_in_subtree([](Paintable const& descendant) {
+        if (descendant.layout_node().is_text_decoration_propagation_boundary())
+            return TraversalDecision::SkipChildrenAndContinue;
+        // Only fragment-painting paintables record propagated decorations.
+        if (descendant.is_paintable_with_lines() || descendant.is_inline_paintable())
+            descendant.invalidate_paint_cache();
+        return TraversalDecision::Continue;
+    });
+}
+
+void Paintable::repaint_after_style_change(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
+{
+    if (invalidation.needs_repaint())
+        set_needs_repaint();
+    if (invalidation.repaint_propagated_text_decorations)
+        invalidate_propagated_text_decoration_caches();
+}
+
 void Paintable::set_cached_commands(PaintPhase phase, u64 display_list_id, DisplayListCommandRange range, VisualContextIndex recorded_context_index, bool captured_under_empty_effective_clip) const
 {
     if (!m_cached_paint_data)
@@ -1127,17 +1137,43 @@ Optional<CSSPixelRect> Paintable::absolute_containing_line_box_rect() const
     return lines[*m_containing_line_box_index].rect.translated(containing_block->absolute_position());
 }
 
-CSSPixelPoint Paintable::clamp_scroll_offset(CSSPixelPoint offset) const
+CSSPixelPoint Paintable::minimum_scroll_offset() const
 {
     auto scrollable_overflow_rect = this->scrollable_overflow_rect();
     if (!scrollable_overflow_rect.has_value())
+        return {};
+
+    auto scrollport_rect = absolute_padding_box_rect();
+    return {
+        min(scrollable_overflow_rect->left() - scrollport_rect.left(), CSSPixels(0)),
+        min(scrollable_overflow_rect->top() - scrollport_rect.top(), CSSPixels(0)),
+    };
+}
+
+CSSPixelPoint Paintable::maximum_scroll_offset() const
+{
+    auto scrollable_overflow_rect = this->scrollable_overflow_rect();
+    if (!scrollable_overflow_rect.has_value())
+        return {};
+
+    auto scrollport_rect = absolute_padding_box_rect();
+    return {
+        max(scrollable_overflow_rect->right() - scrollport_rect.right(), CSSPixels(0)),
+        max(scrollable_overflow_rect->bottom() - scrollport_rect.bottom(), CSSPixels(0)),
+    };
+}
+
+CSSPixelPoint Paintable::clamp_scroll_offset(CSSPixelPoint offset) const
+{
+    if (!scrollable_overflow_rect().has_value())
         return offset;
 
-    auto padding_rect = absolute_padding_box_rect();
-    auto max_x_offset = max(scrollable_overflow_rect->width() - padding_rect.width(), 0);
-    auto max_y_offset = max(scrollable_overflow_rect->height() - padding_rect.height(), 0);
-
-    return { clamp(offset.x(), 0, max_x_offset), clamp(offset.y(), 0, max_y_offset) };
+    auto minimum_offset = minimum_scroll_offset();
+    auto maximum_offset = maximum_scroll_offset();
+    return {
+        clamp(offset.x(), minimum_offset.x(), maximum_offset.x()),
+        clamp(offset.y(), minimum_offset.y(), maximum_offset.y()),
+    };
 }
 
 Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
@@ -1147,8 +1183,7 @@ Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
 
     offset = clamp_scroll_offset(offset);
 
-    // FIXME: If there is horizontal and vertical scroll ignore only part of the new offset
-    if (offset.y() < 0 || scroll_offset() == offset)
+    if (scroll_offset() == offset)
         return ScrollHandled::No;
 
     if (is_viewport_paintable()) {
@@ -1632,15 +1667,17 @@ Optional<Paintable::ScrollbarData> Paintable::compute_scrollbar_data(ScrollDirec
 
     ScrollbarData scrollbar_data = { .gutter_rect = {}, .thumb_rect = scrollbar_rect.value(), .thumb_travel_to_scroll_ratio = 0 };
 
+    if (scrollable_overflow_length > scrollport_size)
+        scrollbar_data.thumb_travel_to_scroll_ratio = (usable_scrollbar_length - thumb_length) / (scrollable_overflow_length - scrollport_size);
+
     scrollbar_data.thumb_rect.set_primary_size_for_orientation(orientation, thumb_length);
     scrollbar_data.thumb_rect.set_secondary_size_for_orientation(orientation, thumb_thickness);
-    scrollbar_data.thumb_rect.translate_primary_offset_for_orientation(orientation, thumb_margin);
+    auto minimum_offset = minimum_scroll_offset().primary_offset_for_orientation(orientation);
+    scrollbar_data.thumb_rect.translate_primary_offset_for_orientation(orientation, thumb_margin - minimum_offset * scrollbar_data.thumb_travel_to_scroll_ratio);
     if (with_gutter || (!is_horizontal && is_chrome_mirrored()))
         scrollbar_data.thumb_rect.translate_secondary_offset_for_orientation(orientation, thumb_margin);
     if (with_gutter)
         scrollbar_data.gutter_rect = scrollbar_rect.value();
-    if (scrollable_overflow_length > scrollport_size)
-        scrollbar_data.thumb_travel_to_scroll_ratio = (usable_scrollbar_length - thumb_length) / (scrollable_overflow_length - scrollport_size);
 
     if (scroll_state_snapshot) {
         auto own_offset = scroll_state_snapshot->device_offset_for_index(m_own_scroll_node_index);
