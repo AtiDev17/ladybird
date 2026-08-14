@@ -121,6 +121,7 @@ enum class SetNeedsLayoutReason {
     X(NodeSetTextContent)                                 \
     X(None)                                               \
     X(ShadowRootSetInnerHTML)                             \
+    X(SlotAssignmentChange)                               \
     X(StyleChange)                                        \
     X(SVGResourceElementRemoved)                          \
     X(TopLayerMembershipChange)
@@ -370,6 +371,11 @@ public:
 
     Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
     Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
+    Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
+    Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
+    {
+        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(inclusive_ancestor));
+    }
 
     RefPtr<Painting::Paintable const> paintable_box() const;
     RefPtr<Painting::Paintable> paintable_box();
@@ -396,6 +402,8 @@ public:
 
     [[nodiscard]] bool needs_layout_tree_update() const { return m_needs_layout_tree_update; }
     void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
+
+    [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return m_may_reuse_layout_node_for_child_list_insertion; }
 
     [[nodiscard]] bool child_needs_layout_tree_update() const { return m_child_needs_layout_tree_update; }
     void set_child_needs_layout_tree_update(bool b) { m_child_needs_layout_tree_update = b; }
@@ -544,6 +552,7 @@ protected:
     NodeType m_type { NodeType::INVALID };
     bool m_needs_layout_tree_update { false };
     bool m_child_needs_layout_tree_update { false };
+    bool m_may_reuse_layout_node_for_child_list_insertion { false };
 
     bool m_children_may_depend_on_non_inherited_property_inheritance { false };
     bool m_in_editable_subtree { false };

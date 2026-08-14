@@ -142,8 +142,10 @@ public:
     Utf16String dump_gc_graph();
     Utf16String dump_session_history();
     Utf16String dump_ui_process_session_history();
+    Utf16String dump_ui_process_session_history_without_update();
     Utf16String dump_site_isolation_process_tree();
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
+    bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
     void clobber_next_navigation_with_a_traversal();
 
     GC::Ptr<DOM::ShadowRoot> get_shadow_root(GC::Ref<DOM::Element>);
@@ -165,12 +167,14 @@ public:
     GC::Ref<JS::Object> style_invalidation_counters_object() const;
     void reset_style_invalidation_counters();
     GC::Ref<JS::Object> layout_tree_build_stats();
+    GC::Ref<JS::Object> compare_layout_tree_with_full_rebuild();
     GC::Ref<JS::Object> computed_values_stats();
     GC::Ref<JS::Object> style_ffi_counters();
     GC::Ref<JS::Object> style_engine_counters();
     u64 style_record_identity(DOM::Element&);
     u64 layout_style_record_identity(DOM::Element&);
     u64 paint_style_record_identity(DOM::Element&);
+    u64 layout_node_identity(DOM::Node&);
     double style_engine_match_document();
     Utf16String style_engine_matched_rules();
     GC::Ref<JS::Object> style_engine_transaction_reactions();

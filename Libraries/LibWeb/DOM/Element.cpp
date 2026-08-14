@@ -1342,6 +1342,27 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
         result = compute_required_invalidation_between_computed_values(old_computed_values, new_computed_values);
         style_computer.cache_computed_style_invalidation(style_record_delta, result);
     }
+
+    // The table fixup algorithm needs an authored box's display from before box type
+    // transformation. A flex or grid item can therefore keep the same blockified display while
+    // changing whether it needs anonymous table wrappers. Generated pseudo-element boxes are
+    // anonymous, so fixup uses their adjusted display instead.
+    if (!abstract_element.pseudo_element().has_value()) {
+        auto is_table_fixup_child = [](CSS::Display const& display) {
+            return display.is_table_row_group()
+                || display.is_table_header_group()
+                || display.is_table_footer_group()
+                || display.is_table_column_group()
+                || display.is_table_caption();
+        };
+        auto old_display = old_computed_values.display_before_box_type_transformation();
+        auto new_display = new_computed_values.display_before_box_type_transformation();
+        if (is_table_fixup_child(old_display) != is_table_fixup_child(new_display)) {
+            result.any_computed_value_changed = true;
+            result.invalidation |= CSS::RequiredInvalidationAfterStyleChange::full();
+        }
+    }
+
     // An unchanged style record already names the same counter-style environment. A group swap
     // changes only inherited payloads under that environment. In either case, re-resolving through
     // a temporary record projection can manufacture a change even though the durable inputs did
@@ -1396,16 +1417,47 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
         if (style_record_is_unchanged(style_record_delta))
             ++document().style_invalidation_counters().unchanged_style_record_deltas;
 
-        // TODO: Can we be smarter about invalidation?
+        // A non-inline generated box can split an inline originating element and mutate anonymous structure in its
+        // parent. Inline ::before and ::after boxes remain confined to the originating element's layout subtree.
+        auto pseudo_style_can_escape_originating_element = [&](CSS::ComputedValues const* pseudo_style) {
+            if (!pseudo_style || !originating_style->display().is_inline_outside())
+                return false;
+            auto pseudo_display = pseudo_style->display();
+            return !pseudo_display.is_none() && !pseudo_display.is_contents() && !pseudo_display.is_inline_outside();
+        };
+
         if (pseudo_element_values && new_pseudo_element_style) {
             DOM::AbstractElement abstract_element { *this, pseudo_element };
             auto result = compute_required_invalidation_with_cache(style_computer, *pseudo_element_values, *new_pseudo_element_style, old_state, abstract_element, style_record_delta);
+            // A display: contents pseudo-element has no principal layout node to receive its updated style. A
+            // list-item pseudo-element also owns a generated marker whose layout state is not updated through the
+            // originating element. Rebuild their layout subtrees when a style change otherwise requires relayout.
+            if (result.invalidation.needs_relayout()
+                && !result.invalidation.needs_layout_tree_rebuild()
+                && (pseudo_element_values->display().is_contents()
+                    || pseudo_element_values->display().is_list_item()
+                    || new_pseudo_element_style->display().is_contents()
+                    || new_pseudo_element_style->display().is_list_item())) {
+                result.invalidation.ensure_at_least(CSS::InvalidationLevel::RebuildLayoutTree);
+            }
+            if (result.invalidation.needs_layout_tree_rebuild()
+                && result.invalidation.layout_tree_rebuild_root() != CSS::LayoutTreeRebuildRoot::Parent
+                && (!first_is_one_of(pseudo_element, CSS::PseudoElement::Before, CSS::PseudoElement::After)
+                    || pseudo_style_can_escape_originating_element(pseudo_element_values)
+                    || pseudo_style_can_escape_originating_element(new_pseudo_element_style.ptr()))) {
+                result.invalidation.ensure_at_least(CSS::InvalidationLevel::RebuildLayoutTree);
+            }
             if (result.any_computed_value_changed)
                 document().style_invalidation_counters().element_computed_style_changes++;
             invalidation |= result.invalidation;
         } else if (pseudo_element_values || new_pseudo_element_style) {
             document().style_invalidation_counters().element_computed_style_changes++;
-            invalidation = CSS::RequiredInvalidationAfterStyleChange::full();
+            auto rebuild_root = first_is_one_of(pseudo_element, CSS::PseudoElement::Before, CSS::PseudoElement::After)
+                    && !pseudo_style_can_escape_originating_element(pseudo_element_values)
+                    && !pseudo_style_can_escape_originating_element(new_pseudo_element_style.ptr())
+                ? CSS::LayoutTreeRebuildRoot::Self
+                : CSS::LayoutTreeRebuildRoot::Parent;
+            invalidation |= CSS::RequiredInvalidationAfterStyleChange::rebuild_layout_tree_from(rebuild_root);
         }
 
         if (new_pseudo_element_style) {
@@ -1447,16 +1499,12 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     return invalidation;
 }
 
-void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reason)
+void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reason, CSS::LayoutTreeRebuildRoot rebuild_root)
 {
-    // NB: We normally mark the parent element for the rebuild rather than this element itself, so that a "display"
-    //     change to or from "contents" is handled correctly: an element with display:contents generates no box of its
-    //     own, so its children's boxes have to be inserted into (or removed from) the parent's subtree.
-    //     Top layer elements (open modal dialogs, popovers, fullscreen elements) are the exception. They generate
-    //     boxes as siblings of the root, and a dedicated top layer pass in the layout tree builder recreates their
-    //     boxes based on the element's own needs-layout-tree-update flag; the DOM parent's subtree rebuild skips them
-    //     entirely. Mark the element itself in that case. This still propagates child-needs-layout-tree-update up to
-    //     the document, which is what makes the top layer pass run.
+    // A self-scoped style invalidation can replace the element's principal box in place. Anonymous-parent escalation
+    // in Node::set_needs_layout_tree_update() still widens the rebuild when the old box participates in an outer
+    // wrapper. Other style changes rebuild from the parent. Top layer elements are handled separately because their
+    // boxes are siblings of the root.
     // NB: Called outside layout tree construction.
     auto* layout_node = unsafe_layout_node();
     // An element that just left the top layer keeps its box as a viewport child until the
@@ -1467,6 +1515,18 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
         // insert of a detached member appends out of order, so it needs a zone rebuild.
         if (!layout_node || !layout_node->parent())
             document().set_top_layer_needs_layout_zone_rebuild();
+        set_needs_layout_tree_update(true, reason);
+        return;
+    }
+    // A newly inserted element already has its entire subtree scheduled for construction. Its
+    // initial style computation cannot require rebuilding an existing principal box, so keep
+    // the insertion-specific invalidation on its parent instead of widening it to StyleChange.
+    if (!layout_node && may_reuse_layout_node_for_child_list_insertion())
+        return;
+    bool can_rebuild_from_self = rebuild_root == CSS::LayoutTreeRebuildRoot::Self
+        || (rebuild_root == CSS::LayoutTreeRebuildRoot::SelfUnlessDocumentElementOrBody
+            && !is_html_html_element() && !is_html_body_element());
+    if (can_rebuild_from_self) {
         set_needs_layout_tree_update(true, reason);
         return;
     }

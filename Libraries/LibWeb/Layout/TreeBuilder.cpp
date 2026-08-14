@@ -21,6 +21,7 @@
 #include <LibWeb/CSS/CounterStyle.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/Enums.h>
+#include <LibWeb/CSS/GeneratedContent.h>
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
@@ -111,6 +112,76 @@ void LayoutTreeBuilderAccess::set_synthetic_pseudo_element_node(DOM::Element& el
 static RustFFI::FfiPrincipalDisplayFacts ffi_principal_display_facts(CSS::Display);
 static void update_style_if_needed_for_layout_tree_bypass_path(DOM::Element&);
 static RefPtr<Layout::Node> create_layout_node_for_text(DOM::Text&, bool needs_style_wrapper);
+
+static bool may_reuse_layout_node_for_child_list_insertion(DOM::Node const& node)
+{
+    if (!node.may_reuse_layout_node_for_child_list_insertion())
+        return false;
+
+    auto const* element = as_if<DOM::Element>(node);
+    auto const* layout_node = as_if<NodeWithStyle>(node.unsafe_layout_node());
+    if (!element || !layout_node || element->shadow_root() || is<HTML::HTMLSlotElement>(*element))
+        return false;
+
+    auto parent_display = layout_node->display();
+    auto parent_has_children = layout_node->has_children();
+    auto parent_lays_out_flex_or_grid_children = parent_display.is_flex_inside() || parent_display.is_grid_inside();
+    auto parent_lays_out_inline_children = (parent_display.is_flow_inside() || parent_display.is_flow_root_inside())
+        && (layout_node->children_are_inline() || !parent_has_children);
+    auto parent_lays_out_block_children = (parent_display.is_flow_inside() || parent_display.is_flow_root_inside())
+        && !layout_node->children_are_inline();
+    if (!parent_lays_out_flex_or_grid_children && !parent_lays_out_inline_children && !parent_lays_out_block_children) {
+        return false;
+    }
+    if (node.first_letter_owner_for_layout_subtree_from(node))
+        return false;
+
+    bool will_insert_inline_child = false;
+    bool will_insert_block_child = false;
+    bool has_indirect_existing_child = false;
+    for (auto const* child = node.first_child(); child; child = child->next_sibling()) {
+        if (auto const* child_layout_node = child->unsafe_layout_node()) {
+            if (child_layout_node->parent() != layout_node)
+                has_indirect_existing_child = true;
+            continue;
+        }
+
+        auto const* child_element = as_if<DOM::Element>(*child);
+        if (!child_element) {
+            if (child->needs_layout_tree_update() && is<DOM::Text>(*child))
+                return false;
+            continue;
+        }
+
+        auto computed_style = child_element->computed_style();
+        if (!computed_style || computed_style->display().is_contents())
+            return false;
+        if (!child->needs_layout_tree_update() || computed_style->display().is_none())
+            continue;
+        if (CSS::subtree_affects_generated_content_state(*child_element))
+            return false;
+        auto child_display = computed_style->display();
+        if (child_element->rendered_in_top_layer() || is<SVG::SVGElement>(*child_element))
+            return false;
+        if (parent_lays_out_flex_or_grid_children)
+            continue;
+        if (parent_lays_out_block_children && child_display.is_block_outside()) {
+            will_insert_block_child = true;
+            if (will_insert_inline_child)
+                return false;
+            continue;
+        }
+        if (parent_lays_out_inline_children && child_display.is_inline_outside()
+            && (child_display.is_flow_root_inside() || child_display.is_flex_inside() || child_display.is_grid_inside())) {
+            will_insert_inline_child = true;
+            if (will_insert_block_child)
+                return false;
+            continue;
+        }
+        return false;
+    }
+    return !has_indirect_existing_child;
+}
 
 static size_t ffi_assigned_node_count(void* slot_element_pointer)
 {
@@ -773,9 +844,6 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
             auto& node = *static_cast<DOM::Node*>(node_pointer);
             node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
             node.set_child_needs_layout_tree_update(false); },
-        .needs_layout_tree_update = [](void* node_pointer) {
-            VERIFY(node_pointer);
-            return static_cast<DOM::Node*>(node_pointer)->needs_layout_tree_update(); },
         .assigned_node_count = ffi_assigned_node_count,
         .assigned_node_at = ffi_assigned_node_at,
         .is_svg_element = [](void* node_pointer) {
@@ -924,6 +992,7 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
             return {
                 .must_create_subtree = must_create_subtree,
                 .needs_layout_tree_update = node.needs_layout_tree_update(),
+                .may_reuse_layout_node_for_child_list_insertion = may_reuse_layout_node_for_child_list_insertion(node),
                 .document_needs_full_layout_tree_update = node.document().needs_full_layout_tree_update(),
                 .is_document = node.is_document(),
                 .has_layout_node = existing_layout_node != nullptr,
@@ -1320,15 +1389,6 @@ static NonnullRefPtr<CSS::ComputedValues const> table_wrapper_computed_values(Bo
     return move(builder).build();
 }
 
-static void ffi_update_existing_table_wrapper(void*, void* table_root_pointer, void* wrapper_pointer)
-{
-    VERIFY(table_root_pointer);
-    VERIFY(wrapper_pointer);
-    auto& table_box = as<Box>(*static_cast<Node*>(table_root_pointer));
-    auto& wrapper = as<TableWrapper>(*static_cast<Node*>(wrapper_pointer));
-    wrapper.set_computed_values(table_wrapper_computed_values(table_box));
-}
-
 static void ffi_wrap_table_root(void*, void* table_root_pointer, void* nearest_sibling_pointer)
 {
     VERIFY(table_root_pointer);
@@ -1387,10 +1447,45 @@ static void ffi_insert_child(void*, void* parent_pointer, void* child_pointer, R
     VERIFY(child_pointer);
     auto& parent = *static_cast<Node*>(parent_pointer);
     NonnullRefPtr child = *static_cast<Node*>(child_pointer);
-    if (mode == RustFFI::FfiInsertionMode::Prepend)
+    if (mode == RustFFI::FfiInsertionMode::Prepend) {
         parent.prepend_child(*child);
-    else
+        return;
+    }
+    if (mode == RustFFI::FfiInsertionMode::Append) {
         parent.append_child(*child);
+        return;
+    }
+
+    VERIFY(mode == RustFFI::FfiInsertionMode::InDomOrder);
+    auto* dom_node = child->dom_node();
+    VERIFY(dom_node);
+    for (auto* sibling = dom_node->next_sibling(); sibling; sibling = sibling->next_sibling()) {
+        auto* sibling_layout_node = sibling->unsafe_layout_node();
+        if (sibling_layout_node && sibling_layout_node->parent() == &parent) {
+            parent.insert_before(*child, sibling_layout_node);
+            return;
+        }
+    }
+
+    if (auto const* parent_element = as_if<DOM::Element>(parent.dom_node())) {
+        if (auto* after_layout_node = parent_element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::After)) {
+            auto* after_layout_child = after_layout_node;
+            while (after_layout_child->parent() && after_layout_child->parent() != &parent)
+                after_layout_child = after_layout_child->parent();
+            if (after_layout_child->parent() == &parent) {
+                parent.insert_before(*child, after_layout_child);
+                return;
+            }
+        }
+    }
+
+    for (auto layout_child = parent.first_child(); layout_child; layout_child = layout_child->next_sibling()) {
+        if (layout_child->is_generated_for_after_pseudo_element()) {
+            parent.insert_before(*child, layout_child);
+            return;
+        }
+    }
+    parent.append_child(*child);
 }
 
 static RustFFI::NodeSlotId ffi_create_button_content_wrapper(void*, void* layout_node_pointer)
@@ -1447,7 +1542,6 @@ RustFFI::FfiTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_tree_builder_ca
         .context = this,
         .remove_nodes = ffi_remove_layout_nodes,
         .wrap_in_anonymous = ffi_wrap_in_anonymous_table_box,
-        .update_existing_table_wrapper = ffi_update_existing_table_wrapper,
         .wrap_table_root = ffi_wrap_table_root,
         .append_missing_table_cell = ffi_append_missing_table_cell,
         .create_and_append_anonymous_wrapper = ffi_create_and_append_anonymous_wrapper,

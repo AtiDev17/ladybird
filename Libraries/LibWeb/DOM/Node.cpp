@@ -20,6 +20,7 @@
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/GeneratedContent.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
@@ -867,6 +868,15 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
             parent_element()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBeforeWithDisplayContents);
         }
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+        for (auto& inserted_node : nodes) {
+            auto inserted_subtree_already_needs_layout_tree_update = inserted_node->needs_layout_tree_update() || inserted_node->child_needs_layout_tree_update();
+            inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+
+            // An inserted subtree may already need a layout tree update, for example after being adopted from another
+            // document. Setting the same value again is coalesced, so explicitly propagate it through its new parent.
+            if (inserted_subtree_already_needs_layout_tree_update)
+                set_child_needs_layout_tree_update(true);
+        }
     }
 
     // AD-HOC: An inserted list item renumbers the list-item counter for its list owner's whole list.
@@ -966,6 +976,61 @@ void Node::live_range_pre_remove()
     }
 }
 
+static bool node_contributes_to_layout_tree(Node const& node)
+{
+    if (node.unsafe_layout_node())
+        return true;
+
+    auto const* element = as_if<Element>(node);
+    return element && element->has_style()
+        && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
+}
+
+static bool can_detach_layout_subtree_for_removal(Node const& node, Node const& parent)
+{
+    auto const* layout_node = as_if<Layout::NodeWithStyle>(node.unsafe_layout_node());
+    auto const* parent_layout_node = parent.unsafe_layout_node();
+    if (!layout_node || !parent_layout_node || layout_node->parent() != parent_layout_node || layout_node->is_out_of_flow())
+        return false;
+    if (CSS::subtree_affects_generated_content_state(node))
+        return false;
+
+    auto const* parent_with_style = as_if<Layout::NodeWithStyle>(parent_layout_node);
+    if (!parent_with_style)
+        return false;
+
+    auto sibling_is_direct_layout_child = [&](Node const* sibling) {
+        if (!sibling)
+            return true;
+        if (auto const* sibling_layout_node = sibling->unsafe_layout_node())
+            return sibling_layout_node->parent() == parent_layout_node;
+        auto const* sibling_element = as_if<Element>(*sibling);
+        return !sibling_element || !sibling_element->has_style()
+            || !CSS::display_from_ffi_display(sibling_element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
+    };
+    if (!sibling_is_direct_layout_child(node.previous_sibling())
+        && !sibling_is_direct_layout_child(node.next_sibling())) {
+        return false;
+    }
+
+    auto parent_display = parent_with_style->display();
+    if (parent_display.is_flex_inside() || parent_display.is_grid_inside())
+        return true;
+
+    // Direct block children and in-flow atomic inline children can be detached without changing
+    // anonymous wrapper structure. Other box kinds still rebuild the parent so tree fixup can
+    // reconstruct any affected wrappers.
+    if ((parent_display.is_flow_inside() || parent_display.is_flow_root_inside())
+        && !parent_layout_node->children_are_inline()) {
+        if (auto previous_layout_sibling = layout_node->previous_sibling(); previous_layout_sibling && previous_layout_sibling->is_anonymous()) {
+            if (auto next_layout_sibling = layout_node->next_sibling(); next_layout_sibling && next_layout_sibling->is_anonymous())
+                return false;
+        }
+        return layout_node->display().is_block_outside();
+    }
+    return parent_layout_node->children_are_inline() && layout_node->is_inline_block() && !layout_node->is_out_of_flow();
+}
+
 // https://dom.spec.whatwg.org/#concept-node-remove
 void Node::remove(bool suppress_observers)
 {
@@ -1027,11 +1092,27 @@ void Node::remove(bool suppress_observers)
             return TraversalDecision::Continue;
         });
 
-        // NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
-        //       after we’ve been removed from the DOM.
+        // A display: contents element has no principal layout node of its own, but removing it also removes
+        // all of its children's boxes from the parent's layout subtree.
         // NB: Called during DOM removal, layout is not up to date.
-        if (unsafe_layout_node())
-            parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+        if (node_contributes_to_layout_tree(*this)) {
+            if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*parent)) {
+                first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+            } else if (can_detach_layout_subtree_for_removal(*this, *parent)) {
+                RefPtr<Layout::Node> layout_node = unsafe_layout_node();
+                layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
+                    node.clear_paintable();
+                    return TraversalDecision::Continue;
+                });
+                layout_node->prepare_subtree_for_detach_from_layout_tree();
+                layout_node->remove();
+                if (auto* parent_layout_node = parent->unsafe_layout_node(); !parent_layout_node->has_children())
+                    parent_layout_node->set_children_are_inline(false);
+                parent->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+            } else {
+                parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+            }
+        }
     }
 
     // 7. Remove node from its parent’s children.
@@ -1374,11 +1455,15 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     GC::Ptr<Element> const moved_from_next = moved_element ? moved_element->next_element_sibling() : nullptr;
 
     if (old_parent->is_connected()) {
-        // NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
-        //       after we’ve been removed from the DOM.
+        // NOTE: If we did not contribute to the layout tree before, rebuilding it will not create a box
+        //       after we have been removed from the DOM.
         // NB: Called during DOM node move, layout is not up to date.
-        if (unsafe_layout_node())
-            old_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+        if (node_contributes_to_layout_tree(*this)) {
+            if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*old_parent))
+                first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+            else
+                old_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
+        }
     }
 
     // 13. Remove node from oldParent’s children.
@@ -1886,6 +1971,7 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
     case SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData:
     case SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML:
     case SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML:
+    case SetNeedsLayoutTreeUpdateReason::SlotAssignmentChange:
     // The box of an element that entered the top layer leaves the parent's subtree,
     // which is a child-list change.
     case SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange:
@@ -1897,9 +1983,18 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
 
 void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReason reason)
 {
-    if (m_needs_layout_tree_update == value)
+    if (value && reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore) {
+        if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*this); first_letter_owner && first_letter_owner != this)
+            first_letter_owner->set_needs_layout_tree_update(true, reason);
+    }
+
+    if (m_needs_layout_tree_update == value) {
+        if (value && reason != SetNeedsLayoutTreeUpdateReason::NodeInsertBefore)
+            m_may_reuse_layout_node_for_child_list_insertion = false;
         return;
+    }
     m_needs_layout_tree_update = value;
+    m_may_reuse_layout_node_for_child_list_insertion = value && reason == SetNeedsLayoutTreeUpdateReason::NodeInsertBefore;
 
     if constexpr (UPDATE_LAYOUT_DEBUG) {
         if (m_needs_layout_tree_update) {
@@ -3750,6 +3845,28 @@ void Node::add_registered_observer(RegisteredObserver& registered_observer)
     if (!m_registered_observer_list)
         m_registered_observer_list = make<Vector<GC::Ref<RegisteredObserver>>>();
     m_registered_observer_list->append(registered_observer);
+}
+
+Element const* Node::first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const
+{
+    auto const* layout_subtree_root = unsafe_layout_node();
+    if (!layout_subtree_root)
+        return nullptr;
+
+    for (auto const* ancestor = &inclusive_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_node()) {
+        auto const* element = as_if<Element>(*ancestor);
+        if (!element || !element->has_style(CSS::PseudoElement::FirstLetter))
+            continue;
+
+        auto const* first_letter_layout_node = element->pseudo_element_unsafe_layout_node(CSS::PseudoElement::FirstLetter);
+        if (!first_letter_layout_node)
+            return element;
+        for (auto const* layout_ancestor = first_letter_layout_node; layout_ancestor; layout_ancestor = layout_ancestor->parent()) {
+            if (layout_ancestor == layout_subtree_root)
+                return element;
+        }
+    }
+    return nullptr;
 }
 
 bool Node::has_inclusive_ancestor_with_display_none_ignoring_animations() const
