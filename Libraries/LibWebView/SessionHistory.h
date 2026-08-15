@@ -32,31 +32,10 @@ public:
     struct TraversalTarget {
         size_t target_step_index { 0 };
         i32 target_step { 0 };
+        size_t target_top_level_entry_index { 0 };
         Entry const* target_top_level_entry { nullptr };
         bool target_step_is_top_level_entry { false };
         bool changes_top_level_entry { false };
-    };
-
-    struct SameDocumentNavigationFinalization {
-        i32 entry_step { 0 };
-        i32 target_step { 0 };
-        u64 script_history_length { 0 };
-        u64 script_history_index { 0 };
-    };
-
-    enum class UpdateResult {
-        // WebContent sent the same complete top-level traversable session
-        // history that the UI process stores authoritatively.
-        CompleteSnapshot,
-
-        // WebContent sent a valid partial view of session history. The UI
-        // process merged it into the authoritative history mirror, but
-        // WebContent cannot be assumed to know or use every UI history step.
-        MergedPartialSnapshot,
-
-        // WebContent sent a snapshot that cannot describe the current UI-owned
-        // traversable session history.
-        InvalidSnapshot,
     };
 
     bool is_empty() const { return m_entries.is_empty(); }
@@ -72,40 +51,23 @@ public:
     Optional<size_t> current_top_level_entry_index() const;
 
     void clear();
+    bool initialize_for_testing(Vector<Entry>, Vector<i32> used_steps, size_t current_used_step_index);
     void initialize_with_initial_history_entry(Entry initial_history_entry);
-    void navigate(URL::URL, Web::HTML::CrossProcessId document_state_id);
-    void navigate(URL::URL, Web::HTML::CrossProcessId document_state_id, Web::HTML::DocumentResource);
-    void replace_current_entry_url(URL::URL, Web::HTML::CrossProcessId document_state_id);
-    void replace_current_entry(URL::URL, Web::HTML::CrossProcessId document_state_id, Web::HTML::DocumentResource);
     void mark_current_entry_reload_pending();
     void clear_current_entry_reload_pending();
     bool update_entry(Optional<Web::HTML::CrossProcessId> nested_history_id, Utf16String const& navigation_api_key, Function<void(Entry&)> const& update_entry);
+    bool update_entry_persisted_state(Optional<Web::HTML::CrossProcessId> nested_history_id, Web::HTML::SessionHistoryEntryPersistedState const&);
     bool update_document_state(Optional<Web::HTML::CrossProcessId> nested_history_id, Utf16String const& navigation_api_key, Function<void(Web::HTML::SessionHistoryDocumentStateDescriptor&)> const& update_document_state);
-    bool append_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::SessionHistoryNestedHistoryDescriptor);
-    bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId child_navigable_id);
-    Optional<SameDocumentNavigationFinalization> finalize_same_document_navigation(CanonicalNavigable const&, Web::HTML::SameDocumentNavigationEntry target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior, Web::HTML::UserNavigationInvolvement, Optional<i32> maximum_claimed_step = {});
-    bool finalize_cross_document_navigation(Optional<Web::HTML::CrossProcessId> nested_history_id, Entry history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key, Optional<i32> maximum_claimed_step = {});
-    UpdateResult update_from_web_content(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
-    [[nodiscard]] bool did_seed_web_content_from_ui_process(Vector<Entry> entries, Vector<i32> used_steps, size_t current_used_step_index);
-    void did_seed_web_content_from_ui_process(size_t current_top_level_entry_index);
-    [[nodiscard]] bool did_restore_web_content_to_current_step(i32 step);
-    [[nodiscard]] bool did_apply_web_content_traversal_to_step(i32 step);
-    [[nodiscard]] bool did_set_web_content_current_session_history_step(i32 step);
-    void forget_web_content_state();
+    Optional<i32> append_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId parent_document_state_id, Web::HTML::CrossProcessId child_navigable_id, Web::HTML::PendingSessionHistoryEntryDescriptor);
+    bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId parent_document_state_id, Web::HTML::CrossProcessId child_navigable_id);
+    Optional<i32> finalize_same_document_navigation(CanonicalNavigable const&, Web::HTML::SameDocumentNavigationEntry target_entry, Optional<Utf16String> entry_to_replace_navigation_api_key);
+    Optional<i32> finalize_cross_document_navigation(Optional<Web::HTML::CrossProcessId> nested_history_id, Web::HTML::PendingSessionHistoryEntryDescriptor history_entry, Optional<Utf16String> entry_to_replace_navigation_api_key);
     Vector<Entry> entries() const;
     Vector<i32> used_steps() const;
-    Vector<Entry> web_content_known_entries() const;
-    Vector<i32> web_content_known_used_steps() const;
-    Optional<i32> web_content_current_step() const;
-    bool web_content_uses_ui_step_coordinates() const { return m_web_content_uses_ui_step_coordinates; }
-    bool web_content_history_matches_mirror() const;
 
     [[nodiscard]] bool can_go_back() const;
     [[nodiscard]] bool can_go_forward() const;
     [[nodiscard]] bool has_only_top_level_used_steps() const;
-    [[nodiscard]] bool current_step_is_top_level_entry() const;
-    [[nodiscard]] Optional<i32> current_step_to_restore_after_loading_top_level_entry() const;
-    [[nodiscard]] bool web_content_can_traverse_to(TraversalTarget const&) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_delta(int delta) const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_step(i32 step) const;
     [[nodiscard]] Optional<Vector<Entry> const&> get_session_history_entries(CanonicalNavigable const&) const;
@@ -113,9 +75,9 @@ public:
     [[nodiscard]] Entry const* get_the_target_history_entry(CanonicalNavigable const&, i32 step) const;
     [[nodiscard]] Optional<Web::HTML::HistoryObjectLengthAndIndex> get_the_history_object_length_and_index(i32 step) const;
     [[nodiscard]] Optional<Vector<Entry>> get_session_history_entries_for_the_navigation_api(CanonicalNavigable const&, i32 target_step) const;
-    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_whose_current_session_history_entry_will_change_or_reload(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step = {}) const;
-    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_might_experience_a_cross_document_traversal(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step = {}) const;
-    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_only_need_history_object_length_index_update(CanonicalNavigable const& traversable, i32 target_step, Optional<i32> current_step = {}) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_whose_current_session_history_entry_will_change_or_reload(CanonicalNavigable const& traversable, i32 target_step) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_might_experience_a_cross_document_traversal(CanonicalNavigable const& traversable, i32 target_step) const;
+    [[nodiscard]] Vector<Web::HTML::CrossProcessId> get_all_navigables_that_only_need_history_object_length_index_update(CanonicalNavigable const& traversable, i32 target_step) const;
     void set_current_session_history_step(i32 step)
     {
         auto index = m_used_steps.find_first_index(step);
@@ -141,17 +103,6 @@ private:
     // Index of the current session history step within m_used_steps.
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
     Optional<size_t> m_current_used_step_index;
-
-    // WebContent's latest current session history step, translated into the
-    // UI-owned traversable session history's step coordinate space.
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
-    Vector<Entry> m_web_content_known_entries;
-    Vector<i32> m_web_content_known_used_steps;
-    Optional<i32> m_web_content_current_step;
-    // False when a partial snapshot was translated into the UI-owned step
-    // coordinate space. In that state WebContent still uses its original step
-    // numbers, so the UI must reseed/load instead of delegating traversal by step.
-    bool m_web_content_uses_ui_step_coordinates { false };
 };
 
 }

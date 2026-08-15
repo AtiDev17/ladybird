@@ -634,87 +634,6 @@ GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId id)
     return nullptr;
 }
 
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
-static Vector<NonnullRefPtr<SessionHistoryEntry>>* get_session_history_entries_if_present(LocalTraversableNavigable& traversable, LocalNavigable const& navigable)
-{
-    // 4. Let docStates be an empty ordered set of document states.
-    Vector<RefPtr<DocumentState>> doc_states;
-
-    // 5. For each entry of traversable's session history entries, append entry's document state to docStates.
-    for (auto& entry : traversable.session_history_entries())
-        doc_states.append(entry->document_state());
-
-    // 6. For each docState of docStates:
-    for (size_t i = 0; i < doc_states.size(); ++i) {
-        auto doc_state = doc_states[i];
-
-        // 1. For each nestedHistory of docState's nested histories:
-        for (auto& nested_history : doc_state->nested_histories()) {
-            // 1. If nestedHistory's id equals navigable's id, return nestedHistory's entries.
-            if (nested_history.id == navigable.id())
-                return &nested_history.entries;
-
-            // 2. For each entry of nestedHistory's entries, append entry's document state to docStates.
-            for (auto& entry : nested_history.entries)
-                doc_states.append(entry->document_state());
-        }
-    }
-
-    return nullptr;
-}
-
-Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navigable(
-    LocalNavigable& parent_navigable, LocalNavigable& child_navigable, SessionHistoryEntry& history_entry)
-{
-    VERIFY(child_navigable.parent().ptr() == &parent_navigable);
-
-    auto parent_doc_state = parent_navigable.active_session_history_entry()->document_state();
-    auto& parent_navigable_entries = parent_navigable.get_session_history_entries();
-    auto target_step_entry_iterator = parent_navigable_entries.find_if([parent_doc_state](auto& entry) {
-        return entry->document_state() == parent_doc_state;
-    });
-    if (target_step_entry_iterator == parent_navigable_entries.end())
-        return nullptr;
-
-    history_entry.set_step((*target_step_entry_iterator)->step());
-
-    DocumentState::NestedHistory nested_history {
-        .id = child_navigable.id(),
-        .entries { history_entry },
-    };
-    parent_doc_state->nested_histories().append(move(nested_history));
-
-    if (auto traversable = parent_navigable.traversable_navigable()) {
-        SessionHistoryNestedHistoryDescriptor nested_history_descriptor {
-            .id = child_navigable.id(),
-            .entries { create_session_history_entry_descriptor(history_entry) },
-        };
-        traversable->page().client().page_did_append_nested_history(parent_navigable.id(), nested_history_descriptor);
-    }
-
-    return &parent_doc_state->nested_histories().last().entries;
-}
-
-static Vector<NonnullRefPtr<SessionHistoryEntry>>*
-recreate_missing_nested_history_for_live_child_navigable(LocalTraversableNavigable& traversable, LocalNavigable& navigable)
-{
-    VERIFY(&navigable != &traversable);
-
-    auto parent = navigable.parent();
-    if (!parent)
-        return nullptr;
-
-    auto container = navigable.container();
-    if (!container || container->content_navigable().ptr() != &navigable)
-        return nullptr;
-
-    auto history_entry = navigable.active_session_history_entry();
-    if (!history_entry)
-        return nullptr;
-
-    return append_nested_history_for_child_navigable(as<LocalNavigable>(*parent), navigable, *history_entry);
-}
-
 // https://html.spec.whatwg.org/multipage/document-sequences.html#child-navigable
 Vector<GC::Root<LocalNavigable>> LocalNavigable::child_navigables() const
 {
@@ -824,7 +743,7 @@ bool LocalNavigable::is_script_closable()
         return false;
 
     return as<LocalTraversableNavigable>(this)->is_created_by_web_content()
-        || get_session_history_entries().size() == 1;
+        || as<LocalTraversableNavigable>(this)->session_history_entry_count() == 1;
 }
 
 void LocalNavigable::set_delaying_load_events(bool value)
@@ -868,6 +787,19 @@ void LocalNavigable::set_current_session_history_entry(RefPtr<SessionHistoryEntr
     m_current_session_history_entry = move(entry);
 }
 
+Optional<CrossProcessId> LocalNavigable::child_navigable_history_reconstruction_id(size_t index) const
+{
+    if (index >= m_child_navigable_history_reconstruction_ids.size())
+        return {};
+    return m_child_navigable_history_reconstruction_ids[index];
+}
+
+void LocalNavigable::consume_child_navigable_history_reconstruction_id(size_t index)
+{
+    VERIFY(index < m_child_navigable_history_reconstruction_ids.size());
+    m_child_navigable_history_reconstruction_ids[index].clear();
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#initialize-the-navigable
 void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document)
 {
@@ -906,52 +838,6 @@ void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_
     document->set_initial_visibility_state(traversable_navigable()->system_visibility_state());
 }
 
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-target-history-entry
-static RefPtr<SessionHistoryEntry> get_the_target_history_entry_from_entries(
-    Vector<NonnullRefPtr<SessionHistoryEntry>> const& entries, int target_step)
-{
-    // 2. Return the item in entries that has the greatest step less than or equal to step.
-    RefPtr<SessionHistoryEntry> result = nullptr;
-    for (auto& entry : entries) {
-        // NB: "pending" is not a used history step.
-        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#she-step
-        auto entry_step = entry->step_value();
-        if (entry_step.has_value() && *entry_step <= target_step) {
-            if (!result || *result->step_value() < *entry_step) {
-                result = entry;
-            }
-        }
-    }
-
-    return result;
-}
-
-RefPtr<SessionHistoryEntry> LocalNavigable::get_the_target_history_entry(int target_step) const
-{
-    // 1. Let entries be the result of getting session history entries for navigable.
-    auto& entries = get_session_history_entries();
-
-    return get_the_target_history_entry_from_entries(entries, target_step);
-}
-
-RefPtr<SessionHistoryEntry> LocalNavigable::get_the_target_history_entry_if_present(int target_step) const
-{
-    auto traversable = traversable_navigable();
-    Vector<NonnullRefPtr<SessionHistoryEntry>>* entries = nullptr;
-    if (this == traversable.ptr())
-        entries = &traversable->session_history_entries();
-    else
-        entries = get_session_history_entries_if_present(*traversable, *this);
-
-    // AD-HOC: The spec asserts that a nested history list is found. During queued navigable creation/destruction
-    //         bookkeeping, engines can still observe a child navigable after its iframe has been removed from the
-    //         parent's nested histories. In that case, the detached child has no observable session history effect.
-    if (!entries)
-        return nullptr;
-
-    return get_the_target_history_entry_from_entries(*entries, target_step);
-}
-
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
 void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, GC::Ref<DOM::Document> document)
 {
@@ -965,6 +851,13 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
     //    back to the initial about:blank Document because it always gets replaced when we
     //    navigate away from it.
     VERIFY(!new_document->is_initial_about_blank());
+
+    // DocumentState identifies its associated Document by a process-local ID. Restore that association at the
+    // transition that makes a reconstructed entry's Document active.
+    VERIFY(entry);
+    auto document_state = entry->document_state();
+    VERIFY(document_state);
+    document_state->set_document_id(new_document->unique_id());
 
     // 4. Set navigable's active session history entry to entry.
     m_active_session_history_entry = entry;
@@ -1020,29 +913,61 @@ void LocalNavigable::save_persisted_state_to_active_session_history_entry()
     scroll_position_data.viewport_scroll_position = viewport_scroll_offset();
     entry->set_scroll_position_data(move(scroll_position_data));
 
-    if (auto traversable = traversable_navigable()) {
-        traversable->page().client().page_did_update_session_history_entry_scroll_position_data(
-            id(), entry->navigation_api_key(), entry->scroll_position_data());
-    }
-
     // FIXME: 2. Optionally, update entry's persisted user state.
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-persisted-user-state
 void LocalNavigable::restore_persisted_state_from_session_history_entry(SessionHistoryEntry const& entry)
 {
+    m_pending_persisted_state_restoration.clear();
+
     // 1. If entry's scroll restoration mode is "auto", and entry's document's relevant global object's navigation
     //    API's suppress normal scroll restoration during ongoing navigation is false, then restore scroll position
     //    data given entry.
     if (entry.scroll_restoration_mode() == ScrollRestorationMode::Auto) {
         if (auto window = active_window()) {
-            if (!window->navigation()->suppress_normal_scroll_restoration_during_ongoing_navigation())
+            if (!window->navigation()->suppress_normal_scroll_restoration_during_ongoing_navigation()) {
                 restore_scroll_position_data(entry);
+            }
         }
     }
 
     // FIXME: 2. Optionally, update other aspects of entry's document and its rendering, for instance values of form
     //        fields, that the user agent had previously recorded in entry's persisted user state.
+}
+
+void LocalNavigable::schedule_persisted_state_restoration_retry(SessionHistoryEntry const& entry)
+{
+    auto document = active_document();
+    auto document_state = entry.document_state();
+    if (!document || !document_state || document->readiness() == DocumentReadyState::Complete)
+        return;
+    if (entry.scroll_restoration_mode() != ScrollRestorationMode::Auto
+        || !entry.scroll_position_data().viewport_scroll_position.has_value()) {
+        return;
+    }
+    m_pending_persisted_state_restoration = PendingPersistedStateRestoration {
+        .document = document,
+        .document_state_id = document_state->cross_process_id(),
+        .navigation_api_key = entry.navigation_api_key(),
+    };
+}
+
+void LocalNavigable::restore_pending_persisted_state_for_completed_document(GC::Ref<DOM::Document> document)
+{
+    if (!m_pending_persisted_state_restoration.has_value()
+        || m_pending_persisted_state_restoration->document != document) {
+        return;
+    }
+
+    auto restoration = m_pending_persisted_state_restoration.release_value();
+    auto entry = active_session_history_entry();
+    if (!entry || entry->navigation_api_key() != restoration.navigation_api_key)
+        return;
+    auto document_state = entry->document_state();
+    if (!document_state || document_state->cross_process_id() != restoration.document_state_id)
+        return;
+    restore_persisted_state_from_session_history_entry(*entry);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-scroll-position-data
@@ -1081,11 +1006,13 @@ Optional<URL::Origin> LocalNavigable::active_document_origin() const
 ReplicatedNavigableState LocalNavigable::replicated_state() const
 {
     VERIFY(m_active_document);
+    VERIFY(m_active_session_history_entry);
     return {
         .target_name = target_name(),
         .active_document_url = m_active_document->url(),
         .active_document_origin = m_active_document->origin(),
         .active_document_is_fully_active = m_active_document->is_fully_active(),
+        .active_session_history_entry_identity = session_history_entry_identity(*m_active_session_history_entry),
     };
 }
 
@@ -1225,6 +1152,28 @@ void LocalNavigable::process_pending_navigations()
         auto navigation_params = m_pending_navigations.take_first();
         begin_navigation(navigation_params);
     }
+}
+
+void LocalNavigable::route_initial_navigation_to_session_history_entry(SessionHistoryEntryDescriptor entry, GC::Ref<DOM::Document> source_document)
+{
+    NavigateParams* params;
+    if (m_pending_navigations.is_empty()) {
+        m_pending_navigations.append({
+            .url = entry.url,
+            .source_document = source_document,
+            .document_resource = entry.document_state.resource,
+            .history_handling = Bindings::NavigationHistoryBehavior::Replace,
+            .user_involvement = UserNavigationInvolvement::BrowserUI,
+        });
+        params = &m_pending_navigations.last();
+    } else {
+        params = &m_pending_navigations.first();
+        params->url = entry.url;
+        params->document_resource = entry.document_state.resource;
+        params->history_handling = Bindings::NavigationHistoryBehavior::Replace;
+        params->user_involvement = UserNavigationInvolvement::BrowserUI;
+    }
+    params->session_history_entry_to_restore = move(entry);
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
@@ -1446,34 +1395,6 @@ GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(Utf16Vie
 
     // 8. Return null.
     return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
-Vector<NonnullRefPtr<SessionHistoryEntry>>& LocalNavigable::get_session_history_entries() const
-{
-    // 1. Let traversable be navigable's traversable navigable.
-    auto traversable = traversable_navigable();
-
-    // FIXME: 2. Assert: this is running within traversable's session history traversal queue.
-
-    // 3. If navigable is traversable, return traversable's session history entries.
-    if (this == traversable.ptr())
-        return traversable->session_history_entries();
-
-    if (auto* entries = get_session_history_entries_if_present(*traversable, *this))
-        return *entries;
-
-    VERIFY_NOT_REACHED();
-}
-
-bool LocalNavigable::has_session_history_entries() const
-{
-    auto traversable = traversable_navigable();
-    if (!traversable)
-        return false;
-    if (this == traversable.ptr())
-        return true;
-    return get_session_history_entries_if_present(*traversable, *this) != nullptr;
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container
@@ -2694,16 +2615,17 @@ void LocalNavigable::begin_navigation(NavigateParams params)
     }
 
     // 12-13. Determine historyHandling for this navigation.
-    history_handling = determine_history_handling_for_navigation(history_handling, url, active_document, initiator_origin_snapshot);
+    if (!params.history_handling_already_determined)
+        history_handling = determine_history_handling_for_navigation(history_handling, url, active_document, initiator_origin_snapshot);
 
     // FIXME: Revisit the following once the dust settles on our Navigation rewrites — specifically, whether the "the UI
-    //        process seeds the new process's active session-history entry with the target URL *before* its document has
-    //        loaded" behavior is actually a mistake that the following is just working around (papering over).
+    //        process installs the new process's active session-history entry with the target URL *before* its document
+    //        has loaded" behavior is actually a mistake that the following is just working around (papering over).
     // AD-HOC: In addition to the spec requirements here, we also require the active document's URL (ignoring fragments)
-    //         to match. That's because: After a cross-site process swap, the UI process seeds the new process's active
-    //         session-history entry with the target URL *before* its document has loaded. So, doing just the session-
-    //         history-entry check alone would misclassify a fresh cross-document navigation as a same-document fragment
-    //         navigation — and completely skip loading the document. See issue #10312.
+    //         to match. That's because: After a cross-site process swap, the UI process installs the new process's
+    //         active session-history entry with the target URL *before* its document has loaded. So, doing just the
+    //         session-history-entry check alone would misclassify a fresh cross-document navigation as a same-document
+    //         fragment navigation — and completely skip loading the document. See issue #10312.
     // 14. If all of the following are true:
     //     - documentResource is null;
     //     - response is null;
@@ -2752,6 +2674,9 @@ void LocalNavigable::begin_navigation(NavigateParams params)
 
     // 20. If url's scheme is "javascript", then:
     if (url.scheme() == "javascript"sv) {
+        if (is_top_level_traversable())
+            active_browsing_context()->page().client().page_did_start_loading(navigation_id, url, false);
+
         // 1. Queue a global task on the navigation and traversal task source given navigable's active window to navigate to a javascript: URL given navigable, url, historyHandling, sourceSnapshotParams, initiatorOriginSnapshot, userInvolvement, cspNavigationType, initialInsertion, and navigationId.
         VERIFY(active_window());
         queue_global_task(Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*active_window()), GC::create_function(heap(), [this, url, history_handling, source_snapshot_params, initiator_origin_snapshot, user_involvement, csp_navigation_type, initial_insertion, navigation_id] {
@@ -2923,11 +2848,6 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                     }
                 }
 
-                // AD-HOC: Tell the UI that we started loading.
-                if (is_top_level_traversable()) {
-                    active_browsing_context()->page().client().page_did_start_loading(navigation_id, url, document_resource, false, history_handling);
-                }
-
                 // 3. Queue a global task on the navigation and traversal task source given navigable's active window to abort a document and its descendants given navigable's active document.
                 queue_global_task(Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*active_window()), GC::create_function(heap(), [this] {
                     this->active_document()->abort_a_document_and_its_descendants();
@@ -2969,6 +2889,9 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                 auto history_entry = SessionHistoryEntry::create();
                 history_entry->set_url(url);
                 history_entry->set_document_state(document_state);
+
+                if (is_top_level_navigation)
+                    active_browsing_context()->page().client().page_did_start_loading(navigation_id, url, false);
 
                 // 7. Let navigationParams be null.
                 NavigationParamsVariant navigation_params = LocalNavigable::NullOrError {};
@@ -3068,7 +2991,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                     history_entry->document_state()->navigable_target_name(),
                     history_entry->document_state()->reload_pending(),
                     history_entry->document_state()->ever_populated(),
-                    source_snapshot_params, target_snapshot_params, user_involvement, navigation_id, navigation_params, csp_navigation_type, true, GC::create_function(heap(), [this, history_entry, history_handling, navigation_id, user_involvement](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
+                    source_snapshot_params, target_snapshot_params, user_involvement, navigation_id, navigation_params, csp_navigation_type, true, GC::create_function(heap(), [this, history_entry, history_handling, navigation_id, user_involvement, entry_to_restore = move(params.session_history_entry_to_restore)](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
                         if (output && output->download_handled) {
                             if (is_top_level_traversable())
                                 active_browsing_context()->page().client().page_did_cancel_loading(navigation_id, history_entry->url());
@@ -3081,7 +3004,7 @@ void LocalNavigable::begin_navigation(NavigateParams params)
                             output->apply_to(*history_entry);
                         auto pending_document = output ? output->document : GC::Ptr<DOM::Document> {};
                         // 1. Append session history traversal steps to navigable's traversable to finalize a cross-document navigation given navigable, historyHandling, userInvolvement, and historyEntry.
-                        finalize_a_cross_document_navigation(*this, to_history_handling_behavior(history_handling), user_involvement, history_entry, pending_document, navigation_id, GC::create_function(heap(), [](HistoryStepResult) { }));
+                        finalize_a_cross_document_navigation(*this, to_history_handling_behavior(history_handling), user_involvement, history_entry, pending_document, navigation_id, GC::create_function(heap(), [](HistoryStepResult) { }), move(entry_to_restore));
                     }));
             }));
     }));
@@ -3110,6 +3033,7 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
 
     save_persisted_state_to_active_session_history_entry();
     auto active_entry = active_session_history_entry();
+    auto previous_entry_persisted_state = create_session_history_entry_persisted_state(*active_entry);
 
     // 6. Let historyEntry be a new session history entry, with
     //      URL: url
@@ -3168,7 +3092,7 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     // 17. Append the following session history synchronous navigation steps involving navigable to traversable:
     // 1. Finalize a same-document navigation given traversable, navigable, historyEntry, entryToReplace,
     //    historyHandling, and userInvolvement.
-    traversable->finalize_same_document_navigation(*this, history_entry, entry_to_replace, history_handling, user_involvement);
+    traversable->finalize_same_document_navigation(*this, history_entry, entry_to_replace, history_handling, user_involvement, move(previous_entry_persisted_state));
 
     // FIXME: Invoke WebDriver BiDi fragment navigated with navigable and a new WebDriver BiDi navigation status whose
     //        id is navigationId, url is url, and status is "complete".
@@ -3291,6 +3215,14 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
 {
     auto& vm = this->vm();
 
+    // AD-HOC: These return paths do not run finalize_a_cross_document_navigation(). Clear a child navigable's
+    //         load-event delay and tell the UI that a recorded top-level load has ended.
+    auto finish_loading_without_navigation = [&] {
+        set_delaying_load_events(false);
+        if (is_top_level_traversable())
+            active_browsing_context()->page().client().page_did_cancel_loading(navigation_id, url);
+    };
+
     // 1. Assert: historyHandling is "replace".
     VERIFY(history_handling == HistoryHandlingBehavior::Replace);
 
@@ -3303,8 +3235,10 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
     set_ongoing_navigation({});
 
     // 4. If initiatorOrigin is not same origin-domain with targetNavigable's active document's origin, then return.
-    if (!initiator_origin.is_same_origin_domain(active_document()->origin()))
+    if (!initiator_origin.is_same_origin_domain(active_document()->origin())) {
+        finish_loading_without_navigation();
         return;
+    }
 
     // 5. Let request be a new request whose URL is url and whose policy container is sourceSnapshotParams's source policy container.
     auto request = Fetch::Infrastructure::Request::create(vm);
@@ -3315,8 +3249,10 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
     request->set_client(source_snapshot_params->fetch_client);
 
     // 6. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then return.
-    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type) == ContentSecurityPolicy::Directives::Directive::Result::Blocked)
+    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+        finish_loading_without_navigation();
         return;
+    }
 
     // 7. Let newDocument be the result of evaluating a javascript: URL given targetNavigable, url, initiatorOrigin, and userInvolvement.
     auto new_document = evaluate_javascript_url(url, initiator_origin, user_involvement, navigation_id);
@@ -3329,10 +3265,7 @@ void LocalNavigable::navigate_to_a_javascript_url(URL::URL const& url, HistoryHa
             run_iframe_load_event_steps(as<HTMLIFrameElement>(*container()));
         }
 
-        // AD-HOC: Clear the delaying_load_events flag that was set by begin_navigation step 15.
-        //         Since no new document was created, no finalize_a_cross_document_navigation will
-        //         run to clear it, which would leave the parent's load event delayed indefinitely.
-        set_delaying_load_events(false);
+        finish_loading_without_navigation();
 
         // 2. Return.
         // NOTE: In this case, some JavaScript code was executed, but no new Document was created, so we will not perform a navigation.
@@ -3513,20 +3446,8 @@ TargetSnapshotParams LocalNavigable::snapshot_target_snapshot_params()
     };
 }
 
-static void report_finalized_cross_document_navigation_to_ui_process(LocalTraversableNavigable& traversable, LocalNavigable const& navigable, SessionHistoryEntry const& history_entry, RefPtr<SessionHistoryEntry> const& entry_to_replace)
-{
-    Optional<Utf16String> entry_to_replace_navigation_api_key;
-    if (entry_to_replace)
-        entry_to_replace_navigation_api_key = entry_to_replace->navigation_api_key();
-
-    traversable.page().client().page_did_finalize_cross_document_navigation(
-        navigable.id(),
-        create_session_history_entry_descriptor(history_entry),
-        entry_to_replace_navigation_api_key);
-}
-
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
-static Optional<int> finalize_a_cross_document_navigation_at_queued_position(GC::Ref<LocalNavigable> navigable, HistoryHandlingBehavior history_handling, NonnullRefPtr<SessionHistoryEntry> history_entry, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> const& expected_ongoing_navigation_id, u64 initiation_id)
+static Optional<Web::CrossDocumentNavigationFinalization> finalize_a_cross_document_navigation_at_queued_position(GC::Ref<LocalNavigable> navigable, HistoryHandlingBehavior history_handling, NonnullRefPtr<SessionHistoryEntry> history_entry, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> const& expected_ongoing_navigation_id, Optional<SessionHistoryEntryDescriptor> entry_to_restore)
 {
     // NOTE: This is not in the spec but we should not navigate destroyed navigable.
     if (navigable->has_been_destroyed()) {
@@ -3583,127 +3504,46 @@ static Optional<int> finalize_a_cross_document_navigation_at_queued_position(GC:
 
     // 5. Let entryToReplace be navigable's active session history entry if historyHandling is "replace", otherwise null.
     auto entry_to_replace = history_handling == HistoryHandlingBehavior::Replace ? navigable->active_session_history_entry() : nullptr;
+    Optional<Utf16String> entry_to_replace_navigation_api_key;
+    if (entry_to_replace)
+        entry_to_replace_navigation_api_key = entry_to_replace->navigation_api_key();
 
     // 6. Let traversable be navigable's traversable navigable.
     auto traversable = navigable->traversable_navigable();
 
-    // 7. Let targetStep be null.
-    int target_step;
+    if (entry_to_restore.has_value())
+        traversable->restore_session_history_entry_from_ui_process(*navigable, *history_entry, entry_to_restore.release_value());
 
-    // 8. Let targetEntries be the result of getting session history entries for navigable.
-    Vector<NonnullRefPtr<SessionHistoryEntry>>* target_entries_pointer = nullptr;
-    if (navigable.ptr() == traversable.ptr()) {
-        target_entries_pointer = &traversable->session_history_entries();
-    } else {
-        target_entries_pointer = get_session_history_entries_if_present(*traversable, navigable);
-        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
-        // AD-HOC: The spec asserts that targetEntries is not null. A queued child-frame commit can run after the
-        //         iframe was removed and its nested history list was pruned from the parent document state. Chromium,
-        //         WebKit, and Gecko bind child-frame commits to the live frame, so detached frames have no observable
-        //         session history effect. Conversely, if this is still the container's live content navigable,
-        //         preserve the requested navigation by recreating the missing nested history.
-        if (!target_entries_pointer) {
-            target_entries_pointer = recreate_missing_nested_history_for_live_child_navigable(*traversable, *navigable);
-            if (!target_entries_pointer) {
-                navigable->clear_navigation_load_event_guard();
-                return {};
-            }
-        }
-    }
-    auto& target_entries = *target_entries_pointer;
-
-    // 9. If entryToReplace is null, then:
-    if (entry_to_replace == nullptr) {
-        // 1. Clear the forward session history of traversable.
-        traversable->clear_the_forward_session_history();
-
-        // 2. Set targetStep to traversable's current session history step + 1.
-        // AD-HOC: Claim the step instead — so a step claimed by an apply-history-step run still in flight can't be
-        //         handed out twice. The claim is retired when the coordinated operation completes.
-        //         See https://github.com/whatwg/html/issues/12576.
-        target_step = traversable->claim_next_session_history_step();
-        traversable->set_history_operation_claimed_step(initiation_id, target_step);
-
-        // 3. Set historyEntry's step to targetStep.
-        history_entry->set_step(target_step);
-
-        // 4. Append historyEntry to targetEntries.
-        target_entries.append(history_entry);
-        report_finalized_cross_document_navigation_to_ui_process(*traversable, navigable, history_entry, nullptr);
-    } else {
-        // 1. Replace entryToReplace with historyEntry in targetEntries.
-        auto entry_to_replace_iterator = target_entries.find(*entry_to_replace);
-        if (entry_to_replace_iterator == target_entries.end()) {
-            if (!navigable->active_document()->is_initial_about_blank()) {
-                // AD-HOC: A non-initial document whose entryToReplace is no longer in targetEntries is the same
-                //         stale child-frame commit case as above.
-                navigable->clear_navigation_load_event_guard();
-                return {};
-            }
-
-            // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-child-navigable
-            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
-            // AD-HOC: Initial about:blank's first real navigation is a replacement. If a synchronous
-            //         same-document history update swapped out the original entry object before the queued
-            //         cross-document commit runs, replace the remaining initial child entry instead.
-            Optional<size_t> entry_to_replace_index;
-            for (size_t i = 0; i < target_entries.size(); ++i) {
-                if (target_entries[i]->step() == entry_to_replace->step()) {
-                    entry_to_replace_index = i;
-                    break;
-                }
-            }
-            if (!entry_to_replace_index.has_value() && target_entries.size() == 1)
-                entry_to_replace_index = 0;
-            if (!entry_to_replace_index.has_value()) {
-                navigable->clear_navigation_load_event_guard();
-                return {};
-            }
-
-            auto replacement_entry = target_entries[*entry_to_replace_index];
-            target_entries[*entry_to_replace_index] = history_entry;
-            history_entry->set_step(replacement_entry->step());
-        } else {
-            *entry_to_replace_iterator = history_entry;
-
-            // 2. Set historyEntry's step to entryToReplace's step.
-            history_entry->set_step(entry_to_replace->step());
-        }
-
-        // 3. If historyEntry's document state's origin is same origin with entryToReplace's document state's origin,
-        //    then set historyEntry's navigation API key to entryToReplace's navigation API key.
-        if (history_entry->document_state()->origin().has_value() && entry_to_replace->document_state()->origin().has_value() && history_entry->document_state()->origin()->is_same_origin(*entry_to_replace->document_state()->origin())) {
-            history_entry->set_navigation_api_key(entry_to_replace->navigation_api_key());
-        }
-
-        // 4. Set targetStep to traversable's current session history step.
-        target_step = traversable->current_session_history_step();
-        report_finalized_cross_document_navigation_to_ui_process(*traversable, navigable, history_entry, entry_to_replace);
-    }
-
-    return target_step;
+    return Web::CrossDocumentNavigationFinalization {
+        .history_entry = create_pending_session_history_entry_descriptor(*history_entry),
+        .entry_to_replace_navigation_api_key = move(entry_to_replace_navigation_api_key),
+    };
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
-void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, NonnullRefPtr<SessionHistoryEntry> history_entry, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete)
+void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, NonnullRefPtr<SessionHistoryEntry> history_entry, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete, Optional<SessionHistoryEntryDescriptor> entry_to_restore)
 {
     auto traversable = navigable->traversable_navigable();
+    auto pending_document_state_id = entry_to_restore.has_value()
+        ? entry_to_restore->document_state.id
+        : history_entry->document_state()->cross_process_id();
     traversable->request_history_operation(
         history_handling == HistoryHandlingBehavior::Replace
-            ? HistoryOperationParameters { ReplaceHistoryOperationParameters { .navigable_id = navigable->id(), .user_involvement = user_involvement } }
-            : HistoryOperationParameters { PushHistoryOperationParameters { .navigable_id = navigable->id(), .user_involvement = user_involvement } },
+            ? HistoryOperationParameters { ReplaceHistoryOperationParameters { .navigable_id = navigable->id(), .pending_document_state_id = pending_document_state_id, .user_involvement = user_involvement } }
+            : HistoryOperationParameters { PushHistoryOperationParameters { .navigable_id = navigable->id(), .pending_document_state_id = pending_document_state_id, .user_involvement = user_involvement } },
         {
             .pending_document = pending_document,
             .expected_ongoing_navigation_navigable = navigable,
             .expected_ongoing_navigation_id = expected_ongoing_navigation_id,
-            .finalized_navigable_id = navigable->id(),
-            .pre_steps = GC::create_function(navigable->heap(), [navigable, history_handling, history_entry, pending_document, expected_ongoing_navigation_id = move(expected_ongoing_navigation_id)](u64 initiation_id, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) {
-                auto target_step = finalize_a_cross_document_navigation_at_queued_position(navigable, history_handling, history_entry, pending_document, expected_ongoing_navigation_id, initiation_id);
-                if (!target_step.has_value()) {
-                    ready->function()(false, {}, HistoryStepResult::Applied);
+            .local_target_navigable_id = navigable->id(),
+            .local_target_entry = history_entry,
+            .pre_steps = GC::create_function(navigable->heap(), [navigable, history_handling, history_entry, pending_document, expected_ongoing_navigation_id = move(expected_ongoing_navigation_id), entry_to_restore = move(entry_to_restore)](u64, Optional<SessionHistoryEntryDescriptor>, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
+                auto finalization = finalize_a_cross_document_navigation_at_queued_position(navigable, history_handling, history_entry, pending_document, expected_ongoing_navigation_id, move(entry_to_restore));
+                if (!finalization.has_value()) {
+                    ready->function()(HistoryStepResult::Applied);
                     return;
                 }
-                ready->function()(true, *target_step, HistoryStepResult::Applied);
+                ready->function()(finalization.release_value());
             }),
             .on_complete = GC::create_function(navigable->heap(), [navigable, on_complete](HistoryStepResult result) {
                 // AD-HOC: Trigger a relayout in the container document for size negotiation with SVG documents.
@@ -3723,6 +3563,7 @@ void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_
     // 2. Let activeEntry be navigable's active session history entry.
     auto active_entry = navigable->active_session_history_entry();
     navigable->save_persisted_state_to_active_session_history_entry();
+    auto previous_entry_persisted_state = create_session_history_entry_persisted_state(*active_entry);
 
     // 3. Let newEntry be a new session history entry, with
     //      URL: newURL
@@ -3781,7 +3622,7 @@ void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_
     // 13. Append the following session history synchronous navigation steps involving navigable to traversable:
     // 1. Finalize a same-document navigation given traversable, navigable, newEntry, entryToReplace,
     //    historyHandling, and "none".
-    traversable->finalize_same_document_navigation(*navigable, new_entry, entry_to_replace, history_handling, UserNavigationInvolvement::None);
+    traversable->finalize_same_document_navigation(*navigable, new_entry, entry_to_replace, history_handling, UserNavigationInvolvement::None, move(previous_entry_persisted_state));
 
     // FIXME: Invoke WebDriver BiDi history updated with navigable.
 }

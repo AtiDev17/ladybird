@@ -148,6 +148,7 @@ void Page::load(URL::URL const& url, HTML::DocumentResource document_resource,
         .history_handling = history_handling,
         .user_involvement = HTML::UserNavigationInvolvement::BrowserUI,
         .cross_process_source_snapshot = move(source_snapshot),
+        .history_handling_already_determined = true,
     });
 }
 
@@ -190,11 +191,6 @@ void Page::load_html(StringView html, URL::URL const& url)
 void Page::reload()
 {
     top_level_traversable()->reload();
-}
-
-void Page::traverse_the_history_by_delta(int delta)
-{
-    m_client->page_did_request_traverse_the_history_by_delta(delta, HistoryTraversalPrecheck::Needed);
 }
 
 Gfx::Palette Page::palette() const

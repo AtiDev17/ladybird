@@ -33,11 +33,6 @@ public:
     }
     ~DocumentState();
 
-    struct NestedHistory {
-        CrossProcessId id;
-        Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
-    };
-
     enum class Client {
         Tag,
     };
@@ -46,12 +41,6 @@ public:
     void set_document_id(Optional<UniqueNodeID> document_id) { m_document_id = document_id; }
 
     [[nodiscard]] CrossProcessId cross_process_id() const { return m_cross_process_id; }
-
-    // Reconstructing from the UI process adopts the canonical id the UI already tracks for this state, so later reports
-    // and acknowledgements name the identity the UI expects.
-    // FIXME: Remove this API. It is only needed because the UI process can mint its own ids for provisional entries and
-    //        seed them back onto live local states. Remove once ids are only ever allocated in WebContent.
-    void adopt_cross_process_id_from_ui_process(CrossProcessId id) { m_cross_process_id = id; }
 
     [[nodiscard]] Variant<SerializedPolicyContainer, Client> const& history_policy_container() const { return m_history_policy_container; }
     void set_history_policy_container(Variant<SerializedPolicyContainer, Client> history_policy_container) { m_history_policy_container = move(history_policy_container); }
@@ -70,9 +59,6 @@ public:
 
     [[nodiscard]] Optional<URL::URL> const& about_base_url() const { return m_about_base_url; }
     void set_about_base_url(Optional<URL::URL> url) { m_about_base_url = move(url); }
-
-    [[nodiscard]] Vector<NestedHistory> const& nested_histories() const { return m_nested_histories; }
-    [[nodiscard]] Vector<NestedHistory>& nested_histories() { return m_nested_histories; }
 
     [[nodiscard]] DocumentResource resource() const { return m_resource; }
     void set_resource(DocumentResource resource) { m_resource = move(resource); }
@@ -94,8 +80,7 @@ private:
     //       decoupled from the document's lifetime (LocalNavigable owns the document directly).
     Optional<UniqueNodeID> m_document_id;
 
-    // AD-HOC: Stable identity used by the UI-process session history mirror to preserve shared document states
-    //         across IPC and WebContent process swaps.
+    // AD-HOC: Stable identity used to preserve shared document states across canonical UI history and WebContent process swaps.
     CrossProcessId m_cross_process_id;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-history-policy-container
@@ -115,9 +100,6 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-about-base-url
     Optional<URL::URL> m_about_base_url = {};
-
-    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-nested-histories
-    Vector<NestedHistory> m_nested_histories;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-resource
     DocumentResource m_resource {};

@@ -701,9 +701,9 @@ void WebContentView::mouseReleaseEvent(QMouseEvent* event)
     enqueue_native_event(Web::MouseEvent::Type::MouseUp, *event);
 
     if (event->button() == Qt::MouseButton::BackButton)
-        (void)traverse_the_history_by_delta(-1);
+        traverse_the_history_by_delta(-1);
     else if (event->button() == Qt::MouseButton::ForwardButton)
-        (void)traverse_the_history_by_delta(1);
+        traverse_the_history_by_delta(1);
 }
 
 void WebContentView::wheelEvent(QWheelEvent* event)
@@ -1115,9 +1115,9 @@ void WebContentView::update_screen_rects()
     }
 }
 
-void WebContentView::initialize_client(WebView::ViewImplementation::CreateNewClient create_new_client)
+void WebContentView::initialize_client(WebView::ViewImplementation::CreateNewClient create_new_client, Optional<Web::HTML::CrossProcessId> initial_document_state_id)
 {
-    ViewImplementation::initialize_client(create_new_client);
+    ViewImplementation::initialize_client(create_new_client, initial_document_state_id);
 
     update_compositor_display_metadata();
     update_palette();

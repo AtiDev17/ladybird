@@ -125,13 +125,10 @@ public:
     void load(URL::URL const&, HTML::DocumentResource,
         Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto,
         Optional<HTML::NavigationSourceSnapshot> = {});
-
     void load_html(StringView);
     void load_html(StringView, URL::URL const&);
 
     void reload();
-
-    void traverse_the_history_by_delta(int delta);
 
     CSSPixelPoint device_to_css_point(DevicePixelPoint) const;
     DevicePixelPoint css_to_device_point(CSSPixelPoint) const;
@@ -532,11 +529,9 @@ public:
     virtual void page_did_request_minimize_window() { }
     virtual void page_did_request_fullscreen_window() { }
     virtual void page_did_request_exit_fullscreen() { }
-    virtual void page_did_start_loading(Optional<Utf16String> const&, URL::URL const&, HTML::DocumentResource document_resource, bool is_redirect, Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto)
+    virtual void page_did_start_loading(Optional<Utf16String> const&, URL::URL const&, bool is_redirect)
     {
-        (void)document_resource;
         (void)is_redirect;
-        (void)history_handling;
     }
     virtual void page_did_cancel_loading(Optional<Utf16String> const&, URL::URL const&) { }
     virtual void page_did_create_new_document(Web::DOM::Document&) { }
@@ -619,16 +614,9 @@ public:
     virtual void page_did_create_top_level_traversable([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryDescriptor const& initial_history_entry) { }
     virtual void page_did_update_session_history_entry_navigation_api_state([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] HTML::StorageSerializationRecord const& navigation_api_state) { }
     virtual void page_did_update_session_history_entry_scroll_restoration_mode([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] HTML::ScrollRestorationMode scroll_restoration_mode) { }
-    virtual void page_did_update_session_history_entry_scroll_position_data([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] HTML::SessionHistoryEntryScrollPositionData const& scroll_position_data) { }
     virtual void page_did_update_session_history_entry_document_state_navigable_target_name([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] Utf16String const& navigable_target_name) { }
     virtual void page_did_set_session_history_entry_document_state_reload_pending([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Utf16String const& navigation_api_key, [[maybe_unused]] bool reload_pending) { }
-    virtual void page_did_append_nested_history([[maybe_unused]] HTML::CrossProcessId parent_navigable_id, [[maybe_unused]] HTML::SessionHistoryNestedHistoryDescriptor const& nested_history) { }
-    virtual void page_did_remove_nested_history([[maybe_unused]] HTML::CrossProcessId parent_navigable_id, [[maybe_unused]] HTML::CrossProcessId child_navigable_id) { }
-    virtual void page_did_request_finalize_same_document_navigation([[maybe_unused]] u64 operation_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SameDocumentNavigationEntry const& target_entry, [[maybe_unused]] bool replaces_current_entry, [[maybe_unused]] HTML::HistoryHandlingBehavior history_handling, [[maybe_unused]] HTML::UserNavigationInvolvement user_involvement, [[maybe_unused]] bool applies_history_step_in_coordinator = false) { }
-    virtual void page_did_finalize_cross_document_navigation([[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] HTML::SessionHistoryEntryDescriptor const& history_entry, [[maybe_unused]] Optional<Utf16String> const& entry_to_replace_navigation_api_key) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
-    virtual String page_did_update_session_history_and_request_ui_process_session_history_for_testing([[maybe_unused]] Vector<HTML::SessionHistoryEntryDescriptor> const& entries, [[maybe_unused]] Vector<i32> const& used_steps, [[maybe_unused]] size_t current_used_step_index) { return "{}"_string; }
-    virtual void page_did_request_traverse_the_history_by_delta([[maybe_unused]] int delta, [[maybe_unused]] HistoryTraversalPrecheck history_traversal_precheck) { }
     virtual void page_did_request_history_operation([[maybe_unused]] u64 initiation_id, [[maybe_unused]] HistoryOperationParameters parameters) { }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
 

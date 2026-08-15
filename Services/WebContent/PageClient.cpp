@@ -207,9 +207,9 @@ void PageClient::set_window_handle(Utf16String window_handle)
         m_webdriver->page_did_set_window_handle({}, page().top_level_traversable()->window_handle().to_utf8());
 }
 
-void PageClient::did_start_webdriver_navigation(URL::URL const& url)
+void PageClient::did_start_webdriver_navigation()
 {
-    client().async_did_start_webdriver_navigation(m_id, url);
+    client().async_did_start_webdriver_navigation(m_id);
 }
 
 void PageClient::setup_palette()
@@ -259,8 +259,13 @@ void PageClient::request_new_process_for_navigation(URL::URL const& url, Web::HT
 
 void PageClient::notify_webdriver_of_window_replacement()
 {
-    if (m_webdriver)
+    if (m_webdriver) {
         m_webdriver->page_did_start_window_replacement({}, page().top_level_traversable()->window_handle().to_utf8());
+
+        auto pending_history_traversals = move(m_pending_webdriver_history_traversal_requests);
+        for (auto& request : pending_history_traversals)
+            request.value({ .accepted = true });
+    }
 }
 
 void PageClient::close_webdriver_connection_after_sending_pending_messages()
@@ -587,12 +592,12 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
     client().async_did_request_external_url(m_id, url, initiator_origin, has_transient_activation);
 }
 
-void PageClient::page_did_start_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url, Web::HTML::DocumentResource document_resource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior history_handling)
+void PageClient::page_did_start_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url, bool is_redirect)
 {
     if (m_webdriver)
         m_webdriver->page_did_start_loading({}, url);
 
-    client().async_did_start_loading(m_id, navigation_id, url, move(document_resource), is_redirect, history_handling);
+    client().async_did_start_loading(m_id, navigation_id, url, is_redirect);
 }
 
 void PageClient::page_did_cancel_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url)
@@ -600,7 +605,7 @@ void PageClient::page_did_cancel_loading(Optional<Utf16String> const& navigation
     if (m_webdriver)
         m_webdriver->page_did_cancel_loading({}, url);
 
-    client().async_did_cancel_loading(m_id, navigation_id, url);
+    client().async_did_cancel_loading(m_id, navigation_id);
 }
 
 void PageClient::page_did_create_new_document(Web::DOM::Document& document)
@@ -1208,11 +1213,6 @@ void PageClient::page_did_update_session_history_entry_scroll_restoration_mode(W
     client().async_did_update_session_history_entry_scroll_restoration_mode(m_id, navigable_id, navigation_api_key, scroll_restoration_mode);
 }
 
-void PageClient::page_did_update_session_history_entry_scroll_position_data(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Web::HTML::SessionHistoryEntryScrollPositionData const& scroll_position_data)
-{
-    client().async_did_update_session_history_entry_scroll_position_data(m_id, navigable_id, navigation_api_key, scroll_position_data);
-}
-
 void PageClient::page_did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_api_key, Utf16String const& navigable_target_name)
 {
     client().async_did_update_session_history_entry_document_state_navigable_target_name(m_id, navigable_id, navigation_api_key, navigable_target_name);
@@ -1223,37 +1223,9 @@ void PageClient::page_did_set_session_history_entry_document_state_reload_pendin
     client().async_did_set_session_history_entry_document_state_reload_pending(m_id, navigable_id, navigation_api_key, reload_pending);
 }
 
-void PageClient::page_did_append_nested_history(Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::SessionHistoryNestedHistoryDescriptor const& nested_history)
-{
-    client().async_did_append_nested_history(m_id, parent_navigable_id, nested_history);
-}
-
-void PageClient::page_did_remove_nested_history(Web::HTML::CrossProcessId parent_navigable_id, Web::HTML::CrossProcessId child_navigable_id)
-{
-    client().async_did_remove_nested_history(m_id, parent_navigable_id, child_navigable_id);
-}
-
-void PageClient::page_did_request_finalize_same_document_navigation(u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SameDocumentNavigationEntry const& target_entry, bool replaces_current_entry, Web::HTML::HistoryHandlingBehavior history_handling, Web::HTML::UserNavigationInvolvement user_involvement, bool applies_history_step_in_coordinator)
-{
-    client().async_did_request_finalize_same_document_navigation(m_id, operation_id, navigable_id, target_entry, replaces_current_entry, history_handling, user_involvement, applies_history_step_in_coordinator);
-}
-
 void PageClient::page_did_request_history_operation(u64 initiation_id, Web::HistoryOperationParameters parameters)
 {
     client().async_request_history_operation(m_id, initiation_id, move(parameters));
-}
-
-void PageClient::did_complete_finalize_same_document_navigation(u64 operation_id, bool committed, int entry_step, int target_step, u64 script_history_length, u64 script_history_index)
-{
-    page().top_level_traversable()->did_complete_finalize_same_document_navigation(operation_id, committed, entry_step, target_step, {
-                                                                                                                                         .script_history_length = script_history_length,
-                                                                                                                                         .script_history_index = script_history_index,
-                                                                                                                                     });
-}
-
-void PageClient::page_did_finalize_cross_document_navigation(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& history_entry, Optional<Utf16String> const& entry_to_replace_navigation_api_key)
-{
-    client().async_did_finalize_cross_document_navigation(m_id, navigable_id, history_entry, entry_to_replace_navigation_api_key);
 }
 
 String PageClient::page_did_request_ui_process_session_history_for_testing()
@@ -1266,16 +1238,6 @@ String PageClient::dump_site_isolation_process_tree_for_testing()
     return client().did_request_site_isolation_process_tree_for_testing(m_id);
 }
 
-String PageClient::page_did_update_session_history_and_request_ui_process_session_history_for_testing(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index)
-{
-    return client().did_update_session_history_and_request_ui_process_session_history_for_testing(m_id, entries, used_steps, current_used_step_index);
-}
-
-void PageClient::page_did_request_traverse_the_history_by_delta(int delta, Web::HistoryTraversalPrecheck history_traversal_precheck)
-{
-    client().async_did_request_traverse_the_history_by_delta(m_id, delta, history_traversal_precheck);
-}
-
 void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)
 {
     auto request_id = m_next_webdriver_history_traversal_request_id++;
@@ -1283,7 +1245,7 @@ void PageClient::request_webdriver_history_traversal(int delta, Function<void(We
     client().async_did_request_webdriver_history_traversal(m_id, request_id, delta);
 }
 
-void PageClient::did_complete_webdriver_history_traversal(u64 request_id, bool accepted, bool will_replace_web_content_process, bool will_change_top_level_entry)
+void PageClient::did_complete_webdriver_history_traversal(u64 request_id, bool accepted)
 {
     auto maybe_callback = m_pending_webdriver_history_traversal_requests.take(request_id);
     if (!maybe_callback.has_value())
@@ -1291,8 +1253,6 @@ void PageClient::did_complete_webdriver_history_traversal(u64 request_id, bool a
 
     maybe_callback.value()(WebDriverHistoryTraversalResult {
         .accepted = accepted,
-        .will_replace_web_content_process = will_replace_web_content_process,
-        .will_change_top_level_entry = will_change_top_level_entry,
     });
 }
 
@@ -1304,11 +1264,6 @@ Web::WebDriver::Response PageClient::request_webdriver_load_url_from_ui(URL::URL
 Web::WebDriver::Response PageClient::request_webdriver_traverse_history_from_ui(int delta)
 {
     return client().did_request_webdriver_traverse_history_from_ui(m_id, delta);
-}
-
-Web::WebDriver::Response PageClient::request_webdriver_mark_web_content_session_history_stale()
-{
-    return client().did_request_webdriver_mark_web_content_session_history_stale(m_id);
 }
 
 Web::WebDriver::Response PageClient::request_webdriver_session_history()

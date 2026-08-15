@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <AK/Function.h>
-#include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
@@ -20,6 +18,7 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/DocumentState.h>
+#include <LibWeb/HTML/SessionHistoryEntryIdentity.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -57,7 +56,6 @@ struct SessionHistoryDocumentStateDescriptor {
     DocumentResource resource;
     bool reload_pending { false };
     bool ever_populated { false };
-    bool is_provisional { false };
     Utf16String navigable_target_name;
     Vector<SessionHistoryNestedHistoryDescriptor> nested_histories;
 };
@@ -66,13 +64,28 @@ struct SessionHistoryDocumentStateDescriptor {
 struct SessionHistoryEntryScrollPositionData {
     // FIXME: Track all restorable scrollable regions. Currently only the viewport is persisted.
     Optional<CSSPixelPoint> viewport_scroll_position;
+};
 
-    bool operator==(SessionHistoryEntryScrollPositionData const&) const = default;
+struct SessionHistoryEntryPersistedState {
+    CrossProcessId document_state_id;
+    Utf16String navigation_api_key;
+    SessionHistoryEntryScrollPositionData scroll_position_data;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry
 struct SessionHistoryEntryDescriptor {
     i32 step { 0 };
+    URL::URL url;
+    SessionHistoryDocumentStateDescriptor document_state;
+    StorageSerializationRecord classic_history_api_state;
+    StorageSerializationRecord navigation_api_state;
+    Utf16String navigation_api_key;
+    Utf16String navigation_api_id;
+    ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
+    SessionHistoryEntryScrollPositionData scroll_position_data;
+};
+
+struct PendingSessionHistoryEntryDescriptor {
     URL::URL url;
     SessionHistoryDocumentStateDescriptor document_state;
     StorageSerializationRecord classic_history_api_state;
@@ -176,12 +189,11 @@ private:
 };
 
 WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(SessionHistoryEntry const&);
-WEB_API bool session_history_entry_descriptors_match(SessionHistoryEntryDescriptor const&, SessionHistoryEntryDescriptor const&);
-enum class MatchNestedHistories {
-    Yes,
-    No,
-};
-WEB_API bool session_history_entry_matches_descriptor_ignoring_document_state_id(SessionHistoryEntry const&, SessionHistoryEntryDescriptor const&, MatchNestedHistories = MatchNestedHistories::Yes);
+WEB_API PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descriptor(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryDescriptor create_session_history_entry_descriptor(PendingSessionHistoryEntryDescriptor, i32 step);
+WEB_API Optional<SessionHistoryEntryPersistedState> create_session_history_entry_persisted_state(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntry const&);
+WEB_API SessionHistoryEntryIdentity session_history_entry_identity(SessionHistoryEntryDescriptor const&);
 
 }
 
@@ -194,10 +206,22 @@ template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> decode(Decoder&);
 
 template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::PendingSessionHistoryEntryDescriptor const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::PendingSessionHistoryEntryDescriptor> decode(Decoder&);
+
+template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryScrollPositionData const&);
 
 template<>
 WEB_API ErrorOr<Web::HTML::SessionHistoryEntryScrollPositionData> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryEntryPersistedState const&);
+
+template<>
+WEB_API ErrorOr<Web::HTML::SessionHistoryEntryPersistedState> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::SessionHistoryDocumentStateDescriptor const&);

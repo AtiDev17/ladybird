@@ -10,27 +10,38 @@
 #include <AK/Variant.h>
 #include <LibIPC/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/HTML/ApplyHistoryStep.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
+#include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 
 namespace Web {
 
-enum class HistoryTraversalPrecheck : u8 {
-    Needed,
-    AlreadyDone,
-};
-
 struct PushHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
+    HTML::CrossProcessId pending_document_state_id;
     HTML::UserNavigationInvolvement user_involvement;
 };
 
 struct ReplaceHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
+    HTML::CrossProcessId pending_document_state_id;
     HTML::UserNavigationInvolvement user_involvement;
 };
+
+struct CrossDocumentNavigationFinalization {
+    HTML::PendingSessionHistoryEntryDescriptor history_entry;
+    Optional<Utf16String> entry_to_replace_navigation_api_key;
+};
+
+using HistoryOperationReadyResult = Variant<
+    Empty,
+    HTML::HistoryStepResult,
+    HTML::CrossProcessId,
+    HTML::SameDocumentNavigationEntry,
+    CrossDocumentNavigationFinalization>;
 
 struct ReloadHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
@@ -63,17 +74,22 @@ struct ResumeTraverseHistoryOperationParameters {
 };
 
 struct NavigableCreationHistoryOperationParameters {
+    HTML::CrossProcessId parent_navigable_id;
     HTML::CrossProcessId navigable_id;
+    HTML::PendingSessionHistoryEntryDescriptor initial_history_entry;
 };
 
 struct NavigableDestructionHistoryOperationParameters {
-    HTML::CrossProcessId traversable_id;
+    HTML::CrossProcessId parent_navigable_id;
+    HTML::CrossProcessId parent_document_state_id;
+    HTML::CrossProcessId navigable_id;
 };
 
 struct FinalizeSameDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
     HTML::SameDocumentNavigationEntry target_entry;
-    bool replaces_current_entry;
+    Optional<Utf16String> entry_to_replace_navigation_api_key;
+    Optional<HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state;
     HTML::HistoryHandlingBehavior history_handling;
     HTML::UserNavigationInvolvement user_involvement;
 };
@@ -118,6 +134,11 @@ template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::ReplaceHistoryOperationParameters const&);
 template<>
 WEB_API ErrorOr<Web::ReplaceHistoryOperationParameters> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::CrossDocumentNavigationFinalization const&);
+template<>
+WEB_API ErrorOr<Web::CrossDocumentNavigationFinalization> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::ReloadHistoryOperationParameters const&);

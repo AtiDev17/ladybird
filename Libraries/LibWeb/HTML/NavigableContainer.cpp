@@ -106,31 +106,42 @@ void NavigableContainer::create_new_child_navigable()
     // 9. Set element's content navigable to navigable.
     m_content_navigable = navigable;
 
+    auto traversable = parent_navigable->traversable_navigable();
+    (void)traversable->adopt_canonical_id_for_child_created_during_history_reconstruction(*parent_navigable, navigable);
+
     page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->replicated_state());
 
     // 10. Let historyEntry be navigable's active session history entry.
     auto history_entry = navigable->active_session_history_entry();
 
-    // 11. Let traversable be parentNavigable's traversable navigable.
-    auto traversable = parent_navigable->traversable_navigable();
-
     // 12. Append the following session history traversal steps to traversable:
     traversable->request_history_operation(
         NavigableCreationHistoryOperationParameters {
+            .parent_navigable_id = parent_navigable->id(),
             .navigable_id = navigable->id(),
+            .initial_history_entry = create_pending_session_history_entry_descriptor(*history_entry),
         },
         {
-            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](u64, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
+            .local_target_navigable_id = navigable->id(),
+            .local_target_entry = history_entry,
+            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](u64, Optional<SessionHistoryEntryDescriptor> creation_target_entry, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
                 if (navigable->has_been_destroyed() || parent_navigable->has_been_destroyed()) {
-                    ready->function()(false, {}, HistoryStepResult::Applied);
+                    ready->function()(HistoryStepResult::Applied);
                     return;
                 }
 
                 // 1-6. Append nestedHistory to parentDocState's nested histories.
-                VERIFY(append_nested_history_for_child_navigable(*parent_navigable, *navigable, *history_entry));
+                if (creation_target_entry.has_value()) {
+                    VERIFY(navigable->traversable_navigable()->route_child_created_during_history_reconstruction(
+                        *parent_navigable, *navigable, *history_entry, creation_target_entry.release_value()));
+                    ready->function()(HistoryStepResult::Applied);
+                    return;
+                }
+
+                auto parent_document_state = parent_navigable->active_session_history_entry()->document_state();
 
                 // 7. Update for navigable creation/destruction given traversable
-                ready->function()(true, {}, HistoryStepResult::Applied);
+                ready->function()(parent_document_state->cross_process_id());
             }),
             .on_complete = GC::create_function(heap(), [this, navigable](HistoryStepResult) {
                 if (navigable->has_been_destroyed() || content_navigable() != navigable)
@@ -333,22 +344,21 @@ void NavigableContainer::destroy_the_child_navigable()
         navigable->remove_from_all_local_navigables();
 
         // 6. Let parentDocState be container's node navigable's active session history entry's document state.
-        auto parent_doc_state = this->navigable()->active_session_history_entry()->document_state();
+        auto parent_navigable = this->navigable();
+        auto parent_doc_state = parent_navigable->active_session_history_entry()->document_state();
 
         // 7. Remove the nested history from parentDocState's nested histories whose id equals navigable's id.
-        parent_doc_state->nested_histories().remove_all_matching([&](auto& nested_history) {
-            return navigable->id() == nested_history.id;
-        });
+        // NB: The UI process performs this step in canonical session history.
 
         // 8. Let traversable be container's node navigable's traversable navigable.
-        auto traversable = this->navigable()->traversable_navigable();
-
-        traversable->page().client().page_did_remove_nested_history(this->navigable()->id(), navigable->id());
+        auto traversable = parent_navigable->traversable_navigable();
 
         // 9. Append the following session history traversal steps to traversable:
         // 1. Update for navigable creation/destruction given traversable.
         traversable->request_history_operation(NavigableDestructionHistoryOperationParameters {
-            .traversable_id = traversable->id(),
+            .parent_navigable_id = parent_navigable->id(),
+            .parent_document_state_id = parent_doc_state->cross_process_id(),
+            .navigable_id = navigable->id(),
         });
     });
 
