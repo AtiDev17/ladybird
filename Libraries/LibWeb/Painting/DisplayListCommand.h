@@ -167,14 +167,14 @@ struct DrawScaledDecodedImageFrame {
     static constexpr StringView command_name = "DrawScaledDecodedImageFrame"sv;
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawScaledDecodedImageFrame;
 
-    Gfx::IntRect dst_rect;
+    Gfx::FloatRect dst_rect;
     Optional<Gfx::FloatRect> src_rect;
     ImageFrameResourceId frame_id;
     Gfx::ScalingMode scaling_mode;
     Gfx::CompositingAndBlendingOperator compositing_and_blending_operator { Gfx::CompositingAndBlendingOperator::Normal };
     Optional<Color> isolated_backdrop_color;
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return dst_rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return Gfx::enclosing_int_rect(dst_rect); }
     void dump(StringBuilder&) const;
 };
 
@@ -303,9 +303,9 @@ struct AddClipRect {
     static constexpr StringView command_name = "AddClipRect"sv;
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::AddClipRect;
 
-    Gfx::IntRect rect;
+    Gfx::FloatRect rect;
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return Gfx::enclosing_int_rect(rect); }
     bool is_clip() const { return true; }
     void dump(StringBuilder&) const;
 };
@@ -435,6 +435,7 @@ struct DisplayListPaintStyle {
     float radial_gradient_end_radius { 0.0f };
     DisplayListResourceId pattern_tile_display_list_id;
     Gfx::FloatRect pattern_tile_rect;
+    Gfx::FloatSize pattern_content_scale { 1, 1 };
     Optional<Gfx::AffineTransform> pattern_transform;
 };
 
@@ -442,7 +443,7 @@ struct FillPath {
     static constexpr StringView command_name = "FillPath"sv;
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::FillPath;
 
-    Gfx::IntRect path_bounding_rect;
+    Gfx::FloatRect path_bounding_rect;
     DisplayListDataSpan path_data;
     float opacity { 1.0f };
     PathPaintKind paint_kind { PathPaintKind::Color };
@@ -451,7 +452,7 @@ struct FillPath {
     Gfx::WindingRule winding_rule;
     Gfx::ShouldAntiAlias should_anti_alias { Gfx::ShouldAntiAlias::Yes };
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return path_bounding_rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return Gfx::enclosing_int_rect(path_bounding_rect); }
 
     void dump(StringBuilder&) const;
 };
@@ -465,7 +466,7 @@ struct StrokePath {
     float miter_limit;
     DisplayListDataSpan dash_array;
     float dash_offset;
-    Gfx::IntRect path_bounding_rect;
+    Gfx::FloatRect path_bounding_rect;
     DisplayListDataSpan path_data;
     float opacity;
     PathPaintKind paint_kind { PathPaintKind::Color };
@@ -474,7 +475,7 @@ struct StrokePath {
     float thickness;
     Gfx::ShouldAntiAlias should_anti_alias { Gfx::ShouldAntiAlias::Yes };
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return path_bounding_rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return Gfx::enclosing_int_rect(path_bounding_rect); }
 
     void dump(StringBuilder&) const;
 };
@@ -583,9 +584,11 @@ struct PaintNestedDisplayList {
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::PaintNestedDisplayList;
 
     DisplayListResourceId display_list_id;
-    Gfx::IntRect rect;
+    Gfx::FloatRect rect;
+    // The size the nested list was recorded at; replay scales it into the destination rect.
+    Gfx::IntSize list_size;
 
-    [[nodiscard]] Gfx::IntRect bounding_rect() const { return rect; }
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return Gfx::enclosing_int_rect(rect); }
 
     void dump(StringBuilder&) const;
 };

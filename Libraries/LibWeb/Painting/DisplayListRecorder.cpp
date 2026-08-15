@@ -233,6 +233,7 @@ static DisplayListPaintStyle to_display_list_paint_style(
             auto const& tile_display_list = pattern.tile_display_list();
             display_list_paint_style.pattern_tile_display_list_id = resource_storage.add_display_list(tile_display_list.display_list, tile_display_list.visual_context_tree);
             display_list_paint_style.pattern_tile_rect = pattern.tile_rect();
+            display_list_paint_style.pattern_content_scale = pattern.content_scale();
             display_list_paint_style.pattern_transform = pattern.pattern_transform();
         });
     return display_list_paint_style;
@@ -269,12 +270,13 @@ DisplayListCommandRange DisplayListRecorder::append_cached_command_range(Display
     return { destination_offset, source_range.size };
 }
 
-void DisplayListRecorder::paint_nested_display_list(DisplayListResource const& display_list, Gfx::IntRect rect)
+void DisplayListRecorder::paint_nested_display_list(DisplayListResource const& display_list, Gfx::FloatRect rect, Gfx::IntSize list_size)
 {
     auto display_list_id = resource_storage().add_display_list(display_list.display_list, display_list.visual_context_tree);
     append_command(PaintNestedDisplayList {
         display_list_id,
         rect,
+        list_size,
     });
 }
 
@@ -309,8 +311,7 @@ void DisplayListRecorder::fill_path(FillPathParams params)
     if (params.paint_style_or_color.has<Gfx::Color>() && params.paint_style_or_color.get<Gfx::Color>().alpha() == 0)
         return;
     auto path_bounding_rect = params.path.bounding_box();
-    auto path_bounding_int_rect = enclosing_int_rect(path_bounding_rect);
-    if (path_bounding_int_rect.is_empty())
+    if (path_bounding_rect.is_empty())
         return;
     CommandPayloadBuilder<FillPath> payload_builder(m_display_list);
     auto path_span = append_path_data(payload_builder, params.path);
@@ -325,7 +326,7 @@ void DisplayListRecorder::fill_path(FillPathParams params)
     }
     append_command(
         FillPath {
-            .path_bounding_rect = path_bounding_int_rect,
+            .path_bounding_rect = path_bounding_rect,
             .path_data = path_span,
             .opacity = params.opacity,
             .paint_kind = paint_kind,
@@ -347,8 +348,7 @@ void DisplayListRecorder::stroke_path(StrokePathParams params)
     auto path_bounding_rect = params.path.bounding_box();
     // Increase path bounding box by `thickness` to account for stroke.
     path_bounding_rect.inflate(params.thickness, params.thickness);
-    auto path_bounding_int_rect = enclosing_int_rect(path_bounding_rect);
-    if (path_bounding_int_rect.is_empty())
+    if (path_bounding_rect.is_empty())
         return;
     CommandPayloadBuilder<StrokePath> payload_builder(m_display_list);
     auto path_span = append_path_data(payload_builder, params.path);
@@ -369,7 +369,7 @@ void DisplayListRecorder::stroke_path(StrokePathParams params)
             .miter_limit = params.miter_limit,
             .dash_array = dash_array,
             .dash_offset = params.dash_offset,
-            .path_bounding_rect = path_bounding_int_rect,
+            .path_bounding_rect = path_bounding_rect,
             .path_data = path_span,
             .opacity = params.opacity,
             .paint_kind = paint_kind,
@@ -491,7 +491,7 @@ void DisplayListRecorder::draw_video_frame(Gfx::IntRect const& dst_rect, VideoSi
     });
 }
 
-void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& dst_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator, Optional<Color> isolated_backdrop_color)
+void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::FloatRect const& dst_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator, Optional<Color> isolated_backdrop_color)
 {
     if (dst_rect.is_empty())
         return;
@@ -505,7 +505,7 @@ void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& ds
     });
 }
 
-void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& dst_rect, Gfx::FloatRect const& src_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator, Optional<Color> isolated_backdrop_color)
+void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::FloatRect const& dst_rect, Gfx::FloatRect const& src_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator, Optional<Color> isolated_backdrop_color)
 {
     if (dst_rect.is_empty())
         return;
@@ -624,7 +624,7 @@ void DisplayListRecorder::draw_glyph_run(Gfx::FloatPoint baseline_start, Gfx::Gl
         payload_builder.inline_data());
 }
 
-void DisplayListRecorder::add_clip_rect(Gfx::IntRect const& rect)
+void DisplayListRecorder::add_clip_rect(Gfx::FloatRect const& rect)
 {
     append_command(AddClipRect { rect });
 }

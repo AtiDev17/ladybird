@@ -50,10 +50,19 @@ struct ClipData {
     bool contains(DevicePixelPoint point) const;
 };
 
+// Distinguishes the two producers of transform nodes so value-only updates can patch each from its
+// own source: CSS transforms recompute from style, SVG viewport transforms from the viewport
+// paintable's committed viewBox transform and box position.
+enum class TransformDataRole : u8 {
+    CssTransform,
+    SvgViewportTransform,
+};
+
 struct TransformData {
     Gfx::FloatMatrix4x4 matrix;
     Gfx::FloatPoint origin;
     bool flattens_inherited_transform { false };
+    TransformDataRole role { TransformDataRole::CssTransform };
 
     Gfx::FloatMatrix4x4 matrix_including_origin() const;
 };
@@ -145,9 +154,10 @@ public:
 
     static WEB_API AccumulatedVisualContextTree create();
     static WEB_API AccumulatedVisualContextTree create(TransformData visual_viewport_transform);
-    // For nested display list trees (masks, patterns, background tiles) whose content is recorded
-    // in outer coordinates but replayed into a list-local surface: the offset becomes the root
-    // transform, keeping the tree the single source of coordinate truth for the list.
+    // For nested display list trees (masks, patterns, background tiles): the given transform
+    // becomes the root node. Unlike a document tree's visual viewport root, this root is real
+    // content placement, so queries asked to exclude the visual viewport transform include it.
+    static WEB_API AccumulatedVisualContextTree create_with_content_root(TransformData content_transform);
     static WEB_API AccumulatedVisualContextTree create_with_content_offset(Gfx::IntPoint content_offset);
 
     AccumulatedVisualContextTree(AccumulatedVisualContextTree const&) = default;
@@ -170,6 +180,8 @@ public:
     Optional<Gfx::FloatPoint> transform_point_for_hit_test(VisualContextIndex, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
     Gfx::FloatPoint inverse_transform_point(VisualContextIndex, Gfx::FloatPoint) const;
     Gfx::FloatRect transform_rect_to_viewport(VisualContextIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;
+    Gfx::FloatMatrix4x4 accumulated_matrix(VisualContextIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
+    Gfx::FloatSize accumulated_2d_scale(VisualContextIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
     void dump(VisualContextIndex, StringBuilder&) const;
 
     bool has_empty_effective_clip(VisualContextIndex i) const { return m_nodes[i.value()].has_empty_effective_clip; }
@@ -182,9 +194,10 @@ public:
     }
 
 private:
-    AccumulatedVisualContextTree(u64 version, Vector<AccumulatedVisualContextNode>&& nodes)
+    AccumulatedVisualContextTree(u64 version, Vector<AccumulatedVisualContextNode>&& nodes, bool root_is_visual_viewport)
         : m_version(version)
         , m_nodes(move(nodes))
+        , m_root_is_visual_viewport(root_is_visual_viewport)
     {
     }
 
@@ -193,12 +206,22 @@ private:
 
     u64 m_version { 0 };
     Vector<AccumulatedVisualContextNode> m_nodes;
+    bool m_root_is_visual_viewport { true };
 
     template<typename T>
     friend ErrorOr<void> IPC::encode(IPC::Encoder&, T const&);
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
+
+// Pattern tiles exclude the root's own transform: patternTransform reaches the replay-side tile
+// shader instead, so the tiling grid repeats under it rather than the content scaling twice.
+enum class IncludeRootElementTransform : u8 {
+    No,
+    Yes,
+};
+
+WEB_API AccumulatedVisualContextTree build_nested_svg_visual_context_tree(Paintable& root_paintable, TransformData root_transform, NestedVisualContextAssignments&, IncludeRootElementTransform = IncludeRootElementTransform::Yes);
 
 }
 

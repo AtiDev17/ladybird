@@ -18,6 +18,7 @@
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/SVGForeignObjectPaintable.h>
 #include <LibWeb/Painting/SVGGraphicsPaintable.h>
+#include <LibWeb/Painting/SVGPathPaintable.h>
 #include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/AttributeParser.h>
@@ -37,18 +38,6 @@ namespace Web::SVG {
 SVGGraphicsElement::SVGGraphicsElement(DOM::Document& document, DOM::QualifiedName qualified_name)
     : SVGElement(document, move(qualified_name))
 {
-}
-
-void SVGGraphicsElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
-{
-    Base::attribute_changed(name, old_value, value, namespace_);
-
-    if (name == AttributeNames::transform) {
-        auto transform_list = AttributeParser::parse_transform(value.value_or({}));
-        if (transform_list.has_value())
-            m_transform = transform_from_transform_list(*transform_list);
-        set_needs_layout_update(DOM::SetNeedsLayoutReason::SVGGraphicsElementTransformChange);
-    }
 }
 
 Optional<Painting::PaintStyle> SVGGraphicsElement::svg_paint_computed_value_to_gfx_paint_style(SVGPaintContext const& paint_context, Optional<CSS::SVGPaint> const& paint_value, DisplayListRecordingContext* recording_context) const
@@ -285,16 +274,32 @@ Optional<float> SVGGraphicsElement::stroke_opacity() const
 
 float SVGGraphicsElement::resolve_relative_to_viewport_size(CSS::LengthPercentage const& length_percentage) const
 {
-    // FIXME: Converting to pixels isn't really correct - values should be in "user units"
-    //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
     // Resolved relative to the "Scaled viewport size": https://www.w3.org/TR/2017/WD-fill-stroke-3-20170413/#scaled-viewport-size
-    // FIXME: This isn't right, but it's something.
+    // FIXME: The spec formula is the normalized diagonal sqrt((width² + height²) / 2); this keeps
+    //        the historical (width + height) / 2 approximation.
+    // NB: Resolution happens during layout, so only the viewBox and computed style are available,
+    //     not committed viewport geometry.
     CSSPixels viewport_width = 0;
     CSSPixels viewport_height = 0;
-    if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
-        if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node()) {
-            viewport_width = svg_svg_layout_node->width().to_px(0);
-            viewport_height = svg_svg_layout_node->height().to_px(0);
+    auto resolve_viewport_size_from = [&](SVGElement const& viewport_element, Optional<ViewBox> const& view_box) {
+        if (view_box.has_value()) {
+            viewport_width = CSSPixels::nearest_value_for(view_box->width);
+            viewport_height = CSSPixels::nearest_value_for(view_box->height);
+        } else if (auto viewport_layout_node = viewport_element.unsafe_layout_node()) {
+            viewport_width = viewport_layout_node->width().to_px(0);
+            viewport_height = viewport_layout_node->height().to_px(0);
+        }
+    };
+    // <symbol> instances establish nested viewports; percentages inside one resolve against it,
+    // not the enclosing <svg>.
+    for (auto* ancestor = first_flat_tree_ancestor_of_type<SVGElement>(); ancestor; ancestor = ancestor->first_flat_tree_ancestor_of_type<SVGElement>()) {
+        if (auto* svg_svg_element = as_if<SVGSVGElement>(*ancestor)) {
+            resolve_viewport_size_from(*svg_svg_element, svg_svg_element->active_view_box());
+            break;
+        }
+        if (auto* symbol_element = as_if<SVGSymbolElement>(*ancestor)) {
+            resolve_viewport_size_from(*symbol_element, symbol_element->view_box());
+            break;
         }
     }
     auto scaled_viewport_size = (viewport_width + viewport_height) * CSSPixels(0.5);
@@ -350,17 +355,6 @@ Optional<float> SVGGraphicsElement::stroke_width() const
     return resolve_relative_to_viewport_size(unsafe_layout_node()->stroke_width());
 }
 
-static Painting::SVGGraphicsPaintable::ComputedTransforms const* computed_svg_transforms_of(Painting::Paintable const& paintable)
-{
-    if (auto const* svg_graphics_paintable = as_if<Painting::SVGGraphicsPaintable>(paintable))
-        return &svg_graphics_paintable->computed_transforms();
-    if (auto const* svg_foreign_object_paintable = as_if<Painting::SVGForeignObjectPaintable>(paintable))
-        return &svg_foreign_object_paintable->computed_transforms();
-    if (auto const* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable))
-        return &svg_svg_paintable->computed_transforms();
-    return nullptr;
-}
-
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGGraphicsElement__getBBox
 WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bindings::SVGBoundingBoxOptions const&)
 {
@@ -379,26 +373,20 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
     document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetBBox);
     if (!layout_node())
         return Geometry::DOMRect::create();
-    // Invert the SVG -> screen space transform.
     auto owner_svg_element = this->owner_svg_element();
 
     // The outermost svg element has no ancestor svg element to measure against; per the bounding box
     // algorithm its bounding box is the union of its children's bounding boxes in its own user
-    // coordinate system (i.e. with the viewBox transform undone, but each child's own transforms kept).
+    // coordinate system, with each child's own transforms kept.
     if (!owner_svg_element) {
         if (!is<SVGSVGElement>(*this))
             return Geometry::DOMRect::create();
         auto self_paintable = paintable_box();
         if (!self_paintable)
             return Geometry::DOMRect::create();
-        auto viewport_origin = self_paintable->absolute_rect().location().to_type<float>();
         Gfx::FloatRect united_rect;
         self_paintable->for_each_child([&](Painting::Paintable const& child) {
-            auto child_rect = child.absolute_rect().to_type<float>().translated(-viewport_origin);
-            if (auto const* transforms = computed_svg_transforms_of(child)) {
-                if (auto inverse = transforms->svg_to_viewbox_transform().inverse(); inverse.has_value())
-                    child_rect = inverse->map(child_rect);
-            }
+            auto child_rect = child.layout_node().used_svg_element_transform().map(child.absolute_rect().to_type<float>());
             united_rect.unite(child_rect);
             return IterationDecision::Continue;
         });
@@ -407,10 +395,8 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
         return Geometry::DOMRect::create(united_rect);
     }
 
-    // Invert the SVG -> screen space transform.
-    auto owner_paintable = owner_svg_element->paintable_box();
     auto self_paintable = paintable_box();
-    if (!owner_paintable || !self_paintable) {
+    if (!owner_svg_element->paintable_box() || !self_paintable) {
         // Throw only for non-rendered *graphics* elements where geometry isn't computable
         // (e.g. elements inside <marker>, <pattern>, etc.).
         if (is<SVGSVGElement>(*this))
@@ -420,18 +406,17 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
             "Element is not rendered and geometry is not computable"_utf16);
     }
 
-    auto svg_rect = owner_paintable->absolute_rect();
-    auto rect = self_paintable->absolute_rect().to_type<float>().translated(-svg_rect.location().to_type<float>());
+    // A path-like element's bounding box covers its geometry alone; the committed content rect is
+    // inflated by the visible stroke width, so take the unstroked path bounds directly.
+    if (auto const* path_paintable = as_if<Painting::SVGPathPaintable>(*self_paintable); path_paintable && path_paintable->computed_path().has_value())
+        return Geometry::DOMRect::create(path_paintable->computed_path()->bounding_box());
+
+    auto rect = self_paintable->absolute_rect().to_type<float>();
     // An element with a non-positive geometry dimension is not rendered and
     // therefore contributes an empty bounding box, regardless of its
     // positioning rectangle's origin.
     if (rect.width() <= 0 || rect.height() <= 0)
         return Geometry::DOMRect::create();
-    if (auto const* transforms = computed_svg_transforms_of(*self_paintable)) {
-        auto inv = transforms->svg_to_css_pixels_transform().inverse();
-        if (inv.has_value())
-            rect = inv->map(rect);
-    }
     return Geometry::DOMRect::create(rect);
 }
 

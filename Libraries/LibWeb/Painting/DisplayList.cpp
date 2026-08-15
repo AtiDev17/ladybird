@@ -307,9 +307,11 @@ void DisplayListPlayer::execute_impl(
                     nullptr);
                 if (auto display_list_id = display_list.mask_display_list_id(frame_node_index);
                     display_list_id.has_value() && resource_storage().has_display_list(*display_list_id)) {
+                    auto mask_rect = mask->rect.to_type<int>();
                     play_command(PaintNestedDisplayList {
                         .display_list_id = *display_list_id,
-                        .rect = mask->rect.to_type<int>(),
+                        .rect = mask_rect.to_type<float>(),
+                        .list_size = mask_rect.size(),
                     });
                 }
                 play_command(Restore {}); // DstIn layer
@@ -381,14 +383,14 @@ void DisplayListPlayer::execute_impl(
                                 .corner_clip = Gfx::CornerClip::Outside,
                             });
                         } else {
-                            play_command(AddClipRect { .rect = clip.rect.to_type<int>() });
+                            play_command(AddClipRect { .rect = clip.rect.to_type<int>().to_type<float>() });
                         }
                     },
                     [&](ClipPathData const& clip_path) {
                         add_clip_path(clip_path.path, clip_path.fill_rule);
                     },
                     [&](MaskData const& mask) {
-                        play_command(AddClipRect { .rect = mask.rect.to_type<int>() });
+                        play_command(AddClipRect { .rect = mask.rect.to_type<int>().to_type<float>() });
                         play_command(SaveLayer {});
                         ++applied_mask_frame_count;
                     },
@@ -425,7 +427,7 @@ void DisplayListPlayer::execute_impl(
                 if (header.type == DisplayListCommandType::AddClipRect)
                     play_command(read_display_list_command_payload<AddClipRect>(payload));
                 else
-                    play_command(AddClipRect { bounding_rect.release_value() });
+                    play_command(AddClipRect { bounding_rect.release_value().to_type<float>() });
             }
             return;
         }
