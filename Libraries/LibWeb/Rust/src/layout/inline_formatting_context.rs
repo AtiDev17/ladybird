@@ -755,6 +755,7 @@ pub(crate) struct InlineFormattingContext<'context> {
     pub(crate) containing_used_values: std::rc::Rc<UsedValues>,
     pub(crate) fragmented_inlines_in_pre_order: Vec<Node>,
     pub(crate) automatic_content_inline_size: CssPixels,
+    pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub(crate) automatic_content_block_size: CssPixels,
     block_axis_float_clearance: Cell<CssPixels>,
 }
@@ -780,6 +781,7 @@ impl<'context> InlineFormattingContext<'context> {
             containing_used_values,
             fragmented_inlines_in_pre_order: Vec::new(),
             automatic_content_inline_size: CssPixels::default(),
+            min_content_inline_size_from_max_content_layout: None,
             automatic_content_block_size: CssPixels::default(),
             block_axis_float_clearance: Cell::new(CssPixels::default()),
         }
@@ -992,6 +994,14 @@ impl<'context> InlineFormattingContext<'context> {
         content_baselines
     }
 
+    pub(crate) fn paired_min_content_inline_size_for_atomic_root(&self, node: Node) -> Option<CssPixels> {
+        self.parent.sizing().paired_min_content_inline_size_for_atomic_root(
+            node,
+            self.input.available_space,
+            self.input.containing_block_constraints,
+        )
+    }
+
     fn clear_floating_boxes(&self, node: Node) -> bool {
         self.parent.clear_floating_boxes(
             node,
@@ -1018,12 +1028,185 @@ impl<'context> InlineFormattingContext<'context> {
         style.text_overflow() == text_overflow::ELLIPSIS && style.overflow_x() != overflow::VISIBLE
     }
 
+    fn reusable_atomic_line_prefix(
+        &self,
+        previous: &LineData,
+        iterator: &InlineLevelIterator,
+    ) -> (Vec<LineBoxData>, usize) {
+        if self.containing_block != self.run.box_
+            || !previous.inline_box_pieces.is_empty()
+            || previous
+                .line_boxes
+                .iter()
+                .any(|line| line.writing_mode != writing_mode::HORIZONTAL_TB)
+            || iterator.items().iter().any(|item| item.type_ != ItemType::Element)
+        {
+            return (Vec::new(), 0);
+        }
+
+        let mut item_index = 0usize;
+        let mut reused_lines = Vec::new();
+        let mut item_count_before_last_line = 0usize;
+        for line in &previous.line_boxes {
+            if line.fragments.is_empty()
+                || line.has_block_level_box
+                || !line.static_position_markers.is_empty()
+                || !line.inline_box_baselines.is_empty()
+            {
+                break;
+            }
+            let line_item_start = item_index;
+            let mut running_inline_length = CssPixels::default();
+            let mut matched = true;
+            for fragment in &line.fragments {
+                let Some(item) = iterator.items().get(item_index) else {
+                    matched = false;
+                    break;
+                };
+                let used = self.used(item.node);
+                let expected_inline_offset =
+                    running_inline_length + item.margin_start + item.border_start + item.padding_start;
+                if !fragment.is_atomic_inline
+                    || fragment.layout_node != item.node
+                    || fragment.inline_offset != expected_inline_offset
+                    || fragment.inline_length != item.inline_size
+                    || fragment.block_length != used.content_block_size.get()
+                    || fragment.border_box_block_start != used.border_box_top(false)
+                {
+                    matched = false;
+                    break;
+                }
+                running_inline_length += item.margin_start
+                    + item.border_start
+                    + item.padding_start
+                    + item.inline_size
+                    + item.padding_end
+                    + item.border_end
+                    + item.margin_end;
+                item_index += 1;
+            }
+            if !matched || running_inline_length != line.inline_length {
+                item_index = line_item_start;
+                break;
+            }
+            item_count_before_last_line = line_item_start;
+            reused_lines.push(line.clone());
+        }
+
+        // Additional content can fit on the old final line, so that line is
+        // damaged even when every old fragment before the insertion matches.
+        if item_index < iterator.items().len() && reused_lines.len() == previous.line_boxes.len() {
+            reused_lines.pop();
+            item_index = item_count_before_last_line;
+        }
+        (reused_lines, item_index)
+    }
+
+    fn min_content_inline_size_from_max_content_items(&self, items: &[Item]) -> Option<CssPixels> {
+        if self.input.available_space.inline_size != AvailableSize::MaxContent {
+            return None;
+        }
+        if self.facts(self.containing_block).is_scroll_container() {
+            return None;
+        }
+        if self.style(self.containing_block).writing_mode() != writing_mode::HORIZONTAL_TB {
+            return None;
+        }
+
+        let containing_style = self.style(self.containing_block);
+        let containing_inline_size = self.input.containing_block_constraints.inline_basis();
+        if containing_style.text_indent().to_px(containing_inline_size) != CssPixels::default() {
+            return None;
+        }
+
+        let wraps = containing_style.text_wrap_mode() == text_wrap_mode::WRAP;
+        let mut maximum = CssPixels::default();
+        let mut current = CssPixels::default();
+        let mut line_has_content = false;
+        let finish_line =
+            |maximum: &mut CssPixels, current: &mut CssPixels, line_has_content: &mut bool| {
+                *maximum = (*maximum).max(*current);
+                *current = CssPixels::default();
+                *line_has_content = false;
+            };
+        for item in items {
+            match item.type_ {
+                ItemType::Element => {
+                    if item.has_box_model_metrics() {
+                        return None;
+                    }
+                    if wraps && line_has_content {
+                        finish_line(&mut maximum, &mut current, &mut line_has_content);
+                    }
+                    current += item.min_content_inline_size?;
+                    line_has_content = true;
+                }
+                ItemType::Text => {
+                    if item.has_box_model_metrics() || item.contains_tab(self) {
+                        return None;
+                    }
+                    if item.length_in_node == 0 && item.inline_size == CssPixels::default() {
+                        continue;
+                    }
+                    let wraps = self.style(self.parent_node(item.node)).text_wrap_mode() == text_wrap_mode::WRAP;
+                    if !wraps {
+                        current += item.inline_size;
+                        line_has_content = true;
+                        continue;
+                    }
+                    if item.is_ascii_whitespace(self) {
+                        if !item.is_collapsible_whitespace {
+                            return None;
+                        }
+                        if line_has_content {
+                            finish_line(&mut maximum, &mut current, &mut line_has_content);
+                        }
+                        continue;
+                    }
+                    if item.trailing_whitespace.inline_size != CssPixels::default() {
+                        return None;
+                    }
+                    if item.can_break_before && line_has_content {
+                        finish_line(&mut maximum, &mut current, &mut line_has_content);
+                    }
+                    current += item.inline_size;
+                    line_has_content = true;
+                }
+                ItemType::ForcedBreak => {
+                    finish_line(&mut maximum, &mut current, &mut line_has_content);
+                }
+                ItemType::BlockLevelBox | ItemType::AbsolutelyPositionedElement | ItemType::FloatingElement => {
+                    return None;
+                }
+            }
+        }
+        finish_line(&mut maximum, &mut current, &mut line_has_content);
+        Some(maximum)
+    }
+
     pub(crate) fn generate_line_boxes(&mut self) {
-        self.line_data_mut().line_boxes.clear();
-        self.line_data_mut().inline_box_pieces.clear();
         let mut iterator = InlineLevelIterator::new(self);
+        self.min_content_inline_size_from_max_content_layout =
+            self.min_content_inline_size_from_max_content_items(iterator.items());
         self.fragmented_inlines_in_pre_order = iterator.take_visited_fragmented_inlines();
-        let mut line_builder = LineBuilder::new(self);
+        let (reused_lines, reused_item_count) = self
+            .run
+            .previous_line_data
+            .as_deref()
+            .map(|previous| self.reusable_atomic_line_prefix(previous, &iterator))
+            .unwrap_or_default();
+        {
+            let mut data = self.line_data_mut();
+            data.line_boxes = reused_lines;
+            data.inline_box_pieces.clear();
+        }
+        iterator.skip_items(reused_item_count);
+        let reused_line_count = self.line_data().line_boxes.len();
+        let mut line_builder = if reused_line_count == 0 {
+            LineBuilder::new(self)
+        } else {
+            LineBuilder::new_after_reused_lines(self)
+        };
 
         let mut leading_margin = CssPixels::default();
         let mut leading_border = CssPixels::default();
@@ -1129,8 +1312,7 @@ impl<'context> InlineFormattingContext<'context> {
                 ItemType::Text => {
                     line_builder.prepare_to_append_inline_content();
                     if self.style(self.parent_node(item.node)).text_wrap_mode() == text_wrap_mode::WRAP {
-                        let is_whitespace =
-                            item.is_collapsible_whitespace || iterator.item_is_ascii_whitespace(self, &item);
+                        let is_whitespace = item.is_collapsible_whitespace || item.is_ascii_whitespace(self);
                         let next_inline_size = if is_whitespace {
                             iterator.next_non_whitespace_sequence_inline_size(self)
                         } else {
@@ -1167,7 +1349,7 @@ impl<'context> InlineFormattingContext<'context> {
         }
 
         let line_count = self.line_data().line_boxes.len();
-        for line_index in 0..line_count {
+        for line_index in reused_line_count..line_count {
             self.line_data_mut().line_boxes[line_index].trim_trailing_whitespace();
         }
         if self.text_overflow_applies() {

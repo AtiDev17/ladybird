@@ -59,6 +59,7 @@ pub(crate) enum IntrinsicSizeCacheKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IntrinsicInlineSizeMeasurement {
     pub(crate) automatic_content_inline_size: CssPixels,
+    pub(crate) min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub(crate) available_block_size: AvailableSize,
     pub(crate) content_inline_size: CssPixels,
     pub(crate) content_block_size: CssPixels,
@@ -267,16 +268,15 @@ impl LayoutNodeArena {
         &self.fc_run_cache_store
     }
 
-    /// Drops entries whose slot, epoch, or viewport stamp no longer match.
+    /// Drops entries whose slot or epoch no longer matches.
     /// Runs at the end of every full pass so invalidated entries whose box
     /// never probes again do not accumulate for the document's lifetime.
     pub(crate) fn sweep_stale_fc_run_cache_entries(&self) {
-        let viewport = self.fc_run_cache_store.viewport_size();
         self.fc_run_cache_store.retain_entries(|slot, validity| {
             let Some(metadata) = self.slot_metadata.get(slot as usize) else {
                 return false;
             };
-            if !metadata.occupied || metadata.generation != validity.slot_generation || viewport != validity.viewport {
+            if !metadata.occupied || metadata.generation != validity.slot_generation {
                 return false;
             }
             let id = NodeSlotId::new(slot, metadata.generation);
@@ -1070,6 +1070,25 @@ pub unsafe extern "C" fn layout_arena_fc_run_cache_hit_count(arena: *mut c_void)
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_note_inline_layout_damage(arena: *mut c_void, mut box_: NodeSlotId) {
+    abort_on_panic(|| {
+        assert!(!arena.is_null(), "layout node arena handle is null");
+        // SAFETY: The C++ caller keeps the arena and layout tree alive for this synchronous call.
+        let arena = unsafe { &*arena.cast::<LayoutNodeArena>() };
+        // OPTIMIZATION: The edit invalidates line data at its direct parent and every formatting
+        // ancestor. Preserve the structural proof along the same unbounded path as the fragment
+        // epoch bumps so each affected inline context can reuse its unchanged line prefix.
+        while !box_.is_invalid() {
+            let data = arena.data(box_);
+            arena.fc_run_cache_store().note_inline_layout_damage(box_);
+            // SAFETY: data() validated that box_ names a live slot, and the layout tree is stable
+            // for the duration of this synchronous topology update.
+            box_ = unsafe { (&raw const (*data).parent).read() };
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_set_text_content(
     arena: *mut c_void,
     id: NodeSlotId,
@@ -1119,22 +1138,6 @@ pub unsafe extern "C" fn layout_arena_set_replaced_content_facts(
         // serializes all access on the document thread.
         unsafe { &mut *arena.cast::<LayoutNodeArena>() }.set_replaced_content_facts(id, facts)
     })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_note_viewport_size(
-    arena: *mut c_void,
-    viewport_inline_size_raw: i32,
-    viewport_block_size_raw: i32,
-) {
-    abort_on_panic(|| {
-        assert!(!arena.is_null(), "layout node arena handle is null");
-        // SAFETY: The C++ wrapper keeps the arena alive for this call and
-        // serializes all access on the document thread.
-        unsafe { &*arena.cast::<LayoutNodeArena>() }
-            .fc_run_cache_store()
-            .note_viewport_size(viewport_inline_size_raw, viewport_block_size_raw);
-    });
 }
 
 #[unsafe(no_mangle)]

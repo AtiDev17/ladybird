@@ -29,7 +29,9 @@ fn fc_run_cache_mode_from_environment() -> FcRunCacheMode {
 
 /// The complete identity of a memoizable run: the layout input plus the
 /// pre-run root record state the dispatch seam captures anyway, so every
-/// value a parent hands a spawned run is part of the key.
+/// value a parent hands a spawned run is part of the key. Viewport changes
+/// reach a run through that input or through the normal style/layout epoch
+/// invalidation for viewport-dependent computed values.
 #[derive(Clone, Copy, PartialEq)]
 struct FcRunCacheKey {
     fc_type: FfiFormattingContextType,
@@ -39,14 +41,11 @@ struct FcRunCacheKey {
 
 /// What must still be true for a stored entry to be replayed: the slot
 /// holds the same box (generation), nothing in its subtree was invalidated
-/// (the fragment cache epoch, whose bump walk has no propagation
-/// boundary), and the viewport is unchanged (viewport-relative styles do
-/// not necessarily funnel through per-node invalidation).
+/// (the fragment cache epoch, whose bump walk has no propagation boundary).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FcRunCacheValidity {
     pub(crate) slot_generation: u8,
     pub(crate) fragment_cache_epoch: u32,
-    pub(crate) viewport: (i32, i32),
 }
 
 struct FcRunCacheEntry {
@@ -66,24 +65,51 @@ struct FcRunCacheEntry {
     retained_fonts: Vec<libgfx_rust::font::RetainedFont>,
 }
 
+impl FcRunCacheEntry {
+    fn can_reuse_committed_subtree(&self) -> bool {
+        self.outputs
+            .root
+            .as_ref()
+            .is_none_or(|root| root.propagated_pending_abspos.is_empty())
+    }
+
+    fn outputs_for_reused_subtree(&self) -> RunOutputs {
+        debug_assert!(self.can_reuse_committed_subtree());
+        let root = self.outputs.root.as_ref().map(|root| UnplacedRootFragment {
+            node: root.node,
+            // Commit stops at the reused root, so descendant fragments and nested reuse markers never
+            // enter its scopes. Only payloads that escape the run still have to reach the parent.
+            scoped_descendants: Vec::new(),
+            reused_subtree_roots: std::collections::HashSet::new(),
+            propagated_pending_abspos: root.propagated_pending_abspos.clone(),
+            propagated_anchor_candidates: root.propagated_anchor_candidates.clone(),
+            propagated_inline_containing_block_rects: root.propagated_inline_containing_block_rects.clone(),
+            propagated_abspos_containing_block_info: root.propagated_abspos_containing_block_info.clone(),
+        });
+        RunOutputs {
+            result: self.outputs.result,
+            root,
+            root_outcome: self.outputs.root_outcome.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InlineLayoutDamage {
+    generation: u8,
+    structural_epoch_bumps: u32,
+}
+
 /// Per-document store of completed run results, one entry per slot,
 /// surviving across layout passes on the node arena.
 #[derive(Default)]
 pub(crate) struct FcRunCacheArenaStore {
-    viewport: Cell<(i32, i32)>,
     hit_count: Cell<u64>,
     entries: RefCell<Vec<Option<std::rc::Rc<FcRunCacheEntry>>>>,
+    inline_layout_damage: RefCell<Vec<InlineLayoutDamage>>,
 }
 
 impl FcRunCacheArenaStore {
-    pub(crate) fn note_viewport_size(&self, inline_size_raw: i32, block_size_raw: i32) {
-        self.viewport.set((inline_size_raw, block_size_raw));
-    }
-
-    pub(crate) fn viewport_size(&self) -> (i32, i32) {
-        self.viewport.get()
-    }
-
     pub(crate) fn hit_count(&self) -> u64 {
         self.hit_count.get()
     }
@@ -92,19 +118,96 @@ impl FcRunCacheArenaStore {
         if let Some(entry) = self.entries.borrow_mut().get_mut(slot as usize) {
             *entry = None;
         }
+        if let Some(damage) = self.inline_layout_damage.borrow_mut().get_mut(slot as usize) {
+            *damage = InlineLayoutDamage::default();
+        }
     }
 
-    /// A matching entry stays stored — hits hand out shared handles — while
-    /// a stale entry is evicted on sight, releasing its tree and fonts.
-    fn matching(&self, slot: u32, validity: FcRunCacheValidity, key: &FcRunCacheKey) -> Option<std::rc::Rc<FcRunCacheEntry>> {
-        let mut entries = self.entries.borrow_mut();
-        let stored = entries.get_mut(slot as usize)?;
+    pub(crate) fn note_inline_layout_damage(&self, box_: Node) {
+        if self
+            .entries
+            .borrow()
+            .get(box_.slot_index() as usize)
+            .is_none_or(Option::is_none)
+        {
+            return;
+        }
+        let mut damage = self.inline_layout_damage.borrow_mut();
+        if damage.len() <= box_.slot_index() as usize {
+            damage.resize(box_.slot_index() as usize + 1, InlineLayoutDamage::default());
+        }
+        let entry = &mut damage[box_.slot_index() as usize];
+        if entry.generation != box_.generation() {
+            *entry = InlineLayoutDamage {
+                generation: box_.generation(),
+                structural_epoch_bumps: 1,
+            };
+        } else {
+            entry.structural_epoch_bumps = entry
+                .structural_epoch_bumps
+                .checked_add(1)
+                .expect("inline layout damage counter overflowed");
+        }
+    }
+
+    fn take_inline_layout_damage(&self, box_: Node) -> u32 {
+        let mut damage = self.inline_layout_damage.borrow_mut();
+        let Some(entry) = damage.get_mut(box_.slot_index() as usize) else {
+            return 0;
+        };
+        let result = if entry.generation == box_.generation() {
+            entry.structural_epoch_bumps
+        } else {
+            0
+        };
+        *entry = InlineLayoutDamage::default();
+        result
+    }
+
+    /// A matching entry stays stored and hands out a shared handle. A stale
+    /// entry survives until the fresh run replaces it, allowing structural
+    /// inline damage to use its line data during that run.
+    fn matching(
+        &self,
+        slot: u32,
+        validity: FcRunCacheValidity,
+        key: &FcRunCacheKey,
+    ) -> Option<std::rc::Rc<FcRunCacheEntry>> {
+        let entries = self.entries.borrow();
+        let stored = entries.get(slot as usize)?;
         let entry = stored.as_ref()?;
         if entry.validity != validity {
-            *stored = None;
             return None;
         }
         if entry.key != *key {
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    fn structurally_damaged_entry(
+        &self,
+        slot: u32,
+        validity: FcRunCacheValidity,
+        key: &FcRunCacheKey,
+        structural_epoch_bumps: u32,
+    ) -> Option<std::rc::Rc<FcRunCacheEntry>> {
+        if structural_epoch_bumps == 0 {
+            return None;
+        }
+        let entries = self.entries.borrow();
+        let entry = entries.get(slot as usize)?.as_ref()?;
+        if entry.validity.slot_generation != validity.slot_generation
+            || entry.key != *key
+            // Each child-list edit bumps once when topology changes and once
+            // when the parent is marked for layout-tree-update layout.
+            || validity
+                .fragment_cache_epoch
+                .wrapping_sub(entry.validity.fragment_cache_epoch)
+                != structural_epoch_bumps
+                    .checked_mul(2)
+                    .expect("inline layout damage epoch delta overflowed")
+        {
             return None;
         }
         Some(entry.clone())
@@ -160,7 +263,6 @@ fn run_root_validity(callbacks: &FfiLayoutFcCallbacks, box_: Node) -> FcRunCache
     FcRunCacheValidity {
         slot_generation: data.slot_generation,
         fragment_cache_epoch: data.fragment_cache_epoch,
-        viewport: callbacks.arena().fc_run_cache_store().viewport.get(),
     }
 }
 
@@ -182,6 +284,7 @@ enum FcRunCacheAttempt {
         /// a forever-valid entry.
         validity: FcRunCacheValidity,
         shadow_entry: Option<std::rc::Rc<FcRunCacheEntry>>,
+        structurally_damaged_entry: Option<std::rc::Rc<FcRunCacheEntry>>,
     },
 }
 
@@ -209,6 +312,11 @@ impl FcRunCacheAttempt {
                 fc_type,
                 FfiFormattingContextType::InternalReplaced | FfiFormattingContextType::InternalDummy
             )
+            // The direct normal-layout path for an empty atomic block only sizes and snapshots its root.
+            // Replaying a stored output costs more than rebuilding it and retains an entry needlessly.
+            || (fc_type == FfiFormattingContextType::Block
+                && input.participation == ParticipationInParentFormattingContext::AtomicInline
+                && callbacks.first_child(box_).is_invalid())
         {
             return Ok(Self::Bypass);
         }
@@ -237,6 +345,7 @@ impl FcRunCacheAttempt {
         });
         let store = callbacks.arena().fc_run_cache_store();
         let validity = run_root_validity(callbacks, box_);
+        let structural_epoch_bumps = store.take_inline_layout_damage(box_);
         match store.matching(box_.slot_index(), validity, &key) {
             Some(entry) if mode == FcRunCacheMode::Shadow => {
                 // A shadow match is the same event a replay would be, so the
@@ -247,18 +356,35 @@ impl FcRunCacheAttempt {
                     key,
                     validity,
                     shadow_entry: Some(entry),
+                    structurally_damaged_entry: None,
                 })
             }
             Some(entry) => {
                 store.hit_count.set(store.hit_count.get() + 1);
                 Err(entry)
             }
-            None => Ok(Self::Store {
-                key,
-                validity,
-                shadow_entry: None,
-            }),
+            None => {
+                let structurally_damaged_entry =
+                    store.structurally_damaged_entry(box_.slot_index(), validity, &key, structural_epoch_bumps);
+                Ok(Self::Store {
+                    key,
+                    validity,
+                    shadow_entry: None,
+                    structurally_damaged_entry,
+                })
+            }
         }
+    }
+
+    fn previous_line_data(&self) -> Option<std::rc::Rc<LineData>> {
+        let Self::Store {
+            structurally_damaged_entry: Some(entry),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        entry.outputs.root_outcome.line_data.clone()
     }
 
     fn conclude(self, callbacks: &FfiLayoutFcCallbacks, box_: Node, outputs: &RunOutputs) {
@@ -266,6 +392,7 @@ impl FcRunCacheAttempt {
             key,
             validity,
             shadow_entry,
+            structurally_damaged_entry: _,
         } = self
         else {
             return;
@@ -273,6 +400,12 @@ impl FcRunCacheAttempt {
         let Some(root) = &outputs.root else {
             return;
         };
+        // A committed-subtree hit omits that subtree's descendant fragments. Do not embed such a
+        // skeletal result in an entry that exports an out-of-flow descendant: replaying the parent
+        // has to rebuild its paintable subtree so the freshly laid-out descendant can commit.
+        if !root.propagated_pending_abspos.is_empty() && !root.reused_subtree_roots.is_empty() {
+            return;
+        }
         let mut fonts = Vec::new();
         if let Some(line_data) = &outputs.root_outcome.line_data {
             collect_line_data_fonts(line_data, &mut fonts);

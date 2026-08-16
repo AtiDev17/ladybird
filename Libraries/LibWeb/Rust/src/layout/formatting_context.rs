@@ -780,6 +780,7 @@ pub struct FfiBordersData {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChildLayoutResult {
     pub automatic_content_inline_size: CssPixels,
+    pub min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub automatic_content_block_size: CssPixels,
     pub baselines: DerivedBaselines,
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
@@ -1128,6 +1129,7 @@ pub(crate) struct FormattingContextRun {
     pub(crate) should_collect_devtools_layout_data: bool,
     pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     pub(crate) fragments: Option<std::rc::Rc<RunFragmentBuilder>>,
+    pub(crate) previous_line_data: Option<std::rc::Rc<LineData>>,
 }
 
 impl FormattingContextRun {
@@ -1637,8 +1639,21 @@ fn run_formatting_context(
         &root_cells,
     ) {
         Ok(attempt) => attempt,
-        Err(entry) => return absorb_run_outputs(parent_fragments, parent_used, box_, entry.outputs.clone()),
+        Err(entry) => {
+            let reuses_committed_subtree = entry.can_reuse_committed_subtree();
+            let outputs = if reuses_committed_subtree {
+                entry.outputs_for_reused_subtree()
+            } else {
+                entry.outputs.clone()
+            };
+            return absorb_run_outputs(parent_fragments, parent_used, box_, outputs, reuses_committed_subtree);
+        }
     };
+    if let Some(parent_fragments) = parent_fragments {
+        // A later fresh run for this root supersedes a hit recorded earlier in the same pass.
+        parent_fragments.clear_reused_subtree_root(box_);
+    }
+    let previous_line_data = cache_attempt.previous_line_data();
     let outputs = execute_formatting_context_run(
         purpose,
         root_cells,
@@ -1650,9 +1665,10 @@ fn run_formatting_context(
         callbacks,
         input,
         parent_block,
+        previous_line_data,
     );
     cache_attempt.conclude(&callbacks, box_, &outputs);
-    absorb_run_outputs(parent_fragments, parent_used, box_, outputs)
+    absorb_run_outputs(parent_fragments, parent_used, box_, outputs, false)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1667,6 +1683,7 @@ fn execute_formatting_context_run(
     callbacks: FfiLayoutFcCallbacks,
     input: LayoutInput,
     parent_block: Option<&BlockFormattingContext>,
+    previous_line_data: Option<std::rc::Rc<LineData>>,
 ) -> RunOutputs {
     assert!(!box_.is_invalid());
     let root_used = std::rc::Rc::new(root_cells.materialize_record());
@@ -1685,6 +1702,7 @@ fn execute_formatting_context_run(
                 (!root_containing_block.is_invalid()).then_some(root_containing_block),
             ))
         }),
+        previous_line_data,
     };
     let run = &run;
     let body_input = apply_root_sizing_directives(run, &input);
@@ -1706,6 +1724,15 @@ fn execute_formatting_context_run(
             baselines: cached_baselines,
             ..ChildLayoutResult::default()
         }
+    } else if layout_mode == LayoutMode::Normal
+        && !purpose.is_measurement()
+        && matches!(input.participation, ParticipationInParentFormattingContext::AtomicInline)
+        && fc_type == FfiFormattingContextType::Block
+        && callbacks.first_child(box_).is_invalid()
+    {
+        // An empty atomic block context has no body output. Root sizing and finalization still
+        // run through the shared paths around this branch.
+        ChildLayoutResult::default()
     } else {
         let mut context_implementation = create_formatting_context_implementation(run, parent_grid, fc_type);
         let result = match &mut context_implementation {
@@ -1715,6 +1742,8 @@ fn execute_formatting_context_run(
                 store_derived_baselines(&run.records.used_values(run.box_), baselines);
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
+                    min_content_inline_size_from_max_content_layout: context
+                        .min_content_inline_size_from_max_content_layout(),
                     automatic_content_block_size: context.automatic_content_block_size(),
                     baselines,
                     table_box_in_wrapper_border_box_block_size: context.table_box_in_wrapper_border_box_block_size(),
@@ -1809,22 +1838,23 @@ fn execute_formatting_context_run(
     if registered_abspos_children_could_never_be_laid_out {
         return run.outputs(result, take_run_fragments());
     }
-    let implementation = implementation.expect("cached measurement replay only occurs on measurement states");
-    match &implementation {
-        FormattingContextImplementation::Block(_) => {}
-        FormattingContextImplementation::Table(_) => {
-            let box_ = run.box_;
-            register_table_abspos_descendants(run, box_);
-        }
-        FormattingContextImplementation::Flex(context) => {
-            context.parent_did_dimension();
-        }
-        FormattingContextImplementation::Grid(context) => {
-            context.parent_did_dimension();
-        }
-        FormattingContextImplementation::Svg(_) | FormattingContextImplementation::ReplacedWithChildren => {}
-        FormattingContextImplementation::InternalReplaced | FormattingContextImplementation::InternalDummy => {
-            return run.outputs(result, take_run_fragments());
+    if let Some(implementation) = implementation {
+        match &implementation {
+            FormattingContextImplementation::Block(_) => {}
+            FormattingContextImplementation::Table(_) => {
+                let box_ = run.box_;
+                register_table_abspos_descendants(run, box_);
+            }
+            FormattingContextImplementation::Flex(context) => {
+                context.parent_did_dimension();
+            }
+            FormattingContextImplementation::Grid(context) => {
+                context.parent_did_dimension();
+            }
+            FormattingContextImplementation::Svg(_) | FormattingContextImplementation::ReplacedWithChildren => {}
+            FormattingContextImplementation::InternalReplaced | FormattingContextImplementation::InternalDummy => {
+                return run.outputs(result, take_run_fragments());
+            }
         }
     }
     run.records.used_values(run.box_).seal_own_metrics();
@@ -1960,6 +1990,7 @@ fn absorb_run_outputs(
     parent_used: &UsedValues,
     child: Node,
     outputs: RunOutputs,
+    reuses_committed_subtree: bool,
 ) -> ChildLayoutResult {
     let RunOutputs {
         result,
@@ -1969,6 +2000,9 @@ fn absorb_run_outputs(
     root_outcome.apply_to_record(parent_used);
     if let (Some(fragments), Some(root)) = (parent_fragments, root) {
         debug_assert!(root.node == child, "a child run returned a root for a different box");
+        if reuses_committed_subtree {
+            fragments.note_reused_subtree_root(child);
+        }
         fragments.hold_unplaced_root(root);
     }
     result
@@ -2074,6 +2108,7 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             should_collect_devtools_layout_data,
             treat_block_axis_percentage_insets_as_auto_beyond_root: false,
             fragments: Some(entry_fragments.clone()),
+            previous_line_data: None,
         };
 
         let mut root_for_layout = root;
@@ -2176,6 +2211,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
             should_collect_devtools_layout_data: false,
             treat_block_axis_percentage_insets_as_auto_beyond_root: false,
             fragments: Some(entry_fragments.clone()),
+            previous_line_data: None,
         };
         if !viewport.is_invalid() && viewport != root {
             let viewport_inline_size = CssPixels::from_raw(viewport_inline_size_raw);
@@ -2270,6 +2306,7 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
             should_collect_devtools_layout_data: false,
             treat_block_axis_percentage_insets_as_auto_beyond_root: false,
             fragments: Some(entry_fragments.clone()),
+            previous_line_data: None,
         };
         AbsposEngine::for_run(&run).replay(&run, box_);
         drain_and_commit_entry_pass(
