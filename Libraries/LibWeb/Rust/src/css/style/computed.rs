@@ -33,6 +33,8 @@ use super::memory::MemoryLease;
 use super::tree::PseudoElementKind;
 use super::tree::PseudoElementTarget;
 use super::tree::StyleNodeID;
+use crate::css::computed_longhand_table::ComputedLonghandTable;
+use crate::css::computed_longhand_table::LONGHAND_COUNT;
 use crate::css::computed_values::computed_group_output_mask;
 use crate::css::computed_values::release_group_payload;
 use crate::css::computed_values::replay_style_group_identity;
@@ -42,10 +44,11 @@ use crate::css::computed_values::retained_group_payload_bytes;
 use crate::css::computed_values::style_group_payloads_equal;
 use crate::css::style_value::RetainedStyleValueData;
 use crate::css::style_value::StyleValueData;
+use crate::css::style_value::retain_style_value as retain_style_value_reference;
 use crate::css::style_value::retained_value_depends_on_color_scheme;
 use crate::css::style_value::retained_value_depends_on_current_color;
 use crate::css::style_value::retained_value_may_depend_on_font_metrics;
-use crate::css::style_value::rust_style_value_retain;
+use crate::css::style_value::rust_style_value_equals;
 
 // The high bit is a node-local production capability carried with publication and stripped before
 // the semantic fixed metadata is interned or exposed through a style-record view.
@@ -100,6 +103,14 @@ impl InternIdentity for ComputedReconstructionMetadataID {
     }
 }
 
+define_id! { pub struct ComputedLonghandTableID(); }
+
+impl InternIdentity for ComputedLonghandTableID {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StyleRecordID(NonZeroU32);
 
@@ -136,12 +147,63 @@ struct ComputedReconstructionMetadata {
     raw_cascaded_font_size: Option<RetainedStyleValueData>,
 }
 
+/// The interned form of one drive's computed longhand table: one retained
+/// data pointer per longhand (null where the drive stored no value), which is
+/// also the borrowed span the record view hands out. Provenance (the
+/// source-slot sidecar) stays on the drive table and is not retained here,
+/// so equal value tuples share one identity.
+struct RetainedLonghandTable {
+    storage: RetainedLonghandTableStorage,
+}
+
+fn longhand_value_views_equal(first: &[*const c_void], second: &[*const c_void]) -> bool {
+    first
+        .iter()
+        .zip(second)
+        .all(|(&first, &second)| first == second || unsafe { rust_style_value_equals(first.cast(), second.cast()) })
+}
+
+enum RetainedLonghandTableStorage {
+    Shared(*const ComputedLonghandTable),
+    Values(Box<[*const c_void]>),
+}
+
+impl RetainedLonghandTable {
+    fn value_view(&self) -> &[*const c_void] {
+        match &self.storage {
+            RetainedLonghandTableStorage::Shared(table) => unsafe { &**table }.value_pointers(),
+            RetainedLonghandTableStorage::Values(values) => values,
+        }
+    }
+}
+
+impl Drop for RetainedLonghandTable {
+    fn drop(&mut self) {
+        match &self.storage {
+            RetainedLonghandTableStorage::Shared(table) => unsafe {
+                crate::css::computed_longhand_table::rust_computed_longhand_table_release(table.cast_mut());
+            },
+            RetainedLonghandTableStorage::Values(values) => {
+                for &value in values {
+                    if !value.is_null() {
+                        unsafe { crate::css::style_value::release_style_value(value.cast()) };
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct StyleRecordView<'a> {
     pub payloads: &'a [*const c_void],
     pub base_payloads: &'a [*const c_void],
     pub property_importance: &'a [u8],
     pub property_inheritance: &'a [u8],
     pub inheritance_dependent_values: &'a [super::bridge::FfiInheritanceDependentValue],
+    /// One entry per longhand (null where the drive stored no value), or
+    /// empty when the record was published without a longhand table. Always
+    /// the base record's table: animation overlays store no table entries.
+    pub longhand_values: &'a [*const c_void],
     pub raw_cascaded_font_size: *const c_void,
     pub animated_properties: *const c_void,
     pub pseudo_element_styles: u64,
@@ -156,14 +218,15 @@ struct StyleRecord {
     custom_properties: CustomPropertyEnvironmentID,
     fixed_metadata: ComputedFixedMetadataID,
     reconstruction_metadata: ComputedReconstructionMetadataID,
+    longhand_table: Option<ComputedLonghandTableID>,
 }
 
 struct RetainedAnimatedProperties(*const c_void);
 
 impl RetainedAnimatedProperties {
-    fn new(pointer: *const c_void) -> Self {
+    /// Assumes ownership of one leaked C++ reference.
+    unsafe fn from_leaked(pointer: *const c_void) -> Self {
         assert!(!pointer.is_null(), "style-record animated properties are null");
-        unsafe { ladybird_animated_properties_ref(pointer) };
         Self(pointer)
     }
 
@@ -174,21 +237,9 @@ impl RetainedAnimatedProperties {
 
 impl Drop for RetainedAnimatedProperties {
     fn drop(&mut self) {
-        unsafe { ladybird_animated_properties_unref(self.0) };
+        crate::css::ffi_stats::release_animated_properties(self.0);
     }
 }
-
-#[cfg(not(test))]
-unsafe extern "C" {
-    fn ladybird_animated_properties_ref(values: *const c_void);
-    fn ladybird_animated_properties_unref(values: *const c_void);
-}
-
-#[cfg(test)]
-unsafe fn ladybird_animated_properties_ref(_: *const c_void) {}
-
-#[cfg(test)]
-unsafe fn ladybird_animated_properties_unref(_: *const c_void) {}
 
 pub struct ComputedReconstructionMetadataInput<'a> {
     pub property_importance: &'a [u8],
@@ -205,6 +256,13 @@ pub struct ComputedMetadataInput<'a> {
     pub animation_overlay_identity: u64,
     pub animated_properties: *const c_void,
     pub animation_overlay_payloads: &'a [*const c_void],
+    /// The drive's frozen computed longhand table, or null when the publisher
+    /// carries none. Its values are interned as the record's longhand-table
+    /// relation. The style-sheet-context sidecar stays on the drive table:
+    /// its cascade source slots are only meaningful against the drive's own
+    /// cascade, so folding them into interned identity would split records
+    /// across otherwise identical recomputes.
+    pub longhand_table: *const ComputedLonghandTable,
     pub reconstruction: ComputedReconstructionMetadataInput<'a>,
 }
 
@@ -265,6 +323,7 @@ struct ComputedGroup {
 struct ComputedGroupSet {
     identities: Box<[ComputedGroupID]>,
     payloads: Box<[*const c_void]>,
+    canonical_longhand_table: Option<ComputedLonghandTableID>,
 }
 
 #[derive(Clone, Copy)]
@@ -357,6 +416,7 @@ pub struct ComputedGroupSets {
     computed_fixed_metadata_column: Vec<Option<ComputedFixedMetadataID>>,
     computed_reconstruction_metadata: InternTable<ComputedReconstructionMetadataID, ComputedReconstructionMetadata>,
     computed_reconstruction_metadata_column: Vec<Option<ComputedReconstructionMetadataID>>,
+    computed_longhand_tables: InternTable<ComputedLonghandTableID, RetainedLonghandTable>,
     style_records: InternTable<StyleRecordID, StyleRecord>,
     style_record_column: Vec<Option<StyleRecordID>>,
     // Recyclable animation overlays are deliberately separate from the permanent base records
@@ -394,6 +454,7 @@ impl Default for ComputedGroupSets {
             computed_fixed_metadata_column: Vec::new(),
             computed_reconstruction_metadata: InternTable::default(),
             computed_reconstruction_metadata_column: Vec::new(),
+            computed_longhand_tables: InternTable::default(),
             style_records: InternTable::default(),
             style_record_column: Vec::new(),
             animation_overlay_slots: Vec::new(),
@@ -439,8 +500,15 @@ impl ComputedGroupSets {
         let identities = groups.into_boxed_slice();
         self.group_set_nested_memory
             .grow_committed((size_of_val(identities.as_ref()) + size_of_val(payloads.as_ref())) as u64);
-        self.sets
-            .insert(hash, identity, ComputedGroupSet { identities, payloads });
+        self.sets.insert(
+            hash,
+            identity,
+            ComputedGroupSet {
+                identities,
+                payloads,
+                canonical_longhand_table: None,
+            },
+        );
         (identity, true)
     }
 
@@ -462,6 +530,90 @@ impl ComputedGroupSets {
         let identity = StyleRecordID(NonZeroU32::new(raw).expect("base style-record identities are nonzero"));
         self.style_records.insert(hash, identity, record);
         (identity, true)
+    }
+
+    /// Interns the values of one drive's frozen computed longhand table, so
+    /// equal value tuples share one identity and one retained copy. A
+    /// value-equal previous table keeps its identity even when the fresh
+    /// drive re-allocated equal values. The table's provenance sidecar is
+    /// deliberately not part of the identity, nor retained here at all: its
+    /// cascade source slots are per-drive data.
+    fn intern_longhand_table(
+        &mut self,
+        table: &ComputedLonghandTable,
+        previous: Option<ComputedLonghandTableID>,
+        canonical: Option<ComputedLonghandTableID>,
+    ) -> ComputedLonghandTableID {
+        debug_assert!(table.is_frozen(), "only frozen longhand tables are published");
+        let values = table.value_pointers();
+        for candidate in [previous, canonical].into_iter().flatten() {
+            let candidate_values = self.computed_longhand_tables[candidate].value_view();
+            if longhand_value_views_equal(candidate_values, values) {
+                return candidate;
+            }
+        }
+        let hash = longhand_table_hash(values);
+        if let Some(identity) = self.computed_longhand_tables.find(hash, |_identity, candidate| {
+            longhand_value_views_equal(candidate.value_view(), values)
+        }) {
+            return identity;
+        }
+        let identity = ComputedLonghandTableID(
+            u32::try_from(self.computed_longhand_tables.len())
+                .expect("computed longhand-table identity space exhausted"),
+        );
+        let retained = unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_retain(table) };
+        self.reconstruction_nested_memory
+            .grow_committed(size_of_val(values) as u64);
+        self.computed_longhand_tables.insert(
+            hash,
+            identity,
+            RetainedLonghandTable {
+                storage: RetainedLonghandTableStorage::Shared(retained),
+            },
+        );
+        identity
+    }
+
+    fn intern_longhand_values(
+        &mut self,
+        values: &[*const c_void],
+        previous: Option<ComputedLonghandTableID>,
+    ) -> ComputedLonghandTableID {
+        assert_eq!(values.len(), LONGHAND_COUNT);
+        if let Some(previous) = previous {
+            let previous_values = self.computed_longhand_tables[previous].value_view();
+            if longhand_value_views_equal(previous_values, values) {
+                return previous;
+            }
+        }
+        let hash = longhand_table_hash(values);
+        if let Some(identity) = self.computed_longhand_tables.find(hash, |_identity, candidate| {
+            longhand_value_views_equal(candidate.value_view(), values)
+        }) {
+            return identity;
+        }
+        let identity = ComputedLonghandTableID(
+            u32::try_from(self.computed_longhand_tables.len())
+                .expect("computed longhand-table identity space exhausted"),
+        );
+        let value_view: Box<[*const c_void]> = values
+            .iter()
+            .map(|&value| match value.is_null() {
+                true => value,
+                false => unsafe { retain_style_value_reference(value.cast()) }.cast(),
+            })
+            .collect();
+        self.reconstruction_nested_memory
+            .grow_committed(size_of_val(value_view.as_ref()) as u64);
+        self.computed_longhand_tables.insert(
+            hash,
+            identity,
+            RetainedLonghandTable {
+                storage: RetainedLonghandTableStorage::Values(value_view),
+            },
+        );
+        identity
     }
 
     /// Replace a fully inheriting element's static inherited groups with its flat-tree parent's
@@ -509,11 +661,36 @@ impl ComputedGroupSets {
         let mut groups = old_group_set.identities.to_vec();
         groups[..INHERITED_GROUP_COUNT].copy_from_slice(parent_groups);
         let group_set = self.intern_group_set(groups).0;
+        // The swap is only taken for a fully inheriting element, so every
+        // inherited-by-default longhand's value is the parent's; the swapped
+        // record's table is the old one with those slots replaced by the
+        // parent's, keeping the record a complete inheritance source for a
+        // child's drive. Records without tables on either side (none remain
+        // in practice) publish without one.
+        let parent_style_record = self.style_record_column.get(parent_index).copied().flatten();
+        let parent_table = parent_style_record
+            .and_then(|record| self.style_records.get_index(record.raw() as usize - 1))
+            .and_then(|record| record.longhand_table);
+        let longhand_table = match (old_record.longhand_table, parent_table) {
+            (Some(old_table), Some(parent_table)) => {
+                use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, property_is_inherited};
+                let mut values = self.computed_longhand_tables[old_table].value_view().to_vec();
+                let parent_values = self.computed_longhand_tables[parent_table].value_view();
+                for (index, value) in values.iter_mut().enumerate() {
+                    if property_is_inherited(FIRST_LONGHAND_PROPERTY_ID + index as u16) {
+                        *value = parent_values[index];
+                    }
+                }
+                Some(self.intern_longhand_values(&values, Some(old_table)))
+            }
+            _ => None,
+        };
         let new_record = StyleRecord {
             groups: group_set,
             custom_properties: old_record.custom_properties,
             fixed_metadata: old_record.fixed_metadata,
             reconstruction_metadata: old_record.reconstruction_metadata,
+            longhand_table,
         };
         let new_style_record = self.intern_style_record(new_record).0;
         self.column[index] = Some(group_set);
@@ -537,7 +714,7 @@ impl ComputedGroupSets {
         &mut self,
         base_style_record: StyleRecordID,
         source_identity: u64,
-        animated_properties: *const c_void,
+        animated_properties: RetainedAnimatedProperties,
         payloads: &[*const c_void],
     ) -> AnimationOverlayRecord {
         assert!(payloads.iter().all(|payload| !payload.is_null()));
@@ -548,7 +725,7 @@ impl ComputedGroupSets {
             base_style_record,
             source_identity,
             final_style_record: self.next_animation_overlay_record(),
-            animated_properties: RetainedAnimatedProperties::new(animated_properties),
+            animated_properties,
             payloads: payloads.into(),
             pin_count: 0,
             is_assigned: true,
@@ -559,11 +736,17 @@ impl ComputedGroupSets {
         &mut self,
         base_style_record: StyleRecordID,
         source_identity: u64,
-        animated_properties: *const c_void,
+        animated_properties: &mut Option<RetainedAnimatedProperties>,
         payloads: &[*const c_void],
     ) -> (u32, FinalStyleRecordID, bool) {
-        let record =
-            self.make_animation_overlay_record(base_style_record, source_identity, animated_properties, payloads);
+        let record = self.make_animation_overlay_record(
+            base_style_record,
+            source_identity,
+            animated_properties
+                .take()
+                .expect("animation overlay properties are missing"),
+            payloads,
+        );
         self.animation_overlay_nested_memory
             .grow_committed(size_of_val(record.payloads.as_ref()) as u64);
         let final_style_record = record.final_style_record;
@@ -613,7 +796,7 @@ impl ComputedGroupSets {
         current_slot: Option<u32>,
         base_style_record: StyleRecordID,
         source_identity: u64,
-        animated_properties: *const c_void,
+        animated_properties: &mut Option<RetainedAnimatedProperties>,
         payloads: &[*const c_void],
     ) -> AnimationOverlayPublication {
         if source_identity == 0 {
@@ -651,7 +834,9 @@ impl ComputedGroupSets {
                 let record = self.make_animation_overlay_record(
                     base_style_record,
                     source_identity,
-                    animated_properties,
+                    animated_properties
+                        .take()
+                        .expect("animation overlay properties are missing"),
                     payloads,
                 );
                 let new_payload_bytes = size_of_val(record.payloads.as_ref()) as u64;
@@ -719,8 +904,15 @@ impl ComputedGroupSets {
             animation_overlay_identity,
             animated_properties,
             animation_overlay_payloads,
+            longhand_table,
             reconstruction: reconstruction_metadata,
         } = metadata_input;
+        let mut animated_properties = if animated_properties.is_null() {
+            None
+        } else {
+            Some(unsafe { RetainedAnimatedProperties::from_leaked(animated_properties) })
+        };
+        let longhand_table = unsafe { longhand_table.as_ref() };
         let inherited_group_swap_eligible = dependency_flags & INHERITED_GROUP_SWAP_ELIGIBLE != 0;
         let dependency_flags = dependency_flags & COMPUTED_VALUE_DEPENDENCY_FLAGS;
         assert!(inherited_group_count <= payloads.len());
@@ -862,6 +1054,34 @@ impl ComputedGroupSets {
             }
         };
 
+        // NB: A recompute allocates fresh value data for many longhands even when nothing changed,
+        //     so interning by pointer content alone would mint a new table identity - and a new
+        //     style record - on every recompute. The target's previous table is offered as a
+        //     canonical candidate and reused when every slot holds an equal value, mirroring how
+        //     output group payloads canonicalize against the previous group set above.
+        let previous_longhand_table = target.and_then(|target| {
+            let ComputedStyleTarget { node, pseudo_kind } = target;
+            let style_record = if target.is_pseudo() {
+                self.pseudo_assignments
+                    .get(&(node, pseudo_kind))
+                    .map(|inputs| inputs.style_record)
+            } else {
+                node.element_index()
+                    .and_then(|index| self.style_record_column.get(index as usize))
+                    .copied()
+                    .flatten()
+            }?;
+            self.style_records
+                .get_index(style_record.raw() as usize - 1)?
+                .longhand_table
+        });
+        let canonical_longhand_table = self.sets[identity].canonical_longhand_table;
+        let longhand_table_identity = longhand_table
+            .map(|table| self.intern_longhand_table(table, previous_longhand_table, canonical_longhand_table));
+        if self.sets[identity].canonical_longhand_table.is_none() {
+            self.sets[identity].canonical_longhand_table = longhand_table_identity;
+        }
+
         assert_eq!(
             reconstruction_metadata.inheritance_dependent_properties.len(),
             reconstruction_metadata.inheritance_dependent_values.len()
@@ -934,6 +1154,7 @@ impl ComputedGroupSets {
             custom_properties: custom_property_environment_identity,
             fixed_metadata: computed_fixed_metadata_identity,
             reconstruction_metadata: computed_reconstruction_metadata_identity,
+            longhand_table: longhand_table_identity,
         };
         let (style_record_identity, new_style_record) = self.intern_style_record(style_record);
 
@@ -955,7 +1176,7 @@ impl ComputedGroupSets {
                 previous.and_then(|previous| previous.animation_overlay_slot),
                 style_record_identity,
                 animation_overlay_identity,
-                animated_properties,
+                &mut animated_properties,
                 animation_overlay_payloads,
             );
             if previous.is_none() {
@@ -1008,7 +1229,7 @@ impl ComputedGroupSets {
                 self.animation_overlay_column[index],
                 style_record_identity,
                 animation_overlay_identity,
-                animated_properties,
+                &mut animated_properties,
                 animation_overlay_payloads,
             );
             let changed = (
@@ -1075,6 +1296,209 @@ impl ComputedGroupSets {
             animation_overlay_record_updated: animation_overlay_publication.record_updated,
             live_animation_overlay_records: self.live_animation_overlay_assignments,
             is_pseudo,
+        }
+    }
+
+    pub fn assign_shared_style_record(
+        &mut self,
+        target: ComputedStyleTarget,
+        raw_style_record: u64,
+        inherited_group_count: usize,
+        inherited_group_swap_eligible: bool,
+    ) -> Option<ComputedGroupPublication> {
+        let final_style_record = FinalStyleRecordID(raw_style_record);
+        let requested_style_record_identity = final_style_record.base_record()?;
+        let previous_base_style_record_identity = if target.is_pseudo() {
+            self.pseudo_assignments
+                .get(&(target.node, target.pseudo_kind))
+                .map(|assignment| assignment.style_record)
+        } else {
+            target
+                .node
+                .element_index()
+                .and_then(|index| self.style_record_column.get(index as usize))
+                .copied()
+                .flatten()
+        };
+        // A regular publication canonicalizes every freshly produced group and longhand table
+        // against the target's previous record. A shared record was canonicalized against its
+        // donor instead, so preserve the target's identity when both records carry equal values.
+        // This keeps a no-op recompute from looking like a layout-affecting style change.
+        let style_record_identity = previous_base_style_record_identity
+            .filter(|&previous| self.style_records_equal_by_value(previous, requested_style_record_identity))
+            .unwrap_or(requested_style_record_identity);
+        let record = *self.style_records.get_index(style_record_identity.raw() as usize - 1)?;
+        let inherited_groups = &self.sets[record.groups].identities[..inherited_group_count];
+        let inherited_identity = self
+            .inherited_sets
+            .find(content_hash(inherited_groups), |_identity, groups| {
+                groups.as_ref() == inherited_groups
+            })?;
+
+        let is_pseudo = target.is_pseudo();
+        let (
+            node_handle_changed,
+            inherited_node_handle_changed,
+            custom_property_environment_node_handle_changed,
+            computed_fixed_metadata_node_handle_changed,
+            computed_reconstruction_metadata_node_handle_changed,
+            previous_style_record_identity,
+            animation_overlay_publication,
+        ) = if target.is_pseudo() {
+            let key = (target.node, target.pseudo_kind);
+            let previous = self.pseudo_assignments.get(&key).copied();
+            let previous_style_record_identity = previous
+                .map(|previous| self.final_style_record(previous.style_record, previous.animation_overlay_slot));
+            let mut animated_properties = None;
+            let animation_overlay_publication = self.update_animation_overlay(
+                previous.and_then(|previous| previous.animation_overlay_slot),
+                style_record_identity,
+                0,
+                &mut animated_properties,
+                &[],
+            );
+            if previous.is_none() {
+                let kinds = self.pseudo_kinds_by_node.entry(target.node).or_default();
+                let capacity_before = kinds.capacity();
+                kinds.push(target.pseudo_kind);
+                self.pseudo_assignment_nested_memory
+                    .grow_committed((kinds.capacity() - capacity_before) as u64);
+            }
+            self.pseudo_assignments.insert(
+                key,
+                PublishedComputedInputs {
+                    groups: record.groups,
+                    inherited_groups: inherited_identity,
+                    custom_properties: record.custom_properties,
+                    fixed_metadata: record.fixed_metadata,
+                    reconstruction_metadata: record.reconstruction_metadata,
+                    style_record: style_record_identity,
+                    animation_overlay_slot: None,
+                    cascade_state: previous.and_then(|previous| previous.cascade_state),
+                },
+            );
+            (
+                previous.is_none_or(|previous| previous.groups != record.groups),
+                previous.is_none_or(|previous| previous.inherited_groups != inherited_identity),
+                previous.is_none_or(|previous| previous.custom_properties != record.custom_properties),
+                previous.is_none_or(|previous| previous.fixed_metadata != record.fixed_metadata),
+                previous.is_none_or(|previous| previous.reconstruction_metadata != record.reconstruction_metadata),
+                previous_style_record_identity,
+                animation_overlay_publication,
+            )
+        } else {
+            let index = target
+                .node
+                .element_index()
+                .expect("only elements publish computed groups") as usize;
+            if self.column.len() <= index {
+                self.column.resize(index + 1, None);
+                self.inherited_column.resize(index + 1, None);
+                self.custom_property_environment_column.resize(index + 1, None);
+                self.computed_fixed_metadata_column.resize(index + 1, None);
+                self.computed_reconstruction_metadata_column.resize(index + 1, None);
+                self.style_record_column.resize(index + 1, None);
+                self.animation_overlay_column.resize(index + 1, None);
+                self.inherited_group_swap_eligible_column.resize(index + 1, 0);
+                self.cascade_state_column.resize(index + 1, None);
+            }
+            let previous_style_record_identity = self.style_record_column[index]
+                .map(|style_record| self.final_style_record(style_record, self.animation_overlay_column[index]));
+            let mut animated_properties = None;
+            let animation_overlay_publication = self.update_animation_overlay(
+                self.animation_overlay_column[index],
+                style_record_identity,
+                0,
+                &mut animated_properties,
+                &[],
+            );
+            let changed = (
+                self.column[index] != Some(record.groups),
+                self.inherited_column[index] != Some(inherited_identity),
+                self.custom_property_environment_column[index] != Some(record.custom_properties),
+                self.computed_fixed_metadata_column[index] != Some(record.fixed_metadata),
+                self.computed_reconstruction_metadata_column[index] != Some(record.reconstruction_metadata),
+                previous_style_record_identity,
+                animation_overlay_publication,
+            );
+            self.column[index] = Some(record.groups);
+            self.inherited_column[index] = Some(inherited_identity);
+            self.custom_property_environment_column[index] = Some(record.custom_properties);
+            self.computed_fixed_metadata_column[index] = Some(record.fixed_metadata);
+            self.computed_reconstruction_metadata_column[index] = Some(record.reconstruction_metadata);
+            self.style_record_column[index] = Some(style_record_identity);
+            self.animation_overlay_column[index] = None;
+            self.inherited_group_swap_eligible_column[index] = u8::from(inherited_group_swap_eligible);
+            changed
+        };
+
+        Some(ComputedGroupPublication {
+            previous_style_record_identity,
+            style_record_identity: animation_overlay_publication.final_style_record,
+            new_groups: 0,
+            canonical_output_groups_reused: 0,
+            new_group_set: false,
+            new_inherited_group_set: false,
+            new_custom_property_environment: false,
+            new_computed_fixed_metadata: false,
+            new_computed_reconstruction_metadata: false,
+            new_style_record: false,
+            node_handle_changed,
+            inherited_node_handle_changed,
+            custom_property_environment_node_handle_changed,
+            computed_fixed_metadata_node_handle_changed,
+            computed_reconstruction_metadata_node_handle_changed,
+            style_record_node_handle_changed: previous_style_record_identity
+                != Some(animation_overlay_publication.final_style_record),
+            animation_overlay_slot_allocated: false,
+            animation_overlay_slot_released: animation_overlay_publication.slot_released,
+            animation_overlay_record_updated: false,
+            live_animation_overlay_records: self.live_animation_overlay_assignments,
+            is_pseudo,
+        })
+    }
+
+    fn style_records_equal_by_value(&self, first: StyleRecordID, second: StyleRecordID) -> bool {
+        if first == second {
+            return true;
+        }
+        let Some(first) = self.style_records.get_index(first.raw() as usize - 1) else {
+            return false;
+        };
+        let Some(second) = self.style_records.get_index(second.raw() as usize - 1) else {
+            return false;
+        };
+        if first.custom_properties != second.custom_properties
+            || first.fixed_metadata != second.fixed_metadata
+            || first.reconstruction_metadata != second.reconstruction_metadata
+        {
+            return false;
+        }
+        let first_groups = &self.sets[first.groups].identities;
+        let second_groups = &self.sets[second.groups].identities;
+        if first_groups.len() != second_groups.len()
+            || first_groups
+                .iter()
+                .zip(second_groups)
+                .enumerate()
+                .any(|(index, (&first, &second))| {
+                    first != second
+                        && !style_group_payloads_equal(index, self.groups[first].payload, self.groups[second].payload)
+                })
+        {
+            return false;
+        }
+        match (first.longhand_table, second.longhand_table) {
+            (None, None) => true,
+            (Some(first), Some(second)) if first == second => true,
+            (Some(first), Some(second)) => self.computed_longhand_tables[first]
+                .value_view()
+                .iter()
+                .zip(self.computed_longhand_tables[second].value_view())
+                .all(|(&first, &second)| {
+                    first == second || unsafe { rust_style_value_equals(first.cast(), second.cast()) }
+                }),
+            _ => false,
         }
     }
 
@@ -1419,6 +1843,7 @@ impl ComputedGroupSets {
             shallow [
                 self.computed_reconstruction_metadata,
                 self.computed_reconstruction_metadata_column,
+                self.computed_longhand_tables,
             ];
             cached [self.reconstruction_nested_memory.bytes()];
             nested [];
@@ -1538,12 +1963,17 @@ impl ComputedGroupSets {
         let reconstruction_metadata = self
             .computed_reconstruction_metadata
             .get_index(record.reconstruction_metadata.0 as usize)?;
+        let longhand_values = record
+            .longhand_table
+            .and_then(|identity| self.computed_longhand_tables.get_index(identity.0 as usize))
+            .map_or(&[][..], RetainedLonghandTable::value_view);
         Some(StyleRecordView {
             payloads,
             base_payloads,
             property_importance: &reconstruction_metadata.property_importance,
             property_inheritance: &reconstruction_metadata.property_inheritance,
             inheritance_dependent_values: &reconstruction_metadata.inheritance_dependent_value_view,
+            longhand_values,
             raw_cascaded_font_size: reconstruction_metadata
                 .raw_cascaded_font_size
                 .as_ref()
@@ -1674,6 +2104,14 @@ fn content_hash(content: impl Hash) -> u64 {
     hasher.finish()
 }
 
+fn longhand_table_hash(values: &[*const c_void]) -> u64 {
+    let mut hasher = fast_hasher();
+    for &value in values {
+        (value as usize).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn reconstruction_metadata_hash(
     property_importance: &[u8],
     property_inheritance: &[u8],
@@ -1719,7 +2157,7 @@ fn retain_style_value(value: *const c_void) -> RetainedStyleValueData {
         !value.is_null(),
         "computed reconstruction metadata contains a null style value"
     );
-    let retained = unsafe { rust_style_value_retain(value.cast::<StyleValueData>()) };
+    let retained = unsafe { retain_style_value_reference(value.cast::<StyleValueData>()) };
     unsafe { RetainedStyleValueData::from_retained_pointer(retained) }
 }
 
@@ -1741,6 +2179,7 @@ mod tests {
             animation_overlay_identity: 0,
             animated_properties: std::ptr::NonNull::<c_void>::dangling().as_ptr(),
             animation_overlay_payloads: &[],
+            longhand_table: std::ptr::null(),
             reconstruction: ComputedReconstructionMetadataInput {
                 property_importance,
                 property_inheritance,
@@ -1938,6 +2377,7 @@ mod tests {
         sets.custom_property_environments.reserve(1);
         sets.computed_fixed_metadata.reserve(1);
         sets.computed_reconstruction_metadata.reserve(1);
+        sets.computed_longhand_tables.reserve(1);
         sets.style_records.reserve(1);
         sets.pending_cascade_states.reserve(1);
         sets.animation_overlay_slots_by_record.reserve(1);
@@ -1959,6 +2399,7 @@ mod tests {
             + sets.custom_property_environments.capacity_bytes() as usize
             + sets.computed_fixed_metadata.capacity_bytes() as usize
             + sets.computed_reconstruction_metadata.capacity_bytes() as usize
+            + sets.computed_longhand_tables.capacity_bytes() as usize
             + sets.style_records.capacity_bytes() as usize
             + sets.pending_cascade_states.capacity()
                 * (size_of::<(StyleNodeID, u8)>() + size_of::<(u64, CascadeStateID)>() + 1)

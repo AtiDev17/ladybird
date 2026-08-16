@@ -44,7 +44,7 @@ FontSourceStyleValue::Source FontSourceStyleValue::source() const
 {
     auto const& data = m_value->font_source;
     if (data.is_local)
-        return Local { *m_local_name };
+        return Local { wrap_rust_child(data.local_name) };
 
     return url_from_rust_data(data.url, data.url_type, data.url_modifiers);
 }
@@ -52,74 +52,13 @@ FontSourceStyleValue::Source FontSourceStyleValue::source() const
 FontSourceStyleValue::FontSourceStyleValue(Source source, Optional<Utf16FlyString> format, Vector<FontTech> tech)
     : StyleValueWithDefaultOperators(Type::FontSource, make_font_source_data(source, format, tech))
 {
-    if (source.has<Local>())
-        m_local_name = source.get<Local>().name;
 }
 
 FontSourceStyleValue::FontSourceStyleValue(StyleValueFFI::StyleValueData const* data)
     : StyleValueWithDefaultOperators(Type::FontSource, data)
 {
-    auto const* local_name_data = static_cast<StyleValueFFI::StyleValueData const*>(data->font_source.local_name.pointer);
-    if (local_name_data)
-        m_local_name = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(local_name_data));
 }
 
 FontSourceStyleValue::~FontSourceStyleValue() = default;
-
-void FontSourceStyleValue::serialize(StringBuilder& builder, SerializationMode) const
-{
-    // <font-src> = <url> [ format(<font-format>)]? [ tech( <font-tech>#)]? | local(<family-name>)
-    source().visit(
-        [&builder](Local const& local) {
-            // local(<family-name>)
-
-            // https://www.w3.org/TR/cssom-1/#serialize-a-local
-            // To serialize a LOCAL means to create a string represented by "local(",
-            // followed by the serialization of the LOCAL as a string, followed by ")".
-            builder.append("local("sv);
-            local.name->serialize(builder, SerializationMode::Normal);
-            builder.append(')');
-        },
-        [this, &builder](URL const& url) {
-            // <url> [ format(<font-format>)]? [ tech( <font-tech>#)]?
-            builder.append(url.to_string());
-
-            if (auto format = this->format(); format.has_value()) {
-                builder.append(" format("sv);
-                serialize_an_identifier(builder, *format);
-                builder.append(")"sv);
-            }
-
-            if (auto tech_list = this->tech(); !tech_list.is_empty()) {
-                builder.append(" tech("sv);
-                serialize_a_comma_separated_list(builder, tech_list, [](auto& b, FontTech const tech) {
-                    return b.append(CSS::to_string(tech));
-                });
-                builder.append(")"sv);
-            }
-        });
-}
-
-bool FontSourceStyleValue::properties_equal(FontSourceStyleValue const& other) const
-{
-    auto other_source = other.source();
-    bool sources_equal = source().visit(
-        [&other_source](Local const& local) {
-            if (auto* other_local = other_source.get_pointer<Local>()) {
-                return local.name == other_local->name;
-            }
-            return false;
-        },
-        [&other_source](URL const& url) {
-            if (auto* other_url = other_source.get_pointer<URL>()) {
-                return url == *other_url;
-            }
-            return false;
-        });
-
-    return sources_equal
-        && format() == other.format()
-        && tech() == other.tech();
-}
 
 }

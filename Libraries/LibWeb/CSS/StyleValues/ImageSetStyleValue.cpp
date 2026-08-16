@@ -30,7 +30,7 @@ StyleValueFFI::StyleValueData const* ImageSetStyleValue::make_image_set_data(Vec
             { StyleValueFFI::rust_style_value_retain(option.image->rust_style_value_data()) },
             { StyleValueFFI::rust_style_value_retain(option.resolution->rust_style_value_data()) },
             option.type.has_value(),
-            { option.type.has_value() ? option.type->to_raw_leaked() : 0 },
+            { option.type.has_value() ? option.type->to_raw_leaked() : 0, nullptr },
         });
     }
     return StyleValueFFI::rust_style_value_create_image_set(ffi_options.data(), ffi_options.size());
@@ -84,49 +84,6 @@ Optional<ImageSetStyleValue::Option> ImageSetStyleValue::select_option(double de
     return best_below_or_equal;
 }
 
-void ImageSetStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    builder.append("image-set("sv);
-    auto options = this->options();
-    for (size_t i = 0; i < options.size(); ++i) {
-        if (i > 0)
-            builder.append(", "sv);
-        auto const& option = options[i];
-        option.image->serialize(builder, mode);
-        builder.append(' ');
-        option.resolution->serialize(builder, mode);
-        if (option.type.has_value()) {
-            builder.append(" type(\""sv);
-            builder.append_escaped_for_json(MUST(option.type->utf16_view().to_utf8()));
-            builder.append("\")"sv);
-        }
-    }
-    builder.append(')');
-}
-
-bool ImageSetStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-    auto const& other_image_set = other.as_image_set();
-    auto options = this->options();
-    auto other_options = other_image_set.options();
-    if (options.size() != other_options.size())
-        return false;
-
-    for (size_t i = 0; i < options.size(); ++i) {
-        auto const& option = options[i];
-        auto const& other_option = other_options[i];
-        if (!option.image->equals(*other_option.image))
-            return false;
-        if (!option.resolution->equals(*other_option.resolution))
-            return false;
-        if (option.type != other_option.type)
-            return false;
-    }
-    return true;
-}
-
 void ImageSetStyleValue::load_any_resources(DOM::Document& document)
 {
     auto dpr = document.page().client().device_pixels_per_css_pixel();
@@ -165,10 +122,11 @@ Optional<CSSPixelFraction> ImageSetStyleValue::natural_aspect_ratio(DOM::Documen
     return {};
 }
 
-void ImageSetStyleValue::resolve_for_size(Layout::NodeWithStyle const& layout_node, CSSPixelSize size) const
+ResolvedImage ImageSetStyleValue::resolve_for_size(Layout::NodeWithStyle const& layout_node, CSSPixelSize size) const
 {
     if (m_selected_image)
-        m_selected_image->resolve_for_size(layout_node, size);
+        return m_selected_image->resolve_for_size(layout_node, size);
+    return Empty {};
 }
 
 bool ImageSetStyleValue::is_paintable(DOM::Document const& document) const
@@ -178,10 +136,10 @@ bool ImageSetStyleValue::is_paintable(DOM::Document const& document) const
     return false;
 }
 
-void ImageSetStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, ImageRendering image_rendering, PreferredColorScheme color_scheme) const
+void ImageSetStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, ImageRendering image_rendering, PreferredColorScheme color_scheme, ResolvedImage const& resolved_image) const
 {
     if (m_selected_image)
-        m_selected_image->paint(context, document, dest_rect, image_rendering, color_scheme);
+        m_selected_image->paint(context, document, dest_rect, image_rendering, color_scheme, resolved_image);
 }
 
 Optional<Gfx::Color> ImageSetStyleValue::color_if_single_pixel_bitmap(DOM::Document const& document) const

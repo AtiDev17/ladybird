@@ -20,33 +20,6 @@ namespace Web::CSS {
 
 ColorFunctionStyleValue::ColorFunctionStyleValue(StyleValueFFI::StyleValueData const* data)
     : ColorStyleValue(data)
-    , m_channels([&] {
-        auto adopt = [](auto const& retained) -> ValueComparingNonnullRefPtr<StyleValue const> {
-            auto const* child_data = static_cast<StyleValueFFI::StyleValueData const*>(retained.pointer);
-            return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
-        };
-        auto const& color = data->color_function;
-        return Array<ValueComparingNonnullRefPtr<StyleValue const>, 3> {
-            adopt(color.channel_0), adopt(color.channel_1), adopt(color.channel_2)
-        };
-    }())
-    , m_alpha([&]() -> ValueComparingRefPtr<StyleValue const> {
-        auto const* child_data = static_cast<StyleValueFFI::StyleValueData const*>(data->color_function.alpha.pointer);
-        if (!child_data)
-            return nullptr;
-        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
-    }())
-    , m_name([&]() -> Optional<Utf16FlyString> {
-        if (!data->color_function.has_name)
-            return {};
-        return Utf16FlyString::from_raw(data->color_function.name.raw);
-    }())
-    , m_origin_color([&]() -> ValueComparingRefPtr<StyleValue const> {
-        auto const* child_data = static_cast<StyleValueFFI::StyleValueData const*>(data->color_function.origin_color.pointer);
-        if (!child_data)
-            return nullptr;
-        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
-    }())
 {
 }
 
@@ -276,8 +249,8 @@ ValueComparingRefPtr<StyleValue const> ColorFunctionStyleValue::resolve_relative
     auto const& descriptor = this->descriptor();
 
     auto resolve_channel = [&](size_t index) -> ValueComparingNonnullRefPtr<StyleValue const> {
-        auto const& value = *channels()[index];
-        if (value.to_keyword() == Keyword::None)
+        auto value = channel(index);
+        if (value->to_keyword() == Keyword::None)
             return KeywordStyleValue::create(Keyword::None);
         auto const& channel_descriptor = descriptor.channels[index];
         auto resolved = channel_descriptor.kind == ChannelKind::Hue
@@ -408,130 +381,6 @@ bool ColorFunctionStyleValue::equals(StyleValue const& other) const
     if (origin_color() != other_color_function.origin_color())
         return false;
     return name() == other_color_function.name();
-}
-
-namespace {
-
-bool alpha_should_be_serialized(StyleValue const& alpha)
-{
-    if (alpha.is_number() && alpha.as_number().number() >= 1)
-        return false;
-    if (alpha.is_percentage() && alpha.as_percentage().percentage().as_fraction() >= 1)
-        return false;
-    return true;
-}
-
-}
-
-void ColorFunctionStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    auto const& descriptor = this->descriptor();
-
-    // https://drafts.csswg.org/css-color-5/#serial-relative-color
-    if (origin_color()) {
-        if (descriptor.serialization_behavior == SerializationBehavior::ColorFunction) {
-            builder.append("color(from "sv);
-            origin_color()->serialize(builder, mode);
-            builder.appendff(" {} ", descriptor.function_name);
-        } else {
-            builder.appendff("{}(from ", descriptor.function_name);
-            origin_color()->serialize(builder, mode);
-            builder.append(' ');
-        }
-        channels()[0]->serialize(builder, mode);
-        builder.append(' ');
-        channels()[1]->serialize(builder, mode);
-        builder.append(' ');
-        channels()[2]->serialize(builder, mode);
-        if (alpha()) {
-            builder.append(" / "sv);
-            alpha()->serialize(builder, mode);
-        }
-        builder.append(')');
-        return;
-    }
-
-    if (descriptor.serialization_behavior == SerializationBehavior::SrgbLegacy || descriptor.serialization_behavior == SerializationBehavior::SrgbModern) {
-        if (mode != SerializationMode::ResolvedValue && name().has_value()) {
-            builder.append(MUST(name()->to_ascii_lowercase().view().to_utf8()));
-            return;
-        }
-        // sRGB-equivalent shortcut: serialize via Color::serialize_a_srgb_value when the color resolves cleanly.
-        if (auto color = to_color({}); color.has_value()) {
-            builder.append(color->serialize_a_srgb_value());
-            return;
-        }
-    }
-
-    // https://drafts.csswg.org/css-color-4/#serializing-color-function-values
-    if (descriptor.serialization_behavior == SerializationBehavior::ColorFunction) {
-        auto convert_percentage = [&](StyleValue const& value) -> ValueComparingNonnullRefPtr<StyleValue const> {
-            if (value.is_percentage())
-                return NumberStyleValue::create(value.as_percentage().raw_value() / 100);
-            if (mode == SerializationMode::ResolvedValue && value.is_calculated()) {
-                // FIXME: Figure out how to get the proper calculation resolution context here.
-                CalculationResolutionContext calculation_resolution_context {};
-                auto const& calculated = value.as_calculated();
-                if (calculated.resolves_to_percentage()) {
-                    if (auto resolved_percentage = calculated.resolve_percentage(calculation_resolution_context); resolved_percentage.has_value()) {
-                        auto resolved_number = resolved_percentage->value() / 100;
-                        if (!isfinite(resolved_number))
-                            resolved_number = 0;
-                        return NumberStyleValue::create(resolved_number);
-                    }
-                } else if (calculated.resolves_to_number()) {
-                    if (auto resolved_number = calculated.resolve_number(calculation_resolution_context); resolved_number.has_value())
-                        return NumberStyleValue::create(*resolved_number);
-                }
-            }
-            return value;
-        };
-
-        // An omitted alpha is treated as 1 and not serialized.
-        auto original_alpha = this->alpha();
-        ValueComparingNonnullRefPtr<StyleValue const> alpha = original_alpha
-            ? convert_percentage(*original_alpha)
-            : NumberStyleValue::create(1);
-
-        bool const is_alpha_required = original_alpha && [&]() {
-            if (alpha->is_number())
-                return alpha->as_number().number() < 1;
-            return true;
-        }();
-
-        if (alpha->is_number() && alpha->as_number().number() < 0)
-            alpha = NumberStyleValue::create(0);
-
-        builder.appendff("color({} ", descriptor.function_name);
-        convert_percentage(*channels()[0])->serialize(builder, mode);
-        builder.append(' ');
-        convert_percentage(*channels()[1])->serialize(builder, mode);
-        builder.append(' ');
-        convert_percentage(*channels()[2])->serialize(builder, mode);
-        if (is_alpha_required) {
-            builder.append(" / "sv);
-            alpha->serialize(builder, mode);
-        }
-        builder.append(')');
-        return;
-    }
-
-    builder.append(descriptor.function_name);
-    builder.append('(');
-    for (size_t i = 0; i < 3; ++i) {
-        if (i > 0)
-            builder.append(' ');
-        auto const& channel_descriptor = descriptor.channels[i];
-        if (channel_descriptor.kind == ChannelKind::Hue)
-            serialize_hue_component(builder, mode, channels()[i]);
-        else
-            serialize_color_component(builder, mode, channels()[i], channel_descriptor.percent_reference, channel_descriptor.serialize_clamp_min, channel_descriptor.serialize_clamp_max);
-    }
-    if (alpha() && alpha_should_be_serialized(*alpha())) {
-        builder.append(" / "sv);
-        serialize_alpha_component(builder, mode, *alpha());
-    }
-    builder.append(')');
 }
 
 }

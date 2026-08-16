@@ -9,8 +9,9 @@
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/TransformFunctions.h>
+#include <LibWeb/CSS/Units.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -25,6 +26,19 @@
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::ViewTransition {
+
+CSS::RustStyleValueHandle make_translation_transform(CSSPixels x, CSSPixels y)
+{
+    CSS::StyleValueFFI::StyleValueData const* values[] = {
+        CSS::StyleValueFFI::rust_style_value_create_length(x.to_double(), to_underlying(CSS::LengthUnit::Px)),
+        CSS::StyleValueFFI::rust_style_value_create_length(y.to_double(), to_underlying(CSS::LengthUnit::Px)),
+    };
+    return CSS::RustStyleValueHandle { CSS::StyleValueFFI::rust_style_value_create_transformation(
+        to_underlying(CSS::PropertyID::Transform),
+        static_cast<u8>(to_underlying(CSS::TransformFunction::Translate)),
+        values,
+        array_size(values)) };
+}
 
 GC_DEFINE_ALLOCATOR(NamedViewTransitionPseudoElement);
 GC_DEFINE_ALLOCATOR(ReplacedNamedViewTransitionPseudoElement);
@@ -310,11 +324,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         // 6. Set capture’s old transform to a <transform-function> that would map element’s border box from the
         //    snapshot containing block origin to its current visual position.
         // FIXME: Actually compute the right transform here.
-        capture->old_transform = CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Translate,
-            CSS::StyleValueVector {
-                CSS::LengthStyleValue::create(CSS::Length(0, CSS::LengthUnit::Px)),
-                CSS::LengthStyleValue::create(CSS::Length(0, CSS::LengthUnit::Px)),
-            });
+        capture->old_transform = make_translation_transform(0, 0);
 
         // 7. Set capture’s old writing-mode to the computed value of writing-mode on element.
         capture->old_writing_mode = element.layout_node()->writing_mode();
@@ -329,7 +339,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         capture->old_mix_blend_mode = element.layout_node()->mix_blend_mode();
 
         // 11. Set capture’s old backdrop-filter to the computed value of backdrop-filter on element.
-        capture->old_backdrop_filter = element.layout_node()->backdrop_filter();
+        capture->old_backdrop_filter = element.layout_node()->backdrop_filter().materialize();
 
         // 12. Set capture’s old color-scheme to the computed value of color-scheme on element.
         capture->old_color_scheme = element.layout_node()->color_scheme();
@@ -820,7 +830,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         //    colorScheme be null.
         Optional<CSSPixels> width = {};
         Optional<CSSPixels> height = {};
-        RefPtr<CSS::TransformationStyleValue const> transform = {};
+        CSS::RustStyleValueHandle transform;
         Optional<CSS::WritingMode> writing_mode = {};
         Optional<CSS::Direction> direction = {};
         // FIXME: Implement this once we have text-orientation.
@@ -893,10 +903,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             // 5. Set transform to a transform that would map newRect from the snapshot containing block origin
             //    to its current visual position.
             auto offset = new_rect.location() - captured_element->new_element->navigable()->snapshot_containing_block().location();
-            CSS::StyleValueVector transform_values;
-            transform_values.append(CSS::LengthStyleValue::create(CSS::Length::make_px(offset.x())));
-            transform_values.append(CSS::LengthStyleValue::create(CSS::Length::make_px(offset.y())));
-            transform = CSS::TransformationStyleValue::create(CSS::PropertyID::Transform, CSS::TransformFunction::Translate, move(transform_values));
+            transform = make_translation_transform(offset.x(), offset.y());
 
             // 6. Set writingMode to the computed value of writing-mode on capturedElement’s new element.
             writing_mode = captured_element->new_element->layout_node()->writing_mode();
@@ -913,7 +920,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             mix_blend_mode = captured_element->new_element->layout_node()->mix_blend_mode();
 
             // 10. Set backdropFilter to the computed value of backdrop-filter on capturedElement’s new element.
-            backdrop_filter = captured_element->new_element->layout_node()->backdrop_filter();
+            backdrop_filter = captured_element->new_element->layout_node()->backdrop_filter().materialize();
 
             // 11. Set colorScheme to the computed value of color-scheme on capturedElement’s new element.
             color_scheme = captured_element->new_element->layout_node()->color_scheme();

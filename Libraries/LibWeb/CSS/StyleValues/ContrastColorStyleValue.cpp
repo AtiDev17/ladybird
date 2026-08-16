@@ -34,19 +34,4 @@ ValueComparingNonnullRefPtr<StyleValue const> ContrastColorStyleValue::absolutiz
     return create(move(absolutized_color));
 }
 
-bool ContrastColorStyleValue::equals(StyleValue const& other) const
-{
-    auto const* other_contrast_color = as_if<ContrastColorStyleValue>(other);
-    if (!other_contrast_color)
-        return false;
-    return color() == other_contrast_color->color();
-}
-
-void ContrastColorStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    builder.append("contrast-color("sv);
-    color()->serialize(builder, mode);
-    builder.append(')');
-}
-
 }

@@ -13,17 +13,10 @@
 
 namespace Web::CSS {
 
-void TreeCountingFunctionStyleValue::serialize(StringBuilder& builder, SerializationMode) const
-{
-    switch (function()) {
-    case TreeCountingFunction::SiblingCount:
-        builder.append("sibling-count()"sv);
-        break;
-    case TreeCountingFunction::SiblingIndex:
-        builder.append("sibling-index()"sv);
-        break;
-    }
-}
+// The function discriminant crosses the style value FFI as a raw code; the Rust serializer
+// depends on it.
+static_assert(to_underlying(TreeCountingFunctionStyleValue::TreeCountingFunction::SiblingCount) == 0);
+static_assert(to_underlying(TreeCountingFunctionStyleValue::TreeCountingFunction::SiblingIndex) == 1);
 
 size_t TreeCountingFunctionStyleValue::resolve(DOM::AbstractElement const& abstract_element) const
 {
@@ -64,16 +57,6 @@ ValueComparingNonnullRefPtr<StyleValue const> TreeCountingFunctionStyleValue::ab
     }
 
     VERIFY_NOT_REACHED();
-}
-
-bool TreeCountingFunctionStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-
-    auto const& other_tree_counting_function = other.as_tree_counting_function();
-
-    return function() == other_tree_counting_function.function() && computed_type() == other_tree_counting_function.computed_type();
 }
 
 }

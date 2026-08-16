@@ -13,14 +13,13 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Font/Font.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/BorderImageSliceStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
@@ -42,7 +41,6 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/InlineNode.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
@@ -72,6 +70,7 @@
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
+#include <LibWeb/SVG/SVGSVGElement.h>
 
 namespace Web::Painting {
 
@@ -389,7 +388,7 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
         // Only use text-decoration if it was explicitly set in the ::selection rule, not inherited.
         if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextDecorationLine)) {
             style.text_decoration = TextDecorationStyle {
-                .line = computed_selection_style->text_decoration_line(),
+                .line = Vector<CSS::TextDecorationLine> { computed_selection_style->text_decoration_line() },
                 .style = computed_selection_style->text_decoration_style(),
                 .color = computed_selection_style->text_decoration_color(),
             };
@@ -888,10 +887,21 @@ Paintable const* nearest_svg_viewport_paintable_of(Layout::Node const& layout_no
     return nullptr;
 }
 
+// active_view_box covers <view> redirection and the svg-as-image fallback viewBox, which
+// layout used to build the geometry these callers interpret.
+static Gfx::FloatRect svg_svg_box_view_box_or_viewport_rect(Layout::Box const& svg_svg_box)
+{
+    if (auto view_box = as<SVG::SVGSVGElement>(*svg_svg_box.dom_node()).active_view_box(); view_box.has_value())
+        return { view_box->min_x, view_box->min_y, view_box->width, view_box->height };
+    if (auto const* paintable = as_if<SVGSVGPaintable>(svg_svg_box.paintable_box().ptr()))
+        return { {}, { paintable->svg_viewport_size().width().to_float(), paintable->svg_viewport_size().height().to_float() } };
+    return {};
+}
+
 Gfx::FloatRect svg_viewport_user_rect(Paintable const& viewport_paintable)
 {
-    if (auto const* svg_svg_box = as_if<Layout::SVGSVGBox>(viewport_paintable.layout_node()))
-        return svg_svg_box->view_box_or_viewport_rect();
+    if (viewport_paintable.layout_node().is_svg_svg_box())
+        return svg_svg_box_view_box_or_viewport_rect(static_cast<Layout::Box const&>(viewport_paintable.layout_node()));
     if (auto dom_node = viewport_paintable.dom_node()) {
         if (auto const* fit_to_view_box = as_if<SVG::SVGFitToViewBox>(*dom_node)) {
             if (auto view_box = fit_to_view_box->view_box(); view_box.has_value())
@@ -901,23 +911,25 @@ Gfx::FloatRect svg_viewport_user_rect(Paintable const& viewport_paintable)
     return { {}, viewport_paintable.absolute_rect().size().to_type<float>() };
 }
 
-ResolvedCSSFilter resolve_css_filter(CSS::Filter const& computed_filter, Paintable const& paintable_box)
+ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView computed_filter, Paintable const& paintable_box)
 {
     auto const& layout_node = paintable_box.layout_node();
 
     ResolvedCSSFilter result;
-    for (auto const& filter_operation : computed_filter.filters()) {
-        if (filter_operation->is_url()) {
-            auto url = filter_operation->as_url().url();
-            auto const& url_string = url.url();
-            if (url_string.is_empty() || !url_string.starts_with('#'))
-                return {};
-            auto fragment_or_error = url_string.substring_from_byte_offset(1);
-            if (fragment_or_error.is_error())
-                return {};
-            auto maybe_filter = paintable_box.document().get_element_by_id(Utf16String::from_utf8(fragment_or_error.value()));
-            if (!maybe_filter)
-                return {};
+    bool failed = false;
+    computed_filter.for_each_operation([&](auto const& operation) {
+        if (failed)
+            return;
+        if (auto const* url = operation.template get_pointer<CSS::Filter::Url>()) {
+            if (url->fragment.is_empty()) {
+                failed = true;
+                return;
+            }
+            auto maybe_filter = paintable_box.document().get_element_by_id(url->fragment);
+            if (!maybe_filter) {
+                failed = true;
+                return;
+            }
             if (auto* filter_element = as_if<SVG::SVGFilterElement>(*maybe_filter)) {
                 // Filter primitive lengths are specified in the filtered element's user coordinate system, but the
                 // resulting filter operates in device pixels. Compute the user-unit-to-device-pixel scale so the
@@ -938,57 +950,56 @@ ResolvedCSSFilter resolve_css_filter(CSS::Filter const& computed_filter, Paintab
                 if (!bounds.is_empty())
                     result.svg_filter_bounds = bounds;
             } else {
-                return {};
+                failed = true;
             }
-            continue;
+            return;
         }
 
-        auto const& filter_value = filter_operation->as_filter();
-        switch (filter_value.kind()) {
-        case CSS::FilterStyleValue::Kind::Blur: {
-            auto const& blur = static_cast<CSS::BlurFilterStyleValue const&>(filter_value);
-            auto resolved_radius = blur.resolved_radius();
-            result.operations.empend(ResolvedCSSFilter::Blur {
-                .radius = CSSPixels::nearest_value_for(resolved_radius),
-            });
-            break;
-        }
-        case CSS::FilterStyleValue::Kind::DropShadow: {
-            auto const& drop_shadow = static_cast<CSS::DropShadowFilterStyleValue const&>(filter_value);
-            auto to_css_px = [&](NonnullRefPtr<CSS::StyleValue const> const& length) {
-                return CSS::Length::from_style_value(length, {}).absolute_length_to_px();
-            };
-            auto color_context = CSS::ColorResolutionContext::for_layout_node_with_style(layout_node);
-            auto resolved_color = drop_shadow.color()
-                ? drop_shadow.color()->to_color(color_context).value_or(layout_node.color())
-                : layout_node.color();
+        operation.visit(
+            [&](CSS::Filter::Blur const& blur) {
+                result.operations.empend(ResolvedCSSFilter::Blur {
+                    .radius = CSSPixels::nearest_value_for(blur.resolved_radius),
+                });
+            },
+            [&](CSS::Filter::DropShadow const& drop_shadow) {
+                result.operations.empend(ResolvedCSSFilter::DropShadow {
+                    .offset_x = drop_shadow.offset_x,
+                    .offset_y = drop_shadow.offset_y,
+                    .radius = drop_shadow.radius,
+                    .color = drop_shadow.color,
+                });
+            },
+            [&](CSS::Filter::ColorOperation const& color_operation) {
+                result.operations.empend(ResolvedCSSFilter::Color {
+                    .operation = color_operation.operation,
+                    .amount = color_operation.resolved_amount,
+                });
+            },
+            [&](CSS::Filter::HueRotate const& hue_rotate) {
+                result.operations.empend(ResolvedCSSFilter::HueRotate {
+                    .angle_degrees = hue_rotate.angle_degrees,
+                });
+            },
+            [&](CSS::Filter::Url const&) {});
+    });
+    if (failed)
+        return {};
+    return result;
+}
 
-            result.operations.empend(ResolvedCSSFilter::DropShadow {
-                .offset_x = to_css_px(drop_shadow.offset_x()),
-                .offset_y = to_css_px(drop_shadow.offset_y()),
-                .radius = drop_shadow.radius() ? to_css_px(*drop_shadow.radius()) : CSSPixels(0),
-                .color = resolved_color,
-            });
-            break;
-        }
-        case CSS::FilterStyleValue::Kind::Color: {
-            auto const& color_operation = static_cast<CSS::ColorFilterStyleValue const&>(filter_value);
-            result.operations.empend(ResolvedCSSFilter::Color {
-                .operation = color_operation.operation(),
-                .amount = color_operation.resolved_amount(),
-            });
-            break;
-        }
-        case CSS::FilterStyleValue::Kind::HueRotate: {
-            auto const& hue_rotate = static_cast<CSS::HueRotateFilterStyleValue const&>(filter_value);
-            result.operations.empend(ResolvedCSSFilter::HueRotate {
-                .angle_degrees = hue_rotate.angle_degrees(),
-            });
-            break;
-        }
+CSS::ResolvedImage const& Paintable::resolved_image_for_size(CSS::AbstractImageStyleValue const& image, CSSPixelSize size) const
+{
+    for (auto& entry : m_resolved_images_for_size) {
+        if (entry.image.ptr() == &image) {
+            if (entry.size != size) {
+                entry.size = size;
+                entry.resolved = image.resolve_for_size(layout_node(), size);
+            }
+            return entry.resolved;
         }
     }
-    return result;
+    m_resolved_images_for_size.append({ &image, size, image.resolve_for_size(layout_node(), size) });
+    return m_resolved_images_for_size.last().resolved;
 }
 
 NonnullRefPtr<Paintable> Paintable::create(Layout::Box const& layout_box)
@@ -1157,8 +1168,8 @@ void Paintable::reset_for_relayout()
     m_accumulated_visual_context_for_descendants_index = VISUAL_VIEWPORT_NODE_INDEX;
     m_fixed_background_visual_context = {};
 
-    m_used_values_for_grid_template_columns = nullptr;
-    m_used_values_for_grid_template_rows = nullptr;
+    m_used_values_for_grid_template_columns = {};
+    m_used_values_for_grid_template_rows = {};
     m_grid_layout_data = nullptr;
     m_flex_layout_data = nullptr;
 
@@ -2801,7 +2812,7 @@ void Paintable::paint_box_shadow(DisplayListRecordingContext& context) const
 
 void Paintable::paint_box_shadow(DisplayListRecordingContext& context, CSSPixelRect const& border_box_rect, CSSPixelRect const& padding_box_rect, BorderRadiiData const& border_radii) const
 {
-    auto const& box_shadow_layers = layout_node().box_shadow();
+    auto box_shadow_layers = layout_node().box_shadow();
     if (box_shadow_layers.is_empty())
         return;
     Vector<Painting::ShadowData> resolved_box_shadow_data;

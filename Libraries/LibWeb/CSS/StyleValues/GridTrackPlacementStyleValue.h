@@ -21,26 +21,21 @@ public:
 
     GridTrackPlacement grid_track_placement() const
     {
-        return m_grid_track_placement;
+        return placement_from_data(m_value.data());
     }
-    void serialize(StringBuilder&, SerializationMode) const;
 
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-
-    bool properties_equal(GridTrackPlacementStyleValue const& other) const { return grid_track_placement() == other.grid_track_placement(); }
 
 private:
     friend class StyleValue;
 
     explicit GridTrackPlacementStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValueWithDefaultOperators(Type::GridTrackPlacement, data)
-        , m_grid_track_placement(placement_from_data(data))
     {
     }
 
     explicit GridTrackPlacementStyleValue(GridTrackPlacement grid_track_placement)
         : StyleValueWithDefaultOperators(Type::GridTrackPlacement, make_grid_track_placement_data(grid_track_placement))
-        , m_grid_track_placement(move(grid_track_placement))
     {
     }
 
@@ -83,10 +78,20 @@ private:
             if (placement.has_identifier())
                 name = placement.identifier();
         }
-        return StyleValueFFI::rust_style_value_create_grid_track_placement(kind, value, name.has_value(), name.has_value() ? name->to_raw_leaked() : 0);
+        Optional<Utf16FlyString> implicit_start_name;
+        Optional<Utf16FlyString> implicit_end_name;
+        if (kind == 2 && name.has_value()) {
+            implicit_start_name = implicit_grid_line_name(*name, "-start"sv);
+            implicit_end_name = implicit_grid_line_name(*name, "-end"sv);
+        }
+        return StyleValueFFI::rust_style_value_create_grid_track_placement(
+            kind,
+            value,
+            name.has_value(),
+            name.has_value() ? name->to_raw_leaked() : 0,
+            implicit_start_name.has_value() ? implicit_start_name->to_raw_leaked() : 0,
+            implicit_end_name.has_value() ? implicit_end_name->to_raw_leaked() : 0);
     }
-
-    GridTrackPlacement m_grid_track_placement;
 };
 
 }

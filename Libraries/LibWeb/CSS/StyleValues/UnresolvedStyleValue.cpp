@@ -111,13 +111,7 @@ ValueComparingNonnullRefPtr<UnresolvedStyleValue const> UnresolvedStyleValue::cr
 
 UnresolvedStyleValue::UnresolvedStyleValue(String source_text, String value_comparison_text, Parser::SubstitutionFunctionsPresence substitution_presence, bool contains_attr_tainted_values, RefPtr<StyleValue const> parsed_value)
     : StyleValue(Type::Unresolved, create_rust_style_value(move(source_text), move(value_comparison_text), substitution_presence, contains_attr_tainted_values, parsed_value.ptr()))
-    , m_parsed_value(move(parsed_value))
 {
-}
-
-void UnresolvedStyleValue::serialize(StringBuilder& builder, SerializationMode) const
-{
-    builder.append(source_text());
 }
 
 Vector<Parser::ComponentValue> UnresolvedStyleValue::values() const

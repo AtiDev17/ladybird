@@ -5,11 +5,9 @@
  */
 
 #include <LibGfx/Matrix4x4.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Layout/SVGPatternBox.h>
-#include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/DisplayListRecordingContext.h>
@@ -236,9 +234,9 @@ Optional<Painting::PaintStyle> SVGPatternElement::to_gfx_paint_style(SVGPaintCon
     if (!content_element)
         return {};
 
-    Layout::SVGPatternBox const* pattern_box = nullptr;
-    target_layout_node.for_each_child_of_type<Layout::SVGPatternBox>([&](auto const& candidate) {
-        if (&candidate.dom_node() == content_element.ptr()) {
+    Layout::Box const* pattern_box = nullptr;
+    target_layout_node.for_each_child_of_type<Layout::Box>([&](auto const& candidate) {
+        if (candidate.is_svg_pattern_box() && candidate.dom_node() == content_element.ptr()) {
             pattern_box = &candidate;
             return IterationDecision::Break;
         }
@@ -327,11 +325,11 @@ Optional<Painting::PaintStyle> SVGPatternElement::to_gfx_paint_style(SVGPaintCon
     Optional<Gfx::AffineTransform> user_space_pattern_transform;
     auto style = computed_style();
     VERIFY(style);
-    auto const& css_transformations = style->transformations();
-    if (!css_transformations.is_empty()) {
+    if (style->has_transformations()) {
         auto matrix = Gfx::FloatMatrix4x4::identity();
-        for (auto const& css_transform : css_transformations)
-            matrix = matrix * css_transform->to_matrix(*pattern_paintable);
+        style->for_each_transformation([&](auto const& css_transform) {
+            matrix = matrix * css_transform.to_matrix(*pattern_paintable);
+        });
 
         user_space_pattern_transform = extract_2d_affine_transform(matrix);
     } else {

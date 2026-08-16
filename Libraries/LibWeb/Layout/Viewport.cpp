@@ -18,7 +18,7 @@
 namespace Web::Layout {
 
 Viewport::Viewport(DOM::Document& document, CSS::LayoutStyle style)
-    : BlockContainer(document, &document, style)
+    : BlockContainer(document, &document, style, RustFFI::NodeKind::Viewport)
 {
 }
 
@@ -27,11 +27,6 @@ Viewport::~Viewport() = default;
 DOM::Document const& Viewport::dom_node() const
 {
     return static_cast<DOM::Document const&>(*Node::dom_node());
-}
-
-RefPtr<Painting::Paintable> Viewport::create_paintable() const
-{
-    return Painting::ViewportPaintable::create(*this);
 }
 
 Vector<Viewport::TextBlock> const& Viewport::text_blocks()

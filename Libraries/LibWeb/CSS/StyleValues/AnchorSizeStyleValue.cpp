@@ -34,31 +34,7 @@ AnchorSizeStyleValue::AnchorSizeStyleValue(
     Optional<AnchorSize> const& anchor_size,
     ValueComparingRefPtr<StyleValue const> const& fallback_value)
     : StyleValueWithDefaultOperators(Type::AnchorSize, make_anchor_size_data(anchor_name, anchor_size, fallback_value))
-    , m_fallback_value(fallback_value)
 {
-}
-
-void AnchorSizeStyleValue::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
-{
-    // FIXME: Handle SerializationMode.
-    builder.append("anchor-size("sv);
-
-    if (anchor_name().has_value())
-        builder.append(serialize_an_identifier(anchor_name().value()));
-
-    if (anchor_size().has_value()) {
-        if (anchor_name().has_value())
-            builder.append(' ');
-        builder.append(CSS::to_string(anchor_size().value()));
-    }
-
-    if (fallback_value()) {
-        if (anchor_name().has_value() || anchor_size().has_value())
-            builder.append(", "sv);
-        fallback_value()->serialize(builder, serialization_mode);
-    }
-
-    builder.append(')');
 }
 
 }

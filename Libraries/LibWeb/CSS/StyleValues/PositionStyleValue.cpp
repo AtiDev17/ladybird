@@ -9,6 +9,8 @@
 
 #include "PositionStyleValue.h"
 #include <LibWeb/CSS/Enums.h>
+#include <LibWeb/CSS/PercentageOr.h>
+#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 
 namespace Web::CSS {
 
@@ -49,13 +51,6 @@ ValueComparingNonnullRefPtr<StyleValue const> PositionStyleValue::absolutized(Co
     return PositionStyleValue::create(
         edge_x()->absolutized(computation_context)->as_edge(),
         edge_y()->absolutized(computation_context)->as_edge());
-}
-
-void PositionStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    edge_x()->serialize(builder, mode);
-    builder.append(' ');
-    edge_y()->serialize(builder, mode);
 }
 
 }

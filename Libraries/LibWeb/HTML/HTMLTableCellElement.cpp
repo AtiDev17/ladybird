@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -105,13 +106,13 @@ void HTMLTableCellElement::apply_presentational_hints(Vector<CSS::StyleProperty>
         auto const* color = [&] {
             switch (color_property) {
             case CSS::PropertyID::BorderLeftColor:
-                return border_values.border_left_color_style_value.data();
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_left_color_style_value.pointer);
             case CSS::PropertyID::BorderTopColor:
-                return border_values.border_top_color_style_value.data();
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_top_color_style_value.pointer);
             case CSS::PropertyID::BorderRightColor:
-                return border_values.border_right_color_style_value.data();
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_right_color_style_value.pointer);
             case CSS::PropertyID::BorderBottomColor:
-                return border_values.border_bottom_color_style_value.data();
+                return static_cast<CSS::StyleValueFFI::StyleValueData const*>(border_values.border_bottom_color_style_value.pointer);
             default:
                 VERIFY_NOT_REACHED();
             }

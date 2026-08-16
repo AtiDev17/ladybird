@@ -20,6 +20,7 @@ from Utils.utils import camel_casify
 from Utils.utils import snake_casify
 from Utils.utils import title_casify
 from Utils.utils import underlying_type_for_enum
+from Utils.utils import write_case_insensitive_ascii_string_to_enum_lookup
 
 
 def is_legacy_alias(prop: dict) -> bool:
@@ -232,14 +233,6 @@ enum class PropertyID : {property_id_underlying_type} {{
     out.write(f"""
 }};
 
-enum class AnimationType {{
-    Discrete,
-    ByComputedValue,
-    RepeatableList,
-    Custom,
-    None,
-}};
-WEB_API AnimationType animation_type_from_longhand_property(PropertyID);
 bool is_animatable_property(PropertyID);
 
 Optional<PropertyID> property_id_from_camel_case_string(StringView);
@@ -290,9 +283,6 @@ Vector<PropertyID> const& shorthands_for_longhand(PropertyID);
 WEB_API Vector<PropertyID> const& property_computation_order();
 bool property_is_positional_value_list_shorthand(PropertyID);
 
-WEB_API bool property_requires_computation_with_inherited_value(PropertyID);
-WEB_API bool property_requires_computation_with_initial_value(PropertyID);
-WEB_API bool property_requires_computation_with_cascaded_value(PropertyID);
 
 size_t property_maximum_value_count(PropertyID);
 
@@ -359,6 +349,7 @@ struct Formatter<Web::CSS::PropertyID> : Formatter<Utf16FlyString> {
 def write_implementation_file(out: TextIO, properties: dict, logical_property_groups: dict, enum_names: list) -> None:
     out.write("""
 #include <AK/Assertions.h>
+#include <AK/CharacterTypes.h>
 #include <AK/NeverDestroyed.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/Parser/Parser.h>
@@ -403,30 +394,25 @@ Optional<PropertyID> property_id_from_camel_case_string(Utf16View string)
     return {};
 }
 
-static auto generate_properties_table()
-{
-    HashMap<StringView, PropertyID, CaseInsensitiveASCIIStringViewTraits> table;
 """)
 
+    property_ids_by_name = {}
     for name, value in properties.items():
         legacy_alias_for = value.get("legacy-alias-for")
         target = title_casify(legacy_alias_for) if legacy_alias_for is not None else title_casify(name)
-        out.write(f"""
-    table.set("{name}"sv, PropertyID::{target});
-""")
+        property_ids_by_name[name] = f"PropertyID::{target}"
+    write_case_insensitive_ascii_string_to_enum_lookup(
+        out, "property_id_from_string_impl", "PropertyID", property_ids_by_name
+    )
 
     out.write("""
-    return table;
-}
-
-static auto const& properties_table = *new HashMap<StringView, PropertyID, CaseInsensitiveASCIIStringViewTraits>(generate_properties_table());
 
 Optional<PropertyID> property_id_from_string(StringView string)
 {
     if (is_a_custom_property_name_string(string))
         return PropertyID::Custom;
 
-    return properties_table.get(string);
+    return property_id_from_string_impl(string);
 }
 
 Optional<PropertyID> property_id_from_string(Utf16View string)
@@ -434,14 +420,7 @@ Optional<PropertyID> property_id_from_string(Utf16View string)
     if (is_a_custom_property_name_string(string))
         return PropertyID::Custom;
 
-    if (string.has_ascii_storage())
-        return properties_table.get(StringView { string.bytes() });
-
-    for (auto const& entry : properties_table) {
-        if (string.equals_ignoring_ascii_case(entry.key))
-            return entry.value;
-    }
-    return {};
+    return property_id_from_string_impl(string);
 }
 
 Utf16FlyString const& string_from_property_id(PropertyID property_id) {
@@ -485,40 +464,6 @@ Utf16FlyString const& camel_case_string_from_property_id(PropertyID property_id)
         static Utf16FlyString const& invalid_property_id_string = *new Utf16FlyString("(invalid CSS::PropertyID)"_utf16_fly_string);
         return invalid_property_id_string;
     }
-    }
-}
-
-AnimationType animation_type_from_longhand_property(PropertyID property_id)
-{
-    switch (property_id) {
-""")
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-
-        if "longhands" in value:
-            if "animation-type" in value:
-                print(f"Property '{name}' with longhands cannot specify 'animation-type'", file=sys.stderr)
-                sys.exit(1)
-            out.write(f"""
-    case PropertyID::{title_casify(name)}:
-        VERIFY_NOT_REACHED();
-""")
-            continue
-
-        animation_type = value.get("animation-type")
-        if animation_type is None:
-            print(f"No animation-type specified for property '{name}'", file=sys.stderr)
-            sys.exit(1)
-        out.write(f"""
-    case PropertyID::{title_casify(name)}:
-        return AnimationType::{title_casify(animation_type)};
-""")
-
-    out.write("""
-    default:
-        return AnimationType::None;
     }
 }
 
@@ -784,11 +729,13 @@ bool property_has_quirk(PropertyID property_id, Quirk quirk)
     case PropertyID::{title_casify(name)}: {{
         switch (quirk) {{
 """)
-            for quirk in quirks:
-                out.write(f"""
+            out.writelines(
+                f"""
         case Quirk::{title_casify(quirk)}:
             return true;
-""")
+"""
+                for quirk in quirks
+            )
             out.write("""
         default:
             return false;
@@ -1017,8 +964,7 @@ Vector<Utf16View> property_custom_ident_blacklist(PropertyID property_id)
             out.write(f"""
     case PropertyID::{title_casify(name)}:
         return Vector<Utf16View> {{ """)
-            for keyword in blacklisted_keywords:
-                out.write(f'"{keyword}"sv, ')
+            out.writelines(f'"{keyword}"sv, ' for keyword in blacklisted_keywords)
             out.write("};\n")
 
     out.write("""
@@ -1155,8 +1101,7 @@ bool property_maps_to_shorthand(PropertyID property_id)
     switch (property_id) {
 """)
 
-    for longhand in shorthands_for_longhand_map.keys():
-        out.write(f"        case PropertyID::{title_casify(longhand)}:\n")
+    out.writelines(f"        case PropertyID::{title_casify(longhand)}:\n" for longhand in shorthands_for_longhand_map)
 
     out.write("""
             return true;
@@ -1203,7 +1148,7 @@ Vector<PropertyID> const& shorthands_for_longhand(PropertyID property_id)
         shorthands.sort(key=sort_key)
         return shorthands
 
-    for longhand in shorthands_for_longhand_map.keys():
+    for longhand in shorthands_for_longhand_map:
         shorthands = ", ".join(f"PropertyID::{title_casify(s)}" for s in get_shorthands_for_longhand(longhand))
         out.write(f"""
     case PropertyID::{title_casify(longhand)}: {{
@@ -1256,8 +1201,7 @@ Vector<PropertyID> const& shorthands_for_longhand(PropertyID property_id)
 Vector<PropertyID> const& property_computation_order() {
     static auto const& order = *new Vector<PropertyID> {
 """)
-    for property_name in manually_specified_computation_order:
-        out.write(f"        PropertyID::{property_name},\n")
+    out.writelines(f"        PropertyID::{property_name},\n" for property_name in manually_specified_computation_order)
 
     for name, value in properties.items():
         if is_legacy_alias(value):
@@ -1294,84 +1238,7 @@ bool property_is_positional_value_list_shorthand(PropertyID property_id)
 }
 """)
 
-    properties_requiring_inherited = []
-    properties_requiring_initial = []
-    properties_requiring_cascaded = []
-
-    for name, value in properties.items():
-        if is_legacy_alias(value):
-            continue
-        requires_computation = value.get("requires-computation")
-        if requires_computation is not None and "longhands" in value:
-            print(f"Property '{name}' is a shorthand and cannot have 'requires-computation' set.", file=sys.stderr)
-            sys.exit(1)
-        if "longhands" in value:
-            continue
-        if requires_computation is None:
-            print(f"Property '{name}' is missing 'requires-computation' field.", file=sys.stderr)
-            sys.exit(1)
-        if requires_computation == "always":
-            properties_requiring_inherited.append(name)
-            properties_requiring_initial.append(name)
-            properties_requiring_cascaded.append(name)
-        elif requires_computation == "non-inherited-value":
-            properties_requiring_initial.append(name)
-            properties_requiring_cascaded.append(name)
-        elif requires_computation == "cascaded-value":
-            properties_requiring_cascaded.append(name)
-        elif requires_computation != "never":
-            print(
-                f"Property '{name}' has unrecognized 'requires-computation' value '{requires_computation}'",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
     out.write("""
-bool property_requires_computation_with_inherited_value(PropertyID property_id)
-{
-    switch(property_id) {
-    """)
-
-    for property_name in properties_requiring_inherited:
-        out.write(f"    case PropertyID::{title_casify(property_name)}:\n")
-
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool property_requires_computation_with_initial_value(PropertyID property_id)
-{
-    switch(property_id) {
-    """)
-
-    for property_name in properties_requiring_initial:
-        out.write(f"    case PropertyID::{title_casify(property_name)}:\n")
-
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool property_requires_computation_with_cascaded_value(PropertyID property_id)
-{
-    switch(property_id) {
-    """)
-
-    for property_name in properties_requiring_cascaded:
-        out.write(f"    case PropertyID::{title_casify(property_name)}:\n")
-
-    out.write("""
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool property_is_logical_alias(PropertyID property_id)
 {
     switch(property_id) {
@@ -1622,11 +1489,13 @@ PropertyID map_physical_property_to_logical_alias(PropertyID property_id, Logica
 
         for physical_property_name in physical_properties.values():
             out.write(f"        case PropertyID::{title_casify(physical_property_name)}:\n")
-            for logical_property_name in logical_properties.values():
-                out.write(f"""
+            out.writelines(
+                f"""
             if (map_logical_alias_to_physical_property(PropertyID::{title_casify(logical_property_name)}, mapping_context) == property_id)
                 return PropertyID::{title_casify(logical_property_name)};
-""")
+"""
+                for logical_property_name in logical_properties.values()
+            )
             out.write("            VERIFY_NOT_REACHED();\n")
 
     out.write("""
@@ -1651,8 +1520,7 @@ Optional<LogicalPropertyGroup> logical_property_group_for_property(PropertyID pr
             members.append(logical_property)
 
     for group_name, group_properties in logical_property_group_members.items():
-        for prop_name in group_properties:
-            out.write(f"    case PropertyID::{title_casify(prop_name)}:\n")
+        out.writelines(f"    case PropertyID::{title_casify(prop_name)}:\n" for prop_name in group_properties)
         out.write(f"        return LogicalPropertyGroup::{title_casify(group_name)};\n")
 
     out.write("""

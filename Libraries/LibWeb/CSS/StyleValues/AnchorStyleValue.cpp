@@ -36,28 +36,7 @@ AnchorStyleValue::AnchorStyleValue(Optional<Utf16FlyString> const& anchor_name,
     ValueComparingNonnullRefPtr<StyleValue const> const& anchor_side,
     ValueComparingRefPtr<StyleValue const> const& fallback_value)
     : AbstractNonMathCalcFunctionStyleValue(Type::Anchor, make_anchor_data(anchor_name, anchor_side, fallback_value))
-    , m_anchor_side(anchor_side)
-    , m_fallback_value(fallback_value)
 {
-}
-
-void AnchorStyleValue::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
-{
-    builder.append("anchor("sv);
-
-    if (anchor_name().has_value())
-        builder.append(serialize_an_identifier(anchor_name().value()));
-
-    if (anchor_name().has_value())
-        builder.append(' ');
-    anchor_side()->serialize(builder, serialization_mode);
-
-    if (fallback_value()) {
-        builder.append(", "sv);
-        fallback_value()->serialize(builder, serialization_mode);
-    }
-
-    builder.append(')');
 }
 
 // https://drafts.csswg.org/css-anchor-position-1/#anchor-pos
@@ -84,15 +63,6 @@ Optional<CalcNodeRef> AnchorStyleValue::resolve_to_calculation_node(CalculationC
         ? CalcNodeRef::non_math_function(fallback_value->as_anchor(), NumericType { NumericType::BaseType::Length, 1 })
         : CalcNodeRef::from_style_value(*fallback_value);
     return simplify_a_calculation_tree(fallback_node, calculation_context, calculation_resolution_context);
-}
-
-bool AnchorStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-
-    auto const& other_anchor = other.as_anchor();
-    return anchor_name() == other_anchor.anchor_name() && anchor_side() == other_anchor.anchor_side() && fallback_value() == other_anchor.fallback_value();
 }
 
 }

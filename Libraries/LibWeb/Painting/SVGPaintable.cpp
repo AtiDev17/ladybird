@@ -5,22 +5,20 @@
  */
 
 #include <LibGfx/BoundingBox.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/SVGPaintable.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 
 namespace Web::Painting {
 
-SVGPaintable::SVGPaintable(Layout::SVGBox const& layout_box)
+SVGPaintable::SVGPaintable(Layout::Box const& layout_box)
     : Paintable(layout_box)
 {
 }
 
-Layout::SVGBox const& SVGPaintable::layout_box() const
+Layout::Box const& SVGPaintable::layout_box() const
 {
-    return static_cast<Layout::SVGBox const&>(layout_node());
+    return static_cast<Layout::Box const&>(layout_node());
 }
 
 // https://drafts.csswg.org/css-masking-1/#ClipPathElement
@@ -65,8 +63,10 @@ CSSPixelRect SVGPaintable::compute_absolute_rect() const
 {
     // SVG content geometry lives in the user space of the nearest ancestor viewport, and layout
     // places every box viewport-relative already, so no ancestor offsets accumulate.
-    if (layout_box().first_ancestor_of_type<Layout::SVGSVGBox>())
-        return { offset(), content_size() };
+    for (auto const* ancestor = layout_box().parent(); ancestor; ancestor = ancestor->parent()) {
+        if (ancestor->is_svg_svg_box())
+            return { offset(), content_size() };
+    }
     return Paintable::compute_absolute_rect();
 }
 

@@ -18,24 +18,4 @@ AngleStyleValue::AngleStyleValue(Angle angle)
 
 AngleStyleValue::~AngleStyleValue() = default;
 
-ValueComparingNonnullRefPtr<StyleValue const> AngleStyleValue::absolutized(ComputationContext const&) const
-{
-    if (angle().unit() == canonical_angle_unit())
-        return *this;
-    return create(Angle::make_degrees(angle().to_degrees()));
-}
-
-void AngleStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    angle().serialize(builder, mode);
-}
-
-bool AngleStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-    auto const& other_angle = other.as_angle();
-    return angle() == other_angle.angle();
-}
-
 }

@@ -267,7 +267,7 @@ class ColorInterpolationMethodStyleValue;
 class ColorMixStyleValue;
 class ColorSchemeStyleValue;
 class ColorStyleValue;
-class ComputedProperties;
+class ComputedStyleWorkingSet;
 class ComputedValues;
 class ComputedStyleRecordView;
 class LayoutStyle;
@@ -1007,30 +1007,16 @@ class IntersectionObserverEntry;
 
 namespace Web::Layout {
 
-class AudioBox;
 class BlockContainer;
+class ImageProvider;
 class Box;
-class ButtonBox;
-class CheckBox;
-class FieldSetBox;
-class ImageBox;
-class InlineNode;
-class Label;
-class LegendBox;
-class ListItemBox;
-class ListItemMarkerBox;
 class LayoutRustBridge;
 class Node;
 class NodeArena;
 class NodeWithStyle;
-class RadioButton;
-class ReplacedBox;
-class SVGSVGBox;
-class TableWrapper;
 class TextNode;
 class TextOffsetMapping;
 class LayoutTreeBuilderAccess;
-class VideoBox;
 class Viewport;
 
 }

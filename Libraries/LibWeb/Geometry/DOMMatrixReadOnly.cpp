@@ -12,8 +12,8 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Bindings/DOMMatrixReadOnly.h>
 #include <LibWeb/Bindings/DOMPointReadOnly.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShorthandStyleValue.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
@@ -932,7 +932,7 @@ WebIDL::ExceptionOr<ParsedMatrix> parse_dom_matrix_init_string(StringView transf
     auto transform_style_value = parse_css_value(parsing_params, transform_list, CSS::PropertyID::Transform);
     if (!transform_style_value || (transform_style_value->is_keyword() && transform_style_value->to_keyword() != CSS::Keyword::None) || transform_style_value->is_unresolved())
         return WebIDL::SyntaxError::create("Failed to parse CSS transform string."_utf16);
-    auto parsed_value = CSS::ComputedProperties::transformations_for_style_value(*transform_style_value);
+    auto parsed_value = CSS::transformations_for_style_value(*transform_style_value);
 
     // NB: Check that no <length> values with non-absolute length units were used
     if (!all_of(parsed_value, [](auto& transform) { return transform->can_be_converted_to_matrix_without_reference_box(); }))

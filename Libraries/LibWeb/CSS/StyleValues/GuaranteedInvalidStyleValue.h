@@ -19,13 +19,10 @@ public:
         return instance;
     }
     virtual ~GuaranteedInvalidStyleValue() override = default;
-    void serialize(StringBuilder&, SerializationMode) const { }
     Vector<Parser::ComponentValue> tokenize() const
     {
         return { Parser::ComponentValue { Parser::GuaranteedInvalidValue {} } };
     }
-
-    bool properties_equal(GuaranteedInvalidStyleValue const&) const { return true; }
 
 private:
     friend class StyleValue;

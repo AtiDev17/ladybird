@@ -9,9 +9,10 @@
 
 namespace Web::Layout {
 
-BlockContainer::BlockContainer(DOM::Document& document, GC::Ptr<DOM::Node> node, CSS::LayoutStyle style)
-    : Box(document, node, move(style))
+BlockContainer::BlockContainer(DOM::Document& document, GC::Ptr<DOM::Node> node, CSS::LayoutStyle style, RustFFI::NodeKind kind)
+    : Box(document, node, move(style), kind)
 {
+    set_node_kind(kind);
 }
 
 BlockContainer::~BlockContainer() = default;
@@ -20,11 +21,6 @@ RefPtr<Painting::PaintableWithLines const> BlockContainer::paintable_with_lines(
 {
     auto paintable_box = Box::paintable_box();
     return as_if<Painting::PaintableWithLines>(paintable_box.ptr());
-}
-
-RefPtr<Painting::Paintable> BlockContainer::create_paintable() const
-{
-    return Painting::PaintableWithLines::create(*this);
 }
 
 }

@@ -25,12 +25,6 @@
 #include <LibWeb/CSS/Size.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FlexStyleValue.h>
-#include <LibWeb/CSS/StyleValues/FunctionStyleValue.h>
-#include <LibWeb/CSS/StyleValues/GridTrackSizeListStyleValue.h>
-#include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
-#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
@@ -42,21 +36,11 @@
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/DominantBaseline.h>
-#include <LibWeb/Layout/FieldSetBox.h>
 #include <LibWeb/Layout/FlexLayoutData.h>
 #include <LibWeb/Layout/GridLayoutData.h>
-#include <LibWeb/Layout/InlineNode.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
-#include <LibWeb/Layout/SVGClipBox.h>
-#include <LibWeb/Layout/SVGGeometryBox.h>
-#include <LibWeb/Layout/SVGImageBox.h>
-#include <LibWeb/Layout/SVGMaskBox.h>
-#include <LibWeb/Layout/SVGPatternBox.h>
-#include <LibWeb/Layout/SVGSVGBox.h>
-#include <LibWeb/Layout/SVGTextBox.h>
-#include <LibWeb/Layout/SVGTextPathBox.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
@@ -65,9 +49,14 @@
 #include <LibWeb/Painting/SVGPathPaintable.h>
 #include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
+#include <LibWeb/SVG/SVGGeometryElement.h>
+#include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
+#include <LibWeb/SVG/SVGTextPathElement.h>
+#include <LibWeb/SVG/SVGTextPositioningElement.h>
 
 namespace Web::Layout {
 
@@ -84,25 +73,23 @@ static_assert(to_underlying(CSS::StyleGroupIndex::SizingValues) == RustFFI::STYL
 static_assert(to_underlying(CSS::StyleGroupIndex::SurroundValues) == RustFFI::STYLE_GROUP_INDEX_SURROUND);
 static_assert(to_underlying(CSS::StyleGroupIndex::BoxValues) == RustFFI::STYLE_GROUP_INDEX_BOX);
 
-static CSS::GridTrackSizeList build_used_grid_track_list(RustFFI::FfiUsedGridTrackList const& list)
+static Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGridTrackList const& list)
 {
-    auto result = list.is_subgrid ? CSS::GridTrackSizeList::make_subgrid() : CSS::GridTrackSizeList::make_none();
     VERIFY(list.is_subgrid ? list.track_count == 0 : list.track_count + 1 == list.line_count);
 
+    Painting::UsedGridTrackList result;
+    result.is_subgrid = list.is_subgrid;
+    result.lines.ensure_capacity(list.line_count);
+    result.track_sizes.ensure_capacity(list.track_count);
     for (size_t line_index = 0; line_index < list.line_count; ++line_index) {
         CSS::GridLineNames line_names;
         auto const& line = list.lines[line_index];
         for (size_t name_index = 0; name_index < line.name_count; ++name_index)
             line_names.append(Utf16FlyString::from_raw(line.names[name_index]));
-        if (list.is_subgrid || !line_names.is_empty())
-            result.append(move(line_names));
+        result.lines.unchecked_append(move(line_names));
 
-        if (line_index < list.track_count) {
-            auto size = CSSPixels::from_raw(list.track_sizes[line_index]);
-            result.append(CSS::ExplicitGridTrack {
-                CSS::GridSize { CSS::LengthStyleValue::create(CSS::Length::make_px(size)) },
-            });
-        }
+        if (line_index < list.track_count)
+            result.track_sizes.unchecked_append(CSSPixels::from_raw(list.track_sizes[line_index]));
     }
     return result;
 }
@@ -350,15 +337,16 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
     SVG::SVGUnits pattern_units {};
     SVG::NumberPercentage pattern_width = SVG::NumberPercentage::create_number(0);
     SVG::NumberPercentage pattern_height = SVG::NumberPercentage::create_number(0);
-    if (auto const* mask_box = as_if<SVGMaskBox>(node))
-        content_units = mask_box->dom_node().mask_content_units();
-    else if (auto const* clip_box = as_if<SVGClipBox>(node))
-        content_units = clip_box->dom_node().clip_path_units();
-    else if (auto const* pattern_box = as_if<SVGPatternBox>(node)) {
-        content_units = pattern_box->dom_node().pattern_content_units();
-        pattern_units = pattern_box->dom_node().pattern_units();
-        pattern_width = pattern_box->dom_node().pattern_width();
-        pattern_height = pattern_box->dom_node().pattern_height();
+    if (node.is_svg_mask_box())
+        content_units = as<SVG::SVGMaskElement>(*node.dom_node()).mask_content_units();
+    else if (node.is_svg_clip_box())
+        content_units = as<SVG::SVGClipPathElement>(*node.dom_node()).clip_path_units();
+    else if (node.is_svg_pattern_box()) {
+        auto const& pattern_element = as<SVG::SVGPatternElement>(*node.dom_node());
+        content_units = pattern_element.pattern_content_units();
+        pattern_units = pattern_element.pattern_units();
+        pattern_width = pattern_element.pattern_width();
+        pattern_height = pattern_element.pattern_height();
     }
 
     return {
@@ -398,10 +386,10 @@ static Utf16String rendered_svg_text_contents(SVG::SVGTextContentElement const& 
 }
 
 // The advance of the text run rendered by the given box; that is, of its direct child text content.
-static float svg_text_run_advance(SVGTextBox const& text_box)
+static float svg_text_run_advance(Box const& text_box)
 {
     // FIXME: Use per-code-point fonts.
-    return text_box.first_available_font().width(text_box.dom_node().text_contents());
+    return text_box.first_available_font().width(static_cast<SVG::SVGTextContentElement const&>(*text_box.dom_node()).text_contents());
 }
 
 // https://svgwg.org/svg2-draft/text.html#TermTextChunk
@@ -409,11 +397,11 @@ static float svg_text_run_advance(SVGTextBox const& text_box)
 // https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
 // NB: The initial value of 'x' and 'y' is "0 for 'text'; (none) for 'tspan'". So, a <text> element always positions its
 //     first character absolutely, and so always starts a chunk.
-static bool svg_text_box_starts_text_chunk(SVGTextBox const& text_box)
+static bool svg_text_box_starts_text_chunk(Box const& text_box)
 {
-    if (is<SVG::SVGTextElement>(text_box.dom_node()))
+    if (is<SVG::SVGTextElement>(*text_box.dom_node()))
         return true;
-    auto text_positioning = text_box.dom_node().text_positioning();
+    auto text_positioning = as<SVG::SVGTextPositioningElement>(*text_box.dom_node()).text_positioning();
     return !text_positioning.x.is_empty() || !text_positioning.y.is_empty();
 }
 
@@ -425,27 +413,27 @@ struct SvgTextChunkMeasurement {
 // Measures the total advance of the text chunk that starts at the given box, and determines the 'text-anchor' value
 // that applies to the chunk. The chunk extends in document order through the subtree of the containing <text> element
 // until the next box that starts a chunk of its own.
-static SvgTextChunkMeasurement measure_svg_text_chunk(SVGTextBox const& chunk_start_box)
+static SvgTextChunkMeasurement measure_svg_text_chunk(Box const& chunk_start_box)
 {
     auto const* subtree_root = &chunk_start_box;
-    for (auto const* ancestor = chunk_start_box.parent(); ancestor && is<SVGTextBox>(*ancestor); ancestor = ancestor->parent())
-        subtree_root = static_cast<SVGTextBox const*>(ancestor);
+    for (auto const* ancestor = chunk_start_box.parent(); ancestor && ancestor->kind() == RustFFI::NodeKind::SVGTextBox; ancestor = ancestor->parent())
+        subtree_root = static_cast<Box const*>(ancestor);
 
     SvgTextChunkMeasurement measurement;
     bool found_chunk_start = false;
     bool found_first_rendered_text = false;
     subtree_root->for_each_in_inclusive_subtree([&](Node const& node) {
         // AD-HOC: Text on a path is laid out independently; see compute_path_for_svg_text_path().
-        if (is<SVGTextPathBox>(node))
+        if (node.kind() == RustFFI::NodeKind::SVGTextPathBox)
             return TraversalDecision::SkipChildrenAndContinue;
-        auto const* text_box = as_if<SVGTextBox>(node);
-        if (!text_box)
+        if (node.kind() != RustFFI::NodeKind::SVGTextBox)
             return TraversalDecision::Continue;
+        auto const* text_box = static_cast<Box const*>(&node);
         if (text_box == &chunk_start_box)
             found_chunk_start = true;
         else if (found_chunk_start && svg_text_box_starts_text_chunk(*text_box))
             return TraversalDecision::Break;
-        if (found_chunk_start && !text_box->dom_node().text_contents().is_empty()) {
+        if (found_chunk_start && !static_cast<SVG::SVGTextContentElement const&>(*text_box->dom_node()).text_contents().is_empty()) {
             if (!found_first_rendered_text) {
                 // https://svgwg.org/svg2-draft/text.html#TextLayoutAlgorithm
                 // Adjust shift based on the value of 'text-anchor' and 'direction' of the element the character at index i.
@@ -460,9 +448,9 @@ static SvgTextChunkMeasurement measure_svg_text_chunk(SVGTextBox const& chunk_st
     return measurement;
 }
 
-static Gfx::Path compute_path_for_svg_text(SVGTextBox const& text_box, Gfx::FloatPoint current_text_position)
+static Gfx::Path compute_path_for_svg_text(Box const& text_box, Gfx::FloatPoint current_text_position)
 {
-    auto& text_element = text_box.dom_node();
+    auto const& text_element = static_cast<SVG::SVGTextContentElement const&>(*text_box.dom_node());
     // FIXME: Use per-code-point fonts.
     auto& font = text_box.first_available_font();
     auto text_contents = text_element.text_contents();
@@ -477,9 +465,9 @@ static Gfx::Path compute_path_for_svg_text(SVGTextBox const& text_box, Gfx::Floa
     return path;
 }
 
-static Gfx::Path compute_path_for_svg_text_path(SVGTextPathBox const& text_path_box, CSSPixelSize viewport_size)
+static Gfx::Path compute_path_for_svg_text_path(Box const& text_path_box, CSSPixelSize viewport_size)
 {
-    auto& text_path_element = static_cast<SVG::SVGTextPathElement const&>(text_path_box.dom_node());
+    auto const& text_path_element = as<SVG::SVGTextPathElement>(*text_path_box.dom_node());
     auto path_or_shape = text_path_element.path_or_shape();
     if (!path_or_shape)
         return {};
@@ -511,7 +499,7 @@ static Gfx::Path compute_path_for_svg_text_path(SVGTextPathBox const& text_path_
 
 static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, RustFFI::FfiSvgPathRequest const& request)
 {
-    auto const& graphics_box = as<SVGGraphicsBox>(node);
+    auto const& graphics_box = as<Box>(node);
     CSSPixelSize viewport_size {
         CSSPixels::from_raw(request.viewport_width),
         CSSPixels::from_raw(request.viewport_height),
@@ -522,10 +510,11 @@ static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, Rus
     };
 
     Gfx::Path path;
-    if (auto const* geometry_box = as_if<SVGGeometryBox>(graphics_box)) {
-        path = const_cast<SVGGeometryBox&>(*geometry_box).dom_node().get_path(viewport_size);
-    } else if (auto const* text_box = as_if<SVGTextBox>(graphics_box)) {
-        auto const& text_element = text_box->dom_node();
+    if (graphics_box.is_svg_geometry_box()) {
+        path = as<SVG::SVGGeometryElement>(const_cast<DOM::Node&>(*graphics_box.dom_node())).get_path(viewport_size);
+    } else if (graphics_box.kind() == RustFFI::NodeKind::SVGTextBox) {
+        auto const* text_box = &graphics_box;
+        auto const& text_element = as<SVG::SVGTextPositioningElement>(*text_box->dom_node());
         // https://svgwg.org/svg2-draft/text.html#TextElementXAttribute
         // the starting X (Y) coordinate for rendering the glyphs corresponding to the given character is the X (Y) coordinate
         // of the resulting current text position from the most recently rendered glyph for the current 'text' element.
@@ -567,8 +556,8 @@ static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, Rus
         // width for horizontal text or height for vertical text).
         // FIXME: Take writing mode and text direction into account.
         text_position.translate_by(svg_text_run_advance(*text_box), 0);
-    } else if (auto const* text_path_box = as_if<SVGTextPathBox>(graphics_box)) {
-        path = compute_path_for_svg_text_path(*text_path_box, viewport_size);
+    } else if (graphics_box.kind() == RustFFI::NodeKind::SVGTextPathBox) {
+        path = compute_path_for_svg_text_path(graphics_box, viewport_size);
     }
 
     auto bounding_box = path.bounding_box();
@@ -974,8 +963,8 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             VERIFY(columns);
             VERIFY(rows);
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_used_values_for_grid_template_columns(CSS::GridTrackSizeListStyleValue::create(build_used_grid_track_list(*columns)));
-            paintable.set_used_values_for_grid_template_rows(CSS::GridTrackSizeListStyleValue::create(build_used_grid_track_list(*rows))); },
+            paintable.set_used_values_for_grid_template_columns(build_used_grid_track_list(*columns));
+            paintable.set_used_values_for_grid_template_rows(build_used_grid_track_list(*rows)); },
         .finish_node = [](void*, void* node_pointer, void* paintable_pointer, void* parent_paintable_pointer, void* insert_before_paintable_pointer) {
             auto& node = *static_cast<Node*>(node_pointer);
             auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
@@ -1111,8 +1100,8 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             VERIFY(node_with_style);
             return compute_svg_path(*node_with_style, request); },
         .svg_image_bounding_box = [](void*, void* node, i32 viewport_width, i32 viewport_height) {
-            auto const& image_box = as<SVGImageBox>(*static_cast<Node const*>(node));
-            auto bounding_box = image_box.dom_node().bounding_box({
+            auto const& image_element = as<SVG::SVGImageElement>(*static_cast<Node const*>(node)->dom_node());
+            auto bounding_box = image_element.bounding_box({
                 CSSPixels::from_raw(viewport_width),
                 CSSPixels::from_raw(viewport_height),
             });

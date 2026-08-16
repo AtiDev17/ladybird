@@ -32,7 +32,8 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
+#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Invalidation/AttributeInvalidator.h>
@@ -124,8 +125,6 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/Layout/InlineNode.h>
-#include <LibWeb/Layout/ListItemBox.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -145,6 +144,7 @@
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
@@ -1099,7 +1099,7 @@ RefPtr<Layout::NodeWithStyle> Element::create_layout_node_for_display_type(DOM::
         return make_ref_counted<Layout::Box>(document, element, style);
 
     if (display.is_list_item())
-        return make_ref_counted<Layout::ListItemBox>(document, element, style);
+        return make_ref_counted<Layout::BlockContainer>(document, element, style, Layout::RustFFI::NodeKind::ListItemBox);
 
     if (display.is_table_cell())
         return make_ref_counted<Layout::BlockContainer>(document, element, style);
@@ -1121,13 +1121,13 @@ RefPtr<Layout::NodeWithStyle> Element::create_layout_node_for_display_type(DOM::
         if (display.is_flow_root_inside())
             return make_ref_counted<Layout::BlockContainer>(document, element, style);
         if (display.is_flow_inside())
-            return make_ref_counted<Layout::InlineNode>(document, element, style);
+            return make_ref_counted<Layout::NodeWithStyle>(document, element, style, Layout::RustFFI::NodeKind::InlineNode);
         if (display.is_flex_inside())
             return make_ref_counted<Layout::Box>(document, element, style);
         if (display.is_grid_inside())
             return make_ref_counted<Layout::Box>(document, element, style);
         dbgln_if(LIBWEB_CSS_DEBUG, "FIXME: Support display: {}", display.to_string());
-        return make_ref_counted<Layout::InlineNode>(document, element, style);
+        return make_ref_counted<Layout::NodeWithStyle>(document, element, style, Layout::RustFFI::NodeKind::InlineNode);
     }
 
     if (display.is_flex_inside() || display.is_grid_inside())
@@ -1142,7 +1142,7 @@ RefPtr<Layout::NodeWithStyle> Element::create_layout_node_for_display_type(DOM::
     if (display.is_ruby_inside())
         return make_ref_counted<Layout::BlockContainer>(document, element, style);
 
-    return make_ref_counted<Layout::InlineNode>(document, element, style);
+    return make_ref_counted<Layout::NodeWithStyle>(document, element, style, Layout::RustFFI::NodeKind::InlineNode);
 }
 
 void Element::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
@@ -1207,13 +1207,6 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
     }
 }
 
-static bool style_value_changed(CSS::StyleValue const& old_value, CSS::StyleValue const& new_value)
-{
-    if (&old_value == &new_value)
-        return false;
-    return !old_value.equals(new_value);
-}
-
 static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidation_between_computed_values(CSS::ComputedValues const& old_computed_values, CSS::ComputedValues const& new_computed_values, bool element_folds_transform_into_layout = false)
 {
     CSS::StyleComputer::ComputedStyleInvalidation result;
@@ -1235,20 +1228,50 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
             result.invalidation.ensure_at_least(CSS::InvalidationLevel::Relayout);
         }
 
-        for (auto i = to_underlying(CSS::first_longhand_property_id); i <= to_underlying(CSS::last_longhand_property_id); ++i) {
-            auto property_id = static_cast<CSS::PropertyID>(i);
+        constexpr auto longhand_count = CSS::number_of_longhand_properties;
+        constexpr auto longhand_bitmap_bytes = (longhand_count + 7) / 8;
+        Array<u16, longhand_count> old_physical_properties;
+        Array<u16, longhand_count> new_physical_properties;
+        for (size_t index = 0; index < longhand_count; ++index) {
+            auto property_id = static_cast<CSS::PropertyID>(to_underlying(CSS::first_longhand_property_id) + index);
             auto old_physical_property_id = property_id;
             auto new_physical_property_id = property_id;
             if (CSS::property_is_logical_alias(property_id)) {
                 old_physical_property_id = CSS::map_logical_alias_to_physical_property(property_id, CSS::LogicalAliasMappingContext { old_computed_values.writing_mode(), old_computed_values.direction() });
                 new_physical_property_id = CSS::map_logical_alias_to_physical_property(property_id, CSS::LogicalAliasMappingContext { new_computed_values.writing_mode(), new_computed_values.direction() });
             }
+            old_physical_properties[index] = to_underlying(old_physical_property_id);
+            new_physical_properties[index] = to_underlying(new_physical_property_id);
+        }
 
-            auto old_value = old_computed_values.computed_style_value(old_physical_property_id);
-            auto new_value = new_computed_values.computed_style_value(new_physical_property_id);
+        auto old_longhands = old_computed_values.computed_longhand_values();
+        auto new_longhands = new_computed_values.computed_longhand_values();
+        VERIFY(old_longhands.size() == longhand_count);
+        VERIFY(new_longhands.size() == longhand_count);
+        auto old_importance = old_computed_values.property_importance_bitmap();
+        auto new_importance = new_computed_values.property_importance_bitmap();
+        Array<u8, longhand_bitmap_bytes> changed_properties;
+        auto const* old_animated_properties = old_computed_values.animated_properties();
+        auto const* new_animated_properties = new_computed_values.animated_properties();
+        VERIFY(CSS::StyleValueFFI::rust_style_value_diff_effective_longhands(
+            old_longhands.data(),
+            new_longhands.data(),
+            old_physical_properties.data(),
+            new_physical_properties.data(),
+            longhand_count,
+            old_animated_properties ? old_animated_properties->overlay() : nullptr,
+            new_animated_properties ? new_animated_properties->overlay() : nullptr,
+            old_importance.data(),
+            new_importance.data(),
+            old_importance.size(),
+            changed_properties.data(),
+            changed_properties.size()));
 
-            if (!style_value_changed(*old_value, *new_value))
+        for (size_t index = 0; index < longhand_count; ++index) {
+            if (!(changed_properties[index / 8] & (1 << (index % 8))))
                 continue;
+            auto property_id = static_cast<CSS::PropertyID>(to_underlying(CSS::first_longhand_property_id) + index);
+            auto new_physical_property_id = static_cast<CSS::PropertyID>(new_physical_properties[index]);
             result.any_computed_value_changed = true;
             if (CSS::is_inherited_property(property_id)) {
                 // Equal groups adopted the old payload above, so a changed value names a group
@@ -1259,7 +1282,7 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
                 else
                     result.invalidation.mark_all_inherited_style_groups_changed();
             }
-            auto property_invalidation = CSS::compute_property_invalidation(property_id, old_value.ptr(), new_value.ptr(), &old_computed_values, &new_computed_values);
+            auto property_invalidation = CSS::compute_property_invalidation(property_id, old_computed_values, new_computed_values);
             // SVG layout folds element transforms into container bounding boxes, so a transform
             // change needs layout there even though it stays paint-only for CSS boxes.
             if (element_folds_transform_into_layout
@@ -1311,7 +1334,7 @@ static void add_element_dependent_invalidation(CSS::RequiredInvalidationAfterSty
             invalidation.ensure_at_least(CSS::InvalidationLevel::RebuildLayoutTree);
 
         if (old_list_counter_style.has_value()) {
-            auto const& new_list_style_type = new_computed_values.list_style_type();
+            auto new_list_style_type = new_computed_values.list_style_type(abstract_element.style_scope());
             if (new_list_style_type.has<RefPtr<CSS::CounterStyle const>>()) {
                 ValueComparingRefPtr<CSS::CounterStyle const> new_counter_style = new_list_style_type.get<RefPtr<CSS::CounterStyle const>>();
                 if (*old_list_counter_style != new_counter_style)
@@ -2401,7 +2424,7 @@ int Element::client_top() const
     // 2. Return the computed value of the border-top-width property
     //    plus the height of any scrollbar rendered between the top padding edge and the top border edge,
     //    ignoring any transforms that apply to the element and its ancestors.
-    auto const& border_top = style_group<CSS::ComputedValues::BorderValues>()->border_top;
+    auto const& border_top = style_group<CSS::ComputedValues::BorderValues>()->border_top_value();
     if (border_top.line_style == CSS::LineStyle::None || border_top.line_style == CSS::LineStyle::Hidden)
         return 0;
     return border_top.width.to_int();
@@ -2426,7 +2449,7 @@ int Element::client_left() const
     // 2. Return the computed value of the border-left-width property
     //    plus the width of any scrollbar rendered between the left padding edge and the left border edge,
     //    ignoring any transforms that apply to the element and its ancestors.
-    auto const& border_left = style_group<CSS::ComputedValues::BorderValues>()->border_left;
+    auto const& border_left = style_group<CSS::ComputedValues::BorderValues>()->border_left_value();
     if (border_left.line_style == CSS::LineStyle::None || border_left.line_style == CSS::LineStyle::Hidden)
         return 0;
     return border_left.width.to_int();
@@ -2534,7 +2557,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
                 ? as<ShadowRoot>(old_root).anchor_name_map()
                 : document().anchor_name_map();
             bool element_had_registered_anchor_names = false;
-            for (auto const& name : anchor_values->anchor_names) {
+            for (auto const& name : anchor_values->anchor_names_span()) {
                 element_had_registered_anchor_names = true;
                 anchor_names.unregister_name(name, *this);
             }
@@ -3632,7 +3655,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
 
     // AD-HOC: The spec doesn't specify when to do this, but we need to apply scroll-margin and scroll-margin to target
     //         bounding border box (https://drafts.csswg.org/cssom-view-1/#example-51af1565).
-    auto const& scroll_margin = target.style_group<CSS::ComputedValues::MiscResetValues>()->scroll_margin;
+    auto scroll_margin = target.computed_style()->scroll_margin();
     auto scroll_margin_top = scroll_margin.top().to_px_or_zero(CSSPixels { 0 });
     auto scroll_margin_right = scroll_margin.right().to_px_or_zero(CSSPixels { 0 });
     auto scroll_margin_bottom = scroll_margin.bottom().to_px_or_zero(CSSPixels { 0 });
@@ -4498,7 +4521,7 @@ void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_eleme
             //        custom property data so we just ignore it.
             //
             //        The issue with this is it means the relevant custom properties aren't included in
-            //        getComputedStyle, which would be fixed if we stored CustomPropertyData on ComputedProperties
+            //        getComputedStyle, which would be fixed if we stored CustomPropertyData on the computed style
             //        instead of on the Element/PseudoElement directly. Chrome displays this same (presumably broken)
             //        behavior whereas Firefox includes the properties in getComputedStyle.
         }
@@ -5479,7 +5502,7 @@ Optional<Utf16FlyString> Element::document_scoped_view_transition_name()
     // 1. Let scopedViewTransitionName be the computed value of view-transition-name for element.
     auto const* values = style_group<CSS::ComputedValues::MiscResetValues>();
     VERIFY(values);
-    auto scoped_view_transition_name = values->view_transition_name;
+    auto scoped_view_transition_name = values->view_transition_name_value();
 
     // 2. If scopedViewTransitionName is associated with element’s node document, then return
     //    scopedViewTransitionName.

@@ -8,7 +8,6 @@
 #include <AK/NonnullRefPtr.h>
 #include <LibWeb/CSS/BooleanExpression.h>
 #include <LibWeb/CSS/CalculationResolutionContext.h>
-#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
@@ -285,8 +284,8 @@ static ColorResolutionContext fallback_color_resolution_context_for_style_query(
         VERIFY(ui_values);
         VERIFY(text_values);
         ColorResolutionContext color_resolution_context {
-            .color_scheme = ui_values->color_scheme,
-            .current_color = text_values->color,
+            .color_scheme = ui_values->color_scheme_value(),
+            .current_color = text_values->color_value(),
             .calculation_resolution_context = calculation_resolution_context,
         };
         return color_resolution_context;

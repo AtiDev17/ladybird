@@ -77,9 +77,6 @@ public:
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(::URL::URL const&);
     virtual ~ImageStyleValue() override;
 
-    void serialize(StringBuilder&, SerializationMode) const;
-    bool equals(StyleValue const& other) const;
-
     virtual void load_any_resources(DOM::Document&) override;
 
     Optional<CSSPixels> natural_width(DOM::Document const&) const override;
@@ -87,7 +84,7 @@ public:
     Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const&) const override;
 
     virtual bool is_paintable(DOM::Document const&) const override;
-    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme) const override;
+    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme, ResolvedImage const&) const override;
     Optional<Painting::DisplayListResource> record_display_list(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&, PreferredColorScheme) const;
 
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
@@ -99,7 +96,7 @@ private:
     friend class ImageStyleValueResource;
     friend class Client;
     friend class CSSStyleSheet;
-    ImageStyleValue(URL const&, Optional<::URL::URL> style_resource_base_url = {});
+    ImageStyleValue(URL const&, Optional<::URL::URL> style_resource_base_url = {}, Optional<bool> parent_style_sheet_origin_clean = {}, bool should_absolutize_url_for_computed_value = false);
     explicit ImageStyleValue(StyleValueFFI::StyleValueData const*);
 
     void register_client(Client&) const;
@@ -118,7 +115,7 @@ private:
 
     URL url_value() const;
 
-    static StyleValueFFI::StyleValueData const* make_image_url_data(URL const&);
+    static StyleValueFFI::StyleValueData const* make_image_url_data(URL const&, Optional<::URL::URL> const&, Optional<bool>, bool should_absolutize_url_for_computed_value);
 
     // NB: Style sheet attachment and loading state, not value data.
     Optional<::URL::URL> m_style_resource_base_url;

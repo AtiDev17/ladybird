@@ -220,139 +220,12 @@ ValueComparingNonnullRefPtr<ColorMixStyleValue const> ColorMixStyleValue::create
 
 ColorMixStyleValue::ColorMixStyleValue(RefPtr<StyleValue const> color_interpolation_method, ColorMixComponent first_component, ColorMixComponent second_component)
     : ColorStyleValue(make_color_mix_data(color_interpolation_method, first_component, second_component))
-    , m_color_interpolation_method(move(color_interpolation_method))
-    , m_first_component(move(first_component))
-    , m_second_component(move(second_component))
 {
 }
 
 ColorMixStyleValue::ColorMixStyleValue(StyleValueFFI::StyleValueData const* data)
     : ColorStyleValue(data)
-    , m_color_interpolation_method([&]() -> ValueComparingRefPtr<StyleValue const> {
-        auto const* child_data = static_cast<StyleValueFFI::StyleValueData const*>(data->color_mix.color_interpolation_method.pointer);
-        if (!child_data)
-            return nullptr;
-        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child_data));
-    }())
-    , m_first_component([&] {
-        auto const& color_mix = data->color_mix;
-        auto color = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(color_mix.first_color.pointer)));
-        ValueComparingRefPtr<StyleValue const> percentage;
-        if (auto const* percentage_data = static_cast<StyleValueFFI::StyleValueData const*>(color_mix.first_percentage.pointer))
-            percentage = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(percentage_data));
-        return ColorMixComponent { move(color), move(percentage) };
-    }())
-    , m_second_component([&] {
-        auto const& color_mix = data->color_mix;
-        auto color = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(color_mix.second_color.pointer)));
-        ValueComparingRefPtr<StyleValue const> percentage;
-        if (auto const* percentage_data = static_cast<StyleValueFFI::StyleValueData const*>(color_mix.second_percentage.pointer))
-            percentage = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(percentage_data));
-        return ColorMixComponent { move(color), move(percentage) };
-    }())
 {
-}
-
-bool ColorMixStyleValue::equals(StyleValue const& other) const
-{
-    auto const* other_color_mix = as_if<ColorMixStyleValue>(other);
-    if (!other_color_mix)
-        return false;
-    return color_interpolation_method_value() == other_color_mix->color_interpolation_method_value()
-        && first_component() == other_color_mix->first_component()
-        && second_component() == other_color_mix->second_component();
-}
-
-// https://drafts.csswg.org/css-color-5/#serial-color-mix
-void ColorMixStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    auto serialize_first_percentage = [&mode](StringBuilder& builder, RefPtr<StyleValue const> const& p1, RefPtr<StyleValue const> const& p2) {
-        // if BOTH the first percentage p1 and second percentage p2 are specified:
-        if (p1 && p2) {
-            // If both p1 equals 50% and p2 equals 50%, nothing is serialized.
-            if (p1->is_percentage() && p2->is_percentage() && p1->as_percentage().percentage().value() == 50 && p2->as_percentage().percentage().value() == 50)
-                return;
-
-            // else, p1 is serialized as is.
-            builder.append(' ');
-            p1->serialize(builder, mode);
-        }
-        // else if ONLY the first percentage p1 is specified:
-        else if (p1) {
-            // If p1 is equal to 50%, nothing is serialized.
-            if (p1->is_percentage() && p1->as_percentage().percentage().value() == 50)
-                return;
-
-            // else, p1 is serialized as is.
-            builder.append(' ');
-            p1->serialize(builder, mode);
-        }
-        // else if ONLY the second percentage p2 is specified:
-        else if (p2) {
-            // if p2 equals 50%, nothing is serialized.
-            if (p2->is_percentage() && p2->as_percentage().percentage().value() == 50)
-                return;
-
-            // if p2 is not calc(), the value of 100% - p2 is serialized.
-            if (!p2->is_calculated())
-                builder.appendff(" {}%", 100 - p2->as_percentage().percentage().value());
-
-            // else, nothing is serialized.
-        }
-        // else if NEITHER is specified:
-        else {
-            // nothing is serialized.
-        }
-    };
-
-    auto serialize_second_percentage = [&mode](StringBuilder& builder, RefPtr<StyleValue const> const& p1, RefPtr<StyleValue const> const& p2) {
-        // If BOTH the first percentage p1 and second percentages p2 are specified:
-        if (p1 && p2) {
-            // if neither p1 nor p2 is calc(), and p1 + p2 equals 100%, nothing is serialized.
-            if (p1->is_percentage() && p2->is_percentage() && p1->as_percentage().percentage().value() + p2->as_percentage().percentage().value() == 100)
-                return;
-
-            // else, p2 is serialized as is.
-            builder.append(' ');
-            p2->serialize(builder, mode);
-        }
-        // else if ONLY the first percentage p1 is specified:
-        else if (p1) {
-            // nothing is serialized.
-        }
-        // else if ONLY the second percentage p2 is specified:
-        else if (p2) {
-            // if p2 equals 50%, nothing is serialized.
-            if (p2->is_percentage() && p2->as_percentage().percentage().value() == 50)
-                return;
-
-            // if p2 is not calc(), nothing is serialized.
-            if (!p2->is_calculated())
-                return;
-
-            // else, p2 is serialized as is.
-            builder.append(' ');
-            p2->serialize(builder, mode);
-        }
-        // else if NEITHER is specified:
-        else {
-            // nothing is serialized.
-        }
-    };
-
-    builder.append("color-mix("sv);
-
-    if (color_interpolation_method_value() && color_interpolation_method_value()->as_color_interpolation_method().color_interpolation_method() != RectangularColorSpace::Oklab) {
-        color_interpolation_method_value()->serialize(builder, mode);
-        builder.append(", "sv);
-    }
-
-    first_component().color->serialize(builder, mode);
-    serialize_first_percentage(builder, first_component().percentage, second_component().percentage);
-    builder.append(", "sv);
-    second_component().color->serialize(builder, mode);
-    serialize_second_percentage(builder, first_component().percentage, second_component().percentage);
-    builder.append(')');
 }
 
 // https://drafts.csswg.org/css-color-5/#color-mix-percent-norm
@@ -427,8 +300,9 @@ Optional<Color> ColorMixStyleValue::to_color(ColorResolutionContext color_resolu
     auto normalized = normalize_percentage_pair(p1, p2);
 
     auto default_color_interpolation_method = ColorInterpolationMethodStyleValue::create(RectangularColorSpace::Oklab);
-    auto const& color_interpolation_method = color_interpolation_method_value()
-        ? *color_interpolation_method_value()
+    auto color_interpolation_method_holder = color_interpolation_method_value();
+    auto const& color_interpolation_method = color_interpolation_method_holder
+        ? *color_interpolation_method_holder
         : static_cast<StyleValue const&>(*default_color_interpolation_method);
     auto style_value = interpolate_color_in_rust(
         *first_component().color,

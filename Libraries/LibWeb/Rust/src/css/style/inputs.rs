@@ -85,6 +85,12 @@ impl StyleEngine {
             force_bounded_prefix_completion: false,
             prepared_batch_matching_traversal: None,
             published_match_answers: PublishedMatchAnswers::default(),
+            ffi_style_transaction_output: bridge::FfiStyleTransactionOutput::default(),
+            ffi_style_transaction_output_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
+            ffi_flat_tree_descendants: Vec::new(),
+            ffi_flat_tree_descendants_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
+            ffi_retained_cascade_assignments: Vec::new(),
+            ffi_retained_cascade_assignments_memory: MemoryLease::new(MemoryCategory::BridgeBuffer),
             transaction_fact_view: None,
             facts: ElementFactStore::new(),
             programs: SelectorPrograms::new(),
@@ -1583,6 +1589,19 @@ impl StyleEngine {
         declared: &[DeclaredProperty],
         declarations_are_complete: bool,
     ) {
+        if matches!(
+            kind,
+            ElementDeclarationKind::PresentationalHint | ElementDeclarationKind::SvgPresentationAttribute
+        ) {
+            verify_cascade_winners(|| {
+                let mut properties: Vec<u16> = declared.iter().map(|declared| declared.property).collect();
+                properties.sort_unstable();
+                assert!(
+                    properties.windows(2).all(|pair| pair[0] != pair[1]),
+                    "element-attached declarations repeat a property"
+                );
+            });
+        }
         let (current_declared, current_declarations_are_complete) = self.facts.element_declared_properties(node, kind);
         if current_declarations_are_complete == declarations_are_complete && current_declared == declared {
             return;

@@ -466,16 +466,6 @@ pub struct FfiAnimatedProperty {
 }
 
 #[repr(C)]
-pub struct FfiAnimationCallbacks {
-    pub context: *mut std::ffi::c_void,
-    pub compute_values: unsafe extern "C" fn(
-        context: *mut std::ffi::c_void,
-        properties: *const FfiResolvedAnimationProperty,
-        property_count: usize,
-    ) -> FfiComputedAnimationBatch,
-}
-
-#[repr(C)]
 pub struct FfiAnimationDeclaration {
     pub keyframe_index: usize,
     pub property_id: u16,
@@ -601,6 +591,13 @@ pub struct FfiResolvedAnimationProperty {
     pub value_source: FfiAnimationSpecifiedValueSource,
 }
 
+#[repr(C)]
+pub struct FfiResolvedAnimationProperties {
+    pub properties: *const FfiResolvedAnimationProperty,
+    pub count: usize,
+    pub storage: *mut std::ffi::c_void,
+}
+
 fn resolve_animation_declarations(
     declarations: &[FfiAnimationDeclaration],
     writing_mode: u8,
@@ -626,7 +623,7 @@ fn resolve_animation_declarations(
                     source_property_id: declaration.property_id,
                     source_longhand_id: longhand_id,
                     value: unsafe {
-                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::rust_style_value_retain(
+                        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
                             data.cast(),
                         ))
                     },
@@ -827,7 +824,7 @@ fn handled_without_value() -> FfiAnimationValueResult {
 }
 
 fn handled_retained_value(value: RetainedStyleValueData) -> FfiAnimationValueResult {
-    let pointer = unsafe { crate::css::style_value::rust_style_value_retain(value.data()) };
+    let pointer = unsafe { crate::css::style_value::retain_style_value(value.data()) };
     FfiAnimationValueResult {
         value: pointer,
         handled: true,
@@ -845,7 +842,7 @@ fn discrete_value(
     }
     let value = if delta < 0.5 { from } else { to };
     FfiAnimationValueResult {
-        value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+        value: unsafe { crate::css::style_value::retain_style_value(value) },
         handled: true,
     }
 }
@@ -864,7 +861,7 @@ fn interpolate_visibility(
 
     if from_keyword == to_keyword {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -884,7 +881,7 @@ fn interpolate_visibility(
             to
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
@@ -906,7 +903,7 @@ fn interpolate_content_visibility(
 
     if from_keyword == to_keyword {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -928,7 +925,7 @@ fn interpolate_content_visibility(
             from
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
@@ -948,7 +945,7 @@ fn interpolate_display(
 
     if from_raw == to_raw {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -974,7 +971,7 @@ fn interpolate_display(
             from
         };
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(value) },
+            value: unsafe { crate::css::style_value::retain_style_value(value) },
             handled: true,
         };
     }
@@ -988,7 +985,7 @@ fn interpolate_scale(from: &StyleValueData, to: &StyleValueData, delta: f32) -> 
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -1222,7 +1219,7 @@ fn interpolate_translate(from: &StyleValueData, to: &StyleValueData, delta: f32)
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -1312,7 +1309,7 @@ fn interpolate_individual_rotate(
         && matches!(to, StyleValueData::Keyword { keyword } if *keyword == none)
     {
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(from) },
+            value: unsafe { crate::css::style_value::retain_style_value(from) },
             handled: true,
         };
     }
@@ -3131,7 +3128,7 @@ fn composite_scalar_value(
             }
             owned(StyleValueData::OpenTypeTagged {
                 mode: OPEN_TYPE_MODE_FONT_VARIATION_SETTINGS,
-                tag: unsafe { RetainedUtf16FlyString::from_borrowed_raw(underlying_tag.raw()) },
+                tag: underlying_tag.clone(),
                 packed_tag: *underlying_packed_tag,
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
@@ -3160,7 +3157,7 @@ fn composite_scalar_value(
                 return handled_without_value();
             }
             owned(StyleValueData::Function {
-                name: unsafe { RetainedUtf16FlyString::from_borrowed_raw(underlying_name.raw()) },
+                name: underlying_name.clone(),
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
         }
@@ -3367,7 +3364,7 @@ fn interpolate_scalar_value(
             if from == to =>
         {
             FfiAnimationValueResult {
-                value: unsafe { crate::css::style_value::rust_style_value_retain(from_value) },
+                value: unsafe { crate::css::style_value::retain_style_value(from_value) },
                 handled: true,
             }
         }
@@ -3851,7 +3848,7 @@ fn interpolate_scalar_value(
             }
             owned(StyleValueData::OpenTypeTagged {
                 mode: OPEN_TYPE_MODE_FONT_VARIATION_SETTINGS,
-                tag: unsafe { RetainedUtf16FlyString::from_borrowed_raw(from_tag.raw()) },
+                tag: from_tag.clone(),
                 packed_tag: *from_packed_tag,
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
@@ -3881,7 +3878,7 @@ fn interpolate_scalar_value(
                 return handled_without_value();
             }
             owned(StyleValueData::Function {
-                name: unsafe { RetainedUtf16FlyString::from_borrowed_raw(from_name.raw()) },
+                name: from_name.clone(),
                 value: unsafe { RetainedStyleValueData::from_retained_pointer(value.value) },
             })
         }
@@ -5224,6 +5221,13 @@ fn animation_length_resolution_context(
         root_font_metrics: font_metrics(&animation_context.root_font_metrics),
         font_metrics_depend_on_viewport_metrics: animation_context.font_metrics_depend_on_viewport_metrics,
         root_font_metrics_depend_on_viewport_metrics: animation_context.root_font_metrics_depend_on_viewport_metrics,
+        has_container_width_basis: false,
+        has_container_height_basis: false,
+        container_width_basis: 0.0,
+        container_height_basis: 0.0,
+        container_width_basis_depends_on_viewport_metrics: false,
+        container_height_basis_depends_on_viewport_metrics: false,
+        subject_inline_axis_is_horizontal: true,
         resolved_viewport_relative_length: std::ptr::null_mut(),
     })
 }
@@ -5293,7 +5297,7 @@ fn resolve_animation_color(
     if current_color.is_null() {
         return None;
     }
-    let retained = unsafe { crate::css::style_value::rust_style_value_retain(current_color) };
+    let retained = unsafe { crate::css::style_value::retain_style_value(current_color) };
     Some(unsafe { RetainedStyleValueData::from_retained_pointer(retained) })
 }
 
@@ -6063,7 +6067,7 @@ pub(crate) fn interpolate_value(
         // NB: Such values are normally filtered before evaluation. Preserve the C++ scalar API's
         //     existing endpoint behavior if one reaches this lower-level operation.
         return FfiAnimationValueResult {
-            value: unsafe { crate::css::style_value::rust_style_value_retain(to) },
+            value: unsafe { crate::css::style_value::retain_style_value(to) },
             handled: true,
         };
     }
@@ -6444,7 +6448,7 @@ fn evaluate_animation_value(
         }
         return FfiAnimatedProperty {
             property_id: input.property_id,
-            value: unsafe { crate::css::style_value::rust_style_value_retain(start_keyframe.value) },
+            value: unsafe { crate::css::style_value::retain_style_value(start_keyframe.value) },
             progress,
             start_index,
             end_index,
@@ -6476,25 +6480,16 @@ fn evaluate_animation_value(
     }
 }
 
-/// Resolve an element's keyframe declarations, request their computed values in one C++ batch,
-/// then evaluate and compose every animation interval without consulting C++ or the DOM again.
-///
-/// Computed values are requested in at most one callback. Results are written into caller-owned
-/// storage returned with the computed values, transferring every non-null result value.
+/// Resolve an element's keyframe declarations into one owned batch for C++ computation.
 ///
 /// # Safety
-/// `batch` and `callbacks` must point to live values. Their declaration and bitmap ranges and every
-/// input style value returned by `compute_values` must remain live for the call. Its result storage
-/// must have room for every input value, and C++ must adopt every non-null result after return.
+/// `batch` must point to a live value whose declaration and bitmap ranges remain live for the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_evaluate_animations(
+pub unsafe extern "C" fn rust_resolve_animation_declarations(
     batch: *const FfiAnimationBatch,
-    callbacks: *const FfiAnimationCallbacks,
-) -> usize {
+) -> FfiResolvedAnimationProperties {
     crate::abort_on_panic(|| {
-        crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
         let batch = unsafe { &*batch };
-        let callbacks = unsafe { &*callbacks };
         let declarations = unsafe { std::slice::from_raw_parts(batch.declarations, batch.declaration_count) };
         let important_property_bitmap = unsafe {
             std::slice::from_raw_parts(batch.important_property_bitmap, batch.important_property_bitmap_length)
@@ -6506,16 +6501,43 @@ pub unsafe extern "C" fn rust_evaluate_animations(
             important_property_bitmap,
         );
         if resolved.properties.is_empty() {
-            return 0;
+            return FfiResolvedAnimationProperties {
+                properties: std::ptr::null(),
+                count: 0,
+                storage: std::ptr::null_mut(),
+            };
         }
-        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::AnimationComputeBatchCallback);
-        let computed = unsafe {
-            (callbacks.compute_values)(
-                callbacks.context,
-                resolved.properties.as_ptr(),
-                resolved.properties.len(),
-            )
-        };
+        let resolved = Box::new(resolved);
+        let properties = resolved.properties.as_ptr();
+        let count = resolved.properties.len();
+        FfiResolvedAnimationProperties {
+            properties,
+            count,
+            storage: Box::into_raw(resolved).cast(),
+        }
+    })
+}
+
+/// # Safety
+/// `storage` must be null or a live pointer returned by `rust_resolve_animation_declarations`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_resolved_animation_properties_destroy(storage: *mut std::ffi::c_void) {
+    if !storage.is_null() {
+        drop(unsafe { Box::from_raw(storage.cast::<ResolvedAnimationDeclarations>()) });
+    }
+}
+
+/// Evaluate and compose every prepared animation interval without consulting C++ or the DOM.
+/// Results are written into caller-owned storage, transferring every non-null result value.
+///
+/// # Safety
+/// `computed` must point to a live batch whose input style values remain live for the call. Its
+/// result storage must have room for every input value, and C++ must adopt every non-null result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
+    crate::abort_on_panic(|| {
+        crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
+        let computed = unsafe { &*computed };
         if computed.value_count == 0 {
             return 0;
         }
@@ -6948,12 +6970,12 @@ mod tests {
         let result = interpolate_value(Some(&animation_context(true)), property_id, &from, &to, 0.25);
         assert!(result.handled);
         assert_eq!(result.value, Arc::as_ptr(&from));
-        unsafe { crate::css::style_value::rust_style_value_release(result.value) };
+        unsafe { crate::css::style_value::release_style_value(result.value) };
 
         let result = interpolate_value(Some(&animation_context(true)), property_id, &from, &to, 0.75);
         assert!(result.handled);
         assert_eq!(result.value, Arc::as_ptr(&to));
-        unsafe { crate::css::style_value::rust_style_value_release(result.value) };
+        unsafe { crate::css::style_value::release_style_value(result.value) };
 
         let result = interpolate_value(Some(&animation_context(false)), property_id, &from, &to, 0.75);
         assert!(result.handled);

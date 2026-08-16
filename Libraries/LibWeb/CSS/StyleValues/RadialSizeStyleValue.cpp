@@ -10,28 +10,6 @@
 
 namespace Web::CSS {
 
-bool RadialSizeStyleValue::properties_equal(RadialSizeStyleValue const& other) const
-{
-    auto our_components = components();
-    auto their_components = other.components();
-    if (our_components.size() != their_components.size())
-        return false;
-    for (size_t i = 0; i < our_components.size(); ++i) {
-        bool components_equal = our_components[i].visit(
-            [&](RadialExtent extent) {
-                auto const* their_extent = their_components[i].get_pointer<RadialExtent>();
-                return their_extent && *their_extent == extent;
-            },
-            [&](NonnullRefPtr<StyleValue const> const& value) {
-                auto const* their_value = their_components[i].get_pointer<NonnullRefPtr<StyleValue const>>();
-                return their_value && value->equals(**their_value);
-            });
-        if (!components_equal)
-            return false;
-    }
-    return true;
-}
-
 ValueComparingNonnullRefPtr<StyleValue const> RadialSizeStyleValue::absolutized(ComputationContext const& computation_context) const
 {
     bool any_component_required_absolutization = false;
@@ -54,24 +32,6 @@ ValueComparingNonnullRefPtr<StyleValue const> RadialSizeStyleValue::absolutized(
         return *this;
 
     return RadialSizeStyleValue::create(move(absolutized_components));
-}
-
-void RadialSizeStyleValue::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
-{
-    bool first = true;
-    for (auto const& component : components()) {
-        if (!first)
-            builder.append(' ');
-        first = false;
-
-        component.visit(
-            [&](RadialExtent extent) {
-                builder.append(CSS::to_string(extent));
-            },
-            [&](NonnullRefPtr<StyleValue const> const& length_percentage) {
-                length_percentage->serialize(builder, serialization_mode);
-            });
-    }
 }
 
 static CSSPixelSize side_shape(CSSPixelPoint const& center, CSSPixelRect const& reference_box, Function<CSSPixels(CSSPixels, CSSPixels)> distance_function)

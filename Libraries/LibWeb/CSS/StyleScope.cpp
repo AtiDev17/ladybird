@@ -24,6 +24,7 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
@@ -387,7 +388,7 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                         if (easing_value->is_easing() || easing_value->is_keyword())
                             resolved_keyframe.easing = EasingFunction::from_style_value(*easing_value);
                         else
-                            resolved_keyframe.easing = easing_value;
+                            resolved_keyframe.easing = RustStyleValueHandle::retained(easing_value->rust_style_value_data());
                         continue;
                     }
                     if (it.property_id == PropertyID::AnimationComposition) {
@@ -404,10 +405,16 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                         continue;
 
                     // Unresolved properties will be resolved in collect_animation_into()
-                    StyleComputer::for_each_property_expanding_shorthands(it.property_id, it.value, [&](PropertyID shorthand_id, StyleValue const& shorthand_value) {
-                        animated_properties.set(shorthand_id);
-                        resolved_keyframe.properties.set(shorthand_id, NonnullRefPtr<StyleValue const> { shorthand_value });
-                    });
+                    auto expansion = ComputedValuesFFI::rust_expand_property_shorthands(
+                        to_underlying(it.property_id), it.value->rust_style_value_data());
+                    for (size_t i = 0; i < expansion.count; ++i) {
+                        auto const& property = expansion.properties[i];
+                        auto longhand_property_id = static_cast<PropertyID>(property.property_id);
+                        animated_properties.set(longhand_property_id);
+                        resolved_keyframe.properties.set(longhand_property_id,
+                            RustStyleValueHandle::retained(static_cast<StyleValueFFI::StyleValueData const*>(property.data)));
+                    }
+                    ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
                 }
 
                 for (auto const& key : keyframe.keys()) {

@@ -12,6 +12,13 @@
 
 namespace Web::CSS {
 
+inline String string_from_rust_data(StyleValueFFI::RetainedString const& string)
+{
+    if (string.raw != 0)
+        return String::from_raw(string.raw);
+    return String::from_utf8_without_validation({ string.bytes, string.length });
+}
+
 // Marshals a URL's request URL modifiers for a Rust-owned allocation, retaining one leaked
 // reference to each string-valued modifier.
 inline Vector<StyleValueFFI::RetainedRequestUrlModifier> retain_url_modifiers_for_rust(URL const& url)
@@ -19,7 +26,7 @@ inline Vector<StyleValueFFI::RetainedRequestUrlModifier> retain_url_modifiers_fo
     Vector<StyleValueFFI::RetainedRequestUrlModifier> modifiers;
     modifiers.ensure_capacity(url.request_url_modifiers().size());
     for (auto const& modifier : url.request_url_modifiers()) {
-        StyleValueFFI::RetainedRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, { 0 } };
+        StyleValueFFI::RetainedRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, { 0, nullptr } };
         modifier.value().visit(
             [&](CrossOriginModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
             [&](ReferrerPolicyModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
@@ -48,7 +55,7 @@ inline URL url_from_rust_data(StyleValueFFI::RetainedString const& url_string, u
             break;
         }
     }
-    return URL(String::from_raw(url_string.raw), static_cast<URL::Type>(url_type), move(modifiers));
+    return URL(string_from_rust_data(url_string), static_cast<URL::Type>(url_type), move(modifiers));
 }
 
 class URLStyleValue final : public StyleValueWithDefaultOperators<URLStyleValue> {
@@ -65,10 +72,6 @@ public:
         auto const& data = m_value->url;
         return url_from_rust_data(data.url, data.url_type, data.modifiers);
     }
-
-    bool properties_equal(URLStyleValue const& other) const { return url() == other.url(); }
-
-    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(url().to_string()); }
 
 private:
     friend class StyleValue;

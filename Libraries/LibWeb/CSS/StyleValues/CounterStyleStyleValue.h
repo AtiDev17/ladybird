@@ -28,8 +28,6 @@ public:
 
     virtual ~CounterStyleStyleValue() override = default;
 
-    void serialize(StringBuilder&, SerializationMode) const;
-
     RefPtr<CounterStyle const> resolve_counter_style(StyleScope const&) const;
     Variant<Utf16FlyString, SymbolsFunction> value() const
     {
@@ -42,8 +40,6 @@ public:
             symbols.unchecked_append(Utf16FlyString::from_raw(data.symbols.pointer[i].raw));
         return SymbolsFunction { static_cast<SymbolsType>(data.symbols_type), move(symbols) };
     }
-
-    bool properties_equal(CounterStyleStyleValue const& other) const { return value() == other.value(); }
 
 private:
     friend class StyleValue;

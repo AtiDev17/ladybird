@@ -1,4 +1,22 @@
 has counters: true
 all zero after reset: true
-longhand driver ran: true
-longhand loop called back into C++: true
+has no C++ longhand fallback counter: true
+callback aggregate counters removed: true
+simple element stayed callback-free: true
+transaction stayed callback-free: true
+longhand computation returned without callbacks: true
+shorthand expansion returned without callbacks: true
+inherited partial restyle stayed callback-free: true
+pseudo-element stayed callback-free: true
+custom properties stayed callback-free: true
+cascade returned without callbacks: true
+custom-property cascade entered Rust: true
+cascade resolution entered Rust: true
+custom-property cascade avoided C++ callback: true
+font and viewport lengths stayed callback-free: true
+animations and transitions stayed callback-free: true
+animation evaluation returned without callbacks: true
+flat-tree descendants stayed callback-free: true
+resource-backed value stayed callback-free: true
+retained cascade winner stayed callback-free: true
+retained source-slot assignments returned without callbacks: true

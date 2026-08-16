@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/NumericLimits.h>
+#include <AK/OwnPtr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/Export.h>
@@ -20,8 +21,6 @@ struct LineBoxFragmentCoordinate {
 };
 
 class WEB_API Box : public NodeWithStyle {
-    LAYOUT_NODE(Box, NodeWithStyle);
-
 public:
     RefPtr<Painting::Paintable const> paintable_box() const;
     RefPtr<Painting::Paintable> paintable_box();
@@ -32,7 +31,7 @@ public:
     bool is_partial_relayout_boundary() const;
 
     // https://www.w3.org/TR/css-images-3/#natural-dimensions
-    virtual CSS::SizeWithAspectRatio natural_size() const { return {}; }
+    CSS::SizeWithAspectRatio natural_size() const;
 
     // When computed width/height is auto, auto_content_box_size gives the fallback content-box size for
     // elements whose used size is determined by natural dimensions, attributes, or defaults other than
@@ -47,12 +46,18 @@ public:
 
     RustFFI::FfiReplacedContentFacts build_replaced_content_facts_for_arena() const;
 
+    ImageProvider const& image_provider() const;
+    ImageProvider& image_provider()
+    {
+        return const_cast<ImageProvider&>(const_cast<Box const&>(*this).image_provider());
+    }
+    void set_owned_image_provider(NonnullOwnPtr<ImageProvider>);
+
+    void set_replaced_box_can_have_children(bool value) { set_flag(RustFFI::NodeFlag::ReplacedBoxCanHaveChildren, value); }
+
     virtual ~Box() override;
 
-    virtual void did_set_content_size() { }
-
-    virtual RefPtr<Painting::Paintable> create_paintable() const override;
-
+    void did_set_content_size();
     bool has_saved_abspos_layout_inputs() const { return has_flag(RustFFI::NodeFlag::HasSavedAbsposLayoutInputs); }
     bool has_saved_committed_geometry() const { return has_flag(RustFFI::NodeFlag::HasSavedCommittedGeometry); }
     bool saved_abspos_cb_derives_from_own_computed_values() const { return has_flag(RustFFI::NodeFlag::SavedAbsposCbDerivesFromOwnComputedValues); }
@@ -81,15 +86,15 @@ public:
             ++epoch;
     }
 
-    Box(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle);
-
-protected:
-    virtual CSS::SizeWithAspectRatio compute_auto_content_box_size() const { return natural_size(); }
+    Box(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::Box);
 
 private:
+    CSS::SizeWithAspectRatio compute_auto_content_box_size() const;
+
     virtual bool is_box() const final { return true; }
 
     WeakPtr<Node> m_default_scroll_shift_anchor;
+    OwnPtr<ImageProvider> m_owned_image_provider;
 };
 
 template<>

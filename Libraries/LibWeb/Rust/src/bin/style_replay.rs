@@ -324,14 +324,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .read(engine)
                     });
                     let start = Instant::now();
-                    let actual_result = unsafe {
-                        bridge::style_engine_take_style_transaction(
-                            engine,
-                            root,
-                            (&raw mut context).cast(),
-                            replay_style_transaction_emit,
-                        )
-                    };
+                    let actual_view = unsafe { bridge::style_engine_take_style_transaction(engine, root) };
+                    if actual_view.count != 0 {
+                        let answers = unsafe { std::slice::from_raw_parts(actual_view.answers, actual_view.count) };
+                        replay_style_transaction_output(
+                            &mut context,
+                            actual_view.transaction_version,
+                            actual_view.program_version,
+                            answers,
+                        );
+                    }
                     let elapsed = start.elapsed();
                     let after = counter_reader.read(engine);
                     let detailed_after = detailed_before
@@ -358,11 +360,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(error.into());
                     }
                     if !context.expected_emissions.is_empty() {
-                        return Err("style transaction omitted recorded callbacks".into());
+                        return Err("style transaction omitted recorded output".into());
                     }
                     if options.assert_digests {
                         let actual = StyleTransactionOutputs {
-                            result: actual_result,
+                            result: actual_view.scoped,
                             filter_calls: Vec::new(),
                             emissions: context.actual_emissions,
                         };
@@ -544,15 +546,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let root = event.payload.read_u32()?;
                     let expected = event.payload.read_u32_vec()?;
-                    let mut actual = Vec::new();
-                    unsafe {
-                        bridge::style_engine_for_each_flat_tree_descendant(
-                            engine,
-                            root,
-                            (&mut actual as *mut Vec<u32>).cast(),
-                            collect_style_node,
-                        )
+                    let view = unsafe { bridge::style_engine_flat_tree_descendants(engine, root) };
+                    let actual = if view.count == 0 {
+                        Vec::new()
+                    } else {
+                        unsafe { std::slice::from_raw_parts(view.nodes, view.count) }.to_vec()
                     };
+                    unsafe { bridge::style_engine_discard_flat_tree_descendants(engine) };
                     if actual != expected {
                         return Err(format!(
                             "flat-tree descendants diverged for node {root}: expected {expected:?}, got {actual:?}"
@@ -756,6 +756,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         0 => std::ptr::null(),
                         token => bridge::replay_style_value(token, raw_cascaded_font_size_flags),
                     };
+                    let longhand_table = match event.payload.read_bool()? {
+                        false => std::ptr::null_mut(),
+                        true => {
+                            let table =
+                                libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_create();
+                            let stored_value_count = event.payload.read_length()?;
+                            let mut stored_values = Vec::with_capacity(stored_value_count);
+                            for _ in 0..stored_value_count {
+                                let property = event.payload.read_u16()?;
+                                let token = event.payload.read_u64()?;
+                                let flags = event.payload.read_u8()?;
+                                stored_values.push((property, bridge::replay_style_value(token, flags)));
+                            }
+                            let source_slot_count = event.payload.read_length()?;
+                            let mut source_slots = std::collections::HashMap::new();
+                            for _ in 0..source_slot_count {
+                                let property = event.payload.read_u16()?;
+                                let slot = event.payload.read_u32()?;
+                                source_slots.insert(property, slot);
+                            }
+                            for (property, value) in stored_values {
+                                let slot = source_slots.get(&property).map_or(-1, |&slot| i64::from(slot));
+                                unsafe {
+                                    libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_set(
+                                        table,
+                                        property,
+                                        value.cast(),
+                                        slot,
+                                    );
+                                }
+                            }
+                            unsafe {
+                                libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_freeze(table);
+                            }
+                            table
+                        }
+                    };
                     let expected = bridge::FfiStyleRecordDelta {
                         old_style_record: event.payload.read_u64()?,
                         new_style_record: event.payload.read_u64()?,
@@ -784,8 +821,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             inheritance_dependent_values.as_ptr(),
                             inheritance_dependent_properties.len(),
                             raw_cascaded_font_size,
+                            longhand_table.cast_const().cast(),
                         )
                     };
+                    if !longhand_table.is_null() {
+                        unsafe {
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_release(
+                                longhand_table,
+                            );
+                        }
+                    }
                     if actual != expected {
                         return Err(format!(
                             "computed style publication diverged for node {node}: expected {expected:?}, got {actual:?}"
@@ -1656,29 +1701,21 @@ impl MatchAnswerIdentityMapping {
     }
 }
 
-extern "C" fn collect_style_node(context: *mut c_void, node: u32) {
-    let nodes = unsafe { &mut *context.cast::<Vec<u32>>() };
-    nodes.push(node);
-}
-
-unsafe extern "C" fn replay_style_transaction_emit(
-    context: *mut c_void,
+fn replay_style_transaction_output(
+    context: &mut ReplayStyleTransactionContext,
     transaction_version: u64,
     program_version: u64,
-    answers: *const FfiStyleDelta,
-    count: usize,
+    answers: &[FfiStyleDelta],
 ) {
-    let context = unsafe { &mut *context.cast::<ReplayStyleTransactionContext>() };
-    let answers = unsafe { std::slice::from_raw_parts(answers, count) }.to_vec();
     let actual = StyleTransactionEmission {
         transaction_version,
         program_version,
-        answers,
+        answers: answers.to_vec(),
     };
     let Some(expected) = context.expected_emissions.pop_front() else {
         context
             .error
-            .get_or_insert_with(|| "style transaction made an extra emit callback".into());
+            .get_or_insert_with(|| "style transaction returned extra output".into());
         return;
     };
     if actual.answers.len() == expected.answers.len() {
@@ -1706,7 +1743,7 @@ unsafe extern "C" fn replay_style_transaction_emit(
     {
         context.error.get_or_insert_with(|| {
             format!(
-                "style transaction emission diverged: expected versions {}/{} and {:?}, got versions {}/{} and {:?}",
+                "style transaction output diverged: expected versions {}/{} and {:?}, got versions {}/{} and {:?}",
                 expected.transaction_version,
                 expected.program_version,
                 expected.answers,
@@ -1959,6 +1996,7 @@ struct RecordedStyleRecordView<'a> {
     counter_style_environment_identity: u64,
     animation_overlay_identity: u64,
     dependency_flags: u8,
+    longhand_values: EncodedU64Slice<'a>,
 }
 
 fn read_style_record_view<'a>(
@@ -1983,6 +2021,7 @@ fn read_style_record_view<'a>(
         counter_style_environment_identity: payload.read_u64()?,
         animation_overlay_identity: payload.read_u64()?,
         dependency_flags: payload.read_u8()?,
+        longhand_values: read_u64_slice(payload)?,
     })
 }
 
@@ -1995,6 +2034,7 @@ fn style_record_view_matches(
         || actual.property_importance_count != expected.property_importance.len()
         || actual.property_inheritance_count != expected.property_inheritance.len()
         || actual.inheritance_dependent_value_count != expected.inheritance_dependent_values.len()
+        || actual.longhand_value_count != expected.longhand_values.len()
     {
         return Ok(false);
     }
@@ -2032,6 +2072,7 @@ fn style_record_view_matches(
     };
     Ok(pointers_match(actual.payloads, expected.payloads)?
         && pointers_match(actual.base_payloads, expected.base_payloads)?
+        && pointers_match(actual.longhand_values, expected.longhand_values)?
         && bytes_match(actual.property_importance, &expected.property_importance)
         && bytes_match(actual.property_inheritance, &expected.property_inheritance)
         && inheritance_dependent_values_match
@@ -2074,6 +2115,7 @@ fn semantic_style_record_view(
     Ok(OwnedSemanticStyleRecordView {
         payloads: pointers(view.payloads, view.payload_count)?,
         base_payloads: pointers(view.base_payloads, view.payload_count)?,
+        longhand_values: pointers(view.longhand_values, view.longhand_value_count)?,
         property_importance: bytes(view.property_importance, view.property_importance_count),
         property_inheritance: bytes(view.property_inheritance, view.property_inheritance_count),
         inheritance_dependent_values,
@@ -2089,6 +2131,7 @@ fn semantic_style_record_view(
 struct OwnedSemanticStyleRecordView {
     payloads: Vec<u64>,
     base_payloads: Vec<u64>,
+    longhand_values: Vec<u64>,
     property_importance: Vec<u8>,
     property_inheritance: Vec<u8>,
     inheritance_dependent_values: Vec<(u16, u64)>,
@@ -2106,6 +2149,7 @@ impl std::fmt::Debug for OwnedSemanticStyleRecordView {
             .debug_struct("SemanticStyleRecordView")
             .field("payloads", &self.payloads)
             .field("base_payloads", &self.base_payloads)
+            .field("longhand_values", &self.longhand_values)
             .field("property_importance", &self.property_importance)
             .field("property_inheritance", &self.property_inheritance)
             .field("inheritance_dependent_values", &self.inheritance_dependent_values)
@@ -2227,12 +2271,6 @@ extern "C" fn ladybird_animated_properties_unref(_values: *const c_void) {}
 
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_string_unref(_raw: usize) {}
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_string_ref(_raw: usize) {}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_utf16_fly_string_ref(_raw: usize) {}
-
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
 

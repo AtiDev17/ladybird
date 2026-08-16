@@ -12,8 +12,6 @@
 namespace Web::Layout {
 
 class Viewport final : public BlockContainer {
-    LAYOUT_NODE(Viewport, BlockContainer);
-
 public:
     explicit Viewport(DOM::Document&, CSS::LayoutStyle);
     virtual ~Viewport() override;
@@ -33,8 +31,6 @@ public:
     DOM::Document const& dom_node() const;
 
 private:
-    virtual RefPtr<Painting::Paintable> create_paintable() const override;
-
     void update_text_blocks();
 
     virtual bool is_viewport() const override { return true; }

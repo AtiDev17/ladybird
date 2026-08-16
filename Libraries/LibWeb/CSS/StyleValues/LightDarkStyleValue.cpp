@@ -28,22 +28,4 @@ ValueComparingNonnullRefPtr<StyleValue const> LightDarkStyleValue::absolutized(C
     return light()->absolutized(context);
 }
 
-bool LightDarkStyleValue::equals(StyleValue const& other) const
-{
-    auto const* other_light_dark = as_if<LightDarkStyleValue>(other);
-    if (!other_light_dark)
-        return false;
-    return light() == other_light_dark->light() && dark() == other_light_dark->dark();
-}
-
-void LightDarkStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
-{
-    // FIXME: We don't have enough information to determine the computed value here.
-    builder.append("light-dark("sv);
-    light()->serialize(builder, mode);
-    builder.append(", "sv);
-    dark()->serialize(builder, mode);
-    builder.append(')');
-}
-
 }
