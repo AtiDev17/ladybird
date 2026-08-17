@@ -565,6 +565,8 @@ pub(crate) fn principal_node_entry_decision(
             SvgEntryDecision::Skip
         } else if facts.is_svg_foreign_object {
             SvgEntryDecision::EnterForeignContent
+        } else if facts.is_element && !facts.requires_svg_container && context.has_svg_root {
+            SvgEntryDecision::Skip
         } else {
             SvgEntryDecision::Continue
         };
@@ -815,7 +817,7 @@ unsafe fn update_layout_tree_for_display_contents(
             }
         }
 
-        if !facts.content_visibility_hidden {
+        if !facts.content_visibility_hidden && !context.has_svg_root {
             create_pseudo_element(
                 host,
                 state,
@@ -882,7 +884,7 @@ unsafe fn update_layout_tree_for_display_contents(
             }
         }
 
-        if !facts.content_visibility_hidden {
+        if !facts.content_visibility_hidden && !context.has_svg_root {
             create_pseudo_element(
                 host,
                 state,
@@ -1021,7 +1023,11 @@ unsafe fn update_principal_node_descendants(
             }
 
             // Add the ::before pseudo-element before walking normal children.
-            if facts.is_element && layout_node_can_have_children && !facts.content_visibility_hidden {
+            if facts.is_element
+                && layout_node_can_have_children
+                && !facts.content_visibility_hidden
+                && !context.has_svg_root
+            {
                 state.ancestor_stack.push(layout_node);
                 create_pseudo_element(
                     host,
@@ -1223,7 +1229,11 @@ unsafe fn update_principal_node_descendants(
             }
 
             // Add ::marker and ::after once normal and SVG resource children are complete.
-            if facts.is_element && layout_node_can_have_children && !facts.content_visibility_hidden {
+            if facts.is_element
+                && layout_node_can_have_children
+                && !facts.content_visibility_hidden
+                && !context.has_svg_root
+            {
                 state.ancestor_stack.push(layout_node);
                 if layout_host.data(layout_node).kind == NodeKind::ListItemBox {
                     create_pseudo_element(
@@ -3129,6 +3139,11 @@ fn generate_missing_child_wrappers(host: &TreeBuilderHost<'_>, root: LayoutNode)
         if !node_kind_is_box(data.kind) {
             return TraversalDecision::Continue;
         }
+        // AD-HOC: SVG layout derives box types from the element, so display values must not introduce anonymous boxes
+        //         inside SVG content.
+        if node_kind_is_svg_box(data.kind) || data.kind == NodeKind::SVGSVGBox {
+            return TraversalDecision::Continue;
+        }
 
         let display = host.display(parent);
         if display.is_table_inside() {
@@ -3174,19 +3189,24 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
     // 3. Generate missing parents:
     let mut table_roots_to_wrap = Vec::new();
     host.for_each_in_inclusive_subtree(root, |parent| {
-        let (has_style, is_box) = {
+        let (has_style, is_box, kind) = {
             let data = host.data(parent);
-            (node_has_flag(data, NodeFlag::HasStyle), node_kind_is_box(data.kind))
+            (
+                node_has_flag(data, NodeFlag::HasStyle),
+                node_kind_is_box(data.kind),
+                data.kind,
+            )
         };
         let current_display = host.display(parent);
         let is_inline_outside = node_is_inline_outside(host, parent);
         if !has_style {
             return TraversalDecision::Continue;
         }
+        let node_is_svg_content = node_kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox;
 
         // 1. An anonymous table-row box must be generated around each sequence of consecutive table-cell boxes whose
         //    parent is not a table-row.
-        if !current_display.is_table_row() {
+        if !node_is_svg_content && !current_display.is_table_row() {
             for_each_sequence_of_consecutive_children_matching(
                 host,
                 parent,
@@ -3212,7 +3232,7 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
             || current_display.is_table_header_group()
             || current_display.is_table_footer_group();
         // A table-row is misparented if its parent is neither a table-row-group nor a table-root box.
-        if !is_table_row_group && !current_display.is_table_inside() {
+        if !node_is_svg_content && !is_table_row_group && !current_display.is_table_inside() {
             for_each_sequence_of_consecutive_children_matching(
                 host,
                 parent,
@@ -3224,7 +3244,7 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
         }
 
         // A table-column box is misparented if its parent is neither a table-column-group box nor a table-root box.
-        if !current_display.is_table_column_group() && !current_display.is_table_inside() {
+        if !node_is_svg_content && !current_display.is_table_column_group() && !current_display.is_table_inside() {
             for_each_sequence_of_consecutive_children_matching(
                 host,
                 parent,
@@ -3237,7 +3257,7 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
 
         // A table-row-group, table-column-group, or table-caption box is misparented if its parent is not a table-root
         // box.
-        if !current_display.is_table_inside() {
+        if !node_is_svg_content && !current_display.is_table_inside() {
             for_each_sequence_of_consecutive_children_matching(
                 host,
                 parent,
@@ -3256,7 +3276,14 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
 
         // 3. An anonymous table-wrapper box must be generated around each table-root.
         if is_box && current_display.is_table_inside() {
-            table_roots_to_wrap.push(parent);
+            let wrap_parent = host.parent(parent);
+            let wrap_parent_is_svg_content = !wrap_parent.is_invalid() && {
+                let wrap_parent_kind = host.data(wrap_parent).kind;
+                node_kind_is_svg_box(wrap_parent_kind) || wrap_parent_kind == NodeKind::SVGSVGBox
+            };
+            if !wrap_parent_is_svg_content {
+                table_roots_to_wrap.push(parent);
+            }
         }
 
         TraversalDecision::Continue
@@ -3566,6 +3593,15 @@ mod tests {
         context.has_svg_root = false;
         let decision = principal_node_entry_decision(facts, &context);
         assert_eq!(decision.svg, SvgEntryDecision::Skip);
+
+        facts.is_svg_foreign_object = false;
+        facts.requires_svg_container = false;
+        context.has_svg_root = true;
+        let decision = principal_node_entry_decision(facts, &context);
+        assert_eq!(decision.svg, SvgEntryDecision::Skip);
+        context.has_svg_root = false;
+        let decision = principal_node_entry_decision(facts, &context);
+        assert_eq!(decision.svg, SvgEntryDecision::Continue);
     }
 
     #[test]
