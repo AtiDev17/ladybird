@@ -30,6 +30,7 @@
 #include <LibWeb/Painting/BoxModelMetrics.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/ChromeWidget.h>
+#include <LibWeb/Painting/CollapsedTableBorders.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/HitTestResult.h>
@@ -354,41 +355,11 @@ public:
     RefPtr<Scrollbar> scrollbar(ScrollDirection) const;
     NonnullRefPtr<Scrollbar> ensure_scrollbar(ScrollDirection);
 
-    enum class ConflictingElementKind {
-        Cell,
-        Row,
-        RowGroup,
-        Column,
-        ColumnGroup,
-        Table,
-    };
+    void set_uses_collapsing_borders_model(bool value) { m_uses_collapsing_borders_model = value; }
+    bool uses_collapsing_borders_model() const { return m_uses_collapsing_borders_model; }
 
-    struct BorderDataWithElementKind {
-        CSS::BorderData border_data;
-        ConflictingElementKind element_kind;
-    };
-
-    struct BordersDataWithElementKind {
-        BorderDataWithElementKind top;
-        BorderDataWithElementKind right;
-        BorderDataWithElementKind bottom;
-        BorderDataWithElementKind left;
-    };
-
-    void set_override_borders_data(BordersDataWithElementKind const& override_borders_data) { m_override_borders_data = override_borders_data; }
-    Optional<BordersDataWithElementKind> const& override_borders_data() const { return m_override_borders_data; }
-
-    static BordersData remove_element_kind_from_borders_data(Paintable::BordersDataWithElementKind borders_data);
-
-    struct TableCellCoordinates {
-        size_t row_index;
-        size_t column_index;
-        size_t row_span;
-        size_t column_span;
-    };
-
-    void set_table_cell_coordinates(TableCellCoordinates const& table_cell_coordinates) { m_table_cell_coordinates = table_cell_coordinates; }
-    auto const& table_cell_coordinates() const { return m_table_cell_coordinates; }
+    void set_collapsed_table_borders(OwnPtr<CollapsedTableBorders> collapsed_table_borders) { m_collapsed_table_borders = move(collapsed_table_borders); }
+    CollapsedTableBorders const* collapsed_table_borders() const { return m_collapsed_table_borders.ptr(); }
 
     enum class ShrinkRadiiForBorders {
         Yes,
@@ -560,6 +531,7 @@ private:
     bool m_absolutely_positioned : 1 { false };
     bool m_floating : 1 { false };
     bool m_inline : 1 { false };
+    bool m_uses_collapsing_borders_model : 1 { false };
     CSS::Display m_display;
 
     RefPtr<StackingContext> m_stacking_context;
@@ -583,8 +555,7 @@ private:
     size_t m_visual_context_nodes_begin { 0 };
     size_t m_visual_context_nodes_end { 0 };
 
-    Optional<BordersDataWithElementKind> m_override_borders_data;
-    Optional<TableCellCoordinates> m_table_cell_coordinates;
+    OwnPtr<CollapsedTableBorders> m_collapsed_table_borders;
     Optional<size_t> m_containing_line_box_index;
 
     ResolvedCSSFilter m_filter;

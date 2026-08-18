@@ -6,15 +6,6 @@
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-pub struct FfiTableCellCoordinates {
-    pub row_index: usize,
-    pub column_index: usize,
-    pub row_span: usize,
-    pub column_span: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
 pub struct FfiCommittedBoxMetrics {
     pub fragment_identity: u64,
     pub reuses_committed_subtree: bool,
@@ -39,6 +30,7 @@ pub struct FfiCommittedBoxMetrics {
     pub inset_bottom: crate::layout::CssPixels,
     pub containing_line_box_index: usize,
     pub has_containing_line_box_index: bool,
+    pub uses_collapsing_borders_model: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,8 +80,6 @@ pub struct FfiCommitSink {
     pub finish_commit: unsafe extern "C" fn(*mut c_void),
     pub prepare_node: unsafe extern "C" fn(*mut c_void, *mut c_void, bool, bool) -> *mut c_void,
     pub set_box_metrics: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiCommittedBoxMetrics),
-    pub set_override_borders: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiBordersData),
-    pub set_table_cell_coordinates: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiTableCellCoordinates),
     pub begin_line_data: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     pub begin_line: unsafe extern "C" fn(*mut c_void, FfiLineRecord),
     pub emit_fragment: unsafe extern "C" fn(*mut c_void, FfiCommittedFragment),
@@ -102,6 +92,7 @@ pub struct FfiCommitSink {
     pub set_flex_layout_data: unsafe extern "C" fn(*mut c_void, *mut c_void, *const FfiFlexLayoutData),
     pub set_used_grid_tracks:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *const FfiUsedGridTrackList, *const FfiUsedGridTrackList),
+    pub set_collapsed_table_borders: unsafe extern "C" fn(*mut c_void, *mut c_void, *const FfiCollapsedTableBorders),
     pub finish_node:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> FfiCommitNodeResult,
     pub assign_inline_box_geometry: unsafe extern "C" fn(*mut c_void, *mut c_void),
@@ -203,19 +194,9 @@ fn commit_subtree(
                     inset_bottom: link.inset_bottom,
                     containing_line_box_index: link.containing_line_box_index.unwrap_or(0),
                     has_containing_line_box_index: link.containing_line_box_index.is_some(),
+                    uses_collapsing_borders_model: fragment.uses_collapsing_borders_model,
                 },
             );
-        }
-
-        if !reuses_committed_subtree {
-            unsafe {
-            if let Some(borders) = fragment.override_borders_data {
-                (sink.set_override_borders)(sink.context, paintable, borders);
-            }
-            if let Some(coordinates) = fragment.table_cell_coordinates {
-                (sink.set_table_cell_coordinates)(sink.context, paintable, coordinates);
-            }
-            }
         }
 
         if !reuses_committed_subtree && let Some(line_data) = &fragment.line_data {
@@ -274,6 +255,11 @@ fn commit_subtree(
         if !reuses_committed_subtree && let Some(tracks) = &fragment.used_grid_tracks {
             tracks.with_ffi_views(|columns, rows| {
                 unsafe { (sink.set_used_grid_tracks)(sink.context, paintable, columns, rows) };
+            });
+        }
+        if !reuses_committed_subtree && let Some(borders) = &fragment.collapsed_table_borders {
+            borders.with_ffi_view(|view| {
+                unsafe { (sink.set_collapsed_table_borders)(sink.context, paintable, view) };
             });
         }
     }

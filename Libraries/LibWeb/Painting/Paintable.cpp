@@ -1155,8 +1155,8 @@ void Paintable::reset_for_relayout()
     m_box_model = {};
 
     m_overflow_data.clear();
-    m_override_borders_data.clear();
-    m_table_cell_coordinates.clear();
+    m_collapsed_table_borders = nullptr;
+    m_uses_collapsing_borders_model = false;
     m_containing_line_box_index.clear();
     m_sticky_insets = nullptr;
 
@@ -1514,7 +1514,7 @@ CSSPixelRect Paintable::compute_absolute_border_box_rect() const
 {
     auto padded_rect = this->absolute_padding_box_rect();
     CSSPixelRect rect;
-    auto use_collapsing_borders_model = override_borders_data().has_value();
+    auto use_collapsing_borders_model = uses_collapsing_borders_model();
     // Implement the collapsing border model https://www.w3.org/TR/CSS22/tables.html#collapsing-borders.
     auto border_top = box_model().border.top;
     auto border_bottom = box_model().border.bottom;
@@ -1902,12 +1902,11 @@ void Paintable::paint(DisplayListRecordingContext& context, PaintPhase phase) co
         paint_box_shadow(context);
     }
 
-    auto const is_table_with_collapsed_borders = display().is_table_inside() && layout_node().border_collapse() == CSS::BorderCollapse::Collapse;
-    if (!display().is_table_cell() && !is_table_with_collapsed_borders && phase == PaintPhase::Border) {
+    if (phase == PaintPhase::Border && !uses_collapsing_borders_model() && !empty_cells_property_applies()) {
         paint_border(context);
     }
 
-    if ((display().is_table_inside() || layout_node().border_collapse() == CSS::BorderCollapse::Collapse) && phase == PaintPhase::TableCollapsedBorder) {
+    if (phase == PaintPhase::TableCollapsedBorder && collapsed_table_borders()) {
         paint_table_borders(context, *this);
     }
 
@@ -2284,16 +2283,6 @@ Optional<int> Paintable::effective_z_index() const
     return {};
 }
 
-BordersData Paintable::remove_element_kind_from_borders_data(Paintable::BordersDataWithElementKind borders_data)
-{
-    return {
-        .top = borders_data.top.border_data,
-        .right = borders_data.right.border_data,
-        .bottom = borders_data.bottom.border_data,
-        .left = borders_data.left.border_data,
-    };
-}
-
 enum class BorderImageTrack {
     Start,
     Center,
@@ -2633,7 +2622,7 @@ static bool paint_border_image(DisplayListRecordingContext& context, Paintable c
 
 void Paintable::paint_border(DisplayListRecordingContext& context) const
 {
-    auto borders_data = m_override_borders_data.has_value() ? remove_element_kind_from_borders_data(m_override_borders_data.value()) : BordersData {
+    BordersData borders_data {
         .top = box_model().border.top == 0 ? CSS::BorderData() : layout_node().border_top(),
         .right = box_model().border.right == 0 ? CSS::BorderData() : layout_node().border_right(),
         .bottom = box_model().border.bottom == 0 ? CSS::BorderData() : layout_node().border_bottom(),

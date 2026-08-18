@@ -21,8 +21,8 @@ pub(crate) struct Fragment {
     pub(crate) padding_right: CssPixels,
     pub(crate) padding_top: CssPixels,
     pub(crate) padding_bottom: CssPixels,
-    pub(crate) table_cell_coordinates: Option<FfiTableCellCoordinates>,
-    pub(crate) override_borders_data: Option<FfiBordersData>,
+    pub(crate) uses_collapsing_borders_model: bool,
+    pub(crate) collapsed_table_borders: Option<std::rc::Rc<OwnedCollapsedTableBorders>>,
     pub(crate) line_data: Option<std::rc::Rc<LineData>>,
     pub(crate) grid_layout_data: Option<std::rc::Rc<OwnedGridLayoutData>>,
     pub(crate) flex_layout_data: Option<std::rc::Rc<OwnedFlexLayoutData>>,
@@ -162,8 +162,7 @@ fn snapshot_fragment(
     let rare_payloads = used.rare_data.get().map(|cell| {
         let mut rare = cell.borrow_mut();
         (
-            rare.table_cell_coordinates,
-            rare.override_borders_data,
+            rare.collapsed_table_borders.take(),
             rare.grid_layout_data.take(),
             rare.flex_layout_data.take(),
             rare.used_grid_tracks.take(),
@@ -173,8 +172,7 @@ fn snapshot_fragment(
         )
     });
     let (
-        table_cell_coordinates,
-        override_borders_data,
+        collapsed_table_borders,
         grid_layout_data,
         flex_layout_data,
         used_grid_tracks,
@@ -199,8 +197,8 @@ fn snapshot_fragment(
         padding_right: used.padding_right.get(),
         padding_top: used.padding_top.get(),
         padding_bottom: used.padding_bottom.get(),
-        table_cell_coordinates,
-        override_borders_data,
+        uses_collapsing_borders_model: used.uses_collapsing_borders_model.get(),
+        collapsed_table_borders,
         line_data,
         grid_layout_data,
         flex_layout_data,

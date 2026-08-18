@@ -4,12 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-pub(crate) const ELEMENT_CELL: u8 = 0;
-pub(crate) const ELEMENT_ROW: u8 = 1;
-pub(crate) const ELEMENT_ROW_GROUP: u8 = 2;
-pub(crate) const ELEMENT_COLUMN: u8 = 3;
-pub(crate) const ELEMENT_TABLE: u8 = 5;
-
 pub(crate) const LINE_STYLE_NONE: u8 = 0;
 pub(crate) const LINE_STYLE_HIDDEN: u8 = 1;
 pub(crate) const LINE_STYLE_DOTTED: u8 = 2;
@@ -108,16 +102,75 @@ pub(crate) struct ElementBorders {
 // first. A candidate border only replaces the current winner of a segment when it is strictly more
 // specific (steps 1-3 of the border conflict resolution algorithm), so ties resolve towards the
 // earlier-applied part, which implements step 4 without tracking element kinds or coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BorderWidths {
+    pub(crate) top: CssPixels,
+    pub(crate) right: CssPixels,
+    pub(crate) bottom: CssPixels,
+    pub(crate) left: CssPixels,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiCollapsedBorderEdge {
+    pub border_data: FfiBorderData,
+    pub source_order: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiCollapsedTableBorders {
+    pub row_count: usize,
+    pub column_count: usize,
+    pub row_offsets: *const CssPixels,
+    pub column_offsets: *const CssPixels,
+    pub horizontal_edges: *const FfiCollapsedBorderEdge,
+    pub vertical_edges: *const FfiCollapsedBorderEdge,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct OwnedCollapsedTableBorders {
+    pub(crate) row_offsets: Vec<CssPixels>,
+    pub(crate) column_offsets: Vec<CssPixels>,
+    pub(crate) horizontal_edges: Vec<FfiCollapsedBorderEdge>,
+    pub(crate) vertical_edges: Vec<FfiCollapsedBorderEdge>,
+}
+
+impl OwnedCollapsedTableBorders {
+    pub(crate) fn with_ffi_view(&self, callback: impl FnOnce(&FfiCollapsedTableBorders)) {
+        let view = FfiCollapsedTableBorders {
+            row_count: self.row_offsets.len() - 1,
+            column_count: self.column_offsets.len() - 1,
+            row_offsets: self.row_offsets.as_ptr(),
+            column_offsets: self.column_offsets.as_ptr(),
+            horizontal_edges: self.horizontal_edges.as_ptr(),
+            vertical_edges: self.vertical_edges.as_ptr(),
+        };
+        callback(&view);
+    }
+}
+
+fn grid_line_offsets(sizes: impl ExactSizeIterator<Item = CssPixels>) -> Vec<CssPixels> {
+    let mut offsets = Vec::with_capacity(sizes.len() + 1);
+    let mut offset = CssPixels::default();
+    offsets.push(offset);
+    for size in sizes {
+        offset += size;
+        offsets.push(offset);
+    }
+    offsets
+}
+
 pub(crate) struct CollapsedBorderGrid {
-    horizontal_lines: Vec<Vec<FfiBorderDataWithElementKind>>,
-    vertical_lines: Vec<Vec<FfiBorderDataWithElementKind>>,
+    horizontal_lines: Vec<Vec<FfiCollapsedBorderEdge>>,
+    vertical_lines: Vec<Vec<FfiCollapsedBorderEdge>>,
 }
 
 impl CollapsedBorderGrid {
     pub(crate) fn new(row_count: usize, column_count: usize) -> Self {
         Self {
-            horizontal_lines: vec![vec![FfiBorderDataWithElementKind::default(); column_count]; row_count + 1],
-            vertical_lines: vec![vec![FfiBorderDataWithElementKind::default(); row_count]; column_count + 1],
+            horizontal_lines: vec![vec![FfiCollapsedBorderEdge::default(); column_count]; row_count + 1],
+            vertical_lines: vec![vec![FfiCollapsedBorderEdge::default(); row_count]; column_count + 1],
         }
     }
 
@@ -128,35 +181,35 @@ impl CollapsedBorderGrid {
         row_end: usize,
         column_start: usize,
         column_end: usize,
-        element_kind: u8,
+        source_order: u32,
     ) {
         Self::apply_to_segments(
             &mut self.horizontal_lines[row_start],
             column_start,
             column_end,
             borders.top,
-            element_kind,
+            source_order,
         );
         Self::apply_to_segments(
             &mut self.horizontal_lines[row_end],
             column_start,
             column_end,
             borders.bottom,
-            element_kind,
+            source_order,
         );
         Self::apply_to_segments(
             &mut self.vertical_lines[column_start],
             row_start,
             row_end,
             borders.left,
-            element_kind,
+            source_order,
         );
         Self::apply_to_segments(
             &mut self.vertical_lines[column_end],
             row_start,
             row_end,
             borders.right,
-            element_kind,
+            source_order,
         );
     }
 
@@ -166,16 +219,17 @@ impl CollapsedBorderGrid {
         row_end: usize,
         column_start: usize,
         column_end: usize,
+        source_order: u32,
     ) {
         // Segments strictly inside a spanning cell are not borders of any element; mark them as hidden
         // so that borders of rows and columns crossing the span cannot win there.
-        let hidden = FfiBorderDataWithElementKind {
+        let hidden = FfiCollapsedBorderEdge {
             border_data: FfiBorderData {
                 color: 0,
                 line_style: LINE_STYLE_HIDDEN,
                 width: CssPixels::default(),
             },
-            element_kind: ELEMENT_CELL,
+            source_order,
         };
         for row in row_start + 1..row_end {
             for column in column_start..column_end {
@@ -189,67 +243,66 @@ impl CollapsedBorderGrid {
         }
     }
 
-    pub(crate) fn resolve_for_cell(
+    pub(crate) fn resolve_used_widths_for_cell(
         &self,
         row_start: usize,
         row_end: usize,
         column_start: usize,
         column_end: usize,
-        own: ElementBorders,
-    ) -> FfiBordersData {
-        let harvest = |winner: FfiBorderDataWithElementKind, own_border: FfiBorderData| {
-            // A winner whose style is 'none' means every border meeting at this edge is 'none'; fall
-            // back to the cell's own (invisible) border so the stored winner matches the cell.
-            if winner.border_data.line_style == LINE_STYLE_NONE {
-                FfiBorderDataWithElementKind {
-                    border_data: own_border,
-                    element_kind: ELEMENT_CELL,
-                }
-            } else {
-                winner
-            }
-        };
-        FfiBordersData {
-            top: harvest(
-                Self::most_specific(&self.horizontal_lines[row_start], column_start, column_end),
-                own.top,
-            ),
-            right: harvest(
-                Self::most_specific(&self.vertical_lines[column_end], row_start, row_end),
-                own.right,
-            ),
-            bottom: harvest(
-                Self::most_specific(&self.horizontal_lines[row_end], column_start, column_end),
-                own.bottom,
-            ),
-            left: harvest(
-                Self::most_specific(&self.vertical_lines[column_start], row_start, row_end),
-                own.left,
-            ),
+    ) -> BorderWidths {
+        BorderWidths {
+            top: Self::most_specific(&self.horizontal_lines[row_start], column_start, column_end).border_data.width,
+            right: Self::most_specific(&self.vertical_lines[column_end], row_start, row_end).border_data.width,
+            bottom: Self::most_specific(&self.horizontal_lines[row_end], column_start, column_end).border_data.width,
+            left: Self::most_specific(&self.vertical_lines[column_start], row_start, row_end).border_data.width,
         }
     }
 
-    fn apply_to_segments(
-        line: &mut [FfiBorderDataWithElementKind],
-        start: usize,
-        end: usize,
-        data: FfiBorderData,
-        element_kind: u8,
-    ) {
+    fn apply_to_segments(line: &mut [FfiCollapsedBorderEdge], start: usize, end: usize, data: FfiBorderData, source_order: u32) {
         if data.line_style == LINE_STYLE_NONE {
             return;
         }
         for segment in &mut line[start..end] {
             if candidate_wins(data, segment.border_data) {
-                *segment = FfiBorderDataWithElementKind {
+                *segment = FfiCollapsedBorderEdge {
                     border_data: data,
-                    element_kind,
+                    source_order,
                 };
             }
         }
     }
 
-    fn most_specific(line: &[FfiBorderDataWithElementKind], start: usize, end: usize) -> FfiBorderDataWithElementKind {
+    pub(crate) fn outer_edge_widths(&self) -> BorderWidths {
+        let max_width = |segments: &[FfiCollapsedBorderEdge]| {
+            segments
+                .iter()
+                .fold(CssPixels::default(), |max, segment| max.max(segment.border_data.width))
+        };
+        BorderWidths {
+            top: max_width(&self.horizontal_lines[0]),
+            right: max_width(self.vertical_lines.last().expect("grid has vertical lines")),
+            bottom: max_width(self.horizontal_lines.last().expect("grid has horizontal lines")),
+            left: max_width(&self.vertical_lines[0]),
+        }
+    }
+
+    pub(crate) fn has_paintable_edges(&self) -> bool {
+        let paints = |segment: &FfiCollapsedBorderEdge| {
+            segment.border_data.width > CssPixels::default()
+                && segment.border_data.line_style != LINE_STYLE_NONE
+                && segment.border_data.line_style != LINE_STYLE_HIDDEN
+        };
+        self.horizontal_lines.iter().flatten().any(paints) || self.vertical_lines.iter().flatten().any(paints)
+    }
+
+    pub(crate) fn take_edges(self) -> (Vec<FfiCollapsedBorderEdge>, Vec<FfiCollapsedBorderEdge>) {
+        (
+            self.horizontal_lines.iter().flatten().copied().collect(),
+            self.vertical_lines.iter().flatten().copied().collect(),
+        )
+    }
+
+    fn most_specific(line: &[FfiCollapsedBorderEdge], start: usize, end: usize) -> FfiCollapsedBorderEdge {
         let mut winner = line[start];
         for segment in &line[start + 1..end] {
             if candidate_wins(segment.border_data, winner.border_data) {
@@ -803,6 +856,7 @@ struct TableFormattingContext {
     deferred_cell_inside_layouts: Vec<bool>,
     columns: Vec<Column>,
     rows: Vec<Row>,
+    collapsed_border_grid: Option<CollapsedBorderGrid>,
     derived_baselines_of_root_box: Cell<DerivedBaselines>,
 }
 
@@ -869,6 +923,7 @@ impl TableFormattingContext {
             deferred_cell_inside_layouts: Vec::new(),
             columns: Vec::new(),
             rows: Vec::new(),
+            collapsed_border_grid: None,
             derived_baselines_of_root_box: Cell::new(DerivedBaselines::default()),
         }
     }
@@ -915,17 +970,6 @@ impl TableFormattingContext {
 
     fn create_used_values(&self, node: Node, constraints: ContainingBlockConstraints) -> std::rc::Rc<UsedValues> {
         self.records.create_used_values(&self.callbacks, node, constraints)
-    }
-
-    fn set_cell_coordinates(&self, cell: TableCell) {
-        self.used_values(cell.box_)
-            .rare_data_mut()
-            .table_cell_coordinates = Some(crate::layout::FfiTableCellCoordinates {
-            row_index: cell.row_index,
-            column_index: cell.column_index,
-            row_span: cell.row_span,
-            column_span: cell.column_span,
-        });
     }
 
     fn place_child(&self, node: Node, x: CssPixels, y: CssPixels) {
@@ -982,27 +1026,31 @@ impl TableFormattingContext {
 
     fn border_conflict_resolution(&mut self) {
         if self.style(self.table_box).border_collapse() == BORDER_COLLAPSE_SEPARATE {
-            for cell_index in 0..self.cells.len() {
-                let cell = self.cells[cell_index];
-                self.set_cell_coordinates(cell);
-            }
             return;
         }
 
         let row_count = self.rows.len();
         let column_count = self.columns.len();
         let mut grid = CollapsedBorderGrid::new(row_count, column_count);
+        let mut next_source_order = 0u32;
+        let mut take_source_order = move || {
+            let source_order = next_source_order;
+            next_source_order += 1;
+            source_order
+        };
         // Cells, column by column so that on ties the cell further to the left, then further to the
         // top, wins. TableCell spans are already clipped to the table end by TableGrid.
         let mut cells = self.cells.clone();
         cells.sort_by_key(|cell| (cell.column_index, cell.row_index));
         for cell in cells {
+            let source_order = take_source_order();
             if cell.row_span > 1 || cell.column_span > 1 {
                 grid.hide_segments_inside_span(
                     cell.row_index,
                     cell.row_index + cell.row_span,
                     cell.column_index,
                     cell.column_index + cell.column_span,
+                    source_order,
                 );
             }
             let borders = self.element_borders(cell.box_);
@@ -1012,13 +1060,13 @@ impl TableFormattingContext {
                 cell.row_index + cell.row_span,
                 cell.column_index,
                 cell.column_index + cell.column_span,
-                ELEMENT_CELL,
+                source_order,
             );
         }
         for row_index in 0..row_count {
             let row_box = self.rows[row_index].box_;
             let borders = self.element_borders(row_box);
-            grid.apply_borders(borders, row_index, row_index + 1, 0, column_count, ELEMENT_ROW);
+            grid.apply_borders(borders, row_index, row_index + 1, 0, column_count, take_source_order());
         }
         // Row groups, in the order their rows appear in the grid. Rows of a group are contiguous in
         // m_rows, since TableGrid collects them in tree order.
@@ -1039,42 +1087,89 @@ impl TableFormattingContext {
                 row_index += 1;
             }
             let borders = self.element_borders(group);
-            grid.apply_borders(borders, start, row_index, 0, column_count, ELEMENT_ROW_GROUP);
+            grid.apply_borders(borders, start, row_index, 0, column_count, take_source_order());
         }
 
         // Column (<col>) elements.
         let mut column_index = 0usize;
+        let mut column_group_ranges = Vec::new();
         for column_group in self.matching_children(self.table_box, |facts| facts.is_table_column_group()) {
+            let group_start = column_index;
             for column in self.matching_children(column_group, |facts| facts.is_table_column()) {
                 let span = self.table_column_span(column);
                 let end = (column_index + span).min(column_count);
                 let borders = self.element_borders(column);
+                let source_order = take_source_order();
                 while column_index < end {
-                    grid.apply_borders(borders, 0, row_count, column_index, column_index + 1, ELEMENT_COLUMN);
+                    grid.apply_borders(borders, 0, row_count, column_index, column_index + 1, source_order);
                     column_index += 1;
                 }
             }
+            column_group_ranges.push((column_group, group_start, column_index));
+        }
+        for (column_group, group_start, group_end) in column_group_ranges {
+            if group_start < group_end {
+                let borders = self.element_borders(column_group);
+                grid.apply_borders(borders, 0, row_count, group_start, group_end, take_source_order());
+            }
         }
         let table_borders = self.element_borders(self.table_box);
-        grid.apply_borders(table_borders, 0, row_count, 0, column_count, ELEMENT_TABLE);
+        grid.apply_borders(table_borders, 0, row_count, 0, column_count, take_source_order());
+
+        let outer = grid.outer_edge_widths();
+        let table_used = self.used_values(self.table_box);
+        let old_border_box_top = table_used.border_box_top(false);
+        let old_inline_borders = table_used.border_box_left(false) + table_used.border_box_right(false);
+        table_used.border_top.set(outer.top);
+        table_used.border_right.set(outer.right);
+        table_used.border_bottom.set(outer.bottom);
+        table_used.border_left.set(outer.left);
+        table_used.uses_collapsing_borders_model.set(true);
+        self.table_box_content_block_offset_in_wrapper += table_used.border_box_top(true) - old_border_box_top;
+        let freed_inline = old_inline_borders - (table_used.border_box_left(true) + table_used.border_box_right(true));
+        if let AvailableSize::Definite(available) = self.available_space.inline_size {
+            self.available_space.inline_size = AvailableSize::definite(available + freed_inline);
+        }
 
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
-            let own = self.element_borders(cell.box_);
             let row_end = cell.row_index + cell.row_span;
             let column_end = cell.column_index + cell.column_span;
-            let resolved = grid.resolve_for_cell(cell.row_index, row_end, cell.column_index, column_end, own);
-            self.set_cell_coordinates(cell);
+            let widths = grid.resolve_used_widths_for_cell(cell.row_index, row_end, cell.column_index, column_end);
             let used = self.used_values(cell.box_);
-            used.border_top.set(resolved.top.border_data.width);
-            used.border_right.set(resolved.right.border_data.width);
-            used.border_bottom.set(resolved.bottom.border_data.width);
-            used.border_left.set(resolved.left.border_data.width);
+            used.border_top.set(widths.top);
+            used.border_right.set(widths.right);
+            used.border_bottom.set(widths.bottom);
+            used.border_left.set(widths.left);
             used.uses_collapsing_borders_model.set(true);
-            self.used_values(cell.box_)
-                .rare_data_mut()
-                .override_borders_data = Some(resolved);
         }
+        self.collapsed_border_grid = Some(grid);
+    }
+
+    fn materialize_collapsed_table_borders(&mut self) {
+        let Some(grid) = self.collapsed_border_grid.take() else {
+            return;
+        };
+        if self.purpose.is_measurement() {
+            return;
+        }
+        if !grid.has_paintable_edges() {
+            return;
+        }
+        let column_offsets = grid_line_offsets(self.columns.iter().map(|column| column.used_inline_size));
+        let row_offsets = grid_line_offsets(
+            self.rows
+                .iter()
+                .map(|row| if row.is_collapsed { CssPixels::default() } else { row.final_block_size }),
+        );
+        let (horizontal_edges, vertical_edges) = grid.take_edges();
+        self.used_values(self.table_box).rare_data_mut().collapsed_table_borders =
+            Some(std::rc::Rc::new(OwnedCollapsedTableBorders {
+                row_offsets,
+                column_offsets,
+                horizontal_edges,
+                vertical_edges,
+            }));
     }
 
     fn seed_table_participant_used_values(&mut self) {
@@ -1746,7 +1841,8 @@ impl TableFormattingContext {
         let mut resolved = constraint.to_px(basis);
         if self.style(self.table_box).box_sizing() == box_sizing::BORDER_BOX {
             let used = self.used_values(self.table_box);
-            resolved -= used.border_box_left(false) + used.border_box_right(false);
+            let collapsed = used.uses_collapsing_borders_model.get();
+            resolved -= used.border_box_left(collapsed) + used.border_box_right(collapsed);
         }
         resolved.max(CssPixels::default())
     }
@@ -2179,7 +2275,8 @@ impl TableFormattingContext {
             .fold(CssPixels::default(), |sum, row| sum + row.base_block_size);
         if let Some(minimum) = self.min_border_box_block_size_from_flex_item {
             let used = self.used_values(self.table_box);
-            let content_min = minimum - used.border_box_top(false) - used.border_box_bottom(false);
+            let collapsed = used.uses_collapsing_borders_model.get();
+            let content_min = minimum - used.border_box_top(collapsed) - used.border_box_bottom(collapsed);
             self.table_block_size = self.table_block_size.max(content_min);
         }
         let table_style = self.style(self.table_box);
@@ -2189,7 +2286,8 @@ impl TableFormattingContext {
             let mut specified = table_style.height().to_px(self.table_constraints.block_basis());
             if table_style.box_sizing() == box_sizing::BORDER_BOX {
                 let used = self.used_values(self.table_box);
-                specified -= used.border_box_top(false) + used.border_box_bottom(false);
+                let collapsed = used.uses_collapsing_borders_model.get();
+                specified -= used.border_box_top(collapsed) + used.border_box_bottom(collapsed);
             }
             self.table_block_size = self.table_block_size.max(specified);
         }
@@ -2316,7 +2414,8 @@ impl TableFormattingContext {
         let table_used = self.used_values(self.table_box);
         let block_spacing = self.border_spacing_block();
         let inline_spacing = self.border_spacing_inline();
-        let inline_offset = table_used.border_left.get() + table_used.padding_left.get() + inline_spacing;
+        let inline_offset =
+            table_used.border_box_left(table_used.uses_collapsing_borders_model.get()) + inline_spacing;
         let mut row_block_offset = self.table_box_content_block_offset_in_wrapper + block_spacing;
         for row_index in 0..self.rows.len() {
             let row = &self.rows[row_index];
@@ -2555,6 +2654,7 @@ impl TableFormattingContext {
         self.position_row_boxes();
         self.layout_deferred_cells_inside(run);
         self.position_cell_boxes();
+        self.materialize_collapsed_table_borders();
         table_used.set_content_block_size(self.table_block_size);
         // Derive baselines for the table internals bottom-up (rows, then row groups, then the table box)
         // now that all offsets are final, so the table exports its baseline to outside consumers
