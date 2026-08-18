@@ -62,6 +62,13 @@ class Element;
 
 }
 
+namespace Web::HTML {
+
+template<typename>
+class HTMLOrSVGOrMathMLElement;
+
+}
+
 namespace Web::Bindings {
 
 class PlatformObject;
@@ -202,7 +209,6 @@ public:
     Optional<Utf16String> get_attribute(Utf16FlyString const& name) const;
     Optional<Utf16String> get_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name) const;
     Utf16String get_attribute_value(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_ = {}) const;
-    Optional<Utf16View> get_attribute_value_view(Utf16FlyString const& name) const;
 
     Utf16String get_an_elements_target(Optional<Utf16String> target = {}) const;
     HTML::TokenizedFeature::NoOpener get_an_elements_noopener(URL::URL const& url, Utf16View target) const;
@@ -228,6 +234,7 @@ public:
     WebIDL::ExceptionOr<GC::Ptr<Attr>> set_attribute_node_ns(Attr&);
 
     void append_attribute(Attr&);
+    void append_attribute(QualifiedName, Utf16String value);
     void remove_attribute(Utf16FlyString const& name);
     void remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& name);
     WebIDL::ExceptionOr<GC::Ref<Attr>> remove_attribute_node(GC::Ref<Attr>);
@@ -248,7 +255,7 @@ public:
 
     GC::Ref<DOMTokenList> class_list();
     GC::Ref<DOMTokenList> part_list();
-    ReadonlySpan<Utf16FlyString> part_names() const { return m_parts; }
+    ReadonlySpan<Utf16FlyString> part_names() const;
 
     using ShadowRootOptions = Bindings::ShadowRootInit;
 
@@ -297,7 +304,8 @@ public:
     void for_each_attribute(Function<void(Attr&)>);
     void for_each_attribute(Function<void(Attr const&)>) const;
 
-    void for_each_attribute(Function<void(Utf16FlyString const&, Utf16View)>) const;
+    void for_each_attribute(Function<void(QualifiedName, Utf16String)>) const;
+    void for_each_attribute(Function<void(Utf16FlyString, Utf16String)>) const;
 
     bool has_class(Utf16View, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
     bool has_class(Utf16FlyString const&, CaseSensitivity = CaseSensitivity::CaseSensitive) const;
@@ -326,7 +334,7 @@ public:
 
     void set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason, CSS::LayoutTreeRebuildRoot);
 
-    Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element() const { return m_associated_shadow_host_pseudo_element; }
+    Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element() const;
     void set_associated_shadow_host_pseudo_element(CSS::PseudoElement pseudo_element);
 
     Layout::NodeWithStyle* layout_node();
@@ -360,12 +368,13 @@ public:
     template<typename Callback>
     void for_each_synthetic_pseudo_element(Callback const& callback)
     {
-        if (!m_pseudo_element_data)
+        auto* pseudo_element_data = this->pseudo_element_data();
+        if (!pseudo_element_data)
             return;
 
         for (auto i = to_underlying(CSS::first_synthetic_pseudo_element); i <= to_underlying(CSS::last_synthetic_pseudo_element); ++i) {
             auto type = static_cast<CSS::PseudoElement>(i);
-            auto pseudo_element = m_pseudo_element_data->get(type);
+            auto pseudo_element = pseudo_element_data->get(type);
             if (!pseudo_element.has_value())
                 continue;
 
@@ -383,12 +392,13 @@ public:
     template<typename Callback>
     void for_each_synthetic_pseudo_element(Callback const& callback) const
     {
-        if (!m_pseudo_element_data)
+        auto const* pseudo_element_data = this->pseudo_element_data();
+        if (!pseudo_element_data)
             return;
 
         for (auto i = to_underlying(CSS::first_synthetic_pseudo_element); i <= to_underlying(CSS::last_synthetic_pseudo_element); ++i) {
             auto type = static_cast<CSS::PseudoElement>(i);
-            auto pseudo_element = m_pseudo_element_data->get(type);
+            auto pseudo_element = pseudo_element_data->get(type);
             if (!pseudo_element.has_value())
                 continue;
 
@@ -438,8 +448,8 @@ public:
 
     void set_fullscreen_flag(bool is_fullscreen);
     bool is_fullscreen_element() const { return m_fullscreen_flag; }
-    void set_fullscreen_request_type(Fullscreen::RequestType request_type) { m_fullscreen_request_type = request_type; }
-    Fullscreen::RequestType fullscreen_request_type() const { return m_fullscreen_request_type; }
+    void set_fullscreen_request_type(Fullscreen::RequestType);
+    Fullscreen::RequestType fullscreen_request_type() const;
 
     GC::Ptr<WebIDL::CallbackType> onfullscreenchange();
     void set_onfullscreenchange(GC::Ptr<WebIDL::CallbackType>);
@@ -629,11 +639,11 @@ public:
     void enqueue_a_custom_element_callback_reaction(Utf16FlyString const& callback_name, CustomElementCallbackReactionArguments arguments);
 
     using CustomElementReactionQueue = Vector<Variant<CustomElementUpgradeReaction, CustomElementCallbackReaction, CustomElementConnectedMoveCallbackReaction>>;
-    CustomElementReactionQueue* custom_element_reaction_queue() { return m_custom_element_reaction_queue; }
-    CustomElementReactionQueue const* custom_element_reaction_queue() const { return m_custom_element_reaction_queue; }
+    CustomElementReactionQueue* custom_element_reaction_queue();
+    CustomElementReactionQueue const* custom_element_reaction_queue() const;
     CustomElementReactionQueue& ensure_custom_element_reaction_queue();
 
-    GC::Ptr<HTML::CustomStateSet const> custom_state_set() const { return m_custom_state_set; }
+    GC::Ptr<HTML::CustomStateSet const> custom_state_set() const;
     HTML::CustomStateSet& ensure_custom_state_set();
 
     bool can_upgrade_custom_element() const { return m_custom_element_state == CustomElementState::Undefined || m_custom_element_state == CustomElementState::Uncustomized; }
@@ -642,11 +652,11 @@ public:
     bool is_defined() const;
     bool is_custom() const;
 
-    Optional<Utf16FlyString> const& is_value() const { return m_is_value; }
-    void set_is_value(Optional<Utf16FlyString> const& is) { m_is_value = is; }
+    Optional<Utf16FlyString> const& is_value() const;
+    void set_is_value(Optional<Utf16FlyString> const& is);
 
     void set_custom_element_state(CustomElementState);
-    void set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition> definition) { m_custom_element_definition = definition; }
+    void set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition>);
     void clear_custom_element_reaction_queue();
     void setup_custom_element_from_constructor(HTML::CustomElementDefinition& custom_element_definition, Optional<Utf16FlyString> const& is_value);
 
@@ -678,7 +688,7 @@ public:
         Rtl,
         Auto,
     };
-    Optional<Dir> dir() const { return m_dir; }
+    Optional<Dir> dir() const;
     bool has_auto_directionality() const;
 
     enum class Directionality {
@@ -689,7 +699,7 @@ public:
     bool is_auto_directionality_form_associated_element() const;
 
     Optional<Utf16FlyString> const& id() const { return m_id; }
-    Optional<Utf16FlyString> const& name() const { return m_name; }
+    Optional<Utf16FlyString> name() const;
 
     virtual GC::Ptr<GC::Function<void()>> take_lazy_load_resumption_steps(Badge<DOM::Document>)
     {
@@ -706,12 +716,12 @@ public:
     void set_rendered_in_top_layer(bool rendered_in_top_layer) { m_rendered_in_top_layer = rendered_in_top_layer; }
     bool rendered_in_top_layer() const { return m_rendered_in_top_layer; }
 
-    bool has_non_empty_counters_set() const { return m_counters_set; }
+    bool has_non_empty_counters_set() const;
     Optional<CSS::CountersSet const&> counters_set() const;
     CSS::CountersSet& ensure_counters_set();
     void set_counters_set(OwnPtr<CSS::CountersSet>&&);
 
-    ProximityToTheViewport proximity_to_the_viewport() const { return m_proximity_to_the_viewport; }
+    ProximityToTheViewport proximity_to_the_viewport() const;
     void determine_proximity_to_the_viewport();
     bool is_relevant_to_the_user();
 
@@ -730,8 +740,8 @@ public:
 
     void invalidate_list_item_counters_for_list_owner();
 
-    bool captured_in_a_view_transition() const { return m_captured_in_a_view_transition; }
-    void set_captured_in_a_view_transition(bool value) { m_captured_in_a_view_transition = value; }
+    bool captured_in_a_view_transition() const;
+    void set_captured_in_a_view_transition(bool);
 
     // https://drafts.csswg.org/css-images-4/#element-not-rendered
     bool not_rendered() const;
@@ -751,7 +761,7 @@ public:
     virtual bool contributes_a_script_blocking_style_sheet() const { return false; }
 
     void set_had_duplicate_attribute_during_tokenization(Badge<HTML::HTMLParser>);
-    bool had_duplicate_attribute_during_tokenization() const { return m_had_duplicate_attribute_during_tokenization; }
+    bool had_duplicate_attribute_during_tokenization() const;
 
     GC::Ref<CSS::StylePropertyMapReadOnly> computed_style_map();
 
@@ -772,8 +782,8 @@ public:
 
     WebIDL::ExceptionOr<void> request_pointer_lock(PointerLockOptions const&);
 
-    GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const { return m_custom_element_registry; }
-    void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> registry) { m_custom_element_registry = registry; }
+    GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
+    void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry>);
 
     virtual void initialize_element() { }
 
@@ -796,19 +806,51 @@ protected:
     virtual void prepare_for_style_computation() { }
 
     virtual void visit_edges(Cell::Visitor&) override;
+    virtual size_t external_memory_size() const override;
 
     virtual bool id_reference_exists(Utf16View) const override;
 
     CustomElementState custom_element_state() const { return m_custom_element_state; }
-    GC::Ptr<HTML::CustomElementDefinition> custom_element_definition() const { return m_custom_element_definition; }
+    GC::Ptr<HTML::CustomElementDefinition> custom_element_definition() const;
 
     friend void Bindings::set_prototype_from_custom_element_definition_if_needed(Element&, Bindings::PlatformObject&);
+    template<typename>
+    friend class HTML::HTMLOrSVGOrMathMLElement;
 
     void play_or_cancel_animations_after_display_property_change();
     void clear_element_reference_pseudo_elements();
 
+    struct RareData;
+
 private:
+    struct Attribute {
+        QualifiedName name;
+        Utf16String value;
+    };
+    using AttributeList = Vector<Attribute, 1>;
+
+    AttributeList& ensure_attribute_list();
+    Optional<size_t> find_attribute_index(Utf16FlyString const& qualified_name) const;
+    Optional<size_t> find_attribute_index_ns(Optional<Utf16FlyString> const&, Utf16FlyString const& local_name) const;
+    void change_attribute_value(GC::Ref<Attr>, Utf16String value);
+    void handle_attribute_changes(QualifiedName, Optional<Utf16String> old_value, Optional<Utf16String> new_value);
+    void remove_attribute_at(size_t index);
+
     using PreservedPseudoElementStyles = Array<RefPtr<CSS::ComputedValues const>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)>;
+    using PseudoElementData = HashMap<CSS::PseudoElement, GC::Ref<PseudoElement>>;
+
+    virtual OwnPtr<Node::RareData> create_rare_data() const override;
+    virtual SlottableMixin::RareData* slottable_rare_data() override;
+    virtual SlottableMixin::RareData const* slottable_rare_data() const override;
+    virtual SlottableMixin::RareData& ensure_slottable_rare_data() override;
+    virtual ARIA::ARIAMixin::RareData* aria_rare_data() override;
+    virtual ARIA::ARIAMixin::RareData const* aria_rare_data() const override;
+    virtual ARIA::ARIAMixin::RareData& ensure_aria_rare_data() override;
+    RareData& ensure_element_rare_data() const;
+    RareData* element_rare_data();
+    RareData const* element_rare_data() const;
+    PseudoElementData* pseudo_element_data();
+    PseudoElementData const* pseudo_element_data() const;
 
     Utf16FlyString make_html_uppercased_qualified_name() const;
 
@@ -828,14 +870,10 @@ private:
     Directionality parent_directionality() const;
 
     QualifiedName m_qualified_name;
-    mutable Optional<Utf16FlyString> m_html_uppercased_qualified_name;
 
-    GC::Ptr<NamedNodeMap> m_attributes;
+    OwnPtr<AttributeList> m_attributes;
     GC::Ptr<CSS::CSSStyleProperties> m_inline_style;
-    GC::Ptr<CSS::StylePropertyMap> m_attribute_style_map;
-    GC::Ptr<DOMTokenList> m_class_list;
     GC::Ptr<ShadowRoot> m_shadow_root;
-    GC::Ptr<DOMTokenList> m_part_list;
 
     // The authoritative StyleEngine record. C++ compatibility consumers borrow the record-owned
     // computed-values view rather than retaining one complete style per element.
@@ -844,49 +882,17 @@ private:
     OwnPtr<CSS::StyleInputRecord> m_style_input_record;
     PublishedCustomPropertyNames m_published_custom_property_names;
 
-    using PseudoElementData = HashMap<CSS::PseudoElement, GC::Ref<PseudoElement>>;
-    mutable OwnPtr<PseudoElementData> m_pseudo_element_data;
     void register_element_reference_pseudo_element(CSS::PseudoElement type, GC::Ref<Element> element);
     SyntheticPseudoElement& ensure_synthetic_pseudo_element(CSS::PseudoElement) const;
     void clear_synthetic_pseudo_element_layout_nodes();
 
-    Optional<CSS::PseudoElement> m_associated_shadow_host_pseudo_element;
-
     Vector<Utf16FlyString> m_classes;
     CSS::StyleNodeID m_style_node_id;
-    Vector<Utf16FlyString> m_parts;
-    Optional<Dir> m_dir;
 
     Optional<Utf16FlyString> m_id;
-    Optional<Utf16FlyString> m_name;
 
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#custom-element-reaction-queue
-    // All elements have an associated custom element reaction queue, initially empty. Each item in the custom element reaction queue is of one of two types:
-    // NOTE: See the structs at the top of this header.
-    OwnPtr<CustomElementReactionQueue> m_custom_element_reaction_queue;
-
-    // https://dom.spec.whatwg.org/#element-custom-element-registry
-    GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
-
-    // https://dom.spec.whatwg.org/#concept-element-custom-element-definition
-    GC::Ptr<HTML::CustomElementDefinition> m_custom_element_definition;
-
-    // https://dom.spec.whatwg.org/#concept-element-is-value
-    Optional<Utf16FlyString> m_is_value;
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#states-set
-    GC::Ptr<HTML::CustomStateSet> m_custom_state_set;
-
-    // https://www.w3.org/TR/intersection-observer/#dom-element-registeredintersectionobservers-slot
-    // Element objects have an internal [[RegisteredIntersectionObservers]] slot, which is initialized to an empty list.
-    OwnPtr<Vector<GC::Ref<IntersectionObserver::IntersectionObserver>>> m_registered_intersection_observers;
-
-    // https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemapcache-slot
-    // Every Element has a [[computedStyleMapCache]] internal slot, initially set to null, which caches the result of
-    // the computedStyleMap() method when it is first called.
-    GC::Ptr<CSS::StylePropertyMapReadOnly> m_computed_style_map_cache;
-
-    CSSPixelPoint m_scroll_offset;
+    friend class Attr;
+    friend class NamedNodeMap;
 
     bool m_is_being_activated : 1 { false };
     bool m_in_top_layer : 1 { false };
@@ -903,33 +909,13 @@ private:
     bool m_child_style_uses_tree_counting_function : 1 { false };
     bool m_style_uses_tree_counting_function : 1 { false };
     bool m_fullscreen_flag : 1 { false };
-
-    Fullscreen::RequestType m_fullscreen_request_type { Fullscreen::RequestType::Standard };
-
-    size_t m_sibling_invalidation_distance { 0 };
-
-    OwnPtr<CSS::CountersSet> m_counters_set;
+    bool m_uses_document_global_custom_element_registry : 1 { false };
+    bool m_has_name : 1 { false };
 
     mutable Optional<Utf16String> m_lang_value;
 
-    // https://w3c.github.io/webappsec-csp/#is-element-nonceable
-    // AD-HOC: We need to know the element had a duplicate attribute when it was created from the HTML parser.
-    //         However, there currently isn't any specified way to do this, so we store a flag on the token, which is
-    //         then passed down to here. This is used by Content Security Policy to disable the nonce attribute if this
-    //         flag is set.
-    bool m_had_duplicate_attribute_during_tokenization { false };
-
     // https://dom.spec.whatwg.org/#concept-element-custom-element-state
     CustomElementState m_custom_element_state { CustomElementState::Undefined };
-
-    // https://drafts.csswg.org/css-contain/#proximity-to-the-viewport
-    ProximityToTheViewport m_proximity_to_the_viewport { ProximityToTheViewport::NotDetermined };
-
-    // https://drafts.csswg.org/css-view-transitions-1/#captured-in-a-view-transition
-    bool m_captured_in_a_view_transition { false };
-
-    // https://drafts.csswg.org/css-values-5/#random-caching
-    HashMap<CSS::RandomCachingKey, double> m_element_specific_css_random_base_value_cache;
 };
 
 template<>
