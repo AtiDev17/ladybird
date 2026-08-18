@@ -61,6 +61,7 @@
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/SessionHistory.h>
+#include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageSetResult.h>
 #include <LibWebView/WebContentClient.h>
@@ -143,6 +144,13 @@ public:
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void()> on_ready = nullptr);
     [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
+
+    [[nodiscard]] Optional<SessionHistorySnapshot> session_history_snapshot() const;
+    [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
+
+    Optional<SessionTabId> session_tab_id() const { return m_session_tab_id; }
+    void set_session_tab_id(SessionTabId session_tab_id) { m_session_tab_id = session_tab_id; }
+    void clear_session_tab_id() { m_session_tab_id = {}; }
 
     void zoom_in();
     void zoom_out();
@@ -298,9 +306,13 @@ public:
     void did_receive_history_operation_ready(Badge<WebContentClient>, u64 operation_id, Web::HistoryOperationReadyResult);
     void did_receive_history_step_unload_cancelation_result(Badge<WebContentClient>, u64 operation_id, Web::HTML::HistoryStepResult);
     void did_receive_changing_navigable_history_job_ready(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition);
-    void did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state);
+    void did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state);
     void did_receive_nonchanging_navigable_history_state_updated(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id);
     void did_reset_session_history_for_testing(Badge<WebContentClient>, Web::HTML::SessionHistoryEntryDescriptor);
+    bool capture_session_history_snapshot_for_testing(Badge<WebContentClient>);
+    bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentClient>);
+    bool register_session_store_tab_for_testing(Badge<WebContentClient>);
+    String session_store_tab_state_for_testing(Badge<WebContentClient>) const;
     void did_start_webdriver_navigation(Badge<WebContentClient>);
     String ui_process_session_history_for_testing(Badge<WebContentClient>) const;
     JsonValue webdriver_session_history() const;
@@ -480,6 +492,7 @@ protected:
     void complete_webdriver_navigation(u64 navigation_id);
     void complete_webdriver_history_traversal(u64 operation_id);
     void update_navigation_action_state();
+    void notify_session_history_changed();
     enum class SessionHistoryDumpMode {
         IfDebuggingEnabled,
         Always,
@@ -677,6 +690,8 @@ protected:
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     CanonicalTraversable m_top_level_traversable;
+    Optional<SessionTabId> m_session_tab_id;
+    Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
     struct PendingWebDriverNavigation {
         u64 id { 0 };
         WebDriverNavigationCompletionSource completion_source { WebDriverNavigationCompletionSource::Load };

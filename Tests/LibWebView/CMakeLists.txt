@@ -11,7 +11,9 @@ set(TEST_SOURCES
     TestOmnibox.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
+    TestSessionHistorySnapshotStorage.cpp
     TestSessionHistoryTraversalQueue.cpp
+    TestSessionStore.cpp
     TestStorageJar.cpp
     TestWebViewURL.cpp
 )

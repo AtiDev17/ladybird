@@ -489,7 +489,7 @@ static HistoryEntry entry_after_visit(Optional<HistoryEntry> existing_entry, Str
 
     if (title.has_value() && !title->is_empty())
         entry.title = title;
-    VERIFY(entry.visit_count != NumericLimits<u64>::max());
+    VERIFY(entry.visit_count != NumericLimits<i64>::max());
     ++entry.visit_count;
     entry.last_visited_time = max(entry.last_visited_time, visited_at);
 
@@ -498,7 +498,7 @@ static HistoryEntry entry_after_visit(Optional<HistoryEntry> existing_entry, Str
         entry.last_qualifying_visit_time = max(entry.last_qualifying_visit_time, visited_at);
 
         if (transition == HistoryVisitTransition::Omnibox) {
-            VERIFY(entry.direct_visit_count != NumericLimits<u64>::max());
+            VERIFY(entry.direct_visit_count != NumericLimits<i64>::max());
             ++entry.direct_visit_count;
             entry.decayed_direct_score = score_after_event(entry.decayed_direct_score, entry.score_updated_at, visited_at, 60.0);
             entry.last_direct_visit_time = max(entry.last_direct_visit_time, visited_at);
@@ -567,53 +567,6 @@ void HistoryStore::update_favicon(URL::URL const& url, String const& favicon_bas
         favicon_base64_png.bytes().size());
 
     m_storage->update_favicon(*normalized_url, favicon_base64_png);
-}
-
-void HistoryStore::record_closed_tab(URL::URL const& url, UnixDateTime closed_at)
-{
-    m_recently_closed_entries.empend(RecentlyClosedEntry {
-        .urls = { url },
-        .was_window = false,
-        .active_tab_index = 0,
-        .closed_time = closed_at,
-    });
-}
-
-void HistoryStore::record_closed_window(Vector<URL::URL> urls, size_t active_tab_index, UnixDateTime closed_at)
-{
-    if (urls.is_empty())
-        return;
-
-    m_recently_closed_entries.empend(RecentlyClosedEntry {
-        .urls = move(urls),
-        .was_window = true,
-        .active_tab_index = 0,
-        .closed_time = closed_at,
-    });
-
-    auto& entry = m_recently_closed_entries.last();
-    entry.active_tab_index = active_tab_index < entry.urls.size() ? active_tab_index : entry.urls.size() - 1;
-}
-
-bool HistoryStore::has_recently_closed_entries() const
-{
-    return !m_recently_closed_entries.is_empty();
-}
-
-Optional<RecentlyClosedEntry const&> HistoryStore::most_recently_closed_entry() const
-{
-    if (m_recently_closed_entries.is_empty())
-        return {};
-
-    return m_recently_closed_entries.last();
-}
-
-Optional<RecentlyClosedEntry> HistoryStore::pop_most_recently_closed_entry()
-{
-    if (m_recently_closed_entries.is_empty())
-        return {};
-
-    return m_recently_closed_entries.take_last();
 }
 
 Optional<HistoryEntry> HistoryStore::entry_for_url(URL::URL const& url)
@@ -775,9 +728,6 @@ void HistoryStore::remove_entries_accessed_since(UnixDateTime since)
         m_storage->name(),
         since.seconds_since_epoch());
     m_storage->remove_entries_accessed_since(since);
-    m_recently_closed_entries.remove_all_matching([&](auto const& entry) {
-        return entry.closed_time >= since;
-    });
 }
 
 void HistoryStore::TransientStorage::record_visit(String const& url, Optional<String> const& title, UnixDateTime visited_at, HistoryVisitTransition transition)
@@ -896,10 +846,10 @@ void HistoryStore::TransientStorage::record_omnibox_engagement(OmniboxEngagement
     });
     if (existing != m_omnibox_engagements.end()) {
         if (engagement.was_explicit) {
-            VERIFY(existing->explicit_use_count != NumericLimits<u64>::max());
+            VERIFY(existing->explicit_use_count != NumericLimits<i64>::max());
             ++existing->explicit_use_count;
         } else {
-            VERIFY(existing->default_use_count != NumericLimits<u64>::max());
+            VERIFY(existing->default_use_count != NumericLimits<i64>::max());
             ++existing->default_use_count;
         }
         existing->destination = move(destination);
@@ -1026,16 +976,20 @@ Optional<HistoryEntry> HistoryStore::PersistedStorage::entry_for_url(String cons
 
     m_database.execute_statement(
         m_statements.get_entry,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 0);
             auto favicon = m_database.result_column<String>(statement_id, 3);
+            auto visit_count = m_database.result_column<i64>(statement_id, 1);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 4);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entry = HistoryEntry {
                 .url = url,
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
                 .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 1),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 4),
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 2),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 5),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
@@ -1043,6 +997,7 @@ Optional<HistoryEntry> HistoryStore::PersistedStorage::entry_for_url(String cons
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 8),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 9),
             };
+            return {};
         },
         url);
 
@@ -1059,16 +1014,20 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::autocomplete_entries(String
 
     auto outcome = m_database.execute_interruptible_statement(
         m_statements.search_entries,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 1);
             auto favicon = m_database.result_column<String>(statement_id, 4);
+            auto visit_count = m_database.result_column<i64>(statement_id, 2);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 5);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entries.append(HistoryEntry {
                 .url = m_database.result_column<String>(statement_id, 0),
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
                 .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 2),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 5),
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 3),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 7),
@@ -1076,6 +1035,7 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::autocomplete_entries(String
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 9),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 10),
             });
+            return {};
         },
         url_query_string,
         url_contains_query_string,
@@ -1097,16 +1057,20 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::list_entries(StringView tit
 
     m_database.execute_statement(
         m_statements.list_entries,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto title = m_database.result_column<String>(statement_id, 1);
             auto favicon = m_database.result_column<String>(statement_id, 4);
+            auto visit_count = m_database.result_column<i64>(statement_id, 2);
+            auto direct_visit_count = m_database.result_column<i64>(statement_id, 5);
+            if (visit_count < 0 || direct_visit_count < 0)
+                return {};
 
             entries.append(HistoryEntry {
                 .url = m_database.result_column<String>(statement_id, 0),
                 .title = title.is_empty() ? Optional<String> {} : Optional<String> { move(title) },
                 .favicon_base64_png = favicon.is_empty() ? Optional<String> {} : Optional<String> { move(favicon) },
-                .visit_count = m_database.result_column<u64>(statement_id, 2),
-                .direct_visit_count = m_database.result_column<u64>(statement_id, 5),
+                .visit_count = visit_count,
+                .direct_visit_count = direct_visit_count,
                 .last_visited_time = m_database.result_column<UnixDateTime>(statement_id, 3),
                 .last_qualifying_visit_time = m_database.result_column<UnixDateTime>(statement_id, 6),
                 .last_direct_visit_time = m_database.result_column<UnixDateTime>(statement_id, 7),
@@ -1114,6 +1078,7 @@ Vector<HistoryEntry> HistoryStore::PersistedStorage::list_entries(StringView tit
                 .decayed_direct_score = m_database.result_column<double>(statement_id, 9),
                 .score_updated_at = m_database.result_column<UnixDateTime>(statement_id, 10),
             });
+            return {};
         },
         title_query_string,
         url_query_string,
@@ -1147,15 +1112,21 @@ Vector<StoredOmniboxEngagement> HistoryStore::PersistedStorage::omnibox_engageme
     Vector<StoredOmniboxEngagement> results;
     auto outcome = m_database.execute_interruptible_statement(
         m_statements.search_omnibox_engagements,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
+            auto explicit_use_count = m_database.result_column<i64>(statement_id, 3);
+            auto default_use_count = m_database.result_column<i64>(statement_id, 4);
+            if (explicit_use_count < 0 || default_use_count < 0)
+                return {};
+
             results.append({
                 .normalized_input = m_database.result_column<String>(statement_id, 0),
                 .destination_kind = static_cast<OmniboxDestinationKind>(m_database.result_column<u8>(statement_id, 1)),
                 .destination = m_database.result_column<String>(statement_id, 2),
-                .explicit_use_count = m_database.result_column<u64>(statement_id, 3),
-                .default_use_count = m_database.result_column<u64>(statement_id, 4),
+                .explicit_use_count = explicit_use_count,
+                .default_use_count = default_use_count,
                 .last_used_time = m_database.result_column<UnixDateTime>(statement_id, 5),
             });
+            return {};
         },
         MUST(String::from_utf8(normalized_url_input)),
         MUST(String::from_utf8(normalized_search_input)),
@@ -1178,10 +1149,11 @@ void HistoryStore::PersistedStorage::remove_entries_for_same_site(StringView sit
 
     m_database.execute_statement(
         m_statements.all_urls,
-        [&](auto statement_id) {
+        [&](auto statement_id) -> ErrorOr<void> {
             auto url = m_database.result_column<String>(statement_id, 0);
             if (history_entry_matches_site_key(url.bytes_as_string_view(), site_key))
                 urls_to_remove.append(move(url));
+            return {};
         });
 
     for (auto const& url : urls_to_remove)

@@ -24,21 +24,14 @@ struct WEBVIEW_API HistoryEntry {
     String url;
     Optional<String> title;
     Optional<String> favicon_base64_png;
-    u64 visit_count { 0 };
-    u64 direct_visit_count { 0 };
+    i64 visit_count { 0 };
+    i64 direct_visit_count { 0 };
     UnixDateTime last_visited_time;
     UnixDateTime last_qualifying_visit_time;
     UnixDateTime last_direct_visit_time;
     double decayed_visit_score { 0 };
     double decayed_direct_score { 0 };
     UnixDateTime score_updated_at;
-};
-
-struct WEBVIEW_API RecentlyClosedEntry {
-    Vector<URL::URL> urls;
-    bool was_window { false };
-    size_t active_tab_index { 0 };
-    UnixDateTime closed_time;
 };
 
 enum class RemoveHistoryEntryEngagements {
@@ -63,12 +56,6 @@ public:
     void record_visit(URL::URL const&, Optional<String> title = {}, UnixDateTime visited_at = UnixDateTime::now(), HistoryVisitTransition = HistoryVisitTransition::Link);
     void update_title(URL::URL const&, String const& title);
     void update_favicon(URL::URL const&, String const& favicon_base64_png);
-
-    void record_closed_tab(URL::URL const&, UnixDateTime closed_at = UnixDateTime::now());
-    void record_closed_window(Vector<URL::URL>, size_t active_tab_index, UnixDateTime closed_at = UnixDateTime::now());
-    bool has_recently_closed_entries() const;
-    Optional<RecentlyClosedEntry const&> most_recently_closed_entry() const;
-    Optional<RecentlyClosedEntry> pop_most_recently_closed_entry();
 
     Optional<HistoryEntry> entry_for_url(URL::URL const&);
     Vector<HistoryEntry> autocomplete_entries(StringView query, size_t limit = 8);
@@ -176,7 +163,6 @@ private:
     explicit HistoryStore(NonnullOwnPtr<StorageImpl>&&, bool is_disabled = false);
 
     NonnullOwnPtr<StorageImpl> m_storage;
-    Vector<RecentlyClosedEntry> m_recently_closed_entries;
     bool m_is_disabled { false };
 };
 

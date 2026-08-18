@@ -289,11 +289,6 @@ void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId 
     client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
 }
 
-void PageClient::page_did_commit_child_frame_navigation(Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
-{
-    client().async_did_commit_child_frame_navigation(m_id, frame_id, replicated_state);
-}
-
 void PageClient::page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
 {
     m_remote_child_frame_compositor_contexts.remove(frame_id);
@@ -501,11 +496,6 @@ void PageClient::page_did_update_editing_history_state(bool can_undo, bool can_r
     client().async_did_update_editing_history_state(m_id, can_undo, can_redo);
 }
 
-void PageClient::page_did_change_url(URL::URL const& url)
-{
-    client().async_did_change_url(m_id, url);
-}
-
 void PageClient::page_did_request_refresh()
 {
     client().async_did_request_refresh(m_id);
@@ -619,9 +609,6 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
     auto& realm = document.relevant_settings_object().realm();
 
     clear_pending_dom_mutations();
-
-    if (auto navigable = document.navigable())
-        client().async_did_change_top_level_active_document(m_id, navigable->replicated_state());
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
@@ -1236,6 +1223,26 @@ String PageClient::page_did_request_ui_process_session_history_for_testing()
 String PageClient::dump_site_isolation_process_tree_for_testing()
 {
     return client().did_request_site_isolation_process_tree_for_testing(m_id);
+}
+
+bool PageClient::page_did_request_capture_session_history_snapshot_for_testing()
+{
+    return client().did_request_capture_session_history_snapshot_for_testing(m_id);
+}
+
+bool PageClient::page_did_request_restore_session_history_snapshot_for_testing()
+{
+    return client().did_request_restore_session_history_snapshot_for_testing(m_id);
+}
+
+bool PageClient::page_did_request_register_session_store_tab_for_testing()
+{
+    return client().did_request_register_session_store_tab_for_testing(m_id);
+}
+
+String PageClient::page_did_request_session_store_tab_state_for_testing()
+{
+    return client().did_request_session_store_tab_state_for_testing(m_id);
 }
 
 void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)

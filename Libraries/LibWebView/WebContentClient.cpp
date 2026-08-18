@@ -553,34 +553,6 @@ void WebContentClient::did_update_child_frame_viewport(u64 page_id, Web::HTML::C
         child_frame->set_viewport(viewport_rect, device_pixel_ratio);
 }
 
-void WebContentClient::did_commit_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
-{
-    auto child_frame = this->child_frame(page_id, frame_id);
-    if (!child_frame.has_value())
-        return;
-
-    if (child_frame->has_remote_host())
-        SiteIsolationManager::the().transition_child_frame_to_local(*child_frame);
-
-    child_frame->did_commit_navigation(move(replicated_state));
-}
-
-void WebContentClient::did_change_top_level_active_document(u64 page_id, Web::HTML::ReplicatedNavigableState replicated_state)
-{
-    auto* navigable = navigable_for_page(page_id);
-    if (!navigable)
-        return;
-
-    auto active_document_url = replicated_state.active_document_url;
-    navigable->did_commit_navigation(move(replicated_state));
-
-    if (auto view = owning_view_for_page_id(page_id); view.has_value()) {
-        if (!Web::HTML::url_matches_about_blank(active_document_url) || !view->m_client_state.site_url.has_value())
-            view->m_client_state.site_url = move(active_document_url);
-        view->m_external_url_request_policy.clear_page_request_allowance();
-    }
-}
-
 void WebContentClient::did_destroy_child_frame(u64 page_id, Web::HTML::CrossProcessId frame_id)
 {
     if (auto child_frame = this->child_frame(page_id, frame_id); child_frame.has_value())
@@ -873,14 +845,6 @@ void WebContentClient::did_change_title(u64 page_id, Utf16String title)
 
         view->set_title({}, title);
     }
-}
-
-void WebContentClient::did_change_url(u64 page_id, URL::URL url)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value())
-        view->set_url({}, url);
-    else if (auto* child_frame = embedded_page_host(page_id))
-        child_frame->reporting_client().async_run_iframe_load_event_steps(child_frame->reporting_page_id(), child_frame->id());
 }
 
 void WebContentClient::did_request_tooltip_override(u64 page_id, Gfx::IntPoint position, ByteString title)
@@ -1918,16 +1882,48 @@ void WebContentClient::changing_navigable_history_job_ready(u64 page_id, u64 ope
         view->did_receive_changing_navigable_history_job_ready({}, *this, page_id, operation_id, navigable_id, disposition);
 }
 
-void WebContentClient::changing_navigable_continuation_applied(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state)
+void WebContentClient::changing_navigable_continuation_applied(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_receive_changing_navigable_continuation_applied({}, *this, page_id, operation_id, navigable_id, move(previous_entry_persisted_state));
+        view->did_receive_changing_navigable_continuation_applied({}, *this, page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
 }
 
 void WebContentClient::nonchanging_navigable_history_state_updated(u64 page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
         view->did_receive_nonchanging_navigable_history_state_updated({}, *this, page_id, operation_id, navigable_id);
+}
+
+Messages::WebContentClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse WebContentClient::did_request_capture_session_history_snapshot_for_testing(u64 page_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        return { view->capture_session_history_snapshot_for_testing({}) };
+
+    return { false };
+}
+
+Messages::WebContentClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse WebContentClient::did_request_restore_session_history_snapshot_for_testing(u64 page_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        return { view->restore_captured_session_history_snapshot_for_testing({}) };
+
+    return { false };
+}
+
+Messages::WebContentClient::DidRequestRegisterSessionStoreTabForTestingResponse WebContentClient::did_request_register_session_store_tab_for_testing(u64 page_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        return { view->register_session_store_tab_for_testing({}) };
+
+    return { false };
+}
+
+Messages::WebContentClient::DidRequestSessionStoreTabStateForTestingResponse WebContentClient::did_request_session_store_tab_state_for_testing(u64 page_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        return { view->session_store_tab_state_for_testing({}) };
+
+    return { "{}"_string };
 }
 
 void WebContentClient::did_present_backing_stores(u64 page_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)

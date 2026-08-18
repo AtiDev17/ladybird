@@ -86,6 +86,10 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
         this->m_crash_count = 0;
     });
 
+    m_top_level_traversable.on_session_history_changed = [this] {
+        notify_session_history_changed();
+    };
+
     on_request_file = [this](auto const& path, auto request_id) {
         auto file = Core::File::open(path, Core::File::OpenMode::Read);
 
@@ -2214,6 +2218,109 @@ void ViewImplementation::reconstruct_current_session_history_entry_with_history_
     dump_session_history(reason);
 }
 
+Optional<SessionHistorySnapshot> ViewImplementation::session_history_snapshot() const
+{
+    auto const& session_history = m_top_level_traversable.session_history();
+
+    auto current_used_step_index = session_history.current_used_step_index();
+    if (!current_used_step_index.has_value())
+        return {};
+
+    return SessionHistorySnapshot {
+        .entries = session_history.entries(),
+        .used_steps = session_history.used_steps(),
+        .current_used_step_index = *current_used_step_index,
+    };
+}
+
+ErrorOr<void> ViewImplementation::restore_session_history_from_snapshot(SessionHistorySnapshot snapshot)
+{
+    TRY(m_top_level_traversable.restore_session_history_from_ui_snapshot(move(snapshot)));
+
+    reconstruct_current_session_history_entry_with_history_operation("restored-session-history-from-ui-snapshot"sv);
+    update_navigation_action_state();
+    return {};
+}
+
+bool ViewImplementation::capture_session_history_snapshot_for_testing(Badge<WebContentClient>)
+{
+    m_captured_session_history_snapshot_for_testing = session_history_snapshot();
+    return m_captured_session_history_snapshot_for_testing.has_value();
+}
+
+bool ViewImplementation::restore_captured_session_history_snapshot_for_testing(Badge<WebContentClient>)
+{
+    if (!m_captured_session_history_snapshot_for_testing.has_value())
+        return false;
+
+    auto result = restore_session_history_from_snapshot(m_captured_session_history_snapshot_for_testing.release_value());
+    return !result.is_error();
+}
+
+bool ViewImplementation::register_session_store_tab_for_testing(Badge<WebContentClient>)
+{
+    if (m_session_tab_id.has_value())
+        return true;
+
+    auto tab_id = Application::session_store(is_private()).tab_opened({ .window_id = {}, .initial_url = m_url, .insertion_index = {}, .is_active = SessionStore::IsActive::No });
+    if (tab_id.is_error())
+        return false;
+    set_session_tab_id(tab_id.value());
+    notify_session_history_changed();
+    return true;
+}
+
+static Optional<size_t> current_top_level_history_entry_index_for_step(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Optional<i32> current_step)
+{
+    if (!current_step.has_value())
+        return {};
+
+    Optional<size_t> current_entry_index;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i].step > *current_step)
+            break;
+        current_entry_index = i;
+    }
+    return current_entry_index;
+}
+
+String ViewImplementation::session_store_tab_state_for_testing(Badge<WebContentClient>) const
+{
+    JsonObject serialized;
+    if (!m_session_tab_id.has_value())
+        return serialized.serialized();
+
+    auto cached_state = Application::session_store(is_private()).cached_tab_state_for_testing(*m_session_tab_id);
+    if (!cached_state.has_value())
+        return serialized.serialized();
+
+    serialized.set("url"sv, cached_state->url.serialize());
+    if (cached_state->history.has_value()) {
+        auto const& history = *cached_state->history;
+        Optional<i32> current_step;
+        if (history.current_used_step_index < history.used_steps.size())
+            current_step = history.used_steps[history.current_used_step_index];
+        serialized.set("entries"sv, history_json_entries(history.entries, current_top_level_history_entry_index_for_step(history.entries, current_step)));
+        serialized.set("usedSteps"sv, history_json_steps(history.used_steps, history.current_used_step_index));
+    }
+    return serialized.serialized();
+}
+
+void ViewImplementation::notify_session_history_changed()
+{
+    if (!m_session_tab_id.has_value())
+        return;
+    auto url = m_url;
+    if (auto const* current_entry = m_top_level_traversable.session_history().current_entry())
+        url = current_entry->url;
+    SessionStore::TabStateUpdate update {
+        .tab_id = *m_session_tab_id,
+        .history = session_history_snapshot(),
+        .url = move(url),
+    };
+    Application::session_store(is_private()).update_tab_state(move(update));
+}
+
 NonnullRefPtr<Core::Promise<Empty>> ViewImplementation::reset_session_history_for_testing()
 {
     m_pending_session_history_reset_for_testing = Core::Promise<Empty>::construct();
@@ -2324,9 +2431,9 @@ void ViewImplementation::did_receive_changing_navigable_history_job_ready(Badge<
     m_top_level_traversable.did_receive_changing_navigable_history_job_ready(source_client, source_page_id, operation_id, navigable_id, disposition);
 }
 
-void ViewImplementation::did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, WebContentClient& source_client, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state)
+void ViewImplementation::did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, WebContentClient& source_client, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state)
 {
-    m_top_level_traversable.did_receive_changing_navigable_continuation_applied(source_client, source_page_id, operation_id, navigable_id, move(previous_entry_persisted_state));
+    m_top_level_traversable.did_receive_changing_navigable_continuation_applied(source_client, source_page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
 }
 
 void ViewImplementation::did_receive_nonchanging_navigable_history_state_updated(Badge<WebContentClient>, WebContentClient& source_client, u64 source_page_id, u64 operation_id, Web::HTML::CrossProcessId navigable_id)
