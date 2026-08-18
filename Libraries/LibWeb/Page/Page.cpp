@@ -794,6 +794,13 @@ void Page::for_each_media_element(Callback&& callback)
     }
 }
 
+void Page::sync_media_element_video_sink_ticking()
+{
+    for_each_media_element([&](auto& media_element) {
+        media_element.sync_video_sink_ticking();
+    });
+}
+
 void Page::restore_all_media_element_video_sinks()
 {
     for_each_media_element([&](auto& media_element) {
@@ -804,7 +811,7 @@ void Page::restore_all_media_element_video_sinks()
 void Page::detach_all_media_element_video_sinks_after_compositor_lost()
 {
     for_each_media_element([&](auto& media_element) {
-        media_element.detach_video_sink_after_compositor_lost();
+        media_element.detach_video_sink_edge();
     });
 }
 

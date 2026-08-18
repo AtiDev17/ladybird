@@ -25,7 +25,7 @@ void VideoPresentationServerConnection::die()
 {
     revoke_weak_refs();
     for (auto& entry : m_edge_states)
-        PlaybackManager::release_video_edge(entry.value.handle);
+        PlaybackManager::release_video_edge(entry.value.handle, *entry.value.pump);
     m_edge_states.clear();
 }
 
@@ -97,8 +97,9 @@ void VideoPresentationServerConnection::release_video_edge(u64 edge_id)
     if (it == m_edge_states.end())
         return;
     auto handle = it->value.handle;
+    auto pump = it->value.pump;
     m_edge_states.remove(it);
-    PlaybackManager::release_video_edge(handle);
+    PlaybackManager::release_video_edge(handle, *pump);
 }
 
 void VideoPresentationServerConnection::request_start(u64 edge_id)
@@ -141,14 +142,6 @@ void VideoPresentationServerConnection::notify_sink_resize(u64 edge_id, u32 widt
     if (it == m_edge_states.end())
         return;
     it->value.pump->report_remote_resize(Gfx::Size<u32> { width, height });
-}
-
-void VideoPresentationServerConnection::set_sink_ticking(u64 edge_id, bool ticking)
-{
-    auto it = m_edge_states.find(edge_id);
-    if (it == m_edge_states.end())
-        return;
-    PlaybackManager::set_video_sink_ticking(it->value.handle, ticking);
 }
 
 }
