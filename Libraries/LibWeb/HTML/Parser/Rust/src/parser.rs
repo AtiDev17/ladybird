@@ -547,9 +547,14 @@ impl TreeBuilder {
         // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the C++
         // HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
         unsafe {
-            self.tokenizer
-                .as_mut()
-                .next_token(stop_at_insertion_point, cdata_allowed)
+            let tokenizer = self.tokenizer.as_mut();
+            if !stop_at_insertion_point && let Some((code_point, position)) = tokenizer.try_fast_data_char() {
+                let mut token = Token::new_character(code_point);
+                token.start_position = position;
+                token.end_position = position;
+                return Some(token);
+            }
+            tokenizer.next_token(stop_at_insertion_point, cdata_allowed)
         }
     }
 
@@ -561,6 +566,33 @@ impl TreeBuilder {
 
     fn run(&mut self, stop_at_insertion_point: bool) {
         loop {
+            if !stop_at_insertion_point
+                && !self.next_line_feed_can_be_ignored
+                && self.insertion_mode == InsertionMode::InBody
+                && self
+                    .adjusted_current_node()
+                    .is_some_and(|node| node.namespace_ == RustFfiHtmlNamespace::Html)
+            {
+                // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the
+                // C++ HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+                let has_fast_data_run = unsafe { self.tokenizer.as_ref().has_fast_data_run() };
+                if has_fast_data_run {
+                    self.reconstruct_the_active_formatting_elements();
+                    // SAFETY: See above. Reconstructing the active formatting elements does not
+                    // run the tokenizer, so the same Data-state run is still available.
+                    let contains_non_whitespace = unsafe {
+                        self.tokenizer
+                            .as_mut()
+                            .try_fast_data_run(&mut self.pending_text)
+                            .unwrap()
+                    };
+                    if contains_non_whitespace {
+                        self.frameset_ok = false;
+                    }
+                    continue;
+                }
+            }
+
             let cdata_allowed = self
                 .adjusted_current_node()
                 .is_some_and(|node| node.namespace_ != RustFfiHtmlNamespace::Html);
@@ -3047,7 +3079,6 @@ impl TreeBuilder {
     fn insert_html_element_for_document(&mut self, token: &Token, document: usize) -> usize {
         self.flush_character_insertions();
         let attributes = attributes_from_token(token, RustFfiHtmlNamespace::Html);
-        let owned_attributes = owned_attributes_from_token(token, RustFfiHtmlNamespace::Html);
         let local_name = token.tag_name();
         let element = self.create_element(
             document,
@@ -3064,7 +3095,7 @@ impl TreeBuilder {
             local_name: local_name.to_string(),
             namespace_: RustFfiHtmlNamespace::Html,
             namespace_uri: None,
-            attributes: owned_attributes,
+            attributes: Vec::new(),
             template_content: None,
         });
         element
@@ -3089,7 +3120,11 @@ impl TreeBuilder {
         let adjusted_insertion_location = self.appropriate_place_for_inserting_node(None);
         let local_name = adjusted_foreign_tag_name(token.tag_name(), namespace_);
         let attributes = attributes_from_token(token, namespace_);
-        let owned_attributes = owned_attributes_from_token(token, namespace_);
+        let owned_attributes = if namespace_ == RustFfiHtmlNamespace::MathMl && local_name == "annotation-xml" {
+            owned_attributes_from_token(token, namespace_)
+        } else {
+            Vec::new()
+        };
         let namespace_uri = if namespace_ == RustFfiHtmlNamespace::Other {
             self.adjusted_current_node()
                 .and_then(|node| node.namespace_uri.as_ref())
