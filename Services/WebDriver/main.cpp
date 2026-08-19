@@ -42,9 +42,9 @@ static Vector<ByteString> create_arguments(ByteString const& webdriver_endpoint,
 {
     Vector<ByteString> arguments;
 #if defined(AK_OS_MACOS)
-    arguments.append("--webdriver-mach-server-name"sv);
+    arguments.append("--webdriver-browser-mach-server-name"sv);
 #else
-    arguments.append("--webdriver-content-path"sv);
+    arguments.append("--webdriver-browser-path"sv);
 #endif
     arguments.append(webdriver_endpoint);
 

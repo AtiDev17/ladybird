@@ -202,14 +202,6 @@ void PageClient::set_has_focus(bool has_focus)
 void PageClient::set_window_handle(Utf16String window_handle)
 {
     page().top_level_traversable()->set_window_handle(move(window_handle));
-
-    if (m_webdriver)
-        m_webdriver->page_did_set_window_handle({}, page().top_level_traversable()->window_handle().to_utf8());
-}
-
-void PageClient::did_start_webdriver_navigation()
-{
-    client().async_did_start_webdriver_navigation(m_id);
 }
 
 void PageClient::setup_palette()
@@ -252,26 +244,7 @@ Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL co
 
 void PageClient::request_new_process_for_navigation(URL::URL const& url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> const& source_snapshot)
 {
-    notify_webdriver_of_window_replacement();
-
     client().async_did_request_new_process_for_navigation(m_id, url, move(document_resource), history_handling, source_snapshot);
-}
-
-void PageClient::notify_webdriver_of_window_replacement()
-{
-    if (m_webdriver) {
-        m_webdriver->page_did_start_window_replacement({}, page().top_level_traversable()->window_handle().to_utf8());
-
-        auto pending_history_traversals = move(m_pending_webdriver_history_traversal_requests);
-        for (auto& request : pending_history_traversals)
-            request.value({ .accepted = true });
-    }
-}
-
-void PageClient::close_webdriver_connection_after_sending_pending_messages()
-{
-    if (m_webdriver)
-        m_webdriver->transport().close_after_sending_all_pending_messages();
 }
 
 void PageClient::request_new_process_for_child_frame_navigation(Web::HTML::CrossProcessId frame_id, URL::URL const& url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> const& source_snapshot)
@@ -584,17 +557,11 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 
 void PageClient::page_did_start_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url, bool is_redirect)
 {
-    if (m_webdriver)
-        m_webdriver->page_did_start_loading({}, url);
-
     client().async_did_start_loading(m_id, navigation_id, url, is_redirect);
 }
 
-void PageClient::page_did_cancel_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url)
+void PageClient::page_did_cancel_loading(Optional<Utf16String> const& navigation_id, URL::URL const&)
 {
-    if (m_webdriver)
-        m_webdriver->page_did_cancel_loading({}, url);
-
     client().async_did_cancel_loading(m_id, navigation_id);
 }
 
@@ -699,22 +666,6 @@ void PageClient::cancel_download(u64 download_id)
 
     if (reader.has_value())
         Web::Fetch::Infrastructure::cancel_incremental_read(*reader.value());
-}
-
-void PageClient::wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)> on_complete)
-{
-    auto request_id = m_next_webdriver_navigation_completion_request_id++;
-    m_pending_webdriver_navigation_completion_requests.set(request_id, move(on_complete));
-    client().async_did_request_webdriver_navigation_completion(m_id, request_id, page_load_timeout);
-}
-
-void PageClient::did_complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response response)
-{
-    auto maybe_callback = m_pending_webdriver_navigation_completion_requests.take(request_id);
-    if (!maybe_callback.has_value())
-        return;
-
-    maybe_callback.value()(move(response));
 }
 
 void PageClient::page_did_finish_test(Utf16String const& text)
@@ -1164,9 +1115,6 @@ void PageClient::page_did_close_top_level_traversable()
 {
     page().top_level_traversable()->compositor_context().stop_presenting_to_client();
 
-    if (m_webdriver)
-        m_webdriver->page_did_close_window({}, page().top_level_traversable()->window_handle().to_utf8());
-
     // FIXME: Rename this IPC call
     client().async_did_close_browsing_context(m_id);
 
@@ -1245,37 +1193,15 @@ String PageClient::page_did_request_session_store_tab_state_for_testing()
     return client().did_request_session_store_tab_state_for_testing(m_id);
 }
 
-void PageClient::request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)> on_complete)
+void PageClient::run_webdriver_user_prompt_handling(u64 request_id)
 {
-    auto request_id = m_next_webdriver_history_traversal_request_id++;
-    m_pending_webdriver_history_traversal_requests.set(request_id, move(on_complete));
-    client().async_did_request_webdriver_history_traversal(m_id, request_id, delta);
-}
-
-void PageClient::did_complete_webdriver_history_traversal(u64 request_id, bool accepted)
-{
-    auto maybe_callback = m_pending_webdriver_history_traversal_requests.take(request_id);
-    if (!maybe_callback.has_value())
-        return;
-
-    maybe_callback.value()(WebDriverHistoryTraversalResult {
-        .accepted = accepted,
-    });
-}
-
-Web::WebDriver::Response PageClient::request_webdriver_load_url_from_ui(URL::URL const& url)
-{
-    return client().did_request_webdriver_load_url_from_ui(m_id, url);
-}
-
-Web::WebDriver::Response PageClient::request_webdriver_traverse_history_from_ui(int delta)
-{
-    return client().did_request_webdriver_traverse_history_from_ui(m_id, delta);
-}
-
-Web::WebDriver::Response PageClient::request_webdriver_session_history()
-{
-    return client().did_request_webdriver_session_history(m_id);
+    Web::WebDriver::handle_any_user_prompts(page(),
+        GC::create_function(heap(), [this, request_id](Optional<Web::WebDriver::Error> error) {
+            auto response = error.has_value()
+                ? Web::WebDriver::Response { error.release_value() }
+                : Web::WebDriver::Response { JsonValue {} };
+            client().async_webdriver_user_prompt_handling_complete(m_id, request_id, move(response));
+        }));
 }
 
 void PageClient::request_file(Web::FileRequest file_request)
@@ -1432,12 +1358,27 @@ void PageClient::page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot
     client().async_did_take_screenshot(m_id, screenshot);
 }
 
-ErrorOr<void> PageClient::connect_to_webdriver(ByteString const& webdriver_endpoint)
+WebDriverConnection& PageClient::ensure_webdriver_session()
 {
-    VERIFY(!m_webdriver);
-    m_webdriver = TRY(WebDriverConnection::connect(*this, webdriver_endpoint));
+    if (!m_webdriver)
+        m_webdriver = WebDriverConnection::create(*this);
+    return *m_webdriver;
+}
 
-    return {};
+void PageClient::run_webdriver_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments)
+{
+    ensure_webdriver_session().run_command(command_id, name, move(payload), move(arguments));
+}
+
+void PageClient::webdriver_command_complete(u64 command_id, Web::WebDriver::Response response)
+{
+    client().async_webdriver_command_complete(m_id, command_id, move(response));
+}
+
+void PageClient::set_webdriver_session_config(Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue const& timeouts)
+{
+    Web::WebDriver::set_user_prompt_handler(move(user_prompt_handler));
+    ensure_webdriver_session().set_session_config(page_load_strategy, strict_file_interactability, timeouts);
 }
 
 ErrorOr<void> PageClient::connect_to_web_ui(IPC::TransportHandle handle)

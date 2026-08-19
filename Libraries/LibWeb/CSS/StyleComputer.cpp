@@ -6232,6 +6232,13 @@ static NonnullRefPtr<StyleValue const> compute_style_value_list(NonnullRefPtr<St
     return StyleValueList::create(move(computed_entries), StyleValueList::Separator::Comma);
 }
 
+static NonnullRefPtr<StyleValue const> compute_svg_number_as_length(NonnullRefPtr<StyleValue const> const& style_value)
+{
+    if (!style_value->is_number())
+        return style_value;
+    return LengthStyleValue::create(Length::make_px(style_value->as_number().number()));
+}
+
 // https://drafts.csswg.org/css-contain-2/#contain-property
 static NonnullRefPtr<StyleValue const> collapse_containment_list(NonnullRefPtr<StyleValue const> const& style_value)
 {
@@ -6318,6 +6325,11 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
     case PropertyID::BorderTopWidth:
     case PropertyID::OutlineWidth:
         return compute_border_or_outline_width(absolutized_value, device_pixels_per_css_pixel);
+    case PropertyID::BorderSpacing: {
+        if (absolutized_value->is_value_list())
+            return absolutized_value;
+        return StyleValueList::create(StyleValueVector { absolutized_value, absolutized_value }, StyleValueList::Separator::Space);
+    }
     case PropertyID::Contain:
         return collapse_containment_list(absolutized_value);
     case PropertyID::CornerBottomLeftShape:
@@ -6355,6 +6367,20 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
         return compute_line_height(absolutized_value, computation_context.length_resolution_context.font_metrics.font_size);
     case PropertyID::MathDepth:
         return compute_math_depth(absolutized_value, inheritance_parent());
+    case PropertyID::StrokeDasharray:
+        // https://svgwg.org/svg2-draft/painting.html#StrokeDasharrayProperty
+        // as comma separated list of absolute lengths or percentages, numbers converted to
+        // absolute lengths first, or keyword specified
+        if (!absolutized_value->is_value_list())
+            return absolutized_value;
+        return compute_style_value_list(absolutized_value, [](NonnullRefPtr<StyleValue const> const& dash) {
+            return compute_svg_number_as_length(dash);
+        });
+    case PropertyID::StrokeDashoffset:
+    case PropertyID::StrokeWidth:
+        // https://svgwg.org/svg2-draft/painting.html#StrokeWidth
+        // an absolute length or percentage, numbers converted to absolute lengths first
+        return compute_svg_number_as_length(absolutized_value);
     case PropertyID::TransformOrigin:
         return compute_transform_origin(absolutized_value);
     default:

@@ -45,6 +45,7 @@
 #include <LibWebView/Profile.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageJar.h>
+#include <LibWebView/WebDriverSessionConfig.h>
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/TransportBootstrapMach.h>
@@ -154,6 +155,13 @@ public:
 
     void maybe_close_private_browsing_session();
     void reset_private_browsing_session();
+
+    void notify_webdriver_window_created(String const& handle);
+    void notify_webdriver_window_closed(String const& handle);
+    void webdriver_browser_connection_died(Badge<WebDriverBrowserConnection>);
+    void push_webdriver_session_config(ViewImplementation&);
+    void update_webdriver_session_config(Badge<WebDriverBrowserConnection>, Function<void(WebDriverSessionConfig&)> update);
+    void complete_webdriver_content_command(u64 command_id, Web::WebDriver::Response);
 
     Web::Compositor::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
@@ -341,6 +349,8 @@ private:
     void initialize_actions();
     void update_vertical_tabs_action();
 
+    WebDriverBrowserConnection* webdriver_browser_connection();
+
     struct MenuData {
         Menu& menu;
         ReadonlySpan<BookmarkItem> items;
@@ -442,6 +452,10 @@ private:
     RequestServerOptions m_request_server_options;
     WebContentOptions m_web_content_options;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
+
+    RefPtr<WebDriverBrowserConnection> m_webdriver_browser_connection;
+    bool m_webdriver_browser_connection_failed { false };
+    WebDriverSessionConfig m_webdriver_session_config;
 
     RefPtr<Requests::RequestClient> m_request_server_client;
     RefPtr<Requests::RequestClient> m_private_request_server_client;

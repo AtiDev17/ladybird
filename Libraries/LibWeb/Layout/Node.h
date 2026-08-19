@@ -637,7 +637,7 @@ public:
             m_mask_layers = style_group<CSS::ComputedValues::MaskValues>().mask_layers_value();
         return *m_mask_layers;
     }
-    RefPtr<CSS::AbstractImageStyleValue const> mask_image() const { return mask_layers().first().background_image; }
+    RefPtr<CSS::AbstractImageStyleValue const> mask_image() const { return style_group<CSS::ComputedValues::MaskValues>().mask_image_value(); }
     CSS::ListStyleType const& list_style_type() const
     {
         if (!m_list_style_type.has_value()) {
@@ -669,6 +669,7 @@ public:
             m_border_image = style_group<CSS::ComputedValues::BorderValues>().border_image_value();
         return *m_border_image;
     }
+    RefPtr<CSS::AbstractImageStyleValue const> border_image_source() const { return style_group<CSS::ComputedValues::BorderValues>().border_image_source_value(); }
     bool has_noninitial_border_radii() const { return style_group<CSS::ComputedValues::BorderValues>().has_noninitial_border_radii_value(); }
     CSS::BorderRadiusData border_bottom_left_radius() const { return style_group<CSS::ComputedValues::BorderValues>().border_bottom_left_radius_value(); }
     CSS::BorderRadiusData border_bottom_right_radius() const { return style_group<CSS::ComputedValues::BorderValues>().border_bottom_right_radius_value(); }

@@ -177,7 +177,6 @@ Optional<PageClient const&> ConnectionFromClient::page(u64 index, SourceLocation
 
 void ConnectionFromClient::close_server()
 {
-    m_page_host->close_webdriver_connections_after_sending_pending_messages();
     shutdown();
 }
 
@@ -196,31 +195,22 @@ void ConnectionFromClient::set_window_handle(u64 page_id, String handle)
     }
 }
 
-void ConnectionFromClient::connect_to_webdriver(u64 page_id, ByteString webdriver_endpoint)
-{
-    if (auto page = this->page(page_id); page.has_value()) {
-        // FIXME: Propagate this error back to the browser.
-        if (auto result = page->connect_to_webdriver(webdriver_endpoint); result.is_error())
-            dbgln("Unable to connect to the WebDriver process: {}", result.error());
-    }
-}
-
-void ConnectionFromClient::notify_webdriver_of_window_replacement(u64 page_id)
+void ConnectionFromClient::run_webdriver_command(u64 page_id, u64 command_id, String name, JsonValue payload, Vector<String> arguments)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->notify_webdriver_of_window_replacement();
+        page->run_webdriver_command(command_id, name, move(payload), move(arguments));
 }
 
-void ConnectionFromClient::complete_webdriver_navigation_completion(u64 page_id, u64 request_id, Web::WebDriver::Response response)
+void ConnectionFromClient::set_webdriver_session_config(u64 page_id, Web::WebDriver::UserPromptHandler user_prompt_handler, Web::WebDriver::PageLoadStrategy page_load_strategy, bool strict_file_interactability, JsonValue timeouts)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->did_complete_webdriver_navigation_completion(request_id, move(response));
+        page->set_webdriver_session_config(move(user_prompt_handler), page_load_strategy, strict_file_interactability, timeouts);
 }
 
-void ConnectionFromClient::complete_webdriver_history_traversal(u64 page_id, u64 request_id, bool accepted)
+void ConnectionFromClient::run_webdriver_user_prompt_handling(u64 page_id, u64 request_id)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->did_complete_webdriver_history_traversal(request_id, accepted);
+        page->run_webdriver_user_prompt_handling(request_id);
 }
 
 void ConnectionFromClient::connect_to_web_ui(u64 page_id, IPC::TransportHandle handle)

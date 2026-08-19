@@ -10,6 +10,7 @@
 #include <AK/Forward.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/JsonValue.h>
@@ -65,6 +66,7 @@
 #include <LibWebView/Settings.h>
 #include <LibWebView/StorageSetResult.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebDriverSessionConfig.h>
 
 namespace WebView {
 
@@ -125,7 +127,12 @@ public:
     void reload();
     void stop_loading();
     bool is_loading() const { return m_is_loading; }
-    bool has_uncommitted_top_level_navigation() const { return m_uncommitted_top_level_navigation.has_value(); }
+    bool has_uncommitted_top_level_navigation() const
+    {
+        return m_ongoing_top_level_navigation.has_value()
+            && m_ongoing_top_level_navigation->load.has_value()
+            && m_ongoing_top_level_navigation->load->is_uncommitted;
+    }
     bool cancel_uncommitted_top_level_navigation_for_browser_traversal();
 
     struct SessionHistoryTraversalMenuItem {
@@ -313,10 +320,18 @@ public:
     bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentClient>);
     bool register_session_store_tab_for_testing(Badge<WebContentClient>);
     String session_store_tab_state_for_testing(Badge<WebContentClient>) const;
-    void did_start_webdriver_navigation(Badge<WebContentClient>);
+    void did_start_webdriver_navigation();
+    void load_for_webdriver_navigation(URL::URL const&);
     String ui_process_session_history_for_testing(Badge<WebContentClient>) const;
     JsonValue webdriver_session_history() const;
-    void wait_for_webdriver_navigation_completion(Badge<WebContentClient>, Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
+    void wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
+    void apply_webdriver_session_config(WebDriverSessionConfig const&);
+    void run_webdriver_content_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments);
+    void did_complete_webdriver_content_command(Badge<WebContentClient>, u64 command_id, Web::WebDriver::Response);
+    void did_close_browsing_context(Badge<WebContentClient>);
+    void run_webdriver_user_prompt_handling(Function<void(Web::WebDriver::Response)> on_complete);
+    void did_complete_webdriver_user_prompt_handling(Badge<WebContentClient>, u64 request_id, Web::WebDriver::Response);
+    static Optional<ViewImplementation&> find_view_by_handle(StringView);
     void did_change_needs_beforeunload_check(Badge<WebContentClient>, bool needs_beforeunload_check);
     void did_change_background_color(Badge<WebContentClient>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
@@ -478,9 +493,14 @@ protected:
     u64 page_id() const;
 
     void set_url(URL::URL);
-    void did_start_navigation(URL::URL const&, bool is_redirect, bool has_navigation_id);
-    bool did_cancel_navigation();
+    void did_start_navigation(Optional<Utf16String> navigation_id, URL::URL const&, bool is_redirect);
+    bool did_cancel_navigation(Optional<Utf16String> const& navigation_id);
     void did_finish_navigation(URL::URL const&);
+    bool matches_ongoing_navigation(Optional<Utf16String> const& navigation_id) const;
+    struct OngoingTopLevelNavigation;
+    OngoingTopLevelNavigation& ensure_ongoing_top_level_navigation();
+    void clear_ongoing_top_level_navigation_load();
+    void clear_ongoing_navigation_webdriver_observation();
     void set_loading_state(bool);
     void complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     enum class WebDriverNavigationCompletionSource : u8 {
@@ -667,21 +687,37 @@ protected:
     bool m_can_undo { false };
     bool m_can_redo { false };
     bool m_is_loading { false };
-    bool m_is_waiting_for_navigation_start { false };
-    Optional<Utf16String> m_loading_navigation_id;
-    Optional<URL::URL> m_loading_url;
-    Optional<URL::URL> m_last_stopped_load_url;
-    enum class UncommittedTopLevelNavigation {
-        CurrentProcess,
-        ReplacementProcess,
+    struct OngoingTopLevelNavigation {
+        struct Load {
+            Optional<Utf16String> navigation_id;
+            Optional<URL::URL> url;
+            bool has_started { false };
+            bool uses_replacement_process { false };
+            bool is_uncommitted { false };
+        };
+        Optional<Load> load;
+
+        Optional<WebDriverNavigationCompletionSource> webdriver_completion_source;
+        u64 webdriver_navigation_id { 0 };
+        Optional<u64> history_operation_id;
+        Optional<URL::URL> expected_url;
+        bool history_operation_completed { false };
+        bool load_completed { false };
     };
-    Optional<UncommittedTopLevelNavigation> m_uncommitted_top_level_navigation;
+    Optional<OngoingTopLevelNavigation> m_ongoing_top_level_navigation;
+    u64 m_next_webdriver_navigation_id { 1 };
+    Optional<URL::URL> m_last_stopped_load_url;
 
     size_t m_crash_count = 0;
     RefPtr<Core::Timer> m_repeated_crash_timer;
 
     RefPtr<Core::Promise<LexicalPath>> m_pending_screenshot;
     RefPtr<Core::Promise<String>> m_pending_info_request;
+
+    u64 m_next_webdriver_user_prompt_request_id { 0 };
+    HashMap<u64, Function<void(Web::WebDriver::Response)>> m_pending_webdriver_user_prompt_requests;
+    HashTable<u64> m_pending_webdriver_command_ids;
+    HashTable<u64> m_pending_webdriver_crash_command_ids;
 
     Web::HTML::AudioPlayState m_audio_play_state { Web::HTML::AudioPlayState::Paused };
     size_t m_number_of_elements_playing_audio { 0 };
@@ -692,16 +728,6 @@ protected:
     CanonicalTraversable m_top_level_traversable;
     Optional<SessionTabId> m_session_tab_id;
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
-    struct PendingWebDriverNavigation {
-        u64 id { 0 };
-        WebDriverNavigationCompletionSource completion_source { WebDriverNavigationCompletionSource::Load };
-        Optional<u64> history_operation_id;
-        Optional<URL::URL> expected_url;
-        bool history_operation_completed { false };
-        bool load_completed { false };
-    };
-    u64 m_next_webdriver_navigation_id { 1 };
-    Optional<PendingWebDriverNavigation> m_pending_webdriver_navigation;
     RefPtr<Core::Promise<Empty>> m_pending_session_history_reset_for_testing;
 
     struct WebDriverNavigationCompletionRequest {

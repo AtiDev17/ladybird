@@ -23,11 +23,11 @@
 //! reference counted or freed.
 
 use std::alloc::{Layout, alloc, dealloc};
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::OnceLock;
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -54,19 +54,19 @@ use crate::css::style_value::{retained_list_drop, retained_list_partial_eq};
 /// Reference count value marking an intentionally leaked payload.
 pub const STYLE_GROUP_STATIC_REFCOUNT: usize = usize::MAX;
 
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 static REPLAY_STYLE_GROUPS: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 thread_local! {
     static REPLAY_STYLE_GROUP_SIZES: RefCell<Vec<Option<usize>>> = const { RefCell::new(Vec::new()) };
 }
 
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 pub fn enable_style_group_replay() {
     REPLAY_STYLE_GROUPS.store(true, Ordering::Relaxed);
 }
 
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 pub fn register_replay_style_group(identity: u32, retained_bytes: usize) -> *const c_void {
     let pointer = identity as usize + 1;
     REPLAY_STYLE_GROUP_SIZES.with(|sizes| {
@@ -83,11 +83,11 @@ pub fn register_replay_style_group(identity: u32, retained_bytes: usize) -> *con
 }
 
 fn replay_style_group_size(pointer: *const c_void) -> Option<usize> {
-    #[cfg(feature = "style-recording")]
+    #[cfg(feature = "style-replay")]
     return (pointer as usize)
         .checked_sub(1)
         .and_then(|identity| REPLAY_STYLE_GROUP_SIZES.with(|sizes| sizes.borrow().get(identity).copied().flatten()));
-    #[cfg(not(feature = "style-recording"))]
+    #[cfg(not(feature = "style-replay"))]
     {
         let _ = pointer;
         None
@@ -95,18 +95,18 @@ fn replay_style_group_size(pointer: *const c_void) -> Option<usize> {
 }
 
 pub(crate) fn replay_style_group_identity(pointer: *const c_void) -> Option<u32> {
-    #[cfg(feature = "style-recording")]
+    #[cfg(feature = "style-replay")]
     return u32::try_from((pointer as usize).checked_sub(1)?).ok();
-    #[cfg(not(feature = "style-recording"))]
+    #[cfg(not(feature = "style-replay"))]
     let _ = pointer;
-    #[cfg(not(feature = "style-recording"))]
+    #[cfg(not(feature = "style-replay"))]
     None
 }
 
 pub(crate) fn replaying_style_groups() -> bool {
-    #[cfg(feature = "style-recording")]
+    #[cfg(feature = "style-replay")]
     return REPLAY_STYLE_GROUPS.load(Ordering::Relaxed);
-    #[cfg(not(feature = "style-recording"))]
+    #[cfg(not(feature = "style-replay"))]
     false
 }
 
@@ -528,6 +528,7 @@ impl_computed_payload_clone_and_eq!(BorderValues {
     border_bottom_right_radius,
     border_top_left_radius,
     border_top_right_radius,
+    has_noninitial_border_radii,
     corner_bottom_left_shape,
     corner_bottom_right_shape,
     corner_top_left_shape,
@@ -625,6 +626,7 @@ impl_computed_payload_clone_and_eq!(FontValues {
     math_shift_value,
     math_style_value,
     math_depth_value,
+    font_size_value,
 });
 impl_computed_payload_clone_and_eq!(InheritedSVGValues {
     fill,
@@ -1608,7 +1610,7 @@ pub(crate) fn property_dependency_masks_snapshot() -> Option<(u16, &'static [u32
     Some((mapping.first_property, &mapping.masks, &mapping.output_masks))
 }
 
-#[cfg(feature = "style-recording")]
+#[cfg(feature = "style-replay")]
 pub fn register_replay_property_dependency_masks(first_property: u16, masks: &[u32], output_masks: &[u32]) {
     assert_eq!(masks.len(), output_masks.len());
     if let Some(existing) = PROPERTY_DEPENDENCY_MASKS.get() {
@@ -2871,6 +2873,7 @@ impl BorderValues {
             border_bottom_right_radius: initial(property_id::BORDER_BOTTOM_RIGHT_RADIUS),
             border_top_left_radius: initial(property_id::BORDER_TOP_LEFT_RADIUS),
             border_top_right_radius: initial(property_id::BORDER_TOP_RIGHT_RADIUS),
+            has_noninitial_border_radii: false,
             corner_bottom_left_shape: 1.0,
             corner_bottom_right_shape: 1.0,
             corner_top_left_shape: 1.0,
@@ -3016,6 +3019,7 @@ impl FontValues {
             math_shift_value: initial(property_id::MATH_SHIFT),
             math_style_value: initial(property_id::MATH_STYLE),
             math_depth_value: initial(property_id::MATH_DEPTH),
+            font_size_value: initial(property_id::FONT_SIZE),
         }
     }
 }
@@ -3606,9 +3610,9 @@ pub unsafe extern "C" fn rust_build_sizing_group(
 }
 
 /// Builds an inherited table group payload from the computed values, with the
-/// same sharing rules as the inherited box builder. Border-spacing must be an
-/// absolute pixel length; two-value spacings and anything else fall back to
-/// the C++ population path by returning null.
+/// same sharing rules as the inherited box builder. Border-spacing must be a
+/// pair of absolute pixel lengths; anything else falls back to the C++
+/// population path by returning null.
 ///
 /// # Safety
 /// The value pointers must be valid StyleValueData or null, and
@@ -3631,9 +3635,22 @@ pub unsafe extern "C" fn rust_build_inherited_table_group(
                 _ => None,
             }
         };
-        let spacing = match unsafe { (border_spacing as *const StyleValueData).as_ref() } {
-            Some(StyleValueData::Length { value, unit }) if *unit == crate::css::style_compute::px_length_unit() => {
-                crate::css::css_pixels::CssPixels::nearest_value_for(*value).raw_value()
+        let spacing_component = |data: &StyleValueData| -> Option<i32> {
+            match data {
+                StyleValueData::Length { value, unit } if *unit == crate::css::style_compute::px_length_unit() => {
+                    Some(crate::css::css_pixels::CssPixels::nearest_value_for(*value).raw_value())
+                }
+                _ => None,
+            }
+        };
+        let (horizontal_spacing, vertical_spacing) = match unsafe { (border_spacing as *const StyleValueData).as_ref() }
+        {
+            Some(StyleValueData::ValueList { values, .. }) if values.as_slice().len() == 2 => {
+                let components = values.as_slice();
+                (
+                    spacing_component(components[0].data())?,
+                    spacing_component(components[1].data())?,
+                )
             }
             _ => return None,
         };
@@ -3641,8 +3658,8 @@ pub unsafe extern "C" fn rust_build_inherited_table_group(
             border_collapse: keyword_code(border_collapse, crate::css::style_compute::keyword_to_border_collapse)?,
             caption_side: keyword_code(caption_side, crate::css::style_compute::keyword_to_caption_side)?,
             empty_cells: keyword_code(empty_cells, crate::css::style_compute::keyword_to_empty_cells)?,
-            border_spacing_horizontal: spacing,
-            border_spacing_vertical: spacing,
+            border_spacing_horizontal: horizontal_spacing,
+            border_spacing_vertical: vertical_spacing,
         };
 
         if !parent_payload.is_null() {

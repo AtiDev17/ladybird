@@ -559,12 +559,6 @@ void WebContentClient::did_destroy_child_frame(u64 page_id, Web::HTML::CrossProc
         SiteIsolationManager::the().remove_child_frame_subtree(*child_frame);
 }
 
-void WebContentClient::did_start_webdriver_navigation(u64 page_id)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value())
-        view->did_start_webdriver_navigation({});
-}
-
 void WebContentClient::maybe_record_history_visit_for_current_load(u64 page_id, URL::URL const& url, Optional<String> title, StringView reason)
 {
     auto normalized_url = HistoryStore::normalize_url(url);
@@ -601,12 +595,9 @@ void WebContentClient::did_start_loading(u64 page_id, Optional<Utf16String> navi
             view->m_history_visit_transition_for_current_load = view->m_history_visit_transition_for_next_load;
             view->m_history_visit_transition_for_next_load = HistoryVisitTransition::Link;
         }
-        view->m_is_waiting_for_navigation_start = false;
-        view->m_loading_navigation_id = navigation_id;
-        view->m_loading_url = url;
         view->m_should_suppress_history_for_current_load = view->m_should_suppress_history_for_next_load;
         view->m_should_suppress_history_for_next_load = false;
-        view->did_start_navigation(url, is_redirect, navigation_id.has_value());
+        view->did_start_navigation(move(navigation_id), url, is_redirect);
 
         view->set_url({}, url);
         view->set_title({}, Utf16String::from_utf8(url.serialize()));
@@ -628,12 +619,8 @@ void WebContentClient::did_cancel_loading(u64 page_id, Optional<Utf16String> nav
     m_history_recorded_urls_for_current_load.remove(page_id);
 
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        if (!view->m_is_waiting_for_navigation_start && navigation_id != view->m_loading_navigation_id)
+        if (!view->did_cancel_navigation(navigation_id))
             return;
-        view->m_is_waiting_for_navigation_start = false;
-        view->m_loading_navigation_id.clear();
-        view->m_loading_url.clear();
-        view->did_cancel_navigation();
 
         auto const& client_url = view->url();
         if (view->on_load_finish)
@@ -722,11 +709,9 @@ void WebContentClient::did_finish_loading(u64 page_id, Optional<Utf16String> nav
     }
 
     if (auto view = view_for_page_id(page_id); view.has_value()) {
-        if (view->m_is_waiting_for_navigation_start || navigation_id != view->m_loading_navigation_id)
+        if (!view->matches_ongoing_navigation(navigation_id))
             return;
 
-        view->m_loading_navigation_id.clear();
-        view->m_loading_url.clear();
         auto client_url = url;
         // Browser-generated pages can finish with an internal document URL. Keep exposing the URL accepted at load
         // start for suppressed loads. Documents created for inline error content finish with about:error; keep the URL
@@ -1488,6 +1473,7 @@ void WebContentClient::did_close_browsing_context(u64 page_id)
     m_detached_pages_pending_close.remove(page_id);
 
     if (auto view = m_views.get(page_id); view.has_value()) {
+        (*view)->did_close_browsing_context({});
         if ((*view)->on_close)
             (*view)->on_close();
     }
@@ -1501,96 +1487,16 @@ void WebContentClient::did_change_needs_beforeunload_check(u64 page_id, bool nee
         view->did_change_needs_beforeunload_check({}, needs_beforeunload_check);
 }
 
-void WebContentClient::did_request_webdriver_history_traversal(u64 page_id, u64 request_id, i32 delta)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        auto view_id = view->view_id();
-        auto weak_this = static_cast<Core::EventReceiver&>(*this).make_weak_ptr();
-        // This request originates from WebDriver in WebContent. Defer the UI
-        // traversal so it can safely call back into WebContent for the
-        // cancelation checks from the traverse history step algorithm.
-        Core::deferred_invoke([weak_this, page_id, request_id, view_id, delta] {
-            auto self = weak_this.strong_ref();
-            if (!self)
-                return;
-            auto& client = static_cast<WebContentClient&>(*self);
-
-            auto view = ViewImplementation::find_view_by_id(view_id);
-            if (!view.has_value()) {
-                client.async_complete_webdriver_history_traversal(page_id, request_id, false);
-                return;
-            }
-
-            view->traverse_the_history_by_delta(delta, CheckForCancelation::Yes,
-                [weak_this, page_id, request_id] {
-                    auto self = weak_this.strong_ref();
-                    if (!self)
-                        return;
-                    auto& client = static_cast<WebContentClient&>(*self);
-
-                    client.async_complete_webdriver_history_traversal(page_id, request_id, true);
-                });
-        });
-        return;
-    }
-
-    async_complete_webdriver_history_traversal(page_id, request_id, false);
-}
-
-Messages::WebContentClient::DidRequestWebdriverLoadUrlFromUiResponse WebContentClient::did_request_webdriver_load_url_from_ui(u64 page_id, URL::URL url)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        auto view_id = view->view_id();
-        if (url.scheme() != "javascript"sv)
-            view->did_start_webdriver_navigation({});
-        Core::deferred_invoke([view_id, url = move(url)] {
-            auto view = ViewImplementation::find_view_by_id(view_id);
-            if (!view.has_value())
-                return;
-            view->load(url);
-        });
-        return { JsonValue {} };
-    }
-
-    return { Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv) };
-}
-
-Messages::WebContentClient::DidRequestWebdriverTraverseHistoryFromUiResponse WebContentClient::did_request_webdriver_traverse_history_from_ui(u64 page_id, i32 delta)
-{
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        auto view_id = view->view_id();
-        // This request is already a synchronous IPC from WebContent, so defer the
-        // UI traversal before running cancelation checks against WebContent.
-        Core::deferred_invoke([view_id, delta] {
-            auto view = ViewImplementation::find_view_by_id(view_id);
-            if (!view.has_value())
-                return;
-            view->traverse_the_history_by_delta(delta, CheckForCancelation::Yes);
-        });
-        return { JsonValue {} };
-    }
-
-    return { Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv) };
-}
-
-Messages::WebContentClient::DidRequestWebdriverSessionHistoryResponse WebContentClient::did_request_webdriver_session_history(u64 page_id)
+void WebContentClient::webdriver_user_prompt_handling_complete(u64 page_id, u64 request_id, Web::WebDriver::Response response)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        return { view->webdriver_session_history() };
-
-    return { Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv) };
+        view->did_complete_webdriver_user_prompt_handling({}, request_id, move(response));
 }
 
-void WebContentClient::did_request_webdriver_navigation_completion(u64 page_id, u64 request_id, Optional<u64> page_load_timeout)
+void WebContentClient::webdriver_command_complete(u64 page_id, u64 command_id, Web::WebDriver::Response response)
 {
-    if (auto view = view_for_page_id(page_id); view.has_value()) {
-        view->wait_for_webdriver_navigation_completion({}, page_load_timeout, [this, page_id, request_id](Web::WebDriver::Response response) {
-            async_complete_webdriver_navigation_completion(page_id, request_id, move(response));
-        });
-        return;
-    }
-
-    async_complete_webdriver_navigation_completion(page_id, request_id, Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchWindow, "Window not found"sv));
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->did_complete_webdriver_content_command({}, command_id, move(response));
 }
 
 void WebContentClient::did_update_resource_count(u64 page_id, i32 count_waiting)

@@ -1133,20 +1133,55 @@ WillChange ComputedValues::MiscResetValues::will_change_value() const
     return WillChange(move(entries));
 }
 
+static StyleValueVector style_value_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle, Optional<StyleValueList::Separator> separator)
+{
+    auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer);
+    VERIFY(value);
+    if (value->tag == StyleValueFFI::StyleValueData::Tag::ValueList
+        && (!separator.has_value() || value->value_list.separator == to_underlying(*separator))) {
+        StyleValueVector items;
+        items.ensure_capacity(value->value_list.values.length);
+        for (size_t i = 0; i < value->value_list.values.length; ++i)
+            items.unchecked_append(StyleValue::wrap_rust_child(value->value_list.values.pointer[i]));
+        return items;
+    }
+    return { StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value)) };
+}
+
 static StyleValueVector animation_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
 {
-    auto value = animation_style_value(handle);
-    if (value->is_value_list() && value->as_value_list().separator() == StyleValueList::Separator::Comma)
-        return value->as_value_list().values();
-    return { move(value) };
+    return style_value_items(handle, StyleValueList::Separator::Comma);
+}
+
+static StyleValueFFI::StyleValueData const* first_animation_item_data(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+{
+    auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer);
+    VERIFY(value);
+    if (value->tag == StyleValueFFI::StyleValueData::Tag::ValueList
+        && value->value_list.separator == to_underlying(StyleValueList::Separator::Comma)) {
+        VERIFY(value->value_list.values.length > 0);
+        return static_cast<StyleValueFFI::StyleValueData const*>(value->value_list.values.pointer[0].pointer);
+    }
+    return value;
+}
+
+static RefPtr<AbstractImageStyleValue const> first_abstract_image_value(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
+{
+    auto const* image_data = first_animation_item_data(handle);
+    if (!AK::first_is_one_of(image_data->tag,
+            StyleValueFFI::StyleValueData::Tag::Image,
+            StyleValueFFI::StyleValueData::Tag::ImageSet,
+            StyleValueFFI::StyleValueData::Tag::LinearGradient,
+            StyleValueFFI::StyleValueData::Tag::ConicGradient,
+            StyleValueFFI::StyleValueData::Tag::RadialGradient))
+        return nullptr;
+    auto image = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(image_data));
+    return image->as_abstract_image();
 }
 
 static StyleValueVector component_items(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
 {
-    auto value = animation_style_value(handle);
-    if (value->is_value_list())
-        return value->as_value_list().values();
-    return { move(value) };
+    return style_value_items(handle, {});
 }
 
 ListStyleType ComputedValues::InheritedListValues::list_style_type_value(StyleScope const& style_scope) const
@@ -1301,21 +1336,6 @@ static BorderRadiusData border_radius_from_handle(ComputedValuesFFI::ComputedSty
     };
 }
 
-static bool border_radius_handle_is_initial(ComputedValuesFFI::ComputedStyleValueHandle const& handle)
-{
-    auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(handle.pointer);
-    VERIFY(value);
-    VERIFY(value->tag == StyleValueFFI::StyleValueData::Tag::BorderRadius);
-    auto is_zero_px = [](StyleValueFFI::RetainedStyleValueData const& child) {
-        auto const* data = static_cast<StyleValueFFI::StyleValueData const*>(child.pointer);
-        return data->tag == StyleValueFFI::StyleValueData::Tag::Length
-            && data->length.value == 0
-            && data->length.unit == to_underlying(LengthUnit::Px);
-    };
-    return is_zero_px(value->border_radius.horizontal_radius)
-        && is_zero_px(value->border_radius.vertical_radius);
-}
-
 BorderRadiusData ComputedValues::BorderValues::border_bottom_left_radius_value() const
 {
     return border_radius_from_handle(border_bottom_left_radius);
@@ -1338,10 +1358,7 @@ BorderRadiusData ComputedValues::BorderValues::border_top_right_radius_value() c
 
 bool ComputedValues::BorderValues::has_noninitial_border_radii_value() const
 {
-    return !border_radius_handle_is_initial(border_bottom_left_radius)
-        || !border_radius_handle_is_initial(border_bottom_right_radius)
-        || !border_radius_handle_is_initial(border_top_left_radius)
-        || !border_radius_handle_is_initial(border_top_right_radius);
+    return has_noninitial_border_radii;
 }
 
 BorderImageData ComputedValues::BorderValues::border_image_value() const
@@ -1412,6 +1429,11 @@ BorderImageData ComputedValues::BorderValues::border_image_value() const
     return result;
 }
 
+RefPtr<AbstractImageStyleValue const> ComputedValues::BorderValues::border_image_source_value() const
+{
+    return first_abstract_image_value(border_image_source);
+}
+
 Vector<BackgroundLayerData> ComputedValues::BackgroundValues::background_layers_value() const
 {
     auto image_items = animation_items(background_image);
@@ -1468,9 +1490,9 @@ Vector<BackgroundLayerData> ComputedValues::BackgroundValues::background_layers_
 
 Optional<MaskReference> ComputedValues::MaskValues::mask_value() const
 {
-    auto image = animation_items(mask_image).first();
-    if (image->is_url())
-        return MaskReference { image->as_url().url() };
+    auto const* image = first_animation_item_data(mask_image);
+    if (image->tag == StyleValueFFI::StyleValueData::Tag::Url)
+        return MaskReference { url_from_rust_data(image->url.url, image->url.url_type, image->url.modifiers) };
     return {};
 }
 
@@ -1481,10 +1503,7 @@ MaskType ComputedValues::MaskValues::mask_type_value() const
 
 RefPtr<AbstractImageStyleValue const> ComputedValues::MaskValues::mask_image_value() const
 {
-    auto image = animation_items(mask_image).first();
-    if (image->is_abstract_image())
-        return image->as_abstract_image();
-    return nullptr;
+    return first_abstract_image_value(mask_image);
 }
 
 Vector<Position> ComputedValues::MaskValues::mask_positions_value() const
@@ -1504,11 +1523,14 @@ Vector<Position> ComputedValues::MaskValues::mask_positions_value() const
 
 Optional<ClipPathReference> ComputedValues::MaskValues::clip_path_value() const
 {
-    auto value = animation_style_value(clip_path);
-    if (value->is_url())
-        return ClipPathReference { value->as_url().url() };
-    if (value->is_basic_shape())
+    auto const* value_data = static_cast<StyleValueFFI::StyleValueData const*>(clip_path.pointer);
+    VERIFY(value_data);
+    if (value_data->tag == StyleValueFFI::StyleValueData::Tag::Url)
+        return ClipPathReference { url_from_rust_data(value_data->url.url, value_data->url.url_type, value_data->url.modifiers) };
+    if (value_data->tag == StyleValueFFI::StyleValueData::Tag::BasicShape) {
+        auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value_data));
         return ClipPathReference { value->as_basic_shape() };
+    }
     return {};
 }
 

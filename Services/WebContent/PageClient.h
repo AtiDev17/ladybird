@@ -25,7 +25,9 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
+#include <LibWeb/WebDriver/Capabilities.h>
 #include <LibWeb/WebDriver/Response.h>
+#include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/Geolocation.h>
 #include <LibWebView/Mutation.h>
@@ -54,9 +56,10 @@ public:
     virtual Web::Page const& page() const override { return *m_page; }
     virtual bool has_focus() const override { return m_has_focus; }
 
-    ErrorOr<void> connect_to_webdriver(ByteString const& webdriver_endpoint);
-    void notify_webdriver_of_window_replacement();
-    void close_webdriver_connection_after_sending_pending_messages();
+    WebDriverConnection& ensure_webdriver_session();
+    void run_webdriver_command(u64 command_id, String const& name, JsonValue payload, Vector<String> arguments);
+    void webdriver_command_complete(u64 command_id, Web::WebDriver::Response);
+    void set_webdriver_session_config(Web::WebDriver::UserPromptHandler, Web::WebDriver::PageLoadStrategy, bool strict_file_interactability, JsonValue const& timeouts);
     ErrorOr<void> connect_to_web_ui(IPC::TransportHandle);
 
     virtual Queue<Web::QueuedInputEvent>& input_event_queue() override;
@@ -81,15 +84,7 @@ public:
     void set_preferred_motion(Web::CSS::PreferredMotion);
     virtual void set_has_focus(bool) override;
     void set_window_handle(Utf16String);
-    void did_start_webdriver_navigation();
-    struct WebDriverHistoryTraversalResult {
-        bool accepted { false };
-    };
-    void request_webdriver_history_traversal(int delta, Function<void(WebDriverHistoryTraversalResult)>);
-    void did_complete_webdriver_history_traversal(u64 request_id, bool accepted);
-    Web::WebDriver::Response request_webdriver_load_url_from_ui(URL::URL const&);
-    Web::WebDriver::Response request_webdriver_traverse_history_from_ui(int delta);
-    Web::WebDriver::Response request_webdriver_session_history();
+    void run_webdriver_user_prompt_handling(u64 request_id);
     void set_is_scripting_enabled(bool);
     void set_window_position(Web::DevicePixelPoint);
     void set_window_size(Web::DevicePixelSize);
@@ -139,8 +134,6 @@ public:
 
     void queue_screenshot_task(Optional<Web::UniqueNodeID> node_id);
     void send_current_needs_beforeunload_check();
-    void wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
-    void did_complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     void run_iframe_load_event_steps(Web::HTML::CrossProcessId);
     void set_remote_child_frame_compositor_context(Web::HTML::CrossProcessId, Optional<Web::Compositor::CompositorContextId>);
     void cancel_download(u64 download_id);
@@ -326,10 +319,6 @@ private:
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
 
-    u64 m_next_webdriver_navigation_completion_request_id { 0 };
-    HashMap<u64, Function<void(Web::WebDriver::Response)>> m_pending_webdriver_navigation_completion_requests;
-    u64 m_next_webdriver_history_traversal_request_id { 0 };
-    HashMap<u64, Function<void(WebDriverHistoryTraversalResult)>> m_pending_webdriver_history_traversal_requests;
     RefPtr<WebDriverConnection> m_webdriver;
     RefPtr<WebUIConnection> m_web_ui;
 
