@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
@@ -63,6 +64,9 @@ public:
     [[nodiscard]] bool has_deferred_element_initial_features(StyleNodeID style_node) const { return m_nodes_with_pending_initial_features.contains(style_node); }
     Vector<StyleNodeID> take_deferred_element_initial_features();
     HashTable<StyleNodeID> take_elements_awaiting_first_style_computation();
+    void mark_style_node_preallocated(StyleNodeID style_node, TreeScopeID tree_scope) { m_preallocated_style_nodes.set(style_node, tree_scope); }
+    Optional<TreeScopeID> consume_preallocated_style_node(StyleNodeID style_node) { return m_preallocated_style_nodes.take(style_node); }
+    void cancel_preallocated_style_node(StyleNodeID style_node) { m_preallocated_style_nodes.remove(style_node); }
     [[nodiscard]] bool resize_parsed_substitution_cache(u64 bytes);
 
     void set_element_parts(StyleNodeID node, ReadonlySpan<StyleAtomID> names, ReadonlySpan<StyleNodeID> hosts);
@@ -131,12 +135,14 @@ public:
     // identity on both sides would cancel in the journal and invalidate nothing.
     [[nodiscard]] u32 next_declaration_block_version() { return ++m_declaration_block_version; }
 
-    // Interns one selector-mentioned name and returns its document-local atom.
+    // Interns one selector-mentioned name and returns its process-global atom, retained by this
+    // document.
     //
     // Utf16FlyString is already interned, so its one-word raw form is the identity: this is a hash
     // lookup on that word plus one reference to keep the name alive. No string is copied, and
     // neither side pays an ASCII or UTF-16 conversion for a fact a u32 comparison answers.
     StyleAtomID intern_atom(Utf16FlyString const&);
+    [[nodiscard]] u64 atom_generation() const { return m_atom_generation; }
     // The namespace `[*|x]` names, which is any of them. No interned namespace is zero, so this
     // keys a form of its own in the same table.
     static constexpr StyleAtomID any_namespace { 0 };
@@ -144,16 +150,26 @@ public:
     // A name both a selector and the DOM produce as text, with no interned identity on either side:
     // a language subtag and a `:dir()` keyword. Matched ASCII case-insensitively.
     StyleAtomID intern_text_atom(Utf16View);
+    StyleAtomID intern_language_atom(Utf16View);
     // The same, without the ASCII folding, for names compared literally such as namespace URIs.
     StyleAtomID intern_case_sensitive_text_atom(Utf16View);
 
-    // Interns an attribute value and records what it spells, so a value operator can test it
-    // without a DOM to ask. Values repeat heavily, so the text crosses once per distinct value.
-    StyleAtomID intern_attribute_value(Utf16View);
+    // Interns the exact identity an attribute fact uses and memoizes its namespace and folded
+    // forms. Demand expansion revisits every live attribute, so these forms must not cross the
+    // boundary again merely to recover an already published name.
+    StyleAtomID intern_attribute_name(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri);
+
+    // Interns an attribute value and records what it spells when a selector for this name needs
+    // text. Values repeat heavily, so demanded text crosses once per distinct value.
+    StyleAtomID intern_attribute_value(StyleAtomID name, Utf16View value);
+    // Demand expansion already has every value identity. Check the name before interning the text
+    // so attributes no selector reads do not pay another string hash.
+    void backfill_attribute_value_text_if_required(StyleAtomID name, Utf16View value);
 
     // Deltas accumulate here and cross in one flat batch per style flush, never one call per
     // element.
     void record_tree_delta(StyleEngineFFI::FfiTreeDelta const&);
+    void record_element_arrival(StyleEngineFFI::FfiElementArrival, ReadonlySpan<StyleAtomID> custom_states);
     void record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const&);
     void record_state_delta(StyleEngineFFI::FfiStateDelta const&);
     void record_element_declaration_delta(StyleEngineFFI::FfiElementDeclarationDelta const&);
@@ -224,19 +240,32 @@ private:
     using InputTransaction = StyleEngineFFI::FfiStyleInputTransaction;
 
     bool read_matches(StyleNodeID, Vector<RuleMatch>&, Optional<MatchPurpose>);
+    void append_or_merge_element_style_input(StyleNodeID, u8 reaction, u8 inherited_style_groups);
     void apply_transaction(InputTransaction const&);
     void submit_recorded_input();
+    bool refresh_attribute_value_text_requirements();
+    [[nodiscard]] bool attribute_name_requires_value_text(StyleAtomID);
+    void publish_attribute_value_text(StyleAtomID, Utf16View);
 
     void* m_impl { nullptr };
     GC::Ptr<StyleComputer> m_style_computer;
 
-    HashTable<FlatPtr> m_atoms;
+    HashMap<FlatPtr, StyleAtomID> m_atoms;
+    HashTable<StyleAtomID> m_published_language_atoms;
+    HashMap<StyleAtomID, HashMap<StyleAtomID, StyleAtomID>> m_attribute_name_atoms;
+    HashMap<StyleAtomID, bool> m_attribute_names_requiring_value_text;
+    u64 m_atom_generation { 1 };
+    u64 m_attribute_value_text_requirements_version { 0 };
     HashTable<StyleNodeID> m_nodes_with_pending_initial_features;
     HashTable<StyleNodeID> m_nodes_awaiting_first_style_computation;
+    HashMap<StyleNodeID, TreeScopeID> m_preallocated_style_nodes;
+    HashMap<StyleNodeID, size_t> m_element_style_input_indices;
     size_t m_element_match_capacity { 64 };
 
     u32 m_declaration_block_version { 1 };
     Vector<StyleEngineFFI::FfiTreeDelta> m_tree_deltas;
+    Vector<StyleEngineFFI::FfiElementArrival> m_element_arrivals;
+    Vector<u32> m_arrival_custom_state_atoms;
     Vector<StyleEngineFFI::FfiLocalFeatureDelta> m_local_feature_deltas;
     Vector<StyleEngineFFI::FfiStateDelta> m_state_deltas;
     Vector<StyleEngineFFI::FfiElementDeclarationDelta> m_element_declaration_deltas;

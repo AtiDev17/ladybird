@@ -55,8 +55,9 @@ ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(int fd, 
     return adopt_ref(*new AnonymousBufferImpl(fd, size, ptr));
 }
 
-ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size)
+ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size, Sealability)
 {
+    // FIXME: Support sealability on Windows.
     auto impl = TRY(AnonymousBufferImpl::create(size));
     return AnonymousBuffer(move(impl));
 }
@@ -65,6 +66,16 @@ ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t siz
 {
     auto impl = TRY(AnonymousBufferImpl::create(fd, size));
     return AnonymousBuffer(move(impl));
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(Sealability sealability) const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot snapshot an invalid anonymous buffer");
+
+    auto copy = TRY(create_with_size(size(), sealability));
+    bytes().copy_to({ copy.data<u8>(), copy.size() });
+    return copy;
 }
 
 }

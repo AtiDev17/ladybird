@@ -1322,6 +1322,27 @@ void Element::apply_presentational_hints(Vector<CSS::StyleProperty>& properties)
     }
 }
 
+bool Element::presentational_hint_properties_need_publication(ReadonlySpan<CSS::StyleProperty> properties) const
+{
+    if (m_published_presentational_hint_properties.size() == properties.size()) {
+        bool properties_are_unchanged = true;
+        for (size_t index = 0; index < properties.size(); ++index)
+            properties_are_unchanged &= m_published_presentational_hint_properties[index] == properties[index];
+        if (properties_are_unchanged)
+            return false;
+    }
+
+    return true;
+}
+
+void Element::did_publish_presentational_hint_properties(ReadonlySpan<CSS::StyleProperty> properties)
+{
+    m_published_presentational_hint_properties.clear();
+    m_published_presentational_hint_properties.ensure_capacity(properties.size());
+    for (auto const& property : properties)
+        m_published_presentational_hint_properties.unchecked_append(property);
+}
+
 void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     attribute_changed(local_name, old_value, value, namespace_);
@@ -1364,10 +1385,12 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
     // NB: The adoption also makes an unchanged element keep sharing group storage with its
     //     previous style generation, which future diffs turn into pure pointer compares.
     bool const all_group_payloads_shared = new_computed_values.adopt_identical_group_payloads(old_computed_values);
-    // The inheritance-dependent specified values live outside the group payloads, and swapping
-    // one for a concrete value with the same used color changes what descendants inherit, so
-    // equal payloads alone cannot prove the diff away.
+    // The computed longhand table, resolved font list and inheritance-dependent specified values
+    // live outside the group payloads, so equal payloads alone cannot prove the diff away. When
+    // all longhands are equal, adopting identical group payloads also adopts the previous table.
     bool const property_diff_can_be_skipped = all_group_payloads_shared
+        && old_computed_values.computed_longhand_values().data() == new_computed_values.computed_longhand_values().data()
+        && old_computed_values.font_list().equals(new_computed_values.font_list())
         && !CSS::ComputedValues::either_carries_animated_overlay(old_computed_values, new_computed_values)
         && old_computed_values.inheritance_dependent_specified_values_equal(new_computed_values);
     static bool const verify_fast_path = getenv("LIBWEB_VERIFY_STYLE_DIFF_FAST_PATH") != nullptr;
@@ -1986,14 +2009,17 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
     // Which animations an element references is an index StyleEngine keeps, in the same shape as the
     // anchor-name registry above: nothing about selector matching can say it, and without it a
     // `@keyframes` rule cannot find the elements running the animation it describes.
-    {
+    auto indexable_animation_names = [](CSS::ComputedValues const& style) {
         Vector<Utf16FlyString> animation_names;
-        for (auto const& animation_name : new_style->animation_names()) {
+        for (auto const& animation_name : style.animation_names()) {
             if (animation_name.syntax != CSS::ComputedAnimationNameSyntax::None)
                 animation_names.append(animation_name.name);
         }
+        return animation_names;
+    };
+    auto animation_names = indexable_animation_names(*new_style);
+    if (old_computed_values ? indexable_animation_names(*old_computed_values) != animation_names : !animation_names.is_empty())
         CSS::record_element_animation_names(*this, animation_names);
-    }
     // Which custom properties this element declares or references decides which `@property`
     // registrations reach it. Declaring one matters because registration changes how it computes;
     // referencing one matters because registration gives it a value where it had none.
@@ -2387,18 +2413,8 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
     if (m_shadow_root == shadow_root)
         return;
     if (m_shadow_root) {
-        if (is_connected()) {
-            m_shadow_root->for_each_shadow_including_inclusive_descendant([](DOM::Node& descendant) {
-                if (auto* element = as_if<DOM::Element>(descendant))
-                    CSS::record_element_disconnecting(*element);
-                return TraversalDecision::Continue;
-            });
-            m_shadow_root->for_each_shadow_including_inclusive_descendant([](DOM::Node& descendant) {
-                if (auto* shadow_root = as_if<DOM::ShadowRoot>(descendant))
-                    CSS::record_shadow_root_disconnecting(*shadow_root);
-                return TraversalDecision::Continue;
-            });
-        }
+        if (is_connected())
+            CSS::record_subtree_disconnecting(*m_shadow_root);
         m_shadow_root->set_host(nullptr);
         m_shadow_root->set_is_connected(false);
         // NB: We don't need to run the removed steps if the children have already been disconnected (or were never

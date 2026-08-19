@@ -94,6 +94,44 @@ TEST_CASE(reconstruct_from_anon_fd_shares_memory)
     EXPECT_EQ(mirrored, payload);
 }
 
+TEST_CASE(snapshot_has_independent_contents)
+{
+    auto original = MUST(Core::AnonymousBuffer::create_with_size(128));
+
+    auto const payload = "copied into private memory"sv;
+    memcpy(original.data<void>(), payload.characters_without_null_termination(), payload.length());
+
+    auto snapshot = MUST(original.snapshot());
+    EXPECT_EQ(snapshot.size(), original.size());
+    EXPECT_EQ(StringView(snapshot.data<char const>(), payload.length()), payload);
+
+    original.data<char>()[0] = 'C';
+    EXPECT_EQ(StringView(snapshot.data<char const>(), payload.length()), payload);
+}
+
+TEST_CASE(snapshot_rejects_an_invalid_buffer)
+{
+    EXPECT(Core::AnonymousBuffer {}.snapshot().is_error());
+}
+
+#if (defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)) && defined(F_ADD_SEALS) && defined(F_GET_SEALS) && defined(F_SEAL_GROW) && defined(F_SEAL_SHRINK)
+TEST_CASE(create_sealable_buffer)
+{
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(128, Core::AnonymousBuffer::Sealability::Sealable));
+    MUST(Core::System::fcntl(buffer.fd(), F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK));
+    auto seals = MUST(Core::System::fcntl(buffer.fd(), F_GET_SEALS, static_cast<uintptr_t>(0)));
+    EXPECT_EQ(seals & (F_SEAL_GROW | F_SEAL_SHRINK), F_SEAL_GROW | F_SEAL_SHRINK);
+}
+
+TEST_CASE(snapshot_rejects_a_buffer_larger_than_its_backing_store)
+{
+    auto original = MUST(Core::AnonymousBuffer::create_with_size(64, Core::AnonymousBuffer::Sealability::Sealable));
+    auto fd = MUST(Core::System::dup(original.fd()));
+    auto oversized = MUST(Core::AnonymousBuffer::create_from_anon_fd(fd, 128));
+    EXPECT(oversized.snapshot().is_error());
+}
+#endif
+
 #ifndef AK_OS_WINDOWS
 TEST_CASE(failed_creation_from_an_fd_closes_the_fd)
 {

@@ -23,6 +23,7 @@ use std::num::NonZeroU32;
 
 use super::capacity::capacity_bytes;
 use super::cascade::CascadeStateID;
+use super::column::BitColumn;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::fast_hasher;
 use super::intern_table::InternIdentity;
@@ -134,6 +135,7 @@ struct ComputedFixedMetadata {
     counter_style_environment_identity: u64,
 }
 
+#[repr(C)]
 pub(crate) struct InheritanceDependentValue {
     pub property: u16,
     pub value: RetainedStyleValueData,
@@ -143,8 +145,24 @@ struct ComputedReconstructionMetadata {
     property_importance: Box<[u8]>,
     property_inheritance: Box<[u8]>,
     inheritance_dependent_values: Box<[InheritanceDependentValue]>,
-    inheritance_dependent_value_view: Box<[super::bridge::FfiInheritanceDependentValue]>,
     raw_cascaded_font_size: Option<RetainedStyleValueData>,
+}
+
+impl ComputedReconstructionMetadata {
+    fn inheritance_dependent_value_view(&self) -> &[super::bridge::FfiInheritanceDependentValue] {
+        const {
+            assert!(size_of::<InheritanceDependentValue>() == size_of::<super::bridge::FfiInheritanceDependentValue>());
+            assert!(
+                align_of::<InheritanceDependentValue>() == align_of::<super::bridge::FfiInheritanceDependentValue>()
+            );
+        }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.inheritance_dependent_values.as_ptr().cast(),
+                self.inheritance_dependent_values.len(),
+            )
+        }
+    }
 }
 
 /// The interned form of one drive's computed longhand table: one retained
@@ -271,9 +289,14 @@ pub struct FinalStyleRecordID(u64);
 
 impl FinalStyleRecordID {
     const ANIMATION_OVERLAY_TAG: u64 = 1 << 63;
+    const MAX_BASE_GENERATION: u32 = (1 << 31) - 1;
 
-    fn base(style_record: StyleRecordID) -> Self {
-        Self(style_record.raw().into())
+    fn base(style_record: StyleRecordID, generation: u32) -> Self {
+        assert!(
+            generation <= Self::MAX_BASE_GENERATION,
+            "base style-record generation space exhausted"
+        );
+        Self((u64::from(generation) << 32) | u64::from(style_record.raw()))
     }
 
     fn animation_overlay(generation: u64) -> Self {
@@ -290,8 +313,14 @@ impl FinalStyleRecordID {
         if self.0 & Self::ANIMATION_OVERLAY_TAG != 0 {
             return None;
         }
-        let raw = u32::try_from(self.0).ok()?;
-        Some(StyleRecordID(NonZeroU32::new(raw)?))
+        if self.0 as u32 == 0 {
+            return None;
+        }
+        Some(StyleRecordID(NonZeroU32::new(self.0 as u32)?))
+    }
+
+    fn base_generation(self) -> u32 {
+        (self.0 >> 32) as u32
     }
 }
 
@@ -321,7 +350,7 @@ struct ComputedGroup {
 }
 
 struct ComputedGroupSet {
-    identities: Box<[ComputedGroupID]>,
+    identity_hash: u64,
     payloads: Box<[*const c_void]>,
     canonical_longhand_table: Option<ComputedLonghandTableID>,
 }
@@ -335,7 +364,219 @@ struct PublishedComputedInputs {
     reconstruction_metadata: ComputedReconstructionMetadataID,
     style_record: StyleRecordID,
     animation_overlay_slot: Option<u32>,
-    cascade_state: Option<(u64, CascadeStateID)>,
+}
+
+#[derive(Clone, Copy)]
+struct PseudoComputedRow {
+    kind: u8,
+    flags: u8,
+    assignment: Option<PublishedComputedInputs>,
+    cascade_versions: [u64; 3],
+    cascade_states: [CascadeStateID; 3],
+}
+
+#[derive(Default)]
+struct PublishedComputedColumns {
+    groups: Vec<u32>,
+    inherited_groups: Vec<u32>,
+    custom_properties: Vec<u32>,
+    fixed_metadata: Vec<u32>,
+    reconstruction_metadata: Vec<u32>,
+    animation_overlay_slots: Vec<u32>,
+    cascade_versions: Vec<u64>,
+    cascade_states: Vec<u32>,
+    flags: Vec<u8>,
+}
+
+impl PublishedComputedColumns {
+    const ASSIGNED: u8 = 1;
+    const INHERITED_GROUP_SWAP_ELIGIBLE: u8 = 1 << 1;
+    const HAS_CASCADE_STATE: u8 = 1 << 2;
+
+    fn ensure(&mut self, index: usize) {
+        if self.flags.len() > index {
+            return;
+        }
+        let len = index
+            .checked_add(1)
+            .expect("computed publication column space exhausted");
+        self.groups.resize(len, 0);
+        self.inherited_groups.resize(len, 0);
+        self.custom_properties.resize(len, 0);
+        self.fixed_metadata.resize(len, 0);
+        self.reconstruction_metadata.resize(len, 0);
+        self.animation_overlay_slots.resize(len, 0);
+        self.cascade_versions.resize(len, 0);
+        self.cascade_states.resize(len, 0);
+        self.flags.resize(len, 0);
+    }
+
+    fn is_assigned(&self, index: usize) -> bool {
+        self.flags.get(index).is_some_and(|flags| flags & Self::ASSIGNED != 0)
+    }
+
+    fn groups(&self, index: usize) -> Option<ComputedGroupSetID> {
+        self.is_assigned(index).then(|| ComputedGroupSetID(self.groups[index]))
+    }
+
+    fn inherited_groups(&self, index: usize) -> Option<InheritedGroupSetID> {
+        self.is_assigned(index)
+            .then(|| InheritedGroupSetID(self.inherited_groups[index]))
+    }
+
+    fn custom_properties(&self, index: usize) -> Option<CustomPropertyEnvironmentID> {
+        self.is_assigned(index)
+            .then(|| CustomPropertyEnvironmentID(self.custom_properties[index]))
+    }
+
+    fn fixed_metadata(&self, index: usize) -> Option<ComputedFixedMetadataID> {
+        self.is_assigned(index)
+            .then(|| ComputedFixedMetadataID(self.fixed_metadata[index]))
+    }
+
+    fn reconstruction_metadata(&self, index: usize) -> Option<ComputedReconstructionMetadataID> {
+        self.is_assigned(index)
+            .then(|| ComputedReconstructionMetadataID(self.reconstruction_metadata[index]))
+    }
+
+    fn animation_overlay_slot(&self, index: usize) -> Option<u32> {
+        let encoded = *self.animation_overlay_slots.get(index)?;
+        encoded.checked_sub(1)
+    }
+
+    fn set_animation_overlay_slot(&mut self, index: usize, slot: Option<u32>) {
+        self.animation_overlay_slots[index] = slot.map_or(0, |slot| {
+            slot.checked_add(1)
+                .expect("animation overlay slot identity space exhausted")
+        });
+    }
+
+    fn inherited_group_swap_eligible(&self, index: usize) -> bool {
+        self.flags
+            .get(index)
+            .is_some_and(|flags| flags & Self::INHERITED_GROUP_SWAP_ELIGIBLE != 0)
+    }
+
+    fn cascade_state(&self, index: usize) -> Option<(u64, CascadeStateID)> {
+        self.flags
+            .get(index)
+            .is_some_and(|flags| flags & Self::HAS_CASCADE_STATE != 0)
+            .then(|| (self.cascade_versions[index], CascadeStateID(self.cascade_states[index])))
+    }
+
+    fn replace_cascade_state(
+        &mut self,
+        index: usize,
+        state: Option<(u64, CascadeStateID)>,
+    ) -> Option<(u64, CascadeStateID)> {
+        let previous = self.cascade_state(index);
+        if let Some((version, state)) = state {
+            self.cascade_versions[index] = version;
+            self.cascade_states[index] = state.0;
+            self.flags[index] |= Self::HAS_CASCADE_STATE;
+        } else if let Some(flags) = self.flags.get_mut(index) {
+            *flags &= !Self::HAS_CASCADE_STATE;
+        }
+        previous
+    }
+
+    fn publish(&mut self, index: usize, inputs: PublishedComputedInputs, inherited_group_swap_eligible: bool) {
+        self.ensure(index);
+        self.groups[index] = inputs.groups.0;
+        self.inherited_groups[index] = inputs.inherited_groups.0;
+        self.custom_properties[index] = inputs.custom_properties.0;
+        self.fixed_metadata[index] = inputs.fixed_metadata.0;
+        self.reconstruction_metadata[index] = inputs.reconstruction_metadata.0;
+        self.set_animation_overlay_slot(index, inputs.animation_overlay_slot);
+        self.flags[index] = (self.flags[index] & Self::HAS_CASCADE_STATE)
+            | Self::ASSIGNED
+            | if inherited_group_swap_eligible {
+                Self::INHERITED_GROUP_SWAP_ELIGIBLE
+            } else {
+                0
+            };
+    }
+
+    fn remove(&mut self, index: usize) -> Option<u32> {
+        let overlay = self.animation_overlay_slot(index);
+        if let Some(flags) = self.flags.get_mut(index) {
+            *flags = 0;
+            self.animation_overlay_slots[index] = 0;
+        }
+        overlay
+    }
+}
+
+struct ComputedReachability {
+    groups: Vec<bool>,
+    sets: Vec<bool>,
+    inherited_sets: Vec<bool>,
+    custom_property_environments: Vec<bool>,
+    fixed_metadata: Vec<bool>,
+    reconstruction_metadata: Vec<bool>,
+    longhand_tables: Vec<bool>,
+    style_records: Vec<bool>,
+}
+
+impl ComputedReachability {
+    fn mark<Identity: InternIdentity>(marks: &mut [bool], identity: Identity) {
+        marks[identity.index()] = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ComputedGroupRetention {
+    pub retained: usize,
+    pub reachable: usize,
+}
+
+impl PseudoComputedRow {
+    const PUBLISHED: u8 = 1;
+    const CURRENT_CASCADE: usize = 0;
+    const RETAINED_CASCADE: usize = 1;
+    const PENDING_CASCADE: usize = 2;
+
+    fn new(kind: u8) -> Self {
+        Self {
+            kind,
+            flags: 0,
+            assignment: None,
+            cascade_versions: [0; 3],
+            cascade_states: [CascadeStateID(0); 3],
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        self.flags & Self::PUBLISHED != 0
+    }
+
+    fn set_published(&mut self, published: bool) {
+        self.flags = (self.flags & !Self::PUBLISHED) | if published { Self::PUBLISHED } else { 0 };
+    }
+
+    fn cascade_state(&self, index: usize) -> Option<(u64, CascadeStateID)> {
+        (self.flags & (1 << (index + 1)) != 0).then_some((self.cascade_versions[index], self.cascade_states[index]))
+    }
+
+    fn replace_cascade_state(
+        &mut self,
+        index: usize,
+        state: Option<(u64, CascadeStateID)>,
+    ) -> Option<(u64, CascadeStateID)> {
+        let previous = self.cascade_state(index);
+        if let Some((version, state)) = state {
+            self.cascade_versions[index] = version;
+            self.cascade_states[index] = state;
+            self.flags |= 1 << (index + 1);
+        } else {
+            self.flags &= !(1 << (index + 1));
+        }
+        previous
+    }
+
+    fn is_empty(&self) -> bool {
+        self.flags == 0 && self.assignment.is_none()
+    }
 }
 
 pub struct ComputedGroupPublication {
@@ -407,37 +648,32 @@ impl ComputedStyleTarget {
 pub struct ComputedGroupSets {
     groups: InternTable<ComputedGroupID, ComputedGroup>,
     sets: InternTable<ComputedGroupSetID, ComputedGroupSet>,
-    column: Vec<Option<ComputedGroupSetID>>,
     inherited_sets: InternTable<InheritedGroupSetID, Box<[ComputedGroupID]>>,
-    inherited_column: Vec<Option<InheritedGroupSetID>>,
     custom_property_environments: InternTable<CustomPropertyEnvironmentID, u64>,
-    custom_property_environment_column: Vec<Option<CustomPropertyEnvironmentID>>,
     computed_fixed_metadata: InternTable<ComputedFixedMetadataID, ComputedFixedMetadata>,
-    computed_fixed_metadata_column: Vec<Option<ComputedFixedMetadataID>>,
     computed_reconstruction_metadata: InternTable<ComputedReconstructionMetadataID, ComputedReconstructionMetadata>,
-    computed_reconstruction_metadata_column: Vec<Option<ComputedReconstructionMetadataID>>,
     computed_longhand_tables: InternTable<ComputedLonghandTableID, RetainedLonghandTable>,
     style_records: InternTable<StyleRecordID, StyleRecord>,
+    style_record_liveness: BitColumn,
+    style_record_generations: Vec<u32>,
     style_record_column: Vec<Option<StyleRecordID>>,
+    base_style_record_pins: HashMap<StyleRecordID, u64>,
+    columns: PublishedComputedColumns,
     // Recyclable animation overlays are deliberately separate from the permanent base records
     // above. Dense element assignments and sparse pseudo assignments pin at most one slot each.
     animation_overlay_slots: Vec<Option<AnimationOverlayRecord>>,
     animation_overlay_slots_by_record: HashMap<FinalStyleRecordID, u32>,
     free_animation_overlay_slots: Vec<u32>,
-    animation_overlay_column: Vec<Option<u32>>,
-    inherited_group_swap_eligible_column: Vec<u8>,
     live_animation_overlay_assignments: usize,
     next_animation_overlay_generation: u64,
-    cascade_state_column: Vec<Option<(u64, CascadeStateID)>>,
-    pseudo_cascade_state_rows: HashMap<(StyleNodeID, u8), (u64, CascadeStateID)>,
-    pseudo_retained_cascade_rows: HashMap<(StyleNodeID, u8), (u64, CascadeStateID)>,
-    pseudo_assignments: HashMap<(StyleNodeID, u8), PublishedComputedInputs>,
-    pending_cascade_states: HashMap<(StyleNodeID, u8), (u64, CascadeStateID)>,
-    pseudo_kinds_by_node: HashMap<StyleNodeID, Vec<u8>>,
+    pending_cascade_states: HashMap<StyleNodeID, (u64, CascadeStateID)>,
+    pseudo_rows_by_node: HashMap<StyleNodeID, Box<[PseudoComputedRow]>>,
     group_set_nested_memory: MemoryLease,
     reconstruction_nested_memory: MemoryLease,
     animation_overlay_nested_memory: MemoryLease,
     pseudo_assignment_nested_memory: MemoryLease,
+    style_records_interned_since_reclamation: usize,
+    next_reclamation_after: usize,
 }
 
 impl Default for ComputedGroupSets {
@@ -445,70 +681,169 @@ impl Default for ComputedGroupSets {
         Self {
             groups: InternTable::default(),
             sets: InternTable::default(),
-            column: Vec::new(),
             inherited_sets: InternTable::default(),
-            inherited_column: Vec::new(),
             custom_property_environments: InternTable::default(),
-            custom_property_environment_column: Vec::new(),
             computed_fixed_metadata: InternTable::default(),
-            computed_fixed_metadata_column: Vec::new(),
             computed_reconstruction_metadata: InternTable::default(),
-            computed_reconstruction_metadata_column: Vec::new(),
             computed_longhand_tables: InternTable::default(),
             style_records: InternTable::default(),
+            style_record_liveness: BitColumn::default(),
+            style_record_generations: Vec::new(),
             style_record_column: Vec::new(),
+            base_style_record_pins: HashMap::default(),
+            columns: PublishedComputedColumns::default(),
             animation_overlay_slots: Vec::new(),
             animation_overlay_slots_by_record: HashMap::default(),
             free_animation_overlay_slots: Vec::new(),
-            animation_overlay_column: Vec::new(),
-            inherited_group_swap_eligible_column: Vec::new(),
             live_animation_overlay_assignments: 0,
             next_animation_overlay_generation: 0,
-            cascade_state_column: Vec::new(),
-            pseudo_cascade_state_rows: HashMap::default(),
-            pseudo_retained_cascade_rows: HashMap::default(),
-            pseudo_assignments: HashMap::default(),
             pending_cascade_states: HashMap::default(),
-            pseudo_kinds_by_node: HashMap::default(),
+            pseudo_rows_by_node: HashMap::default(),
             group_set_nested_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
             reconstruction_nested_memory: MemoryLease::new(MemoryCategory::ComputedReconstructionMetadata),
             animation_overlay_nested_memory: MemoryLease::new(MemoryCategory::AnimationOverlayRecord),
             pseudo_assignment_nested_memory: MemoryLease::new(MemoryCategory::ComputedPseudoAssignment),
+            style_records_interned_since_reclamation: 0,
+            next_reclamation_after: 1024,
         }
     }
 }
 
 impl ComputedGroupSets {
+    fn group_identity(&self, index: usize, payload: *const c_void) -> ComputedGroupID {
+        let key = (index, payload as usize);
+        self.groups
+            .find(content_hash(key), |_identity, group| {
+                (group.index, group.payload as usize) == key
+            })
+            .expect("computed group-set payload names a live group")
+    }
+
+    fn group_identities(&self, set: ComputedGroupSetID) -> Vec<ComputedGroupID> {
+        self.sets[set]
+            .payloads
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, payload)| self.group_identity(index, payload))
+            .collect()
+    }
+
+    fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
+        self.pseudo_rows_by_node.get(&node).map_or(&[], Box::as_ref)
+    }
+
+    fn pseudo_row(&self, node: StyleNodeID, kind: u8) -> Option<&PseudoComputedRow> {
+        self.pseudo_rows(node).iter().find(|row| row.kind == kind)
+    }
+
+    fn pseudo_row_mut(&mut self, node: StyleNodeID, kind: u8) -> Option<&mut PseudoComputedRow> {
+        self.pseudo_rows_by_node
+            .get_mut(&node)
+            .and_then(|rows| rows.iter_mut().find(|row| row.kind == kind))
+    }
+
+    fn ensure_pseudo_row(&mut self, node: StyleNodeID, kind: u8) -> &mut PseudoComputedRow {
+        let row_index = self
+            .pseudo_rows_by_node
+            .get(&node)
+            .and_then(|rows| rows.iter().position(|row| row.kind == kind));
+        let row_index = row_index.unwrap_or_else(|| {
+            let mut rows = self
+                .pseudo_rows_by_node
+                .remove(&node)
+                .map_or_else(Vec::new, |rows| rows.into_vec());
+            rows.push(PseudoComputedRow::new(kind));
+            self.pseudo_assignment_nested_memory
+                .grow_committed(size_of::<PseudoComputedRow>() as u64);
+            let row_index = rows.len() - 1;
+            self.pseudo_rows_by_node.insert(node, rows.into_boxed_slice());
+            row_index
+        });
+        &mut self
+            .pseudo_rows_by_node
+            .get_mut(&node)
+            .expect("pseudo row entry is live")[row_index]
+    }
+
+    fn remove_empty_pseudo_row(&mut self, node: StyleNodeID, kind: u8) {
+        let Some(row_index) = self
+            .pseudo_rows_by_node
+            .get(&node)
+            .and_then(|rows| rows.iter().position(|row| row.kind == kind && row.is_empty()))
+        else {
+            return;
+        };
+        let mut rows = self
+            .pseudo_rows_by_node
+            .remove(&node)
+            .expect("pseudo row entry is live")
+            .into_vec();
+        rows.remove(row_index);
+        self.pseudo_assignment_nested_memory
+            .shrink_committed(size_of::<PseudoComputedRow>() as u64);
+        if !rows.is_empty() {
+            self.pseudo_rows_by_node.insert(node, rows.into_boxed_slice());
+        }
+    }
+
     pub(super) fn assigned_style_record(&self, node: StyleNodeID) -> Option<FinalStyleRecordID> {
         let index = node.element_index()? as usize;
         let style_record = *self.style_record_column.get(index)?.as_ref()?;
-        Some(self.final_style_record(style_record, self.animation_overlay_column[index]))
+        Some(self.final_style_record(style_record, self.columns.animation_overlay_slot(index)))
     }
 
-    fn intern_group_set(&mut self, groups: Vec<ComputedGroupID>) -> (ComputedGroupSetID, bool) {
-        let hash = content_hash(&groups);
-        if let Some(identity) = self.sets.find(hash, |_identity, set| set.identities.as_ref() == groups) {
+    fn intern_group_set(&mut self, groups: &[ComputedGroupID]) -> (ComputedGroupSetID, bool) {
+        let hash = content_hash(groups);
+        if let Some(identity) = self.sets.find(hash, |_identity, set| {
+            set.payloads.len() == groups.len()
+                && set
+                    .payloads
+                    .iter()
+                    .zip(groups)
+                    .all(|(&payload, &identity)| payload == self.groups[identity].payload)
+        }) {
             return (identity, false);
         }
-        let identity =
-            ComputedGroupSetID(u32::try_from(self.sets.len()).expect("computed group-set identity space exhausted"));
+        let identity = self.sets.take_free_identity().unwrap_or_else(|| {
+            ComputedGroupSetID(u32::try_from(self.sets.len()).expect("computed group-set identity space exhausted"))
+        });
         let payloads = groups
             .iter()
             .map(|identity| self.groups[*identity].payload)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let identities = groups.into_boxed_slice();
         self.group_set_nested_memory
-            .grow_committed((size_of_val(identities.as_ref()) + size_of_val(payloads.as_ref())) as u64);
+            .grow_committed(size_of_val(payloads.as_ref()) as u64);
         self.sets.insert(
             hash,
             identity,
             ComputedGroupSet {
-                identities,
+                identity_hash: hash,
                 payloads,
                 canonical_longhand_table: None,
             },
         );
+        (identity, true)
+    }
+
+    fn intern_inherited_group_set(&mut self, groups: &[ComputedGroupID]) -> (InheritedGroupSetID, bool) {
+        let hash = content_hash(groups);
+        if let Some(identity) = self
+            .inherited_sets
+            .find(hash, |_identity, candidate| candidate.as_ref() == groups)
+        {
+            return (identity, false);
+        }
+        let identity = self.inherited_sets.take_free_identity().unwrap_or_else(|| {
+            InheritedGroupSetID(
+                u32::try_from(self.inherited_sets.len()).expect("inherited group-set identity space exhausted"),
+            )
+        });
+        let groups: Box<[ComputedGroupID]> = groups.into();
+        self.group_set_nested_memory
+            .grow_committed(size_of_val(groups.as_ref()) as u64);
+        self.inherited_sets.insert(hash, identity, groups);
         (identity, true)
     }
 
@@ -520,16 +855,45 @@ impl ComputedGroupSets {
         {
             return (identity, false);
         }
-        let raw = u32::try_from(
-            self.style_records
-                .len()
+        let identity = self.style_records.take_free_identity().unwrap_or_else(|| {
+            let raw = u32::try_from(
+                self.style_records
+                    .len()
+                    .checked_add(1)
+                    .expect("base style-record identity space exhausted"),
+            )
+            .expect("base style-record identity space exhausted");
+            StyleRecordID(NonZeroU32::new(raw).expect("base style-record identities are nonzero"))
+        });
+        if identity.index() == self.style_record_generations.len() {
+            self.style_record_generations.push(0);
+        } else {
+            let generation = &mut self.style_record_generations[identity.index()];
+            *generation = generation
                 .checked_add(1)
-                .expect("base style-record identity space exhausted"),
-        )
-        .expect("base style-record identity space exhausted");
-        let identity = StyleRecordID(NonZeroU32::new(raw).expect("base style-record identities are nonzero"));
+                .filter(|&generation| generation <= FinalStyleRecordID::MAX_BASE_GENERATION)
+                .expect("base style-record generation space exhausted");
+        }
         self.style_records.insert(hash, identity, record);
+        let (changed, _) = self.style_record_liveness.set(identity.index(), true);
+        assert!(changed, "new base style-record identity must not already be live");
+        self.style_records_interned_since_reclamation = self
+            .style_records_interned_since_reclamation
+            .checked_add(1)
+            .expect("style-record reclamation growth count overflow");
         (identity, true)
+    }
+
+    fn style_record_is_live(&self, identity: StyleRecordID) -> bool {
+        self.style_record_liveness.contains(identity.index())
+    }
+
+    fn style_record_generation_is_live(&self, identity: StyleRecordID, generation: u32) -> bool {
+        self.style_record_is_live(identity) && self.style_record_generations.get(identity.index()) == Some(&generation)
+    }
+
+    fn final_base_style_record(&self, identity: StyleRecordID) -> FinalStyleRecordID {
+        FinalStyleRecordID::base(identity, self.style_record_generations[identity.index()])
     }
 
     /// Interns the values of one drive's frozen computed longhand table, so
@@ -558,10 +922,12 @@ impl ComputedGroupSets {
         }) {
             return identity;
         }
-        let identity = ComputedLonghandTableID(
-            u32::try_from(self.computed_longhand_tables.len())
-                .expect("computed longhand-table identity space exhausted"),
-        );
+        let identity = self.computed_longhand_tables.take_free_identity().unwrap_or_else(|| {
+            ComputedLonghandTableID(
+                u32::try_from(self.computed_longhand_tables.len())
+                    .expect("computed longhand-table identity space exhausted"),
+            )
+        });
         let retained = unsafe { crate::css::computed_longhand_table::rust_computed_longhand_table_retain(table) };
         self.reconstruction_nested_memory
             .grow_committed(size_of_val(values) as u64);
@@ -593,10 +959,12 @@ impl ComputedGroupSets {
         }) {
             return identity;
         }
-        let identity = ComputedLonghandTableID(
-            u32::try_from(self.computed_longhand_tables.len())
-                .expect("computed longhand-table identity space exhausted"),
-        );
+        let identity = self.computed_longhand_tables.take_free_identity().unwrap_or_else(|| {
+            ComputedLonghandTableID(
+                u32::try_from(self.computed_longhand_tables.len())
+                    .expect("computed longhand-table identity space exhausted"),
+            )
+        });
         let value_view: Box<[*const c_void]> = values
             .iter()
             .map(|&value| match value.is_null() {
@@ -631,36 +999,26 @@ impl ComputedGroupSets {
         }
         let index = node.element_index()? as usize;
         let parent_index = parent.element_index()? as usize;
-        if self
-            .inherited_group_swap_eligible_column
-            .get(index)
-            .copied()
-            .unwrap_or(0)
-            == 0
-            || self.animation_overlay_column.get(index).copied().flatten().is_some()
-            || self
-                .animation_overlay_column
-                .get(parent_index)
-                .copied()
-                .flatten()
-                .is_some()
+        if !self.columns.inherited_group_swap_eligible(index)
+            || self.columns.animation_overlay_slot(index).is_some()
+            || self.columns.animation_overlay_slot(parent_index).is_some()
             || self.assigned_pseudo_kinds(node).next().is_some()
         {
             return None;
         }
 
         let old_style_record = *self.style_record_column.get(index)?.as_ref()?;
-        let old_record = *self.style_records.get_index(old_style_record.raw() as usize - 1)?;
+        let old_record = *self.style_records.get_index(old_style_record.index())?;
         let old_group_set = self.sets.get_index(old_record.groups.0 as usize)?;
-        let parent_inherited = *self.inherited_column.get(parent_index)?.as_ref()?;
+        let parent_inherited = self.columns.inherited_groups(parent_index)?;
         let parent_groups = self.inherited_sets.get_index(parent_inherited.0 as usize)?;
-        if parent_groups.len() != INHERITED_GROUP_COUNT || old_group_set.identities.len() < INHERITED_GROUP_COUNT {
+        if parent_groups.len() != INHERITED_GROUP_COUNT || old_group_set.payloads.len() < INHERITED_GROUP_COUNT {
             return None;
         }
 
-        let mut groups = old_group_set.identities.to_vec();
+        let mut groups = self.group_identities(old_record.groups);
         groups[..INHERITED_GROUP_COUNT].copy_from_slice(parent_groups);
-        let group_set = self.intern_group_set(groups).0;
+        let group_set = self.intern_group_set(&groups).0;
         // The swap is only taken for a fully inheriting element, so every
         // inherited-by-default longhand's value is the parent's; the swapped
         // record's table is the old one with those slots replaced by the
@@ -669,7 +1027,7 @@ impl ComputedGroupSets {
         // in practice) publish without one.
         let parent_style_record = self.style_record_column.get(parent_index).copied().flatten();
         let parent_table = parent_style_record
-            .and_then(|record| self.style_records.get_index(record.raw() as usize - 1))
+            .and_then(|record| self.style_records.get_index(record.index()))
             .and_then(|record| record.longhand_table);
         let longhand_table = match (old_record.longhand_table, parent_table) {
             (Some(old_table), Some(parent_table)) => {
@@ -693,12 +1051,12 @@ impl ComputedGroupSets {
             longhand_table,
         };
         let new_style_record = self.intern_style_record(new_record).0;
-        self.column[index] = Some(group_set);
-        self.inherited_column[index] = Some(parent_inherited);
+        self.columns.groups[index] = group_set.0;
+        self.columns.inherited_groups[index] = parent_inherited.0;
         self.style_record_column[index] = Some(new_style_record);
         Some((
-            FinalStyleRecordID::base(old_style_record),
-            FinalStyleRecordID::base(new_style_record),
+            self.final_base_style_record(old_style_record),
+            self.final_base_style_record(new_style_record),
         ))
     }
 
@@ -805,7 +1163,7 @@ impl ComputedGroupSets {
             }
             return AnimationOverlayPublication {
                 slot: None,
-                final_style_record: FinalStyleRecordID::base(base_style_record),
+                final_style_record: self.final_base_style_record(base_style_record),
                 slot_allocated: false,
                 slot_released: current_slot.is_some(),
                 record_updated: false,
@@ -879,7 +1237,7 @@ impl ComputedGroupSets {
         animation_overlay_slot: Option<u32>,
     ) -> FinalStyleRecordID {
         animation_overlay_slot.map_or_else(
-            || FinalStyleRecordID::base(base_style_record),
+            || self.final_base_style_record(base_style_record),
             |slot| {
                 self.animation_overlay_slots[slot as usize]
                     .as_ref()
@@ -919,14 +1277,12 @@ impl ComputedGroupSets {
         let previous_group_set = target.and_then(|target| {
             let ComputedStyleTarget { node, pseudo_kind } = target;
             if target.is_pseudo() {
-                self.pseudo_assignments
-                    .get(&(node, pseudo_kind))
+                self.pseudo_row(node, pseudo_kind)
+                    .and_then(|row| row.assignment)
                     .map(|inputs| inputs.groups)
             } else {
                 node.element_index()
-                    .and_then(|index| self.column.get(index as usize))
-                    .copied()
-                    .flatten()
+                    .and_then(|index| self.columns.groups(index as usize))
             }
         });
         let mut new_groups = 0;
@@ -960,7 +1316,9 @@ impl ComputedGroupSets {
                 continue;
             }
             let key = (index, payload as usize);
-            let previous_identity = previous_group_set.and_then(|set| self.sets[set].identities.get(index).copied());
+            let previous_identity = previous_group_set
+                .and_then(|set| self.sets[set].payloads.get(index).copied())
+                .map(|payload| self.group_identity(index, payload));
             let previous_equal_identity = previous_identity
                 .filter(|identity| style_group_payloads_equal(index, payload, self.groups[*identity].payload));
             let identity = match previous_equal_identity {
@@ -976,9 +1334,11 @@ impl ComputedGroupSets {
                     Some(identity) => identity,
                     None => {
                         retain_group_payload(index, payload);
-                        let identity = ComputedGroupID(
-                            u32::try_from(self.groups.len()).expect("computed group identity space exhausted"),
-                        );
+                        let identity = self.groups.take_free_identity().unwrap_or_else(|| {
+                            ComputedGroupID(
+                                u32::try_from(self.groups.len()).expect("computed group identity space exhausted"),
+                            )
+                        });
                         self.groups
                             .insert(content_hash(key), identity, ComputedGroup { index, payload });
                         self.group_set_nested_memory
@@ -991,26 +1351,10 @@ impl ComputedGroupSets {
             groups.push(identity);
         }
 
-        let (identity, new_group_set) = self.intern_group_set(groups);
+        let (identity, new_group_set) = self.intern_group_set(&groups);
 
-        let inherited_groups = &self.sets[identity].identities[..inherited_group_count];
-        let inherited_hash = content_hash(inherited_groups);
-        let existing_inherited = self
-            .inherited_sets
-            .find(inherited_hash, |_identity, groups| groups.as_ref() == inherited_groups);
-        let (inherited_identity, new_inherited_group_set) = match existing_inherited {
-            Some(identity) => (identity, false),
-            None => {
-                let identity = InheritedGroupSetID(
-                    u32::try_from(self.inherited_sets.len()).expect("inherited group-set identity space exhausted"),
-                );
-                let inherited_groups: Box<[ComputedGroupID]> = inherited_groups.into();
-                self.group_set_nested_memory
-                    .grow_committed(size_of_val(inherited_groups.as_ref()) as u64);
-                self.inherited_sets.insert(inherited_hash, identity, inherited_groups);
-                (identity, true)
-            }
-        };
+        let (inherited_identity, new_inherited_group_set) =
+            self.intern_inherited_group_set(&groups[..inherited_group_count]);
 
         let custom_property_environment_hash = content_hash(custom_property_environment);
         let (custom_property_environment_identity, new_custom_property_environment) = match self
@@ -1020,10 +1364,15 @@ impl ComputedGroupSets {
             }) {
             Some(identity) => (identity, false),
             None => {
-                let identity = CustomPropertyEnvironmentID(
-                    u32::try_from(self.custom_property_environments.len())
-                        .expect("custom-property environment identity space exhausted"),
-                );
+                let identity = self
+                    .custom_property_environments
+                    .take_free_identity()
+                    .unwrap_or_else(|| {
+                        CustomPropertyEnvironmentID(
+                            u32::try_from(self.custom_property_environments.len())
+                                .expect("custom-property environment identity space exhausted"),
+                        )
+                    });
                 self.custom_property_environments.insert(
                     custom_property_environment_hash,
                     identity,
@@ -1044,10 +1393,12 @@ impl ComputedGroupSets {
         {
             Some(identity) => (identity, false),
             None => {
-                let identity = ComputedFixedMetadataID(
-                    u32::try_from(self.computed_fixed_metadata.len())
-                        .expect("computed fixed-metadata identity space exhausted"),
-                );
+                let identity = self.computed_fixed_metadata.take_free_identity().unwrap_or_else(|| {
+                    ComputedFixedMetadataID(
+                        u32::try_from(self.computed_fixed_metadata.len())
+                            .expect("computed fixed-metadata identity space exhausted"),
+                    )
+                });
                 self.computed_fixed_metadata
                     .insert(content_hash(metadata), identity, metadata);
                 (identity, true)
@@ -1062,8 +1413,8 @@ impl ComputedGroupSets {
         let previous_longhand_table = target.and_then(|target| {
             let ComputedStyleTarget { node, pseudo_kind } = target;
             let style_record = if target.is_pseudo() {
-                self.pseudo_assignments
-                    .get(&(node, pseudo_kind))
+                self.pseudo_row(node, pseudo_kind)
+                    .and_then(|row| row.assignment)
                     .map(|inputs| inputs.style_record)
             } else {
                 node.element_index()
@@ -1071,9 +1422,7 @@ impl ComputedGroupSets {
                     .copied()
                     .flatten()
             }?;
-            self.style_records
-                .get_index(style_record.raw() as usize - 1)?
-                .longhand_table
+            self.style_records.get_index(style_record.index())?.longhand_table
         });
         let canonical_longhand_table = self.sets[identity].canonical_longhand_table;
         let longhand_table_identity = longhand_table
@@ -1108,10 +1457,15 @@ impl ComputedGroupSets {
             match existing_reconstruction {
                 Some(identity) => (identity, false),
                 None => {
-                    let identity = ComputedReconstructionMetadataID(
-                        u32::try_from(self.computed_reconstruction_metadata.len())
-                            .expect("computed reconstruction-metadata identity space exhausted"),
-                    );
+                    let identity = self
+                        .computed_reconstruction_metadata
+                        .take_free_identity()
+                        .unwrap_or_else(|| {
+                            ComputedReconstructionMetadataID(
+                                u32::try_from(self.computed_reconstruction_metadata.len())
+                                    .expect("computed reconstruction-metadata identity space exhausted"),
+                            )
+                        });
                     let inheritance_dependent_values: Box<[InheritanceDependentValue]> = inheritance_dependent_values
                         .into_iter()
                         .map(|(property, value)| InheritanceDependentValue {
@@ -1119,28 +1473,18 @@ impl ComputedGroupSets {
                             value: retain_style_value(value),
                         })
                         .collect();
-                    let inheritance_dependent_value_view: Box<[super::bridge::FfiInheritanceDependentValue]> =
-                        inheritance_dependent_values
-                            .iter()
-                            .map(|entry| super::bridge::FfiInheritanceDependentValue {
-                                property: entry.property,
-                                value: entry.value.pointer().cast(),
-                            })
-                            .collect();
                     let raw_cascaded_font_size = (!reconstruction_metadata.raw_cascaded_font_size.is_null())
                         .then(|| retain_style_value(reconstruction_metadata.raw_cascaded_font_size));
                     let metadata = ComputedReconstructionMetadata {
                         property_importance: reconstruction_metadata.property_importance.into(),
                         property_inheritance: reconstruction_metadata.property_inheritance.into(),
                         inheritance_dependent_values,
-                        inheritance_dependent_value_view,
                         raw_cascaded_font_size,
                     };
                     self.reconstruction_nested_memory.grow_committed(
                         (metadata.property_importance.len()
                             + metadata.property_inheritance.len()
-                            + size_of_val(metadata.inheritance_dependent_values.as_ref())
-                            + size_of_val(metadata.inheritance_dependent_value_view.as_ref()))
+                            + size_of_val(metadata.inheritance_dependent_values.as_ref()))
                             as u64,
                     );
                     self.computed_reconstruction_metadata
@@ -1168,8 +1512,7 @@ impl ComputedGroupSets {
             previous_style_record_identity,
             animation_overlay_publication,
         ) = if let Some(ComputedStyleTarget { node, pseudo_kind }) = target.filter(|target| target.is_pseudo()) {
-            let key = (node, pseudo_kind);
-            let previous = self.pseudo_assignments.get(&key).copied();
+            let previous = self.pseudo_row(node, pseudo_kind).and_then(|row| row.assignment);
             let previous_style_record_identity = previous
                 .map(|previous| self.final_style_record(previous.style_record, previous.animation_overlay_slot));
             let animation_overlay_publication = self.update_animation_overlay(
@@ -1179,26 +1522,17 @@ impl ComputedGroupSets {
                 &mut animated_properties,
                 animation_overlay_payloads,
             );
-            if previous.is_none() {
-                let kinds = self.pseudo_kinds_by_node.entry(node).or_default();
-                let capacity_before = kinds.capacity();
-                kinds.push(pseudo_kind);
-                self.pseudo_assignment_nested_memory
-                    .grow_committed((kinds.capacity() - capacity_before) as u64);
-            }
-            self.pseudo_assignments.insert(
-                key,
-                PublishedComputedInputs {
-                    groups: identity,
-                    inherited_groups: inherited_identity,
-                    custom_properties: custom_property_environment_identity,
-                    fixed_metadata: computed_fixed_metadata_identity,
-                    reconstruction_metadata: computed_reconstruction_metadata_identity,
-                    style_record: style_record_identity,
-                    animation_overlay_slot: animation_overlay_publication.slot,
-                    cascade_state: previous.and_then(|previous| previous.cascade_state),
-                },
-            );
+            let row = self.ensure_pseudo_row(node, pseudo_kind);
+            row.set_published(true);
+            row.assignment = Some(PublishedComputedInputs {
+                groups: identity,
+                inherited_groups: inherited_identity,
+                custom_properties: custom_property_environment_identity,
+                fixed_metadata: computed_fixed_metadata_identity,
+                reconstruction_metadata: computed_reconstruction_metadata_identity,
+                style_record: style_record_identity,
+                animation_overlay_slot: animation_overlay_publication.slot,
+            });
             (
                 previous.is_none_or(|previous| previous.groups != identity),
                 previous.is_none_or(|previous| previous.inherited_groups != inherited_identity),
@@ -1212,43 +1546,42 @@ impl ComputedGroupSets {
             )
         } else if let Some(ComputedStyleTarget { node, .. }) = target {
             let index = node.element_index().expect("only elements publish computed groups") as usize;
-            if self.column.len() <= index {
-                self.column.resize(index + 1, None);
-                self.inherited_column.resize(index + 1, None);
-                self.custom_property_environment_column.resize(index + 1, None);
-                self.computed_fixed_metadata_column.resize(index + 1, None);
-                self.computed_reconstruction_metadata_column.resize(index + 1, None);
+            self.columns.ensure(index);
+            if self.style_record_column.len() <= index {
                 self.style_record_column.resize(index + 1, None);
-                self.animation_overlay_column.resize(index + 1, None);
-                self.inherited_group_swap_eligible_column.resize(index + 1, 0);
-                self.cascade_state_column.resize(index + 1, None);
             }
             let previous_style_record_identity = self.style_record_column[index]
-                .map(|style_record| self.final_style_record(style_record, self.animation_overlay_column[index]));
+                .map(|style_record| self.final_style_record(style_record, self.columns.animation_overlay_slot(index)));
             let animation_overlay_publication = self.update_animation_overlay(
-                self.animation_overlay_column[index],
+                self.columns.animation_overlay_slot(index),
                 style_record_identity,
                 animation_overlay_identity,
                 &mut animated_properties,
                 animation_overlay_payloads,
             );
             let changed = (
-                self.column[index] != Some(identity),
-                self.inherited_column[index] != Some(inherited_identity),
-                self.custom_property_environment_column[index] != Some(custom_property_environment_identity),
-                self.computed_fixed_metadata_column[index] != Some(computed_fixed_metadata_identity),
-                self.computed_reconstruction_metadata_column[index] != Some(computed_reconstruction_metadata_identity),
+                self.columns.groups(index) != Some(identity),
+                self.columns.inherited_groups(index) != Some(inherited_identity),
+                self.columns.custom_properties(index) != Some(custom_property_environment_identity),
+                self.columns.fixed_metadata(index) != Some(computed_fixed_metadata_identity),
+                self.columns.reconstruction_metadata(index) != Some(computed_reconstruction_metadata_identity),
                 previous_style_record_identity,
                 animation_overlay_publication,
             );
-            self.column[index] = Some(identity);
-            self.inherited_column[index] = Some(inherited_identity);
-            self.custom_property_environment_column[index] = Some(custom_property_environment_identity);
-            self.computed_fixed_metadata_column[index] = Some(computed_fixed_metadata_identity);
-            self.computed_reconstruction_metadata_column[index] = Some(computed_reconstruction_metadata_identity);
+            self.columns.publish(
+                index,
+                PublishedComputedInputs {
+                    groups: identity,
+                    inherited_groups: inherited_identity,
+                    custom_properties: custom_property_environment_identity,
+                    fixed_metadata: computed_fixed_metadata_identity,
+                    reconstruction_metadata: computed_reconstruction_metadata_identity,
+                    style_record: style_record_identity,
+                    animation_overlay_slot: animation_overlay_publication.slot,
+                },
+                inherited_group_swap_eligible,
+            );
             self.style_record_column[index] = Some(style_record_identity);
-            self.animation_overlay_column[index] = animation_overlay_publication.slot;
-            self.inherited_group_swap_eligible_column[index] = u8::from(inherited_group_swap_eligible);
             changed
         } else {
             assert_eq!(
@@ -1264,7 +1597,7 @@ impl ComputedGroupSets {
                 None,
                 AnimationOverlayPublication {
                     slot: None,
-                    final_style_record: FinalStyleRecordID::base(style_record_identity),
+                    final_style_record: self.final_base_style_record(style_record_identity),
                     slot_allocated: false,
                     slot_released: false,
                     record_updated: false,
@@ -1308,9 +1641,13 @@ impl ComputedGroupSets {
     ) -> Option<ComputedGroupPublication> {
         let final_style_record = FinalStyleRecordID(raw_style_record);
         let requested_style_record_identity = final_style_record.base_record()?;
+        assert!(
+            self.style_record_generation_is_live(requested_style_record_identity, final_style_record.base_generation()),
+            "base style-record is not live"
+        );
         let previous_base_style_record_identity = if target.is_pseudo() {
-            self.pseudo_assignments
-                .get(&(target.node, target.pseudo_kind))
+            self.pseudo_row(target.node, target.pseudo_kind)
+                .and_then(|row| row.assignment)
                 .map(|assignment| assignment.style_record)
         } else {
             target
@@ -1327,13 +1664,10 @@ impl ComputedGroupSets {
         let style_record_identity = previous_base_style_record_identity
             .filter(|&previous| self.style_records_equal_by_value(previous, requested_style_record_identity))
             .unwrap_or(requested_style_record_identity);
-        let record = *self.style_records.get_index(style_record_identity.raw() as usize - 1)?;
-        let inherited_groups = &self.sets[record.groups].identities[..inherited_group_count];
-        let inherited_identity = self
-            .inherited_sets
-            .find(content_hash(inherited_groups), |_identity, groups| {
-                groups.as_ref() == inherited_groups
-            })?;
+        let record = *self.style_records.get_index(style_record_identity.index())?;
+        let group_identities = self.group_identities(record.groups);
+        let inherited_groups = &group_identities[..inherited_group_count];
+        let (inherited_identity, new_inherited_group_set) = self.intern_inherited_group_set(inherited_groups);
 
         let is_pseudo = target.is_pseudo();
         let (
@@ -1345,8 +1679,9 @@ impl ComputedGroupSets {
             previous_style_record_identity,
             animation_overlay_publication,
         ) = if target.is_pseudo() {
-            let key = (target.node, target.pseudo_kind);
-            let previous = self.pseudo_assignments.get(&key).copied();
+            let previous = self
+                .pseudo_row(target.node, target.pseudo_kind)
+                .and_then(|row| row.assignment);
             let previous_style_record_identity = previous
                 .map(|previous| self.final_style_record(previous.style_record, previous.animation_overlay_slot));
             let mut animated_properties = None;
@@ -1357,26 +1692,17 @@ impl ComputedGroupSets {
                 &mut animated_properties,
                 &[],
             );
-            if previous.is_none() {
-                let kinds = self.pseudo_kinds_by_node.entry(target.node).or_default();
-                let capacity_before = kinds.capacity();
-                kinds.push(target.pseudo_kind);
-                self.pseudo_assignment_nested_memory
-                    .grow_committed((kinds.capacity() - capacity_before) as u64);
-            }
-            self.pseudo_assignments.insert(
-                key,
-                PublishedComputedInputs {
-                    groups: record.groups,
-                    inherited_groups: inherited_identity,
-                    custom_properties: record.custom_properties,
-                    fixed_metadata: record.fixed_metadata,
-                    reconstruction_metadata: record.reconstruction_metadata,
-                    style_record: style_record_identity,
-                    animation_overlay_slot: None,
-                    cascade_state: previous.and_then(|previous| previous.cascade_state),
-                },
-            );
+            let row = self.ensure_pseudo_row(target.node, target.pseudo_kind);
+            row.set_published(true);
+            row.assignment = Some(PublishedComputedInputs {
+                groups: record.groups,
+                inherited_groups: inherited_identity,
+                custom_properties: record.custom_properties,
+                fixed_metadata: record.fixed_metadata,
+                reconstruction_metadata: record.reconstruction_metadata,
+                style_record: style_record_identity,
+                animation_overlay_slot: None,
+            });
             (
                 previous.is_none_or(|previous| previous.groups != record.groups),
                 previous.is_none_or(|previous| previous.inherited_groups != inherited_identity),
@@ -1391,44 +1717,43 @@ impl ComputedGroupSets {
                 .node
                 .element_index()
                 .expect("only elements publish computed groups") as usize;
-            if self.column.len() <= index {
-                self.column.resize(index + 1, None);
-                self.inherited_column.resize(index + 1, None);
-                self.custom_property_environment_column.resize(index + 1, None);
-                self.computed_fixed_metadata_column.resize(index + 1, None);
-                self.computed_reconstruction_metadata_column.resize(index + 1, None);
+            self.columns.ensure(index);
+            if self.style_record_column.len() <= index {
                 self.style_record_column.resize(index + 1, None);
-                self.animation_overlay_column.resize(index + 1, None);
-                self.inherited_group_swap_eligible_column.resize(index + 1, 0);
-                self.cascade_state_column.resize(index + 1, None);
             }
             let previous_style_record_identity = self.style_record_column[index]
-                .map(|style_record| self.final_style_record(style_record, self.animation_overlay_column[index]));
+                .map(|style_record| self.final_style_record(style_record, self.columns.animation_overlay_slot(index)));
             let mut animated_properties = None;
             let animation_overlay_publication = self.update_animation_overlay(
-                self.animation_overlay_column[index],
+                self.columns.animation_overlay_slot(index),
                 style_record_identity,
                 0,
                 &mut animated_properties,
                 &[],
             );
             let changed = (
-                self.column[index] != Some(record.groups),
-                self.inherited_column[index] != Some(inherited_identity),
-                self.custom_property_environment_column[index] != Some(record.custom_properties),
-                self.computed_fixed_metadata_column[index] != Some(record.fixed_metadata),
-                self.computed_reconstruction_metadata_column[index] != Some(record.reconstruction_metadata),
+                self.columns.groups(index) != Some(record.groups),
+                self.columns.inherited_groups(index) != Some(inherited_identity),
+                self.columns.custom_properties(index) != Some(record.custom_properties),
+                self.columns.fixed_metadata(index) != Some(record.fixed_metadata),
+                self.columns.reconstruction_metadata(index) != Some(record.reconstruction_metadata),
                 previous_style_record_identity,
                 animation_overlay_publication,
             );
-            self.column[index] = Some(record.groups);
-            self.inherited_column[index] = Some(inherited_identity);
-            self.custom_property_environment_column[index] = Some(record.custom_properties);
-            self.computed_fixed_metadata_column[index] = Some(record.fixed_metadata);
-            self.computed_reconstruction_metadata_column[index] = Some(record.reconstruction_metadata);
+            self.columns.publish(
+                index,
+                PublishedComputedInputs {
+                    groups: record.groups,
+                    inherited_groups: inherited_identity,
+                    custom_properties: record.custom_properties,
+                    fixed_metadata: record.fixed_metadata,
+                    reconstruction_metadata: record.reconstruction_metadata,
+                    style_record: style_record_identity,
+                    animation_overlay_slot: None,
+                },
+                inherited_group_swap_eligible,
+            );
             self.style_record_column[index] = Some(style_record_identity);
-            self.animation_overlay_column[index] = None;
-            self.inherited_group_swap_eligible_column[index] = u8::from(inherited_group_swap_eligible);
             changed
         };
 
@@ -1438,7 +1763,7 @@ impl ComputedGroupSets {
             new_groups: 0,
             canonical_output_groups_reused: 0,
             new_group_set: false,
-            new_inherited_group_set: false,
+            new_inherited_group_set,
             new_custom_property_environment: false,
             new_computed_fixed_metadata: false,
             new_computed_reconstruction_metadata: false,
@@ -1462,10 +1787,10 @@ impl ComputedGroupSets {
         if first == second {
             return true;
         }
-        let Some(first) = self.style_records.get_index(first.raw() as usize - 1) else {
+        let Some(first) = self.style_records.get_index(first.index()) else {
             return false;
         };
-        let Some(second) = self.style_records.get_index(second.raw() as usize - 1) else {
+        let Some(second) = self.style_records.get_index(second.index()) else {
             return false;
         };
         if first.custom_properties != second.custom_properties
@@ -1474,17 +1799,14 @@ impl ComputedGroupSets {
         {
             return false;
         }
-        let first_groups = &self.sets[first.groups].identities;
-        let second_groups = &self.sets[second.groups].identities;
+        let first_groups = &self.sets[first.groups].payloads;
+        let second_groups = &self.sets[second.groups].payloads;
         if first_groups.len() != second_groups.len()
             || first_groups
                 .iter()
                 .zip(second_groups)
                 .enumerate()
-                .any(|(index, (&first, &second))| {
-                    first != second
-                        && !style_group_payloads_equal(index, self.groups[first].payload, self.groups[second].payload)
-                })
+                .any(|(index, (&first, &second))| first != second && !style_group_payloads_equal(index, first, second))
         {
             return false;
         }
@@ -1503,57 +1825,64 @@ impl ComputedGroupSets {
     }
 
     pub fn set_pending_cascade_state(&mut self, target: ComputedStyleTarget, state: (u64, CascadeStateID)) {
-        self.pending_cascade_states
-            .insert((target.node, target.pseudo_kind), state);
+        if !target.is_pseudo() {
+            self.pending_cascade_states.insert(target.node, state);
+            return;
+        }
+        self.ensure_pseudo_row(target.node, target.pseudo_kind)
+            .replace_cascade_state(PseudoComputedRow::PENDING_CASCADE, Some(state));
     }
 
     pub fn take_pending_cascade_state(&mut self, target: ComputedStyleTarget) -> Option<(u64, CascadeStateID)> {
-        self.pending_cascade_states.remove(&(target.node, target.pseudo_kind))
+        if !target.is_pseudo() {
+            return self.pending_cascade_states.remove(&target.node);
+        }
+        let state = self
+            .pseudo_row_mut(target.node, target.pseudo_kind)
+            .and_then(|row| row.replace_cascade_state(PseudoComputedRow::PENDING_CASCADE, None));
+        self.remove_empty_pseudo_row(target.node, target.pseudo_kind);
+        state
     }
 
     #[must_use]
     pub fn cascade_state(&self, target: ComputedStyleTarget) -> Option<(u64, CascadeStateID)> {
         if target.is_pseudo() {
             return self
-                .pseudo_cascade_state_rows
-                .get(&(target.node, target.pseudo_kind))
-                .copied();
+                .pseudo_row(target.node, target.pseudo_kind)?
+                .cascade_state(PseudoComputedRow::CURRENT_CASCADE);
         }
         target
             .node
             .element_index()
-            .and_then(|index| self.cascade_state_column.get(index as usize).copied().flatten())
+            .and_then(|index| self.columns.cascade_state(index as usize))
     }
 
     pub fn pseudo_retained_cascade_states(
         &self,
         node: StyleNodeID,
     ) -> impl Iterator<Item = (u8, (u64, CascadeStateID))> + '_ {
-        self.pseudo_retained_cascade_rows
-            .iter()
-            .filter_map(move |(&(row_node, pseudo_kind), &state)| (row_node == node).then_some((pseudo_kind, state)))
+        self.pseudo_rows(node).iter().filter_map(|row| {
+            row.cascade_state(PseudoComputedRow::RETAINED_CASCADE)
+                .map(|state| (row.kind, state))
+        })
     }
 
     #[must_use]
     pub fn pseudo_retained_cascade_state(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<(u64, CascadeStateID)> {
-        self.pseudo_retained_cascade_rows.get(&(node, pseudo_kind)).copied()
+        self.pseudo_row(node, pseudo_kind)?
+            .cascade_state(PseudoComputedRow::RETAINED_CASCADE)
     }
 
     /// The pseudo-element kinds this node holds published computed styles for.
     pub fn assigned_pseudo_kinds(&self, node: StyleNodeID) -> impl Iterator<Item = u8> + '_ {
-        self.pseudo_kinds_by_node
-            .get(&node)
-            .into_iter()
-            .flat_map(|kinds| kinds.iter().copied())
+        self.pseudo_rows(node)
+            .iter()
+            .filter_map(|row| row.is_published().then_some(row.kind))
     }
 
     #[cfg(test)]
     pub fn record_pseudo_kind_for_test(&mut self, node: StyleNodeID, pseudo_kind: u8) {
-        let kinds = self.pseudo_kinds_by_node.entry(node).or_default();
-        let capacity_before = kinds.capacity();
-        kinds.push(pseudo_kind);
-        self.pseudo_assignment_nested_memory
-            .grow_committed((kinds.capacity() - capacity_before) as u64);
+        self.ensure_pseudo_row(node, pseudo_kind).set_published(true);
     }
 
     fn specified_value_dependency_mask(
@@ -1562,16 +1891,14 @@ impl ComputedGroupSets {
         depends_on_input: impl Fn(&RetainedStyleValueData) -> bool,
     ) -> Option<u32> {
         let reconstruction_metadata = if target.is_pseudo() {
-            self.pseudo_assignments
-                .get(&(target.node, target.pseudo_kind))
+            self.pseudo_row(target.node, target.pseudo_kind)
+                .and_then(|row| row.assignment)
                 .map(|assignment| assignment.reconstruction_metadata)
         } else {
             target
                 .node
                 .element_index()
-                .and_then(|index| self.computed_reconstruction_metadata_column.get(index as usize))
-                .copied()
-                .flatten()
+                .and_then(|index| self.columns.reconstruction_metadata(index as usize))
         }?;
         let mask = self.computed_reconstruction_metadata[reconstruction_metadata.0 as usize]
             .inheritance_dependent_values
@@ -1590,16 +1917,14 @@ impl ComputedGroupSets {
         depends_on_input: impl Fn(&RetainedStyleValueData) -> bool,
     ) -> Option<[u64; 6]> {
         let reconstruction_metadata = if target.is_pseudo() {
-            self.pseudo_assignments
-                .get(&(target.node, target.pseudo_kind))
+            self.pseudo_row(target.node, target.pseudo_kind)
+                .and_then(|row| row.assignment)
                 .map(|assignment| assignment.reconstruction_metadata)
         } else {
             target
                 .node
                 .element_index()
-                .and_then(|index| self.computed_reconstruction_metadata_column.get(index as usize))
-                .copied()
-                .flatten()
+                .and_then(|index| self.columns.reconstruction_metadata(index as usize))
         }?;
         let mut properties = [0u64; 6];
         for entry in
@@ -1666,88 +1991,54 @@ impl ComputedGroupSets {
         cascade_state: (u64, CascadeStateID),
     ) -> Option<(u64, CascadeStateID)> {
         if target.is_pseudo() {
-            let assignment = self
-                .pseudo_assignments
-                .get_mut(&(target.node, target.pseudo_kind))
-                .expect("a pseudo style must be published before its cascade state is bound");
-            assignment.cascade_state = Some(cascade_state);
-            return self
-                .pseudo_cascade_state_rows
-                .insert((target.node, target.pseudo_kind), cascade_state);
+            let row = self.ensure_pseudo_row(target.node, target.pseudo_kind);
+            assert!(
+                row.assignment.is_some(),
+                "a pseudo style must be published before its cascade state is bound"
+            );
+            return row.replace_cascade_state(PseudoComputedRow::CURRENT_CASCADE, Some(cascade_state));
         }
         let index = target
             .node
             .element_index()
             .expect("only elements publish computed groups") as usize;
-        debug_assert!(index < self.cascade_state_column.len());
-        self.cascade_state_column[index].replace(cascade_state)
+        debug_assert!(index < self.columns.flags.len());
+        self.columns.replace_cascade_state(index, Some(cascade_state))
     }
 
     /// Forget the exact cascade state behind a style published through a path that did not run the
     /// cascade, so a later comparison cannot use the state behind an older publication.
     pub fn clear_cascade_state(&mut self, target: ComputedStyleTarget) {
         if target.is_pseudo() {
-            self.pseudo_cascade_state_rows
-                .remove(&(target.node, target.pseudo_kind));
-            self.pseudo_retained_cascade_rows
-                .remove(&(target.node, target.pseudo_kind));
-            if let Some(assignment) = self.pseudo_assignments.get_mut(&(target.node, target.pseudo_kind)) {
-                assignment.cascade_state = None;
+            if let Some(row) = self.pseudo_row_mut(target.node, target.pseudo_kind) {
+                row.replace_cascade_state(PseudoComputedRow::CURRENT_CASCADE, None);
+                row.replace_cascade_state(PseudoComputedRow::RETAINED_CASCADE, None);
             }
+            self.remove_empty_pseudo_row(target.node, target.pseudo_kind);
             return;
         }
         let Some(index) = target.node.element_index().map(|index| index as usize) else {
             return;
         };
-        if let Some(slot) = self.cascade_state_column.get_mut(index) {
-            *slot = None;
-        }
+        self.columns.replace_cascade_state(index, None);
     }
 
     pub fn remove(&mut self, node: StyleNodeID) {
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return;
         };
-        if let Some(slot) = self.column.get_mut(index) {
-            *slot = None;
-        }
-        if let Some(slot) = self.inherited_column.get_mut(index) {
-            *slot = None;
-        }
-        if let Some(slot) = self.custom_property_environment_column.get_mut(index) {
-            *slot = None;
-        }
-        if let Some(slot) = self.computed_fixed_metadata_column.get_mut(index) {
-            *slot = None;
-        }
-        if let Some(slot) = self.computed_reconstruction_metadata_column.get_mut(index) {
-            *slot = None;
-        }
         if let Some(slot) = self.style_record_column.get_mut(index) {
             *slot = None;
         }
-        if let Some(slot) = self.animation_overlay_column.get_mut(index).and_then(Option::take) {
+        if let Some(slot) = self.columns.remove(index) {
             self.release_animation_overlay_assignment(slot);
         }
-        if let Some(slot) = self.inherited_group_swap_eligible_column.get_mut(index) {
-            *slot = 0;
-        }
-        if let Some(slot) = self.cascade_state_column.get_mut(index) {
-            *slot = None;
-        }
-        self.pending_cascade_states
-            .retain(|(pending_node, _), _| *pending_node != node);
-        self.pseudo_cascade_state_rows
-            .retain(|(row_node, _), _| *row_node != node);
-        self.pseudo_retained_cascade_rows
-            .retain(|(row_node, _), _| *row_node != node);
-        if let Some(kinds) = self.pseudo_kinds_by_node.remove(&node) {
+        self.pending_cascade_states.remove(&node);
+        if let Some(rows) = self.pseudo_rows_by_node.remove(&node) {
             self.pseudo_assignment_nested_memory
-                .shrink_committed(kinds.capacity() as u64);
-            for pseudo_kind in kinds {
-                if let Some(removed) = self.pseudo_assignments.remove(&(node, pseudo_kind))
-                    && let Some(slot) = removed.animation_overlay_slot
-                {
+                .shrink_committed(size_of_val(rows.as_ref()) as u64);
+            for row in rows.into_vec() {
+                if let Some(slot) = row.assignment.and_then(|assignment| assignment.animation_overlay_slot) {
                     self.release_animation_overlay_assignment(slot);
                 }
             }
@@ -1755,32 +2046,22 @@ impl ComputedGroupSets {
     }
 
     pub fn remove_pseudo(&mut self, node: StyleNodeID, pseudo_kind: u8) -> Option<FinalStyleRecordID> {
-        let removed = self.pseudo_assignments.remove(&(node, pseudo_kind))?;
+        let row = self.pseudo_row_mut(node, pseudo_kind)?;
+        let removed = row.assignment.take()?;
+        row.set_published(false);
+        row.replace_cascade_state(PseudoComputedRow::PENDING_CASCADE, None);
         let final_style_record = self.final_style_record(removed.style_record, removed.animation_overlay_slot);
         if let Some(slot) = removed.animation_overlay_slot {
             self.release_animation_overlay_assignment(slot);
         }
-        self.pending_cascade_states.remove(&(node, pseudo_kind));
-        let mut remove_node_entry = false;
-        if let Some(kinds) = self.pseudo_kinds_by_node.get_mut(&node) {
-            kinds.retain(|kind| *kind != pseudo_kind);
-            remove_node_entry = kinds.is_empty();
-        }
-        if remove_node_entry {
-            let kinds = self
-                .pseudo_kinds_by_node
-                .remove(&node)
-                .expect("pseudo-kind index entry is live");
-            self.pseudo_assignment_nested_memory
-                .shrink_committed(kinds.capacity() as u64);
-        }
+        self.remove_empty_pseudo_row(node, pseudo_kind);
         Some(final_style_record)
     }
 
     pub fn observe_absent_pseudo_cascade_state(&mut self, target: ComputedStyleTarget, state: (u64, CascadeStateID)) {
         debug_assert!(target.is_pseudo());
-        self.pseudo_cascade_state_rows
-            .insert((target.node, target.pseudo_kind), state);
+        self.ensure_pseudo_row(target.node, target.pseudo_kind)
+            .replace_cascade_state(PseudoComputedRow::CURRENT_CASCADE, Some(state));
     }
 
     pub fn observe_pseudo_retained_cascade_state(
@@ -1789,13 +2070,9 @@ impl ComputedGroupSets {
         state: Option<(u64, CascadeStateID)>,
     ) {
         debug_assert!(target.is_pseudo());
-        if let Some(state) = state {
-            self.pseudo_retained_cascade_rows
-                .insert((target.node, target.pseudo_kind), state);
-        } else {
-            self.pseudo_retained_cascade_rows
-                .remove(&(target.node, target.pseudo_kind));
-        }
+        self.ensure_pseudo_row(target.node, target.pseudo_kind)
+            .replace_cascade_state(PseudoComputedRow::RETAINED_CASCADE, state);
+        self.remove_empty_pseudo_row(target.node, target.pseudo_kind);
     }
 
     #[must_use]
@@ -1804,9 +2081,9 @@ impl ComputedGroupSets {
             shallow [
                 self.groups,
                 self.sets,
-                self.column,
+                self.columns.groups,
                 self.inherited_sets,
-                self.inherited_column,
+                self.columns.inherited_groups,
             ];
             cached [self.group_set_nested_memory.bytes()];
             nested [];
@@ -1817,7 +2094,7 @@ impl ComputedGroupSets {
     #[must_use]
     pub fn custom_property_environment_capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.custom_property_environments, self.custom_property_environment_column];
+            shallow [self.custom_property_environments, self.columns.custom_properties];
             cached [];
             nested [];
             skip [];
@@ -1829,7 +2106,7 @@ impl ComputedGroupSets {
         capacity_bytes! {
             shallow [
                 self.computed_fixed_metadata,
-                self.computed_fixed_metadata_column,
+                self.columns.fixed_metadata,
             ];
             cached [];
             nested [];
@@ -1842,7 +2119,7 @@ impl ComputedGroupSets {
         capacity_bytes! {
             shallow [
                 self.computed_reconstruction_metadata,
-                self.computed_reconstruction_metadata_column,
+                self.columns.reconstruction_metadata,
                 self.computed_longhand_tables,
             ];
             cached [self.reconstruction_nested_memory.bytes()];
@@ -1856,9 +2133,13 @@ impl ComputedGroupSets {
         capacity_bytes! {
             shallow [
                 self.style_records,
+                self.style_record_liveness,
+                self.style_record_generations,
                 self.style_record_column,
-                self.inherited_group_swap_eligible_column,
-                self.cascade_state_column,
+                self.base_style_record_pins,
+                self.columns.cascade_versions,
+                self.columns.cascade_states,
+                self.columns.flags,
                 self.pending_cascade_states,
             ];
             cached [];
@@ -1874,7 +2155,7 @@ impl ComputedGroupSets {
                 self.animation_overlay_slots,
                 self.animation_overlay_slots_by_record,
                 self.free_animation_overlay_slots,
-                self.animation_overlay_column,
+                self.columns.animation_overlay_slots,
             ];
             cached [self.animation_overlay_nested_memory.bytes()];
             nested [];
@@ -1887,16 +2168,272 @@ impl ComputedGroupSets {
         self.live_animation_overlay_assignments
     }
 
+    fn reachability(&self) -> ComputedReachability {
+        let mut reachable = ComputedReachability {
+            groups: vec![false; self.groups.len()],
+            sets: vec![false; self.sets.len()],
+            inherited_sets: vec![false; self.inherited_sets.len()],
+            custom_property_environments: vec![false; self.custom_property_environments.len()],
+            fixed_metadata: vec![false; self.computed_fixed_metadata.len()],
+            reconstruction_metadata: vec![false; self.computed_reconstruction_metadata.len()],
+            longhand_tables: vec![false; self.computed_longhand_tables.len()],
+            style_records: vec![false; self.style_records.len()],
+        };
+
+        {
+            let mut mark_style_record = |identity: StyleRecordID| {
+                ComputedReachability::mark(&mut reachable.style_records, identity);
+                let record = self.style_records.get(identity);
+                ComputedReachability::mark(&mut reachable.sets, record.groups);
+                ComputedReachability::mark(&mut reachable.custom_property_environments, record.custom_properties);
+                ComputedReachability::mark(&mut reachable.fixed_metadata, record.fixed_metadata);
+                ComputedReachability::mark(&mut reachable.reconstruction_metadata, record.reconstruction_metadata);
+                if let Some(longhand_table) = record.longhand_table {
+                    ComputedReachability::mark(&mut reachable.longhand_tables, longhand_table);
+                }
+            };
+            for &identity in self.style_record_column.iter().flatten() {
+                mark_style_record(identity);
+            }
+            for rows in self.pseudo_rows_by_node.values() {
+                for assignment in rows.iter().filter_map(|row| row.assignment) {
+                    mark_style_record(assignment.style_record);
+                }
+            }
+            for overlay in self.animation_overlay_slots.iter().flatten() {
+                mark_style_record(overlay.base_style_record);
+            }
+            for &identity in self.base_style_record_pins.keys() {
+                mark_style_record(identity);
+            }
+        }
+
+        for index in 0..self.columns.flags.len() {
+            if !self.columns.is_assigned(index) {
+                continue;
+            }
+            ComputedReachability::mark(&mut reachable.sets, self.columns.groups(index).unwrap());
+            ComputedReachability::mark(
+                &mut reachable.inherited_sets,
+                self.columns.inherited_groups(index).unwrap(),
+            );
+            ComputedReachability::mark(
+                &mut reachable.custom_property_environments,
+                self.columns.custom_properties(index).unwrap(),
+            );
+            ComputedReachability::mark(
+                &mut reachable.fixed_metadata,
+                self.columns.fixed_metadata(index).unwrap(),
+            );
+            ComputedReachability::mark(
+                &mut reachable.reconstruction_metadata,
+                self.columns.reconstruction_metadata(index).unwrap(),
+            );
+        }
+        for rows in self.pseudo_rows_by_node.values() {
+            for assignment in rows.iter().filter_map(|row| row.assignment) {
+                ComputedReachability::mark(&mut reachable.sets, assignment.groups);
+                ComputedReachability::mark(&mut reachable.inherited_sets, assignment.inherited_groups);
+                ComputedReachability::mark(
+                    &mut reachable.custom_property_environments,
+                    assignment.custom_properties,
+                );
+                ComputedReachability::mark(&mut reachable.fixed_metadata, assignment.fixed_metadata);
+                ComputedReachability::mark(
+                    &mut reachable.reconstruction_metadata,
+                    assignment.reconstruction_metadata,
+                );
+            }
+        }
+        for (index, is_reachable) in reachable.sets.iter().copied().enumerate() {
+            if !is_reachable {
+                continue;
+            }
+            for (group_index, &payload) in self.sets[index].payloads.iter().enumerate() {
+                ComputedReachability::mark(&mut reachable.groups, self.group_identity(group_index, payload));
+            }
+        }
+        for (index, is_reachable) in reachable.inherited_sets.iter().copied().enumerate() {
+            if !is_reachable {
+                continue;
+            }
+            for &group in &self.inherited_sets[index] {
+                ComputedReachability::mark(&mut reachable.groups, group);
+            }
+        }
+        reachable
+    }
+
+    pub(super) fn reclaim_unreachable(&mut self) -> ComputedGroupRetention {
+        let reachable = self.reachability();
+        let retention = ComputedGroupRetention {
+            retained: self.groups.live_identities().count(),
+            reachable: reachable.groups.iter().filter(|&&reachable| reachable).count(),
+        };
+        if replaying_style_groups() {
+            return retention;
+        }
+
+        let mut unreachable_style_records = self
+            .style_records
+            .live_identities()
+            .filter(|identity| !reachable.style_records[identity.index()])
+            .collect::<Vec<_>>();
+        unreachable_style_records.sort_unstable_by_key(|identity| std::cmp::Reverse(identity.index()));
+        for identity in unreachable_style_records {
+            let record = *self.style_records.get(identity);
+            if self.style_record_generations[identity.index()] == FinalStyleRecordID::MAX_BASE_GENERATION {
+                self.style_records.remove_identity(content_hash(record), identity);
+            } else {
+                self.style_records.retire_identity(content_hash(record), identity);
+            }
+            let (changed, _) = self.style_record_liveness.set(identity.index(), false);
+            assert!(changed, "retired base style-record identity must be live");
+        }
+        for identity in self.sets.live_identities().collect::<Vec<_>>() {
+            if reachable.sets[identity.index()] {
+                if let Some(longhand_table) = self.sets[identity].canonical_longhand_table
+                    && !reachable.longhand_tables[longhand_table.index()]
+                {
+                    self.sets[identity].canonical_longhand_table = None;
+                }
+                continue;
+            }
+            let set = std::mem::replace(
+                self.sets.get_mut(identity),
+                ComputedGroupSet {
+                    identity_hash: 0,
+                    payloads: Box::default(),
+                    canonical_longhand_table: None,
+                },
+            );
+            self.group_set_nested_memory
+                .shrink_committed(size_of_val(set.payloads.as_ref()) as u64);
+            self.sets.retire_identity(set.identity_hash, identity);
+        }
+        for identity in self.inherited_sets.live_identities().collect::<Vec<_>>() {
+            if reachable.inherited_sets[identity.index()] {
+                continue;
+            }
+            let groups = std::mem::take(self.inherited_sets.get_mut(identity));
+            self.group_set_nested_memory
+                .shrink_committed(size_of_val(groups.as_ref()) as u64);
+            self.inherited_sets.retire_identity(content_hash(&groups), identity);
+        }
+        for identity in self.custom_property_environments.live_identities().collect::<Vec<_>>() {
+            if reachable.custom_property_environments[identity.index()] {
+                continue;
+            }
+            let environment = *self.custom_property_environments.get(identity);
+            self.custom_property_environments
+                .retire_identity(content_hash(environment), identity);
+        }
+        for identity in self.computed_fixed_metadata.live_identities().collect::<Vec<_>>() {
+            if reachable.fixed_metadata[identity.index()] {
+                continue;
+            }
+            let metadata = *self.computed_fixed_metadata.get(identity);
+            self.computed_fixed_metadata
+                .retire_identity(content_hash(metadata), identity);
+        }
+        for identity in self
+            .computed_reconstruction_metadata
+            .live_identities()
+            .collect::<Vec<_>>()
+        {
+            if reachable.reconstruction_metadata[identity.index()] {
+                continue;
+            }
+            let metadata = self.computed_reconstruction_metadata.get(identity);
+            let inheritance_dependent_values = metadata
+                .inheritance_dependent_values
+                .iter()
+                .map(|entry| (entry.property, entry.value.pointer().cast()))
+                .collect::<Vec<_>>();
+            let hash = reconstruction_metadata_hash(
+                &metadata.property_importance,
+                &metadata.property_inheritance,
+                &inheritance_dependent_values,
+                metadata
+                    .raw_cascaded_font_size
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.pointer().cast()),
+            );
+            let metadata = std::mem::replace(
+                self.computed_reconstruction_metadata.get_mut(identity),
+                ComputedReconstructionMetadata {
+                    property_importance: Box::default(),
+                    property_inheritance: Box::default(),
+                    inheritance_dependent_values: Box::default(),
+                    raw_cascaded_font_size: None,
+                },
+            );
+            self.reconstruction_nested_memory.shrink_committed(
+                (metadata.property_importance.len()
+                    + metadata.property_inheritance.len()
+                    + size_of_val(metadata.inheritance_dependent_values.as_ref())) as u64,
+            );
+            self.computed_reconstruction_metadata.retire_identity(hash, identity);
+        }
+        for identity in self.computed_longhand_tables.live_identities().collect::<Vec<_>>() {
+            if reachable.longhand_tables[identity.index()] {
+                continue;
+            }
+            let hash = longhand_table_hash(self.computed_longhand_tables[identity].value_view());
+            let table = std::mem::replace(
+                self.computed_longhand_tables.get_mut(identity),
+                RetainedLonghandTable {
+                    storage: RetainedLonghandTableStorage::Values(Box::default()),
+                },
+            );
+            self.reconstruction_nested_memory
+                .shrink_committed(size_of_val(table.value_view()) as u64);
+            self.computed_longhand_tables.retire_identity(hash, identity);
+        }
+        for identity in self.groups.live_identities().collect::<Vec<_>>() {
+            if reachable.groups[identity.index()] {
+                continue;
+            }
+            let group = std::mem::replace(
+                self.groups.get_mut(identity),
+                ComputedGroup {
+                    index: usize::MAX,
+                    payload: std::ptr::null(),
+                },
+            );
+            self.groups
+                .retire_identity(content_hash((group.index, group.payload as usize)), identity);
+            self.group_set_nested_memory
+                .shrink_committed(retained_group_payload_bytes(group.index, group.payload) as u64);
+            release_group_payload(group.index, group.payload);
+        }
+        retention
+    }
+
+    pub(super) fn reclaim_unreachable_if_needed(&mut self) -> Option<ComputedGroupRetention> {
+        if self.style_records_interned_since_reclamation < self.next_reclamation_after {
+            return None;
+        }
+        self.style_records_interned_since_reclamation = 0;
+        let retention = self.reclaim_unreachable();
+        self.next_reclamation_after = self.style_records.live_identities().count().max(1024);
+        Some(retention)
+    }
+
     pub fn style_record_payloads(&self, raw_style_record: u64) -> Option<&[*const c_void]> {
+        let final_style_record = FinalStyleRecordID(raw_style_record);
         if raw_style_record & FinalStyleRecordID::ANIMATION_OVERLAY_TAG != 0 {
-            let style_record = FinalStyleRecordID(raw_style_record);
+            let style_record = final_style_record;
             let slot = *self.animation_overlay_slots_by_record.get(&style_record)?;
             let record = self.animation_overlay_slots[slot as usize].as_ref()?;
             return (!record.payloads.is_empty()).then_some(record.payloads.as_ref());
         }
-        let raw_style_record = u32::try_from(raw_style_record).ok()?;
-        let record_index = raw_style_record.checked_sub(1)? as usize;
-        let record = self.style_records.get_index(record_index)?;
+        let style_record = final_style_record.base_record()?;
+        assert!(
+            self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+            "base style-record is not live"
+        );
+        let record = self.style_records.get_index(style_record.index())?;
         Some(&self.sets[record.groups].payloads)
     }
 
@@ -1904,17 +2441,26 @@ impl ComputedGroupSets {
     pub(crate) fn recording_group_identities(&self, raw_style_record: u64) -> Option<Vec<u32>> {
         let final_style_record = FinalStyleRecordID(raw_style_record);
         let base_style_record = match final_style_record.base_record() {
-            Some(style_record) => style_record,
+            Some(style_record) => {
+                assert!(
+                    self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+                    "base style-record is not live"
+                );
+                style_record
+            }
             None => {
                 let slot = *self.animation_overlay_slots_by_record.get(&final_style_record)?;
                 self.animation_overlay_slots[slot as usize].as_ref()?.base_style_record
             }
         };
-        let record = self.style_records.get_index(base_style_record.raw() as usize - 1)?;
+        assert!(
+            self.style_record_is_live(base_style_record),
+            "base style-record is not live"
+        );
+        let record = self.style_records.get_index(base_style_record.index())?;
         Some(
-            self.sets[record.groups]
-                .identities
-                .iter()
+            self.group_identities(record.groups)
+                .into_iter()
                 .map(|identity| identity.0)
                 .collect(),
         )
@@ -1934,11 +2480,47 @@ impl ComputedGroupSets {
         )
     }
 
+    #[cfg(feature = "style-recording")]
+    pub(crate) fn recording_longhand_table(&self, raw_style_record: u64) -> Option<(u32, &[*const c_void])> {
+        let final_style_record = FinalStyleRecordID(raw_style_record);
+        let base_style_record = match final_style_record.base_record() {
+            Some(style_record) => {
+                assert!(
+                    self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+                    "base style-record is not live"
+                );
+                style_record
+            }
+            None => {
+                let slot = *self.animation_overlay_slots_by_record.get(&final_style_record)?;
+                self.animation_overlay_slots[slot as usize].as_ref()?.base_style_record
+            }
+        };
+        assert!(
+            self.style_record_is_live(base_style_record),
+            "base style-record is not live"
+        );
+        let identity = self
+            .style_records
+            .get_index(base_style_record.index())?
+            .longhand_table?;
+        Some((
+            identity.0,
+            self.computed_longhand_tables
+                .get_index(identity.0 as usize)?
+                .value_view(),
+        ))
+    }
+
     pub(crate) fn style_record_view(&self, raw_style_record: u64) -> Option<StyleRecordView<'_>> {
         let final_style_record = FinalStyleRecordID(raw_style_record);
         let (base_style_record, payloads, animation_overlay_identity, animated_properties) =
             if let Some(style_record) = final_style_record.base_record() {
-                let record = self.style_records.get_index(style_record.raw() as usize - 1)?;
+                assert!(
+                    self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+                    "base style-record is not live"
+                );
+                let record = self.style_records.get_index(style_record.index())?;
                 (
                     style_record,
                     self.sets[record.groups].payloads.as_ref(),
@@ -1955,7 +2537,11 @@ impl ComputedGroupSets {
                     overlay.animated_properties.pointer(),
                 )
             };
-        let record = self.style_records.get_index(base_style_record.raw() as usize - 1)?;
+        assert!(
+            self.style_record_is_live(base_style_record),
+            "base style-record is not live"
+        );
+        let record = self.style_records.get_index(base_style_record.index())?;
         let base_payloads = self.sets[record.groups].payloads.as_ref();
         let fixed_metadata = self
             .computed_fixed_metadata
@@ -1972,7 +2558,7 @@ impl ComputedGroupSets {
             base_payloads,
             property_importance: &reconstruction_metadata.property_importance,
             property_inheritance: &reconstruction_metadata.property_inheritance,
-            inheritance_dependent_values: &reconstruction_metadata.inheritance_dependent_value_view,
+            inheritance_dependent_values: reconstruction_metadata.inheritance_dependent_value_view(),
             longhand_values,
             raw_cascaded_font_size: reconstruction_metadata
                 .raw_cascaded_font_size
@@ -1988,7 +2574,13 @@ impl ComputedGroupSets {
 
     pub fn pin_style_record(&mut self, raw_style_record: u64) {
         let final_style_record = FinalStyleRecordID(raw_style_record);
-        if final_style_record.base_record().is_some() {
+        if let Some(style_record) = final_style_record.base_record() {
+            assert!(
+                self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+                "base style-record is not live"
+            );
+            let pin_count = self.base_style_record_pins.entry(style_record).or_default();
+            *pin_count = pin_count.checked_add(1).expect("base style-record pin count overflow");
             return;
         }
         let slot = *self
@@ -2006,7 +2598,19 @@ impl ComputedGroupSets {
 
     pub fn unpin_style_record(&mut self, raw_style_record: u64) {
         let final_style_record = FinalStyleRecordID(raw_style_record);
-        if final_style_record.base_record().is_some() {
+        if let Some(style_record) = final_style_record.base_record() {
+            assert!(
+                self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
+                "base style-record is not live"
+            );
+            let pin_count = self
+                .base_style_record_pins
+                .get_mut(&style_record)
+                .expect("base style-record is pinned");
+            *pin_count = pin_count.checked_sub(1).expect("base style-record is pinned");
+            if *pin_count == 0 {
+                self.base_style_record_pins.remove(&style_record);
+            }
             return;
         }
         let slot = *self
@@ -2028,12 +2632,7 @@ impl ComputedGroupSets {
     #[must_use]
     pub fn pseudo_assignment_capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [
-                self.pseudo_assignments,
-                self.pseudo_kinds_by_node,
-                self.pseudo_cascade_state_rows,
-                self.pseudo_retained_cascade_rows,
-            ];
+            shallow [self.pseudo_rows_by_node];
             cached [self.pseudo_assignment_nested_memory.bytes()];
             nested [];
             skip [];
@@ -2041,10 +2640,17 @@ impl ComputedGroupSets {
     }
 
     pub fn settle_nested_memory(&mut self, memory: &mut MemoryController) {
-        self.group_set_nested_memory.settle_committed(memory);
-        self.reconstruction_nested_memory.settle_committed(memory);
-        self.animation_overlay_nested_memory.settle_committed(memory);
-        self.pseudo_assignment_nested_memory.settle_committed(memory);
+        let group_set = self.group_set_nested_memory.bytes();
+        self.group_set_nested_memory.reconcile_committed(memory, group_set);
+        let reconstruction = self.reconstruction_nested_memory.bytes();
+        self.reconstruction_nested_memory
+            .reconcile_committed(memory, reconstruction);
+        let animation_overlay = self.animation_overlay_nested_memory.bytes();
+        self.animation_overlay_nested_memory
+            .reconcile_committed(memory, animation_overlay);
+        let pseudo_assignment = self.pseudo_assignment_nested_memory.bytes();
+        self.pseudo_assignment_nested_memory
+            .reconcile_committed(memory, pseudo_assignment);
     }
 
     #[must_use]
@@ -2092,7 +2698,8 @@ impl ComputedGroupSets {
 
 impl Drop for ComputedGroupSets {
     fn drop(&mut self) {
-        for group in &self.groups {
+        for identity in self.groups.live_identities() {
+            let group = self.groups.get(identity);
             release_group_payload(group.index, group.payload);
         }
     }
@@ -2369,6 +2976,117 @@ mod tests {
     }
 
     #[test]
+    fn base_style_record_pins_are_counted_until_the_last_view_releases() {
+        let mut sets = ComputedGroupSets::default();
+        let publication = sets.publish(None, &[], 0, 0, metadata(0, 0, 0, &[], &[]));
+        let style_record = publication.style_record_identity;
+        let base_style_record = style_record.base_record().unwrap();
+
+        sets.pin_style_record(style_record.raw());
+        sets.pin_style_record(style_record.raw());
+        assert_eq!(sets.base_style_record_pins.len(), 1);
+        assert_eq!(sets.base_style_record_pins[&base_style_record], 2);
+
+        sets.unpin_style_record(style_record.raw());
+        assert_eq!(sets.base_style_record_pins[&base_style_record], 1);
+        sets.unpin_style_record(style_record.raw());
+        assert!(sets.base_style_record_pins.is_empty());
+    }
+
+    #[test]
+    fn computed_record_reclamation_preserves_roots_while_reusing_record_slots() {
+        let mut sets = ComputedGroupSets::default();
+        let node = StyleNodeID::element(1);
+        let target = ComputedStyleTarget::new(node, u8::MAX);
+        let pinned = sets.publish(Some(target), &[], 0, 1, metadata(0, 0, 0, &[], &[]));
+        sets.pin_style_record(pinned.style_record_identity.raw());
+
+        for environment in 2..128 {
+            sets.publish(Some(target), &[], 0, environment, metadata(0, 0, 0, &[], &[]));
+        }
+        let current = sets.assigned_style_record(node).unwrap().base_record().unwrap();
+        let dense_record_count = sets.style_records.len();
+        let retention = sets.reclaim_unreachable();
+
+        assert_eq!(retention.retained, retention.reachable);
+        assert_eq!(sets.style_records.live_len(), 2);
+        assert!(sets.style_records.live_identities().any(|identity| identity == current));
+        assert!(
+            sets.style_records
+                .live_identities()
+                .any(|identity| identity == pinned.style_record_identity.base_record().unwrap())
+        );
+
+        for environment in 128..253 {
+            sets.publish(Some(target), &[], 0, environment, metadata(0, 0, 0, &[], &[]));
+        }
+        assert_eq!(sets.style_records.len(), dense_record_count);
+
+        sets.unpin_style_record(pinned.style_record_identity.raw());
+        sets.reclaim_unreachable();
+        assert_eq!(sets.style_records.live_len(), 1);
+    }
+
+    #[test]
+    fn computed_record_reclamation_reuses_the_lowest_identity_first() {
+        let mut sets = ComputedGroupSets::default();
+        let first = sets.publish(None, &[], 0, 1, metadata(0, 0, 0, &[], &[]));
+        sets.publish(None, &[], 0, 2, metadata(0, 0, 0, &[], &[]));
+        sets.publish(None, &[], 0, 3, metadata(0, 0, 0, &[], &[]));
+        sets.reclaim_unreachable();
+
+        let replacement = sets.publish(None, &[], 0, 4, metadata(0, 0, 0, &[], &[]));
+        assert_eq!(
+            replacement.style_record_identity.base_record(),
+            first.style_record_identity.base_record()
+        );
+    }
+
+    #[test]
+    fn computed_record_reclamation_retires_an_exhausted_identity() {
+        let mut sets = ComputedGroupSets::default();
+        let exhausted = sets.publish(None, &[], 0, 1, metadata(0, 0, 0, &[], &[]));
+        let exhausted = exhausted.style_record_identity.base_record().unwrap();
+        sets.style_record_generations[exhausted.index()] = FinalStyleRecordID::MAX_BASE_GENERATION;
+        sets.reclaim_unreachable();
+
+        let replacement = sets.publish(None, &[], 0, 2, metadata(0, 0, 0, &[], &[]));
+        assert_ne!(replacement.style_record_identity.base_record(), Some(exhausted));
+    }
+
+    #[test]
+    #[should_panic(expected = "base style-record is not live")]
+    fn a_retired_base_style_record_cannot_be_viewed() {
+        let mut sets = ComputedGroupSets::default();
+        let publication = sets.publish(None, &[], 0, 1, metadata(0, 0, 0, &[], &[]));
+        let retired_final = publication.style_record_identity;
+        let retired = retired_final.base_record().unwrap();
+        sets.reclaim_unreachable();
+        let replacement = sets.publish(None, &[], 0, 2, metadata(0, 0, 0, &[], &[]));
+        let replacement_final = replacement.style_record_identity;
+        let replacement = replacement_final.base_record().unwrap();
+        assert_eq!(retired.index(), replacement.index());
+        assert_ne!(retired_final.base_generation(), replacement_final.base_generation());
+        let _ = sets.style_record_view(publication.style_record_identity.raw());
+    }
+
+    #[test]
+    #[should_panic(expected = "base style-record is not live")]
+    fn a_retired_base_style_record_cannot_be_pinned() {
+        let mut sets = ComputedGroupSets::default();
+        let publication = sets.publish(None, &[], 0, 1, metadata(0, 0, 0, &[], &[]));
+        let retired_final = publication.style_record_identity;
+        let retired = retired_final.base_record().unwrap();
+        sets.reclaim_unreachable();
+        let replacement = sets.publish(None, &[], 0, 2, metadata(0, 0, 0, &[], &[]));
+        let replacement_final = replacement.style_record_identity;
+        let replacement = replacement_final.base_record().unwrap();
+        assert_eq!(retired.index(), replacement.index());
+        assert_ne!(retired_final.base_generation(), replacement_final.base_generation());
+        sets.pin_style_record(publication.style_record_identity.raw());
+    }
+
+    #[test]
     fn computed_group_set_capacity_includes_hash_table_control_bytes() {
         let mut sets = ComputedGroupSets::default();
         sets.groups.reserve(1);
@@ -2381,10 +3099,13 @@ mod tests {
         sets.style_records.reserve(1);
         sets.pending_cascade_states.reserve(1);
         sets.animation_overlay_slots_by_record.reserve(1);
-        sets.pseudo_assignments.reserve(1);
-        sets.pseudo_kinds_by_node.reserve(1);
-        sets.pseudo_cascade_state_rows.reserve(1);
-        sets.pseudo_retained_cascade_rows.reserve(1);
+        sets.pseudo_rows_by_node.reserve(1);
+        sets.pseudo_rows_by_node.insert(
+            StyleNodeID::element(1),
+            vec![PseudoComputedRow::new(1)].into_boxed_slice(),
+        );
+        sets.pseudo_assignment_nested_memory
+            .grow_committed(size_of::<PseudoComputedRow>() as u64);
 
         let accounted = sets.capacity_bytes()
             + sets.custom_property_environment_capacity_bytes()
@@ -2401,17 +3122,14 @@ mod tests {
             + sets.computed_reconstruction_metadata.capacity_bytes() as usize
             + sets.computed_longhand_tables.capacity_bytes() as usize
             + sets.style_records.capacity_bytes() as usize
+            + sets.style_record_generations.capacity() * size_of::<u32>()
             + sets.pending_cascade_states.capacity()
-                * (size_of::<(StyleNodeID, u8)>() + size_of::<(u64, CascadeStateID)>() + 1)
+                * (size_of::<StyleNodeID>() + size_of::<(u64, CascadeStateID)>() + 1)
             + sets.animation_overlay_slots_by_record.capacity()
                 * (size_of::<FinalStyleRecordID>() + size_of::<u32>() + 1)
-            + sets.pseudo_assignments.capacity()
-                * (size_of::<(StyleNodeID, u8)>() + size_of::<PublishedComputedInputs>() + 1)
-            + sets.pseudo_kinds_by_node.capacity() * (size_of::<StyleNodeID>() + size_of::<Vec<u8>>() + 1)
-            + sets.pseudo_cascade_state_rows.capacity()
-                * (size_of::<(StyleNodeID, u8)>() + size_of::<(u64, CascadeStateID)>() + 1)
-            + sets.pseudo_retained_cascade_rows.capacity()
-                * (size_of::<(StyleNodeID, u8)>() + size_of::<(u64, CascadeStateID)>() + 1);
+            + sets.pseudo_rows_by_node.capacity()
+                * (size_of::<StyleNodeID>() + size_of::<Box<[PseudoComputedRow]>>() + 1)
+            + size_of_val(sets.pseudo_rows_by_node[&StyleNodeID::element(1)].as_ref());
 
         assert_eq!(accounted, expected as u64);
     }

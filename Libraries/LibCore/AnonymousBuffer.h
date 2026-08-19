@@ -37,12 +37,19 @@ private:
 
 class CORE_API AnonymousBuffer {
 public:
-    static ErrorOr<AnonymousBuffer> create_with_size(size_t);
+    enum class Sealability {
+        Unsealable,
+        Sealable,
+    };
+
+    static ErrorOr<AnonymousBuffer> create_with_size(size_t, Sealability = Sealability::Unsealable);
     static ErrorOr<AnonymousBuffer> create_from_anon_fd(int fd, size_t);
 
     AnonymousBuffer() = default;
 
     bool is_valid() const { return m_impl; }
+
+    ErrorOr<AnonymousBuffer> snapshot(Sealability = Sealability::Unsealable) const;
 
     int fd() const { return m_impl ? m_impl->fd() : -1; }
     size_t size() const { return m_impl ? m_impl->size() : 0; }

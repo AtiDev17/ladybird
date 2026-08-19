@@ -9,9 +9,13 @@ use std::alloc::Layout;
 use std::alloc::System;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::ffi::c_void;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -19,6 +23,7 @@ use std::time::Instant;
 
 use libweb_rust::css::style::bridge;
 use libweb_rust::css::style::bridge::FfiCascadeOrigin;
+use libweb_rust::css::style::bridge::FfiElementArrival;
 use libweb_rust::css::style::bridge::FfiElementDeclarationDelta;
 use libweb_rust::css::style::bridge::FfiElementDeclarationKind;
 use libweb_rust::css::style::bridge::FfiElementStyleInput;
@@ -47,6 +52,7 @@ use libweb_rust::css::style::record_replay::EventKind;
 use libweb_rust::css::style::record_replay::LogReader;
 use libweb_rust::css::style::record_replay::PayloadReader;
 use libweb_rust::css::style::record_replay::PayloadWriter;
+use libweb_rust::css::style::selector::SelectorProgram;
 
 include!(concat!(env!("OUT_DIR"), "/style_engine_replay_generated.rs"));
 
@@ -80,12 +86,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut match_answer_identity_mappings = Vec::<MatchAnswerIdentityMapping>::new();
         let mut engine_count = 0_u64;
         let mut event_count = 0_u64;
+        let mut intern_atom_boundary_calls = 0_u64;
+        let mut element_arrivals = 0_u64;
+        let mut element_fact_calls = 0_u64;
+        let mut element_declaration_calls = 0_u64;
+        let mut element_animation_name_calls = 0_u64;
+        let mut attribute_value_text_queries = 0_u64;
+        let mut attribute_value_text_publications = 0_u64;
+        let mut selector_program_sharing = SelectorProgramSharing::default();
         let mut flush_count = 0_u64;
         let mut presence_degraded_publication_comparisons = 0_u64;
         let mut boundary_time = Duration::ZERO;
         let mut selected_flush_count = 0_u64;
         let mut selected_boundary_time = Duration::ZERO;
         let mut active_phase = None;
+        let mut last_benchmark_marker = String::new();
         let mut phase_times = BTreeMap::<String, Duration>::new();
         let mut pending_changed_rows = FastMap::<usize, u64>::default();
         let mut amplification = AmplificationLedger::default();
@@ -94,6 +109,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut detailed_counter_reader = None;
         let mut recorded_style_record_payloads = Vec::<Vec<Option<Option<EncodedU64Slice<'_>>>>>::new();
         let mut recorded_style_record_views = Vec::<Vec<Option<Option<RecordedStyleRecordView<'_>>>>>::new();
+        let mut computed_longhand_tables =
+            Vec::<Vec<Option<*mut libweb_rust::css::computed_longhand_table::ComputedLonghandTable>>>::new();
         let mut computed_group_payloads = Vec::new();
         let mut animation_overlay_payloads = Vec::new();
         let mut inheritance_dependent_properties = Vec::new();
@@ -109,6 +126,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             };
             event_count += 1;
+            match event.kind {
+                EventKind::SetElementNamespace
+                | EventKind::SetElementLanguage
+                | EventKind::SetElementDirectionality
+                | EventKind::SetElementCustomStates
+                | EventKind::SetElementIsSlot
+                | EventKind::SetElementHeadingLevel => element_fact_calls += 1,
+                EventKind::SetElementDeclaredProperties => element_declaration_calls += 1,
+                EventKind::SetElementAnimationNames => element_animation_name_calls += 1,
+                EventKind::HasAttributeValueText => attribute_value_text_queries += 1,
+                EventKind::SetAttributeValueText => attribute_value_text_publications += 1,
+                _ => {}
+            }
             match event.kind {
                 kind if replay_generated_boundary_event(kind, &mut event.payload, &live_engines)? => {}
                 EventKind::CreateGraph => {
@@ -130,14 +160,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if engine_id == 0 || live_engines.get(index).is_some_and(Option::is_some) {
                         return Err(format!("engine {engine_id} was created more than once").into());
                     }
-                    let engine = bridge::style_engine_create(bridge::FfiDeviceClass::ForegroundDesktop);
+                    let engine = bridge::style_engine_create_for_replay(bridge::FfiDeviceClass::ForegroundDesktop);
                     unsafe { bridge::style_engine_use_recording_memory_policy(engine) };
                     if live_engines.len() <= index {
                         live_engines.resize(index + 1, None);
+                        selector_program_sharing.resize_engines(index + 1);
                         match_answer_identity_mappings.resize_with(index + 1, MatchAnswerIdentityMapping::default);
+                        computed_longhand_tables.resize_with(index + 1, Vec::new);
                     }
                     live_engines[index] = Some(engine);
                     match_answer_identity_mappings[index] = MatchAnswerIdentityMapping::default();
+                    computed_longhand_tables[index].clear();
                     engine_count += 1;
                 }
                 EventKind::SetComputedGroupDependencyMasks => {
@@ -155,11 +188,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 EventKind::DestroyGraph => {
                     let engine_id = event.payload.read_u64()?;
-                    let engine = usize::try_from(engine_id)
-                        .ok()
-                        .and_then(|index| live_engines.get_mut(index))
+                    let engine_index = usize::try_from(engine_id)?;
+                    let engine = live_engines
+                        .get_mut(engine_index)
                         .and_then(Option::take)
                         .ok_or_else(|| format!("engine {engine_id} was destroyed without being live"))?;
+                    release_computed_longhand_tables(&mut computed_longhand_tables[engine_index]);
                     accumulate_memory_pressure(&mut memory_pressure, unsafe {
                         bridge::replay_memory_pressure_snapshot(engine)
                     });
@@ -180,6 +214,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     // The row arrays are consumed in place from the mapped log; nothing is copied.
                     let tree = event.payload.read_raw_slice::<FfiTreeDelta>()?;
+                    element_arrivals += tree
+                        .iter()
+                        .filter(|delta| !delta.old_connected && delta.new_connected)
+                        .count() as u64;
+                    let arrivals = event.payload.read_raw_slice::<FfiElementArrival>()?;
+                    let arrival_custom_state_atoms = event.payload.read_u32_vec()?;
                     let features = event.payload.read_raw_slice::<FfiLocalFeatureDelta>()?;
                     let states = event.payload.read_raw_slice::<FfiStateDelta>()?;
                     let declarations = event.payload.read_raw_slice::<FfiElementDeclarationDelta>()?;
@@ -191,6 +231,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let transaction = FfiStyleInputTransaction {
                         tree_deltas: tree.as_ptr(),
                         tree_delta_count: tree.len(),
+                        element_arrivals: arrivals.as_ptr(),
+                        element_arrival_count: arrivals.len(),
+                        arrival_custom_state_atoms: arrival_custom_state_atoms.as_ptr(),
+                        arrival_custom_state_atom_count: arrival_custom_state_atoms.len(),
                         local_feature_deltas: features.as_ptr(),
                         local_feature_delta_count: features.len(),
                         state_deltas: states.as_ptr(),
@@ -238,7 +282,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 EventKind::AddStyleRule => {
-                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
                     let sheet = event.payload.read_u32()?;
                     let before_rule = event.payload.read_u32()?;
                     let expected = event.payload.read_u32()?;
@@ -247,6 +291,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {
                             replay_atom_mappings(engine, &mut event.payload)?;
                             let program = libweb_rust::css::style::selector::replay::read(&mut event.payload)?;
+                            selector_program_sharing.record(engine_index, &program);
                             unsafe { bridge::replay_add_style_rule(engine, sheet, before_rule, program) }
                         }
                     };
@@ -255,6 +300,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 EventKind::InternAtom => {
+                    intern_atom_boundary_calls += 1;
                     let engine = read_engine(&mut event.payload, &live_engines)?;
                     let token = usize::try_from(event.payload.read_u64()?)?;
                     let expected = event.payload.read_u32()?;
@@ -266,10 +312,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     replay_atom_mappings(engine, &mut event.payload)?;
                 }
                 EventKind::ReplaceStyleRuleSelectors => {
-                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
                     let rule = event.payload.read_u32()?;
                     replay_atom_mappings(engine, &mut event.payload)?;
                     let program = libweb_rust::css::style::selector::replay::read(&mut event.payload)?;
+                    selector_program_sharing.record(engine_index, &program);
                     unsafe { bridge::replay_replace_style_rule_selectors(engine, rule, program) };
                 }
                 EventKind::SetElementDeclaredProperties => {
@@ -323,8 +370,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .get_or_insert_with(|| DetailedCounterReader::new(engine))
                             .read(engine)
                     });
+                    if expected.style_atoms_swept {
+                        unsafe {
+                            bridge::style_engine_set_replay_reclaimed_style_atoms(
+                                engine,
+                                expected.reclaimed_atoms.as_ptr(),
+                                expected.reclaimed_atoms.len(),
+                            );
+                        }
+                    }
                     let start = Instant::now();
                     let actual_view = unsafe { bridge::style_engine_take_style_transaction(engine, root) };
+                    let actual_reclaimed_atoms = if actual_view.reclaimed_style_atom_count == 0 {
+                        Vec::new()
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                actual_view.reclaimed_style_atoms,
+                                actual_view.reclaimed_style_atom_count,
+                            )
+                        }
+                        .iter()
+                        .map(|reclaimed| reclaimed.atom)
+                        .collect::<Vec<_>>()
+                    };
+                    if actual_view.style_atoms_swept != expected.style_atoms_swept {
+                        return Err(format!(
+                            "style atom sweep diverged: expected {}, got {}",
+                            expected.style_atoms_swept, actual_view.style_atoms_swept
+                        )
+                        .into());
+                    }
+                    if actual_reclaimed_atoms != expected.reclaimed_atoms {
+                        return Err(format!(
+                            "style atom reclamation diverged: expected {:?}, got {:?}",
+                            expected.reclaimed_atoms, actual_reclaimed_atoms
+                        )
+                        .into());
+                    }
                     if actual_view.count != 0 {
                         let answers = unsafe { std::slice::from_raw_parts(actual_view.answers, actual_view.count) };
                         replay_style_transaction_output(
@@ -367,6 +450,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             result: actual_view.scoped,
                             filter_calls: Vec::new(),
                             emissions: context.actual_emissions,
+                            style_atoms_swept: actual_view.style_atoms_swept,
+                            reclaimed_atoms: actual_reclaimed_atoms,
                         };
                         let mut actual_payload = PayloadWriter::default();
                         write_style_transaction_outputs(&actual, &mut actual_payload);
@@ -481,6 +566,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 EventKind::BenchmarkMarker => {
                     let _engine = read_engine(&mut event.payload, &live_engines)?;
                     let name = String::from_utf16(&event.payload.read_u16_vec()?)?;
+                    last_benchmark_marker.clone_from(&name);
                     if let Some(marker) = BenchmarkMarker::parse(&name) {
                         encountered_subtests.insert(format!("{}/{}", marker.suite, marker.test));
                         active_phase = marker.next_phase();
@@ -711,7 +797,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 EventKind::PublishComputedGroups => {
-                    let engine = read_engine(&mut event.payload, &live_engines)?;
+                    let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
                     let node = event.payload.read_u32()?;
                     let pseudo_kind = event.payload.read_u8()?;
                     let group_count = event.payload.read_length()?;
@@ -759,38 +845,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let longhand_table = match event.payload.read_bool()? {
                         false => std::ptr::null_mut(),
                         true => {
-                            let table =
-                                libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_create();
-                            let stored_value_count = event.payload.read_length()?;
-                            let mut stored_values = Vec::with_capacity(stored_value_count);
-                            for _ in 0..stored_value_count {
-                                let property = event.payload.read_u16()?;
-                                let token = event.payload.read_u64()?;
-                                let flags = event.payload.read_u8()?;
-                                stored_values.push((property, bridge::replay_style_value(token, flags)));
-                            }
-                            let source_slot_count = event.payload.read_length()?;
-                            let mut source_slots = std::collections::HashMap::new();
-                            for _ in 0..source_slot_count {
-                                let property = event.payload.read_u16()?;
-                                let slot = event.payload.read_u32()?;
-                                source_slots.insert(property, slot);
-                            }
-                            for (property, value) in stored_values {
-                                let slot = source_slots.get(&property).map_or(-1, |&slot| i64::from(slot));
+                            let identity = usize::try_from(event.payload.read_u32()?)?;
+                            let record_definition = event.payload.read_bool()?;
+                            let tables = &mut computed_longhand_tables[engine_index];
+                            if record_definition {
+                                if tables.len() <= identity {
+                                    tables.resize(identity + 1, None);
+                                }
+                                if tables[identity].is_some() {
+                                    return Err(format!("computed longhand table {identity} was defined twice").into());
+                                }
+                                let table =
+                                    libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_create();
+                                let stored_value_count = event.payload.read_length()?;
+                                for _ in 0..stored_value_count {
+                                    let property = event.payload.read_u16()?;
+                                    let token = event.payload.read_u64()?;
+                                    let flags = event.payload.read_u8()?;
+                                    let value = bridge::replay_style_value(token, flags);
+                                    unsafe {
+                                        libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_set(
+                                            table,
+                                            property,
+                                            value.cast(),
+                                            -1,
+                                        );
+                                    }
+                                }
                                 unsafe {
-                                    libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_set(
+                                    libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_freeze(
                                         table,
-                                        property,
-                                        value.cast(),
-                                        slot,
                                     );
                                 }
+                                tables[identity] = Some(table);
                             }
-                            unsafe {
-                                libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_freeze(table);
-                            }
-                            table
+                            tables
+                                .get(identity)
+                                .copied()
+                                .flatten()
+                                .ok_or_else(|| format!("computed longhand table {identity} was not defined"))?
                         }
                     };
                     let expected = bridge::FfiStyleRecordDelta {
@@ -824,16 +917,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             longhand_table.cast_const().cast(),
                         )
                     };
-                    if !longhand_table.is_null() {
-                        unsafe {
-                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_release(
-                                longhand_table,
-                            );
-                        }
-                    }
                     if actual != expected {
                         return Err(format!(
-                            "computed style publication diverged for node {node}: expected {expected:?}, got {actual:?}"
+                            "computed style publication diverged at event {event_count} after {last_benchmark_marker:?} in {active_phase:?} for node {node}: expected {expected:?}, got {actual:?}"
                         )
                         .into());
                     }
@@ -925,11 +1011,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                EventKind::AttributeValueTextRequirementsVersion => {
+                    let _engine = read_engine(&mut event.payload, &live_engines)?;
+                    let _recorded_version = event.payload.read_u64()?;
+                }
+                EventKind::AttributeNameRequiresValueText => {
+                    let _engine = read_engine(&mut event.payload, &live_engines)?;
+                    let _name = event.payload.read_u32()?;
+                    let _recorded_result = event.payload.read_bool()?;
+                }
                 _ => unreachable!("all boundary events are generated or handled explicitly"),
             }
             event.payload.finish()?;
         }
         let live_at_process_exit = live_engines.iter().flatten().count();
+        for tables in &mut computed_longhand_tables {
+            release_computed_longhand_tables(tables);
+        }
         for engine in live_engines.into_iter().flatten() {
             accumulate_memory_pressure(&mut memory_pressure, unsafe {
                 bridge::replay_memory_pressure_snapshot(engine)
@@ -976,6 +1074,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {phase}: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
         }
         amplification.print();
+        if options.detailed_counters {
+            println!("boundary counters:");
+            println!("  internAtomCalls: {intern_atom_boundary_calls}");
+            println!("  elementArrivals: {element_arrivals}");
+            println!(
+                "  elementFactCalls: {} ({:.2}/arrival)",
+                element_fact_calls,
+                element_fact_calls as f64 / element_arrivals.max(1) as f64
+            );
+            println!("  elementDeclarationCalls: {element_declaration_calls}");
+            println!("  elementAnimationNameCalls: {element_animation_name_calls}");
+            println!("  attributeValueTextQueries: {attribute_value_text_queries}");
+            println!("  attributeValueTextPublications: {attribute_value_text_publications}");
+            println!(
+                "  selectorProgramCompilations: {}",
+                selector_program_sharing.compilations
+            );
+            println!(
+                "  selectorProgramsDistinct: documents={}, process={}",
+                selector_program_sharing.document_distinct_count(),
+                selector_program_sharing.process_hashes.len()
+            );
+            println!(
+                "  selectorProgramBytesDistinct: documents={}, process={}",
+                selector_program_sharing.document_distinct_bytes, selector_program_sharing.process_distinct_bytes
+            );
+        }
         detailed_counters.print(detailed_counter_reader.as_ref());
         reports.push(serde_json::json!({
             "path": path,
@@ -984,6 +1109,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "document_engines": engine_count,
             "live_at_capture_exit": live_at_process_exit,
             "presence_degraded_exact_cascade_publication_comparisons": presence_degraded_publication_comparisons,
+            "boundary_counters": {
+                "intern_atom_calls": intern_atom_boundary_calls,
+                "element_arrivals": element_arrivals,
+                "element_fact_calls": element_fact_calls,
+                "element_fact_calls_per_arrival": element_fact_calls as f64 / element_arrivals.max(1) as f64,
+                "element_declaration_calls": element_declaration_calls,
+                "element_animation_name_calls": element_animation_name_calls,
+                "attribute_value_text_queries": attribute_value_text_queries,
+                "attribute_value_text_publications": attribute_value_text_publications,
+                "selector_program_compilations": selector_program_sharing.compilations,
+                "selector_programs_distinct_documents": selector_program_sharing.document_distinct_count(),
+                "selector_programs_distinct_process": selector_program_sharing.process_hashes.len(),
+                "selector_program_bytes_distinct_documents": selector_program_sharing.document_distinct_bytes,
+                "selector_program_bytes_distinct_process": selector_program_sharing.process_distinct_bytes,
+            },
             "timing": {
                 "boundary_ms": duration_ms(boundary_time),
                 "selected_flushes": selected_flush_count,
@@ -1015,6 +1155,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_writer_pretty(file, &output)?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct SelectorProgramSharing {
+    compilations: u64,
+    document_hashes: Vec<HashSet<u64>>,
+    process_hashes: HashSet<u64>,
+    document_distinct_bytes: u64,
+    process_distinct_bytes: u64,
+}
+
+impl SelectorProgramSharing {
+    fn resize_engines(&mut self, length: usize) {
+        self.document_hashes.resize_with(length, HashSet::new);
+    }
+
+    fn record(&mut self, engine: usize, program: &SelectorProgram) {
+        let mut hasher = DefaultHasher::new();
+        program.hash(&mut hasher);
+        let hash = hasher.finish();
+        let bytes = program.capacity_bytes();
+        self.compilations += 1;
+        if self.document_hashes[engine].insert(hash) {
+            self.document_distinct_bytes += bytes;
+        }
+        if self.process_hashes.insert(hash) {
+            self.process_distinct_bytes += bytes;
+        }
+    }
+
+    fn document_distinct_count(&self) -> usize {
+        self.document_hashes.iter().map(HashSet::len).sum()
+    }
 }
 
 #[derive(Clone)]
@@ -1119,7 +1292,7 @@ impl Options {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ActivePhase {
     suite: String,
     test: String,
@@ -1576,10 +1749,19 @@ fn read_engine_indexed(
     Ok((index, pointer))
 }
 
+fn release_computed_longhand_tables(
+    tables: &mut Vec<Option<*mut libweb_rust::css::computed_longhand_table::ComputedLonghandTable>>,
+) {
+    for table in tables.drain(..).flatten() {
+        unsafe { libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_release(table) };
+    }
+}
+
 fn style_record_replay_index(style_record: u64) -> Result<usize, std::num::TryFromIntError> {
     const ANIMATION_OVERLAY_TAG: u64 = 1 << 63;
+    const BASE_IDENTITY_MASK: u64 = u32::MAX as u64;
 
-    let identity = style_record & !ANIMATION_OVERLAY_TAG;
+    let identity = style_record & BASE_IDENTITY_MASK;
     let namespace = u64::from(style_record & ANIMATION_OVERLAY_TAG != 0);
     usize::try_from(identity * 2 + namespace)
 }
@@ -1656,6 +1838,8 @@ struct StyleTransactionOutputs {
     result: bool,
     filter_calls: Vec<(Vec<u32>, Vec<u32>)>,
     emissions: Vec<StyleTransactionEmission>,
+    style_atoms_swept: bool,
+    reclaimed_atoms: Vec<u32>,
 }
 
 struct ReplayStyleTransactionContext {
@@ -1799,11 +1983,15 @@ fn read_style_transaction_outputs(
             answers,
         });
     }
+    let style_atoms_swept = payload.read_bool()?;
+    let reclaimed_atoms = payload.read_u32_vec()?;
     payload.finish()?;
     Ok(StyleTransactionOutputs {
         result,
         filter_calls,
         emissions,
+        style_atoms_swept,
+        reclaimed_atoms,
     })
 }
 
@@ -1831,6 +2019,8 @@ fn write_style_transaction_outputs(outputs: &StyleTransactionOutputs, payload: &
             payload.write_u8(answer.gap as u8);
         }
     }
+    payload.write_bool(outputs.style_atoms_swept);
+    payload.write_u32_slice(&outputs.reclaimed_atoms);
 }
 
 fn replay_atom_mappings(engine: *mut c_void, payload: &mut PayloadReader) -> Result<(), Box<dyn std::error::Error>> {
@@ -2386,6 +2576,39 @@ mod tests {
         assert_eq!(amplification["stages"]["selector"]["changed_rows"], 4);
         assert_eq!(amplification["stages"]["selector"]["touched_rows"], 10);
         assert_eq!(amplification["stages"]["selector"]["amplification"], 2.5);
+    }
+
+    #[test]
+    fn style_transaction_outputs_round_trip_a_sweep_without_reclaims() {
+        let expected = StyleTransactionOutputs {
+            result: true,
+            filter_calls: Vec::new(),
+            emissions: Vec::new(),
+            style_atoms_swept: true,
+            reclaimed_atoms: Vec::new(),
+        };
+        let mut payload = PayloadWriter::default();
+        write_style_transaction_outputs(&expected, &mut payload);
+
+        let actual = read_style_transaction_outputs(PayloadReader::new(payload.as_bytes())).unwrap();
+
+        assert!(actual.result);
+        assert!(actual.filter_calls.is_empty());
+        assert!(actual.emissions.is_empty());
+        assert!(actual.style_atoms_swept);
+        assert_eq!(actual.reclaimed_atoms, expected.reclaimed_atoms);
+    }
+
+    #[test]
+    fn style_record_replay_indices_ignore_base_generations() {
+        let identity = 17;
+        let first_generation = identity;
+        let later_generation = (29_u64 << 32) | identity;
+        let overlay = (1_u64 << 63) | identity;
+
+        assert_eq!(style_record_replay_index(first_generation).unwrap(), 34);
+        assert_eq!(style_record_replay_index(later_generation).unwrap(), 34);
+        assert_eq!(style_record_replay_index(overlay).unwrap(), 35);
     }
 }
 

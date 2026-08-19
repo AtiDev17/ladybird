@@ -15,6 +15,17 @@ namespace Web::CSS {
 
 extern "C" void ladybird_animated_properties_ref(void const*);
 
+static void ladybird_utf16_fly_string_ref_raw(size_t raw)
+{
+    auto string = Utf16FlyString::from_raw(static_cast<FlatPtr>(raw));
+    (void)string.to_raw_leaked();
+}
+
+static void ladybird_utf16_fly_string_unref_raw(size_t raw)
+{
+    Utf16FlyString::unref_raw(static_cast<FlatPtr>(raw));
+}
+
 static_assert(!IsMoveConstructible<StyleEngine>);
 static_assert(!IsMoveAssignable<StyleEngine>);
 
@@ -33,14 +44,15 @@ StyleEngine::StyleEngine(DeviceClass device_class, StyleComputer* style_computer
     : m_impl(StyleEngineFFI::style_engine_create(device_class))
     , m_style_computer(style_computer)
 {
+    StyleEngineFFI::style_engine_install_raw_atom_callbacks(ladybird_utf16_fly_string_ref_raw, ladybird_utf16_fly_string_unref_raw);
 }
 
 StyleEngine::~StyleEngine()
 {
     if (m_impl)
         StyleEngineFFI::style_engine_destroy(m_impl);
-    for (auto raw : m_atoms)
-        Utf16FlyString::unref_raw(raw);
+    for (auto const& atom : m_atoms)
+        Utf16FlyString::unref_raw(atom.key);
 }
 
 void StyleEngine::visit_edges(GC::Cell::Visitor& visitor)
@@ -215,11 +227,15 @@ StyleAtomID StyleEngine::intern_atom(Utf16FlyString const& name)
     // by the same word but each assigning its own sequence would compare unequal for the same name,
     // which fails to match silently rather than loudly.
     // First time seen, the leaked reference is kept so the identity cannot be reused while the
-    // atom is live; a duplicate releases it again.
+    // atom is live. Duplicates release their new reference and return without crossing the FFI.
     auto raw = name.to_raw_leaked();
-    if (m_atoms.set(raw) != HashSetResult::InsertedNewEntry)
+    if (auto atom = m_atoms.get(raw); atom.has_value()) {
         Utf16FlyString::unref_raw(raw);
-    return StyleAtomID { StyleEngineFFI::style_engine_intern_atom(m_impl, raw) };
+        return atom.release_value();
+    }
+    auto atom = StyleAtomID { StyleEngineFFI::style_engine_intern_atom(m_impl, raw) };
+    m_atoms.set(raw, atom);
+    return atom;
 }
 
 StyleAtomID StyleEngine::intern_text_atom(Utf16View text)
@@ -227,25 +243,113 @@ StyleAtomID StyleEngine::intern_text_atom(Utf16View text)
     return intern_atom(Utf16FlyString::from_utf16(text).to_ascii_lowercase());
 }
 
+StyleAtomID StyleEngine::intern_language_atom(Utf16View text)
+{
+    auto atom = intern_text_atom(text);
+    if (atom == 0 || text.is_empty() || m_published_language_atoms.set(atom) != AK::HashSetResult::InsertedNewEntry)
+        return atom;
+
+    Vector<u16> code_units;
+    code_units.ensure_capacity(text.length_in_code_units());
+    for (size_t i = 0; i < text.length_in_code_units(); ++i)
+        code_units.unchecked_append(text.code_unit_at(i));
+    StyleEngineFFI::style_engine_set_element_language(m_impl, 0, atom.value(), code_units.data(), code_units.size());
+    return atom;
+}
+
 StyleAtomID StyleEngine::intern_case_sensitive_text_atom(Utf16View text)
 {
     return intern_atom(Utf16FlyString::from_utf16(text));
 }
 
-StyleAtomID StyleEngine::intern_attribute_value(Utf16View value)
+// The name an attribute is published under, and the any-namespace name it shares.
+//
+// Three selectors ask three different questions of an attribute called `x`. `[ns|x]` reaches only
+// the one in that namespace, `[x]` reaches only the one in no namespace - which is what the bare
+// local name is - and `[*|x]` reaches whichever of them the element carries. The first two name
+// exactly one of an element's attributes, so they are the key: an element can hold `x` in several
+// namespaces at once, and each is a fact with its own value. `[*|x]` asks about all of them
+// together, so the shared form is published as an identity of the name rather than as a fact of its
+// own, and one entry per attribute answers all three.
+StyleAtomID StyleEngine::intern_attribute_name(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri)
+{
+    auto local = intern_atom(local_name);
+    auto namespace_atom = !namespace_uri.has_value() || namespace_uri->is_empty()
+        ? StyleAtomID {}
+        : intern_case_sensitive_text_atom(namespace_uri->view());
+    auto& names_by_namespace = m_attribute_name_atoms.ensure(local, [] { return HashMap<StyleAtomID, StyleAtomID> {}; });
+    if (auto name = names_by_namespace.get(namespace_atom); name.has_value())
+        return name.release_value();
+
+    auto in_namespace = [&](StyleAtomID name) {
+        if (namespace_atom == 0)
+            return name;
+        return intern_qualified_atom(namespace_atom, name);
+    };
+    auto any_namespace = intern_qualified_atom(StyleEngine::any_namespace, local);
+    auto name = in_namespace(local);
+
+    StyleAtomID folded_name;
+    StyleAtomID folded_local;
+    if (auto folded = local_name.to_ascii_lowercase(); folded != local_name) {
+        auto folded_atom = intern_atom(folded);
+        folded_name = in_namespace(folded_atom);
+        folded_local = intern_qualified_atom(StyleEngine::any_namespace, folded_atom);
+    }
+
+    note_attribute_name_forms(name, any_namespace, folded_name, folded_local);
+    names_by_namespace.set(namespace_atom, name);
+    return name;
+}
+
+StyleAtomID StyleEngine::intern_attribute_value(StyleAtomID name, Utf16View value)
 {
     auto atom = intern_case_sensitive_text_atom(value);
+    if (!attribute_name_requires_value_text(name))
+        return atom;
+
+    publish_attribute_value_text(atom, value);
+    return atom;
+}
+
+void StyleEngine::backfill_attribute_value_text_if_required(StyleAtomID name, Utf16View value)
+{
+    if (!attribute_name_requires_value_text(name))
+        return;
+
+    auto atom = intern_case_sensitive_text_atom(value);
+    publish_attribute_value_text(atom, value);
+}
+
+void StyleEngine::publish_attribute_value_text(StyleAtomID atom, Utf16View value)
+{
     // The engine holds one copy of the text per currently used value. Ask whether it survived
     // reclamation before copying it out of the attribute's representation again.
     if (StyleEngineFFI::style_engine_has_attribute_value_text(m_impl, atom.value()))
-        return atom;
+        return;
 
     Vector<u16> code_units;
     code_units.ensure_capacity(value.length_in_code_units());
     for (size_t i = 0; i < value.length_in_code_units(); ++i)
         code_units.unchecked_append(value.code_unit_at(i));
     StyleEngineFFI::style_engine_set_attribute_value_text(m_impl, atom.value(), code_units.data(), code_units.size());
-    return atom;
+}
+
+bool StyleEngine::refresh_attribute_value_text_requirements()
+{
+    auto version = StyleEngineFFI::style_engine_attribute_value_text_requirements_version(m_impl);
+    if (version == m_attribute_value_text_requirements_version)
+        return false;
+    m_attribute_value_text_requirements_version = version;
+    m_attribute_names_requiring_value_text.clear();
+    return true;
+}
+
+bool StyleEngine::attribute_name_requires_value_text(StyleAtomID name)
+{
+    return m_attribute_names_requiring_value_text.ensure(name, [&] {
+        return StyleEngineFFI::style_engine_attribute_name_requires_value_text(m_impl, name.value());
+    });
 }
 
 void StyleEngine::set_element_language(StyleNodeID node, StyleAtomID language, Utf16View tag)
@@ -253,9 +357,11 @@ void StyleEngine::set_element_language(StyleNodeID node, StyleAtomID language, U
     // A language range is not a name, so `:lang()` compares against the tag itself rather than
     // against the atom. The text is recorded once per language, not once per element.
     Vector<u16> code_units;
-    code_units.ensure_capacity(tag.length_in_code_units());
-    for (size_t i = 0; i < tag.length_in_code_units(); ++i)
-        code_units.unchecked_append(tag.code_unit_at(i));
+    if (language != 0 && !tag.is_empty() && m_published_language_atoms.set(language) == AK::HashSetResult::InsertedNewEntry) {
+        code_units.ensure_capacity(tag.length_in_code_units());
+        for (size_t i = 0; i < tag.length_in_code_units(); ++i)
+            code_units.unchecked_append(tag.code_unit_at(i));
+    }
     StyleEngineFFI::style_engine_set_element_language(m_impl, node.value(), language.value(), code_units.data(), code_units.size());
 }
 
@@ -277,6 +383,19 @@ void StyleEngine::record_tree_delta(StyleEngineFFI::FfiTreeDelta const& delta)
     m_tree_deltas.append(delta);
 }
 
+void StyleEngine::record_element_arrival(StyleEngineFFI::FfiElementArrival arrival, ReadonlySpan<StyleAtomID> custom_states)
+{
+    request_frame_for_first_recorded_input(*this, m_style_computer);
+    VERIFY(m_arrival_custom_state_atoms.size() <= NumericLimits<u32>::max());
+    VERIFY(custom_states.size() <= NumericLimits<u32>::max());
+    VERIFY(m_arrival_custom_state_atoms.size() + custom_states.size() <= NumericLimits<u32>::max());
+    arrival.custom_state_offset = static_cast<u32>(m_arrival_custom_state_atoms.size());
+    arrival.custom_state_count = static_cast<u32>(custom_states.size());
+    for (auto state : custom_states)
+        m_arrival_custom_state_atoms.append(state.value());
+    m_element_arrivals.append(arrival);
+}
+
 void StyleEngine::record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const& delta)
 {
     request_frame_for_first_recorded_input(*this, m_style_computer);
@@ -295,11 +414,24 @@ void StyleEngine::record_element_declaration_delta(StyleEngineFFI::FfiElementDec
     m_element_declaration_deltas.append(delta);
 }
 
+void StyleEngine::append_or_merge_element_style_input(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
+{
+    if (auto existing = m_element_style_input_indices.find(style_node); existing != m_element_style_input_indices.end()) {
+        auto& input = m_element_style_inputs[existing->value];
+        input.reaction |= reaction;
+        input.inherited_style_groups |= inherited_style_groups;
+        return;
+    }
+
+    m_element_style_input_indices.set(style_node, m_element_style_inputs.size());
+    m_element_style_inputs.append({ style_node.value(), reaction, inherited_style_groups });
+}
+
 void StyleEngine::record_element_style_input_change(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
 {
     if (style_node != 0 && reaction != 0) {
         request_frame_for_first_recorded_input(*this, m_style_computer);
-        m_element_style_inputs.append({ style_node.value(), reaction, inherited_style_groups });
+        append_or_merge_element_style_input(style_node, reaction, inherited_style_groups);
     }
 }
 
@@ -315,24 +447,29 @@ void StyleEngine::record_flat_tree_descendant_style_input_changes(StyleNodeID st
     request_frame_for_first_recorded_input(*this, m_style_computer);
     auto descendants = StyleEngineFFI::style_engine_flat_tree_descendants(m_impl, style_node.value());
     for (auto descendant : ReadonlySpan<u32> { descendants.nodes, descendants.count })
-        m_element_style_inputs.append({ descendant, reaction, inherited_style_groups });
+        append_or_merge_element_style_input(StyleNodeID { descendant }, reaction, inherited_style_groups);
     StyleEngineFFI::style_engine_discard_flat_tree_descendants(m_impl);
 }
 
 void StyleEngine::consume_recorded_element_style_input_change(StyleNodeID style_node)
 {
-    m_element_style_inputs.remove_all_matching([&](auto const& input) {
-        return input.style_node == style_node.value();
-    });
+    auto existing = m_element_style_input_indices.find(style_node);
+    if (existing == m_element_style_input_indices.end())
+        return;
+
+    auto index = existing->value;
+    VERIFY(index < m_element_style_inputs.size());
+    m_element_style_input_indices.remove(style_node);
+    auto last_input = m_element_style_inputs.take_last();
+    if (index < m_element_style_inputs.size()) {
+        m_element_style_inputs[index] = last_input;
+        m_element_style_input_indices.set(StyleNodeID { last_input.style_node }, index);
+    }
 }
 
 bool StyleEngine::has_recorded_element_style_input_change(StyleNodeID style_node) const
 {
-    for (auto const& input : m_element_style_inputs) {
-        if (input.style_node == style_node.value())
-            return true;
-    }
-    return false;
+    return m_element_style_input_indices.contains(style_node);
 }
 void StyleEngine::record_benchmark_marker(Utf16View name)
 {
@@ -345,6 +482,7 @@ void StyleEngine::record_benchmark_marker(Utf16View name)
 bool StyleEngine::has_recorded_input() const
 {
     return !m_tree_deltas.is_empty()
+        || !m_element_arrivals.is_empty()
         || !m_local_feature_deltas.is_empty()
         || !m_state_deltas.is_empty()
         || !m_element_declaration_deltas.is_empty()
@@ -355,12 +493,19 @@ void StyleEngine::submit_recorded_input()
 {
     if (m_style_computer)
         publish_pending_element_features(*this, *m_style_computer);
-    if (!has_recorded_input())
+    if (!has_recorded_input()) {
+        if (refresh_attribute_value_text_requirements() && m_style_computer)
+            publish_required_attribute_value_texts(*this, *m_style_computer);
         return;
+    }
 
     InputTransaction transaction {
         .tree_deltas = m_tree_deltas.data(),
         .tree_delta_count = m_tree_deltas.size(),
+        .element_arrivals = m_element_arrivals.data(),
+        .element_arrival_count = m_element_arrivals.size(),
+        .arrival_custom_state_atoms = m_arrival_custom_state_atoms.data(),
+        .arrival_custom_state_atom_count = m_arrival_custom_state_atoms.size(),
         .local_feature_deltas = m_local_feature_deltas.data(),
         .local_feature_delta_count = m_local_feature_deltas.size(),
         .state_deltas = m_state_deltas.data(),
@@ -373,10 +518,18 @@ void StyleEngine::submit_recorded_input()
     apply_transaction(transaction);
 
     m_tree_deltas.clear_with_capacity();
+    m_element_arrivals.clear_with_capacity();
+    m_arrival_custom_state_atoms.clear_with_capacity();
     m_local_feature_deltas.clear_with_capacity();
     m_state_deltas.clear_with_capacity();
     m_element_declaration_deltas.clear_with_capacity();
     m_element_style_inputs.clear_with_capacity();
+    m_element_style_input_indices.clear_with_capacity();
+
+    // Selector demand can arrive while the program change and element facts are still staged.
+    // Refresh after applying the fact batch, then backfill values before matching observes it.
+    if (refresh_attribute_value_text_requirements() && m_style_computer)
+        publish_required_attribute_value_texts(*this, *m_style_computer);
 }
 
 void StyleEngine::apply_transaction(InputTransaction const& transaction)
@@ -407,6 +560,31 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
 {
     submit_recorded_input();
     auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value());
+    if (view.reclaimed_style_atom_count != 0) {
+        HashTable<StyleAtomID> reclaimed_atoms;
+        reclaimed_atoms.ensure_capacity(view.reclaimed_style_atom_count);
+        for (auto const& reclaimed : ReadonlySpan<StyleEngineFFI::FfiReclaimedStyleAtom> { view.reclaimed_style_atoms, view.reclaimed_style_atom_count }) {
+            auto atom_id = StyleAtomID { reclaimed.atom };
+            reclaimed_atoms.set(atom_id);
+            m_published_language_atoms.remove(atom_id);
+            m_attribute_names_requiring_value_text.remove(atom_id);
+            if (reclaimed.raw == 0)
+                continue;
+            auto atom = m_atoms.take(reclaimed.raw);
+            VERIFY(atom.has_value());
+            VERIFY(atom.release_value() == reclaimed.atom);
+            Utf16FlyString::unref_raw(reclaimed.raw);
+        }
+        m_attribute_name_atoms.remove_all_matching([&](StyleAtomID local, auto& names_by_namespace) {
+            if (reclaimed_atoms.contains(local))
+                return true;
+            names_by_namespace.remove_all_matching([&](StyleAtomID namespace_atom, StyleAtomID name) {
+                return reclaimed_atoms.contains(namespace_atom) || reclaimed_atoms.contains(name);
+            });
+            return names_by_namespace.is_empty();
+        });
+        ++m_atom_generation;
+    }
     return {
         .version = { view.transaction_version, view.program_version },
         .reactions = { view.answers, view.count },
@@ -459,7 +637,10 @@ bool StyleEngine::consume_published_match_answer(StyleNodeID node, Vector<RuleMa
 
 void* StyleEngine::compile_selector_query(ReadonlySpan<void const*> selectors)
 {
-    return StyleEngineFFI::style_engine_compile_selector_query(m_impl, selectors.data(), selectors.size());
+    auto* query = StyleEngineFFI::style_engine_compile_selector_query(m_impl, selectors.data(), selectors.size());
+    if (refresh_attribute_value_text_requirements() && m_style_computer)
+        publish_required_attribute_value_texts(*this, *m_style_computer);
+    return query;
 }
 
 void StyleEngine::destroy_selector_query(void* query)

@@ -8,6 +8,68 @@ use super::column::advance_epoch;
 use super::*;
 
 impl StyleEngine {
+    /// Whether the locally evaluable compound containing an input changed truth on that element.
+    fn route_origin_truth_flipped(
+        &mut self,
+        program: SelectorProgramID,
+        origin: selector::SelectorNodeID,
+        node: StyleNodeID,
+    ) -> Option<bool> {
+        let view = self.transaction_fact_view.as_ref()?;
+        let compiled = self.programs.get(program);
+        if !compiled.selector_node_reads_only_local_facts(origin) {
+            return None;
+        }
+        let resident_facts = self.facts.primary();
+        let old = MatchEvaluator::new(&self.tree, resident_facts)
+            .with_transaction_fact_view(view, TransactionFactSide::Before)
+            .matches_selector_node(compiled, origin, node, &mut self.counters)
+            .ok()?;
+        let new = MatchEvaluator::new(&self.tree, resident_facts)
+            .with_transaction_fact_view(view, TransactionFactSide::After)
+            .matches_selector_node(compiled, origin, node, &mut self.counters)
+            .ok()?;
+        Some(old != new)
+    }
+
+    /// Whether one attribute input changed the route's origin test. Presence and case-sensitive
+    /// interned equality are answered directly; text operators use the selector evaluator.
+    fn route_attribute_origin_truth_flipped(
+        &mut self,
+        input: &NormalizedInput,
+        program: SelectorProgramID,
+        origin: selector::SelectorNodeID,
+        node: StyleNodeID,
+    ) -> Option<bool> {
+        let InputKey::LocalFeature(_, LocalFeatureKey::Attribute(_)) = input.key else {
+            return None;
+        };
+        let compiled = self.programs.get(program);
+        if let SelectorOp::Feature(selector::FeatureTest::Attribute(test)) = compiled.node(origin) {
+            let value = |input: InputValue| match input {
+                InputValue::Feature(value) => Some(value),
+                _ => None,
+            };
+            let old = value(input.old)?;
+            let new = value(input.new)?;
+            if test.operator == selector::AttributeOperator::Presence {
+                return Some(old.holds() != new.holds());
+            }
+            if test.operator == selector::AttributeOperator::Exact
+                && test.case == selector::AttributeCase::Sensitive
+                && !test.value_atom.is_none()
+            {
+                let matches = |value: FeatureValue| match value {
+                    FeatureValue::Absent => Some(false),
+                    FeatureValue::Atom(atom) => Some(atom == test.value_atom),
+                    _ => None,
+                };
+                return Some(matches(old)? != matches(new)?);
+            }
+        }
+        self.route_origin_truth_flipped(program, origin, node)
+    }
+
     /// Route one non-program input to the region its transpose routes reach.
     ///
     /// The region a path folds to is often much wider than the subjects that can actually change:
@@ -22,8 +84,8 @@ impl StyleEngine {
     pub(super) fn route_input(
         &mut self,
         input: &NormalizedInput,
-        sheets_in_flux: &[SheetID],
-        programs_in_flux: &[SelectorProgramID],
+        changed_sheets: &[SheetID],
+        changed_programs: &[SelectorProgramID],
         tree_routing: TreeRoutingMode<'_>,
         sibling_entries: &[SiblingEntry],
         sibling_candidates: &mut SiblingCandidateWorkspace,
@@ -55,7 +117,7 @@ impl StyleEngine {
         // An element's part exposure moving is that element becoming addressable from somewhere it
         // was not, or ceasing to be. No selector names the exposure, so there is nothing to
         // transpose: the region is the element whose reach moved.
-        if let InputKey::LocalFeature(node, FeatureKey::PartExposure) = input.key {
+        if let InputKey::LocalFeature(node, LocalFeatureKey::PartExposure) = input.key {
             self.record_selector_truth_refresh(node, None);
             regions.add(ImpactRegion::Node(node), &mut self.counters);
             return;
@@ -79,13 +141,13 @@ impl StyleEngine {
         }
 
         let in_flux = Self::feature_in_flux(input);
-        let is_arrival = matches!(input.key, InputKey::LocalFeature(_, FeatureKey::ArrivingFacts));
+        let is_arrival = matches!(input.key, InputKey::LocalFeature(_, LocalFeatureKey::ArrivingFacts));
         let keys = match input.key {
-            InputKey::LocalFeature(node, FeatureKey::ArrivingFacts) => self.routing_keys_of_arriving_facts(node),
+            InputKey::LocalFeature(node, LocalFeatureKey::ArrivingFacts) => self.routing_keys_of_arriving_facts(node),
             // A `[*|x]` rule registers under the any-namespace form of the name, which the pure
             // mapping cannot produce: it is a property of the atom rather than of the input. An
             // attribute change has to reach those rules as well as the ones naming its own namespace.
-            InputKey::LocalFeature(_, FeatureKey::Attribute(name)) => {
+            InputKey::LocalFeature(_, LocalFeatureKey::Attribute(name)) => {
                 let mut keys = routing_keys_for_input(input);
                 for other in self.facts.attribute_name_keys(name) {
                     if other != name {
@@ -96,6 +158,7 @@ impl StyleEngine {
             }
             _ => routing_keys_for_input(input),
         };
+        let route_liveness = routing.route_liveness(&self.program, &self.programs);
         for key in keys {
             // The tree delta already puts an arriving element and its subtree in the plan. Its
             // individual facts only have work left to do as possible witnesses of relational
@@ -111,22 +174,46 @@ impl StyleEngine {
                 continue;
             };
             for &route in routes {
+                let route_is_live = route_liveness.contains(route.index());
                 // A rule that decides nothing right now cannot be reached through. Its entry
                 // points stay registered, because the rule still holds its position and its sheet
                 // can come back.
                 let rule = routing.rule_of(route);
-                if !self.program.rule_can_decide(rule) && !sheets_in_flux.contains(&self.program.rule_sheet(rule)) {
+                if !route_is_live
+                    && !self.program.rule_can_decide(rule)
+                    && !changed_sheets.contains(&self.program.rule_sheet(rule))
+                {
                     continue;
                 }
                 let point = routing.route(route);
+                let (selector_program, selector_entry) = self.programs.entry_location(point.entry);
                 // A rule that was given a new selector list keeps its identity, so the routes
                 // of the program it left behind are still registered under it. They describe a
                 // selector the rule no longer has, and following them would route a mutation
                 // through a selector nobody wrote.
-                if self.program.rule_version(routing.rule_of(route)).selector_program != Some(point.program)
-                    && !programs_in_flux.contains(&point.program)
+                if !route_is_live
+                    && self.program.rule_version(rule).selector_program != Some(selector_program)
+                    && !changed_programs.contains(&selector_program)
                 {
                     continue;
+                }
+                let path = routing.path_of(route);
+                if !is_arrival
+                    && point.anchor.is_none()
+                    && !path.is_empty()
+                    && matches!(input.key, InputKey::LocalFeature(_, LocalFeatureKey::Attribute(_)))
+                {
+                    let truth_flipped = self.route_attribute_origin_truth_flipped(
+                        input,
+                        selector_program,
+                        point.selector_node.expect("attribute route has no selector node"),
+                        node,
+                    );
+                    if truth_flipped == Some(false) {
+                        self.counters.bump(Counter::OriginTruthRoutesSkipped);
+                        continue;
+                    }
+                    self.counters.bump(Counter::OriginTruthRoutesFired);
                 }
                 // The element the input happened to must satisfy the rest of the compound the input
                 // occurs in, or this route cannot be reached from it at all.
@@ -136,21 +223,20 @@ impl StyleEngine {
                 if !self.node_carries_all(routing.origin_required_of(route), node, in_flux) {
                     continue;
                 }
-                let path = routing.path_of(route);
                 let exact_tree_evaluation = if is_arrival && tree_routing.use_exact {
                     if tree_routing.has_before_sibling_relations
-                        && self.entry_can_use_before_sibling_relations(point.program, point.entry)
+                        && self.entry_can_use_before_sibling_relations(selector_program, selector_entry)
                     {
                         Some(
                             if matches!(path.first(), Some(InverseStep::FollowingSiblings))
-                                && self.entry_is_monotone_in_the_tree(point.program, point.entry)
+                                && self.entry_is_monotone_in_the_tree(selector_program, selector_entry)
                             {
                                 ExactTreeEvaluation::MonotonicArrival
                             } else {
                                 ExactTreeEvaluation::BeforeSiblingRelations
                             },
                         )
-                    } else if self.entry_is_monotone_in_the_tree(point.program, point.entry) {
+                    } else if self.entry_is_monotone_in_the_tree(selector_program, selector_entry) {
                         Some(ExactTreeEvaluation::Arrival)
                     } else {
                         None
@@ -165,8 +251,8 @@ impl StyleEngine {
                     path,
                     waypoints: routing.waypoints_of(route),
                     in_flux,
-                    exact_entry: Some((rule, point.program, point.entry)),
-                    refresh_rule: Some((rule, point.program)),
+                    exact_entry: Some((rule, point.entry)),
+                    refresh_rule: Some((rule, point.entry)),
                     // One side decides for a monotonic tree change, and only where nothing the
                     // change carries can turn the entry the other way. A negation, `:empty` and a
                     // positional test each can, and each is answered on both sides as usual.
@@ -176,7 +262,7 @@ impl StyleEngine {
                     // A relational input resolves its anchors first. Folding the anchor step into
                     // the path would compose "the ancestors of the changed node" with whatever the
                     // outer selector adds, and ancestors-then-descendants is the document.
-                    Some(anchor) => self.route_from_anchors(node, point.program, anchor, &site, regions),
+                    Some(anchor) => self.route_from_anchors(node, selector_program, anchor, &site, regions),
                     None => {
                         let region = ImpactRegion::follow(node, path, &self.tree);
                         let is_sibling_route = exact_tree_evaluation.is_some()
@@ -201,7 +287,6 @@ impl StyleEngine {
                                 let producers = prefix_producer_cache.producers_for_route(
                                     route,
                                     prefix_dispatch.prefixes(),
-                                    point.program,
                                     point.entry,
                                     routing.path_of(route).len(),
                                 );
@@ -441,25 +526,9 @@ impl StyleEngine {
         if sequences.iter().all(|(_, change)| change.relational_records.is_empty()) {
             return;
         }
-        // A route stays registered under the rule that made it, so the ones nothing live decides
-        // through are dropped once for the transaction rather than once per parent.
-        let mut live: Vec<(RouteID, SelectorProgramID, RelativeAnchor)> = Vec::new();
-        for &route in routing.relational_routes() {
-            let rule = routing.rule_of(route);
-            if !self.program.rule_can_decide(rule) {
-                continue;
-            }
-            let point = routing.route(route);
-            if self.program.rule_version(rule).selector_program != Some(point.program) {
-                continue;
-            }
-            let Some(anchor) = point.anchor else {
-                continue;
-            };
-            live.push((route, point.program, anchor));
-        }
+        let live = routing.live_relational_routes(&self.program, &self.programs);
 
-        for &(route, program, anchor) in &live {
+        for &LiveRelationalRoute { route, program, anchor } in live.iter() {
             // An argument that reaches its witness across a sibling relation of its own holds
             // because of an adjacency the query names nothing near. Any element landing in any
             // sequence breaks it while carrying nothing, so the query is asked from its witnesses
@@ -485,7 +554,7 @@ impl StyleEngine {
         &mut self,
         parent: StyleNodeID,
         change: &SequenceChange,
-        live: &[(RouteID, SelectorProgramID, RelativeAnchor)],
+        live: &[LiveRelationalRoute],
         routing: &RoutingRegistry,
         regions: &mut ImpactRegions,
     ) {
@@ -524,9 +593,12 @@ impl StyleEngine {
         let mut above: Option<Vec<StyleNodeID>> = None;
         let mut ancestor_predecessors: Option<Vec<StyleNodeID>> = None;
 
-        for &(route, program, anchor) in live {
+        for &LiveRelationalRoute { route, program, anchor } in live {
             let site = relational_route_site(routing, route);
-            let anchor_posting = posting_for_dispatch_key(anchor.anchor_dispatch);
+            let anchor_posting = anchor
+                .anchor_dispatch
+                .has_selector_posting()
+                .then_some(anchor.anchor_dispatch);
             // An element publishes every fact that holds on it as it connects, so a query resting
             // on one is reached from that fact and not from here. Only a query resting on none - a
             // negation, `*` - is invisible to an arrival, and only then are the anchors around an
@@ -795,11 +867,11 @@ impl StyleEngine {
                     let one_sided = !old_can_match
                         && new_can_match
                         && tree_routing.use_exact
-                        && self.entry_is_monotone_in_the_tree(point.program, point.entry);
+                        && self.entry_is_monotone_in_the_tree_id(point.entry);
                     let exact = match (
                         tree_routing.use_exact
                             && tree_routing.has_before_sibling_relations
-                            && self.entry_can_use_before_sibling_relations(point.program, point.entry),
+                            && self.entry_can_use_before_sibling_relations_id(point.entry),
                         one_sided,
                     ) {
                         (true, _) => Some(ExactTreeEvaluation::BeforeSiblingRelations),
@@ -858,10 +930,10 @@ impl StyleEngine {
             let region = ImpactRegion::follow(node, path, &self.tree);
             let exact_tree_evaluation = (tree_routing.use_exact
                 && tree_routing.has_before_sibling_relations
-                && self.entry_can_use_before_sibling_relations(point.program, point.entry))
+                && self.entry_can_use_before_sibling_relations_id(point.entry))
             .then(|| {
                 if matches!(path.first(), Some(InverseStep::FollowingSiblings))
-                    && self.entry_is_monotone_in_the_tree(point.program, point.entry)
+                    && self.entry_is_monotone_in_the_tree_id(point.entry)
                 {
                     ExactTreeEvaluation::MonotonicArrival
                 } else {
@@ -875,27 +947,6 @@ impl StyleEngine {
             });
             self.push_pending_region(routes, region);
         }
-    }
-
-    /// The compiled sides of a sibling-first route, or nothing when it decides nothing now.
-    ///
-    /// A route stays registered under the rule that made it, so one whose rule has taken a
-    /// new selector list or whose sheet nobody attached is still in the list and answers for
-    /// nothing.
-    pub(super) fn live_sibling_entries(&self) -> Vec<SiblingEntry> {
-        let mut entries = Vec::new();
-        for &route in self.routing.sibling_first_routes() {
-            let rule = self.routing.rule_of(route);
-            if !self.program.rule_can_decide(rule) {
-                continue;
-            }
-            let point = self.routing.route(route);
-            if self.program.rule_version(rule).selector_program != Some(point.program) {
-                continue;
-            }
-            entries.push(SiblingEntry { route });
-        }
-        entries
     }
 
     pub(super) fn sibling_entry_candidates<'a>(
@@ -951,8 +1002,8 @@ impl StyleEngine {
         let before_states = self
             .transaction_fact_view
             .as_ref()
-            .and_then(|view| view.facts(TransactionFactSide::Before, self.planning_facts()))
-            .and_then(|facts| facts.row_of(node).map(|row| facts.states_of(row)));
+            .and_then(|view| view.row_of(TransactionFactSide::Before, self.facts.primary(), node))
+            .map(|(facts, row)| facts.states_of(row));
         if let Some(before_states) = before_states {
             for state in before_states.facts() {
                 for &route in routing.sibling_first_routes_for_origin(DispatchKey::State(state)) {
@@ -989,13 +1040,13 @@ impl StyleEngine {
             let departure_can_be_compared_exactly = tree_routing.use_exact
                 && tree_routing.has_before_sibling_relations
                 && !state_moved
-                && self.entry_can_use_before_sibling_relations(point.program, point.entry);
+                && self.entry_can_use_before_sibling_relations_id(point.entry);
             // The waypoints are the compounds the path passes through, checked by walking back from
             // a candidate. That walk arrives at the place the element had, which no longer leads to
             // it, so the candidate stands on its own features.
             let exact_tree_evaluation = departure_can_be_compared_exactly.then(|| {
                 if matches!(path.first(), Some(InverseStep::FollowingSiblings))
-                    && self.entry_is_monotone_in_the_tree(point.program, point.entry)
+                    && self.entry_is_monotone_in_the_tree_id(point.entry)
                 {
                     ExactTreeEvaluation::MonotonicDeparture
                 } else {
@@ -1102,11 +1153,11 @@ impl StyleEngine {
         if !directionality.is_none() {
             callback(DispatchKey::Directionality(directionality));
         }
-        if let Some(row) = self.planning_facts().row_of(node) {
-            for &state in self.planning_facts().custom_states_of(row) {
+        if let Some(row) = self.facts.primary().row_of(node) {
+            for &state in self.facts.primary().custom_states_of(row) {
                 callback(DispatchKey::CustomState(state));
             }
-            for &part in self.planning_facts().parts_of(row) {
+            for &part in self.facts.primary().parts_of(row) {
                 callback(DispatchKey::Part(part));
             }
         }
@@ -1125,7 +1176,7 @@ impl StyleEngine {
     pub(super) fn route_sequence_changes(
         &mut self,
         sequences: &SequenceChanges,
-        sheets_in_flux: &[SheetID],
+        changed_sheets: &[SheetID],
         tree_routing: TreeRoutingMode<'_>,
         regions: &mut ImpactRegions,
         workspace: &mut ImpactPlanningWorkspace,
@@ -1134,35 +1185,47 @@ impl StyleEngine {
             return DeferredSequenceRoutes::default();
         }
         let routing = Rc::clone(&self.routing);
-        // A route stays registered under the rule that made it: a rule keeps its identity
-        // through a new selector list, and a detached sheet's rules keep their positions because the
-        // sheet can come back. Neither decides anything now, and routing a sequence change through
-        // one names the subjects of a selector nobody wrote or of a sheet nobody attached.
-        let mut entries = Vec::new();
-        for &route in routing.routes_for(RoutingKey::Structural) {
-            let rule = routing.rule_of(route);
-            if !self.program.rule_can_decide(rule) && !sheets_in_flux.contains(&self.program.rule_sheet(rule)) {
-                continue;
+        let exact_before_sibling_relations = tree_routing.use_exact && tree_routing.has_before_sibling_relations;
+        let use_cached_index = changed_sheets.is_empty();
+        let mut entries = if use_cached_index {
+            routing.live_sequence_entries(&self.program, &self.programs).to_vec()
+        } else {
+            let route_liveness = routing.route_liveness(&self.program, &self.programs);
+            // A sheet changing attachment needs the routes from both sides of the transaction. The
+            // current-program cache intentionally contains only the final side, so build this rare
+            // union directly.
+            let mut entries = Vec::new();
+            for &route in routing.routes_for(RoutingKey::Structural) {
+                let route_is_live = route_liveness.contains(route.index());
+                let rule = routing.rule_of(route);
+                if !route_is_live
+                    && !self.program.rule_can_decide(rule)
+                    && !changed_sheets.contains(&self.program.rule_sheet(rule))
+                {
+                    continue;
+                }
+                let point = routing.route(route);
+                let (selector_program, _) = self.programs.entry_location(point.entry);
+                if !route_is_live && self.program.rule_version(rule).selector_program != Some(selector_program) {
+                    continue;
+                }
+                let operator = self
+                    .programs
+                    .get(selector_program)
+                    .node(point.selector_node.expect("structural route has no operator"));
+                if !matches!(operator, SelectorOp::Empty | SelectorOp::NthPosition(_)) {
+                    continue;
+                }
+                entries.push(SequenceEntry {
+                    route,
+                    operator,
+                    can_compare_exactly: self.entry_can_use_before_sibling_relations_id(point.entry),
+                });
             }
-            let point = routing.route(route);
-            if self.program.rule_version(rule).selector_program != Some(point.program) {
-                continue;
-            }
-            let operator = self
-                .programs
-                .get(point.program)
-                .node(point.structural_node.expect("structural route has no operator"));
-            if !matches!(operator, SelectorOp::Empty | SelectorOp::NthPosition(_)) {
-                continue;
-            }
-            let can_compare_exactly = tree_routing.use_exact
-                && tree_routing.has_before_sibling_relations
-                && self.entry_can_use_before_sibling_relations(point.program, point.entry);
-            entries.push(SequenceEntry {
-                route,
-                operator,
-                can_compare_exactly,
-            });
+            entries
+        };
+        for entry in &mut entries {
+            entry.can_compare_exactly &= exact_before_sibling_relations;
         }
         if entries.is_empty() {
             return DeferredSequenceRoutes::default();
@@ -1170,8 +1233,15 @@ impl StyleEngine {
         let entry_scratch_bytes = (entries.capacity() * size_of::<SequenceEntry>()) as u64;
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, entry_scratch_bytes);
-        let mut entry_index = SequenceEntryIndex::build(&entries, &routing);
-        let entry_index_bytes = entry_index.capacity_bytes();
+        let mut cached_entry_index =
+            use_cached_index.then(|| routing.live_sequence_index(&self.program, &self.programs));
+        let mut owned_entry_index = (!use_cached_index).then(|| SequenceEntryIndex::build(&entries, &routing));
+        let entry_index_bytes = owned_entry_index.as_ref().map_or(0, SequenceEntryIndex::capacity_bytes);
+        let entry_index = match (&mut cached_entry_index, &mut owned_entry_index) {
+            (Some(cached), None) => &mut **cached,
+            (None, Some(owned)) => owned,
+            _ => unreachable!(),
+        };
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, entry_index_bytes);
         let parent_emptiness = entries.iter().any(|entry| entry.operator == SelectorOp::Empty);
@@ -1187,18 +1257,11 @@ impl StyleEngine {
                 for &empty_index in &entry_index.empty {
                     let route = entries[empty_index].route;
                     let point = self.routing.route(route);
-                    self.record_selector_truth_refresh(parent, Some((self.routing.rule_of(route), point.program)));
+                    self.record_selector_truth_refresh(parent, Some((self.routing.rule_of(route), point.entry)));
                 }
                 regions.add(ImpactRegion::Node(parent), &mut self.counters);
             }
-            self.add_sequence_region(
-                parent,
-                change,
-                &entries,
-                &mut entry_index,
-                &mut pending_regions,
-                regions,
-            );
+            self.add_sequence_region(parent, change, &entries, entry_index, &mut pending_regions, regions);
         }
         // An entry the automaton answers exactly can wait for the convergence walk: when the
         // walk re-compares every member of every touched sequence, its exact diffs subsume this
@@ -1216,7 +1279,7 @@ impl StyleEngine {
             let routed_region_bytes = (routed_regions.capacity() * size_of::<ImpactRegion>()) as u64;
             pending_inner_bytes += routed_region_bytes;
             let point = routing.route(entry.route);
-            if sequences_are_document_scoped && dispatch.prefixes().contains_entry(point.program, point.entry) {
+            if sequences_are_document_scoped && dispatch.prefixes().contains_entry(point.entry) {
                 deferred.entries.push(entry.clone());
                 deferred.regions.push(std::mem::take(routed_regions));
                 deferred.nested_memory.grow_committed(routed_region_bytes);
@@ -1230,7 +1293,8 @@ impl StyleEngine {
             .release(MemoryCategory::BatchScratch, pending_outer_bytes + pending_inner_bytes);
         self.memory.release(MemoryCategory::BatchScratch, entry_index_bytes);
         self.memory.release(MemoryCategory::BatchScratch, entry_scratch_bytes);
-        deferred.nested_memory.settle_committed(&mut self.memory);
+        let nested = deferred.nested_memory.bytes();
+        deferred.nested_memory.reconcile_committed(&mut self.memory, nested);
         let deferred_header_bytes = deferred.capacity_bytes() - deferred.nested_memory.bytes();
         deferred
             .memory
@@ -1305,10 +1369,13 @@ impl StyleEngine {
                 in_flux: None,
                 exact_entry: None,
                 exact_tree_evaluation: None,
-                refresh_rule: Some((routing.rule_of(entry.route), point.program)),
+                refresh_rule: Some((routing.rule_of(entry.route), point.entry)),
             };
             match point.anchor {
-                Some(anchor) => self.route_from_anchors(parent, point.program, anchor, &site, regions),
+                Some(anchor) => {
+                    let (program, _) = self.programs.entry_location(point.entry);
+                    self.route_from_anchors(parent, program, anchor, &site, regions);
+                }
                 None => {
                     let region = ImpactRegion::follow(parent, path, &self.tree);
                     self.push_pending_region(&mut pending_regions[entry_index], region);
@@ -1411,7 +1478,10 @@ impl StyleEngine {
                     // witness, not a subject: its anchors have to be resolved before the path
                     // continues.
                     match point.anchor {
-                        Some(anchor) => engine.route_from_anchors(child, point.program, anchor, &site, regions),
+                        Some(anchor) => {
+                            let (program, _) = engine.programs.entry_location(point.entry);
+                            engine.route_from_anchors(child, program, anchor, &site, regions);
+                        }
                         None => {
                             let region = ImpactRegion::follow(child, path, &engine.tree);
                             engine.push_pending_region(&mut pending_regions[entry_index], region);
@@ -1505,7 +1575,10 @@ impl StyleEngine {
         self.counters
             .add(Counter::RelationalAnchorsConsidered, anchors.len() as u64);
 
-        let anchor_posting = posting_for_dispatch_key(anchor.anchor_dispatch);
+        let anchor_posting = anchor
+            .anchor_dispatch
+            .has_selector_posting()
+            .then_some(anchor.anchor_dispatch);
         for candidate in anchors {
             // An ancestor that does not carry the anchor compound's feature is not an anchor of
             // this query at all.
@@ -1551,11 +1624,11 @@ impl StyleEngine {
         site: &RoutingSite<'_>,
         regions: &mut ImpactRegions,
     ) {
-        let Some(posting) = posting_for_dispatch_key(anchor.witness_dispatch) else {
+        if !anchor.witness_dispatch.has_selector_posting() {
             self.add_narrowed_region(ImpactRegion::Document, site, regions);
             return;
-        };
-        let candidates: Vec<StyleNodeID> = match self.facts.postings().lookup(posting) {
+        }
+        let candidates: Vec<StyleNodeID> = match self.facts.postings().lookup(anchor.witness_dispatch) {
             Lookup::Known(posting) => posting.candidates().collect(),
             Lookup::KnownAbsent => Vec::new(),
             Lookup::Missing(_) => {
@@ -1606,9 +1679,10 @@ impl StyleEngine {
             return true;
         }
         match (flux_key, key) {
-            (DispatchKey::AttributeName(moved), DispatchKey::AttributeName(named)) => {
-                self.facts.attribute_name_keys(moved).contains(&named)
-            }
+            (DispatchKey::AttributeName(moved), DispatchKey::AttributeName(named)) => self
+                .facts
+                .attribute_name_keys(moved)
+                .any(|candidate| candidate == named),
             _ => false,
         }
     }
@@ -1648,7 +1722,7 @@ impl StyleEngine {
             return true;
         }
         let is_root = self.tree.parent(node).is_none();
-        let resident_facts = self.planning_facts();
+        let resident_facts = self.facts.primary();
         if resident_facts
             .row_of(node)
             .is_some_and(|row| resident_facts.carries_dispatch_key(row, key, is_root))
@@ -1658,15 +1732,8 @@ impl StyleEngine {
         if self
             .transaction_fact_view
             .as_ref()
-            .and_then(|view| match view.resident_side {
-                TransactionFactSide::Before => view.after.as_ref(),
-                TransactionFactSide::After => view.before.as_ref(),
-            })
-            .and_then(|facts| {
-                facts
-                    .row_of(node)
-                    .map(|row| facts.carries_dispatch_key(row, key, is_root))
-            })
+            .and_then(|view| view.row_of(TransactionFactSide::Before, resident_facts, node))
+            .map(|(facts, row)| facts.carries_dispatch_key(row, key, is_root))
             == Some(true)
         {
             return true;
@@ -1675,11 +1742,12 @@ impl StyleEngine {
             return false;
         }
         self.facts.carries_local_dispatch_key(node, key).unwrap_or_else(|| {
-            posting_for_dispatch_key(key).is_none_or(|key| match self.facts.postings().lookup(key) {
-                Lookup::Known(posting) => posting.contains(node),
-                Lookup::KnownAbsent => false,
-                Lookup::Missing(_) => true,
-            })
+            !key.has_selector_posting()
+                || match self.facts.postings().lookup(key) {
+                    Lookup::Known(posting) => posting.contains(node),
+                    Lookup::KnownAbsent => false,
+                    Lookup::Missing(_) => true,
+                }
         })
     }
 
@@ -1787,54 +1855,6 @@ impl StyleEngine {
         true
     }
 
-    /// Pack the old fact side for the whole transaction subtree, once per transaction.
-    ///
-    /// The activation filter enumerates posting candidates across the document, so it reads
-    /// arbitrary old-side rows; the new side is always the primary document arrangement.
-    pub(super) fn materialize_transaction_fact_view_fully(&mut self) {
-        let Some(transition) = self.transaction_fact_view.as_mut() else {
-            return;
-        };
-        if transition.opposite_fully_materialized {
-            return;
-        }
-        transition.opposite_fully_materialized = true;
-        let opposite = match transition.resident_side {
-            TransactionFactSide::Before => &mut transition.after,
-            TransactionFactSide::After => &mut transition.before,
-        };
-        let Some(opposite) = opposite.as_mut() else {
-            return;
-        };
-        let bytes_before = opposite.capacity_bytes();
-        self.facts.materialize_missing(
-            self.tree.preorder(transition.root).chain(self.departed.iter().copied()),
-            opposite,
-        );
-        let bytes_after = opposite.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, bytes_after - bytes_before);
-    }
-
-    /// Grow the transaction's shared old-side batch to cover `covered`.
-    pub(super) fn ensure_transaction_fact_rows(&mut self, covered: &[StyleNodeID]) {
-        let Some(transition) = self.transaction_fact_view.as_mut() else {
-            return;
-        };
-        let opposite = match transition.resident_side {
-            TransactionFactSide::Before => &mut transition.after,
-            TransactionFactSide::After => &mut transition.before,
-        };
-        let Some(opposite) = opposite.as_mut() else {
-            return;
-        };
-        let bytes_before = opposite.capacity_bytes();
-        self.facts.materialize_missing(covered.iter().copied(), opposite);
-        let bytes_after = opposite.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, bytes_after - bytes_before);
-    }
-
     /// Whether an entry is monotonic under a positive tree arrival.
     ///
     /// An arriving element is routed from the facts it publishes, so the new side alone decides
@@ -1849,12 +1869,24 @@ impl StyleEngine {
     }
 
     #[must_use]
+    fn entry_is_monotone_in_the_tree_id(&self, entry: EntryID) -> bool {
+        let (program, index) = self.programs.entry_location(entry);
+        self.entry_is_monotone_in_the_tree(program, index)
+    }
+
+    #[must_use]
     pub(super) fn entry_can_use_before_sibling_relations(&self, program: SelectorProgramID, entry: u32) -> bool {
         let compiled = self.programs.get(program);
         compiled
             .entries()
             .get(entry as usize)
             .is_some_and(|entry| entry.can_use_before_sibling_relations() && entry.observes_sibling_relation())
+    }
+
+    #[must_use]
+    fn entry_can_use_before_sibling_relations_id(&self, entry: EntryID) -> bool {
+        let (program, index) = self.programs.entry_location(entry);
+        self.entry_can_use_before_sibling_relations(program, index)
     }
 
     pub(super) fn candidate_changes_exact_tree(
@@ -1879,9 +1911,6 @@ impl StyleEngine {
                 .and_then(|_| self.retained_entry_matches(node, program, entry)),
         };
         let change = loop {
-            if old_matches.is_none() {
-                self.ensure_transaction_fact_rows(&covered);
-            }
             let result = {
                 let compiled = self.programs.get(program);
                 let exact_entry = &compiled.entries()[entry as usize];
@@ -1923,9 +1952,10 @@ impl StyleEngine {
         node: StyleNodeID,
         site: &RoutingSite<'_>,
     ) -> ExactEntryResult {
-        let Some((rule, program, entry)) = site.exact_entry else {
+        let Some((rule, entry_id)) = site.exact_entry else {
             return Lookup::Missing(ExactEntryGap);
         };
+        let (program, entry) = self.programs.entry_location(entry_id);
         if self.transaction_fact_view.is_none() {
             return Lookup::Missing(ExactEntryGap);
         }
@@ -1964,76 +1994,27 @@ impl StyleEngine {
             .as_ref()
             .filter(|view| view.retained_truth_available)
             .and_then(|_| self.retained_entry_matches(node, program, entry));
-        let resident_facts = if self
-            .transaction_fact_view
-            .as_ref()
-            .is_some_and(|view| view.resident_side == TransactionFactSide::Before)
-        {
-            self.facts.committed()
-        } else {
-            self.facts.primary()
-        };
-        if retained_old_matches.is_none()
-            && self
-                .transaction_fact_view
-                .as_ref()
-                .and_then(|view| view.facts(TransactionFactSide::Before, resident_facts))
-                .is_none()
-        {
-            return Lookup::Missing(ExactEntryGap);
-        }
-
         let mut covered = std::mem::take(&mut self.exact_covered_scratch);
         covered.clear();
         covered.push(node);
         let mut sibling_window = INITIAL_SIBLING_FACT_WINDOW;
         let changed = loop {
-            if retained_old_matches.is_none()
-                || self
-                    .transaction_fact_view
-                    .as_ref()
-                    .is_some_and(|view| view.resident_side == TransactionFactSide::Before)
-            {
-                self.ensure_transaction_fact_rows(&covered);
-            }
             let result = {
-                let resident_facts = if self
-                    .transaction_fact_view
-                    .as_ref()
-                    .is_some_and(|view| view.resident_side == TransactionFactSide::Before)
-                {
-                    self.facts.committed()
-                } else {
-                    self.facts.primary()
-                };
+                let resident_facts = self.facts.primary();
                 let view = self
                     .transaction_fact_view
                     .as_ref()
                     .expect("exact evaluation has a transaction fact view");
-                let old_facts = view
-                    .facts(TransactionFactSide::Before, resident_facts)
-                    .expect("old facts were checked before exact evaluation");
-                let new_facts = view
-                    .facts(TransactionFactSide::After, resident_facts)
-                    .expect("exact evaluation has after facts");
                 let compiled = self.programs.get(program);
                 let exact_entry = &compiled.entries()[entry as usize];
-                let new_matches = MatchEvaluator::new(&self.tree, new_facts).matches_entry_for_program(
-                    program,
-                    compiled,
-                    exact_entry,
-                    node,
-                    &mut self.counters,
-                );
+                let new_matches = MatchEvaluator::new(&self.tree, resident_facts)
+                    .with_transaction_fact_view(view, TransactionFactSide::After)
+                    .matches_entry_for_program(program, compiled, exact_entry, node, &mut self.counters);
                 let old_matches = match retained_old_matches {
                     Some(old_matches) => Ok(old_matches),
-                    None => MatchEvaluator::new(&self.tree, old_facts).matches_entry_for_program(
-                        program,
-                        compiled,
-                        exact_entry,
-                        node,
-                        &mut self.counters,
-                    ),
+                    None => MatchEvaluator::new(&self.tree, resident_facts)
+                        .with_transaction_fact_view(view, TransactionFactSide::Before)
+                        .matches_entry_for_program(program, compiled, exact_entry, node, &mut self.counters),
                 };
                 (old_matches, new_matches)
             };
@@ -2141,7 +2122,8 @@ impl StyleEngine {
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, charged_bytes);
 
-        let (rule, program, entry) = site.exact_entry.unwrap();
+        let (rule, entry_id) = site.exact_entry.unwrap();
+        let (program, entry) = self.programs.entry_location(entry_id);
         let sheet = self.program.rule_sheet(rule);
         let compiled = self.programs.get(program);
         if compiled.can_leave_its_scope()
@@ -2239,16 +2221,13 @@ impl StyleEngine {
             }
         }
 
-        let has_usable_subject =
-            !site.subject.is_empty() && site.subject.iter().all(|&key| posting_for_dispatch_key(key).is_some());
+        let has_usable_subject = !site.subject.is_empty() && site.subject.iter().all(|key| key.has_selector_posting());
         if !self.selector_truth_changes_active
             && has_usable_subject
-            && site.subject.iter().all(|&key| {
-                !matches!(
-                    self.facts.postings().lookup(posting_for_dispatch_key(key).unwrap()),
-                    Lookup::Missing(_)
-                )
-            })
+            && site
+                .subject
+                .iter()
+                .all(|&key| !matches!(self.facts.postings().lookup(key), Lookup::Missing(_)))
             && routed_regions
                 .iter()
                 .all(|region| matches!(region, ImpactRegion::Node(_)))
@@ -2257,14 +2236,13 @@ impl StyleEngine {
             return;
         }
         let cardinality = if has_usable_subject {
-            site.subject
-                .iter()
-                .filter_map(|&key| posting_for_dispatch_key(key))
-                .try_fold(0_usize, |total, posting| match self.facts.postings().lookup(posting) {
+            site.subject.iter().copied().try_fold(0_usize, |total, posting| {
+                match self.facts.postings().lookup(posting) {
                     Lookup::Known(posting) => Some(total.saturating_add(posting.len())),
                     Lookup::KnownAbsent => Some(total),
                     Lookup::Missing(_) => None,
-                })
+                }
+            })
         } else {
             None
         };
@@ -2310,10 +2288,9 @@ impl StyleEngine {
             Some(compiled_regions)
         };
 
-        self.facts.postings_mut().ensure_dense_ids();
         let mut candidates = Vec::new();
         let mut pruned_nodes = Vec::new();
-        for posting in site.subject.iter().filter_map(|&key| posting_for_dispatch_key(key)) {
+        for &posting in site.subject {
             let Ok((_, reused, copied, inspected, _)) = workspace.extend_remaining_posting(
                 posting,
                 self.facts.postings(),
@@ -2476,13 +2453,13 @@ impl StyleEngine {
         route: RouteID,
     ) -> bool {
         let point = routing.route(route);
-        point.has_prefix_chain
-            && point.prefix_chain_has_only_local_facts
+        routing.entry_has_prefix_chain(route)
+            && routing.entry_prefix_chain_has_only_local_facts(route)
             && self
                 .program
                 .sheet_origin(self.program.rule_sheet(routing.rule_of(route)))
                 == CascadeOrigin::Author
-            && dispatch.prefixes().contains_entry(point.program, point.entry)
+            && dispatch.prefixes().contains_entry(point.entry)
     }
 
     pub(super) fn add_prefix_convergence_regions(
@@ -2561,7 +2538,7 @@ impl StyleEngine {
                             touch(&self.tree, relations.parent);
                         }
                     }
-                    InputKey::LocalFeature(node, FeatureKey::TagName | FeatureKey::FoldedTagName)
+                    InputKey::LocalFeature(node, LocalFeatureKey::TagName | LocalFeatureKey::FoldedTagName)
                         if has_of_type_tests =>
                     {
                         touch(&self.tree, self.tree.parent(node));
@@ -2674,10 +2651,11 @@ impl StyleEngine {
             let mut inexact_answer_regions = Vec::new();
             pending.retain(|key, routed_regions| {
                 let route = routing.route(key.route);
+                let (program, entry) = self.programs.entry_location(route.entry);
                 let keep = !self.prefix_route_cannot_change_any_retained_winner(
                     routing.rule_of(key.route),
-                    route.program,
-                    route.entry,
+                    program,
+                    entry,
                     transaction,
                 );
                 if !keep {
@@ -2744,11 +2722,11 @@ impl StyleEngine {
                 break;
             }
             for dispatch in subject {
-                let Some(posting) = posting_for_dispatch_key(*dispatch) else {
+                if !dispatch.has_selector_posting() {
                     subjects_are_indexed = false;
                     break;
-                };
-                let candidates = match self.facts.postings().lookup(posting) {
+                }
+                let candidates = match self.facts.postings().lookup(*dispatch) {
                     Lookup::Known(posting) => posting.candidates(),
                     Lookup::KnownAbsent => continue,
                     Lookup::Missing(_) => {
@@ -2786,9 +2764,9 @@ impl StyleEngine {
         let selection = dispatch.prefixes().select_entries(
             eligible_keys.iter().map(|key| {
                 let route = routing.route(key.route);
-                (route.program, route.entry)
+                route.entry
             }),
-            dispatch.entry_count(),
+            self.programs.entry_capacity(),
         );
         let had_retained_prefix_states = self.prefix_caches.borrow().states.is_retained();
         let mut local_prefix_producers: HashMap<StyleNodeID, Vec<PrefixProducer>> = HashMap::default();
@@ -2827,32 +2805,11 @@ impl StyleEngine {
             //     warm across departure-bearing flushes.
             let can_reuse = retained.lookup_mut(scope_program).sparse().is_ok();
             if can_reuse {
-                if self
+                let view = self
                     .transaction_fact_view
                     .as_ref()
-                    .is_some_and(|view| view.resident_side == TransactionFactSide::Before)
-                {
-                    self.materialize_transaction_fact_view_fully();
-                }
-                let resident_facts = if self
-                    .transaction_fact_view
-                    .as_ref()
-                    .is_some_and(|view| view.resident_side == TransactionFactSide::Before)
-                {
-                    self.facts.committed()
-                } else {
-                    self.facts.primary()
-                };
-                let new_facts = self
-                    .transaction_fact_view
-                    .as_ref()
-                    .and_then(|view| view.facts(TransactionFactSide::After, resident_facts))
-                    .expect("prefix planning has after facts");
-                let old_facts = self
-                    .transaction_fact_view
-                    .as_ref()
-                    .and_then(|view| view.facts(TransactionFactSide::Before, resident_facts))
-                    .expect("prefix planning has before facts");
+                    .expect("prefix planning has a transaction fact view");
+                let resident_facts = self.facts.primary();
                 self.counters.bump(Counter::PrefixTransitionCacheHits);
                 let nodes_in_preorder = regions.sort_nodes_for_top_down_walk(&mut pending_nodes, &self.tree);
                 if automaton_has_sibling_steps && !nodes_in_preorder {
@@ -2863,21 +2820,23 @@ impl StyleEngine {
                 let mut visited = Vec::new();
                 let mut changed_nodes = Vec::new();
                 let mut prefix_delta_arena = PrefixDeltaArena::default();
-                let old_evaluator = MatchEvaluator::new(&self.tree, old_facts);
+                let old_evaluator = MatchEvaluator::new(&self.tree, resident_facts)
+                    .with_transaction_fact_view(view, TransactionFactSide::Before);
                 let old_evaluation = PrefixEvaluation::new(
                     dispatch.prefixes(),
                     &self.tree,
-                    old_facts,
+                    resident_facts,
                     &self.programs,
                     &old_evaluator,
                     None,
                     None,
                 );
-                let new_evaluator = MatchEvaluator::new(&self.tree, new_facts);
+                let new_evaluator = MatchEvaluator::new(&self.tree, resident_facts)
+                    .with_transaction_fact_view(view, TransactionFactSide::After);
                 let new_evaluation = PrefixEvaluation::new(
                     dispatch.prefixes(),
                     &self.tree,
-                    new_facts,
+                    resident_facts,
                     &self.programs,
                     &new_evaluator,
                     None,
@@ -2906,7 +2865,7 @@ impl StyleEngine {
                 let mut prefix_completion_budget = PREFIX_TRANSITION_CACHE_COMPLETION_BUDGET;
                 let mut sibling_walk_abandoned = false;
                 {
-                    let mut states = match retained.lookup_mut(scope_program) {
+                    let states = match retained.lookup_mut(scope_program) {
                         Lookup::Known(states) => states,
                         Lookup::KnownAbsent | Lookup::Missing(_) => {
                             unreachable!("prefix cache reuse proved the program present")
@@ -3082,7 +3041,7 @@ impl StyleEngine {
                 retained.settle_memory(&mut self.memory);
                 if complete {
                     {
-                        let mut states = match retained.lookup_mut(scope_program) {
+                        let states = match retained.lookup_mut(scope_program) {
                             Lookup::Known(states) => states,
                             Lookup::KnownAbsent | Lookup::Missing(_) => {
                                 unreachable!("prefix cache reuse proved the program present")
@@ -3198,9 +3157,9 @@ impl StyleEngine {
             return false;
         }
         let dispatch_key = compiled.dispatch_key(entry);
-        let Some(posting) = posting_for_dispatch_key(dispatch_key) else {
+        if !dispatch_key.has_selector_posting() {
             return false;
-        };
+        }
         // Rules dispatched under one key all walk the same posting, and the winner column is
         // stable for the routing pass, so the distinct-state collection is shared through a
         // generation-keyed cache: the first asker pays the posting walk, and every further rule
@@ -3216,7 +3175,7 @@ impl StyleEngine {
             Some(None) => return false,
             None => {
                 let mut collected: Vec<CascadeStateID> = Vec::new();
-                let complete = match self.facts.postings().lookup(posting) {
+                let complete = match self.facts.postings().lookup(dispatch_key) {
                     Lookup::Known(posting) => posting.candidates().all(|node| {
                         self.winner_groups
                             .lookup(WinnerGroupKey::current(node, winner_program_version))
@@ -3267,36 +3226,34 @@ impl StyleEngine {
         }
         let states = states_with_moved_features.as_deref().unwrap_or(posting_states.as_ref());
 
-        let retained_winner_ignores_transaction = |previous: PropertyWinner, property| {
+        // The proof has a cheap half and an expensive half. The cheap half compares the changed
+        // rule against the exact retained priority; only when it can not win is the expensive half
+        // needed, which walks the winner's transpose sites to prove the transaction does not touch
+        // that winner. Ask the cheap question first.
+        let retained_winner_program = |previous: PropertyWinner, property| {
             let WinnerSource::Rule(winner_rule) = previous.source else {
-                return false;
+                return None;
             };
-            let Some(declaration) = self
+            if !self
                 .program
                 .declared_properties_of(winner_rule)
                 .iter()
-                .find(|declaration| declaration.property == property)
-            else {
-                return false;
-            };
-            let Some(program) = self.program.rule_version(winner_rule).selector_program else {
-                return false;
-            };
+                .any(|declaration| declaration.property == property)
+            {
+                return None;
+            }
+            let program = self.program.rule_version(winner_rule).selector_program?;
             let compiled = self.programs.get(program);
             if compiled.can_leave_its_scope() || compiled.entries().iter().any(|entry| entry.scope_root.is_some()) {
-                return false;
+                return None;
             }
 
+            Some(program)
+        };
+        let retained_winner_ignores_transaction = |program: SelectorProgramID| {
+            let compiled = self.programs.get(program);
             for (entry_index, entry) in compiled.entries().iter().enumerate() {
-                if entry.pseudo_element.is_some()
-                    || self.cascade_priority_of(
-                        winner_rule,
-                        TreeScopeID::DOCUMENT,
-                        entry.specificity,
-                        u32::MAX,
-                        declaration.important,
-                    ) < previous.priority
-                {
+                if entry.pseudo_element.is_some() {
                     continue;
                 }
                 let mut reads_changed_input = false;
@@ -3321,8 +3278,10 @@ impl StyleEngine {
                     u32::MAX,
                     declaration.important,
                 );
-                changed_priority <= previous.priority
-                    && retained_winner_ignores_transaction(previous, declaration.property)
+                let Some(previous_program) = retained_winner_program(previous, declaration.property) else {
+                    return false;
+                };
+                changed_priority <= previous.priority && retained_winner_ignores_transaction(previous_program)
             })
         })
     }
@@ -3333,12 +3292,15 @@ impl StyleEngine {
             if input_routes_on_key(input, key) {
                 return true;
             }
-            let (InputKey::LocalFeature(_, FeatureKey::Attribute(changed)), RoutingKey::AttributeName(required)) =
-                (input.key, key)
-            else {
+            let InputKey::LocalFeature(_, LocalFeatureKey::Attribute(changed)) = input.key else {
                 return false;
             };
-            self.facts.attribute_name_keys(changed).contains(&required)
+            let RoutingKey::AttributeName(required) = key else {
+                return false;
+            };
+            self.facts
+                .attribute_name_keys(changed)
+                .any(|candidate| candidate == required)
         })
     }
 
@@ -3383,7 +3345,7 @@ impl StyleEngine {
             && transaction
                 .inputs
                 .iter()
-                .all(|input| !matches!(input.key, InputKey::LocalFeature(_, FeatureKey::ArrivingFacts)))
+                .all(|input| !matches!(input.key, InputKey::LocalFeature(_, LocalFeatureKey::ArrivingFacts)))
             && self.selector_incidence_is_current
             && self
                 .transaction_fact_view
@@ -3408,9 +3370,9 @@ impl StyleEngine {
                     path: routing.path_of(route),
                     waypoints: routing.waypoints_of(route),
                     in_flux: None,
-                    exact_entry: Some((rule, point.program, point.entry)),
+                    exact_entry: Some((rule, point.entry)),
                     exact_tree_evaluation: key.exact_tree_evaluation,
-                    refresh_rule: Some((rule, point.program)),
+                    refresh_rule: Some((rule, point.entry)),
                 };
                 self.discard_regions_covered_by_subtree(routed_regions, &site, regions);
                 self.add_narrowed_regions_with_workspace(routed_regions, &site, regions, workspace);
@@ -3421,7 +3383,6 @@ impl StyleEngine {
             let point = routing.route(entry.key.route);
             (
                 routing.rule_of(entry.key.route),
-                point.program,
                 point.entry,
                 entry.key.exact_tree_evaluation,
             )
@@ -3430,12 +3391,12 @@ impl StyleEngine {
         while first < pending.entries.len() {
             let key = pending.entries[first].key;
             let point = routing.route(key.route);
-            let exact_entry = (routing.rule_of(key.route), point.program, point.entry);
+            let exact_entry = (routing.rule_of(key.route), point.entry);
             let mut end = first + 1;
             while end < pending.entries.len() {
                 let next = pending.entries[end].key;
                 let next_point = routing.route(next.route);
-                if (routing.rule_of(next.route), next_point.program, next_point.entry) != exact_entry
+                if (routing.rule_of(next.route), next_point.entry) != exact_entry
                     || next.exact_tree_evaluation != key.exact_tree_evaluation
                 {
                     break;
@@ -3489,9 +3450,9 @@ impl StyleEngine {
                     &[]
                 },
                 in_flux: None,
-                exact_entry: Some((rule, point.program, point.entry)),
+                exact_entry: Some((rule, point.entry)),
                 exact_tree_evaluation: key.exact_tree_evaluation,
-                refresh_rule: Some((rule, point.program)),
+                refresh_rule: Some((rule, point.entry)),
             };
             self.discard_regions_covered_by_subtree(routed_regions, &site, regions);
             self.add_narrowed_regions_with_workspace(routed_regions, &site, regions, workspace);
@@ -3539,7 +3500,7 @@ impl StyleEngine {
                 SiblingRouteKind::Departure | SiblingRouteKind::ExactUnion => {
                     let point = routing.route(entry.route);
                     let exact_entry = (key.kind == SiblingRouteKind::ExactUnion || key.exact_tree_evaluation.is_some())
-                        .then_some((routing.rule_of(entry.route), point.program, point.entry));
+                        .then_some((routing.rule_of(entry.route), point.entry));
                     RoutingSite {
                         subject: routing.subject_dispatch_of(entry.route),
                         subject_required: routing.subject_required_of(entry.route),
@@ -3553,7 +3514,7 @@ impl StyleEngine {
                         in_flux: None,
                         exact_entry,
                         exact_tree_evaluation: key.exact_tree_evaluation,
-                        refresh_rule: Some((routing.rule_of(entry.route), point.program)),
+                        refresh_rule: Some((routing.rule_of(entry.route), point.entry)),
                     }
                 }
             };
@@ -3783,8 +3744,8 @@ impl StyleEngine {
         &mut self,
         input: &NormalizedInput,
         program_joins: &[ProgramJoinDelta],
-        rules_arriving: &[RuleID],
-        scopes_departed: &[(SheetID, TreeScopeID)],
+        arriving_rules: &[RuleID],
+        departed_sheet_scopes: &[(SheetID, TreeScopeID)],
         context: ProgramRoutingContext<'_>,
         regions: &mut ImpactRegions,
     ) {
@@ -3793,6 +3754,7 @@ impl StyleEngine {
             winner_program_version,
             document_root,
             attachment_scopes,
+            removed_rules_requiring_refresh,
         } = context;
         let key = input.key;
         if program_joins.is_empty() {
@@ -3812,8 +3774,8 @@ impl StyleEngine {
             InputKey::SheetAttachment(_, tree_scope) => {
                 attachment_scopes.map_or_else(|| vec![tree_scope], |scopes| scopes.to_vec())
             }
-            InputKey::SheetActivation(sheet) => self.scopes_of_sheet(sheet, scopes_departed),
-            InputKey::RuleField(rule, _) => self.scopes_of_sheet(self.program.rule_sheet(rule), scopes_departed),
+            InputKey::SheetActivation(sheet) => self.scopes_of_sheet(sheet, departed_sheet_scopes),
+            InputKey::RuleField(rule, _) => self.scopes_of_sheet(self.program.rule_sheet(rule), departed_sheet_scopes),
             InputKey::CascadeTopology(TopologyAxis::SheetOrder(tree_scope) | TopologyAxis::LayerOrder(tree_scope)) => {
                 vec![tree_scope]
             }
@@ -3871,24 +3833,18 @@ impl StyleEngine {
             }
             if let Some(name) = version.declared_name {
                 let consumers = match version.kind {
-                    RuleKind::Keyframes => match self
-                        .facts
-                        .postings()
-                        .lookup(PostingKey::Dependency(DependencyPostingKey::AnimationName(name)))
-                    {
-                        Lookup::Known(posting) => Ok(posting.candidates().collect()),
-                        Lookup::KnownAbsent => Ok(Vec::new()),
-                        Lookup::Missing(gap) => Err(gap),
-                    },
+                    RuleKind::Keyframes => {
+                        match self.facts.postings().lookup(DependencyPostingKey::AnimationName(name)) {
+                            Lookup::Known(posting) => Ok(posting.candidates().collect()),
+                            Lookup::KnownAbsent => Ok(Vec::new()),
+                            Lookup::Missing(gap) => Err(gap),
+                        }
+                    }
                     // A registration reaches every element whose own cascade declares the name, and
                     // also the elements whose custom-property use could not be named, because one of
                     // them may be using this very property.
                     RuleKind::Property => self.facts.custom_property_candidates(name).and_then(|mut nodes| {
-                        match self
-                            .facts
-                            .postings()
-                            .lookup(PostingKey::Dependency(DependencyPostingKey::AnyCustomProperty))
-                        {
+                        match self.facts.postings().lookup(DependencyPostingKey::AnyCustomProperty) {
                             Lookup::Known(posting) => nodes.extend(posting.candidates()),
                             Lookup::KnownAbsent => {}
                             Lookup::Missing(gap) => return Err(gap),
@@ -3939,26 +3895,23 @@ impl StyleEngine {
             // not reported by the substitution machinery, so it is all of them - bounded by having
             // called a function at all, rather than by the document.
             if version.kind == RuleKind::Function {
-                let consumers: Vec<StyleNodeID> = match self
-                    .facts
-                    .postings()
-                    .lookup(PostingKey::Dependency(DependencyPostingKey::AnyCustomFunction))
-                {
-                    Lookup::Known(posting) => posting.candidates().collect(),
-                    Lookup::KnownAbsent => Vec::new(),
-                    Lookup::Missing(_) => match self.regions_reachable_for_named_consumers(&scopes) {
-                        Some(reachable) => {
-                            for region in reachable {
-                                regions.add_if_not_covered(region, &self.tree, &mut self.counters);
+                let consumers: Vec<StyleNodeID> =
+                    match self.facts.postings().lookup(DependencyPostingKey::AnyCustomFunction) {
+                        Lookup::Known(posting) => posting.candidates().collect(),
+                        Lookup::KnownAbsent => Vec::new(),
+                        Lookup::Missing(_) => match self.regions_reachable_for_named_consumers(&scopes) {
+                            Some(reachable) => {
+                                for region in reachable {
+                                    regions.add_if_not_covered(region, &self.tree, &mut self.counters);
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        None => {
-                            regions.widen_to_document(&mut self.counters);
-                            return;
-                        }
-                    },
-                };
+                            None => {
+                                regions.widen_to_document(&mut self.counters);
+                                return;
+                            }
+                        },
+                    };
                 for node in consumers {
                     regions.add_if_not_covered(ImpactRegion::Node(node), &self.tree, &mut self.counters);
                 }
@@ -3995,7 +3948,7 @@ impl StyleEngine {
                         InputValue::Flag(false)
                     )
                 );
-                if removes_contribution
+                let winner_inventory_is_complete = removes_contribution
                     && self.program.declarations_are_complete_for(rule)
                     && compiled.entries().iter().all(|entry| entry.pseudo_element.is_none())
                     && winner_program_version.is_some_and(|version| {
@@ -4003,21 +3956,37 @@ impl StyleEngine {
                             self.winner_groups.coverage_at_least(version, resident_count),
                             Lookup::Known(())
                         )
-                    })
-                    && !self.winner_groups.rule_is_a_winner(rule)
-                {
-                    if self.selector_truth_changes_active {
-                        let refreshes = &mut self.selector_truth_changes.refreshes;
-                        self.retained_match_answers.for_each_answer_containing_rule(
-                            &self.match_answers,
-                            rule,
-                            |node| {
-                                refreshes.push(SelectorTruthRefresh { node, rule: None });
-                            },
-                        );
+                    });
+                if winner_inventory_is_complete {
+                    if !self.winner_groups.rule_is_a_winner(rule) {
+                        if self.selector_truth_changes_active {
+                            removed_rules_requiring_refresh.push(rule);
+                        }
+                        self.counters.bump(Counter::ProgramCandidatesRejectedByCascade);
+                        continue;
                     }
-                    self.counters.bump(Counter::ProgramCandidatesRejectedByCascade);
-                    continue;
+                    let winning_nodes = (!compiled.can_leave_its_scope()
+                        && compiled
+                            .entries()
+                            .iter()
+                            .all(|entry| compiled.dispatch_key(entry).has_selector_posting()))
+                    .then(|| {
+                        self.winner_groups.winning_nodes(rule).map(|nodes| {
+                            nodes
+                                .filter(|&node| scopes.binary_search(&self.tree.tree_scope(node)).is_ok())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .flatten();
+                    if let Some(nodes) = winning_nodes {
+                        if self.selector_truth_changes_active {
+                            removed_rules_requiring_refresh.push(rule);
+                        }
+                        for node in nodes {
+                            regions.add_if_not_covered(ImpactRegion::Node(node), &self.tree, &mut self.counters);
+                        }
+                        continue;
+                    }
                 }
                 programs.push((rule, selector_program));
             }
@@ -4032,7 +4001,7 @@ impl StyleEngine {
         // nothing to take back.
         if let InputKey::RuleField(rule, field) = key
             && !self.program.rule_conditions_hold(rule)
-            && (field != RuleField::Activation || rules_arriving.contains(&rule))
+            && (field != RuleField::Activation || arriving_rules.contains(&rule))
         {
             return;
         }
@@ -4116,8 +4085,7 @@ impl StyleEngine {
                             self.selector_truth_changes.deltas.push(SelectorTruthDelta {
                                 node,
                                 rule,
-                                program: selector_program,
-                                entry: incidence.entry,
+                                entry: self.programs.entry_id(selector_program, incidence.entry),
                                 change,
                                 selector_truth_changed: false,
                             });
@@ -4128,33 +4096,11 @@ impl StyleEngine {
                 first_program_rule = end_program_rule;
                 continue;
             }
-            if can_filter_exactly {
-                self.materialize_transaction_fact_view_fully();
-            }
-            let activation_fact_sides = can_filter_exactly
-                .then(|| {
-                    let view = self
-                        .transaction_fact_view
-                        .as_ref()
-                        .expect("planning has a transaction fact view");
-                    match (input.old, input.new) {
-                        (InputValue::Flag(false), InputValue::Flag(true)) => {
-                            Some((None, view.facts(TransactionFactSide::After, self.facts.primary())))
-                        }
-                        (InputValue::Flag(true), InputValue::Flag(false)) => view
-                            .facts(TransactionFactSide::Before, self.facts.primary())
-                            .map(|before| (Some(before), None)),
-                        _ => view
-                            .facts(TransactionFactSide::Before, self.facts.primary())
-                            .map(|before| {
-                                (
-                                    Some(before),
-                                    view.facts(TransactionFactSide::After, self.facts.primary()),
-                                )
-                            }),
-                    }
-                })
-                .flatten();
+            let activation_fact_sides = can_filter_exactly.then_some(match (input.old, input.new) {
+                (InputValue::Flag(false), InputValue::Flag(true)) => (None, Some(TransactionFactSide::After)),
+                (InputValue::Flag(true), InputValue::Flag(false)) => (Some(TransactionFactSide::Before), None),
+                _ => (Some(TransactionFactSide::Before), Some(TransactionFactSide::After)),
+            });
             let compiled = self.programs.get(selector_program);
             for (entry_index, entry) in compiled.entries().iter().enumerate() {
                 if scopes.as_slice() == [TreeScopeID::DOCUMENT]
@@ -4169,8 +4115,10 @@ impl StyleEngine {
                         )
                     })
                 {
-                    let rejected = match posting_for_dispatch_key(compiled.dispatch_key(entry))
-                        .map(|key| self.facts.postings().lookup(key))
+                    let dispatch = compiled.dispatch_key(entry);
+                    let rejected = match dispatch
+                        .has_selector_posting()
+                        .then(|| self.facts.postings().lookup(dispatch))
                     {
                         Some(Lookup::Known(posting)) => {
                             if self.selector_truth_changes_active {
@@ -4198,8 +4146,10 @@ impl StyleEngine {
                     );
                     continue;
                 }
-                let posting_key = posting_for_dispatch_key(compiled.dispatch_key(entry));
-                let posting = posting_key.map(|key| self.facts.postings().lookup(key));
+                let dispatch = compiled.dispatch_key(entry);
+                let posting = dispatch
+                    .has_selector_posting()
+                    .then(|| self.facts.postings().lookup(dispatch));
                 match posting {
                     Some(Lookup::Known(posting)) => {
                         // A subject bounded to a prefix or suffix of its sibling sequence is not
@@ -4235,15 +4185,17 @@ impl StyleEngine {
                             if !self.node_is_within_subject_position(node, position) {
                                 continue;
                             }
-                            if let Some((old_facts, new_facts)) = activation_fact_sides {
+                            if let Some((old_side, new_side)) = activation_fact_sides {
                                 let mut may_match = false;
-                                for facts in [old_facts, new_facts].into_iter().flatten() {
-                                    match MatchEvaluator::new(&self.tree, facts).matches_entry(
-                                        compiled,
-                                        entry,
-                                        node,
-                                        &mut self.counters,
-                                    ) {
+                                for side in [old_side, new_side].into_iter().flatten() {
+                                    let view = self
+                                        .transaction_fact_view
+                                        .as_ref()
+                                        .expect("exact activation filtering has a transaction fact view");
+                                    match MatchEvaluator::new(&self.tree, self.facts.primary())
+                                        .with_transaction_fact_view(view, side)
+                                        .matches_entry(compiled, entry, node, &mut self.counters)
+                                    {
                                         Ok(false) => {}
                                         Ok(true) | Err(_) => {
                                             may_match = true;
@@ -4283,7 +4235,14 @@ impl StyleEngine {
                                 for &(rule, _) in program_rules {
                                     self.selector_truth_changes.refreshes.push(SelectorTruthRefresh {
                                         node,
-                                        rule: Some((rule, selector_program)),
+                                        rule: Some((
+                                            rule,
+                                            self.programs.entry_id(
+                                                selector_program,
+                                                u32::try_from(entry_index)
+                                                    .expect("selector program entry space exhausted"),
+                                            ),
+                                        )),
                                     });
                                 }
                             }
@@ -4349,7 +4308,10 @@ impl StyleEngine {
         // declared custom properties, which the winner columns never hold - so the proof cannot
         // see what the rule used to contribute, and pruning would strand its old declarations.
         if matches!(input.key, InputKey::RuleField(changed, RuleField::Declarations) if changed == rule)
-            && self.rules_with_incomplete_old_declarations.contains(&rule)
+            && self
+                .program_staging
+                .rules_with_incomplete_old_declarations
+                .contains(&rule)
         {
             return false;
         }
@@ -4397,23 +4359,16 @@ impl StyleEngine {
                         let Some(previous) = self.winner_groups.winner_in_state(state, current.property) else {
                             return false;
                         };
-                        let priority = self.cascade_priority_of(
-                            rule,
-                            self.tree.tree_scope(node),
-                            entry.specificity,
-                            u32::MAX,
-                            current.important,
-                        );
                         let key = Self::retained_rule_winner_key(*current);
 
                         if previous.source == WinnerSource::Rule(rule) {
                             // Raising the same winner cannot expose anything below it. Lowering it
                             // can, even when its own value is unchanged.
-                            priority >= previous.priority && key == previous.key
+                            (!previous.important || current.important) && key == previous.key
                         } else {
                             // A declaration that remains below the retained winner is inert. One
                             // that reaches or passes it is inert only for the same semantic value.
-                            priority < previous.priority || key == previous.key
+                            key == previous.key
                         }
                     });
                 }
@@ -4464,6 +4419,15 @@ impl StyleEngine {
                 let Some(previous) = self.winner_groups.winner_in_state(state, declared.property) else {
                     return false;
                 };
+                let WinnerSource::Rule(previous_rule) = previous.source else {
+                    return false;
+                };
+                let Some(previous_program) = self.program.rule_version(previous_rule).selector_program else {
+                    return false;
+                };
+                if self.programs.get(previous_program).can_leave_its_scope() {
+                    return false;
+                }
                 let priority =
                     self.cascade_priority_of(rule, tree_scope, entry.specificity, u32::MAX, declared.important);
                 priority <= previous.priority

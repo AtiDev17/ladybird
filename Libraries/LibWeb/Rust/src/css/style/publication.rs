@@ -157,6 +157,19 @@ impl StyleEngine {
         }
     }
 
+    pub(crate) fn recording_computed_longhand_table(
+        &self,
+        style_record: u64,
+    ) -> Option<(u32, &[*const std::ffi::c_void])> {
+        #[cfg(feature = "style-recording")]
+        return self.computed_group_sets.recording_longhand_table(style_record);
+        #[cfg(not(feature = "style-recording"))]
+        {
+            let _ = style_record;
+            None
+        }
+    }
+
     pub(crate) fn style_record_view(&self, style_record: u64) -> Option<computed::StyleRecordView<'_>> {
         self.computed_group_sets.style_record_view(style_record)
     }
@@ -195,9 +208,22 @@ impl StyleEngine {
         );
     }
 
+    pub(super) fn reclaim_computed_memory_if_needed(&mut self) {
+        // Recording dictionaries are keyed by computed identities. Reusing an identity for new
+        // semantics would make later events refer to the first definition replay saw for it.
+        if self.recording_id().is_none()
+            && let Some(retention) = self.computed_group_sets.reclaim_unreachable_if_needed()
+        {
+            self.counters
+                .set(Counter::ComputedGroupsRetained, retention.retained as u64);
+            self.counters
+                .set(Counter::ComputedGroupsReachable, retention.reachable as u64);
+        }
+        self.settle_computed_memory();
+    }
+
     pub(crate) fn unpin_style_record(&mut self, style_record: u64) {
         self.computed_group_sets.unpin_style_record(style_record);
-        self.settle_computed_memory();
     }
 
     pub(super) fn publish_computed_groups_impl(
@@ -424,16 +450,16 @@ impl StyleEngine {
             };
             let declarations = unsafe { std::slice::from_raw_parts(block.declarations, block.declaration_count) };
             let mut source_declarations = declarations.iter().filter(|declaration| {
-                declaration.property_id == winner.property && declaration.important == winner.priority.is_important()
+                declaration.property_id == winner.property && declaration.important == winner.important
             });
             let Some(declaration) = source_declarations.next() else {
                 continue;
             };
             if source_declarations.next().is_some()
-                || !matches!(
-                    unsafe { self.specified_values.identity_of(declaration.data.cast()) },
-                    Lookup::Known(value) if value == winner.key.value
-                )
+                || !unsafe {
+                    self.specified_values
+                        .ensure_identity(declaration.data.cast(), winner.key.value, &mut self.memory)
+                }
             {
                 continue;
             }
@@ -454,7 +480,7 @@ impl StyleEngine {
             let slot = store.seed_retained_property(
                 winner.property,
                 retained,
-                winner.priority.is_important(),
+                winner.important,
                 declaration.has_style_sheet_context,
             );
             assignments.push(FfiSourceSlotAssignment {
@@ -540,16 +566,17 @@ impl StyleEngine {
                 });
             winners.push(lower_bound_winner.unwrap_or(PropertyWinner {
                 property,
+                important: false,
                 key,
                 priority: CascadePriority::exact_output_placeholder(),
                 source: WinnerSource::ExactCascade,
             }));
         }
-        verify_cascade_winners(|| {
+        verify_cascade_winners(self, |verifier| {
             let Some(lower_bound_state) = lower_bound_state else {
                 return;
             };
-            if !self
+            if !verifier
                 .published_match_answers
                 .lookup(target.node())
                 .is_some_and(|answer| answer.cascade_winners_are_complete)
@@ -557,7 +584,8 @@ impl StyleEngine {
                 return;
             }
             let retained = Rc::clone(
-                self.retained_match_answer(target.node())
+                verifier
+                    .retained_match_answer(target.node())
                     .sparse()
                     .expect("a complete published answer retains its exact input"),
             );
@@ -588,20 +616,23 @@ impl StyleEngine {
                     }
                 };
                 for matched in retained.iter().filter(|matched| {
-                    self.programs
+                    verifier
+                        .programs
                         .get(matched.program)
                         .entries()
                         .get(matched.entry as usize)
                         .is_some_and(|entry| entry.pseudo_element == target.pseudo_element_target())
                 }) {
-                    self.program
+                    verifier
+                        .program
                         .declared_properties_of(matched.rule)
                         .iter()
                         .for_each(&mut inspect);
                 }
                 if !target.is_pseudo() {
                     for kind in ElementDeclarationKind::ALL {
-                        self.facts
+                        verifier
+                            .facts
                             .element_declared_properties(target.node(), kind)
                             .0
                             .iter()
@@ -626,19 +657,7 @@ impl StyleEngine {
             }
         });
         let state = self.intern_cascade_state(&winners, previous);
-        if !self.winner_groups.settle_memory(&mut self.memory) {
-            return bridge::FfiExactCascadePublication {
-                computed_group_mask: u32::MAX,
-                computed_property_word_0: u64::MAX,
-                computed_property_word_1: u64::MAX,
-                computed_property_word_2: u64::MAX,
-                computed_property_word_3: u64::MAX,
-                computed_property_word_4: u64::MAX,
-                computed_property_word_5: u64::MAX,
-                computed_property_closure_is_exact: false,
-                unchanged: false,
-            };
-        }
+        self.winner_groups.settle_memory(&mut self.memory);
         let generation = self.winner_groups.generation();
         let delta = self.winner_groups.semantic_delta(previous, state);
         let unchanged = previous.is_some() && delta.is_empty();

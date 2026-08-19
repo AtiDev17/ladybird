@@ -28,10 +28,12 @@ class StyleEngine;
 WEB_API void record_element_connected(DOM::Element&);
 WEB_API void prepare_style_nodes_for_subtree(DOM::Node&);
 WEB_API void publish_pending_element_features(StyleEngine&, StyleComputer&);
+WEB_API void publish_required_attribute_value_texts(StyleEngine&, StyleComputer&);
 
 // Populate an isolated engine with the current facts of a DOM tree. The callback receives the temporary identity
 // assigned to each element; no identity or transaction in the document's
 // resident engine is changed.
+WEB_API void configure_isolated_selector_query_engine(StyleEngine&, DOM::Document&);
 WEB_API void populate_isolated_selector_query_engine(StyleEngine&, DOM::ParentNode&, Function<void(GC::Ref<DOM::Element>, StyleNodeID)> const&);
 
 // Tell the document's engine whether this is an HTML document. Selectors compile against that fact,
@@ -39,8 +41,8 @@ WEB_API void populate_isolated_selector_query_engine(StyleEngine&, DOM::ParentNo
 // before the first sheet attaches, and has to say it itself.
 WEB_API void record_document_kind(DOM::Document&);
 
-// Called while the node is still linked, so its old relations are still readable.
-WEB_API void record_element_disconnecting(DOM::Element&);
+// Called while the subtree is still linked, so its old relations are still readable.
+WEB_API void record_subtree_disconnecting(DOM::Node&);
 
 // Report that an element moved without leaving the tree. `moveBefore()` keeps the element's state
 // and its identity, so nothing disconnects and nothing connects, and only its relations move.
@@ -69,7 +71,7 @@ WEB_API void record_element_custom_states_changed(DOM::Element&);
 // publishes the value it now resolves to.
 WEB_API void record_element_language_and_directionality(DOM::Element&);
 WEB_API void record_element_directionality(DOM::Element&);
-WEB_API void record_element_presentational_hint_properties(DOM::Element&, ReadonlySpan<StyleProperty>);
+WEB_API bool record_element_presentational_hint_properties(DOM::Element&, ReadonlySpan<StyleProperty>);
 WEB_API void record_element_animation_names(DOM::Element&, ReadonlySpan<Utf16FlyString>);
 WEB_API void record_element_custom_property_names(DOM::Element&, ReadonlySpan<Utf16FlyString>, bool uses_unnamed, bool uses_custom_functions);
 

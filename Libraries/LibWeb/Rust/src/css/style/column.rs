@@ -91,6 +91,17 @@ pub(super) struct BitColumn {
     words: Vec<u64>,
 }
 
+impl PartialEq for BitColumn {
+    fn eq(&self, other: &Self) -> bool {
+        let common_length = self.words.len().min(other.words.len());
+        self.words[..common_length] == other.words[..common_length]
+            && self.words[common_length..].iter().all(|word| *word == 0)
+            && other.words[common_length..].iter().all(|word| *word == 0)
+    }
+}
+
+impl Eq for BitColumn {}
+
 impl ShallowCapacityBytes for BitColumn {
     fn shallow_capacity_bytes(&self) -> u64 {
         self.capacity_bytes()
@@ -148,7 +159,41 @@ pub(super) trait RemovablePagedColumnPage: PagedColumnPage {
     fn remove(&mut self, index: usize) -> Option<Self::Value>;
 }
 
+pub(super) const PAGED_VALUE_PAGE_SHIFT: usize = 6;
+const PAGED_VALUE_PAGE_SIZE: usize = 1 << PAGED_VALUE_PAGE_SHIFT;
+
+#[derive(Clone)]
+pub(super) struct PagedValuePage<T: Copy + Default> {
+    known: u64,
+    values: [T; PAGED_VALUE_PAGE_SIZE],
+}
+
+impl<T: Copy + Default> Default for PagedValuePage<T> {
+    fn default() -> Self {
+        Self {
+            known: 0,
+            values: [T::default(); PAGED_VALUE_PAGE_SIZE],
+        }
+    }
+}
+
+impl<T: Copy + Default> PagedColumnPage for PagedValuePage<T> {
+    type Value = T;
+
+    const SHIFT: usize = PAGED_VALUE_PAGE_SHIFT;
+
+    fn get(&self, index: usize) -> Option<T> {
+        (self.known & (1 << index) != 0).then_some(self.values[index])
+    }
+
+    fn insert(&mut self, index: usize, value: T) {
+        self.known |= 1 << index;
+        self.values[index] = value;
+    }
+}
+
 /// A sparse column whose directory and page accounting are shared across page layouts.
+#[derive(Clone)]
 pub(super) struct PagedColumn<P: PagedColumnPage> {
     pages: Vec<Option<Box<P>>>,
     page_count: usize,
@@ -211,6 +256,12 @@ impl<P: PagedColumnPage> PagedColumn<P> {
 
     pub(super) fn capacity_bytes(&self) -> u64 {
         self.pages.shallow_capacity_bytes() + (self.page_count * size_of::<P>()) as u64
+    }
+}
+
+impl<P: PagedColumnPage> ShallowCapacityBytes for PagedColumn<P> {
+    fn shallow_capacity_bytes(&self) -> u64 {
+        self.capacity_bytes()
     }
 }
 
@@ -279,4 +330,25 @@ pub(super) fn advance_epoch(epoch: &mut u32, step: u32, columns: &mut [&mut Epoc
         *epoch = step;
     }
     *epoch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitColumn;
+
+    #[test]
+    fn bit_column_equality_ignores_trailing_zero_words() {
+        let mut left = BitColumn::default();
+        left.set(1, true);
+        left.set(70, true);
+        left.set(70, false);
+
+        let mut right = BitColumn::default();
+        right.set(1, true);
+
+        assert!(left == right);
+
+        right.set(70, true);
+        assert!(left != right);
+    }
 }

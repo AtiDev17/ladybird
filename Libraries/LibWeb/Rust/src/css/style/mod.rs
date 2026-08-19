@@ -50,6 +50,7 @@ macro_rules! define_id {
     };
 }
 
+mod atoms;
 pub mod batch_matcher;
 pub mod bridge;
 mod capacity;
@@ -138,16 +139,18 @@ pub mod transaction;
 mod transaction_view;
 pub mod tree;
 
+use atoms::DocumentAtoms;
+use atoms::PinnedAtoms;
+use atoms::ReclaimedStyleAtom;
 use catalog::*;
+use column::BitColumn;
 use column::Column;
 use fast_hash::FastMap as HashMap;
 use fast_hash::FastSet as HashSet;
-use fast_hash::StableIterationMap;
 use planning::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::hash::Hash;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::css::cascaded_properties::CascadeOrigin;
@@ -208,15 +211,14 @@ use impact::TransactionTopology;
 use impact::choose_plan;
 use index::DependencyPostingKey;
 use index::DispatchCandidateWorkspace;
-use index::DispatchEntryID;
 use index::DispatchKey;
 use index::ElementFactStore;
-use index::FeatureKey;
 use index::FeaturePostings;
 use index::FeatureValue;
+use index::LocalFeatureKey;
+use index::MatchingFactBatch;
 use index::PostingKey;
 use index::RuleDispatch;
-use index::SelectorPostingKey;
 use index::StyleAtomID;
 use index::StyleNodeFacts;
 use input_routing::input_routes_on_key;
@@ -226,6 +228,7 @@ use memory::DeviceClass;
 use memory::MemoryCategory;
 use memory::MemoryController;
 use memory::MemoryLease;
+use memory::TIER3_REFUSAL_CATEGORIES;
 use partial_view::Lookup;
 use prefix::PrefixDeltaArena;
 use prefix::PrefixEnteringDeltas;
@@ -239,6 +242,7 @@ use prefix::PrefixTransitionLookup;
 use program::CascadeLayerID;
 use program::DeclarationBlockID;
 use program::DeclaredProperty;
+use program::EntryID;
 use program::RuleID;
 use program::RuleKind;
 use program::RuleVersion;
@@ -257,6 +261,7 @@ use relative_selector::possible_hosting_anchors;
 use relative_selector::traversal_anchor;
 use selector::Incomplete;
 use selector::InverseStep;
+use selector::LiveRelationalRoute;
 use selector::MatchEvaluationSide;
 use selector::MatchEvaluationWorkspace;
 use selector::MatchEvaluator;
@@ -269,10 +274,10 @@ use selector::SelectorEntry;
 use selector::SelectorOp;
 use selector::SelectorProgram;
 use selector::SelectorPrograms;
+use selector::SiblingEntry;
 use selector::SiblingSequenceGeometry;
 use selector::Specificity;
 use selector::SubjectPosition;
-use selector::ValueStateKind;
 use specified_value::SpecifiedValues;
 use transaction::ElementDeclarationKind;
 use transaction::InputKey;
@@ -294,8 +299,10 @@ use transaction_view::FeatureFluxColumn;
 use transaction_view::PrefixFactTransition;
 use transaction_view::TransactionFactSide;
 use transaction_view::TransactionFactView;
+use tree::SegmentedNodeColumn;
 use tree::StyleNodeID;
 use tree::StyleNodeTree;
+use tree::TreeRelationStaging;
 use tree::TreeScopeID;
 
 /// A candidate source at most this large is always worth enumerating, whatever share of the
@@ -319,45 +326,119 @@ const RETAINED_WITNESS_SIBLING_STEPS: usize = 64;
 const INITIAL_SIBLING_FACT_WINDOW: usize = 8;
 
 mod verification {
+    use super::MatchAnswerID;
+    use super::RuleMatch;
+    use super::StyleEngine;
+    use super::StyleNodeID;
+    #[cfg(test)]
+    use std::cell::Cell;
     use std::sync::OnceLock;
 
     static STYLE_ANSWER_PATCH: OnceLock<bool> = OnceLock::new();
+    static SELECTOR_TRUTH_DERIVATION: OnceLock<bool> = OnceLock::new();
     static CASCADE_WINNERS: OnceLock<bool> = OnceLock::new();
     static STYLE_PLAN_PROVENANCE: OnceLock<bool> = OnceLock::new();
     static PUBLISHED_STYLE_TRANSACTION: OnceLock<bool> = OnceLock::new();
+
+    #[cfg(test)]
+    thread_local! {
+        static SELECTOR_TRUTH_DERIVATION_OVERRIDE: Cell<bool> = const { Cell::new(false) };
+    }
 
     fn enabled(gate: &OnceLock<bool>, variable: &str) -> bool {
         *gate.get_or_init(|| std::env::var_os(variable).is_some())
     }
 
-    /// Re-derive every patched or reused retained answer cold and compare it.
-    pub(super) fn style_answer_patch(check: impl FnOnce()) {
-        if enabled(&STYLE_ANSWER_PATCH, "LIBWEB_VERIFY_STYLE_ANSWER_PATCH") {
-            check();
+    pub(super) struct StyleAnswerVerifier<'a> {
+        engine: &'a mut StyleEngine,
+    }
+
+    impl StyleAnswerVerifier<'_> {
+        pub(super) fn verify_match_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
+            let cold = self
+                .engine
+                .exact_match_answer_for_verification(node)
+                .expect("cold matching must answer wherever a retained answer did");
+            assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
+        }
+
+        pub(super) fn verify_cascade_answer(&mut self, answer: &[RuleMatch], node: StyleNodeID, description: &str) {
+            let (cold, _) = self
+                .engine
+                .exact_cascade_answer_for_verification(node)
+                .expect("cold matching must answer wherever a retained answer did");
+            assert_eq!(answer, cold, "{description} differs from cold matching for {node:?}");
+        }
+
+        pub(super) fn verify_retained_cascade_input(&mut self, node: StyleNodeID, cascade_input: MatchAnswerID) {
+            self.engine.verify_retained_cascade_input(node, cascade_input);
         }
     }
 
+    /// Re-derive every patched or reused retained answer cold and compare it. The callback receives
+    /// only the verifier capability, so it cannot publish through or otherwise mutate the engine.
+    pub(super) fn style_answer_patch(engine: &mut StyleEngine, check: impl FnOnce(&mut StyleAnswerVerifier<'_>)) {
+        if enabled(&STYLE_ANSWER_PATCH, "LIBWEB_VERIFY_STYLE_ANSWER_PATCH") {
+            check(&mut StyleAnswerVerifier { engine });
+        }
+    }
+
+    pub(super) fn selector_truth_derivation_is_enabled() -> bool {
+        #[cfg(test)]
+        if SELECTOR_TRUTH_DERIVATION_OVERRIDE.get() {
+            return true;
+        }
+        *SELECTOR_TRUTH_DERIVATION.get_or_init(|| {
+            std::env::var_os("LIBWEB_VERIFY_STYLE_ANSWER_PATCH").is_some()
+                || std::env::var_os("LIBWEB_VERIFY_SELECTOR_TRUTH_DERIVATION").is_some()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_selector_truth_derivation_enabled<T>(run: impl FnOnce() -> T) -> T {
+        struct RestoreOverride<'a> {
+            value: &'a Cell<bool>,
+            previous: bool,
+        }
+
+        impl Drop for RestoreOverride<'_> {
+            fn drop(&mut self) {
+                self.value.set(self.previous);
+            }
+        }
+
+        SELECTOR_TRUTH_DERIVATION_OVERRIDE.with(|value| {
+            let restore = RestoreOverride {
+                previous: value.replace(true),
+                value,
+            };
+            let result = run();
+            drop(restore);
+            result
+        })
+    }
+
     /// Compare complete retained cascade winners with the legacy cascade output.
-    pub(super) fn cascade_winners(check: impl FnOnce()) {
+    pub(super) fn cascade_winners(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
         if enabled(&CASCADE_WINNERS, "LIBWEB_VERIFY_CASCADE_WINNERS") {
-            check();
+            check(engine);
         }
     }
 
     /// Require every scoped style transaction output to name semantic provenance.
-    pub(super) fn style_plan_provenance(check: impl FnOnce()) {
+    pub(super) fn style_plan_provenance(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
         if enabled(&STYLE_PLAN_PROVENANCE, "LIBWEB_VERIFY_STYLE_PLAN_PROVENANCE") {
-            check();
+            check(engine);
         }
     }
 
     /// Require a published style transaction to complete without another selector query.
-    pub(super) fn published_style_transaction(check: impl FnOnce()) {
+    pub(super) fn published_style_transaction(engine: &StyleEngine, check: impl FnOnce(&StyleEngine)) {
         if enabled(
             &PUBLISHED_STYLE_TRANSACTION,
             "LIBWEB_VERIFY_PUBLISHED_STYLE_TRANSACTION",
         ) {
-            check();
+            check(engine);
         }
     }
 
@@ -369,11 +450,13 @@ mod verification {
                 &PUBLISHED_STYLE_TRANSACTION,
                 "LIBWEB_VERIFY_PUBLISHED_STYLE_TRANSACTION",
             )) << 3)
+            | (u8::from(selector_truth_derivation_is_enabled()) << 4)
     }
 }
 
 use verification::{
     cascade_winners as verify_cascade_winners, published_style_transaction as verify_published_style_transaction,
+    selector_truth_derivation_is_enabled as verify_selector_truth_derivation_is_enabled,
     style_answer_patch as verify_style_answer_patch, style_plan_provenance as verify_style_plan_provenance,
 };
 
@@ -400,21 +483,6 @@ fn anchor_region_for(axis: RelativeAxis) -> Option<fn(StyleNodeID) -> ImpactRegi
         RelativeAxis::NextSibling => Some(ImpactRegion::PreviousSibling),
         RelativeAxis::FollowingSibling => Some(ImpactRegion::PrecedingSiblings),
         RelativeAxis::NextSiblingSubtree | RelativeAxis::FollowingSiblingSubtree => None,
-    }
-}
-
-fn posting_for_dispatch_key(key: DispatchKey) -> Option<PostingKey> {
-    match key {
-        DispatchKey::Part(atom) => Some(PostingKey::Selector(SelectorPostingKey::Part(atom))),
-        DispatchKey::CustomState(atom) => Some(PostingKey::Selector(SelectorPostingKey::CustomState(atom))),
-        DispatchKey::Id(atom) => Some(PostingKey::Selector(SelectorPostingKey::Id(atom))),
-        DispatchKey::Class(atom) => Some(PostingKey::Selector(SelectorPostingKey::Class(atom))),
-        DispatchKey::AttributeName(atom) => Some(PostingKey::Selector(SelectorPostingKey::AttributeName(atom))),
-        DispatchKey::TagName(atom) => Some(PostingKey::Selector(SelectorPostingKey::Tag(atom))),
-        DispatchKey::Directionality(atom) => Some(PostingKey::Selector(SelectorPostingKey::Directionality(atom))),
-        // These have no posting to enumerate from, so a caller that needs one widens, exactly as it
-        // does for the universal bucket these used to sit in.
-        DispatchKey::Root | DispatchKey::State(_) | DispatchKey::Heading | DispatchKey::Universal => None,
     }
 }
 
@@ -449,33 +517,244 @@ fn for_each_matching_scope(
     Ok(())
 }
 
-struct PendingField<K, V>(HashMap<K, V>);
+trait DenseStagingID: Copy + Ord {
+    fn index(self) -> usize;
+}
 
-impl<K, V> Default for PendingField<K, V> {
-    fn default() -> Self {
-        Self(HashMap::default())
+impl DenseStagingID for RuleID {
+    fn index(self) -> usize {
+        self.0 as usize
     }
 }
 
-impl<K: Copy + Eq + Hash, V: Clone> PendingField<K, V> {
+impl DenseStagingID for SheetID {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl DenseStagingID for TreeScopeID {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+struct StagedFieldRow<V> {
+    before: V,
+    after: V,
+    dirty: bool,
+}
+
+/// Dense staging for one program field. The first write freezes `before`, later writes replace
+/// `after`, and `take_dirty()` applies only the last write while retaining both sides for
+/// `ProgramStaging::delta()`. `clear()` releases the dense columns after the transaction.
+struct StagedField<K, V> {
+    rows: Column<Option<StagedFieldRow<V>>>,
+    touched: Vec<K>,
+    dirty_count: usize,
+}
+
+impl<K, V> Default for StagedField<K, V> {
+    fn default() -> Self {
+        Self {
+            rows: Column::default(),
+            touched: Vec::new(),
+            dirty_count: 0,
+        }
+    }
+}
+
+impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
     fn current(&self, key: K, committed: impl FnOnce() -> V) -> V {
-        self.0.get(&key).cloned().unwrap_or_else(committed)
+        self.side(key, TransactionFactSide::After, committed)
     }
 
-    fn stage(&mut self, key: K, value: V) {
-        self.0.insert(key, value);
+    fn after(&self, key: K) -> Option<&V> {
+        self.rows
+            .get(key.index())
+            .and_then(Option::as_ref)
+            .map(|row| &row.after)
     }
 
-    fn take(&mut self) -> HashMap<K, V> {
-        std::mem::take(&mut self.0)
+    fn side(&self, key: K, side: TransactionFactSide, resident: impl FnOnce() -> V) -> V {
+        let row = self.rows.get(key.index()).and_then(Option::as_ref);
+        match (side, row) {
+            (TransactionFactSide::Before, Some(row)) => row.before.clone(),
+            (TransactionFactSide::After, Some(row)) => row.after.clone(),
+            _ => resident(),
+        }
+    }
+
+    fn stage(&mut self, key: K, before: V, after: V) {
+        let slot = self.rows.entry(key.index());
+        if let Some(row) = slot {
+            row.after = after;
+            if !row.dirty {
+                row.dirty = true;
+                self.dirty_count += 1;
+            }
+            return;
+        }
+        *slot = Some(StagedFieldRow {
+            before,
+            after,
+            dirty: true,
+        });
+        self.touched.push(key);
+        self.dirty_count += 1;
+    }
+
+    fn take_dirty(&mut self) -> Vec<(K, V)> {
+        let mut dirty = Vec::with_capacity(self.dirty_count);
+        for &key in &self.touched {
+            let row = self.rows[key.index()].as_mut().unwrap();
+            if row.dirty {
+                dirty.push((key, row.after.clone()));
+                row.dirty = false;
+            }
+        }
+        self.dirty_count = 0;
+        dirty.sort_unstable_by_key(|(key, _)| *key);
+        dirty
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.dirty_count == 0
+    }
+
+    fn clear(&mut self) {
+        self.rows = Column::default();
+        self.touched = Vec::new();
+        self.dirty_count = 0;
     }
 
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.0.iter()
+        self.touched
+            .iter()
+            .map(|key| (key, &self.rows[key.index()].as_ref().unwrap().after))
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = (K, &V, &V)> {
+        self.touched.iter().map(|&key| {
+            let row = self.rows[key.index()].as_ref().unwrap();
+            (key, &row.before, &row.after)
+        })
+    }
+}
+
+#[derive(Default)]
+struct ProgramStagingDelta {
+    sheets: Vec<SheetID>,
+    selector_programs: Vec<SelectorProgramID>,
+    arriving_rules: Vec<RuleID>,
+    departed_scopes: Vec<(SheetID, TreeScopeID)>,
+}
+
+/// Program transaction staging. Every field preserves its first before value and last-writer
+/// after value until release; `delta()` may read those pairs after the final values are applied.
+#[derive(Default)]
+struct ProgramStaging {
+    rule_conditions: StagedField<RuleID, bool>,
+    sheet_conditions: StagedField<SheetID, bool>,
+    sheet_enabled: StagedField<SheetID, bool>,
+    rule_declarations: StagedField<RuleID, PendingRuleDeclarations>,
+    rule_versions: StagedField<RuleID, RuleVersion>,
+    rule_in_a_layer: StagedField<RuleID, bool>,
+    rule_gated_by_container_query: StagedField<RuleID, bool>,
+    rule_liveness: StagedField<RuleID, bool>,
+    layer_orders: StagedField<TreeScopeID, HashMap<CascadeLayerID, u32>>,
+    scopes_using_document_sheets: StagedField<TreeScopeID, bool>,
+    sheets_in_scope: StagedField<TreeScopeID, Vec<SheetID>>,
+    rule_change_is_carried_by_sheet: HashMap<SheetID, bool>,
+    base_version: Option<ProgramVersion>,
+    rule_declaration_changes: Vec<PendingRuleDeclarationChange>,
+    rules_with_incomplete_old_declarations: Vec<RuleID>,
+    sheet_rule_replacements: Column<Option<SheetRuleReplacement>>,
+}
+
+impl ProgramStaging {
+    fn is_dirty(&self) -> bool {
+        !self.rule_conditions.is_empty()
+            || !self.sheet_conditions.is_empty()
+            || !self.sheet_enabled.is_empty()
+            || !self.rule_declarations.is_empty()
+            || !self.rule_versions.is_empty()
+            || !self.rule_in_a_layer.is_empty()
+            || !self.rule_gated_by_container_query.is_empty()
+            || !self.rule_liveness.is_empty()
+            || !self.layer_orders.is_empty()
+            || !self.scopes_using_document_sheets.is_empty()
+            || !self.sheets_in_scope.is_empty()
+            || self.sheet_rule_replacements.iter().any(Option::is_some)
+    }
+
+    fn clear(&mut self) {
+        self.rule_conditions.clear();
+        self.sheet_conditions.clear();
+        self.sheet_enabled.clear();
+        self.rule_declarations.clear();
+        self.rule_versions.clear();
+        self.rule_in_a_layer.clear();
+        self.rule_gated_by_container_query.clear();
+        self.rule_liveness.clear();
+        self.layer_orders.clear();
+        self.scopes_using_document_sheets.clear();
+        self.sheets_in_scope.clear();
+        self.rule_change_is_carried_by_sheet.clear();
+        self.base_version = None;
+        self.rule_declaration_changes.clear();
+        self.rules_with_incomplete_old_declarations.clear();
+        for index in 0..self.sheet_rule_replacements.len() {
+            self.sheet_rule_replacements[index] = None;
+        }
+    }
+
+    fn delta(&self) -> ProgramStagingDelta {
+        let mut delta = ProgramStagingDelta::default();
+        delta
+            .sheets
+            .extend(self.sheet_conditions.pairs().map(|(sheet, _, _)| sheet));
+        delta
+            .sheets
+            .extend(self.sheet_enabled.pairs().map(|(sheet, _, _)| sheet));
+        for (scope, before, after) in self.sheets_in_scope.pairs() {
+            delta.sheets.extend(
+                before
+                    .iter()
+                    .chain(after)
+                    .copied()
+                    .filter(|sheet| before.contains(sheet) != after.contains(sheet)),
+            );
+            delta.departed_scopes.extend(
+                before
+                    .iter()
+                    .copied()
+                    .filter(|sheet| !after.contains(sheet))
+                    .map(|sheet| (sheet, scope)),
+            );
+        }
+        delta.sheets.sort_unstable();
+        delta.sheets.dedup();
+        delta.departed_scopes.sort_unstable();
+        delta.departed_scopes.dedup();
+
+        delta.selector_programs.extend(
+            self.rule_versions
+                .pairs()
+                .filter(|(_, before, after)| before.selector_program != after.selector_program)
+                .filter_map(|(_, before, _)| before.selector_program),
+        );
+        delta.selector_programs.sort_unstable_by_key(|program| program.0);
+        delta.selector_programs.dedup();
+
+        delta.arriving_rules.extend(
+            self.rule_liveness
+                .pairs()
+                .filter_map(|(rule, before, after)| (!before && *after).then_some(rule)),
+        );
+        delta.arriving_rules.sort_unstable();
+        delta.arriving_rules.dedup();
+        delta
     }
 }
 
@@ -489,8 +768,6 @@ pub struct StyleEngine {
     counters: Counters,
     tree: StyleNodeTree,
     program: StyleSheetProgram,
-    /// Rule identities below this bound existed at the preceding commit barrier.
-    committed_rule_count: u32,
     journal: NormalizationJournal,
     /// Whether any tree input batch has crossed into the engine. A first batch consisting entirely
     /// of unique arrivals can install its final relation rows as one bulk load.
@@ -499,53 +776,19 @@ pub struct StyleEngine {
     initial_tree_bulk_load_is_pending: bool,
     /// Final relation rows staged until the next observation boundary. Moving one node updates its
     /// affected neighbours here, so those derived changes need no separate journal ingress.
-    pending_tree_rows: StableIterationMap<StyleNodeID, Option<TreeRelations>>,
-    pending_first_children: HashMap<StyleNodeID, Option<StyleNodeID>>,
-    pending_tree_memory: MemoryLease,
-    /// Final activation flags staged until the program commit barrier.
-    pending_rule_conditions: PendingField<RuleID, bool>,
-    pending_sheet_conditions: PendingField<SheetID, bool>,
-    pending_sheet_enabled: PendingField<SheetID, bool>,
-    /// Final declaration inventories staged until the program commit barrier.
-    pending_rule_declarations: HashMap<RuleID, PendingRuleDeclarations>,
-    /// Final immutable rule versions staged until the program commit barrier.
-    pending_rule_versions: PendingField<RuleID, RuleVersion>,
-    /// Final structural rule flags staged until the program commit barrier.
-    pending_rule_in_a_layer: PendingField<RuleID, bool>,
-    pending_rule_gated_by_container_query: PendingField<RuleID, bool>,
-    /// Final liveness for arriving and departing rules, staged until the program commit barrier.
-    pending_rule_liveness: PendingField<RuleID, bool>,
-    /// Final layer orders staged until the program commit barrier.
-    pending_layer_orders: HashMap<TreeScopeID, HashMap<CascadeLayerID, u32>>,
-    /// Scopes staged to begin including document sheets at the commit barrier.
-    pending_scopes_using_document_sheets: HashSet<TreeScopeID>,
-    /// Final sheet order per changed scope, staged until the program commit barrier.
-    pending_sheets_in_scope: PendingField<TreeScopeID, Vec<SheetID>>,
-    /// Whether each sheet's pending attachment change carries changes to its rules.
-    rule_change_is_carried_by_sheet: HashMap<SheetID, bool>,
-    /// The program version before the first program mutation in the pending transaction.
-    pending_program_base_version: Option<ProgramVersion>,
-    /// Original and final property inventories for declaration edits in the pending transaction.
-    pending_rule_declaration_changes: Vec<PendingRuleDeclarationChange>,
-    /// Rules whose declaration edit started from an incomplete inventory. An incomplete block can
-    /// declare custom properties, which never enter the winner columns, so no winner-based proof
-    /// can see what such a rule used to contribute. Lives until the transaction is released.
-    rules_with_incomplete_old_declarations: Vec<RuleID>,
+    tree_staging: TreeRelationStaging,
+    tree_staging_memory: MemoryLease,
+    /// Program-family before/after rows retained until the transaction is released.
+    program_staging: ProgramStaging,
     /// Sheets whose rules currently have no entry points in the routing registry. A detached
     /// sheet's rules decide nothing, so routing every input past their entry points is pure cost
     /// that grows with every sheet that ever came and went.
-    sheets_excluded_from_routing: HashSet<SheetID>,
+    sheets_excluded_from_routing: BitColumn,
     /// Whether a sheet detached since the last routing shed, so the registry may hold entry
     /// points for rules that can no longer decide.
     routing_needs_detachment_sweep: bool,
     /// The old dense rule sequence while one sheet is synchronously reparsed.
     sheet_rule_replacement: Option<SheetRuleReplacement>,
-    /// Unmatched old rule sequences retained until the transaction boundary, indexed by sheet.
-    pending_sheet_rule_replacements: Column<Option<SheetRuleReplacement>>,
-    /// Elements that left the tree in the transaction being assembled. Their facts are what says
-    /// which selectors their departure can reach, so the rows outlive the mutation and are dropped
-    /// once the transaction that carries it has been routed.
-    departed: Vec<StyleNodeID>,
     match_workspace: MatchEvaluationWorkspace,
     /// Scratch for the fact rows one exact candidate evaluation covers, reused across candidates.
     exact_covered_scratch: Vec<StyleNodeID>,
@@ -577,6 +820,7 @@ pub struct StyleEngine {
     /// exists inside one answers the pages that need it least. An id is never reused for a
     /// different answer, so a consumer holding one across a flush is never told the wrong thing.
     match_answers: MatchAnswerCatalog,
+    selector_truth_sets: SelectorTruthSetCatalog,
     retained_match_answers: RetainedMatchAnswers,
     retained_selector_incidences: RetainedSelectorIncidences,
     /// Whether the current transaction changes activation without changing selector inputs.
@@ -598,9 +842,9 @@ pub struct StyleEngine {
     /// `None` entry records that the posting's coverage was incomplete, which is a `false`
     /// verdict for every asker.
     route_pruning_states: RefCell<RoutePruningStateCache>,
-    /// Once the Tier-3 budget refuses a retained-answer reservation, the rest of the completion
-    /// batch stops asking for exact answers: an exact answer costs more to evaluate, and paying
-    /// that premium for an answer the controller cannot retain buys nothing on any later flush.
+    /// Once Tier-3 pressure closes retained-answer admission, the rest of the completion batch
+    /// stops asking for exact answers: an exact answer costs more to evaluate, and paying that
+    /// premium for an answer the controller cannot retain buys nothing on any later flush.
     completion_exactness_exhausted: bool,
     /// Prefix transitions and their canonical answers have one document-lifetime owner. Matching
     /// traversals and answer patches borrow it synchronously and change its cache-owned lifecycle
@@ -627,6 +871,8 @@ pub struct StyleEngine {
     transaction_fact_view: Option<TransactionFactView>,
     facts: ElementFactStore,
     programs: SelectorPrograms,
+    attribute_value_text_names: HashSet<StyleAtomID>,
+    attribute_value_text_requirements_version: u64,
     selector_programs_need_sweep: bool,
     routing: Rc<RoutingRegistry>,
     /// Exact selector changes and refresh requests emitted by the current transaction.
@@ -646,7 +892,7 @@ pub struct StyleEngine {
     scope_roots: Column<Option<StyleNodeID>>,
     /// The inverse of `scope_roots`. Departing ordinary elements vastly outnumber departing scope
     /// roots, so retirement must ask this index instead of scanning every historical tree scope.
-    scope_by_root: HashMap<StyleNodeID, TreeScopeID>,
+    scope_by_root: SegmentedNodeColumn<TreeScopeID>,
     /// The immutable selector dispatch of each distinct effective sheet set and encapsulation
     /// depth. Concrete scopes retain only its dense identity.
     scope_programs: intern_table::InternTable<ScopeProgramID, Option<ScopeProgram>>,
@@ -669,16 +915,23 @@ pub struct StyleEngine {
     /// The last scope lookup. A style traversal nearly always asks consecutive elements in one
     /// scope, so the common path compares two integers and never hashes its ordered sheet set.
     held_scope_program: Option<(TreeScopeID, u32, ScopeProgramID)>,
-    /// Maps a name's one-word interned identity to its document-local atom. Selector names and DOM
-    /// facts key the same table, so a class in a stylesheet and a class on an element compare as
-    /// one integer.
-    atoms: HashMap<usize, StyleAtomID>,
-    /// A qualified name's atom, keyed by the namespace and the local name it is built from.
+    /// Maps names and qualified names to process-global atoms. Selector names and DOM facts use
+    /// the same owner, so a class in a stylesheet and a class on an element compare as one integer.
     ///
     /// An attribute in a namespace is published under this as well as under its local name, and a
-    /// selector that names the namespace tests it. Both sides mint from the same sequence as every
-    /// other atom, so a qualified name can never collide with a word.
-    qualified_atoms: HashMap<(u32, u32), StyleAtomID>,
+    /// selector that names the namespace tests it. The owner retains one document reference to each
+    /// global identity and releases it when this engine is destroyed.
+    atoms: DocumentAtoms,
+    /// Identities released at transaction settlement. The FFI keeps this batch borrowed until C++
+    /// has removed its matching fly-string references and atom-keyed memo entries.
+    reclaimed_style_atoms: Vec<ReclaimedStyleAtom>,
+    /// Whether transaction settlement performed an atom sweep, including a sweep that reclaimed
+    /// no identities. Recording consumes this alongside the release batch.
+    style_atoms_swept: bool,
+    /// Replay reconstructs semantic engine state but not transient C++ query handles. The recorded
+    /// release batch supplies their lifetime boundary while still requiring every released atom to
+    /// be reclaimable from replay's complete semantic root set.
+    replay_reclaimed_style_atoms: Option<Vec<StyleAtomID>>,
     /// The HTML namespace when this is an HTML document, and none otherwise. Some attribute names
     /// compare their values ASCII case-insensitively on an HTML element in an HTML document.
     html_element_namespace: StyleAtomID,

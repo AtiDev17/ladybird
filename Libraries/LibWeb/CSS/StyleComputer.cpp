@@ -151,7 +151,45 @@ StyleComputer::StyleComputer(DOM::Document& document)
 {
 }
 
-StyleComputer::~StyleComputer() = default;
+void StyleComputer::finalize()
+{
+    Base::finalize();
+    clear_style_sharing_cache();
+}
+
+void StyleComputer::clear_style_sharing_cache() const
+{
+    for (auto const& bucket : m_style_sharing_cache) {
+        for (auto const& entry : bucket.value) {
+            if (entry.explicitly_inherited_non_inherited_property && !!entry.parent_style_record_identity)
+                unpin_style_record(entry.parent_style_record_identity);
+            if (entry.style_record_identity.has_value())
+                unpin_style_record(*entry.style_record_identity);
+        }
+    }
+    m_style_sharing_cache.clear();
+    m_style_sharing_cache_entry_count = 0;
+}
+
+void StyleComputer::prepare_for_style_engine_transaction() const
+{
+    ++m_style_sharing_transaction_generation;
+    if (m_style_sharing_cache_entry_count > maximum_persistent_style_sharing_entries)
+        clear_style_sharing_cache();
+    m_computed_style_invalidation_cache.clear();
+    m_style_engine_cascade_input_cache.clear();
+    m_inherited_style_group_swaps.clear();
+    sweep_custom_property_environments();
+}
+
+void StyleComputer::drop_style_sharing_cache() const
+{
+    clear_style_sharing_cache();
+    m_computed_style_invalidation_cache.clear();
+    m_style_engine_cascade_input_cache.clear();
+    m_inherited_style_group_swaps.clear();
+    sweep_custom_property_environments();
+}
 
 ComputedStyleRecordView StyleComputer::computed_style_record_view(StyleRecordID style_record_identity) const
 {
@@ -160,8 +198,8 @@ ComputedStyleRecordView StyleComputer::computed_style_record_view(StyleRecordID 
     auto view = m_style_engine.style_record_view(style_record_identity);
     if (!view.present)
         return {};
-    if (view.animation_overlay_identity != 0)
-        pin_style_record(style_record_identity);
+    pin_style_record(style_record_identity);
+    ++m_computed_style_record_view_pin_count;
     return ComputedStyleRecordView { view, *this, style_record_identity };
 }
 
@@ -175,18 +213,12 @@ void const* StyleComputer::style_record_payloads(StyleRecordID style_record_iden
 void StyleComputer::pin_style_record(StyleRecordID style_record_identity) const
 {
     VERIFY(style_record_identity);
-    static constexpr u64 animation_overlay_tag = 1ull << 63;
-    if ((style_record_identity.value() & animation_overlay_tag) == 0)
-        return;
     const_cast<StyleComputer&>(*this).m_style_engine.pin_style_record(style_record_identity);
 }
 
 void StyleComputer::unpin_style_record(StyleRecordID style_record_identity) const
 {
     VERIFY(style_record_identity);
-    static constexpr u64 animation_overlay_tag = 1ull << 63;
-    if ((style_record_identity.value() & animation_overlay_tag) == 0)
-        return;
     const_cast<StyleComputer&>(*this).m_style_engine.unpin_style_record(style_record_identity);
 }
 
@@ -203,6 +235,7 @@ void StyleComputer::unregister_style_node(StyleNodeID style_node_id)
 {
     if (style_node_id != 0 && style_node_id.value() < m_style_nodes.size()) {
         m_style_nodes[style_node_id.value()] = nullptr;
+        m_style_engine.cancel_preallocated_style_node(style_node_id);
         m_style_engine.consume_recorded_element_style_input_change(style_node_id);
     }
 }
@@ -225,6 +258,14 @@ void StyleComputer::prepare_elements_for_style_computation()
             if (element && element->is_connected())
                 element->prepare_for_style_computation({});
         }
+    }
+}
+
+void StyleComputer::for_each_style_node(Function<void(DOM::Element&)> callback) const
+{
+    for (auto element : m_style_nodes) {
+        if (element)
+            callback(*element);
     }
 }
 
@@ -2408,7 +2449,9 @@ static Vector<StyleProperty> collect_presentational_hint_properties(DOM::Abstrac
     // Which properties a hint decides is a fact about the element, and this is the one place that
     // knows it: mapping the attributes needs the element fully built, and for a table cell it needs
     // the table's computed style, so it cannot be done when the element arrives.
-    record_element_presentational_hint_properties(element, properties);
+    if (element.presentational_hint_properties_need_publication(properties)
+        && record_element_presentational_hint_properties(element, properties))
+        element.did_publish_presentational_hint_properties(properties);
     return properties;
 }
 
@@ -3625,8 +3668,8 @@ StyleEngine::StyleRecordDelta StyleComputer::publish_computed_style_inputs(DOM::
 {
     auto publication = record_computed_style_inputs(Optional<DOM::AbstractElement> { abstract_element }, values, abstract_element.element().style_node_id());
     if (!abstract_element.pseudo_element().has_value()) {
-        if (auto* record = abstract_element.element().style_input_record(); record && record->bind_next_published_style) {
-            record->computed_style_record = publication.new_style_record;
+        if (auto* record = abstract_element.element().style_input_record()) {
+            record->computed_style_record = record->bind_next_published_style ? publication.new_style_record : StyleRecordID {};
             record->bind_next_published_style = false;
         }
     }
@@ -3725,6 +3768,8 @@ NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM:
             auto& entry = bucket->last();
             VERIFY(entry.values.ptr() == values.ptr());
             VERIFY(entry.custom_property_data.ptr() == abstract_element.custom_property_data().ptr());
+            VERIFY(!entry.style_record_identity.has_value());
+            pin_style_record(publication.new_style_record);
             entry.style_record_identity = publication.new_style_record;
         }
         if (style_record_delta.has_value())
@@ -3749,8 +3794,8 @@ NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM:
             inherited_group_swap_eligible);
         if (!!publication.new_style_record) {
             if (!abstract_element.pseudo_element().has_value()) {
-                if (auto* record = abstract_element.element().style_input_record(); record && record->bind_next_published_style) {
-                    record->computed_style_record = publication.new_style_record;
+                if (auto* record = abstract_element.element().style_input_record()) {
+                    record->computed_style_record = record->bind_next_published_style ? publication.new_style_record : StyleRecordID {};
                     record->bind_next_published_style = false;
                 }
             }
@@ -3833,6 +3878,8 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
                 pinned_style_input_values = element.style_input_record()->pinned_values;
                 cascade_declares_custom_properties = element.style_input_record()->cascade_declares_custom_properties;
             }
+            if (sharing.explicitly_inherited_non_inherited_property && !!sharing.parent_style_record_identity)
+                pin_style_record(sharing.parent_style_record_identity);
             m_style_sharing_cache.ensure(key_hash).append({
                 .key = move(sharing.key),
                 .pinned_parent_groups = move(sharing.pinned_parent_groups),
@@ -3883,6 +3930,8 @@ RefPtr<ComputedValues const> StyleComputer::compute_pseudo_element_style_if_need
             auto& entry = bucket->last();
             VERIFY(entry.values.ptr() == values.ptr());
             VERIFY(entry.custom_property_data.ptr() == abstract_element.custom_property_data().ptr());
+            VERIFY(!entry.style_record_identity.has_value());
+            pin_style_record(publication.new_style_record);
             entry.style_record_identity = publication.new_style_record;
         }
         if (style_record_delta.has_value())
@@ -4743,8 +4792,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     auto materialize_style_record_view = [&](StyleEngine::StyleRecordView const& view, StyleRecordID identity) -> OwnPtr<ComputedStyleRecordView> {
         if (!view.present)
             return {};
-        if (view.animation_overlay_identity != 0)
-            pin_style_record(identity);
+        pin_style_record(identity);
         return make<ComputedStyleRecordView>(view, *this, identity);
     };
     inheritance_parent_style = materialize_style_record_view(inheritance_parent_style_record, inheritance_parent_style_record_identity);
@@ -6184,6 +6232,43 @@ static NonnullRefPtr<StyleValue const> compute_style_value_list(NonnullRefPtr<St
     return StyleValueList::create(move(computed_entries), StyleValueList::Separator::Comma);
 }
 
+// https://drafts.csswg.org/css-contain-2/#contain-property
+static NonnullRefPtr<StyleValue const> collapse_containment_list(NonnullRefPtr<StyleValue const> const& style_value)
+{
+    auto const* containment_list = as_if<StyleValueList>(*style_value);
+    if (!containment_list)
+        return style_value;
+
+    bool contains_size = false;
+    bool contains_layout = false;
+    bool contains_style = false;
+    bool contains_paint = false;
+
+    for (auto const& containment : containment_list->values()) {
+        switch (containment->to_keyword()) {
+        case Keyword::Size:
+            contains_size = true;
+            break;
+        case Keyword::Layout:
+            contains_layout = true;
+            break;
+        case Keyword::Style:
+            contains_style = true;
+            break;
+        case Keyword::Paint:
+            contains_paint = true;
+            break;
+        default:
+            return style_value;
+        }
+    }
+
+    if (!contains_layout || !contains_style || !contains_paint)
+        return style_value;
+
+    return KeywordStyleValue::create(contains_size ? Keyword::Strict : Keyword::Content);
+}
+
 static NonnullRefPtr<StyleValue const> repeat_style_value_list_to_n_elements(NonnullRefPtr<StyleValue const> const& style_value, size_t n)
 {
     auto const& value_list = style_value->as_value_list();
@@ -6233,6 +6318,8 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
     case PropertyID::BorderTopWidth:
     case PropertyID::OutlineWidth:
         return compute_border_or_outline_width(absolutized_value, device_pixels_per_css_pixel);
+    case PropertyID::Contain:
+        return collapse_containment_list(absolutized_value);
     case PropertyID::CornerBottomLeftShape:
     case PropertyID::CornerBottomRightShape:
     case PropertyID::CornerTopLeftShape:

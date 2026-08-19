@@ -19,8 +19,8 @@ use super::computed::ComputedMetadataInput;
 use super::computed::ComputedReconstructionMetadataInput;
 use super::fast_hash::fast_hasher;
 use super::index::DispatchCandidateWorkspace;
-use super::index::FeatureKey;
 use super::index::FeatureValue;
+use super::index::LocalFeatureKey;
 use super::index::StyleAtomID;
 use super::instrumentation::Counters;
 use super::memory::DeviceClass;
@@ -135,7 +135,7 @@ impl Workload {
         let mut classes = vec![Vec::new(); nodes.len()];
         for (index, &node) in nodes.iter().enumerate() {
             engine.record_input(
-                InputKey::LocalFeature(node, FeatureKey::TagName),
+                InputKey::LocalFeature(node, LocalFeatureKey::TagName),
                 InputValue::Feature(FeatureValue::Absent),
                 InputValue::Feature(FeatureValue::Atom(tag_atom(node))),
             );
@@ -146,7 +146,7 @@ impl Workload {
                 }
                 classes[index].push(class);
                 engine.record_input(
-                    InputKey::LocalFeature(node, FeatureKey::Class(class_atom(class))),
+                    InputKey::LocalFeature(node, LocalFeatureKey::Class(class_atom(class))),
                     InputValue::Feature(FeatureValue::Absent),
                     InputValue::Feature(FeatureValue::Present),
                 );
@@ -264,7 +264,7 @@ impl Workload {
                     (FeatureValue::Absent, FeatureValue::Present)
                 };
                 self.engine.record_input(
-                    InputKey::LocalFeature(node, FeatureKey::Class(class_atom(class))),
+                    InputKey::LocalFeature(node, LocalFeatureKey::Class(class_atom(class))),
                     InputValue::Feature(old),
                     InputValue::Feature(new),
                 );
@@ -322,9 +322,8 @@ fn retained_matches(engine: &mut StyleEngine, node: StyleNodeID) -> Option<Vec<R
     }
 
     let (_, dispatch) = engine.ranked_scope_program(TreeScopeID::DOCUMENT);
-    let mut orders: Vec<_> = dispatch
-        .entries()
-        .iter()
+    let mut orders: Vec<_> = (0..dispatch.entry_count())
+        .map(|index| dispatch.entry_at(index))
         .map(|entry| (entry.rule, entry.program, entry.entry, entry.cascade_order))
         .collect();
     orders.sort_unstable_by_key(|&(rule, program, entry, _)| (rule, program, entry));

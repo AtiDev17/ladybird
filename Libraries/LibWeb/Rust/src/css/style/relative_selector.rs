@@ -15,7 +15,7 @@
 use super::fast_hash::FastMap as HashMap;
 
 use super::capacity::capacity_bytes;
-use super::index::FeatureKey;
+use super::index::LocalFeatureKey;
 use super::partial_view::Lookup;
 use super::program::SelectorProgramID;
 use super::selector::Incomplete;
@@ -69,7 +69,7 @@ impl RelativeAxis {
 pub struct RelativeQuery {
     pub axis: RelativeAxis,
     pub compound: SelectorNodeID,
-    pub driving_feature: Option<FeatureKey>,
+    pub driving_feature: Option<LocalFeatureKey>,
     /// False for a query that needs the direct evaluator: a selector list, more than one axis, an
     /// internal combinator, a structural or nested relational operator, or a scope-crossing
     /// construct. Complex is not unsupported; it is exact and retains no witness.
@@ -277,15 +277,27 @@ const MAX_RETAINED_WITNESSES: usize = 16384;
 /// such evaluation that completed with no witness. An evaluation of an overlaid or hypothetical
 /// state must never write here, because that is the one way to plant an entry whose "was true"
 /// half is false - the read-side re-verification only re-establishes the "is true now" half.
-#[derive(Default)]
 pub struct RelationalWitnesses {
     entries: HashMap<RelationalWitnessKey, StyleNodeID>,
+    admitting: bool,
+}
+
+impl Default for RelationalWitnesses {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            admitting: true,
+        }
+    }
 }
 
 impl RelationalWitnesses {
     /// Retain `witness` for `key`, returning whether it was stored. A full table sheds the
     /// entries whose anchor or witness identity has been retired before refusing.
     pub fn retain(&mut self, key: RelationalWitnessKey, witness: StyleNodeID, tree: &StyleNodeTree) -> bool {
+        if !self.admitting && !self.entries.contains_key(&key) {
+            return false;
+        }
         if self.entries.len() >= MAX_RETAINED_WITNESSES && !self.entries.contains_key(&key) {
             self.entries
                 .retain(|entry, retained| tree.is_live(entry.anchor) && tree.is_live(*retained));
@@ -305,13 +317,17 @@ impl RelationalWitnesses {
         self.entries = HashMap::default();
     }
 
+    pub(super) fn set_admitting(&mut self, admitting: bool) {
+        self.admitting = admitting;
+    }
+
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [self.entries];
             cached [];
             nested [];
-            skip [];
+            skip [self.admitting];
         }
     }
 }
@@ -403,7 +419,7 @@ mod tests {
     use super::super::memory::MemoryController;
     use super::*;
 
-    const ERROR_CLASS: FeatureKey = FeatureKey::Class(StyleAtomID(1));
+    const ERROR_CLASS: LocalFeatureKey = LocalFeatureKey::Class(StyleAtomID(1));
 
     /// `root > [card > [a, b, c], other]`
     struct Fixture {

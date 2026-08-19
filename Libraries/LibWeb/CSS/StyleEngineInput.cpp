@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
 #include <LibWeb/CSS/CSSConditionRule.h>
 #include <LibWeb/CSS/CSSContainerRule.h>
 #include <LibWeb/CSS/CSSCounterStyleRule.h>
@@ -52,12 +51,6 @@ static StyleAtomID intern_id_or_class_atom(StyleEngine&, DOM::Element const&, Ut
 static constexpr StyleNodeID no_style_node;
 // Shadow trees get their own scopes with the shadow surface; today everything names the document.
 static constexpr TreeScopeID document_tree_scope;
-
-static HashTable<DOM::Element*>& preallocated_style_elements()
-{
-    static NeverDestroyed<HashTable<DOM::Element*>> elements;
-    return *elements;
-}
 
 static bool has_pending_initial_features(DOM::Element const& element)
 {
@@ -128,6 +121,21 @@ static TreeScopeID tree_scope_of(DOM::Node& document_or_shadow_root)
     return shadow_root->style_engine_tree_scope();
 }
 
+template<typename Callback>
+static void for_each_shadow_including_inclusive_descendant_with_scope(DOM::Node& node, TreeScopeID tree_scope, Callback& callback)
+{
+    callback(node, tree_scope);
+
+    if (auto* element = as_if<DOM::Element>(node); element && element->shadow_root()) {
+        auto& shadow_root = *element->shadow_root();
+        auto shadow_scope = tree_scope_of(shadow_root);
+        for_each_shadow_including_inclusive_descendant_with_scope(shadow_root, shadow_scope, callback);
+    }
+
+    for (auto* child = node.first_child(); child; child = child->next_sibling())
+        for_each_shadow_including_inclusive_descendant_with_scope(*child, tree_scope, callback);
+}
+
 TreeScopeID style_engine_tree_scope_for(DOM::Node& document_or_shadow_root)
 {
     return tree_scope_of(document_or_shadow_root);
@@ -144,7 +152,7 @@ static StyleNodeID style_tree_parent_of(DOM::Element& element, StyleEngine& styl
     return no_style_node;
 }
 
-static StyleEngineFFI::FfiTreeRelations relations_of(DOM::Element& element, StyleEngine& style_engine)
+static StyleEngineFFI::FfiTreeRelations relations_of(DOM::Element& element, StyleEngine& style_engine, TreeScopeID tree_scope)
 {
     auto assigned_slot = no_style_node;
     if (auto slot = element.assigned_slot_internal())
@@ -154,10 +162,15 @@ static StyleEngineFFI::FfiTreeRelations relations_of(DOM::Element& element, Styl
         .parent = style_tree_parent_of(element, style_engine).value(),
         .previous_element_sibling = identity_of(element.previous_element_sibling()).value(),
         .next_element_sibling = identity_of(element.next_element_sibling()).value(),
-        .tree_scope = tree_scope_of(element.root()).value(),
+        .tree_scope = tree_scope.value(),
         .assigned_slot = assigned_slot.value(),
         .reserved = 0,
     };
+}
+
+static StyleEngineFFI::FfiTreeRelations relations_of(DOM::Element& element, StyleEngine& style_engine)
+{
+    return relations_of(element, style_engine, tree_scope_of(element.root()));
 }
 
 static void record_feature(
@@ -181,54 +194,22 @@ static StyleEngineFFI::FfiTreeRelations detached_relations()
     };
 }
 
-// The name an attribute is published under, and the any-namespace name it shares.
-//
-// Three selectors ask three different questions of an attribute called `x`. `[ns|x]` reaches only
-// the one in that namespace, `[x]` reaches only the one in no namespace - which is what the bare
-// local name is - and `[*|x]` reaches whichever of them the element carries. The first two name
-// exactly one of an element's attributes, so they are the key: an element can hold `x` in several
-// namespaces at once, and each is a fact with its own value. `[*|x]` asks about all of them
-// together, so the shared form is published as an identity of the name rather than as a fact of its
-// own, and one entry per attribute answers all three.
-static StyleAtomID attribute_name_atom(StyleEngine& style_engine, Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_uri)
-{
-    auto local = style_engine.intern_atom(local_name);
-    auto any_namespace = style_engine.intern_qualified_atom(StyleEngine::any_namespace, local);
-    auto in_namespace = [&](StyleAtomID name) {
-        if (!namespace_uri.has_value() || namespace_uri->is_empty())
-            return name;
-        return style_engine.intern_qualified_atom(style_engine.intern_case_sensitive_text_atom(namespace_uri->view()), name);
-    };
-    auto name = in_namespace(local);
-
-    // An attribute name is matched ASCII case-insensitively against an HTML element in an HTML
-    // document, and a selector dispatches on the folded form, so an attribute whose own name is not
-    // already lowercase has to answer to that form as well. Only a non-HTML element can hold one:
-    // both the parser and `setAttribute` fold the name for an HTML element in an HTML document.
-    StyleAtomID folded_name;
-    StyleAtomID folded_local;
-    if (auto folded = local_name.to_ascii_lowercase(); folded != local_name) {
-        auto folded_atom = style_engine.intern_atom(folded);
-        folded_name = in_namespace(folded_atom);
-        folded_local = style_engine.intern_qualified_atom(StyleEngine::any_namespace, folded_atom);
-    }
-
-    style_engine.note_attribute_name_forms(name, any_namespace, folded_name, folded_local);
-    return name;
-}
-
 void record_element_connected(DOM::Element& element)
 {
     auto* style_engine = style_engine_for(element);
     if (!style_engine)
         return;
+    Optional<TreeScopeID> preallocated_tree_scope;
     if (element.style_node_id() == no_style_node) {
         element.set_style_node_id(style_engine->allocate_style_node());
         element.document().style_computer().register_style_node(element.style_node_id(), element);
-    } else if (!preallocated_style_elements().remove(&element)) {
-        // Already connected as far as the engine is concerned. Re-recording an insertion would
-        // double-link the element into its sibling sequence.
-        return;
+    } else {
+        preallocated_tree_scope = style_engine->consume_preallocated_style_node(element.style_node_id());
+        if (!preallocated_tree_scope.has_value()) {
+            // Already connected as far as the engine is concerned. Re-recording an insertion would
+            // double-link the element into its sibling sequence.
+            return;
+        }
     }
     // A shadow root that took its identity before its host had one is still waiting to be linked to
     // it. A sheet adopted into a shadow tree names that root, so the root can be identified first,
@@ -241,7 +222,9 @@ void record_element_connected(DOM::Element& element)
         .old_connected = false,
         .new_connected = true,
         .old_relations = detached_relations(),
-        .new_relations = relations_of(element, *style_engine),
+        .new_relations = preallocated_tree_scope.has_value()
+            ? relations_of(element, *style_engine, *preallocated_tree_scope)
+            : relations_of(element, *style_engine),
     });
     style_engine->defer_element_initial_features(element.style_node_id());
 
@@ -272,14 +255,20 @@ void prepare_style_nodes_for_subtree(DOM::Node& root)
     auto& style_computer = root.document().style_computer();
     auto& style_engine = style_computer.style_engine();
     Vector<GC::Ptr<DOM::Element>> elements;
+    Vector<TreeScopeID> element_tree_scopes;
     Vector<GC::Ptr<DOM::ShadowRoot>> shadow_roots;
-    root.for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
-        if (auto* element = as_if<DOM::Element>(node); element && element->style_node_id() == no_style_node)
+    Vector<TreeScopeID> shadow_root_tree_scopes;
+    auto collect = [&](DOM::Node& node, TreeScopeID tree_scope) {
+        if (auto* element = as_if<DOM::Element>(node); element && element->style_node_id() == no_style_node) {
             elements.append(element);
-        else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node); shadow_root && shadow_root->style_node_id() == no_style_node)
+            element_tree_scopes.append(tree_scope);
+        } else if (auto* shadow_root = as_if<DOM::ShadowRoot>(node); shadow_root && shadow_root->style_node_id() == no_style_node) {
             shadow_roots.append(shadow_root);
-        return TraversalDecision::Continue;
-    });
+            shadow_root_tree_scopes.append(tree_scope);
+        }
+    };
+    auto root_tree_scope = tree_scope_of(root.root());
+    for_each_shadow_including_inclusive_descendant_with_scope(root, root_tree_scope, collect);
     Vector<StyleNodeID> identities;
     identities.resize(elements.size() + shadow_roots.size());
     style_engine.allocate_style_nodes(identities.span());
@@ -287,13 +276,13 @@ void prepare_style_nodes_for_subtree(DOM::Node& root)
         auto& element = *elements[index];
         element.set_style_node_id(identities[index]);
         style_computer.register_style_node(identities[index], element);
-        preallocated_style_elements().set(&element);
+        style_engine.mark_style_node_preallocated(element.style_node_id(), element_tree_scopes[index]);
     }
     for (size_t index = 0; index < shadow_roots.size(); ++index) {
         auto& shadow_root = *shadow_roots[index];
         auto identity = identities[elements.size() + index];
         shadow_root.set_style_node_id(identity);
-        style_engine.set_tree_scope_root(tree_scope_of(shadow_root), identity);
+        style_engine.set_tree_scope_root(shadow_root_tree_scopes[index], identity);
     }
 }
 
@@ -308,10 +297,10 @@ template<typename PublishFeature, typename PublishEmptiness>
 static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element, StyleNodeID node, PublishFeature publish_feature, PublishEmptiness publish_emptiness, InvalidateLanguageCache invalidate_language_cache)
 {
     // Slot identity and namespace never change during an element's lifetime.
-    if (is<HTML::HTMLSlotElement>(element))
-        style_engine.set_element_is_slot(node, true);
+    auto is_slot = is<HTML::HTMLSlotElement>(element);
+    StyleAtomID namespace_atom;
     if (auto const& namespace_uri = element.namespace_uri(); namespace_uri.has_value() && !namespace_uri->is_empty())
-        style_engine.set_element_namespace(node, style_engine.intern_case_sensitive_text_atom(namespace_uri->view()));
+        namespace_atom = style_engine.intern_case_sensitive_text_atom(namespace_uri->view());
 
     publish_feature(StyleEngineFFI::FfiFeatureKind::TagName, StyleAtomID {}, StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_atom(element.local_name()));
     if (auto folded_name = element.local_name().to_ascii_lowercase(); folded_name != element.local_name())
@@ -321,7 +310,8 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
     for (auto const& class_name : element.class_names())
         publish_feature(StyleEngineFFI::FfiFeatureKind::Class, intern_id_or_class_atom(style_engine, element, class_name), StyleEngineFFI::FfiFeatureValueKind::Present, StyleAtomID {});
     element.for_each_attribute([&](DOM::QualifiedName const& name, Utf16View value) {
-        publish_feature(StyleEngineFFI::FfiFeatureKind::Attribute, attribute_name_atom(style_engine, name.local_name(), name.namespace_()), StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_attribute_value(value));
+        auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
+        publish_feature(StyleEngineFFI::FfiFeatureKind::Attribute, name_atom, StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_attribute_value(name_atom, value));
     });
 
     bool has_nonempty_text_child = false;
@@ -342,31 +332,55 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
     }
 
     auto const language = element.lang_view();
-    style_engine.set_element_language(node, language.has_value() ? style_engine.intern_text_atom(*language) : 0, language.value_or({}));
+    auto language_atom = language.has_value() ? style_engine.intern_language_atom(*language) : StyleAtomID {};
     auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? "rtl"sv : "ltr"sv;
-    style_engine.set_element_directionality(node, style_engine.intern_text_atom(Utf16View { directionality }));
+    auto directionality_atom = style_engine.intern_text_atom(Utf16View { directionality });
     if (invalidate_language_cache == InvalidateLanguageCache::Yes)
         element.invalidate_lang_value();
 
     GC::Ptr<HTML::HTMLHeadingElement const> heading = as_if<HTML::HTMLHeadingElement>(element);
-    style_engine.set_element_heading_level(node, static_cast<u8>(min(heading ? heading->heading_level() : 0, 255u)));
+    auto heading_level = static_cast<u8>(min(heading ? heading->heading_level() : 0, 255u));
 
     Vector<StyleAtomID> custom_states;
     if (auto states = element.custom_state_set()) {
         for (auto const& state : states->states())
             custom_states.append(style_engine.intern_atom(state));
     }
-    style_engine.set_element_custom_states(node, custom_states);
+    style_engine.record_element_arrival({
+                                            .node = node.value(),
+                                            .namespace_atom = namespace_atom.value(),
+                                            .language_atom = language_atom.value(),
+                                            .directionality_atom = directionality_atom.value(),
+                                            .custom_state_offset = 0,
+                                            .custom_state_count = 0,
+                                            .heading_level = heading_level,
+                                            .is_slot = is_slot,
+                                            .reserved = 0,
+                                        },
+        custom_states);
+}
+
+void publish_required_attribute_value_texts(StyleEngine& style_engine, StyleComputer& style_computer)
+{
+    style_computer.for_each_style_node([&](DOM::Element& element) {
+        element.for_each_attribute([&](DOM::QualifiedName const& name, Utf16View value) {
+            auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
+            style_engine.backfill_attribute_value_text_if_required(name_atom, value);
+        });
+    });
+}
+
+void configure_isolated_selector_query_engine(StyleEngine& style_engine, DOM::Document& document)
+{
+    style_engine.set_fold_id_and_class_name_case(document.in_quirks_mode());
+    style_engine.set_html_element_namespace(
+        document.document_type() == DOM::Document::Type::HTML
+            ? style_engine.intern_case_sensitive_text_atom(Namespace::HTML.view())
+            : 0);
 }
 
 void populate_isolated_selector_query_engine(StyleEngine& style_engine, DOM::ParentNode& root, Function<void(GC::Ref<DOM::Element>, StyleNodeID)> const& publish_identity)
 {
-    style_engine.set_fold_id_and_class_name_case(root.document().in_quirks_mode());
-    style_engine.set_html_element_namespace(
-        root.document().document_type() == DOM::Document::Type::HTML
-            ? style_engine.intern_case_sensitive_text_atom(Namespace::HTML.view())
-            : 0);
-
     Optional<StyleNodeID> non_element_root_identity;
     if (!is<DOM::Element>(root) && !is<DOM::Document>(root)) {
         non_element_root_identity = style_engine.allocate_style_node();
@@ -517,7 +531,8 @@ static void record_element_initial_features(DOM::Element& element)
 
     if (!element.part_names().is_empty())
         record_element_parts_changed(element);
-    record_element_inline_style_properties(element);
+    if (auto const inline_style = element.inline_style(); inline_style && (!inline_style->properties().is_empty() || !inline_style->custom_properties().is_empty()))
+        record_element_inline_style_properties(element);
 }
 
 void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Element* old_previous_sibling, DOM::Element* old_next_sibling)
@@ -606,7 +621,7 @@ void record_element_assigned_slot_changed(DOM::Element& element, DOM::Element* o
     });
 }
 
-void record_element_disconnecting(DOM::Element& element)
+static void record_element_disconnecting(DOM::Element& element, TreeScopeID tree_scope)
 {
     auto* style_engine = style_engine_for(element);
     if (!style_engine)
@@ -643,7 +658,7 @@ void record_element_disconnecting(DOM::Element& element)
         .node = node.value(),
         .old_connected = true,
         .new_connected = false,
-        .old_relations = relations_of(element, *style_engine),
+        .old_relations = relations_of(element, *style_engine, tree_scope),
         .new_relations = detached_relations(),
     });
 
@@ -682,7 +697,7 @@ void record_element_custom_property_names(DOM::Element& element, CustomPropertyD
         return;
 
     auto atoms = data
-        ? data->declared_name_atoms(bit_cast<FlatPtr>(&element.document()), [&](Utf16FlyString const& name) { return style_engine->intern_atom(name); })
+        ? data->declared_name_atoms(bit_cast<FlatPtr>(&element.document()), style_engine->atom_generation(), [&](Utf16FlyString const& name) { return style_engine->intern_atom(name); })
         : ReadonlySpan<StyleAtomID> {};
     style_engine->set_element_custom_property_names(element.style_node_id(), atoms, uses_unnamed, uses_custom_functions);
 }
@@ -951,12 +966,11 @@ struct DeclaredPropertyColumns {
     bool declarations_are_complete;
 };
 
-static void publish_element_declared_properties(DOM::Element& element, StyleEngineFFI::FfiElementDeclarationKind kind, ReadonlySpan<StyleProperty> style_properties, bool declarations_are_complete = true)
+static bool publish_element_declared_properties(DOM::Element& element, StyleEngineFFI::FfiElementDeclarationKind kind, ReadonlySpan<StyleProperty> style_properties, bool declarations_are_complete = true)
 {
     auto* style_engine = style_engine_for(element);
-    if (!style_engine || element.style_node_id() == no_style_node || has_pending_initial_features(element)) {
-        return;
-    }
+    if (!style_engine || element.style_node_id() == no_style_node || has_pending_initial_features(element))
+        return false;
 
     DeclaredPropertyColumns columns(style_properties.size(), declarations_are_complete);
     for (auto const& property : style_properties) {
@@ -966,6 +980,7 @@ static void publish_element_declared_properties(DOM::Element& element, StyleEngi
         columns.append(property, ExpandShorthands::Yes);
     }
     style_engine->set_element_declared_properties(element.style_node_id(), kind, columns.properties, columns.important, columns.operators, columns.values, columns.original_values, columns.declarations_are_complete);
+    return true;
 }
 
 // An element can arrive with a style attribute already written, so this is published on arrival as
@@ -987,9 +1002,9 @@ static void record_element_inline_style_properties(DOM::Element& element)
 // bordered table for that reason. The cascade builds the block anyway, so this costs the call.
 //
 // SVG presentation attributes map through the same hook, so they are published under this kind too.
-void record_element_presentational_hint_properties(DOM::Element& element, ReadonlySpan<StyleProperty> hints)
+bool record_element_presentational_hint_properties(DOM::Element& element, ReadonlySpan<StyleProperty> hints)
 {
-    publish_element_declared_properties(element, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, hints);
+    return publish_element_declared_properties(element, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, hints);
 }
 
 void record_element_declarations_changed(DOM::Element& element, ElementDeclarationKind kind, bool had_declarations, bool has_declarations)
@@ -1049,6 +1064,24 @@ void record_shadow_root_disconnecting(DOM::ShadowRoot& shadow_root)
         });
     }
     shadow_root.set_style_node_id(no_style_node);
+}
+
+void record_subtree_disconnecting(DOM::Node& root)
+{
+    auto root_tree_scope = tree_scope_of(root.root());
+    auto disconnect_element = [](DOM::Node& node, TreeScopeID tree_scope) {
+        if (auto* element = as_if<DOM::Element>(node))
+            record_element_disconnecting(*element, tree_scope);
+    };
+    for_each_shadow_including_inclusive_descendant_with_scope(root, root_tree_scope, disconnect_element);
+
+    // Only once no element still names a shadow root as its parent can the root give up its own
+    // identity.
+    auto disconnect_shadow_root = [](DOM::Node& node, TreeScopeID) {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(node))
+            record_shadow_root_disconnecting(*shadow_root);
+    };
+    for_each_shadow_including_inclusive_descendant_with_scope(root, root_tree_scope, disconnect_shadow_root);
 }
 
 void record_shadow_root_connected(DOM::ShadowRoot& shadow_root)
@@ -2205,17 +2238,19 @@ void record_element_attribute_changed(DOM::Element& element, Utf16FlyString cons
     if (name == HTML::AttributeNames::headingoffset || name == HTML::AttributeNames::headingreset)
         record_heading_levels_in_subtree(element);
 
-    // Both values cross as atoms, with their text recorded once per distinct value. This lets the
-    // match evaluator reconstruct either side of a transaction without asking the DOM, and two
-    // different values cannot cancel in the journal merely because both are present.
+    // Both values cross as atoms. Their text is recorded once per distinct value only when a
+    // compiled selector for this attribute uses an operator that cannot compare atom identities.
+    // This lets the match evaluator reconstruct either side of such a transaction without asking
+    // the DOM, and two different values cannot cancel in the journal merely because both are
+    // present.
     // The same name an arriving attribute publishes, with the same other forms noted alongside it.
-    // See `attribute_name_atom`.
-    auto atom = attribute_name_atom(*style_engine, name, namespace_uri);
+    // See `StyleEngine::intern_attribute_name`.
+    auto atom = style_engine->intern_attribute_name(name, namespace_uri);
     auto kind_of = [](Optional<Utf16String> const& value) {
         return value.has_value() ? StyleEngineFFI::FfiFeatureValueKind::Atom : StyleEngineFFI::FfiFeatureValueKind::Absent;
     };
     auto atom_of = [&](Optional<Utf16String> const& value) {
-        return value.has_value() ? style_engine->intern_attribute_value(*value) : 0;
+        return value.has_value() ? style_engine->intern_attribute_value(atom, *value) : 0;
     };
     auto old_kind = kind_of(old_value);
     auto old_atom = atom_of(old_value);

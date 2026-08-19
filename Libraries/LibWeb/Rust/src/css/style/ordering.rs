@@ -230,10 +230,12 @@ impl StyleEngine {
                 candidates.push(OrderedCascadeCandidate {
                     winner: PropertyWinner {
                         property: declared.property,
+                        important: declared.important,
                         key: Self::retained_rule_winner_key(declared),
                         priority,
                         source: WinnerSource::Rule(entry.rule),
                     },
+                    priority,
                     stratum: self.cascade_stratum_of(entry.rule, entry.tree_scope, declared.important),
                 });
             }
@@ -253,10 +255,12 @@ impl StyleEngine {
                     candidates.push(OrderedCascadeCandidate {
                         winner: PropertyWinner {
                             property: declared.property,
+                            important: declared.important,
                             key: Self::retained_rule_winner_key(declared),
                             priority,
                             source: WinnerSource::Element(kind),
                         },
+                        priority,
                         stratum: self.element_cascade_stratum(node, kind, declared.important),
                     });
                 }
@@ -337,9 +341,19 @@ impl StyleEngine {
         &mut self,
         all: &mut Vec<RuleMatch>,
         can_have_scope_duplicates: bool,
-        publish_winners_for: Option<StyleNodeID>,
+        mut publish_winners_for: Option<StyleNodeID>,
         workspace: &mut CascadeCompactionWorkspace,
     ) {
+        if publish_winners_for.is_some_and(|node| {
+            !self.winner_groups.admits_new_rows()
+                && matches!(
+                    self.winner_groups
+                        .lookup(WinnerGroupKey::current(node, self.program.version())),
+                    Lookup::Missing(_)
+                )
+        }) {
+            publish_winners_for = None;
+        }
         self.order_matches_in_cascade(all, can_have_scope_duplicates);
         self.counters
             .add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
@@ -473,7 +487,7 @@ impl StyleEngine {
                         .into_iter()
                         .map(|target| {
                             let materialize = |property, priority, payload| {
-                                let (key, source) = match payload {
+                                let (key, important, source) = match payload {
                                     CascadeCompactionCandidate::Rule(match_index) => {
                                         let entry = &all[match_index];
                                         let declared = *self
@@ -482,14 +496,21 @@ impl StyleEngine {
                                             .iter()
                                             .find(|declared| declared.property == property)
                                             .expect("winner candidate came from the rule's declaration inventory");
-                                        (Self::retained_rule_winner_key(declared), WinnerSource::Rule(entry.rule))
+                                        (
+                                            Self::retained_rule_winner_key(declared),
+                                            declared.important,
+                                            WinnerSource::Rule(entry.rule),
+                                        )
                                     }
-                                    CascadeCompactionCandidate::Element(kind, declared) => {
-                                        (Self::retained_rule_winner_key(declared), WinnerSource::Element(kind))
-                                    }
+                                    CascadeCompactionCandidate::Element(kind, declared) => (
+                                        Self::retained_rule_winner_key(declared),
+                                        declared.important,
+                                        WinnerSource::Element(kind),
+                                    ),
                                 };
                                 PropertyWinner {
                                     property,
+                                    important,
                                     key,
                                     priority,
                                     source,
@@ -525,6 +546,7 @@ impl StyleEngine {
             let winner_scratch_bytes = (winner_count * size_of::<PropertyWinner>()) as u64;
             self.memory
                 .reserve_required(MemoryCategory::BatchScratch, winner_scratch_bytes);
+            let mut published_row_count = 0;
             for (target, winners) in published_winners {
                 let key = target.map_or_else(
                     || WinnerGroupKey::current(node, self.program.version()),
@@ -535,19 +557,20 @@ impl StyleEngine {
                 if let Some(target) = target {
                     let inventory_is_complete =
                         self.cascade_winner_inventory_is_complete_for_target(all, Some(node), Some(*target));
-                    self.winner_groups
+                    let published = self
+                        .winner_groups
                         .set_pseudo(node, *target, state, self.program.version());
-                    if !inventory_is_complete {
+                    if published && !inventory_is_complete {
                         self.winner_groups.mark_pseudo_inventory_incomplete(node, *target);
                     }
+                    published_row_count += usize::from(published);
                 } else {
-                    self.winner_groups.set(node, state, self.program.version());
+                    published_row_count += usize::from(self.winner_groups.set(node, state, self.program.version()));
                 }
             }
-            if self.winner_groups.settle_memory(&mut self.memory) {
-                self.counters
-                    .add(Counter::CascadeNodeHandlesPublished, published_winners.len() as u64);
-            }
+            self.winner_groups.settle_memory(&mut self.memory);
+            self.counters
+                .add(Counter::CascadeNodeHandlesPublished, published_row_count as u64);
             self.memory.release(MemoryCategory::BatchScratch, winner_scratch_bytes);
         }
 
@@ -731,9 +754,7 @@ impl StyleEngine {
     ) -> bool {
         let mut targets = Vec::new();
         for delta in deltas {
-            let Some(entry) = self.programs.get(delta.program).entries().get(delta.entry as usize) else {
-                return false;
-            };
+            let entry = self.programs.entry(delta.entry).1;
             if !targets.contains(&entry.pseudo_element) {
                 targets.push(entry.pseudo_element);
             }
@@ -763,17 +784,10 @@ impl StyleEngine {
         };
 
         let mut repair_properties = Vec::new();
-        let mut updates = Vec::new();
+        let mut updates: Vec<PropertyWinnerUpdate> = Vec::new();
+        let mut update_priorities = Vec::new();
         for delta in deltas {
-            let Some(entry) = self
-                .programs
-                .get(delta.program)
-                .entries()
-                .get(delta.entry as usize)
-                .copied()
-            else {
-                return false;
-            };
+            let entry = *self.programs.entry(delta.entry).1;
             if entry.pseudo_element != pseudo {
                 continue;
             }
@@ -793,7 +807,7 @@ impl StyleEngine {
                     continue;
                 }
                 let Some(matched) = matches.iter().find(|matched| {
-                    matched.rule == delta.rule && matched.program == delta.program && matched.entry == delta.entry
+                    matched.rule == delta.rule && self.programs.entry_id(matched.program, matched.entry) == delta.entry
                 }) else {
                     return false;
                 };
@@ -806,29 +820,30 @@ impl StyleEngine {
                 );
                 let winner = PropertyWinner {
                     property: declared.property,
+                    important: declared.important,
                     key: Self::retained_rule_winner_key(declared),
                     priority,
                     source: WinnerSource::Rule(delta.rule),
                 };
-                let existing = updates
-                    .iter_mut()
-                    .find(|update: &&mut PropertyWinnerUpdate| update.property == declared.property);
-                match existing {
-                    Some(update) if update.winner.is_none_or(|current| winner.priority >= current.priority) => {
-                        update.winner = Some(winner);
+                if let Some(index) = updates.iter().position(|update| update.property == declared.property) {
+                    if priority >= update_priorities[index] {
+                        updates[index].winner = Some(winner);
+                        update_priorities[index] = priority;
                     }
-                    Some(_) => {}
-                    None if self
-                        .winner_groups
-                        .winner_in_state(previous, declared.property)
-                        .is_none_or(|current| winner.priority >= current.priority) =>
-                    {
+                } else if let Some(previous_winner) = self.winner_groups.winner_in_state(previous, declared.property) {
+                    if priority >= previous_winner.priority {
                         updates.push(PropertyWinnerUpdate {
                             property: declared.property,
                             winner: Some(winner),
                         });
+                        update_priorities.push(priority);
                     }
-                    None => {}
+                } else {
+                    updates.push(PropertyWinnerUpdate {
+                        property: declared.property,
+                        winner: Some(winner),
+                    });
+                    update_priorities.push(priority);
                 }
             }
         }
@@ -851,17 +866,17 @@ impl StyleEngine {
 
         let (state, _) =
             self.with_cascade_interning_counters(|groups| groups.apply_property_updates(previous, &updates));
-        if let Some(pseudo) = pseudo {
+        let published = if let Some(pseudo) = pseudo {
             self.winner_groups
-                .set_pseudo(node, pseudo, state, self.program.version());
+                .set_pseudo(node, pseudo, state, self.program.version())
         } else {
-            self.winner_groups.set(node, state, self.program.version());
+            self.winner_groups.set(node, state, self.program.version())
+        };
+        self.winner_groups.settle_memory(&mut self.memory);
+        if published {
+            self.counters.bump(Counter::CascadeNodeHandlesPublished);
         }
-        if !self.winner_groups.settle_memory(&mut self.memory) {
-            return false;
-        }
-        self.counters.bump(Counter::CascadeNodeHandlesPublished);
-        true
+        published
     }
 
     pub(super) fn cascade_winner_inventory_is_complete_for_target(
@@ -1139,47 +1154,42 @@ impl StyleEngine {
 
     /// Normalize the pending inputs without advancing the committed snapshot.
     pub(super) fn drain_transaction(&mut self) -> StyleTransaction {
-        self.facts.restore_prepared_selector_query_input(&mut self.memory);
         self.initial_tree_bulk_load_is_pending = false;
-        self.finalize_pending_sheet_rule_replacements();
+        self.finalize_staged_sheet_rule_replacements();
+        // A diagnostic or retained planning snapshot may still hold this exact immutable routing
+        // program. It remains queryable in builder form; compact it at the next unshared boundary.
+        if let Some(routing) = Rc::get_mut(&mut self.routing)
+            && routing.finish_directories()
+        {
+            routing.settle_memory(&mut self.memory);
+        }
         self.journal.take_transaction(&mut self.memory, &mut self.counters)
     }
 
     /// Advance staged program and tree state to the transaction's final snapshot.
-    pub(super) fn commit_pending_structural_state(&mut self) {
-        self.apply_pending_program_activation();
-        self.apply_pending_rule_declarations();
-        self.apply_pending_rule_versions();
-        self.apply_pending_rule_metadata();
-        self.apply_pending_rule_liveness();
-        self.apply_pending_scope_program_metadata();
-        self.apply_pending_sheet_orders();
-        self.committed_rule_count = self.program.rule_count();
-        self.rule_change_is_carried_by_sheet.clear();
+    pub(super) fn apply_staged_structural_state(&mut self) {
+        self.commit_staged_program();
+        self.program_staging.rule_change_is_carried_by_sheet.clear();
         self.apply_staged_tree_deltas();
     }
 
     /// Advance staged local facts to the transaction's final snapshot.
-    pub(super) fn commit_pending_facts(
-        &mut self,
-        transaction: &mut StyleTransaction,
-        before_facts: BeforeFactRetention,
-    ) {
-        if before_facts == BeforeFactRetention::Retain && self.facts.has_pending_input() {
-            transaction.install_before_facts(self.facts.before_pending_facts(), &mut self.memory);
+    pub(super) fn apply_staged_facts(&mut self, transaction: &mut StyleTransaction) {
+        if self.facts.has_staged_input() {
+            transaction.install_before_facts(self.facts.staged_before_facts(), &mut self.memory);
         }
-        self.facts.commit_pending(&mut self.memory);
+        self.facts.apply_staged(&mut self.memory);
     }
 
     /// Finish the transaction metadata which depends on committed program state.
-    pub(super) fn finish_pending_commit(&mut self, transaction: &mut StyleTransaction) {
-        transaction.program_base_version = self.pending_program_base_version.take();
+    pub(super) fn finish_staged_application(&mut self, transaction: &mut StyleTransaction) {
+        transaction.program_base_version = self.program_staging.base_version.take();
         let mut program_joins = Vec::new();
         for input in &transaction.inputs {
             self.append_program_join_deltas(input, &mut program_joins);
         }
         transaction.install_program_joins(program_joins, &mut self.memory);
-        let mut declaration_changes = std::mem::take(&mut self.pending_rule_declaration_changes);
+        let mut declaration_changes = std::mem::take(&mut self.program_staging.rule_declaration_changes);
         declaration_changes.retain(|change| {
             transaction
                 .inputs
@@ -1200,27 +1210,107 @@ impl StyleEngine {
     }
 
     /// Advance every staged input family to the transaction's final snapshot.
-    pub(super) fn commit_pending(&mut self, transaction: &mut StyleTransaction, before_facts: BeforeFactRetention) {
-        self.commit_pending_structural_state();
-        self.commit_pending_facts(transaction, before_facts);
-        self.finish_pending_commit(transaction);
+    pub(super) fn apply_staged_transaction(&mut self, transaction: &mut StyleTransaction) {
+        self.apply_staged_structural_state();
+        self.apply_staged_facts(transaction);
+        self.finish_staged_application(transaction);
     }
 
-    /// Normalize and commit the pending inputs into one transaction. A required style observation
+    /// Normalize and apply the staged inputs into one transaction. A required style observation
     /// drains here first, so normalization never combines changes across an observation boundary.
     pub fn take_transaction(&mut self) -> StyleTransaction {
         let mut transaction = self.drain_transaction();
-        self.commit_pending(&mut transaction, BeforeFactRetention::Retain);
+        self.apply_staged_transaction(&mut transaction);
         transaction
     }
 
     /// Release a drained transaction's scratch charge.
     pub fn release_transaction(&mut self, transaction: StyleTransaction) {
         transaction.release(&mut self.memory);
-        self.rules_with_incomplete_old_declarations.clear();
         self.forget_departed_elements();
+        self.tree_staging.clear();
+        self.tree_staging_memory.resize_required_to(&mut self.memory, 0);
+        self.facts.release_staging(&mut self.memory);
+        self.program_staging.clear();
         self.sweep_selector_programs();
         self.shed_routing_for_detached_sheets();
+    }
+
+    /// Release a transaction taken through the bridge and reclaim atoms before the bridge installs
+    /// a new primary view. The returned reclamation batch lets C++ purge its atom memos before any
+    /// reclaimed identity can be reused.
+    pub(super) fn release_transaction_and_sweep_atoms(&mut self, transaction: StyleTransaction) {
+        self.release_transaction(transaction);
+        self.sweep_style_atoms();
+    }
+
+    pub(super) fn collect_live_style_atoms(&self) -> (HashSet<StyleAtomID>, u64) {
+        assert!(
+            self.tree_staging.is_empty(),
+            "style atom sweeping requires settled tree staging"
+        );
+        assert!(
+            self.facts.staging_is_empty(),
+            "style atom sweeping requires settled fact staging"
+        );
+        let mut atoms = HashSet::default();
+        let mut visited = self.tree.collect_atoms(&mut atoms);
+        visited += self.facts.collect_atoms(&mut atoms);
+        visited += self.program.collect_atoms(&mut atoms);
+        visited += self.programs.collect_atoms(&mut atoms);
+        if !self.html_element_namespace.is_none() {
+            atoms.insert(self.html_element_namespace);
+        }
+        (atoms, visited)
+    }
+
+    pub(super) fn sweep_style_atoms(&mut self) {
+        let decision = self.atoms.sweep_decision();
+        self.counters
+            .add(Counter::AtomSweepPinReleasesSkipped, decision.skipped_pin_releases);
+        if !decision.should_sweep && self.replay_reclaimed_style_atoms.is_none() {
+            return;
+        }
+        if self.batch_matching_traversal.is_some() {
+            self.counters.bump(Counter::AtomSweepsDeferredForActiveTraversal);
+            return;
+        }
+        let replay_reclaimed = self.replay_reclaimed_style_atoms.take();
+        self.style_atoms_swept = true;
+        self.facts.sweep_auxiliary_catalogs_without_sync();
+        let (mut live, visited) = self.collect_live_style_atoms();
+        self.atoms.mark_sweep_dependencies(&mut live);
+        loop {
+            let previous_live_count = live.len();
+            self.facts.extend_live_attribute_name_forms(&mut live);
+            self.atoms.mark_sweep_dependencies(&mut live);
+            if live.len() == previous_live_count {
+                break;
+            }
+        }
+        let mut reclaimable = self.atoms.reclaimable_for_sweep(&live);
+        if let Some(recorded) = replay_reclaimed {
+            assert!(
+                recorded.iter().all(|atom| reclaimable.contains(atom)),
+                "a recorded atom release still has a semantic replay owner"
+            );
+            reclaimable = recorded;
+        }
+        self.facts.forget_atoms(&reclaimable);
+        let requirement_count = self.attribute_value_text_names.len();
+        self.attribute_value_text_names
+            .retain(|atom| !reclaimable.contains(atom));
+        if self.attribute_value_text_names.len() != requirement_count {
+            self.attribute_value_text_requirements_version += 1;
+        }
+        let reclaimed = self.atoms.finish_sweep(&reclaimable);
+        self.counters.bump(Counter::AtomSweeps);
+        self.counters.add(Counter::AtomSweepRootSlotsVisited, visited);
+        self.counters.add(
+            Counter::StyleAtomsReclaimed,
+            u64::try_from(reclaimed.len()).expect("reclaimed atom count exceeds u64"),
+        );
+        self.reclaimed_style_atoms.extend(reclaimed);
     }
 
     /// Drop routing entry points for rules whose sheet is attached nowhere.
@@ -1236,11 +1326,11 @@ impl StyleEngine {
         }
         self.routing_needs_detachment_sweep = false;
         let live_rules = self.program.live_selector_programs().collect::<Vec<_>>();
-        let mut excluded_sheets: HashSet<SheetID> = HashSet::default();
+        let mut excluded_sheets = BitColumn::default();
         for &(rule, _) in &live_rules {
             let sheet = self.program.rule_sheet(rule);
             if !self.program.sheet_is_attached_somewhere(sheet) {
-                excluded_sheets.insert(sheet);
+                excluded_sheets.set(sheet.0 as usize, true);
             }
         }
         if excluded_sheets == self.sheets_excluded_from_routing {
@@ -1248,10 +1338,10 @@ impl StyleEngine {
         }
         let mut rebuilt_routing = RoutingRegistry::new();
         for &(rule, program) in &live_rules {
-            if excluded_sheets.contains(&self.program.rule_sheet(rule)) {
+            if excluded_sheets.contains(self.program.rule_sheet(rule).0 as usize) {
                 continue;
             }
-            rebuilt_routing.add_rule(rule, program, self.programs.get(program));
+            rebuilt_routing.add_rule(rule, program, &self.programs);
         }
         let mut previous_routing = std::mem::replace(&mut self.routing, Rc::new(rebuilt_routing));
         Rc::get_mut(&mut previous_routing)
@@ -1282,16 +1372,16 @@ impl StyleEngine {
         }
 
         let mut rebuilt_routing = RoutingRegistry::new();
-        let mut excluded_sheets: HashSet<SheetID> = HashSet::default();
+        let mut excluded_sheets = BitColumn::default();
         for &(rule, program) in &live_rules {
             // A detached sheet's rules keep no routing entry points; see
             // `shed_routing_for_detached_sheets`.
             let sheet = self.program.rule_sheet(rule);
             if !self.program.sheet_is_attached_somewhere(sheet) {
-                excluded_sheets.insert(sheet);
+                excluded_sheets.set(sheet.0 as usize, true);
                 continue;
             }
-            rebuilt_routing.add_rule(rule, program, self.programs.get(program));
+            rebuilt_routing.add_rule(rule, program, &self.programs);
         }
         self.sheets_excluded_from_routing = excluded_sheets;
         let mut previous_routing = std::mem::replace(&mut self.routing, Rc::new(rebuilt_routing));
@@ -1323,18 +1413,27 @@ impl StyleEngine {
     /// left behind here would be read as the next occupant's. Dropping it at the transaction
     /// boundary keeps the row alive for exactly as long as routing needs it.
     pub(super) fn forget_departed_elements(&mut self) {
-        let departed = std::mem::take(&mut self.departed);
+        let departed: Vec<_> = self
+            .tree_staging
+            .rows()
+            .into_iter()
+            .filter_map(|(node, _, after)| after.is_none().then_some(node))
+            .collect();
         if departed.is_empty() {
             return;
         }
         for node in departed {
             self.facts.forget(node);
             self.retained_match_answers.forget(&mut self.match_answers, node);
-            if let Some(tree_scope) = self.scope_by_root.remove(&node) {
+            if let Some(tree_scope) = self.scope_by_root.remove(node) {
                 self.scope_roots[tree_scope.0 as usize] = None;
             }
         }
-        self.facts.sweep_auxiliary_catalogs();
+        // The catalog sweep needs unique primary rows, like the atom sweep; while a traversal
+        // borrows them the dead entries wait for the next boundary.
+        if self.batch_matching_traversal.is_none() {
+            self.facts.sweep_auxiliary_catalogs();
+        }
     }
 
     /// The document budget is written in connected elements and compact program bytes, so it has to
@@ -1345,5 +1444,7 @@ impl StyleEngine {
             ..BudgetInputs::default()
         };
         self.memory.set_budget_inputs(inputs);
+        self.journal
+            .set_document_capacity_limit(self.tree.connected_element_count());
     }
 }
