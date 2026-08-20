@@ -367,24 +367,14 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
     return default_style;
 }
 
-void Paintable::set_overflow_data(OverflowData data)
-{
-    Layout::RustFFI::layout_arena_paintable_set_overflow_data(m_rust_arena->handle(), m_rust_slot, to_ffi_css_pixel_rect(data.scrollable_overflow_rect), data.has_scrollable_overflow, true);
-}
-
 void Paintable::clear_overflow_data()
 {
-    Layout::RustFFI::layout_arena_paintable_set_overflow_data(m_rust_arena->handle(), m_rust_slot, {}, false, false);
-}
-
-void Paintable::set_cached_overflow_data(CachedOverflowData data)
-{
-    Layout::RustFFI::layout_arena_paintable_set_cached_overflow_data(m_rust_arena->handle(), m_rust_slot, to_ffi_css_pixel_rect(data.rect_relative_to_padding_box), data.has_scrollable_overflow, true);
+    Layout::RustFFI::layout_arena_paintable_clear_overflow_data(m_rust_arena->handle(), m_rust_slot);
 }
 
 void Paintable::clear_cached_overflow_data()
 {
-    Layout::RustFFI::layout_arena_paintable_set_cached_overflow_data(m_rust_arena->handle(), m_rust_slot, {}, false, false);
+    Layout::RustFFI::layout_arena_paintable_clear_cached_overflow_data(m_rust_arena->handle(), m_rust_slot);
 }
 
 void Paintable::set_sticky_insets(OwnPtr<StickyInsets> sticky_insets)
@@ -815,24 +805,12 @@ void Paintable::invalidate_paint_cache() const
     mirror_rust_invalidate_paint_cache(*this);
 }
 
-void Paintable::invalidate_propagated_text_decoration_caches() const
-{
-    for_each_in_subtree([](Paintable const& descendant) {
-        if (descendant.layout_node().is_text_decoration_propagation_boundary())
-            return TraversalDecision::SkipChildrenAndContinue;
-        // Only fragment-painting paintables record propagated decorations.
-        if (descendant.is_paintable_with_lines() || descendant.is_inline_paintable())
-            descendant.invalidate_paint_cache();
-        return TraversalDecision::Continue;
-    });
-}
-
 void Paintable::repaint_after_style_change(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
     if (invalidation.needs_repaint())
         set_needs_repaint();
     if (invalidation.repaint_propagated_text_decorations)
-        invalidate_propagated_text_decoration_caches();
+        rust_invalidate_propagated_text_decoration_caches(*this);
 }
 
 void Paintable::reset_for_relayout()
@@ -1093,10 +1071,7 @@ void Paintable::translate_reused_subtree_absolute_geometry(CSSPixelPoint delta)
 {
     for_each_in_inclusive_subtree([&](Paintable& paintable) {
         paintable.invalidate_absolute_geometry_cache(InvalidateDescendantGeometry::No);
-        if (auto overflow_data = paintable.overflow_data(); overflow_data.has_value()) {
-            overflow_data->scrollable_overflow_rect.translate_by(delta);
-            paintable.set_overflow_data(*overflow_data);
-        }
+        Layout::RustFFI::layout_arena_paintable_translate_scrollable_overflow(paintable.m_rust_arena->handle(), paintable.m_rust_slot, { delta.x().raw_value(), delta.y().raw_value() });
         // Recorded paint commands bake absolute coordinates.
         paintable.invalidate_paint_cache();
         return TraversalDecision::Continue;

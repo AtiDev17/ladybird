@@ -144,9 +144,22 @@ fn containment_applies_to_display(arena: &LayoutNodeArena, node: NodeSlotId, sty
     true
 }
 
-fn has_layout_containment(arena: &LayoutNodeArena, node: NodeSlotId, style: ComputedValuesView<'_>) -> bool {
+pub(crate) fn has_layout_containment(arena: &LayoutNodeArena, node: NodeSlotId, style: ComputedValuesView<'_>) -> bool {
     let contained = style.box_values().layout_containment || style.content_visibility() == content_visibility::AUTO;
     contained && containment_applies_to_display(arena, node, style)
+}
+
+pub(crate) fn is_scroll_container(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
+    if arena.node_kind_if_live(node) == Some(NodeKind::Viewport) {
+        return true;
+    }
+    let Some(style) = arena.node_style_if_live(node) else {
+        return false;
+    };
+    let overflow_value_makes_box_a_scroll_container =
+        |overflow_keyword: u8| matches!(overflow_keyword, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
+    overflow_value_makes_box_a_scroll_container(style.overflow_x())
+        || overflow_value_makes_box_a_scroll_container(style.overflow_y())
 }
 
 pub(crate) fn has_paint_containment(arena: &LayoutNodeArena, node: NodeSlotId, style: ComputedValuesView<'_>) -> bool {
@@ -455,12 +468,20 @@ pub(crate) fn is_text_decoration_propagation_boundary(arena: &LayoutNodeArena, n
     let Some(kind) = arena.node_kind_if_live(node) else {
         return false;
     };
+    // NB: Anonymous wrappers must stay transparent to propagation so an element's own decorations still reach
+    //     its text. The principal box of a pseudo-element is not a wrapper and must be checked like any other
+    //     element, and a table wrapper carries the float and position of the table it wraps, so it is the only
+    //     box where an out-of-flow table is observable.
     if has_flag(arena, node, NodeFlag::Anonymous)
         && !arena.node_is_generated_for_pseudo_element(node)
         && kind != NodeKind::TableWrapper
     {
         return false;
     }
+
+    // https://drafts.csswg.org/css-text-decor-4/#decorating-box
+    // NOTE: Note that text decorations are not propagated to any out-of-flow descendants, nor to the contents
+    //       of atomic inline-level descendants such as inline blocks and inline tables.
     if arena.node_is_out_of_flow_if_live(node) {
         return true;
     }

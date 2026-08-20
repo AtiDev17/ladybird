@@ -365,22 +365,17 @@ public:
         return true;
     }
 
-    [[nodiscard]] Box const* containing_block() const { return m_containing_block; }
-    [[nodiscard]] Box* containing_block() { return m_containing_block; }
+    // The containing block is computed inside the Rust arena
+    // (layout_arena_recompute_containing_blocks); the stored slot is always a Box or invalid.
+    // The tolerant resolution yields null when the containing block's slot has been freed.
+    [[nodiscard]] Box const* containing_block() const;
+    [[nodiscard]] Box* containing_block();
 
-    // Returns the inline node that actually establishes the containing block for this absolutely
-    // positioned element, if applicable. This is needed because m_containing_block can only hold
-    // a Box*, but CSS allows inline elements (like a <span> with position:relative) to establish
-    // containing blocks for their absolutely positioned descendants.
-    [[nodiscard]] NodeWithStyle const* inline_containing_block_if_applicable() const { return m_inline_containing_block_if_applicable; }
-
-    void recompute_containing_block(Badge<DOM::Document>);
-
-    // Closest non-anonymous ancestor box, to be used when resolving percentage values.
-    // Anonymous block boxes are ignored when resolving percentage values that would refer to it:
-    // the closest non-anonymous ancestor box is used instead.
-    // https://www.w3.org/TR/CSS22/visuren.html#anonymous-block-level
-    Box const* non_anonymous_containing_block() const;
+    // For an absolutely positioned node, finds a containing-block-establishing *inline* element
+    // (e.g. a <span> with position:relative) between this node and its containing block by
+    // walking the DOM tree. Invoked from the Rust containing-block recomputation, which owns
+    // the layout-tree half of the walk but cannot see DOM ancestry.
+    [[nodiscard]] NodeWithStyle const* find_inline_containing_block(Box const& containing_block) const;
 
     Gfx::Font const& first_available_font() const;
     Gfx::Font const& font(float scale_factor) const;
@@ -435,14 +430,17 @@ private:
         return static_cast<u8>(pseudo_element) + 1;
     }
 
-    void set_containing_block(Box*);
-    void set_inline_containing_block(NodeWithStyle const*);
-
     Node* tree_node_from_slot(RustFFI::NodeSlotId id) const
     {
         if (id.index == RustFFI::NodeSlotId_INVALID.index)
             return nullptr;
         return static_cast<Node*>(RustFFI::layout_arena_node_data(m_arena->handle(), id)->shell);
+    }
+
+    // Unlike tree_node_from_slot, tolerates freed and stale slots by resolving them to null.
+    Node* tree_node_from_slot_if_live(RustFFI::NodeSlotId id) const
+    {
+        return static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(m_arena->handle(), id));
     }
 
 protected:
@@ -454,15 +452,6 @@ private:
     // layout node is destroyed so detach hooks never observe a collected image provider or other element state.
     GC::Root<DOM::Node> m_dom_node;
     RefPtr<Painting::Paintable> m_paintable;
-
-    Box* m_containing_block { nullptr };
-
-    // For absolutely positioned elements, if there's an inline element (like a <span> with
-    // position:relative) that should be the containing block but can't be stored in m_containing_block
-    // (because it's not a Box), we store it here. This happens when a block element is inside an
-    // inline element - the layout tree restructures so the block becomes a sibling of the inline,
-    // but the CSS containing block relationship is based on the DOM structure.
-    NodeWithStyle const* m_inline_containing_block_if_applicable { nullptr };
 
     GC::Weak<DOM::Element> m_pseudo_element_generator;
 
@@ -528,7 +517,6 @@ public:
     }
 
     CSS::Display display() const { return CSS::display_from_ffi_display(style_group<CSS::ComputedValues::BoxValues>().display); }
-    CSS::Display display_before_box_type_transformation() const { return CSS::display_from_ffi_display(style_group<CSS::ComputedValues::BoxValues>().display_before_box_type_transformation); }
     CSS::Float float_() const { return static_cast<CSS::Float>(style_group<CSS::ComputedValues::BoxValues>().float_); }
     CSS::Clear clear() const { return static_cast<CSS::Clear>(style_group<CSS::ComputedValues::BoxValues>().clear); }
     CSS::Positioning position() const { return static_cast<CSS::Positioning>(style_group<CSS::ComputedValues::BoxValues>().position); }
@@ -610,9 +598,6 @@ public:
     CSS::PointerEvents pointer_events() const { return style_group<CSS::ComputedValues::InheritedUIValues>().pointer_events_value(); }
     CSS::ScrollbarColorData scrollbar_color() const { return style_group<CSS::ComputedValues::InheritedUIValues>().scrollbar_color_value(); }
     CSS::Appearance appearance() const { return static_cast<CSS::Appearance>(style_group<CSS::ComputedValues::MiscResetValues>().appearance); }
-    CSS::ObjectFit object_fit() const { return static_cast<CSS::ObjectFit>(style_group<CSS::ComputedValues::MiscResetValues>().object_fit); }
-    CSS::Position object_position() const { return style_group<CSS::ComputedValues::MiscResetValues>().object_position_value(); }
-    CSS::OverflowClipMarginData overflow_clip_margin() const { return style_group<CSS::ComputedValues::MiscResetValues>().overflow_clip_margin_value(); }
     CSS::LengthBox scroll_padding() const { return length_box(style_group<CSS::ComputedValues::MiscResetValues>().scroll_padding); }
     CSS::ScrollbarWidth scrollbar_width() const { return static_cast<CSS::ScrollbarWidth>(style_group<CSS::ComputedValues::MiscResetValues>().scrollbar_width); }
     CSS::UserSelect user_select() const { return static_cast<CSS::UserSelect>(style_group<CSS::ComputedValues::MiscResetValues>().user_select); }
@@ -623,7 +608,6 @@ public:
     CSS::OutlineStyle outline_style() const { return static_cast<CSS::OutlineStyle>(style_group<CSS::ComputedValues::MiscResetValues>().outline_style); }
     CSSPixels outline_width() const { return CSSPixels::from_raw(style_group<CSS::ComputedValues::MiscResetValues>().outline_width); }
     Color background_color() const { return style_group<CSS::ComputedValues::BackgroundValues>().background_color_value(); }
-    CSS::BackgroundBox background_color_clip() const { return style_group<CSS::ComputedValues::BackgroundValues>().background_color_clip_value(); }
     Vector<CSS::BackgroundLayerData> const& background_layers() const
     {
         if (!m_background_layers.has_value())
@@ -636,7 +620,6 @@ public:
             m_mask_layers = style_group<CSS::ComputedValues::MaskValues>().mask_layers_value();
         return *m_mask_layers;
     }
-    RefPtr<CSS::AbstractImageStyleValue const> mask_image() const { return style_group<CSS::ComputedValues::MaskValues>().mask_image_value(); }
     CSS::ListStyleType const& list_style_type() const
     {
         if (!m_list_style_type.has_value()) {
@@ -674,34 +657,18 @@ public:
     CSS::BorderRadiusData border_bottom_right_radius() const { return style_group<CSS::ComputedValues::BorderValues>().border_bottom_right_radius_value(); }
     CSS::BorderRadiusData border_top_left_radius() const { return style_group<CSS::ComputedValues::BorderValues>().border_top_left_radius_value(); }
     CSS::BorderRadiusData border_top_right_radius() const { return style_group<CSS::ComputedValues::BorderValues>().border_top_right_radius_value(); }
-    CSS::BorderCollapse border_collapse() const { return static_cast<CSS::BorderCollapse>(style_group<CSS::ComputedValues::InheritedTableValues>().border_collapse); }
-    CSS::EmptyCells empty_cells() const { return static_cast<CSS::EmptyCells>(style_group<CSS::ComputedValues::InheritedTableValues>().empty_cells); }
     Color color() const { return style_group<CSS::ComputedValues::InheritedTextValues>().color_value(); }
     Color webkit_text_fill_color() const { return style_group<CSS::ComputedValues::InheritedTextValues>().webkit_text_fill_color_value(); }
     CSSPixels letter_spacing() const { return style_group<CSS::ComputedValues::InheritedTextValues>().letter_spacing_value(); }
     ReadonlySpan<CSS::ShadowData> text_shadow() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_shadow_span(); }
     CSS::TextTransform text_transform() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_transform_value(); }
     CSS::WhiteSpaceCollapse white_space_collapse() const { return style_group<CSS::ComputedValues::InheritedTextValues>().white_space_collapse_value(); }
-    CSS::TextDecorationSkipInk text_decoration_skip_ink() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_decoration_skip_ink_value(); }
-    CSSPixels text_underline_offset() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_underline_offset_value(); }
-    CSS::TextUnderlinePosition text_underline_position() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_underline_position_value(); }
-    ReadonlySpan<CSS::TextDecorationLine> text_decoration_line() const { return style_group<CSS::ComputedValues::TextResetValues>().decoration_lines(); }
-    CSS::TextDecorationThickness text_decoration_thickness() const { return style_group<CSS::ComputedValues::TextResetValues>().decoration_thickness(); }
     Color text_decoration_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_color); }
-    CSS::TextDecorationStyle text_decoration_style() const { return static_cast<CSS::TextDecorationStyle>(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_style); }
     Optional<CSS::ContentData> const& content() const { return m_content; }
     CSSPixels line_height() const { return CSSPixels::from_raw(style_group<CSS::ComputedValues::FontValues>().line_height_used); }
     CSSPixels font_size() const { return CSSPixels::from_raw(style_group<CSS::ComputedValues::FontValues>().font_size); }
     Gfx::FontCascadeList const& font_list() const { return style_group<CSS::ComputedValues::FontValues>().font_list_value(); }
-    CSS::FlexBasis flex_basis() const
-    {
-        auto const& value = style_group<CSS::ComputedValues::AlignmentValues>().flex_basis;
-        if (value.is_content)
-            return CSS::FlexBasisContent {};
-        return CSS::Size::view(value.size);
-    }
     CSS::FlexDirection flex_direction() const { return static_cast<CSS::FlexDirection>(style_group<CSS::ComputedValues::AlignmentValues>().flex_direction); }
-    CSS::FlexWrap flex_wrap() const { return static_cast<CSS::FlexWrap>(style_group<CSS::ComputedValues::AlignmentValues>().flex_wrap); }
     CSS::AlignSelf align_self() const { return static_cast<CSS::AlignSelf>(style_group<CSS::ComputedValues::AlignmentValues>().align_self); }
     CSS::JustifySelf justify_self() const { return static_cast<CSS::JustifySelf>(style_group<CSS::ComputedValues::AlignmentValues>().justify_self); }
     i32 order() const { return style_group<CSS::ComputedValues::AlignmentValues>().order; }
@@ -721,7 +688,6 @@ public:
     {
         style_group<CSS::ComputedValues::TransformValues>().for_each_transformation(callback);
     }
-    bool has_resolved_transforms() const { return style_group<CSS::ComputedValues::TransformValues>().has_resolved_transforms(); }
     template<typename Callback>
     void for_each_resolved_transform(Callback callback) const
     {
@@ -737,7 +703,6 @@ public:
     bool has_translate() const { return translate() != nullptr; }
     bool has_scale() const { return scale() != nullptr; }
     Optional<CSSPixels> perspective() const { return style_group<CSS::ComputedValues::TransformValues>().perspective_value(); }
-    CSS::Position perspective_origin() const { return style_group<CSS::ComputedValues::TransformValues>().perspective_origin_value(); }
     Optional<CSS::MaskReference> mask() const { return style_group<CSS::ComputedValues::MaskValues>().mask_value(); }
     CSS::MaskType mask_type() const { return style_group<CSS::ComputedValues::MaskValues>().mask_type_value(); }
     Optional<CSS::ClipPathReference> clip_path() const { return style_group<CSS::ComputedValues::MaskValues>().clip_path_value(); }
@@ -756,16 +721,8 @@ public:
     CSS::ClipRule clip_rule() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().clip_rule_value(); }
     CSS::PaintOrderList paint_order() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().paint_order_value(); }
     CSS::TextAnchor text_anchor() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().text_anchor_value(); }
-    CSS::ShapeRendering shape_rendering() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().shape_rendering_value(); }
-    CSS::LengthPercentage const& cx() const { return CSS::LengthPercentage::view(style_group<CSS::ComputedValues::SVGResetValues>().cx); }
-    CSS::LengthPercentage const& cy() const { return CSS::LengthPercentage::view(style_group<CSS::ComputedValues::SVGResetValues>().cy); }
-    CSS::LengthPercentage const& r() const { return CSS::LengthPercentage::view(style_group<CSS::ComputedValues::SVGResetValues>().r); }
-    CSS::LengthPercentage const& x() const { return CSS::LengthPercentage::view(style_group<CSS::ComputedValues::SVGResetValues>().x); }
-    CSS::LengthPercentage const& y() const { return CSS::LengthPercentage::view(style_group<CSS::ComputedValues::SVGResetValues>().y); }
-    CSS::VectorEffect vector_effect() const { return static_cast<CSS::VectorEffect>(style_group<CSS::ComputedValues::SVGResetValues>().vector_effect); }
     bool is_inline_block() const;
     bool is_inline_table() const;
-    bool has_replaced_element_table_display_adjustment() const;
     bool is_transformable() const;
     Gfx::AffineTransform used_svg_element_transform() const;
     CSS::TransformStyle used_transform_style() const;
@@ -778,30 +735,16 @@ public:
     bool is_fixed_position() const;
     bool is_sticky_position() const;
 
-    bool is_text_decoration_propagation_boundary() const;
-
     // An element is called out of flow if it is floated, absolutely positioned, or is the root element.
     // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
 
-    // An element is called in-flow if it is not out-of-flow.
-    // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
-    bool is_in_flow() const { return !is_out_of_flow(); }
-
-    bool establishes_stacking_context() const;
     bool style_establishes_absolute_positioning_containing_block() const;
     bool establishes_an_absolute_positioning_containing_block() const;
     bool establishes_a_fixed_positioning_containing_block() const;
 
-    struct PositioningContainingBlockEstablishment {
-        bool absolute;
-        bool fixed;
-    };
-    PositioningContainingBlockEstablishment establishes_positioning_containing_blocks() const;
-
     // https://drafts.csswg.org/css-contain-2/#containment-types
     bool has_size_containment() const;
-    bool has_inline_size_containment() const;
     bool has_layout_containment() const;
     bool has_style_containment() const;
     bool has_paint_containment() const;

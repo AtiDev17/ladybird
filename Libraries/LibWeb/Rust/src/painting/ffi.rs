@@ -6,9 +6,9 @@
 
 use crate::abort_on_panic;
 use crate::css::css_pixels::CssPixels;
+use crate::layout::FfiCssPixelPoint;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
-use crate::layout::{FfiCssPixelPoint, FfiCssPixelRect};
 use crate::painting::paintable_data::*;
 use std::ffi::c_void;
 
@@ -175,23 +175,14 @@ pub unsafe extern "C" fn layout_arena_paintable_set_sticky_insets(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_set_overflow_data(
-    arena: *mut c_void,
-    slot: PaintableSlotId,
-    rect: FfiCssPixelRect,
-    has_scrollable_overflow: bool,
-    present: bool,
-) {
+pub unsafe extern "C" fn layout_arena_paintable_clear_overflow_data(arena: *mut c_void, slot: PaintableSlotId) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
         if paintables.is_live(slot) {
             paintables.update_data(slot, |data| {
-                data.overflow = FfiOverflowData {
-                    rect,
-                    has_scrollable_overflow,
-                };
-                data.has_overflow = present;
+                data.overflow = FfiOverflowData::default();
+                data.has_overflow = false;
             });
         }
     });
@@ -201,26 +192,138 @@ pub unsafe extern "C" fn layout_arena_paintable_set_overflow_data(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_set_cached_overflow_data(
+pub unsafe extern "C" fn layout_arena_paintable_clear_cached_overflow_data(arena: *mut c_void, slot: PaintableSlotId) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        if paintables.is_live(slot) {
+            paintables.update_data(slot, |data| {
+                data.cached_overflow = FfiOverflowData::default();
+                data.has_cached_overflow = false;
+            });
+        }
+    });
+}
+
+#[repr(C)]
+pub struct FfiPhysicalOverflowDirections {
+    pub horizontal_axis_is_positive: bool,
+    pub vertical_axis_is_positive: bool,
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_measure_scrollable_overflow(
+    arena: *mut c_void,
+    box_paintable: PaintableSlotId,
+    visual_context_callbacks: crate::painting::host::FfiVisualContextHostCallbacks,
+    overflow_callbacks: crate::painting::host::FfiScrollableOverflowHostCallbacks,
+) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        if !paintables.is_live(box_paintable) {
+            return;
+        }
+        crate::painting::scrollable_overflow::measure_scrollable_overflow(
+            arena,
+            &paintables,
+            &visual_context_callbacks,
+            &overflow_callbacks,
+            box_paintable,
+        );
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_translate_scrollable_overflow(
     arena: *mut c_void,
     slot: PaintableSlotId,
-    rect: FfiCssPixelRect,
-    has_scrollable_overflow: bool,
-    present: bool,
+    delta: FfiCssPixelPoint,
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
         if paintables.is_live(slot) {
             paintables.update_data(slot, |data| {
-                data.cached_overflow = FfiOverflowData {
-                    rect,
-                    has_scrollable_overflow,
-                };
-                data.has_cached_overflow = present;
+                if data.has_overflow {
+                    data.overflow.rect.x += delta.x;
+                    data.overflow.rect.y += delta.y;
+                }
             });
         }
     });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_rebuild_scrollable_overflow_contained_boxes(
+    arena: *mut c_void,
+    root: NodeSlotId,
+) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let mut contained_boxes_by_containing_block =
+            std::mem::take(&mut arena.paintables().borrow_mut().scrollable_overflow_contained_boxes);
+        {
+            let paintables = arena.paintables().borrow();
+            crate::painting::scrollable_overflow::refill_contained_boxes_index(
+                arena,
+                &paintables,
+                root,
+                &mut contained_boxes_by_containing_block,
+            );
+        }
+        arena.paintables().borrow_mut().scrollable_overflow_contained_boxes = contained_boxes_by_containing_block;
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_clear_scrollable_overflow_contained_boxes(arena: *mut c_void) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        arena
+            .paintables()
+            .borrow_mut()
+            .scrollable_overflow_contained_boxes
+            .clear();
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_physical_overflow_directions(
+    arena: *mut c_void,
+    paintable: PaintableSlotId,
+) -> FfiPhysicalOverflowDirections {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        let directions = if paintables.is_live(paintable) {
+            crate::painting::scrollable_overflow::physical_overflow_directions(
+                arena,
+                paintables.data_ref(paintable).layout_node,
+            )
+        } else {
+            crate::painting::scrollable_overflow::PhysicalOverflowDirections::default()
+        };
+        FfiPhysicalOverflowDirections {
+            horizontal_axis_is_positive: directions.horizontal_axis_is_positive,
+            vertical_axis_is_positive: directions.vertical_axis_is_positive,
+        }
+    })
 }
 
 /// # Safety
@@ -284,47 +387,6 @@ pub unsafe extern "C" fn layout_arena_assign_accumulated_visual_contexts(
         state.scroll_state_snapshot.clear();
         state.needs_to_refresh_scroll_state = true;
         is_compatible
-    })
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the
-/// document thread; `out_matrix` and `out_origin` must hold 16 and 2 floats.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_compute_css_transform(
-    arena: *mut c_void,
-    paintable: PaintableSlotId,
-    callbacks: FfiVisualContextHostCallbacks,
-    pixel_ratio: f64,
-    out_matrix: *mut f32,
-    out_origin: *mut f32,
-) -> bool {
-    abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle(arena) };
-        let paintables = arena.paintables().borrow();
-        if !paintables.is_live(paintable) {
-            return false;
-        }
-        let Some((transform, _is_invertible)) = crate::painting::visual_context::node_values::compute_transform(
-            arena,
-            &paintables,
-            &callbacks,
-            paintable,
-            pixel_ratio,
-        ) else {
-            return false;
-        };
-        for (index, value) in transform.matrix.elements.into_iter().flatten().enumerate() {
-            // SAFETY: the caller warrants 16 floats behind out_matrix.
-            unsafe { out_matrix.add(index).write(value) };
-        }
-        // SAFETY: the caller warrants 2 floats behind out_origin.
-        unsafe {
-            out_origin.write(transform.origin.x);
-            out_origin.add(1).write(transform.origin.y);
-        }
-        true
     })
 }
 
@@ -842,10 +904,19 @@ pub unsafe extern "C" fn layout_arena_last_recording_has_blocking_wheel_event_li
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_invalidate_paint_cache(arena: *mut c_void, paintable: PaintableSlotId) {
+pub unsafe extern "C" fn layout_arena_paintable_invalidate_paint_cache(
+    arena: *mut c_void,
+    paintable: PaintableSlotId,
+    propagated_text_decorations: bool,
+) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.paintables().borrow().invalidate_paint_cache(paintable);
+        let paintables = arena.paintables().borrow();
+        if propagated_text_decorations {
+            paintables.invalidate_propagated_text_decoration_caches(arena, paintable);
+        } else {
+            paintables.invalidate_paint_cache(paintable);
+        }
     });
 }
 

@@ -38,7 +38,8 @@ WEB_API bool rust_assign_accumulated_visual_contexts(ViewportPaintable&, bool fo
 WEB_API AccumulatedVisualContextTree materialize_rust_main_visual_context_tree(ViewportPaintable&);
 WEB_API void patch_rust_visual_context_nodes(ViewportPaintable&, AccumulatedVisualContextTree&, size_t begin, size_t end);
 WEB_API bool rust_update_accumulated_visual_context_values(ViewportPaintable&, Paintable&);
-WEB_API Optional<TransformData> rust_compute_css_transform(Paintable const&, double pixel_ratio);
+WEB_API Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Paintable const&);
+WEB_API void rust_measure_scrollable_overflow(Paintable const&);
 WEB_API CSS::ResolvedImage rust_resolve_gradient_for_size(CSS::StyleValue const&, Layout::NodeWithStyle const&, CSSPixelSize);
 WEB_API void rust_update_visual_viewport_transform(ViewportPaintable&);
 WEB_API void rust_refresh_scroll_state(ViewportPaintable&);
@@ -51,6 +52,7 @@ WEB_API void mirror_rust_clear_visual_context_tree(ViewportPaintable&);
 WEB_API void mirror_rust_reset_visual_context_state(ViewportPaintable&);
 WEB_API void mirror_rust_clear_paint_cache_sources(ViewportPaintable&);
 WEB_API void mirror_rust_invalidate_paint_cache(Paintable const&);
+WEB_API void rust_invalidate_propagated_text_decoration_caches(Paintable const&);
 struct InspectorOverlayInputs {
     Paintable const* highlighted_paintable { nullptr };
     Color tooltip_color;

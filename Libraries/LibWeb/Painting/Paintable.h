@@ -403,11 +403,9 @@ public:
     [[nodiscard]] Optional<CSSPixelRect> scrollable_overflow_rect() const;
 
     [[nodiscard]] Optional<OverflowData> overflow_data() const;
-    void set_overflow_data(OverflowData);
     void clear_overflow_data();
 
     Optional<CachedOverflowData> cached_overflow_data() const;
-    void set_cached_overflow_data(CachedOverflowData);
     void clear_cached_overflow_data();
 
     virtual void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
@@ -491,7 +489,6 @@ public:
     CSSPixelPoint inverse_transform_point(CSSPixelPoint screen_position) const;
 
     void invalidate_paint_cache() const;
-    void invalidate_propagated_text_decoration_caches() const;
     void repaint_after_style_change(CSS::RequiredInvalidationAfterStyleChange const&);
 
     [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const

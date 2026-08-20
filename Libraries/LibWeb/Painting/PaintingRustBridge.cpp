@@ -21,6 +21,8 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
@@ -488,23 +490,31 @@ bool rust_update_accumulated_visual_context_values(ViewportPaintable& viewport_p
     return Layout::RustFFI::layout_arena_update_visual_context_values(viewport_paintable.rust_arena().handle(), paintable_box.rust_slot(), visual_context_host_callbacks(viewport_paintable));
 }
 
-Optional<TransformData> rust_compute_css_transform(Paintable const& paintable_box, double pixel_ratio)
+Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Paintable const& paintable_box)
 {
-    auto viewport_paintable = const_cast<DOM::Document&>(paintable_box.document()).unsafe_paintable();
+    return Layout::RustFFI::layout_arena_physical_overflow_directions(paintable_box.rust_arena().handle(), paintable_box.rust_slot());
+}
+
+void rust_measure_scrollable_overflow(Paintable const& box_paintable)
+{
+    auto viewport_paintable = const_cast<DOM::Document&>(box_paintable.document()).unsafe_paintable();
     if (!viewport_paintable)
-        return {};
-    float matrix_values[16];
-    float origin_values[2];
-    if (!Layout::RustFFI::layout_arena_compute_css_transform(viewport_paintable->rust_arena().handle(), paintable_box.rust_slot(), visual_context_host_callbacks(*viewport_paintable), pixel_ratio, matrix_values, origin_values))
-        return {};
-    return TransformData {
-        Gfx::FloatMatrix4x4(
-            matrix_values[0], matrix_values[1], matrix_values[2], matrix_values[3],
-            matrix_values[4], matrix_values[5], matrix_values[6], matrix_values[7],
-            matrix_values[8], matrix_values[9], matrix_values[10], matrix_values[11],
-            matrix_values[12], matrix_values[13], matrix_values[14], matrix_values[15]),
-        { origin_values[0], origin_values[1] },
+        return;
+    Layout::RustFFI::FfiScrollableOverflowHostCallbacks overflow_callbacks {
+        .context = nullptr,
+        .layout_node_is_in_focused_text_control = [](void*, void* layout_node_shell) -> bool {
+            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
+            auto const* dom_node = layout_node.dom_node();
+            if (!dom_node)
+                return false;
+            auto shadow_root = dom_node->containing_shadow_root();
+            return shadow_root
+                && shadow_root->is_user_agent_internal()
+                && is<HTML::FormAssociatedTextControlElement>(shadow_root->host())
+                && shadow_root->host()->is_focused();
+        },
     };
+    Layout::RustFFI::layout_arena_measure_scrollable_overflow(box_paintable.rust_arena().handle(), box_paintable.rust_slot(), visual_context_host_callbacks(*viewport_paintable), overflow_callbacks);
 }
 
 CSS::ResolvedImage rust_resolve_gradient_for_size(CSS::StyleValue const& gradient_style_value, Layout::NodeWithStyle const& layout_node, CSSPixelSize size)
@@ -622,7 +632,12 @@ void mirror_rust_clear_paint_cache_sources(ViewportPaintable& viewport_paintable
 
 void mirror_rust_invalidate_paint_cache(Paintable const& paintable)
 {
-    Layout::RustFFI::layout_arena_paintable_invalidate_paint_cache(paintable.rust_arena().handle(), paintable.rust_slot());
+    Layout::RustFFI::layout_arena_paintable_invalidate_paint_cache(paintable.rust_arena().handle(), paintable.rust_slot(), false);
+}
+
+void rust_invalidate_propagated_text_decoration_caches(Paintable const& paintable)
+{
+    Layout::RustFFI::layout_arena_paintable_invalidate_paint_cache(paintable.rust_arena().handle(), paintable.rust_slot(), true);
 }
 
 void rust_build_stacking_context_tree(ViewportPaintable& viewport_paintable)
@@ -966,8 +981,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto glyph_run = fragment.glyph_run();
             if (!glyph_run)
                 return facts;
-            glyph_run->ensure_text_blob(scale);
-            auto bounds = glyph_run->cached_blob_bounds();
+            auto bounds = glyph_run->bounding_box(static_cast<float>(scale));
             facts.blob_bounds[0] = bounds.x();
             facts.blob_bounds[1] = bounds.y();
             facts.blob_bounds[2] = bounds.width();
@@ -1353,10 +1367,9 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto font = Platform::FontPlugin::the().default_font(css_font_size);
             auto label_font = font->with_size(font->point_size() * context.device_pixels_per_css_pixel);
             auto glyph_run = Gfx::shape_text({}, 0, 0, text.utf16_view(), label_font, Gfx::GlyphRun::TextType::Ltr);
-            glyph_run->ensure_text_blob(1.0);
             for (auto const& glyph : glyph_run->glyphs())
                 Layout::RustFFI::layout_arena_paint_push_overlay_glyph(sink, glyph.glyph_id, glyph.position.x(), glyph.position.y());
-            auto bounds = glyph_run->cached_blob_bounds();
+            auto bounds = glyph_run->bounding_box(1.0f);
             auto metrics = label_font->pixel_metrics();
             return Layout::RustFFI::FfiOverlayLabelFacts {
                 .font_id = context.resource_storage.add_font(glyph_run->font()).value(),

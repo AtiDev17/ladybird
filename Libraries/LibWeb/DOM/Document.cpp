@@ -194,7 +194,6 @@
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
-#include <LibWeb/Layout/ScrollableOverflow.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/TreeBuilder.h>
@@ -1371,7 +1370,8 @@ void Document::tear_down_layout_tree()
     m_hit_test_display_list = nullptr;
     m_layout_root = nullptr;
     m_paintable = nullptr;
-    m_scrollable_overflow_contained_boxes_from_last_layout.clear();
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_clear_scrollable_overflow_contained_boxes(m_layout_node_arena->handle());
     m_needs_full_layout_tree_update = true;
 }
 
@@ -1777,24 +1777,18 @@ static void relayout_subtree(Layout::Box& subtree_root)
     });
 }
 
-// The pre-order traversal visits ancestors before the descendants that mark them, so clearing
-// the flag on visit and marking upwards compose within one walk.
-void Document::recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node& layout_node)
+// Recomputes containing blocks and derives the abspos escape flags for the inclusive subtree
+// inside the Rust arena; the DOM-ancestry half of the inline containing-block workaround stays
+// on the C++ side as the callback.
+static void recompute_containing_blocks_in_inclusive_subtree(Layout::NodeArena& arena, Layout::Node& subtree_root)
 {
-    layout_node.recompute_containing_block({});
-
-    auto* box = as_if<Layout::Box>(layout_node);
-    if (!box)
-        return;
-    box->set_abspos_descendant_escapes(false);
-
-    if (!box->is_absolutely_positioned())
-        return;
-    auto const* containing_block = box->containing_block();
-    for (auto* ancestor = box->parent(); ancestor && ancestor != containing_block; ancestor = ancestor->parent()) {
-        if (auto* ancestor_box = as_if<Layout::Box>(*ancestor))
-            ancestor_box->set_abspos_descendant_escapes(true);
-    }
+    Layout::RustFFI::layout_arena_recompute_containing_blocks(
+        arena.handle(), Layout::Node::slot_id(&subtree_root),
+        [](void* node_shell, void* containing_block_shell) -> Layout::RustFFI::NodeSlotId {
+            auto const& node = *static_cast<Layout::Node const*>(node_shell);
+            auto const& containing_block = *static_cast<Layout::Box const*>(containing_block_shell);
+            return Layout::Node::slot_id(node.find_inline_containing_block(containing_block));
+        });
 }
 
 // Refreshes every structure derived from committed layout results, shared by the partial and
@@ -1809,10 +1803,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     set_needs_to_refresh_scroll_state(true);
 
     // A commit that changed the tree can have replaced boxes referenced by the cached
-    // contained-boxes map; refresh it before overflow measurement follows them. A pending full
-    // recalculation rebuilds the map inside its own measurement traversal instead.
+    // contained-boxes index; refresh it before overflow measurement follows them. A pending full
+    // recalculation rebuilds the index inside its own measurement traversal instead.
     if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
-        Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout);
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     if (layout_commit_scope == LayoutCommitScope::Full)
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
     else
@@ -2028,12 +2022,8 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     // Nodes created by the incremental build have no containing blocks assigned yet, and the
     // mutation may have moved where existing out-of-flow descendants belong; recompute both so
     // boundary qualification below reads facts matching the just-built tree.
-    for (auto* rebuilt_root : rebuilt_subtree_roots) {
-        rebuilt_root->for_each_in_inclusive_subtree([](Layout::Node& node) {
-            recompute_containing_block_and_derive_abspos_escape_flags(node);
-            return TraversalDecision::Continue;
-        });
-    }
+    for (auto* rebuilt_root : rebuilt_subtree_roots)
+        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *rebuilt_root);
 
     // Collect the live boundary set from the post-build tree: registered boundaries that
     // survived the build, plus the nearest boundary containing each rebuilt subtree - which
@@ -2195,11 +2185,7 @@ void Document::update_layout(UpdateLayoutReason reason)
             });
         }
 
-        m_layout_root->for_each_in_inclusive_subtree([&](auto& layout_node) {
-            recompute_containing_block_and_derive_abspos_escape_flags(layout_node);
-
-            return TraversalDecision::Continue;
-        });
+        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *m_layout_root);
 
         // The walk above re-derived every fact partial relayout boundary qualification depends
         // on, so pending changes that escaped classification are accounted for from here on.
@@ -2213,12 +2199,15 @@ void Document::update_layout(UpdateLayoutReason reason)
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) {
-                auto paintable = box.paintable_box();
-                if (&box == m_layout_root.ptr() || box.is_scroll_container() || (paintable && !paintable->scroll_offset().is_zero()))
-                    boxes_needing_eager_overflow_measurement.append(&box);
-            });
+        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
+            auto paintable = box.paintable_box();
+            if (!paintable)
+                return TraversalDecision::Continue;
+            if (&box == m_layout_root.ptr() || box.is_scroll_container() || !paintable->scroll_offset().is_zero())
+                boxes_needing_eager_overflow_measurement.append(&box);
+            return TraversalDecision::Continue;
+        });
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         style_invalidation_counters().relayouts_performed++;
 
@@ -2505,9 +2494,10 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
         // measured recursively when their overflow contributes to one of these roots, so they do
         // not need separate eager measurement.
         for (auto const* box : boxes_needing_eager_measurement) {
-            Layout::measure_scrollable_overflow(*box, m_scrollable_overflow_contained_boxes_from_last_layout);
-            if (auto box_paintable = box->paintable_box())
+            if (auto box_paintable = box->paintable_box()) {
+                Painting::rust_measure_scrollable_overflow(*box_paintable);
                 clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
+            }
         }
         return;
     }
@@ -2524,8 +2514,11 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     };
 
     if (needs_full_recalculation) {
-        Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
+        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
+            record_and_clear_overflow_data(box);
+            return TraversalDecision::Continue;
+        });
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     } else {
         for (auto const& weak_paintable : pending_paintables) {
             auto paintable = weak_paintable.strong_ref();
@@ -2565,7 +2558,7 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
         if (!it.value.has_value() && it.key != m_layout_root.ptr() && !it.key->is_scroll_container() && box_paintable->scroll_offset().is_zero())
             continue;
 
-        Layout::measure_scrollable_overflow(*it.key, m_scrollable_overflow_contained_boxes_from_last_layout);
+        Painting::rust_measure_scrollable_overflow(*box_paintable);
         clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
     }
 
@@ -2621,7 +2614,7 @@ void Document::ensure_scrollable_overflow_is_measured(Layout::Box const& box) co
     auto paintable = box.paintable_box();
     if (!paintable || paintable->overflow_data().has_value() || paintable->cached_overflow_data().has_value())
         return;
-    Layout::measure_scrollable_overflow(box, m_scrollable_overflow_contained_boxes_from_last_layout);
+    Painting::rust_measure_scrollable_overflow(*paintable);
 }
 
 void Document::update_paint_and_hit_testing_properties_if_needed()

@@ -243,16 +243,14 @@ void Node::remove()
     parent->remove_child(*this);
 }
 
-void Node::set_containing_block(Box* containing_block)
+Box const* Node::containing_block() const
 {
-    m_containing_block = containing_block;
-    m_data->containing_block = slot_id(containing_block);
+    return static_cast<Box const*>(tree_node_from_slot_if_live(m_data->containing_block));
 }
 
-void Node::set_inline_containing_block(NodeWithStyle const* containing_block)
+Box* Node::containing_block()
 {
-    m_inline_containing_block_if_applicable = containing_block;
-    m_data->inline_containing_block = slot_id(containing_block);
+    return static_cast<Box*>(tree_node_from_slot_if_live(m_data->containing_block));
 }
 
 static void invalidate_paint_caches(Node& node)
@@ -438,299 +436,65 @@ bool NodeWithStyle::establishes_a_fixed_positioning_containing_block() const
     return style_establishes_fixed_positioning_containing_block(*this);
 }
 
-NodeWithStyle::PositioningContainingBlockEstablishment NodeWithStyle::establishes_positioning_containing_blocks() const
+// FIXME: Containing block handling for absolutely positioned elements needs architectural improvements.
+//
+//        The CSS specification defines the containing block as a *rectangle*, not a box. For most cases,
+//        this rectangle is derived from the padding box of the nearest positioned ancestor Box. However,
+//        when the positioned ancestor is an *inline* element (e.g., a <span> with position: relative),
+//        the containing block rectangle should be the bounding box of that inline's fragments.
+//
+//        Currently, the stored containing block can only name a Box, which cannot represent inline
+//        elements. The proper fix would be to:
+//        1. Separate the concept of "the node that establishes the containing block" from "the containing
+//           block rectangle".
+//        2. Store a reference to the establishing node (which could be InlineNode or Box).
+//        3. Compute the containing block rectangle on demand based on the establishing node's type.
+//
+//        For now, we use a workaround: check if there's an inline element with position:relative (or
+//        other containing-block-establishing properties) between this node and its containing block
+//        in the DOM tree. If found, it is stored in the arena's inline_containing_block slot.
+//
+//        We check the DOM tree here (rather than the layout tree) because when a block element is inside
+//        an inline element, the layout tree restructures so the block becomes a sibling of the inline.
+//        But the CSS containing block relationship is based on the DOM structure.
+NodeWithStyle const* Node::find_inline_containing_block(Box const& containing_block) const
 {
-    if (!is<Box>(*this))
-        return {};
+    auto const* containing_block_dom_node = containing_block.dom_node();
 
-    // https://github.com/w3c/fxtf-drafts/issues/307#issuecomment-499612420
-    // foreignObject establishes a containing block for absolutely and fixed positioned elements.
-    if (is_svg_foreign_object_box())
-        return { true, true };
+    // For pseudo-elements, we need to start from the generating element itself, since it may
+    // be the inline containing block. For regular elements, start from parent_element().
+    GC::Ptr<DOM::Element const> first_ancestor_to_check;
+    if (is_generated_for_pseudo_element()) {
+        first_ancestor_to_check = m_pseudo_element_generator.ptr();
+    } else if (auto const* this_dom_node = dom_node()) {
+        first_ancestor_to_check = this_dom_node->parent_element();
+    }
 
-    auto establishes_fixed_positioning_containing_block = style_establishes_fixed_positioning_containing_block(*this);
-    if (establishes_fixed_positioning_containing_block)
-        return { true, true };
+    for (auto dom_ancestor = first_ancestor_to_check; dom_ancestor; dom_ancestor = dom_ancestor->parent_element()) {
+        // Stop if we reach the DOM node of the containing block.
+        if (dom_ancestor.ptr() == containing_block_dom_node)
+            break;
 
-    auto establishes_absolute_positioning_containing_block = position() != CSS::Positioning::Static
-        || (!will_change().is_auto() && will_change().has_property(CSS::PropertyID::Position));
-    if (establishes_absolute_positioning_containing_block)
-        return { true, false };
+        // NB: Called during containing block recomputation as part of layout.
+        // Check if this DOM element has an InlineNode in the layout tree.
+        auto layout_node = dom_ancestor->unsafe_layout_node();
+        if (!layout_node || !layout_node->is_inline_node())
+            continue;
 
-    if (is<Viewport>(*this))
-        return { true, false };
-
-    return {};
-}
-
-static Box* nearest_ancestor_capable_of_forming_a_containing_block(Node& node)
-{
-    for (auto* ancestor = node.parent(); ancestor; ancestor = ancestor->parent()) {
-        if ((ancestor->is_block_container() && !ancestor->is_fragmented_inline())
-            || ancestor->display().is_flex_inside()
-            || ancestor->display().is_grid_inside()
-            || ancestor->is_replaced_box_with_children()) {
-            return static_cast<Box*>(ancestor);
-        }
+        // Restrict the per-property trigger set to those that actually apply to
+        // non-atomic inlines: `position` and filter/backdrop-filter. transform,
+        // contain, perspective and friends from
+        // style_establishes_absolute_positioning_containing_block()
+        // explicitly do not apply to non-atomic inlines per their respective specs.
+        auto const& will_change = layout_node->will_change();
+        bool const inline_establishes_cb = layout_node->is_positioned()
+            || will_change.has_property(CSS::PropertyID::Position)
+            || layout_node->filter().has_filters() || will_change.has_property(CSS::PropertyID::Filter)
+            || layout_node->backdrop_filter().has_filters() || will_change.has_property(CSS::PropertyID::BackdropFilter);
+        if (inline_establishes_cb)
+            return static_cast<NodeWithStyle const*>(layout_node);
     }
     return nullptr;
-}
-
-void Node::recompute_containing_block(Badge<DOM::Document>)
-{
-    // Reset the inline containing block - we'll set it below if applicable.
-    set_inline_containing_block(nullptr);
-
-    if (is<TextNode>(*this)) {
-        set_containing_block(nearest_ancestor_capable_of_forming_a_containing_block(*this));
-        return;
-    }
-
-    auto position = as<NodeWithStyle>(*this).position();
-
-    // https://drafts.csswg.org/css-position-3/#absolute-cb
-    if (position == CSS::Positioning::Absolute) {
-        auto* ancestor = parent();
-        while (ancestor && !ancestor->establishes_an_absolute_positioning_containing_block())
-            ancestor = ancestor->parent();
-        set_containing_block(static_cast<Box*>(ancestor));
-
-        // FIXME: Containing block handling for absolutely positioned elements needs architectural improvements.
-        //
-        //        The CSS specification defines the containing block as a *rectangle*, not a box. For most cases,
-        //        this rectangle is derived from the padding box of the nearest positioned ancestor Box. However,
-        //        when the positioned ancestor is an *inline* element (e.g., a <span> with position: relative),
-        //        the containing block rectangle should be the bounding box of that inline's fragments.
-        //
-        //        Currently, m_containing_block is typed as Box*, which cannot represent inline elements.
-        //        The proper fix would be to:
-        //        1. Separate the concept of "the node that establishes the containing block" from "the containing
-        //           block rectangle".
-        //        2. Store a reference to the establishing node (which could be InlineNode or Box).
-        //        3. Compute the containing block rectangle on demand based on the establishing node's type.
-        //
-        //        For now, we use a workaround: check if there's an inline element with position:relative (or
-        //        other containing-block-establishing properties) between this node and its containing_block()
-        //        in the DOM tree. If found, store it in m_inline_containing_block_if_applicable.
-        //
-        //        We check the DOM tree here (rather than the layout tree) because when a block element is inside
-        //        an inline element, the layout tree restructures so the block becomes a sibling of the inline.
-        //        But the CSS containing block relationship is based on the DOM structure.
-        if (m_containing_block) {
-            auto const* containing_block_dom_node = m_containing_block->dom_node();
-
-            // For pseudo-elements, we need to start from the generating element itself, since it may
-            // be the inline containing block. For regular elements, start from parent_element().
-            GC::Ptr<DOM::Element const> first_ancestor_to_check;
-            if (is_generated_for_pseudo_element()) {
-                first_ancestor_to_check = m_pseudo_element_generator.ptr();
-            } else if (auto const* this_dom_node = dom_node()) {
-                first_ancestor_to_check = this_dom_node->parent_element();
-            }
-
-            for (auto dom_ancestor = first_ancestor_to_check; dom_ancestor; dom_ancestor = dom_ancestor->parent_element()) {
-                // Stop if we reach the DOM node of the containing block.
-                if (dom_ancestor.ptr() == containing_block_dom_node)
-                    break;
-
-                // NB: Called during containing block recomputation as part of layout.
-                // Check if this DOM element has an InlineNode in the layout tree.
-                auto layout_node = dom_ancestor->unsafe_layout_node();
-                if (!layout_node || !layout_node->is_inline_node())
-                    continue;
-
-                // Restrict the per-property trigger set to those that actually apply to
-                // non-atomic inlines: `position` and filter/backdrop-filter. transform,
-                // contain, perspective and friends from
-                // style_establishes_absolute_positioning_containing_block()
-                // explicitly do not apply to non-atomic inlines per their respective specs.
-                auto const& will_change = layout_node->will_change();
-                bool const inline_establishes_cb = layout_node->is_positioned()
-                    || will_change.has_property(CSS::PropertyID::Position)
-                    || layout_node->filter().has_filters() || will_change.has_property(CSS::PropertyID::Filter)
-                    || layout_node->backdrop_filter().has_filters() || will_change.has_property(CSS::PropertyID::BackdropFilter);
-                if (inline_establishes_cb) {
-                    set_inline_containing_block(static_cast<NodeWithStyle const*>(layout_node));
-                    break;
-                }
-            }
-        }
-
-        return;
-    }
-
-    // https://drafts.csswg.org/css-position-3/#fixed-cb
-    if (position == CSS::Positioning::Fixed) {
-        // The containing block is established by the nearest ancestor box that establishes an fixed positioning
-        // containing block, with the bounds of the containing block determined identically to the absolute positioning
-        // containing block.
-        auto* ancestor = parent();
-        while (ancestor && !ancestor->establishes_a_fixed_positioning_containing_block())
-            ancestor = ancestor->parent();
-        // If no ancestor establishes one, the box’s fixed positioning containing block is the initial fixed containing
-        // block:
-        if (!ancestor) {
-            //  - in continuous media, the layout viewport (whose size matches the dynamic viewport size); as a result,
-            //    fixed boxes do not move when the document is scrolled.
-            ancestor = &root();
-            // FIXME: - in paged media, the page area of each page; fixed positioned boxes are thus replicated on every
-            //   page. (They are fixed with respect to the page box only, and are not affected by being seen through a
-            //   viewport; as in the case of print preview, for example.)
-        }
-        set_containing_block(static_cast<Box*>(ancestor));
-        return;
-    }
-
-    set_containing_block(nearest_ancestor_capable_of_forming_a_containing_block(*this));
-}
-
-Box const* Node::non_anonymous_containing_block() const
-{
-    auto nearest_ancestor_box = containing_block();
-    VERIFY(nearest_ancestor_box);
-    while (nearest_ancestor_box->is_anonymous()) {
-        nearest_ancestor_box = nearest_ancestor_box->containing_block();
-        VERIFY(nearest_ancestor_box);
-    }
-    return nearest_ancestor_box;
-}
-
-// https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Positioning/Understanding_z_index/The_stacking_context
-bool NodeWithStyle::establishes_stacking_context() const
-{
-    // NOTE: While MDN is not authoritative, there isn't a single convenient location
-    //       in the CSS specifications where the rules for stacking contexts is described.
-    //       That's why the "spec link" here points to MDN.
-
-    if (is_svg_box())
-        return false;
-
-    // We make a stacking context for the viewport. Painting and hit testing starts from here.
-    if (is_viewport())
-        return true;
-
-    // Root element of the document (<html>).
-    if (is_root_element())
-        return true;
-
-    auto position = this->position();
-
-    // https://drafts.csswg.org/css-will-change/#will-change
-    // If any non-initial value of a property would create a stacking context on the element, specifying that property
-    // in will-change must create a stacking context on the element.
-    auto will_change_value = will_change();
-    auto will_change_property = [&](CSS::PropertyID property_id) {
-        return will_change_value.has_property(property_id);
-    };
-
-    auto has_z_index = z_index().has_value() || will_change_property(CSS::PropertyID::ZIndex);
-
-    // Element with a position value absolute or relative and z-index value other than auto.
-    if (position == CSS::Positioning::Absolute || position == CSS::Positioning::Relative) {
-        if (has_z_index) {
-            return true;
-        }
-    }
-
-    // Element with a position value fixed or sticky.
-    if (position == CSS::Positioning::Fixed || position == CSS::Positioning::Sticky
-        || will_change_property(CSS::PropertyID::Position)) {
-        return true;
-    }
-
-    if (is_transformable()) {
-        if (has_transformations() || will_change_property(CSS::PropertyID::Transform))
-            return true;
-
-        if (has_translate() || will_change_property(CSS::PropertyID::Translate))
-            return true;
-
-        if (has_rotate() || will_change_property(CSS::PropertyID::Rotate))
-            return true;
-
-        if (has_scale() || will_change_property(CSS::PropertyID::Scale))
-            return true;
-    }
-
-    // Element that is a child of a flex container, with z-index value other than auto.
-    if (parent() && parent()->display().is_flex_inside() && has_z_index)
-        return true;
-
-    // Element that is a child of a grid container, with z-index value other than auto.
-    if (parent() && parent()->display().is_grid_inside() && has_z_index)
-        return true;
-
-    // https://drafts.fxtf.org/filter-effects/#FilterProperty
-    // https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation
-    // A computed value of other than none results in the creation of both a stacking context
-    // [CSS21] and a Containing Block for absolute and fixed position descendants, unless the
-    // element it applies to is a document root element in the current browsing context.
-    // Spec Note: This rule works in the same way as for the filter property.
-    if (backdrop_filter().has_filters() || filter().has_filters()
-        || will_change_property(CSS::PropertyID::BackdropFilter)
-        || will_change_property(CSS::PropertyID::Filter)) {
-        return true;
-    }
-
-    // Element with any of the following properties with value other than none:
-    // - transform
-    // - filter
-    // - backdrop-filter
-    // - perspective
-    // - clip-path
-    // - mask / mask-image / mask-border
-    if (mask().has_value() || clip_path().has_value() || mask_image()
-        || will_change_property(CSS::PropertyID::Mask)
-        || will_change_property(CSS::PropertyID::ClipPath)
-        || will_change_property(CSS::PropertyID::MaskImage)) {
-        return true;
-    }
-
-    if (is_svg_foreign_object_box())
-        return true;
-
-    // https://drafts.fxtf.org/compositing/#propdef-isolation
-    // For CSS, setting isolation to isolate will turn the element into a stacking context.
-    if (isolation() == CSS::Isolation::Isolate || will_change_property(CSS::PropertyID::Isolation))
-        return true;
-
-    // https://drafts.csswg.org/css-contain-2/#containment-types
-    // 5. The layout containment box creates a stacking context.
-    // 3. The paint containment box creates a stacking context.
-    if (has_layout_containment() || has_paint_containment() || will_change_property(CSS::PropertyID::Contain))
-        return true;
-
-    // https://drafts.fxtf.org/compositing/#mix-blend-mode
-    // Applying a blendmode other than normal to the element must establish a new stacking context.
-    if (mix_blend_mode() != CSS::MixBlendMode::Normal || will_change_property(CSS::PropertyID::MixBlendMode))
-        return true;
-
-    // https://drafts.csswg.org/css-view-transitions-1/#named-and-transitioning
-    // Elements captured in a view transition during a view transition or whose view-transition-name computed value is
-    // not 'none' (at any time):
-    // - Form a stacking context.
-    if (view_transition_name().has_value() || will_change_property(CSS::PropertyID::ViewTransitionName))
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#propdef-perspective
-    // The use of this property with any value other than 'none' establishes a stacking context.
-    if (is_transformable() && (perspective().has_value() || will_change_property(CSS::PropertyID::Perspective)))
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#transform-style-property
-    // A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
-    // stacking context and a containing block for all descendants.
-    if (is_transformable() && (transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle)))
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#backface-visibility-property
-    // A computed value of hidden for backface-visibility on a transformable element that participates in a 3D
-    // rendering context establishes both a stacking context and a containing block for all descendants.
-    if ((style_group<CSS::ComputedValues::TransformValues>().backface_visibility_value() == CSS::BackfaceVisibility::Hidden || will_change_property(CSS::PropertyID::BackfaceVisibility))
-        && is_transformable() && participates_in_a_3d_rendering_context())
-        return true;
-
-    return opacity() < 1.0f || will_change_property(CSS::PropertyID::Opacity);
 }
 
 GC::Ptr<HTML::LocalNavigable> Node::navigable() const
@@ -781,21 +545,6 @@ bool NodeWithStyle::is_sticky_position() const
 {
     auto position = this->position();
     return position == CSS::Positioning::Sticky;
-}
-
-bool NodeWithStyle::is_text_decoration_propagation_boundary() const
-{
-    // NB: Anonymous wrappers must stay transparent to propagation so an element's own decorations still reach
-    //     its text. The principal box of a pseudo-element is not a wrapper and must be checked like any other
-    //     element, and a table wrapper carries the float and position of the table it wraps, so it is the only
-    //     box where an out-of-flow table is observable.
-    if (is_anonymous() && !is_pseudo_element_principal_box() && !is_table_wrapper())
-        return false;
-
-    // https://drafts.csswg.org/css-text-decor-4/#decorating-box
-    // NOTE: Note that text decorations are not propagated to any out-of-flow descendants, nor to the contents
-    //       of atomic inline-level descendants such as inline blocks and inline tables.
-    return is_out_of_flow() || is_atomic_inline();
 }
 
 NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, CSS::LayoutStyle style, RustFFI::NodeKind kind)
@@ -1070,14 +819,6 @@ bool NodeWithStyle::is_inline_table() const
 bool Node::is_replaced_element() const
 {
     return has_flag(RustFFI::NodeFlag::IsReplacedElement);
-}
-
-bool NodeWithStyle::has_replaced_element_table_display_adjustment() const
-{
-    if (!is_replaced_element())
-        return false;
-    auto display = display_before_box_type_transformation();
-    return display.is_table_inside() || display.is_internal_table() || display.is_table_caption();
 }
 
 bool Node::is_atomic_inline() const
@@ -1675,33 +1416,6 @@ bool NodeWithStyle::has_size_containment() const
         return true;
 
     if (container_type().is_size_container)
-        return true;
-
-    return false;
-}
-// https://drafts.csswg.org/css-contain-2/#containment-inline-size
-bool NodeWithStyle::has_inline_size_containment() const
-{
-    // Giving an element inline-size containment has no effect if any of the following are true:
-
-    // - if the element does not generate a principal box (as is the case with 'display: contents' or 'display: none')
-    // Note: This is the principal box
-
-    // - if its inner display type is 'table'
-    if (display().is_table_inside())
-        return false;
-
-    // - if its principal box is an internal table box
-    if (display().is_internal_table())
-        return false;
-
-    // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Implement this.
-
-    if (contain().inline_size_containment)
-        return true;
-
-    if (container_type().is_inline_size_container)
         return true;
 
     return false;
