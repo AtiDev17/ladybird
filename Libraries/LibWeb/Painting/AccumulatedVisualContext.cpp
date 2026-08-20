@@ -24,9 +24,6 @@
 #include <LibWeb/Painting/DevicePixelConverter.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
-#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/Painting/ScrollState.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 
@@ -351,6 +348,77 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
     return point;
 }
 
+VisualContextIndex SortingContexts::outermost_context_of(VisualContextIndex context) const
+{
+    for (;;) {
+        auto link = links.get(context.value());
+        if (!link.has_value() || link->parent_context == NO_SORTING_CONTEXT)
+            return context;
+        context = link->parent_context;
+    }
+}
+
+SortingContexts AccumulatedVisualContextTree::resolve_sorting_contexts() const
+{
+    auto node_count = m_nodes.size();
+
+    Vector<bool> is_sorting_context_root;
+    is_sorting_context_root.resize(node_count);
+    bool has_sorting_context_roots = false;
+    for (auto const& node : m_nodes) {
+        if (auto const* transform = node.data.get_pointer<TransformData>(); transform && transform->sorting_context_root_index.has_value()) {
+            is_sorting_context_root[transform->sorting_context_root_index->value()] = true;
+            has_sorting_context_roots = true;
+        }
+    }
+    if (!has_sorting_context_roots)
+        return {};
+
+    // Roots always precede their contexts' nodes, so a single forward walk resolves every node.
+    SortingContexts contexts;
+    contexts.leaf_by_node.ensure_capacity(node_count);
+    contexts.context_by_node.ensure_capacity(node_count);
+    for (size_t i = 0; i < node_count; ++i) {
+        auto parent = m_nodes[i].parent_index.value();
+        auto inherited_leaf = i == 0 ? NO_SORTING_CONTEXT : contexts.leaf_by_node[parent];
+        auto inherited_context = i == 0 ? NO_SORTING_CONTEXT : contexts.context_by_node[parent];
+        auto const* transform = m_nodes[i].data.get_pointer<TransformData>();
+        if (transform && transform->sorting_context_root_index.has_value()) {
+            contexts.leaf_by_node.unchecked_append(VisualContextIndex { i });
+            contexts.context_by_node.unchecked_append(*transform->sorting_context_root_index);
+        } else if (is_sorting_context_root[i]) {
+            contexts.links.set(i, { inherited_context, inherited_leaf });
+            contexts.leaf_by_node.unchecked_append(VisualContextIndex { i });
+            contexts.context_by_node.unchecked_append(VisualContextIndex { i });
+        } else {
+            contexts.leaf_by_node.unchecked_append(inherited_leaf);
+            contexts.context_by_node.unchecked_append(inherited_context);
+        }
+    }
+    return contexts;
+}
+
+Optional<float> AccumulatedVisualContextTree::plane_depth_at_point_for_hit_test(VisualContextIndex plane_node_index, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state) const
+{
+    auto chain = build_ancestor_chain(plane_node_index);
+    auto accumulated_matrix = Gfx::FloatMatrix4x4::identity();
+    for (size_t i = chain.size(); i > 0; --i) {
+        auto node_index = VisualContextIndex { chain[i - 1] };
+        auto local = local_spatial_matrix(m_nodes[node_index.value()], node_index, scroll_state);
+        accumulated_matrix = (local.flattens_inherited_transform ? Gfx::flattened(accumulated_matrix) : accumulated_matrix) * local.matrix;
+    }
+
+    auto inverse = accumulated_matrix.inverse();
+    if (!inverse.has_value())
+        return {};
+
+    auto const& matrix = *inverse;
+    auto depth = -(screen_point.x() * matrix[2, 0] + screen_point.y() * matrix[2, 1] + matrix[2, 3]) / matrix[2, 2];
+    if (!isfinite(depth))
+        return {};
+    return depth;
+}
+
 Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(VisualContextIndex index, Gfx::FloatPoint screen_point) const
 {
     auto chain = build_ancestor_chain(index);
@@ -620,8 +688,10 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::TransformData const& data)
 {
     TRY(encoder.encode(data.matrix));
     TRY(encoder.encode(data.origin));
+    TRY(encoder.encode(data.sorting_context_root_index));
     TRY(encoder.encode(data.flattens_inherited_transform));
     TRY(encoder.encode(data.role));
+    TRY(encoder.encode(data.synthetic_plane));
     return {};
 }
 
@@ -631,8 +701,10 @@ ErrorOr<Web::Painting::TransformData> decode(Decoder& decoder)
     return Web::Painting::TransformData {
         .matrix = TRY(decoder.decode<Gfx::FloatMatrix4x4>()),
         .origin = TRY(decoder.decode<Gfx::FloatPoint>()),
+        .sorting_context_root_index = TRY(decoder.decode<Optional<Web::Painting::VisualContextIndex>>()),
         .flattens_inherited_transform = TRY(decoder.decode<bool>()),
         .role = TRY(decoder.decode<Web::Painting::TransformDataRole>()),
+        .synthetic_plane = TRY(decoder.decode<bool>()),
     };
 }
 
@@ -803,6 +875,13 @@ ErrorOr<Web::Painting::AccumulatedVisualContextTree> decode(Decoder& decoder)
         return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree missing visual viewport node");
     if (!nodes[Web::Painting::VISUAL_VIEWPORT_NODE_INDEX.value()].data.has<Web::Painting::TransformData>())
         return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree visual viewport node is not a transform");
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].parent_index.value() >= max(i, static_cast<size_t>(1)))
+            return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree node parent does not precede it");
+        auto const* transform = nodes[i].data.get_pointer<Web::Painting::TransformData>();
+        if (transform && transform->sorting_context_root_index.has_value() && transform->sorting_context_root_index->value() >= i)
+            return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree sorting context root does not precede its participant");
+    }
     return Web::Painting::AccumulatedVisualContextTree { version, move(nodes), root_is_visual_viewport };
 }
 

@@ -191,6 +191,7 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/ScrollableOverflow.h>
@@ -1811,7 +1812,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // contained-boxes map; refresh it before overflow measurement follows them. A pending full
     // recalculation rebuilds the map inside its own measurement traversal instead.
     if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root);
+        Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout);
     if (layout_commit_scope == LayoutCommitScope::Full)
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
     else
@@ -1825,9 +1826,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
 
     if (layout_tree_changed == LayoutTreeChanged::Yes) {
         // Broadcast the current viewport rect to any new paintables, so they know whether
-        // they're visible or not, and re-collect the content-visibility:auto set.
+        // they're visible or not. If necessary, re-collect the content-visibility:auto set.
         inform_all_viewport_clients_about_the_current_viewport_rect();
-        collect_paintable_boxes_with_auto_content_visibility();
+        if (m_may_have_content_visibility_auto_style)
+            collect_paintable_boxes_with_auto_content_visibility();
     }
 
     m_document->set_needs_repaint();
@@ -2211,8 +2213,8 @@ void Document::update_layout(UpdateLayoutReason reason)
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, [&](Layout::Box const& box) {
+        Layout::collect_scrollable_overflow_contained_boxes(
+            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) {
                 auto paintable = box.paintable_box();
                 if (&box == m_layout_root.ptr() || box.is_scroll_container() || (paintable && !paintable->scroll_offset().is_zero()))
                     boxes_needing_eager_overflow_measurement.append(&box);
@@ -2226,10 +2228,8 @@ void Document::update_layout(UpdateLayoutReason reason)
 
         after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full, boxes_needing_eager_overflow_measurement);
 
-        m_layout_root->for_each_in_inclusive_subtree([](auto& node) {
-            node.reset_needs_layout_update();
-            return TraversalDecision::Continue;
-        });
+        Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
+            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
@@ -2524,8 +2524,8 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     };
 
     if (needs_full_recalculation) {
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
+        Layout::collect_scrollable_overflow_contained_boxes(
+            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
     } else {
         for (auto const& weak_paintable : pending_paintables) {
             auto paintable = weak_paintable.strong_ref();
@@ -2653,6 +2653,33 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     // the snapshot must be derived only after structure work is done.
     if (auto paintable = this->unsafe_paintable())
         paintable->refresh_scroll_state();
+}
+
+bool Document::can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const& layout_node) const
+{
+    if (!m_needs_accumulated_visual_contexts_update || !m_layout_root)
+        return false;
+
+    for (auto const* node = &layout_node; node; node = node->parent()) {
+        if (node->is_svg_box() || node->is_svg_svg_box() || node->is_svg_foreign_object_box())
+            return false;
+
+        auto const* node_with_style = as_if<Layout::NodeWithStyle>(*node);
+        if (!node_with_style)
+            continue;
+        if (node_with_style->has_css_transform() || node_with_style->perspective().has_value() || node_with_style->is_sticky_position())
+            return false;
+        if (m_may_have_default_scroll_shift_anchor) {
+            if (auto const* box = as_if<Layout::Box>(*node); box && box->default_scroll_shift_anchor())
+                return false;
+        }
+        // A scroll container's contents move, but its own border box does not.
+        if (node != &layout_node) {
+            if (auto paintable = node->paintable(); paintable && !paintable->scroll_offset().is_zero())
+                return false;
+        }
+    }
+    return true;
 }
 
 void Document::set_normal_link_color(Optional<Color> color)
@@ -5129,6 +5156,19 @@ void Document::decrement_number_of_things_delaying_the_load_event(Badge<Document
     schedule_html_parser_end_check();
 }
 
+void Document::increment_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>)
+{
+    ++m_number_of_pending_style_sheet_requests;
+    page().client().request_frame();
+}
+
+void Document::decrement_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>)
+{
+    VERIFY(m_number_of_pending_style_sheet_requests);
+    --m_number_of_pending_style_sheet_requests;
+    page().client().request_frame();
+}
+
 void Document::set_html_parser_end_state(GC::Ptr<HTML::HTMLParserEndState> state)
 {
     m_html_parser_end_state = state;
@@ -5954,10 +5994,16 @@ void Document::unload(GC::Ptr<Document>)
         // 2. Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's
         //    salvageable state.
         HTML::relevant_window(*this).fire_a_page_transition_event(HTML::EventNames::pagehide, m_salvageable);
-
-        // 3. Update the visibility state of oldDocument to "hidden".
-        update_the_visibility_state(HTML::VisibilityState::Hidden);
     }
+
+    // 3. Update the visibility state of oldDocument to "hidden".
+    // AD-HOC: Violate the spec requirement for the page to be showing (in the spec, this step is a substep of step 10
+    //         above — not a sibling step) and instead do this for any page ready for post-load tasks; e.g., the initial
+    //         about:blank of a never-navigated child. Gecko/WebKit/Blink consider such pages to be completely loaded —
+    //         and update their visibility state when unloading them.
+    //         See https://github.com/whatwg/html/issues/12288
+    if (m_ready_for_post_load_tasks)
+        update_the_visibility_state(HTML::VisibilityState::Hidden);
 
     // FIXME: 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high
     //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings

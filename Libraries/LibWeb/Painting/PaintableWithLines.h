@@ -23,7 +23,6 @@ class PaintableWithLines : public Paintable {
 public:
     static NonnullRefPtr<PaintableWithLines> create(Layout::BlockContainer const&);
     virtual ~PaintableWithLines() override;
-    virtual StringView class_name() const override { return "PaintableWithLines"sv; }
 
     virtual void reset_for_relayout() override;
 
@@ -52,8 +51,6 @@ public:
             fragment.set_selection_state(SelectionState::None);
     }
 
-    virtual bool foreground_paints_descendant_content() const override { return true; }
-
     void assign_inline_box_geometry();
 
     Vector<PaintableFragment::FragmentSpan, 4> render_spans_for_paint(u64 paint_generation_id, ReadonlySpan<u32> owned_fragment_indices) const;
@@ -80,8 +77,6 @@ protected:
     PaintableWithLines(Layout::BlockContainer const&);
 
 private:
-    [[nodiscard]] virtual bool is_paintable_with_lines() const final { return true; }
-
     Optional<PaintableFragment const&> fragment_at_position(DOM::Position const&) const;
     Optional<CSSPixelRect> empty_line_caret_rect(DOM::Position const&) const;
 

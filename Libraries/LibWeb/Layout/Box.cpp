@@ -37,6 +37,15 @@ Box::~Box()
 {
 }
 
+void Box::set_default_scroll_shift(WeakPtr<Node> anchor, bool compensates_for_horizontal_scroll, bool compensates_for_vertical_scroll)
+{
+    m_default_scroll_shift_anchor = move(anchor);
+    set_flag(RustFFI::NodeFlag::CompensatesForHorizontalScroll, compensates_for_horizontal_scroll);
+    set_flag(RustFFI::NodeFlag::CompensatesForVerticalScroll, compensates_for_vertical_scroll);
+    if (m_default_scroll_shift_anchor)
+        document().note_default_scroll_shift_anchor();
+}
+
 static ImageProvider const& image_provider_for_element(DOM::Element const& element)
 {
     if (auto const* image = as_if<HTML::HTMLImageElement>(element))
@@ -66,6 +75,17 @@ void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
     m_owned_image_provider = move(image_provider);
 }
 
+static bool commit_splice_position_is_derivable_from_layout_ancestors(Box const& box)
+{
+    for (auto const* ancestor = box.parent_ptr(); ancestor; ancestor = ancestor->parent_ptr()) {
+        if (ancestor->paintable_ptr())
+            return true;
+        if (!ancestor->is_fragmented_inline())
+            return false;
+    }
+    return false;
+}
+
 bool Box::is_partial_relayout_boundary() const
 {
     // An absolutely or fixed positioned descendant whose containing block is outside this
@@ -74,10 +94,7 @@ bool Box::is_partial_relayout_boundary() const
     if (abspos_descendant_escapes())
         return false;
 
-    // Committing a subtree splices the new paint subtree into the old paintable's paint-tree
-    // position, so a boundary must still have one - either on the box or, for a box the tree
-    // builder just rebuilt, held by the DOM node until the next commit replaces it there.
-    if (!paintable_box() && !(dom_node() && dom_node()->unsafe_paintable()))
+    if (!paintable_box() && !commit_splice_position_is_derivable_from_layout_ancestors(*this))
         return false;
 
     // An in-flow SVG viewport's used size is determined solely by its own attributes and outer

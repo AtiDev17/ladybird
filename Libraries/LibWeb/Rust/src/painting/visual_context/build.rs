@@ -39,8 +39,10 @@ pub fn compute_svg_viewport_transform_data(
     TransformData {
         matrix: scale_matrix_for_device_pixels(affine_to_matrix(matrix), pixel_ratio as f32),
         origin: FloatPoint::default(),
+        sorting_context_root_index: None,
         flattens_inherited_transform: false,
         role: TransformDataRole::SvgViewportTransform,
+        synthetic_plane: false,
     }
 }
 
@@ -207,6 +209,7 @@ struct DescendantVisualContexts {
     absolute_position_plane_root: usize,
     fixed_position_plane_root: usize,
     flattens_inherited_transform: bool,
+    sorting_context_root: Option<usize>,
 }
 
 struct Builder<'a> {
@@ -217,24 +220,13 @@ struct Builder<'a> {
     scroll_state: ScrollState,
     paintables_with_mask_nodes: Vec<PaintableSlotId>,
     pixel_ratio: f64,
-    facts_cache: std::collections::HashMap<PaintableSlotId, std::rc::Rc<BoxFacts>>,
     root_background_source: crate::painting::host::FfiRootBackgroundSource,
 }
 
 impl Builder<'_> {
-    fn facts(&mut self, slot: PaintableSlotId) -> std::rc::Rc<BoxFacts> {
-        if let Some(facts) = self.facts_cache.get(&slot) {
-            return facts.clone();
-        }
-        let facts = std::rc::Rc::new(BoxFacts::gather(
-            self.layout_arena,
-            self.paintables,
-            self.callbacks,
-            slot,
-            self.pixel_ratio,
-        ));
-        self.facts_cache.insert(slot, facts.clone());
-        facts
+    fn default_scroll_shift_anchor(&self, slot: PaintableSlotId) -> NodeSlotId {
+        self.callbacks
+            .default_scroll_shift_anchor(self.paintables.data_ref(slot).shell)
     }
 
     fn register_scroll_node(&mut self, node_index: usize, paintable: PaintableSlotId, parent_index: usize) {
@@ -277,7 +269,13 @@ impl Builder<'_> {
         may_be_root_element: bool,
     ) -> DescendantVisualContexts {
         let first_visual_context_node_index = self.tree.nodes.len();
-        let facts = self.facts(slot);
+        let facts = BoxFacts::gather(
+            self.layout_arena,
+            self.paintables,
+            self.callbacks,
+            slot,
+            self.pixel_ratio,
+        );
         let (is_fixed, is_absolute, is_sticky, has_sticky_insets, layout_node) = {
             let data = self.paintables.data_ref(slot);
             (
@@ -343,9 +341,8 @@ impl Builder<'_> {
             let mut compensate_vertical_scroll = true;
             let mut visited: Vec<NodeSlotId> = Vec::new();
             const MAX_ANCHOR_CHAIN_DEPTH: usize = 32;
-            let mut box_facts = std::rc::Rc::clone(&facts);
+            let mut anchor_node = facts.default_scroll_shift_anchor;
             while !box_node.is_invalid() && !visited.contains(&box_node) && visited.len() < MAX_ANCHOR_CHAIN_DEPTH {
-                let anchor_node = box_facts.default_scroll_shift_anchor;
                 if anchor_node.is_invalid() {
                     break;
                 }
@@ -398,7 +395,7 @@ impl Builder<'_> {
                     s = self.scroll_state.state_at_slot(s).parent_slot;
                 }
                 box_node = anchor_node;
-                box_facts = self.facts(anchor_paintable);
+                anchor_node = self.default_scroll_shift_anchor(anchor_paintable);
             }
         }
 
@@ -456,6 +453,7 @@ impl Builder<'_> {
         let mut appended_transform_node = false;
         if let Some(mut transform) = transform_data {
             transform.flattens_inherited_transform = flattens_inherited_transform;
+            transform.sorting_context_root_index = inherited.sorting_context_root;
             self.paintables.update_data(slot, |data| {
                 data.set_flag(
                     PaintableFlag::HasNonInvertibleCssTransform,
@@ -523,6 +521,38 @@ impl Builder<'_> {
         } else {
             !establishes_or_extends_3d_rendering_context || inherited_flatten_still_pending
         };
+
+        // https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts
+        // A 3D rendering context is established by a transformable element whose used value for transform-style
+        // is preserve-3d and which itself is not part of a 3D rendering context. An element that establishes a
+        // 3D rendering context also participates in that context.
+        // NB: Every preserve-3d element renders into its own plane, so one without a transform of its own
+        //     appends an identity transform node to provide that plane. The establishing element's own state
+        //     serves as the context's root; replay sorts the content recorded under it as the context's z=0
+        //     plane alongside the planes of the participants, whose transform nodes reference the root.
+        let mut sorting_context_root_for_descendants = inherited.sorting_context_root;
+        if !invisible_to_3d_rendering_contexts {
+            if !establishes_or_extends_3d_rendering_context {
+                sorting_context_root_for_descendants = None;
+            } else {
+                if !appended_transform_node {
+                    own_state = self.tree.append(
+                        VisualContextData::Transform(TransformData {
+                            matrix: libgfx_rust::FloatMatrix4x4::identity(),
+                            origin: FloatPoint::default(),
+                            sorting_context_root_index: sorting_context_root_for_descendants,
+                            flattens_inherited_transform,
+                            role: TransformDataRole::CssTransform,
+                            synthetic_plane: true,
+                        }),
+                        own_state,
+                    );
+                }
+                if sorting_context_root_for_descendants.is_none() {
+                    sorting_context_root_for_descendants = Some(own_state);
+                }
+            }
+        }
 
         if let Some(css_clip) = facts.css_clip {
             append_to_own_and_positioned_descendant_contexts!(VisualContextData::Clip(css_clip));
@@ -662,11 +692,12 @@ impl Builder<'_> {
             absolute_position_plane_root,
             fixed_position_plane_root,
             flattens_inherited_transform: descendants_flatten_inherited_transform,
+            sorting_context_root: sorting_context_root_for_descendants,
         }
     }
 
-    fn has_default_scroll_shift_anchor(&mut self, slot: PaintableSlotId) -> bool {
-        !self.facts(slot).default_scroll_shift_anchor.is_invalid()
+    fn has_default_scroll_shift_anchor(&self, slot: PaintableSlotId) -> bool {
+        !self.default_scroll_shift_anchor(slot).is_invalid()
     }
 }
 
@@ -692,7 +723,6 @@ pub(crate) fn build_visual_context_tree(
         scroll_state: ScrollState::default(),
         paintables_with_mask_nodes: Vec::new(),
         pixel_ratio: inputs.device_pixels_per_css_pixel,
-        facts_cache: std::collections::HashMap::new(),
         root_background_source: callbacks.root_background_source(),
     };
 
@@ -727,6 +757,7 @@ pub(crate) fn build_visual_context_tree(
         absolute_position_plane_root: viewport_state_for_descendants,
         fixed_position_plane_root: VISUAL_VIEWPORT_NODE_INDEX,
         flattens_inherited_transform: true,
+        sorting_context_root: None,
     };
 
     // Anchor-positioned boxes emit AnchorScrollShift nodes by reading the enclosing scroll nodes of
@@ -781,8 +812,8 @@ pub(crate) fn build_visual_context_tree(
     );
 
     let anchor_is_awaiting_build =
-        |builder: &mut Builder<'_>, slot: PaintableSlotId, awaiting: &HashSet<PaintableSlotId>| {
-            let anchor_node = builder.facts(slot).default_scroll_shift_anchor;
+        |builder: &Builder<'_>, slot: PaintableSlotId, awaiting: &HashSet<PaintableSlotId>| {
+            let anchor_node = builder.default_scroll_shift_anchor(slot);
             let mut paintable = builder.paintables.paintable_of_node(anchor_node);
             while !paintable.is_invalid() {
                 if awaiting.contains(&paintable) {
@@ -886,10 +917,19 @@ pub(crate) fn update_visual_context_values(
                     found_svg_viewport_transform = true;
                     continue;
                 }
+                // A synthetic plane node has no computed transform behind it. It stays as-is unless the element
+                // gained a real transform, which changes the structure the node was built for.
+                if transform_data.synthetic_plane {
+                    if transform.is_some() {
+                        return false;
+                    }
+                    continue;
+                }
                 let Some(mut new_data) = transform else {
                     return false;
                 };
                 new_data.flattens_inherited_transform = transform_data.flattens_inherited_transform;
+                new_data.sorting_context_root_index = transform_data.sorting_context_root_index;
                 *transform_data = new_data;
                 found_css_transform = true;
             }

@@ -132,6 +132,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerHandleMouseWheel)          \
     X(EventHandlerRunActivationBehavior)     \
     X(EventHandlerShowContextMenu)           \
+    X(FontFaceSetReady)                      \
     X(HTMLElementGetTheTextSteps)            \
     X(HTMLElementOffsetHeight)               \
     X(HTMLElementOffsetLeft)                 \
@@ -463,6 +464,8 @@ public:
     bool update_style_for_element(AbstractElement const&);
     bool update_style_for_element(AbstractElement const&, StyleUpdateMode);
     void update_layout(UpdateLayoutReason);
+    void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
+    void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
     enum class PartialRelayoutResult : u8 {
         NotEligible,
         Done,
@@ -715,6 +718,9 @@ public:
 
     void add_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref<CSS::CSSImportRule>);
     void remove_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref<CSS::CSSImportRule>);
+    bool has_pending_style_sheet_requests() const { return m_number_of_pending_style_sheet_requests > 0 || !m_pending_css_import_rules.is_empty(); }
+    void increment_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>);
+    void decrement_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>);
 
     bool page_showing() const { return m_page_showing; }
     void set_page_showing(bool);
@@ -1113,6 +1119,7 @@ public:
     void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
 
     void set_needs_accumulated_visual_contexts_update(bool);
+    bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
     void schedule_accumulated_visual_context_value_update(Element&);
     void schedule_accumulated_visual_context_value_update(Layout::Node const&);
     void schedule_scrollable_overflow_recalculation(Element&);
@@ -1488,6 +1495,8 @@ private:
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
     RefPtr<Layout::Viewport> m_layout_root;
+    bool m_may_have_content_visibility_auto_style { false };
+    bool m_may_have_default_scroll_shift_anchor { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -1596,6 +1605,7 @@ private:
     HashTable<GC::Ref<DOM::Element>> m_script_blocking_style_sheet_set;
 
     HashTable<GC::Ref<CSS::CSSImportRule>> m_pending_css_import_rules;
+    size_t m_number_of_pending_style_sheet_requests { 0 };
 
     GC::Ptr<HTML::History> m_history;
 

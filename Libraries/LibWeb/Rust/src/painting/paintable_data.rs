@@ -7,8 +7,8 @@
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::{
-    FfiAffineTransform, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, FfiDrawGlyph, OwnedFlexLayoutData,
-    OwnedGridLayoutData, OwnedUsedGridTracks,
+    FfiAffineTransform, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, FfiDrawGlyph, FlexLayoutData,
+    GridLayoutData, OwnedUsedGridTracks,
 };
 use std::ffi::c_void;
 use std::rc::Rc;
@@ -212,8 +212,6 @@ pub struct PaintableData {
     pub sticky_insets: FfiStickyInsets,
     pub has_sticky_insets: bool,
 
-    pub scroll_offset: FfiCssPixelPoint,
-
     pub stacking_context: u32,
 
     pub enclosing_scroll_node_index: usize,
@@ -266,7 +264,6 @@ impl Default for PaintableData {
             has_cached_overflow: false,
             sticky_insets: FfiStickyInsets::default(),
             has_sticky_insets: false,
-            scroll_offset: FfiCssPixelPoint::default(),
             stacking_context: u32::MAX,
             enclosing_scroll_node_index: 0,
             own_scroll_node_index: 0,
@@ -380,8 +377,8 @@ pub struct PaintableSideData {
     // Only meaningful while is_self_painting(); assigned by the containing block's
     // assign_fragment_ownership().
     pub(crate) fragment_ownership: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,
-    pub(crate) grid_layout_data: Option<Rc<OwnedGridLayoutData>>,
-    pub(crate) flex_layout_data: Option<Rc<OwnedFlexLayoutData>>,
+    pub(crate) grid_layout_data: Option<Rc<GridLayoutData>>,
+    pub(crate) flex_layout_data: Option<Rc<FlexLayoutData>>,
     pub(crate) used_grid_tracks: Option<Rc<OwnedUsedGridTracks>>,
     pub(crate) collapsed_table_borders: Option<Rc<crate::layout::OwnedCollapsedTableBorders>>,
 }

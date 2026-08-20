@@ -862,9 +862,8 @@ set(SOURCES
     Painting/BordersData.cpp
     Painting/BoxModelMetrics.cpp
     Painting/Canvas2DCommandStream.cpp
-    Painting/CanvasPaintable.cpp
-    Painting/CheckBoxPaintable.cpp
     Painting/ChromeWidget.cpp
+    Painting/DepthSortedReplayPlan.cpp
     Painting/DisplayList.cpp
     Painting/DisplayListCommand.cpp
     Painting/DisplayListDamage.cpp
@@ -872,32 +871,18 @@ set(SOURCES
     Painting/DisplayListRecordingContext.cpp
     Painting/DisplayListResourceTransaction.cpp
     Painting/DisplayListResourceStorage.cpp
-    Painting/FieldSetPaintable.cpp
     Painting/HitTestDisplayList.cpp
-    Painting/ImagePaintable.cpp
     Painting/InlinePaintable.cpp
-    Painting/NavigableContainerViewportPaintable.cpp
     Painting/Paintable.cpp
     Painting/PaintStyle.cpp
     Painting/PaintableFragment.cpp
     Painting/PaintableWithLines.cpp
     Painting/PaintingRustBridge.cpp
-    Painting/RadioButtonPaintable.cpp
     Painting/ResolvedCSSFilter.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
     Painting/ScrollState.cpp
-    Painting/SVGClipPaintable.cpp
-    Painting/SVGForeignObjectPaintable.cpp
-    Painting/SVGGraphicsPaintable.cpp
-    Painting/SVGImagePaintable.cpp
-    Painting/SVGMaskable.cpp
-    Painting/SVGMaskPaintable.cpp
-    Painting/SVGPaintable.cpp
-    Painting/SVGPatternPaintable.cpp
-    Painting/SVGPathPaintable.cpp
-    Painting/SVGSVGPaintable.cpp
-    Painting/VideoPaintable.cpp
+    Painting/SVGMasking.cpp
     Painting/ViewportPaintable.cpp
     PerformanceTimeline/EntryTypes.cpp
     PerformanceTimeline/EventNames.cpp

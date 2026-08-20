@@ -30,24 +30,9 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/CanvasPaintable.h>
-#include <LibWeb/Painting/CheckBoxPaintable.h>
-#include <LibWeb/Painting/FieldSetPaintable.h>
-#include <LibWeb/Painting/ImagePaintable.h>
 #include <LibWeb/Painting/InlinePaintable.h>
-#include <LibWeb/Painting/NavigableContainerViewportPaintable.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
-#include <LibWeb/Painting/RadioButtonPaintable.h>
-#include <LibWeb/Painting/SVGClipPaintable.h>
-#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/SVGImagePaintable.h>
-#include <LibWeb/Painting/SVGMaskPaintable.h>
-#include <LibWeb/Painting/SVGPathPaintable.h>
-#include <LibWeb/Painting/SVGPatternPaintable.h>
-#include <LibWeb/Painting/SVGSVGPaintable.h>
-#include <LibWeb/Painting/VideoPaintable.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
@@ -1380,6 +1365,8 @@ void NodeWithStyle::publish_style_record_to_node_data()
     auto const* payloads = document().style_computer().style_engine().style_record_payloads(m_style_record_identity);
     VERIFY(payloads);
     node_data().style = payloads;
+    if (content_visibility() == CSS::ContentVisibility::Auto)
+        document().note_content_visibility_auto_style();
 }
 
 bool NodeWithStyle::synchronize_table_span_data()
@@ -1523,8 +1510,7 @@ void Node::clear_paintable()
 
     invalidate_paint_caches(*this);
     if (m_paintable) {
-        if (m_paintable->parent())
-            m_paintable->remove();
+        RustFFI::layout_arena_paintable_cleared_from_node(arena_handle(), slot_id(this), m_paintable->rust_slot());
         // NB: Layout state may retain this paintable after it stops being the node's current paintable, but its
         //     chrome widgets must no longer use it for input handling.
         m_paintable->detach_chrome_widgets();
@@ -1550,6 +1536,13 @@ RefPtr<Painting::Paintable> Node::create_paintable() const
     case RustFFI::NodeKind::Box:
     case RustFFI::NodeKind::ReplacedBox:
     case RustFFI::NodeKind::SVGBox:
+    case RustFFI::NodeKind::CanvasBox:
+    case RustFFI::NodeKind::CheckBox:
+    case RustFFI::NodeKind::FieldSetBox:
+    case RustFFI::NodeKind::ImageBox:
+    case RustFFI::NodeKind::NavigableContainerViewport:
+    case RustFFI::NodeKind::RadioButton:
+    case RustFFI::NodeKind::VideoBox:
         return Painting::Paintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::BlockContainer:
     case RustFFI::NodeKind::LegendBox:
@@ -1563,40 +1556,18 @@ RefPtr<Painting::Paintable> Node::create_paintable() const
         if (is_fragmented_inline())
             return Painting::InlinePaintable::create(static_cast<NodeWithStyle const&>(*this));
         return Painting::PaintableWithLines::create(static_cast<BlockContainer const&>(*this));
-    case RustFFI::NodeKind::CanvasBox:
-        return Painting::CanvasPaintable::create(static_cast<Box const&>(*this));
-    case RustFFI::NodeKind::CheckBox:
-        return Painting::CheckBoxPaintable::create(static_cast<Box const&>(*this));
-    case RustFFI::NodeKind::FieldSetBox:
-        return Painting::FieldSetPaintable::create(static_cast<BlockContainer const&>(*this));
-    case RustFFI::NodeKind::ImageBox: {
-        auto const& image_box = static_cast<Box const&>(*this);
-        return Painting::ImagePaintable::create(image_box, image_box.image_provider());
-    }
-    case RustFFI::NodeKind::NavigableContainerViewport:
-        return Painting::NavigableContainerViewportPaintable::create(static_cast<Box const&>(*this));
-    case RustFFI::NodeKind::RadioButton:
-        return Painting::RadioButtonPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGSVGBox:
-        return Painting::SVGSVGPaintable::create(static_cast<Box const&>(*this));
-    case RustFFI::NodeKind::VideoBox:
-        return Painting::VideoPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGGraphicsBox:
-        return Painting::SVGGraphicsPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGGeometryBox:
     case RustFFI::NodeKind::SVGTextBox:
     case RustFFI::NodeKind::SVGTextPathBox:
-        return Painting::SVGPathPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGImageBox:
-        return Painting::SVGImagePaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGMaskBox:
-        return Painting::SVGMaskPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGClipBox:
-        return Painting::SVGClipPaintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGPatternBox:
-        return Painting::SVGPatternPaintable::create(static_cast<Box const&>(*this));
+        return Painting::Paintable::create(static_cast<Box const&>(*this));
     case RustFFI::NodeKind::SVGForeignObjectBox:
-        return Painting::SVGForeignObjectPaintable::create(static_cast<BlockContainer const&>(*this));
+        return Painting::PaintableWithLines::create(static_cast<BlockContainer const&>(*this));
     case RustFFI::NodeKind::Viewport:
         return Painting::ViewportPaintable::create(static_cast<Viewport const&>(*this));
     }

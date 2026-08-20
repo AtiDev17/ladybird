@@ -22,7 +22,6 @@
 #include <LibWeb/CSS/GridTrackPlacement.h>
 #include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/LengthBox.h>
-#include <LibWeb/CSS/Size.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/ValueType.h>
@@ -36,18 +35,12 @@
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/DominantBaseline.h>
-#include <LibWeb/Layout/FlexLayoutData.h>
-#include <LibWeb/Layout/GridLayoutData.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
-#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/SVGPathPaintable.h>
-#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
 #include <LibWeb/SVG/SVGImageElement.h>
@@ -94,186 +87,6 @@ Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGridTrack
     return result;
 }
 
-OwnPtr<FlexLayoutData> build_flex_layout_data(RustFFI::FfiFlexLayoutData const& ffi_data)
-{
-    auto growth_state = [](RustFFI::FfiFlexLayoutGrowthState state) {
-        switch (state) {
-        case RustFFI::FfiFlexLayoutGrowthState::Growing:
-            return FlexLayoutGrowthState::Growing;
-        case RustFFI::FfiFlexLayoutGrowthState::Shrinking:
-            return FlexLayoutGrowthState::Shrinking;
-        }
-        VERIFY_NOT_REACHED();
-    };
-    auto clamp_state = [](RustFFI::FfiFlexLayoutClampState state) {
-        switch (state) {
-        case RustFFI::FfiFlexLayoutClampState::Unclamped:
-            return FlexLayoutClampState::Unclamped;
-        case RustFFI::FfiFlexLayoutClampState::ClampedToMin:
-            return FlexLayoutClampState::ClampedToMin;
-        case RustFFI::FfiFlexLayoutClampState::ClampedToMax:
-            return FlexLayoutClampState::ClampedToMax;
-        }
-        VERIFY_NOT_REACHED();
-    };
-
-    auto data = make<FlexLayoutData>();
-    data->align_content = static_cast<CSS::AlignContent>(ffi_data.align_content);
-    data->align_items = static_cast<CSS::AlignItems>(ffi_data.align_items);
-    data->flex_direction = static_cast<CSS::FlexDirection>(ffi_data.flex_direction);
-    data->flex_wrap = static_cast<CSS::FlexWrap>(ffi_data.flex_wrap);
-    data->justify_content = static_cast<CSS::JustifyContent>(ffi_data.justify_content);
-
-    auto axis_direction = [](u8 direction) -> String {
-        switch (direction) {
-        case 0:
-            return "horizontal-lr"_string;
-        case 1:
-            return "horizontal-rl"_string;
-        case 2:
-            return "vertical-tb"_string;
-        case 3:
-            return "vertical-bt"_string;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    };
-    auto main_axis_direction = axis_direction(ffi_data.main_axis_direction);
-    auto cross_axis_direction = axis_direction(ffi_data.cross_axis_direction);
-    bool main_axis_is_horizontal = ffi_data.main_axis_direction <= 1;
-
-    for (size_t line_index = 0; line_index < ffi_data.line_count; ++line_index) {
-        auto const& ffi_line = ffi_data.lines[line_index];
-        FlexLayoutLine line;
-        line.growth_state = growth_state(ffi_line.growth_state);
-        line.cross_start = CSSPixels::from_raw(ffi_line.cross_start);
-        line.cross_size = CSSPixels::from_raw(ffi_line.cross_size);
-        for (size_t item_index = 0; item_index < ffi_line.item_count; ++item_index) {
-            auto const& ffi_item = ffi_line.items[item_index];
-            auto const& item_box = *static_cast<Box const*>(ffi_item.node);
-            auto flex_basis = item_box.flex_basis();
-            auto const& main_size = main_axis_is_horizontal ? item_box.width() : item_box.height();
-            auto const& main_min_size = main_axis_is_horizontal ? item_box.min_width() : item_box.min_height();
-            auto const& main_max_size = main_axis_is_horizontal ? item_box.max_width() : item_box.max_height();
-
-            FlexLayoutItem item;
-            if (auto* dom_node = item_box.dom_node())
-                item.node_id = dom_node->unique_id();
-            item.main_axis_direction = main_axis_direction;
-            item.cross_axis_direction = cross_axis_direction;
-            item.rect = {
-                CSSPixels::from_raw(ffi_item.rect.x),
-                CSSPixels::from_raw(ffi_item.rect.y),
-                CSSPixels::from_raw(ffi_item.rect.width),
-                CSSPixels::from_raw(ffi_item.rect.height),
-            };
-            item.main_base_size = CSSPixels::from_raw(ffi_item.main_base_size);
-            item.main_delta_size = CSSPixels::from_raw(ffi_item.main_delta_size);
-            item.main_min_size = CSSPixels::from_raw(ffi_item.main_min_size);
-            item.main_max_size = CSSPixels::from_raw(ffi_item.main_max_size);
-            item.cross_min_size = CSSPixels::from_raw(ffi_item.cross_min_size);
-            item.cross_max_size = CSSPixels::from_raw(ffi_item.cross_max_size);
-            item.clamp_state = clamp_state(ffi_item.clamp_state);
-            item.flex_basis = flex_basis.has<CSS::FlexBasisContent>()
-                ? "content"_string
-                : MUST(String::formatted("{}", flex_basis.get<CSS::Size>()));
-            item.main_size_property = MUST(String::formatted("{}", main_size));
-            item.main_min_size_property = MUST(String::formatted("{}", main_min_size));
-            item.main_max_size_property = MUST(String::formatted("{}", main_max_size));
-            item.flex_grow = ffi_item.flex_grow;
-            item.flex_shrink = ffi_item.flex_shrink;
-            line.items.append(move(item));
-        }
-        data->lines.append(move(line));
-    }
-    return data;
-}
-
-OwnPtr<GridLayoutData> build_grid_layout_data(RustFFI::FfiGridLayoutData const& ffi_data)
-{
-    auto track_type = [](RustFFI::FfiGridTrackType type) {
-        switch (type) {
-        case RustFFI::FfiGridTrackType::Explicit:
-            return GridTrackType::Explicit;
-        case RustFFI::FfiGridTrackType::Implicit:
-            return GridTrackType::Implicit;
-        }
-        VERIFY_NOT_REACHED();
-    };
-    auto track_state = [](RustFFI::FfiGridTrackState state) {
-        switch (state) {
-        case RustFFI::FfiGridTrackState::Static:
-            return GridTrackState::Static;
-        case RustFFI::FfiGridTrackState::Repeat:
-            return GridTrackState::Repeat;
-        case RustFFI::FfiGridTrackState::Removed:
-            return GridTrackState::Removed;
-        }
-        VERIFY_NOT_REACHED();
-    };
-
-    auto data = make<GridLayoutData>();
-    data->direction = static_cast<CSS::Direction>(ffi_data.direction);
-    data->writing_mode = static_cast<CSS::WritingMode>(ffi_data.writing_mode);
-    data->is_subgrid = ffi_data.is_subgrid;
-
-    auto build_dimension = [track_type, track_state](RustFFI::FfiGridLayoutDimension const& ffi_dimension) {
-        GridLayoutDimension dimension;
-        dimension.lines.ensure_capacity(ffi_dimension.line_count);
-        for (size_t line_index = 0; line_index < ffi_dimension.line_count; ++line_index) {
-            auto const& ffi_line = ffi_dimension.lines[line_index];
-            GridLayoutLine line {
-                .names = {},
-                .start = CSSPixels::from_raw(ffi_line.start),
-                .breadth = CSSPixels::from_raw(ffi_line.breadth),
-                .type = track_type(ffi_line.type_),
-                .number = ffi_line.number,
-                .negative_number = ffi_line.negative_number,
-            };
-            line.names.ensure_capacity(ffi_line.name_count);
-            for (size_t name_index = 0; name_index < ffi_line.name_count; ++name_index)
-                line.names.unchecked_append(Utf16FlyString::from_raw(ffi_line.names[name_index]));
-            dimension.lines.unchecked_append(move(line));
-        }
-
-        dimension.tracks.ensure_capacity(ffi_dimension.track_count);
-        for (size_t track_index = 0; track_index < ffi_dimension.track_count; ++track_index) {
-            auto const& ffi_track = ffi_dimension.tracks[track_index];
-            dimension.tracks.unchecked_append({
-                .start = CSSPixels::from_raw(ffi_track.start),
-                .breadth = CSSPixels::from_raw(ffi_track.breadth),
-                .type = track_type(ffi_track.type_),
-                .state = track_state(ffi_track.state),
-            });
-        }
-        return dimension;
-    };
-
-    data->fragments.ensure_capacity(ffi_data.fragment_count);
-    for (size_t fragment_index = 0; fragment_index < ffi_data.fragment_count; ++fragment_index) {
-        auto const& ffi_fragment = ffi_data.fragments[fragment_index];
-        GridLayoutFragment fragment {
-            .areas = {},
-            .columns = build_dimension(ffi_fragment.columns),
-            .rows = build_dimension(ffi_fragment.rows),
-        };
-        fragment.areas.ensure_capacity(ffi_fragment.area_count);
-        for (size_t area_index = 0; area_index < ffi_fragment.area_count; ++area_index) {
-            auto const& ffi_area = ffi_fragment.areas[area_index];
-            fragment.areas.unchecked_append({
-                .name = Utf16FlyString::from_raw(ffi_area.name),
-                .type = track_type(ffi_area.type_),
-                .row_start = ffi_area.row_start,
-                .row_end = ffi_area.row_end,
-                .column_start = ffi_area.column_start,
-                .column_end = ffi_area.column_end,
-            });
-        }
-        data->fragments.unchecked_append(move(fragment));
-    }
-    return data;
-}
-
 static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform const& transform)
 {
     return {
@@ -283,18 +96,6 @@ static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform 
         .d = transform.d(),
         .e = transform.e(),
         .f = transform.f(),
-    };
-}
-
-static Gfx::AffineTransform from_ffi_affine_transform(RustFFI::FfiAffineTransform const& transform)
-{
-    return {
-        transform.a,
-        transform.b,
-        transform.c,
-        transform.d,
-        transform.e,
-        transform.f,
     };
 }
 
@@ -713,42 +514,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
 {
     return {
         .context = this,
-        .begin_commit = [](void* context, void* root_pointer) {
-            auto& bridge = *static_cast<LayoutRustBridge*>(context);
-            auto& root = *static_cast<Box*>(root_pointer);
-            VERIFY(!bridge.m_replaced_paintable);
-            VERIFY(!bridge.m_commit_parent_paintable);
-            VERIFY(!bridge.m_commit_insert_before_paintable);
-            VERIFY(bridge.m_reused_paintables.is_empty());
-
-            if (!root.is_viewport()) {
-                bridge.m_replaced_paintable = root.paintable();
-                if (!bridge.m_replaced_paintable && root.dom_node()) {
-                    // A rebuilt box has no paintable yet; the previous one stays referenced by
-                    // the DOM node (and alive in the paint tree) until this commit replaces it.
-                    bridge.m_replaced_paintable = root.dom_node()->unsafe_paintable();
-                }
-            }
-
-            if (bridge.m_replaced_paintable) {
-                // Keep the old subtree alive while its replacement is spliced
-                // into the exact same paint-order position.
-                bridge.m_commit_parent_paintable = bridge.m_replaced_paintable->parent();
-                bridge.m_commit_insert_before_paintable = bridge.m_replaced_paintable->next_sibling();
-                if (bridge.m_commit_parent_paintable)
-                    bridge.m_commit_parent_paintable->remove_child(*bridge.m_replaced_paintable);
-            }
-
-            auto slot_of = [](Painting::Paintable const* paintable) {
-                return paintable ? paintable->rust_slot() : RustFFI::PaintableSlotId { RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
-            };
-            return RustFFI::FfiCommitPosition {
-                .parent_paintable = bridge.m_commit_parent_paintable.ptr(),
-                .insert_before_paintable = bridge.m_commit_insert_before_paintable.ptr(),
-                .replaced_paintable_slot = slot_of(bridge.m_replaced_paintable.ptr()),
-                .parent_paintable_slot = slot_of(bridge.m_commit_parent_paintable.ptr()),
-                .insert_before_paintable_slot = slot_of(bridge.m_commit_insert_before_paintable.ptr()),
-            }; },
         .finish_commit = [](void* context) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             for (auto& reused : bridge.m_reused_paintables) {
@@ -756,10 +521,7 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 if (new_absolute_position != reused.old_absolute_position)
                     reused.paintable->translate_reused_subtree_absolute_geometry(new_absolute_position - reused.old_absolute_position);
             }
-            bridge.m_reused_paintables.clear();
-            bridge.m_commit_insert_before_paintable = nullptr;
-            bridge.m_commit_parent_paintable = nullptr;
-            bridge.m_replaced_paintable = nullptr; },
+            bridge.m_reused_paintables.clear(); },
         .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> RustFFI::FfiPreparedPaintable {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             auto& node = *static_cast<Node*>(node_pointer);
@@ -773,8 +535,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 if (reuses_committed_subtree) {
                     VERIFY(paintable);
                     bridge.m_reused_paintables.append({ *paintable, paintable->absolute_position() });
-                    if (paintable->parent())
-                        paintable->remove();
                 } else if (paintable) {
                     paintable->reset_for_relayout();
                     reused = true;
@@ -894,56 +654,18 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             // consumers read out of bounds.
             for (auto const& piece : line_context->paintable.inline_box_pieces())
                 VERIFY(piece.first_fragment_index + piece.fragment_count <= line_context->paintable.fragments().size()); },
-        .set_svg_viewport_transform = [](void*, void* paintable_pointer, RustFFI::FfiAffineTransform transform) {
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_svg_viewport_transform(from_ffi_affine_transform(transform)); },
-        .set_svg_viewport_size = [](void*, void* paintable_pointer, RustFFI::FfiCssPixelSize viewport_size) {
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            if (auto* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable)) {
-                svg_svg_paintable->set_svg_viewport_size({
-                    CSSPixels::from_raw(viewport_size.width),
-                    CSSPixels::from_raw(viewport_size.height),
-                });
-            } },
-        .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer, u64 path_identity) {
-            VERIFY(path_pointer);
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            // The path stays owned by the Rust fragment tree, which may emit it again on a
-            // later commit; the identity is process-unique per path allocation, so a match
-            // means the preserved copy is already this exact path and the copy can be skipped.
-            auto const* path = static_cast<Gfx::Path const*>(path_pointer);
-            if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable))
-                svg_path_paintable->set_computed_path_if_identity_changed(*path, path_identity); },
-        .finish_node = [](void*, void* node_pointer, void* paintable_pointer, void* parent_paintable_pointer, void* insert_before_paintable_pointer) {
+        .finish_node = [](void*, void* node_pointer, void* paintable_pointer) {
             auto& node = *static_cast<Node*>(node_pointer);
             auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
-            auto* parent_paintable = static_cast<Painting::Paintable*>(parent_paintable_pointer);
-            auto* insert_before_paintable = static_cast<Painting::Paintable*>(insert_before_paintable_pointer);
             auto* dom_node = node.dom_node();
-            Painting::Paintable* paintable_for_children = nullptr;
             if (paintable) {
-                if (parent_paintable && !paintable->forms_unconnected_subtree()) {
-                    VERIFY(!paintable->parent());
-                    parent_paintable->insert_before(*paintable, insert_before_paintable);
-                }
                 paintable->set_dom_node(dom_node);
                 if (dom_node)
                     dom_node->set_paintable(paintable);
                 paintable->invalidate_absolute_geometry_cache(Painting::Paintable::InvalidateDescendantGeometry::No);
-                paintable_for_children = paintable;
-            } else {
-                if (dom_node)
-                    dom_node->clear_paintable();
-                // An inline box without a paintable must not orphan its descendants' paintables; pass the
-                // nearest ancestor paintable through. Other paintable-less nodes (e.g. non-rendered SVG
-                // subtrees) keep their descendants disconnected on purpose.
-                if (node.is_fragmented_inline())
-                    paintable_for_children = parent_paintable;
-            }
-            return RustFFI::FfiCommitNodeResult {
-                .paintable = paintable,
-                .paintable_for_children = paintable_for_children,
-            }; },
+            } else if (dom_node) {
+                dom_node->clear_paintable();
+            } },
         .assign_inline_box_geometry = [](void*, void* paintable_pointer) { as<Painting::PaintableWithLines>(*static_cast<Painting::Paintable*>(paintable_pointer)).assign_inline_box_geometry(); },
     };
 }
@@ -976,11 +698,6 @@ bool can_replay_saved_abspos_layout_inputs_after_style_change(Box const& box)
 
 RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
 {
-    static_assert(to_underlying(FlexLayoutGrowthState::Growing) == 0);
-    static_assert(to_underlying(FlexLayoutGrowthState::Shrinking) == 1);
-    static_assert(to_underlying(FlexLayoutClampState::Unclamped) == 0);
-    static_assert(to_underlying(FlexLayoutClampState::ClampedToMin) == 1);
-    static_assert(to_underlying(FlexLayoutClampState::ClampedToMax) == 2);
     static_assert(to_underlying(CSS::GridRepeatType::AutoFit) == 0);
     static_assert(to_underlying(CSS::GridRepeatType::AutoFill) == 1);
     static_assert(to_underlying(CSS::GridRepeatType::Fixed) == 2);
@@ -1081,6 +798,10 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
             if (!anchor_box)
                 return RustFFI::NodeSlotId_INVALID;
             return Node::slot_id(anchor_box); },
+        .node_unique_id = [](void* node) -> i64 {
+            auto const* dom_node = static_cast<Box const*>(node)->dom_node();
+            return dom_node ? dom_node->unique_id().value() : -1;
+        },
         .set_default_scroll_shift = [](void*, void* node, void* anchor, bool horizontal, bool vertical) {
             auto& box = *static_cast<Box*>(node);
             if (!anchor) {

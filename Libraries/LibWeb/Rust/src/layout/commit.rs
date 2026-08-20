@@ -35,23 +35,6 @@ pub struct FfiCommittedBoxMetrics {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-pub struct FfiCommitNodeResult {
-    pub paintable: *mut c_void,
-    pub paintable_for_children: *mut c_void,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiCommitPosition {
-    pub parent_paintable: *mut c_void,
-    pub insert_before_paintable: *mut c_void,
-    pub replaced_paintable_slot: crate::painting::paintable_data::PaintableSlotId,
-    pub parent_paintable_slot: crate::painting::paintable_data::PaintableSlotId,
-    pub insert_before_paintable_slot: crate::painting::paintable_data::PaintableSlotId,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
 pub struct FfiPaintableGeometry {
     pub content_inline_size: crate::layout::CssPixels,
     pub content_block_size: crate::layout::CssPixels,
@@ -79,7 +62,6 @@ pub struct FfiPaintableGeometry {
 #[repr(C)]
 pub struct FfiCommitSink {
     pub context: *mut c_void,
-    pub begin_commit: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiCommitPosition,
     pub finish_commit: unsafe extern "C" fn(*mut c_void),
     pub prepare_node: unsafe extern "C" fn(*mut c_void, *mut c_void, bool, bool) -> crate::painting::paintable_build::FfiPreparedPaintable,
     pub set_box_metrics: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiCommittedBoxMetrics),
@@ -88,18 +70,12 @@ pub struct FfiCommitSink {
     pub emit_fragment: unsafe extern "C" fn(*mut c_void, FfiCommittedFragment),
     pub emit_inline_box_piece: unsafe extern "C" fn(*mut c_void, FfiInlineBoxPiece),
     pub finish_line_data: unsafe extern "C" fn(*mut c_void),
-    pub set_svg_viewport_transform: unsafe extern "C" fn(*mut c_void, *mut c_void, crate::layout::FfiAffineTransform),
-    pub set_svg_viewport_size: unsafe extern "C" fn(*mut c_void, *mut c_void, crate::layout::FfiCssPixelSize),
-    pub set_computed_svg_path: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64),
-    pub finish_node:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> FfiCommitNodeResult,
+    pub finish_node: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
     pub assign_inline_box_geometry: unsafe extern "C" fn(*mut c_void, *mut c_void),
 }
 
 #[derive(Clone, Copy)]
 struct CommitInsertion {
-    parent_paintable: *mut c_void,
-    insert_before_paintable: *mut c_void,
     parent_paintable_slot: crate::painting::paintable_data::PaintableSlotId,
     insert_before_paintable_slot: crate::painting::paintable_data::PaintableSlotId,
 }
@@ -113,8 +89,6 @@ fn commit_subtree(
     scopes: &mut crate::layout::CommitScopes<'_>,
 ) {
     let CommitInsertion {
-        parent_paintable,
-        insert_before_paintable,
         parent_paintable_slot,
         insert_before_paintable_slot,
     } = insertion;
@@ -233,13 +207,10 @@ fn commit_subtree(
         }
 
         if !reuses_committed_subtree {
-            unsafe {
             if let Some(transform) = fragment.svg_viewport_transform {
-                (sink.set_svg_viewport_transform)(sink.context, paintable, transform);
                 paintables.set_svg_viewport_transform(paintable_slot, transform);
             }
             if let Some(viewport_size) = fragment.svg_viewport_size {
-                (sink.set_svg_viewport_size)(sink.context, paintable, viewport_size);
                 paintables.set_svg_viewport_size(paintable_slot, viewport_size);
             }
             // The paintable keeps its committed path across relayout and only swaps it on an
@@ -254,9 +225,7 @@ fn commit_subtree(
                 "committed path-like fragment carries no computed SVG path"
             );
             if let Some(path) = &fragment.computed_svg_path {
-                (sink.set_computed_svg_path)(sink.context, paintable, path.as_raw(), path.identity());
                 paintables.set_computed_svg_path(paintable_slot, path);
-            }
             }
         }
         if !reuses_committed_subtree && let Some(data) = &fragment.grid_layout_data {
@@ -276,16 +245,9 @@ fn commit_subtree(
     let paintable_slot_for_children = paintables.finish_node(node, paintable_slot, parent_paintable_slot, insert_before_paintable_slot);
     // SAFETY: Wiring uses only live layout and paintable pointers for this
     // synchronous commit.
-    let result = unsafe {
-        (sink.finish_node)(
-            sink.context,
-            node_shell,
-            paintable,
-            parent_paintable,
-            insert_before_paintable,
-        )
-    };
-    assert_eq!(result.paintable, paintable);
+    unsafe {
+        (sink.finish_node)(sink.context, node_shell, paintable);
+    }
 
     if reuses_committed_subtree {
         return;
@@ -300,8 +262,6 @@ fn commit_subtree(
         commit_subtree(
             child,
             CommitInsertion {
-                parent_paintable: result.paintable_for_children,
-                insert_before_paintable: null_mut(),
                 parent_paintable_slot: paintable_slot_for_children,
                 insert_before_paintable_slot: crate::painting::paintable_data::PaintableSlotId::INVALID,
             },
@@ -333,27 +293,12 @@ pub(crate) fn commit_replacing(
 ) {
     let mut scopes = crate::layout::CommitScopes::for_pass(pass_fragments);
     let paintables = crate::painting::paintable_build::PaintableCommit::new(callbacks);
-    // SAFETY: The sink resolves and retains the paintable to replace from the
-    // root, detaches it, and returns borrowed insertion pointers that stay
-    // live until finish_commit().
-    let position = unsafe { (sink.begin_commit)(sink.context, callbacks.shell(root)) };
-    let slot_position = paintables.begin_commit(
-        root,
-        crate::painting::paintable_build::FfiCommitSlotPosition {
-            replaced_paintable: position.replaced_paintable_slot,
-            parent_paintable: position.parent_paintable_slot,
-            insert_before_paintable: position.insert_before_paintable_slot,
-        },
-    );
-    debug_assert_eq!(slot_position.parent_paintable, position.parent_paintable_slot, "Rust and C++ disagree on the commit's parent paintable");
-    debug_assert_eq!(slot_position.insert_before_paintable, position.insert_before_paintable_slot, "Rust and C++ disagree on the commit's insertion point");
+    let anchors = paintables.begin_commit(root);
     commit_subtree(
         root,
         CommitInsertion {
-            parent_paintable: position.parent_paintable,
-            insert_before_paintable: position.insert_before_paintable,
-            parent_paintable_slot: slot_position.parent_paintable,
-            insert_before_paintable_slot: slot_position.insert_before_paintable,
+            parent_paintable_slot: anchors.parent_paintable,
+            insert_before_paintable_slot: anchors.insert_before_paintable,
         },
         callbacks,
         sink,

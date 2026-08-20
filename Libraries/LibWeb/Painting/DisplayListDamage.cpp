@@ -126,7 +126,9 @@ static bool visual_context_data_is_equal(VisualContextIndex a_index, VisualConte
             auto const* other = b.get_pointer<TransformData>();
             return other && matrices_are_equal(data.matrix, other->matrix) && data.origin == other->origin
                 && data.flattens_inherited_transform == other->flattens_inherited_transform
-                && data.role == other->role;
+                && data.sorting_context_root_index == other->sorting_context_root_index
+                && data.role == other->role
+                && data.synthetic_plane == other->synthetic_plane;
         },
         [&](PerspectiveData const& data) {
             auto const* other = b.get_pointer<PerspectiveData>();
@@ -277,7 +279,7 @@ Optional<Gfx::IntRect> compute_display_list_damage(
         if (visual_context_chains_are_equal(old_command.header.context_index, old_visual_context_tree, old_scroll_state, new_command.header.context_index, new_visual_context_tree, new_scroll_state))
             return;
         if (!old_command.header.has_bounding_rect || !new_command.header.has_bounding_rect) {
-            if (old_command.header.command_type == DisplayListCommandType::CompositorViewportScrollbar || old_command.header.command_type == DisplayListCommandType::PaintScrollBar)
+            if (old_command.header.command_type == DisplayListCommandType::CompositorViewportScrollbar)
                 changed_unbounded_command = true;
             return;
         }

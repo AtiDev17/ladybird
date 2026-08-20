@@ -22,14 +22,14 @@ unsafe fn arena_from_handle<'a>(arena: *mut c_void) -> &'a LayoutNodeArena {
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_allocate_paintable(
+pub unsafe extern "C" fn layout_arena_paintable_row_for_node(
     arena: *mut c_void,
     layout_node: NodeSlotId,
     shell: *mut c_void,
 ) -> PaintableAllocation {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.paintables().borrow_mut().allocate(layout_node, shell)
+        arena.paintables().borrow_mut().row_for_node(layout_node, shell)
     })
 }
 
@@ -37,10 +37,15 @@ pub unsafe extern "C" fn layout_arena_allocate_paintable(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_free_paintable(arena: *mut c_void, slot: PaintableSlotId, generation: u32) {
+pub unsafe extern "C" fn layout_arena_paintable_shell_destroyed(
+    arena: *mut c_void,
+    slot: PaintableSlotId,
+    generation: u32,
+    shell: *mut c_void,
+) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.paintables().borrow_mut().free(slot, generation);
+        arena.paintables().borrow_mut().shell_destroyed(slot, generation, shell);
     });
 }
 
@@ -55,13 +60,7 @@ pub unsafe extern "C" fn layout_arena_paintable_cleared_from_node(
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        let mut paintables = arena.paintables().borrow_mut();
-        if paintables.is_live(slot) {
-            paintables.remove_from_tree(slot);
-        }
-        if paintables.paintable_of_node(layout_node) == slot {
-            paintables.set_paintable_of_node(layout_node, PaintableSlotId::INVALID);
-        }
+        arena.paintables().borrow_mut().node_cleared(layout_node, slot);
     });
 }
 
@@ -92,25 +91,6 @@ pub unsafe extern "C" fn layout_arena_paintable_transfer_fragments_to_replacemen
                 piece.node = new_node;
             }
         }
-    });
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_detach_layout_node(arena: *mut c_void, slot: PaintableSlotId) {
-    abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle(arena) };
-        let paintables = arena.paintables().borrow();
-        if !paintables.is_live(slot) {
-            return;
-        }
-        paintables.update_data(slot, |data| {
-            data.layout_node = NodeSlotId::INVALID;
-            data.containing_block = PaintableSlotId::INVALID;
-        });
-        paintables.clear_absolute_rect_memo();
     });
 }
 
@@ -165,24 +145,6 @@ pub unsafe extern "C" fn layout_arena_paintable_set_fragment_selection_state(
         }
         if let Some(fragment) = paintables.side_mut(slot).fragments.get_mut(fragment_index as usize) {
             fragment.selection_state = state;
-        }
-    });
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_set_scroll_offset(
-    arena: *mut c_void,
-    slot: PaintableSlotId,
-    offset: FfiCssPixelPoint,
-) {
-    abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle(arena) };
-        let paintables = arena.paintables().borrow();
-        if paintables.is_live(slot) {
-            paintables.update_data(slot, |data| data.scroll_offset = offset);
         }
     });
 }
@@ -904,17 +866,41 @@ pub unsafe extern "C" fn layout_arena_clear_paint_cache_sources(arena: *mut c_vo
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_grid_layout_data(
+pub unsafe extern "C" fn layout_arena_paintable_computed_svg_path(
     arena: *mut c_void,
     paintable: PaintableSlotId,
+) -> *const c_void {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        if !paintables.is_live(paintable) {
+            return std::ptr::null();
+        }
+        paintables
+            .side(paintable)
+            .computed_svg_path
+            .as_ref()
+            .map_or(std::ptr::null(), |path| path.as_raw())
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_grid_layout_json(
+    arena: *mut c_void,
+    paintable: PaintableSlotId,
+    container_node_id: i64,
     context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, *const crate::layout::FfiGridLayoutData),
+    consume: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
         if let Some(data) = &paintables.side(paintable).grid_layout_data {
-            data.with_ffi_view(|view| unsafe { consume(context, view) });
+            let json = crate::painting::devtools_layout::serialize_grid_layout(data, container_node_id);
+            unsafe { consume(context, json.as_ptr(), json.len()) };
         }
     });
 }
@@ -923,17 +909,19 @@ pub unsafe extern "C" fn layout_arena_paintable_grid_layout_data(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_flex_layout_data(
+pub unsafe extern "C" fn layout_arena_paintable_flex_layout_json(
     arena: *mut c_void,
     paintable: PaintableSlotId,
+    container_node_id: i64,
     context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, *const crate::layout::FfiFlexLayoutData),
+    consume: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
         if let Some(data) = &paintables.side(paintable).flex_layout_data {
-            data.with_ffi_view(|view| unsafe { consume(context, view) });
+            let json = crate::painting::devtools_layout::serialize_flex_layout(data, container_node_id);
+            unsafe { consume(context, json.as_ptr(), json.len()) };
         }
     });
 }

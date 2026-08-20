@@ -56,10 +56,6 @@
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ResizeHandle.h>
-#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/SVGPaintable.h>
-#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
@@ -141,7 +137,12 @@ RefPtr<Paintable> Paintable::containing_block() const
 
 Paintable const* Paintable::containing_block_ptr() const
 {
-    return static_cast<Paintable const*>(Layout::RustFFI::layout_arena_paintable_shell(m_rust_arena->handle(), rust_data().containing_block));
+    return shell_from_slot(rust_data().containing_block);
+}
+
+Paintable* Paintable::shell_from_slot(Layout::RustFFI::PaintableSlotId slot) const
+{
+    return static_cast<Paintable*>(Layout::RustFFI::layout_arena_paintable_shell(m_rust_arena->handle(), slot));
 }
 
 bool Paintable::is_visible() const
@@ -603,7 +604,7 @@ static Gfx::FloatRect svg_svg_box_view_box_or_viewport_rect(Layout::Box const& s
 {
     if (auto view_box = as<SVG::SVGSVGElement>(*svg_svg_box.dom_node()).active_view_box(); view_box.has_value())
         return { view_box->min_x, view_box->min_y, view_box->width, view_box->height };
-    if (auto const* paintable = as_if<SVGSVGPaintable>(svg_svg_box.paintable_box().ptr()))
+    if (auto const* paintable = svg_svg_box.paintable_box().ptr())
         return { {}, { paintable->svg_viewport_size().width().to_float(), paintable->svg_viewport_size().height().to_float() } };
     return {};
 }
@@ -706,7 +707,7 @@ Paintable::Paintable(Layout::NodeWithStyle const& layout_node)
     : m_layout_node(layout_node)
     , m_rust_arena(layout_node.node_arena())
 {
-    auto allocation = m_rust_arena->allocate_paintable(Layout::Node::slot_id(&layout_node), this);
+    auto allocation = m_rust_arena->paintable_row_for_node(Layout::Node::slot_id(&layout_node), this);
     m_rust_slot = allocation.slot;
     m_rust_slot_generation = allocation.generation;
     m_rust_data = allocation.data;
@@ -719,14 +720,13 @@ Paintable::Paintable(Layout::Box const& layout_box)
 
 Paintable::~Paintable()
 {
-    m_rust_arena->free_paintable(m_rust_slot, m_rust_slot_generation);
+    m_rust_arena->paintable_shell_destroyed(m_rust_slot, m_rust_slot_generation, this);
 }
 
 void Paintable::detach_from_layout_node(Badge<Layout::Node>)
 {
     m_layout_node.clear();
     detach_chrome_widgets();
-    Layout::RustFFI::layout_arena_paintable_detach_layout_node(m_rust_arena->handle(), m_rust_slot);
 }
 
 void Paintable::detach_chrome_widgets()
@@ -748,6 +748,66 @@ void Paintable::detach_chrome_widgets()
 bool Paintable::has_css_transform() const
 {
     return layout_node().has_css_transform();
+}
+
+StringView Paintable::class_name() const
+{
+    switch (kind()) {
+    case Layout::RustFFI::PaintableKind::None:
+        return "Paintable"sv;
+    case Layout::RustFFI::PaintableKind::Paintable:
+        return "Paintable"sv;
+    case Layout::RustFFI::PaintableKind::PaintableWithLines:
+        return "PaintableWithLines"sv;
+    case Layout::RustFFI::PaintableKind::InlinePaintable:
+        return "InlinePaintable"sv;
+    case Layout::RustFFI::PaintableKind::ViewportPaintable:
+        return "ViewportPaintable"sv;
+    case Layout::RustFFI::PaintableKind::ImagePaintable:
+        return "ImagePaintable"sv;
+    case Layout::RustFFI::PaintableKind::CanvasPaintable:
+        return "CanvasPaintable"sv;
+    case Layout::RustFFI::PaintableKind::VideoPaintable:
+        return "VideoPaintable"sv;
+    case Layout::RustFFI::PaintableKind::CheckBoxPaintable:
+        return "CheckBoxPaintable"sv;
+    case Layout::RustFFI::PaintableKind::RadioButtonPaintable:
+        return "RadioButtonPaintable"sv;
+    case Layout::RustFFI::PaintableKind::FieldSetPaintable:
+        return "FieldSetPaintable"sv;
+    case Layout::RustFFI::PaintableKind::NavigableContainerViewportPaintable:
+        return "NavigableContainerViewportPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGSVGPaintable:
+        return "SVGSVGPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGPathPaintable:
+        return "SVGPathPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGGraphicsPaintable:
+        return "SVGGraphicsPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGImagePaintable:
+        return "SVGImagePaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGMaskPaintable:
+        return "SVGMaskPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGClipPaintable:
+        return "SVGClipPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGPatternPaintable:
+        return "SVGPatternPaintable"sv;
+    case Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable:
+        return "SVGForeignObjectPaintable"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+Optional<Gfx::AffineTransform> Paintable::svg_viewport_transform() const
+{
+    if (!rust_data().has_svg_viewport_transform)
+        return {};
+    auto const& transform = rust_data().svg_viewport_transform;
+    return Gfx::AffineTransform { transform.a, transform.b, transform.c, transform.d, transform.e, transform.f };
+}
+
+Gfx::Path const* Paintable::committed_svg_path() const
+{
+    return static_cast<Gfx::Path const*>(Layout::RustFFI::layout_arena_paintable_computed_svg_path(m_rust_arena->handle(), m_rust_slot));
 }
 
 void Paintable::invalidate_paint_cache() const
@@ -777,11 +837,6 @@ void Paintable::repaint_after_style_change(CSS::RequiredInvalidationAfterStyleCh
 
 void Paintable::reset_for_relayout()
 {
-    if (parent())
-        remove();
-    while (first_child())
-        first_child()->remove();
-
     // A reused paintable must shed its chrome widgets: whether the box still warrants them
     // (e.g. scrollbars on a scroll container) is only known after the new layout is painted.
     detach_chrome_widgets();
@@ -1055,15 +1110,24 @@ CSSPixelPoint Paintable::offset() const
 
 CSSPixelRect Paintable::compute_absolute_rect() const
 {
+    if (is_svg_paintable()) {
+        // SVG content geometry lives in the user space of the nearest ancestor viewport, and layout
+        // places every box viewport-relative already, so no ancestor offsets accumulate.
+        for (auto const* ancestor = layout_node().parent(); ancestor; ancestor = ancestor->parent()) {
+            if (ancestor->is_svg_svg_box())
+                return { offset(), content_size() };
+        }
+    }
+
     CSSPixelRect rect { offset(), content_size() };
     for (auto block = containing_block(); block; block = block->containing_block()) {
         // SVG content offsets are viewport-relative: accumulation never crosses into an enclosing
         // SVG coordinate space, and a foreignObject's own offset is the last one that applies to
         // the CSS content inside it.
-        if (is<SVGSVGPaintable>(*block) || is<SVGPaintable>(*block))
+        if (block->is_svg_svg_paintable() || block->is_svg_paintable())
             break;
         rect.translate_by(block->offset());
-        if (is<SVGForeignObjectPaintable>(*block))
+        if (block->is_svg_foreign_object_paintable())
             break;
     }
     return rect;
@@ -1311,7 +1375,7 @@ Optional<Paintable::ScrollbarData> Paintable::compute_scrollbar_data(ScrollDirec
     CSSPixels min_thumb_length = min(usable_scrollbar_length, metrics.scroll_thumb_min_length);
     CSSPixels thumb_length = max(usable_scrollbar_length * (scrollport_size / scrollable_overflow_length), min_thumb_length);
 
-    ScrollbarData scrollbar_data = { .gutter_rect = {}, .thumb_rect = scrollbar_rect.value(), .thumb_travel_to_scroll_ratio = 0 };
+    ScrollbarData scrollbar_data = { .gutter_rect = {}, .thumb_rect = scrollbar_rect.value(), .track_rect = scrollbar_rect.value(), .thumb_travel_to_scroll_ratio = 0 };
 
     if (scrollable_overflow_length > scrollport_size)
         scrollbar_data.thumb_travel_to_scroll_ratio = (usable_scrollbar_length - thumb_length) / (scrollable_overflow_length - scrollport_size);
@@ -1356,22 +1420,22 @@ Optional<UsedGridTrackList> Paintable::used_values_for_grid_template_rows() cons
     return result;
 }
 
-OwnPtr<Layout::GridLayoutData> Paintable::grid_layout_data() const
+Optional<String> Paintable::grid_layout_json(UniqueNodeID container_node_id) const
 {
-    OwnPtr<Layout::GridLayoutData> result;
-    Layout::RustFFI::layout_arena_paintable_grid_layout_data(rust_arena().handle(), rust_slot(), &result,
-        [](void* context, Layout::RustFFI::FfiGridLayoutData const* data) {
-            *static_cast<OwnPtr<Layout::GridLayoutData>*>(context) = Layout::build_grid_layout_data(*data);
+    Optional<String> result;
+    Layout::RustFFI::layout_arena_paintable_grid_layout_json(rust_arena().handle(), rust_slot(), container_node_id.value(), &result,
+        [](void* context, u8 const* bytes, size_t length) {
+            *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
     return result;
 }
 
-OwnPtr<Layout::FlexLayoutData> Paintable::flex_layout_data() const
+Optional<String> Paintable::flex_layout_json(UniqueNodeID container_node_id) const
 {
-    OwnPtr<Layout::FlexLayoutData> result;
-    Layout::RustFFI::layout_arena_paintable_flex_layout_data(rust_arena().handle(), rust_slot(), &result,
-        [](void* context, Layout::RustFFI::FfiFlexLayoutData const* data) {
-            *static_cast<OwnPtr<Layout::FlexLayoutData>*>(context) = Layout::build_flex_layout_data(*data);
+    Optional<String> result;
+    Layout::RustFFI::layout_arena_paintable_flex_layout_json(rust_arena().handle(), rust_slot(), container_node_id.value(), &result,
+        [](void* context, u8 const* bytes, size_t length) {
+            *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
     return result;
 }
@@ -1551,7 +1615,7 @@ CSSPixelRect Paintable::transform_reference_box() const
     // border-box is stroke-box.
     // FIXME: This currently detects any SVG element except the <svg> one. Is that correct?
     //        And is it correct to use `else` below?
-    if (is<Painting::SVGPaintable>(*this)) {
+    if (is_svg_paintable()) {
         switch (transform_box) {
         case CSS::TransformBox::ContentBox:
             transform_box = CSS::TransformBox::FillBox;

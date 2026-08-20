@@ -58,6 +58,13 @@ pub(crate) fn is_abstract_image(value: &StyleValueData) -> bool {
     )
 }
 
+pub(crate) fn background_layers_have_image(style: ComputedValuesView<'_>) -> bool {
+    let Some(value) = handle_value(&style.background().background_image) else {
+        return false;
+    };
+    for_each_comma_item(value, is_abstract_image)
+}
+
 fn fly_string_equals_ascii(string: &RetainedUtf16FlyString, expected: &[u8]) -> bool {
     with_fly_string_units(string, |units| match units {
         StringUnits::Ascii(bytes) => bytes == expected,
@@ -370,7 +377,7 @@ fn used_transform_style_is_preserve_3d(arena: &LayoutNodeArena, node: NodeSlotId
 }
 
 pub(crate) fn establishes_or_extends_a_3d_rendering_context(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
-    is_transformable(arena, node) && used_transform_style_is_preserve_3d(arena, node)
+    used_transform_style_is_preserve_3d(arena, node) && is_transformable(arena, node)
 }
 
 fn participates_in_a_3d_rendering_context(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
