@@ -10,7 +10,7 @@ use crate::layout::AvailableSize;
 use crate::layout::CssPixels;
 use crate::layout::FfiReplacedContentFacts;
 use crate::layout::UsedValues;
-use crate::layout::node_data::{FfiStylePayloads, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag, NodeSlotId};
+use crate::layout::node_data::{FfiStylePayloads, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag, NodeKind, NodeSlotId};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -150,6 +150,7 @@ pub(crate) struct TextContent {
     pub(crate) text: Vec<u16>,
     pub(crate) untransformed_text_is_ascii_whitespace: bool,
     pub(crate) may_require_bidi_processing: bool,
+    pub(crate) dom_start_offset: usize,
 }
 
 #[derive(Default)]
@@ -242,6 +243,8 @@ pub(crate) struct LayoutNodeArena {
     run_used_records: RefCell<Vec<RunRecordSlot>>,
     next_run_nonce: Cell<u64>,
     fc_run_cache_store: crate::layout::FcRunCacheArenaStore,
+    paintables: RefCell<crate::painting::paintable_arena::PaintableArena>,
+    svg_pattern_referencing_nodes: RefCell<Vec<NodeSlotId>>,
     owner_thread: thread::ThreadId,
 }
 
@@ -264,8 +267,25 @@ impl LayoutNodeArena {
             run_used_records: RefCell::new(Vec::new()),
             next_run_nonce: Cell::new(1),
             fc_run_cache_store: crate::layout::FcRunCacheArenaStore::default(),
+            paintables: RefCell::new(crate::painting::paintable_arena::PaintableArena::new()),
+            svg_pattern_referencing_nodes: RefCell::new(Vec::new()),
             owner_thread: thread::current().id(),
         }
+    }
+
+    pub(crate) fn register_svg_pattern_referencing_node(&self, node: NodeSlotId) {
+        let mut nodes = self.svg_pattern_referencing_nodes.borrow_mut();
+        nodes.retain(|candidate| !self.shell_if_live(*candidate).is_null());
+        if nodes.contains(&node) {
+            return;
+        }
+        nodes.push(node);
+    }
+
+    pub(crate) fn svg_pattern_referencing_nodes(&self) -> Vec<NodeSlotId> {
+        let mut nodes = self.svg_pattern_referencing_nodes.borrow_mut();
+        nodes.retain(|candidate| !self.shell_if_live(*candidate).is_null());
+        nodes.clone()
     }
 
     pub(crate) fn fc_run_cache_store(&self) -> &crate::layout::FcRunCacheArenaStore {
@@ -398,6 +418,7 @@ impl LayoutNodeArena {
         }
         self.fc_run_cache_store.remove_entry(index);
         self.raw_table_column_spans.remove(&id);
+        self.paintables.get_mut().layout_node_freed(index);
         let data = self.data_mut(index);
         debug_assert!(
             data.parent.is_invalid()
@@ -824,6 +845,7 @@ impl LayoutNodeArena {
         text: Vec<u16>,
         untransformed_text_is_ascii_whitespace: bool,
         may_require_bidi_processing: bool,
+        dom_start_offset: usize,
     ) -> bool {
         self.assert_owner_thread();
         self.data(id);
@@ -838,6 +860,7 @@ impl LayoutNodeArena {
                     content.text != text
                         || content.untransformed_text_is_ascii_whitespace != untransformed_text_is_ascii_whitespace
                         || content.may_require_bidi_processing != may_require_bidi_processing
+                        || content.dom_start_offset != dom_start_offset
                 }
                 None => true,
             };
@@ -850,6 +873,7 @@ impl LayoutNodeArena {
                 text,
                 untransformed_text_is_ascii_whitespace,
                 may_require_bidi_processing,
+                dom_start_offset,
             })),
         };
         if let Some(slot) = self.text_chunk_caches.get_mut().get_mut(index) {
@@ -1169,6 +1193,107 @@ impl LayoutNodeArena {
         self.note_inline_layout_damage_at_and_above(parent);
     }
 
+    pub(crate) fn paintables(&self) -> &RefCell<crate::painting::paintable_arena::PaintableArena> {
+        &self.paintables
+    }
+
+    pub(crate) fn node_flags_if_live(&self, id: NodeSlotId) -> u32 {
+        if self.shell_if_live(id).is_null() {
+            return 0;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        unsafe { (*self.data(id)).flags }
+    }
+
+    pub(crate) fn node_is_generated_for_pseudo_element(&self, id: NodeSlotId) -> bool {
+        if self.shell_if_live(id).is_null() {
+            return false;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        unsafe { (*self.data(id)).generated_for != 0 }
+    }
+
+    pub(crate) fn node_kind_if_live(&self, id: NodeSlotId) -> Option<NodeKind> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        Some(unsafe { (*self.data(id)).kind })
+    }
+
+    pub(crate) fn node_parent_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        let parent = unsafe { (*self.data(id)).parent };
+        (!parent.is_invalid()).then_some(parent)
+    }
+
+    pub(crate) fn node_first_child_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        let child = unsafe { (*self.data(id)).first_child };
+        (!child.is_invalid()).then_some(child)
+    }
+
+    pub(crate) fn node_next_sibling_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        let sibling = unsafe { (*self.data(id)).next_sibling };
+        (!sibling.is_invalid()).then_some(sibling)
+    }
+
+    pub(crate) fn node_is_out_of_flow_if_live(&self, id: NodeSlotId) -> bool {
+        if self.shell_if_live(id).is_null() {
+            return false;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        let data = unsafe { &*self.data(id) };
+        crate::layout::node_is_out_of_flow(data, self.node_style_if_live(id))
+    }
+
+    pub(crate) fn node_containing_block_if_live(&self, id: NodeSlotId) -> Option<NodeSlotId> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        // SAFETY: shell_if_live established a live slot of this generation.
+        let block = unsafe { (*self.data(id)).containing_block };
+        (!block.is_invalid()).then_some(block)
+    }
+
+    pub(crate) fn node_style_if_live(
+        &self,
+        id: NodeSlotId,
+    ) -> Option<crate::css::computed_value_views::ComputedValuesView<'_>> {
+        if self.shell_if_live(id).is_null() {
+            return None;
+        }
+        let payloads = self.style_payloads(id)?;
+        Some(crate::css::computed_value_views::ComputedValuesView::new(
+            &payloads.groups,
+        ))
+    }
+
+    pub(crate) fn shell_if_live(&self, id: NodeSlotId) -> *mut c_void {
+        if id.is_invalid() {
+            return std::ptr::null_mut();
+        }
+        let index = id.slot_index() as usize;
+        let Some(metadata) = self.slot_metadata.get(index) else {
+            return std::ptr::null_mut();
+        };
+        if !metadata.occupied || metadata.generation != id.generation() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: The metadata check established a live slot of this generation.
+        unsafe { (*self.data(id)).shell }
+    }
+
     pub(crate) unsafe fn from_handle<'a>(arena: *mut c_void) -> &'a Self {
         assert!(!arena.is_null(), "layout node arena handle is null");
         // SAFETY: Layout passes borrow the document's arena synchronously,
@@ -1220,6 +1345,11 @@ pub unsafe extern "C" fn layout_arena_destroy(arena: *mut c_void) {
         let arena = unsafe { Box::from_raw(arena.cast::<LayoutNodeArena>()) };
         arena.assert_owner_thread();
         assert_eq!(arena.live_count, 0, "layout node arena destroyed with live slots");
+        assert_eq!(
+            arena.paintables.borrow().live_count(),
+            0,
+            "layout node arena destroyed with live paintable slots"
+        );
     });
 }
 
@@ -1312,6 +1442,7 @@ pub unsafe extern "C" fn layout_arena_set_text_content(
     length_in_code_units: usize,
     untransformed_text_is_ascii_whitespace: bool,
     may_require_bidi_processing: bool,
+    dom_start_offset: usize,
 ) -> bool {
     abort_on_panic(|| {
         assert!(!arena.is_null(), "layout node arena handle is null");
@@ -1337,6 +1468,7 @@ pub unsafe extern "C" fn layout_arena_set_text_content(
             text,
             untransformed_text_is_ascii_whitespace,
             may_require_bidi_processing,
+            dom_start_offset,
         )
     })
 }

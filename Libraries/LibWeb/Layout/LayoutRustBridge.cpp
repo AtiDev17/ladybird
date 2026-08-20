@@ -73,7 +73,7 @@ static_assert(to_underlying(CSS::StyleGroupIndex::SizingValues) == RustFFI::STYL
 static_assert(to_underlying(CSS::StyleGroupIndex::SurroundValues) == RustFFI::STYLE_GROUP_INDEX_SURROUND);
 static_assert(to_underlying(CSS::StyleGroupIndex::BoxValues) == RustFFI::STYLE_GROUP_INDEX_BOX);
 
-static Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGridTrackList const& list)
+Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGridTrackList const& list)
 {
     VERIFY(list.is_subgrid ? list.track_count == 0 : list.track_count + 1 == list.line_count);
 
@@ -94,7 +94,7 @@ static Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGr
     return result;
 }
 
-static OwnPtr<FlexLayoutData> build_flex_layout_data(RustFFI::FfiFlexLayoutData const& ffi_data)
+OwnPtr<FlexLayoutData> build_flex_layout_data(RustFFI::FfiFlexLayoutData const& ffi_data)
 {
     auto growth_state = [](RustFFI::FfiFlexLayoutGrowthState state) {
         switch (state) {
@@ -189,7 +189,7 @@ static OwnPtr<FlexLayoutData> build_flex_layout_data(RustFFI::FfiFlexLayoutData 
     return data;
 }
 
-static OwnPtr<GridLayoutData> build_grid_layout_data(RustFFI::FfiGridLayoutData const& ffi_data)
+OwnPtr<GridLayoutData> build_grid_layout_data(RustFFI::FfiGridLayoutData const& ffi_data)
 {
     auto track_type = [](RustFFI::FfiGridTrackType type) {
         switch (type) {
@@ -272,31 +272,6 @@ static OwnPtr<GridLayoutData> build_grid_layout_data(RustFFI::FfiGridLayoutData 
         data->fragments.unchecked_append(move(fragment));
     }
     return data;
-}
-
-static CSS::BorderData from_ffi_border_data(RustFFI::FfiBorderData const&);
-
-static OwnPtr<Painting::CollapsedTableBorders> build_collapsed_table_borders(RustFFI::FfiCollapsedTableBorders const& ffi_borders)
-{
-    auto borders = make<Painting::CollapsedTableBorders>();
-    borders->row_offsets.ensure_capacity(ffi_borders.row_count + 1);
-    for (size_t i = 0; i <= ffi_borders.row_count; ++i)
-        borders->row_offsets.unchecked_append(CSSPixels::from_raw(ffi_borders.row_offsets[i]));
-    borders->column_offsets.ensure_capacity(ffi_borders.column_count + 1);
-    for (size_t i = 0; i <= ffi_borders.column_count; ++i)
-        borders->column_offsets.unchecked_append(CSSPixels::from_raw(ffi_borders.column_offsets[i]));
-    auto build_edges = [](Vector<Painting::CollapsedBorderEdge>& edges, RustFFI::FfiCollapsedBorderEdge const* ffi_edges, size_t count) {
-        edges.ensure_capacity(count);
-        for (size_t i = 0; i < count; ++i) {
-            edges.unchecked_append({
-                .border = from_ffi_border_data(ffi_edges[i].border_data),
-                .source_order = ffi_edges[i].source_order,
-            });
-        }
-    };
-    build_edges(borders->horizontal_edges, ffi_borders.horizontal_edges, (ffi_borders.row_count + 1) * ffi_borders.column_count);
-    build_edges(borders->vertical_edges, ffi_borders.vertical_edges, (ffi_borders.column_count + 1) * ffi_borders.row_count);
-    return borders;
 }
 
 static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform const& transform)
@@ -764,9 +739,15 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                     bridge.m_commit_parent_paintable->remove_child(*bridge.m_replaced_paintable);
             }
 
+            auto slot_of = [](Painting::Paintable const* paintable) {
+                return paintable ? paintable->rust_slot() : RustFFI::PaintableSlotId { RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
+            };
             return RustFFI::FfiCommitPosition {
                 .parent_paintable = bridge.m_commit_parent_paintable.ptr(),
                 .insert_before_paintable = bridge.m_commit_insert_before_paintable.ptr(),
+                .replaced_paintable_slot = slot_of(bridge.m_replaced_paintable.ptr()),
+                .parent_paintable_slot = slot_of(bridge.m_commit_parent_paintable.ptr()),
+                .insert_before_paintable_slot = slot_of(bridge.m_commit_insert_before_paintable.ptr()),
             }; },
         .finish_commit = [](void* context) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
@@ -779,11 +760,12 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             bridge.m_commit_insert_before_paintable = nullptr;
             bridge.m_commit_parent_paintable = nullptr;
             bridge.m_replaced_paintable = nullptr; },
-        .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> void* {
+        .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> RustFFI::FfiPreparedPaintable {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             auto& node = *static_cast<Node*>(node_pointer);
 
             RefPtr<Painting::Paintable> paintable;
+            bool reused = false;
             if (has_used_values || (node.is_fragmented_inline() && node.dom_node())) {
                 // Inline boxes that never went through inline layout (so they have no used values) still
                 // need a paintable so DOM geometry queries have something to answer from.
@@ -793,9 +775,9 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                     bridge.m_reused_paintables.append({ *paintable, paintable->absolute_position() });
                     if (paintable->parent())
                         paintable->remove();
-                    paintable->set_containing_block(nullptr);
                 } else if (paintable) {
                     paintable->reset_for_relayout();
+                    reused = true;
                 } else {
                     paintable = node.create_paintable();
                 }
@@ -805,36 +787,18 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 // stale; drop it so the layout tree only points into the paint tree built by this commit.
                 node.clear_paintable();
             }
-            return paintable.ptr();
+            return RustFFI::FfiPreparedPaintable {
+                .paintable = paintable.ptr(),
+                .slot = paintable ? paintable->rust_slot() : RustFFI::PaintableSlotId { RustFFI::INVALID_PAINTABLE_SLOT_INDEX },
+                .reused = reused,
+            };
         },
         .set_box_metrics = [](void*, void* paintable_pointer, RustFFI::FfiCommittedBoxMetrics metrics) {
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_layout_fragment_identity(metrics.fragment_identity);
-            auto& box_model = paintable.box_model();
-            box_model.inset = {
-                CSSPixels::from_raw(metrics.inset_top),
-                CSSPixels::from_raw(metrics.inset_right),
-                CSSPixels::from_raw(metrics.inset_bottom),
-                CSSPixels::from_raw(metrics.inset_left),
-            };
-            box_model.padding = {
-                CSSPixels::from_raw(metrics.padding_top),
-                CSSPixels::from_raw(metrics.padding_right),
-                CSSPixels::from_raw(metrics.padding_bottom),
-                CSSPixels::from_raw(metrics.padding_left),
-            };
-            box_model.border = {
-                CSSPixels::from_raw(metrics.border_top),
-                CSSPixels::from_raw(metrics.border_right),
-                CSSPixels::from_raw(metrics.border_bottom),
-                CSSPixels::from_raw(metrics.border_left),
-            };
-            box_model.margin = {
-                CSSPixels::from_raw(metrics.margin_top),
-                CSSPixels::from_raw(metrics.margin_right),
-                CSSPixels::from_raw(metrics.margin_bottom),
-                CSSPixels::from_raw(metrics.margin_left),
-            };
+            paintable.set_offset({
+                CSSPixels::from_raw(metrics.content_offset.x),
+                CSSPixels::from_raw(metrics.content_offset.y),
+            });
             CSSPixelSize content_size {
                 CSSPixels::from_raw(metrics.content_inline_size),
                 CSSPixels::from_raw(metrics.content_block_size)
@@ -842,14 +806,7 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             if (metrics.reuses_committed_subtree)
                 VERIFY(paintable.content_size() == content_size);
             else
-                paintable.set_content_size(content_size);
-            paintable.set_offset({
-                CSSPixels::from_raw(metrics.content_offset.x),
-                CSSPixels::from_raw(metrics.content_offset.y),
-            });
-            if (metrics.has_containing_line_box_index)
-                paintable.set_containing_line_box_index(metrics.containing_line_box_index);
-            paintable.set_uses_collapsing_borders_model(metrics.uses_collapsing_borders_model); },
+                paintable.set_content_size(content_size); },
         .begin_line_data = [](void* context, void* paintable_pointer) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             VERIFY(!bridge.m_line_commit_context);
@@ -957,21 +914,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             auto const* path = static_cast<Gfx::Path const*>(path_pointer);
             if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable))
                 svg_path_paintable->set_computed_path_if_identity_changed(*path, path_identity); },
-        .set_grid_layout_data = [](void*, void* paintable_pointer, RustFFI::FfiGridLayoutData const* data) {
-            VERIFY(data);
-            static_cast<Painting::Paintable*>(paintable_pointer)->set_grid_layout_data(build_grid_layout_data(*data)); },
-        .set_flex_layout_data = [](void*, void* paintable_pointer, RustFFI::FfiFlexLayoutData const* data) {
-            VERIFY(data);
-            static_cast<Painting::Paintable*>(paintable_pointer)->set_flex_layout_data(build_flex_layout_data(*data)); },
-        .set_used_grid_tracks = [](void*, void* paintable_pointer, RustFFI::FfiUsedGridTrackList const* columns, RustFFI::FfiUsedGridTrackList const* rows) {
-            VERIFY(columns);
-            VERIFY(rows);
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_used_values_for_grid_template_columns(build_used_grid_track_list(*columns));
-            paintable.set_used_values_for_grid_template_rows(build_used_grid_track_list(*rows)); },
-        .set_collapsed_table_borders = [](void*, void* paintable_pointer, RustFFI::FfiCollapsedTableBorders const* borders) {
-            VERIFY(borders);
-            static_cast<Painting::Paintable*>(paintable_pointer)->set_collapsed_table_borders(build_collapsed_table_borders(*borders)); },
         .finish_node = [](void*, void* node_pointer, void* paintable_pointer, void* parent_paintable_pointer, void* insert_before_paintable_pointer) {
             auto& node = *static_cast<Node*>(node_pointer);
             auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
@@ -987,8 +929,7 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 paintable->set_dom_node(dom_node);
                 if (dom_node)
                     dom_node->set_paintable(paintable);
-                auto* containing_block = node.containing_block();
-                paintable->set_containing_block(containing_block ? containing_block->paintable_ptr() : nullptr);
+                paintable->invalidate_absolute_geometry_cache(Painting::Paintable::InvalidateDescendantGeometry::No);
                 paintable_for_children = paintable;
             } else {
                 if (dom_node)
@@ -1004,15 +945,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 .paintable_for_children = paintable_for_children,
             }; },
         .assign_inline_box_geometry = [](void*, void* paintable_pointer) { as<Painting::PaintableWithLines>(*static_cast<Painting::Paintable*>(paintable_pointer)).assign_inline_box_geometry(); },
-    };
-}
-
-static CSS::BorderData from_ffi_border_data(RustFFI::FfiBorderData const& border)
-{
-    return {
-        .color = Gfx::Color::from_bgra(border.color),
-        .line_style = static_cast<CSS::LineStyle>(border.line_style),
-        .width = CSSPixels::from_raw(border.width),
     };
 }
 

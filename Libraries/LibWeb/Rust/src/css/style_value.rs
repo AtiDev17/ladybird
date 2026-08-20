@@ -757,6 +757,22 @@ impl RetainedShapePointList {
 }
 
 impl RetainedColorStop {
+    pub(crate) fn transition_hint_value(&self) -> Option<&StyleValueData> {
+        self.transition_hint.optional_data()
+    }
+
+    pub(crate) fn color_value(&self) -> &StyleValueData {
+        self.color.data()
+    }
+
+    pub(crate) fn position_value(&self) -> Option<&StyleValueData> {
+        self.position.optional_data()
+    }
+
+    pub(crate) fn second_position_value(&self) -> Option<&StyleValueData> {
+        self.second_position.optional_data()
+    }
+
     /// The stop's retained values, absent ones as null retained references.
     pub(crate) fn values(&self) -> [&RetainedStyleValueData; 4] {
         [

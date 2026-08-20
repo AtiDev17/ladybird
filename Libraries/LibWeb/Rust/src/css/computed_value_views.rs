@@ -11,12 +11,16 @@
 
 use crate::css::calc;
 use crate::css::computed_value_types::{
-    AlignmentValues, BorderLayoutFacts, BoxValues, ComputedAspectRatio, ComputedGap, ComputedLengthPercentageOrAuto,
-    ComputedSize, ComputedSizeKind, ComputedStyleValueHandle, FontLayoutFacts, GridValues, InheritedTextLayoutFacts,
-    STYLE_GROUP_INDEX_ALIGNMENT, STYLE_GROUP_INDEX_BORDER, STYLE_GROUP_INDEX_BOX, STYLE_GROUP_INDEX_FONT,
-    STYLE_GROUP_INDEX_GRID, STYLE_GROUP_INDEX_INHERITED_BOX, STYLE_GROUP_INDEX_INHERITED_TABLE,
-    STYLE_GROUP_INDEX_INHERITED_TEXT, STYLE_GROUP_INDEX_SIZING, STYLE_GROUP_INDEX_SURROUND,
-    STYLE_GROUP_INDEX_SVG_RESET, SVGResetValues, SizingValues, SurroundValues,
+    AlignmentValues, BackgroundValues, BorderLayoutFacts, BorderValues, BoxValues, ComputedAspectRatio, ComputedGap,
+    ComputedLengthPercentageOrAuto, ComputedSize, ComputedSizeKind, ComputedStyleValueHandle, EffectsValues,
+    FontLayoutFacts, FontValues, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextLayoutFacts,
+    InheritedTextValues, InheritedUIValues, MaskValues, MiscResetValues, STYLE_GROUP_INDEX_ALIGNMENT,
+    STYLE_GROUP_INDEX_BACKGROUND, STYLE_GROUP_INDEX_BORDER, STYLE_GROUP_INDEX_BOX, STYLE_GROUP_INDEX_EFFECTS,
+    STYLE_GROUP_INDEX_FONT, STYLE_GROUP_INDEX_GRID, STYLE_GROUP_INDEX_INHERITED_BOX, STYLE_GROUP_INDEX_INHERITED_LIST,
+    STYLE_GROUP_INDEX_INHERITED_SVG, STYLE_GROUP_INDEX_INHERITED_TABLE, STYLE_GROUP_INDEX_INHERITED_TEXT,
+    STYLE_GROUP_INDEX_INHERITED_UI, STYLE_GROUP_INDEX_MASK, STYLE_GROUP_INDEX_MISC_RESET, STYLE_GROUP_INDEX_SIZING,
+    STYLE_GROUP_INDEX_SURROUND, STYLE_GROUP_INDEX_SVG_RESET, STYLE_GROUP_INDEX_TEXT_RESET, STYLE_GROUP_INDEX_TRANSFORM,
+    SVGResetValues, SizingValues, SurroundValues, TextResetValues, TransformValues,
 };
 use crate::css::computed_values::{InheritedBoxValues, InheritedTableValues};
 use crate::css::css_pixels::CssPixels;
@@ -48,12 +52,11 @@ pub(crate) fn px_calc_resolution_context(percentage_basis: CssPixels) -> calc::F
 
 pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: CssPixels) -> CssPixels {
     assert!(!calculated.is_null());
-    let context = px_calc_resolution_context(percentage_basis);
-    // SAFETY: The style value stays alive for the pass and the context
-    // carries no host callbacks.
-    let result = unsafe { calc::rust_calc_resolve(calculated, &raw const context, true) };
-    assert!(result.resolved);
-    CssPixels::nearest_value_for(result.value)
+    // SAFETY: The style value stays alive for the pass.
+    let value = unsafe { &*calculated.cast::<StyleValueData>() };
+    let resolved = crate::css::calc::resolve_calculated_length_without_context(value, percentage_basis.to_double())
+        .expect("computed length-percentage calc failed to resolve");
+    CssPixels::nearest_value_for(resolved)
 }
 
 /// A borrowed computed `<length-percentage>`: a retained length, percentage
@@ -62,6 +65,12 @@ pub(crate) fn resolve_calc_to_px(calculated: *const c_void, percentage_basis: Cs
 #[derive(Clone, Copy)]
 pub(crate) struct LengthPercentageRef<'a> {
     value: &'a StyleValueData,
+}
+
+impl<'a> LengthPercentageRef<'a> {
+    pub(crate) fn over(value: &'a StyleValueData) -> Self {
+        Self { value }
+    }
 }
 
 impl LengthPercentageRef<'_> {
@@ -504,7 +513,7 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    fn svg_reset(self) -> &'a SVGResetValues {
+    pub(crate) fn svg_reset(self) -> &'a SVGResetValues {
         self.native_group(STYLE_GROUP_INDEX_SVG_RESET)
     }
 
@@ -531,6 +540,95 @@ impl<'a> ComputedValuesView<'a> {
     #[inline]
     fn border_facts(self) -> &'a BorderLayoutFacts {
         self.native_group(STYLE_GROUP_INDEX_BORDER)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn content_visibility(self) -> u8 {
+        self.inherited_box().content_visibility
+    }
+
+    #[inline]
+    pub(crate) fn image_rendering(self) -> u8 {
+        self.inherited_box().image_rendering
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn empty_cells(self) -> u8 {
+        self.inherited_table().empty_cells
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn border(self) -> &'a BorderValues {
+        self.native_group(STYLE_GROUP_INDEX_BORDER)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_list(self) -> &'a InheritedListValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_LIST)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_ui(self) -> &'a InheritedUIValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_UI)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_svg(self) -> &'a InheritedSVGValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_SVG)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn inherited_text(self) -> &'a InheritedTextValues {
+        self.native_group(STYLE_GROUP_INDEX_INHERITED_TEXT)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn font(self) -> &'a FontValues {
+        self.native_group(STYLE_GROUP_INDEX_FONT)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn effects(self) -> &'a EffectsValues {
+        self.native_group(STYLE_GROUP_INDEX_EFFECTS)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn mask(self) -> &'a MaskValues {
+        self.native_group(STYLE_GROUP_INDEX_MASK)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn text_reset(self) -> &'a TextResetValues {
+        self.native_group(STYLE_GROUP_INDEX_TEXT_RESET)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn transform(self) -> &'a TransformValues {
+        self.native_group(STYLE_GROUP_INDEX_TRANSFORM)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn background(self) -> &'a BackgroundValues {
+        self.native_group(STYLE_GROUP_INDEX_BACKGROUND)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn misc_reset(self) -> &'a MiscResetValues {
+        self.native_group(STYLE_GROUP_INDEX_MISC_RESET)
     }
 
     #[inline]

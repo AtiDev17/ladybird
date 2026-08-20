@@ -678,7 +678,8 @@ void DisplayListPlayerSkia::play_command(PaintTextShadow const& command)
         .glyph_bounding_rect = command.shadow_bounding_rect,
         .translation = command.draw_location + command.text_rect.location().to_type<float>(),
         .scale = command.scale,
-        .color = command.color.with_alpha(255) });
+        .color = command.color.with_alpha(255),
+        .orientation = Gfx::Orientation::Horizontal });
     canvas.restore();
 }
 
@@ -757,7 +758,7 @@ SkPaint DisplayListPlayerSkia::paint_style_to_skia_paint(DisplayListPaintStyle c
             make_shader);
     };
 
-    switch (paint_style.type) {
+    switch (paint_style.paint_style_type) {
     case DisplayListPaintStyleType::None:
         return {};
     case DisplayListPaintStyleType::LinearGradient:

@@ -77,7 +77,7 @@
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
-#include <LibWeb/Painting/StackingContext.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
@@ -581,11 +581,9 @@ void ConnectionFromClient::debug_request(u64 page_id, ByteString request, ByteSt
             if (auto* viewport = doc->layout_node()) {
                 auto& viewport_paintable = static_cast<Web::Painting::ViewportPaintable&>(*viewport->paintable_box());
                 viewport_paintable.build_stacking_context_tree_if_needed();
-                if (auto stacking_context = viewport_paintable.stacking_context()) {
-                    StringBuilder builder;
-                    stacking_context->dump(builder);
-                    dbgln("{}", builder.string_view());
-                }
+                StringBuilder builder;
+                Web::Painting::dump_stacking_context_tree(builder, viewport_paintable);
+                dbgln("{}", builder.string_view());
             }
         }
         return;
@@ -1198,7 +1196,7 @@ static Optional<JsonObject> flex_layout_for_node(Web::DOM::Node const& node)
     if (!paintable_box)
         return {};
 
-    auto const* flex_layout_data = paintable_box->flex_layout_data();
+    auto flex_layout_data = paintable_box->flex_layout_data();
     if (!flex_layout_data)
         return {};
 
@@ -1222,7 +1220,7 @@ static Optional<JsonObject> grid_layout_for_node(Web::DOM::Node const& node)
     if (!paintable_box)
         return {};
 
-    auto const* grid_layout_data = paintable_box->grid_layout_data();
+    auto grid_layout_data = paintable_box->grid_layout_data();
     if (!grid_layout_data)
         return {};
 
@@ -2037,9 +2035,7 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
 
     auto& viewport_paintable = static_cast<Web::Painting::ViewportPaintable&>(*layout_root->paintable_box());
     viewport_paintable.build_stacking_context_tree_if_needed();
-    if (auto stacking_context = viewport_paintable.stacking_context()) {
-        stacking_context->dump(builder);
-    }
+    Web::Painting::dump_stacking_context_tree(builder, viewport_paintable);
 }
 
 static void append_gc_graph(StringBuilder& builder)

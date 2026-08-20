@@ -34,6 +34,13 @@ enum class MouseAction : u8 {
 
 AK_ENUM_BITWISE_OPERATORS(MouseAction);
 
+enum class ChromeWidgetKind : u8 {
+    None,
+    ResizeHandle,
+    HorizontalScrollbar,
+    VerticalScrollbar,
+};
+
 class ChromeWidget
     : public RefCounted<ChromeWidget>
     , public Weakable<ChromeWidget> {

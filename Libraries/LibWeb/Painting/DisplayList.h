@@ -24,7 +24,6 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
-#include <LibWeb/Painting/DisplayListCommandRange.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/ScrollState.h>
 
@@ -106,6 +105,13 @@ public:
         return adopt_ref(*new DisplayList(visual_context_tree.version()));
     }
 
+    static NonnullRefPtr<DisplayList> create_from_command_bytes(AccumulatedVisualContextTree const& visual_context_tree, ByteBuffer&& command_bytes)
+    {
+        auto display_list = create(visual_context_tree);
+        display_list->m_command_bytes = move(command_bytes);
+        return display_list;
+    }
+
     template<DisplayListCommand Command>
     bool append(Command const& command, AccumulatedVisualContextTree const& visual_context_tree, VisualContextIndex context_index, bool context_geometry_only, ReadonlyBytes inline_data = {})
     {
@@ -154,9 +160,6 @@ public:
     {
         for_each_command_header(command_bytes(), move(callback));
     }
-
-    u32 append_command_range_from(DisplayList const& source_display_list, DisplayListCommandRange, AccumulatedVisualContextTree const&, VisualContextIndex recorded_context_index, VisualContextIndex current_context_index);
-    size_t command_byte_size() const { return m_command_bytes.size(); }
 
 private:
     explicit DisplayList(u64 compatible_visual_context_tree_version);

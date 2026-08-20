@@ -16,6 +16,7 @@
 #include <AK/kmalloc.h>
 #include <LibGC/Ptr.h>
 #include <LibGfx/AffineTransform.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
@@ -25,18 +26,18 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/FlexLayoutData.h>
 #include <LibWeb/Layout/GridLayoutData.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/BackgroundPainting.h>
+#include <LibWeb/Painting/BorderRadiiData.h>
+#include <LibWeb/Painting/BordersData.h>
 #include <LibWeb/Painting/BoxModelMetrics.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/ChromeWidget.h>
-#include <LibWeb/Painting/CollapsedTableBorders.h>
 #include <LibWeb/Painting/DisplayList.h>
-#include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
-#include <LibWeb/Painting/ScrollNodeState.h>
+#include <LibWeb/Painting/ScrollState.h>
 #include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/RefCountedTreeNode.h>
@@ -53,6 +54,7 @@ class Scrollbar;
 
 WEB_API void set_paint_viewport_scrollbars(bool enabled);
 bool should_paint_viewport_scrollbars();
+CSS::ScrollbarColorData scrollbar_colors_for_paint(Paintable const&);
 ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView computed_filter, Paintable const& paintable_box);
 
 // Walks layout ancestors so it also covers content of unconnected resource subtrees.
@@ -72,19 +74,6 @@ struct UsedGridTrackList {
     Vector<CSSPixels> track_sizes;
 };
 
-struct MaskLayerPresence {
-    MaskLayerOrigin origin;
-    CSSPixelRect area;
-    Gfx::MaskKind kind { Gfx::MaskKind::Alpha };
-};
-
-enum class MaskLayerSet : u8 {
-    CssAndSvg,
-    SvgOnly,
-};
-
-bool register_mask_display_lists(DisplayListRecordingContext&, Paintable const&, MaskLayerSet);
-
 class WEB_API Paintable
     : public RefCounted<Paintable>
     , public Weakable<Paintable>
@@ -97,18 +86,15 @@ public:
     virtual StringView class_name() const { return "Paintable"sv; }
 
     [[nodiscard]] bool is_visible() const;
-    [[nodiscard]] bool is_positioned() const { return m_positioned; }
-    [[nodiscard]] bool is_fixed_position() const { return m_fixed_position; }
-    [[nodiscard]] bool is_sticky_position() const { return m_sticky_position; }
-    [[nodiscard]] bool is_absolutely_positioned() const { return m_absolutely_positioned; }
-    [[nodiscard]] bool is_floating() const { return m_floating; }
-    [[nodiscard]] bool is_inline() const { return m_inline; }
-    [[nodiscard]] CSS::Display display() const { return m_display; }
+    [[nodiscard]] bool is_positioned() const { return has_flag(Layout::RustFFI::PaintableFlag::Positioned); }
+    [[nodiscard]] bool is_fixed_position() const { return has_flag(Layout::RustFFI::PaintableFlag::FixedPosition); }
+    [[nodiscard]] bool is_sticky_position() const { return has_flag(Layout::RustFFI::PaintableFlag::StickyPosition); }
+    [[nodiscard]] bool is_absolutely_positioned() const { return has_flag(Layout::RustFFI::PaintableFlag::AbsolutelyPositioned); }
+    [[nodiscard]] bool is_floating() const { return has_flag(Layout::RustFFI::PaintableFlag::Floating); }
+    [[nodiscard]] bool is_inline() const { return has_flag(Layout::RustFFI::PaintableFlag::Inline); }
+    [[nodiscard]] CSS::Display display() const;
 
     bool has_stacking_context() const;
-    RefPtr<StackingContext> enclosing_stacking_context();
-
-    void paint_inspector_overlay(DisplayListRecordingContext&) const;
 
     virtual bool forms_unconnected_subtree() const { return false; }
 
@@ -131,7 +117,7 @@ public:
     GC::Ptr<HTML::LocalNavigable> navigable() const;
 
     RefPtr<Paintable> containing_block() const;
-    Paintable const* containing_block_ptr() const { return m_containing_block; }
+    Paintable const* containing_block_ptr() const;
 
     template<typename T>
     bool fast_is() const = delete;
@@ -144,7 +130,6 @@ public:
 
     [[nodiscard]] virtual bool foreground_paints_descendant_content() const { return false; }
 
-    [[nodiscard]] bool has_css_borders() const;
     [[nodiscard]] virtual bool is_svg_svg_paintable() const { return false; }
     [[nodiscard]] virtual bool is_svg_path_paintable() const { return false; }
     [[nodiscard]] virtual bool is_svg_graphics_paintable() const { return false; }
@@ -165,7 +150,7 @@ public:
 
     using SelectionState = Painting::SelectionState;
 
-    SelectionState selection_state() const { return m_selection_state; }
+    SelectionState selection_state() const { return static_cast<SelectionState>(rust_data().selection_state); }
     void set_selection_state(SelectionState state);
 
     struct TextDecorationStyle {
@@ -193,38 +178,29 @@ public:
 
     virtual void reset_for_relayout();
 
+    Layout::RustFFI::PaintableSlotId rust_slot() const { return m_rust_slot; }
+    Layout::NodeArena& rust_arena() const { return *m_rust_arena; }
+    Layout::RustFFI::PaintableData const& rust_data() const { return *m_rust_data; }
+
     // The viewBox/preserveAspectRatio transform a viewport-establishing box applies to its
     // content, in content-box-local user coordinates. Presence marks the paintable as
     // viewport-establishing for the accumulated visual context tree.
     virtual Optional<Gfx::AffineTransform> svg_viewport_transform() const { return {}; }
     virtual void set_svg_viewport_transform(Gfx::AffineTransform) { VERIFY_NOT_REACHED(); }
 
-    virtual void paint(DisplayListRecordingContext&, PaintPhase) const;
-    virtual void record_hit_test_items(DisplayListRecordingContext&, PaintPhase) const;
-    void record_async_scrolling_metadata(DisplayListRecordingContext&) const;
-
     bool should_paint_cursor() const;
 
     // Callers are responsible for checking that the element is empty and visible.
-    void record_empty_editable_hit_test_item(HitTestDisplayList&) const;
 
-    RefPtr<StackingContext> stacking_context();
-    RefPtr<StackingContext const> stacking_context() const;
-    void set_stacking_context(NonnullRefPtr<StackingContext>);
     void invalidate_stacking_context();
     Optional<int> effective_z_index() const;
 
     virtual Optional<CSSPixelRect> get_mask_area() const { return {}; }
     virtual Optional<Gfx::MaskKind> get_mask_type() const { return {}; }
-    virtual Optional<DisplayListResource> calculate_mask(DisplayListRecordingContext&, CSSPixelRect const&) const { return {}; }
 
     virtual Optional<CSSPixelRect> get_clip_area() const { return {}; }
-    virtual Optional<DisplayListResource> calculate_clip(DisplayListRecordingContext&, CSSPixelRect const&) const { return {}; }
 
-    Vector<MaskLayerPresence, 3> mask_layer_presence(MaskLayerSet) const;
-
-    auto& box_model() { return m_box_model; }
-    auto const& box_model() const { return m_box_model; }
+    BoxModelMetrics box_model() const;
 
     struct OverflowData {
         CSSPixelRect scrollable_overflow_rect;
@@ -258,19 +234,18 @@ public:
     void set_offset(CSSPixelPoint);
     void set_offset(float x, float y) { set_offset({ x, y }); }
 
-    CSSPixelSize const& content_size() const { return m_content_size; }
+    CSSPixelSize content_size() const;
     void set_content_size(CSSPixelSize);
     void set_content_size(CSSPixels width, CSSPixels height) { set_content_size({ width, height }); }
 
     void set_content_width(CSSPixels width) { set_content_size(width, content_height()); }
     void set_content_height(CSSPixels height) { set_content_size(content_width(), height); }
-    CSSPixels content_width() const { return m_content_size.width(); }
-    CSSPixels content_height() const { return m_content_size.height(); }
+    CSSPixels content_width() const { return content_size().width(); }
+    CSSPixels content_height() const { return content_size().height(); }
 
     CSSPixelRect absolute_rect() const;
     CSSPixelRect absolute_padding_box_rect() const;
     CSSPixelRect absolute_border_box_rect() const;
-    CSSPixelRect overflow_clip_edge_rect() const;
 
     CSSPixels border_box_width() const
     {
@@ -288,38 +263,23 @@ public:
     CSSPixels absolute_y() const { return absolute_rect().y(); }
     CSSPixelPoint absolute_position() const { return absolute_rect().location(); }
 
-    void set_containing_line_box_index(size_t line_box_index) { m_containing_line_box_index = line_box_index; }
-    Optional<size_t> containing_line_box_index() const { return m_containing_line_box_index; }
-    Optional<CSSPixelRect> absolute_containing_line_box_rect() const;
-
     CSSPixelPoint transform_to_local_coordinates(CSSPixelPoint position) const;
 
     [[nodiscard]] bool has_scrollable_overflow() const;
 
     [[nodiscard]] bool has_css_transform() const;
 
-    [[nodiscard]] bool has_non_invertible_css_transform() const { return m_has_non_invertible_css_transform; }
-    void set_has_non_invertible_css_transform(bool value) { m_has_non_invertible_css_transform = value; }
-
-    [[nodiscard]] bool overflow_property_applies() const;
+    [[nodiscard]] bool has_non_invertible_css_transform() const { return has_flag(Layout::RustFFI::PaintableFlag::HasNonInvertibleCssTransform); }
 
     [[nodiscard]] Optional<CSSPixelRect> scrollable_overflow_rect() const;
 
-    [[nodiscard]] Optional<OverflowData> const& overflow_data() const { return m_overflow_data; }
-    void set_overflow_data(OverflowData data) { m_overflow_data = move(data); }
-    void clear_overflow_data() { m_overflow_data.clear(); }
+    [[nodiscard]] Optional<OverflowData> overflow_data() const;
+    void set_overflow_data(OverflowData);
+    void clear_overflow_data();
 
-    Optional<CachedOverflowData> const& cached_overflow_data() const { return m_cached_overflow_data; }
-    void set_cached_overflow_data(CachedOverflowData data) { m_cached_overflow_data = move(data); }
-    void clear_cached_overflow_data() { m_cached_overflow_data.clear(); }
-    void set_layout_fragment_identity(u64 identity)
-    {
-        VERIFY(identity);
-        if (m_layout_fragment_identity == identity)
-            return;
-        m_layout_fragment_identity = identity;
-        clear_cached_overflow_data();
-    }
+    Optional<CachedOverflowData> cached_overflow_data() const;
+    void set_cached_overflow_data(CachedOverflowData);
+    void clear_cached_overflow_data();
 
     virtual void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
 
@@ -350,18 +310,7 @@ public:
     RefPtr<Scrollbar> scrollbar(ScrollDirection) const;
     NonnullRefPtr<Scrollbar> ensure_scrollbar(ScrollDirection);
 
-    void set_uses_collapsing_borders_model(bool value) { m_uses_collapsing_borders_model = value; }
-    bool uses_collapsing_borders_model() const { return m_uses_collapsing_borders_model; }
-
-    void set_collapsed_table_borders(OwnPtr<CollapsedTableBorders> collapsed_table_borders) { m_collapsed_table_borders = move(collapsed_table_borders); }
-    CollapsedTableBorders const* collapsed_table_borders() const { return m_collapsed_table_borders.ptr(); }
-
-    enum class ShrinkRadiiForBorders {
-        Yes,
-        No
-    };
-
-    BorderRadiiData normalized_border_radii_data(ShrinkRadiiForBorders shrink = ShrinkRadiiForBorders::No) const;
+    bool uses_collapsing_borders_model() const { return rust_data().uses_collapsing_borders_model; }
 
     BorderRadiiData border_radii_data() const;
 
@@ -371,12 +320,6 @@ public:
 
     void set_filter(ResolvedCSSFilter filter) { m_filter = move(filter); }
     ResolvedCSSFilter const& filter() const { return m_filter; }
-
-    // Box-size-keyed memo of size-dependent image painting state (resolved gradient
-    // data), so image style values stay immutable shared data.
-    CSS::ResolvedImage const& resolved_image_for_size(CSS::AbstractImageStyleValue const&, CSSPixelSize) const;
-
-    Optional<CSSPixelRect> get_clip_rect() const;
 
     struct PhysicalResizeAxes {
         bool horizontal;
@@ -396,115 +339,63 @@ public:
     RefPtr<Paintable const> nearest_scrollable_ancestor() const;
 
     using StickyInsets = Painting::StickyInsets;
-    bool has_sticky_insets() const { return !!m_sticky_insets; }
-    StickyInsets const& sticky_insets() const { return *m_sticky_insets; }
-    void set_sticky_insets(OwnPtr<StickyInsets> sticky_insets) { m_sticky_insets = move(sticky_insets); }
+    bool has_sticky_insets() const { return rust_data().has_sticky_insets; }
+    StickyInsets sticky_insets() const;
+    void set_sticky_insets(OwnPtr<StickyInsets>);
 
     [[nodiscard]] bool could_be_scrolled_by_wheel_event() const;
     [[nodiscard]] bool could_be_scrolled_by_wheel_event(ScrollDirection direction) const;
 
-    void set_used_values_for_grid_template_columns(UsedGridTrackList used_values) { m_used_values_for_grid_template_columns = move(used_values); }
-    Optional<UsedGridTrackList> const& used_values_for_grid_template_columns() const { return m_used_values_for_grid_template_columns; }
+    Optional<UsedGridTrackList> used_values_for_grid_template_columns() const;
+    Optional<UsedGridTrackList> used_values_for_grid_template_rows() const;
+    OwnPtr<Layout::GridLayoutData> grid_layout_data() const;
+    OwnPtr<Layout::FlexLayoutData> flex_layout_data() const;
 
-    void set_used_values_for_grid_template_rows(UsedGridTrackList used_values) { m_used_values_for_grid_template_rows = move(used_values); }
-    Optional<UsedGridTrackList> const& used_values_for_grid_template_rows() const { return m_used_values_for_grid_template_rows; }
-
-    void set_grid_layout_data(OwnPtr<Layout::GridLayoutData> grid_layout_data) { m_grid_layout_data = move(grid_layout_data); }
-    Layout::GridLayoutData const* grid_layout_data() const { return m_grid_layout_data.ptr(); }
-    void set_flex_layout_data(OwnPtr<Layout::FlexLayoutData> flex_layout_data) { m_flex_layout_data = move(flex_layout_data); }
-    Layout::FlexLayoutData const* flex_layout_data() const { return m_flex_layout_data.ptr(); }
-    void paint_flexbox_inspector_overlay(DisplayListRecordingContext&, FlexboxInspectorOverlayOptions const&) const;
-    void paint_grid_inspector_overlay(DisplayListRecordingContext&, GridInspectorOverlayOptions const&) const;
-
-    void set_enclosing_scroll_node_index(VisualContextIndex index) { m_enclosing_scroll_node_index = index; }
-    void set_own_scroll_node_index(VisualContextIndex index) { m_own_scroll_node_index = index; }
-
-    void set_accumulated_visual_context(VisualContextIndex index)
-    {
-        m_accumulated_visual_context_index = index;
-        m_has_accumulated_visual_context = true;
-    }
-    [[nodiscard]] bool has_accumulated_visual_context() const { return m_has_accumulated_visual_context; }
-    [[nodiscard]] VisualContextIndex accumulated_visual_context_index() const { return m_accumulated_visual_context_index; }
-    void set_accumulated_visual_context_for_descendants(VisualContextIndex index) { m_accumulated_visual_context_for_descendants_index = index; }
-    [[nodiscard]] VisualContextIndex accumulated_visual_context_for_descendants_index() const { return m_accumulated_visual_context_for_descendants_index; }
+    [[nodiscard]] bool has_accumulated_visual_context() const { return rust_data().has_accumulated_visual_context; }
+    [[nodiscard]] VisualContextIndex accumulated_visual_context_index() const { return VisualContextIndex { rust_data().accumulated_visual_context_index }; }
+    [[nodiscard]] VisualContextIndex accumulated_visual_context_for_descendants_index() const { return VisualContextIndex { rust_data().accumulated_visual_context_for_descendants_index }; }
 
     Optional<CSSPixelPoint> transform_point_to_local(CSSPixelPoint screen_position) const;
     Optional<CSSPixelPoint> transform_point_to_local_for_descendants(CSSPixelPoint screen_position) const;
     CSSPixelRect transform_rect_to_viewport(CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform = AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes) const;
     CSSPixelPoint inverse_transform_point(CSSPixelPoint screen_position) const;
 
-    static constexpr size_t paint_phase_count = to_underlying(PaintPhase::Overlay) + 1;
-
     void invalidate_paint_cache() const;
     void invalidate_propagated_text_decoration_caches() const;
     void repaint_after_style_change(CSS::RequiredInvalidationAfterStyleChange const&);
 
-    // Commands recorded under an empty effective clip are dropped at append time, so a cached range is
-    // usable only while the emptiness of the phase's effective clip matches what it was at capture time.
-    struct CachedCommandRange {
-        DisplayListCommandRange range;
-        VisualContextIndex recorded_context_index {};
-    };
-    Optional<CachedCommandRange> valid_cached_commands(PaintPhase, u64 source_display_list_id, bool phase_has_empty_effective_clip) const;
-    void set_cached_commands(PaintPhase, u64 display_list_id, DisplayListCommandRange, VisualContextIndex recorded_context_index, bool captured_under_empty_effective_clip) const;
-
-    // A capture may hold hit-test items recorded under both this paintable's own context index and its
-    // descendants' context index, so spliced items are not rewritten; instead a cached range is usable
-    // only while both indices still match what they were at capture time.
-    struct HitTestItemRange {
-        u32 start { 0 };
-        u32 count { 0 };
-    };
-    Optional<HitTestItemRange> valid_cached_hit_test_items(PaintPhase, u64 source_hit_test_display_list_id) const;
-    void set_cached_hit_test_items(PaintPhase, u64 hit_test_display_list_id, HitTestItemRange) const;
-
-    void set_fixed_background_visual_context(VisualContextIndex index) { m_fixed_background_visual_context = index; }
-    [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const { return m_fixed_background_visual_context; }
-
-    // Range of visual context nodes this box appended during the last tree build, used for in-place value patching.
-    void set_visual_context_node_range(size_t begin, size_t end)
+    [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const
     {
-        m_visual_context_nodes_begin = begin;
-        m_visual_context_nodes_end = end;
+        if (!rust_data().has_fixed_background_visual_context)
+            return {};
+        return VisualContextIndex { rust_data().fixed_background_visual_context };
     }
-    [[nodiscard]] size_t visual_context_nodes_begin() const { return m_visual_context_nodes_begin; }
-    [[nodiscard]] size_t visual_context_nodes_end() const { return m_visual_context_nodes_end; }
 
-    [[nodiscard]] VisualContextIndex enclosing_scroll_node_index() const { return m_enclosing_scroll_node_index; }
+    [[nodiscard]] size_t visual_context_nodes_begin() const { return rust_data().visual_context_nodes_begin; }
+    [[nodiscard]] size_t visual_context_nodes_end() const { return rust_data().visual_context_nodes_end; }
 
-    [[nodiscard]] VisualContextIndex own_scroll_node_index() const { return m_own_scroll_node_index; }
+    [[nodiscard]] VisualContextIndex enclosing_scroll_node_index() const { return VisualContextIndex { rust_data().enclosing_scroll_node_index }; }
+
+    [[nodiscard]] VisualContextIndex own_scroll_node_index() const { return VisualContextIndex { rust_data().own_scroll_node_index }; }
 
 protected:
     explicit Paintable(Layout::NodeWithStyle const&);
     explicit Paintable(Layout::Box const&);
 
-    void paint_with_inspector_overlay_context(DisplayListRecordingContext&, Function<void()> const&) const;
-
-    virtual void paint_border(DisplayListRecordingContext&) const;
-    virtual void paint_backdrop_filter(DisplayListRecordingContext&) const;
-    virtual void paint_background(DisplayListRecordingContext&) const;
-    virtual void paint_box_shadow(DisplayListRecordingContext&) const;
-
-    void paint_border(DisplayListRecordingContext&, CSSPixelRect const& border_box_rect, BordersData const&, BorderRadiiData const&) const;
-    void paint_background_within(DisplayListRecordingContext&, CSSPixelRect const& background_rect, BorderRadiiData const&) const;
-    void paint_box_shadow(DisplayListRecordingContext&, CSSPixelRect const& border_box_rect, CSSPixelRect const& padding_box_rect, BorderRadiiData const&) const;
-    void paint_outline(DisplayListRecordingContext&, CSSPixelRect const& border_box_rect, BorderRadiiData const&) const;
-    void paint_focused_area_outline(DisplayListRecordingContext&) const;
-
-    virtual void paint_inspector_overlay_internal(DisplayListRecordingContext&) const;
-
+public:
+protected:
     virtual CSSPixelRect compute_absolute_rect() const;
     virtual CSSPixelRect compute_absolute_padding_box_rect() const;
     virtual CSSPixelRect compute_absolute_border_box_rect() const;
 
     CSSPixels available_scrollbar_length(ScrollDirection direction, ChromeMetrics const& chrome_metrics) const;
+
+public:
     Optional<CSSPixelRect> absolute_resizer_rect(ChromeMetrics const& chrome_metrics) const;
 
 private:
     friend class Layout::LayoutRustBridge;
 
-    struct CachedPaintData;
     enum class InvalidateDescendantGeometry {
         No,
         Yes,
@@ -512,77 +403,31 @@ private:
 
     void detach_from_layout_node(Badge<Layout::Node>);
     void detach_chrome_widgets();
-    void set_containing_block(Paintable* containing_block);
     GC::Ptr<DOM::EventTarget> scroll_event_target();
 
-    void paint_middle_button_scroll_indicator(DisplayListRecordingContext&) const;
     void invalidate_absolute_geometry_cache(InvalidateDescendantGeometry);
     void translate_reused_subtree_absolute_geometry(CSSPixelPoint);
 
+    bool has_flag(Layout::RustFFI::PaintableFlag flag) const { return (rust_data().flags & to_underlying(flag)) != 0; }
+    Layout::RustFFI::PaintableData& rust_data() { return *m_rust_data; }
+
     GC::Weak<DOM::Node> m_dom_node;
     WeakPtr<Layout::NodeWithStyle const> m_layout_node;
-    Paintable* m_containing_block { nullptr };
 
-    SelectionState m_selection_state { SelectionState::None };
-
-    bool m_positioned : 1 { false };
-    bool m_fixed_position : 1 { false };
-    bool m_sticky_position : 1 { false };
-    bool m_absolutely_positioned : 1 { false };
-    bool m_floating : 1 { false };
-    bool m_inline : 1 { false };
-    bool m_uses_collapsing_borders_model : 1 { false };
-    CSS::Display m_display;
-
-    RefPtr<StackingContext> m_stacking_context;
-
-    Optional<OverflowData> m_overflow_data;
-    Optional<CachedOverflowData> m_cached_overflow_data;
-    u64 m_layout_fragment_identity { 0 };
-
-    CSSPixelPoint m_offset;
-    CSSPixelSize m_content_size;
+    NonnullRefPtr<Layout::NodeArena> m_rust_arena;
+    Layout::RustFFI::PaintableSlotId m_rust_slot {};
+    u32 m_rust_slot_generation { 0 };
+    Layout::RustFFI::PaintableData* m_rust_data { nullptr };
 
     Optional<CSSPixelRect> mutable m_absolute_rect;
     Optional<CSSPixelRect> mutable m_absolute_padding_box_rect;
     Optional<CSSPixelRect> mutable m_absolute_border_box_rect;
 
-    VisualContextIndex m_enclosing_scroll_node_index {};
-    VisualContextIndex m_own_scroll_node_index {};
-    bool m_has_accumulated_visual_context { false };
-    VisualContextIndex m_accumulated_visual_context_index { VISUAL_VIEWPORT_NODE_INDEX };
-    VisualContextIndex m_accumulated_visual_context_for_descendants_index { VISUAL_VIEWPORT_NODE_INDEX };
-    Optional<VisualContextIndex> m_fixed_background_visual_context;
-    size_t m_visual_context_nodes_begin { 0 };
-    size_t m_visual_context_nodes_end { 0 };
-
-    OwnPtr<CollapsedTableBorders> m_collapsed_table_borders;
-    Optional<size_t> m_containing_line_box_index;
-
     ResolvedCSSFilter m_filter;
-
-    struct ResolvedImageForSize {
-        RefPtr<CSS::AbstractImageStyleValue const> image;
-        CSSPixelSize size;
-        CSS::ResolvedImage resolved;
-    };
-    mutable Vector<ResolvedImageForSize> m_resolved_images_for_size;
 
     RefPtr<Scrollbar> m_horizontal_scrollbar;
     RefPtr<Scrollbar> m_vertical_scrollbar;
     RefPtr<ResizeHandle> m_resize_handle;
-    bool m_has_non_invertible_css_transform { false };
-
-    OwnPtr<StickyInsets> m_sticky_insets;
-
-    Optional<UsedGridTrackList> m_used_values_for_grid_template_columns;
-    Optional<UsedGridTrackList> m_used_values_for_grid_template_rows;
-    OwnPtr<Layout::GridLayoutData> m_grid_layout_data;
-    OwnPtr<Layout::FlexLayoutData> m_flex_layout_data;
-
-    BoxModelMetrics m_box_model;
-
-    mutable OwnPtr<CachedPaintData> m_cached_paint_data;
 };
 
 template<>

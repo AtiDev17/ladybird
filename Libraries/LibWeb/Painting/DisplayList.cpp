@@ -16,19 +16,6 @@ namespace Web::Painting {
 
 static Atomic<u64> s_next_id { 1 };
 
-static void set_command_sequence_visual_context(Bytes command_bytes, VisualContextIndex context_index)
-{
-    for (size_t offset = 0; offset < command_bytes.size();) {
-        VERIFY(offset + sizeof(DisplayListCommandHeader) <= command_bytes.size());
-        auto* header_data = command_bytes.data() + offset;
-        auto header = read_display_list_object<DisplayListCommandHeader>({ header_data, command_bytes.size() - offset });
-        header.context_index = context_index;
-        write_display_list_object(Bytes { header_data, sizeof(header) }, header);
-        offset += sizeof(header) + header.payload_size;
-        VERIFY(offset <= command_bytes.size());
-    }
-}
-
 DisplayList::DisplayList(u64 compatible_visual_context_tree_version)
     : m_compatible_visual_context_tree_version(compatible_visual_context_tree_version)
     , m_id(s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
@@ -68,7 +55,7 @@ bool DisplayList::append_bytes(
     auto trailing_padding = align_up_to(record_size, command_alignment) - record_size;
     VERIFY(trailing_padding <= NumericLimits<u32>::max() - payload_size);
     DisplayListCommandHeader header {
-        .type = type,
+        .command_type = type,
         .payload_size = static_cast<u32>(payload_size + trailing_padding),
         .context_index = context_index,
         .context_geometry_only = context_geometry_only,
@@ -83,32 +70,6 @@ bool DisplayList::append_bytes(
         m_command_bytes.append(inline_data.data(), inline_data.size());
     m_command_bytes.resize(m_command_bytes.size() + trailing_padding, ByteBuffer::ZeroFillNewElements::Yes);
     return true;
-}
-
-u32 DisplayList::append_command_range_from(
-    DisplayList const& source_display_list,
-    DisplayListCommandRange source_range,
-    AccumulatedVisualContextTree const& visual_context_tree,
-    VisualContextIndex recorded_context_index,
-    VisualContextIndex current_context_index)
-{
-    VERIFY(&source_display_list != this);
-    VERIFY(visual_context_tree.version() == m_compatible_visual_context_tree_version);
-    VERIFY(m_command_bytes.size() % DisplayList::command_alignment == 0);
-    VERIFY(source_range.size % DisplayList::command_alignment == 0);
-    VERIFY(static_cast<size_t>(source_range.offset) + source_range.size <= source_display_list.m_command_bytes.size());
-
-    auto destination_offset = m_command_bytes.size();
-    VERIFY(destination_offset + source_range.size <= NumericLimits<u32>::max());
-    if (source_range.is_empty())
-        return static_cast<u32>(destination_offset);
-
-    m_command_bytes.append(source_display_list.m_command_bytes.data() + source_range.offset, source_range.size);
-    // The copied headers already carry the index the range was recorded under, so they only need rewriting
-    // when the paintable's context was assigned a different index since then.
-    if (recorded_context_index != current_context_index)
-        set_command_sequence_visual_context(m_command_bytes.span().slice(destination_offset, source_range.size), current_context_index);
-    return static_cast<u32>(destination_offset);
 }
 
 void DisplayListPlayer::execute(
@@ -369,6 +330,8 @@ void DisplayListPlayer::execute_impl(
                                  .compositing_and_blending_operator = effects->blend_mode,
                                  .has_filter = effects->gfx_filter.has_value(),
                                  .filter_data = {},
+                                 .has_mask_kind = false,
+                                 .mask_kind = {},
                              },
                     effects->gfx_filter.has_value() ? &effects->gfx_filter.value() : nullptr);
             } else {
@@ -405,7 +368,7 @@ void DisplayListPlayer::execute_impl(
     };
 
     DisplayList::for_each_command_header(commands, [&](DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (display_list_command_is_compositor_metadata(header.type))
+        if (display_list_command_is_compositor_metadata(header.command_type))
             return;
 
         if (backface_culled[header.context_index.value()])
@@ -424,7 +387,7 @@ void DisplayListPlayer::execute_impl(
             // Any clip that's located outside of the visible region is equivalent to a simple clip-rect,
             // so replace it with one to avoid doing unnecessary work.
             if (header.is_clip) {
-                if (header.type == DisplayListCommandType::AddClipRect)
+                if (header.command_type == DisplayListCommandType::AddClipRect)
                     play_command(read_display_list_command_payload<AddClipRect>(payload));
                 else
                     play_command(AddClipRect { bounding_rect.release_value().to_type<float>() });
@@ -445,7 +408,7 @@ void DisplayListPlayer::execute_impl(
             callback(command);
         };
 
-        switch (header.type) {
+        switch (header.command_type) {
 #define DISPATCH_DISPLAY_LIST_COMMAND(command_type, player_method)                    \
     case DisplayListCommandType::command_type:                                        \
         dispatch_command.template operator()<command_type>([&](auto const& command) { \

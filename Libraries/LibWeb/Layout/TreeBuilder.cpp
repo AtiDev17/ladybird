@@ -95,8 +95,6 @@ void LayoutTreeBuilderAccess::detach_layout_node(DOM::Node& node)
 void LayoutTreeBuilderAccess::register_svg_resource_reference(SVG::SVGElement& resource, DOM::Element& referencing_element)
 {
     resource.register_resource_box_referencing_element({}, referencing_element);
-    if (is<SVG::SVGPatternElement>(resource))
-        referencing_element.document().register_svg_pattern_referencing_element(referencing_element);
 }
 
 void LayoutTreeBuilderAccess::set_synthetic_pseudo_element_node(DOM::Element& element, CSS::PseudoElement pseudo_element, Layout::NodeWithStyle* layout_node)
@@ -728,6 +726,7 @@ static void transfer_saved_layout_state_to_replacement_box(Layout::Node& old_lay
 {
     if (auto* containing_block = old_layout_node.containing_block()) {
         if (auto* paintable_with_lines = as_if<Painting::PaintableWithLines>(containing_block->paintable().ptr())) {
+            RustFFI::layout_arena_paintable_transfer_fragments_to_replacement_node(paintable_with_lines->rust_arena().handle(), paintable_with_lines->rust_slot(), Node::slot_id(&old_layout_node), Node::slot_id(&new_layout_node));
             for (auto& fragment : paintable_with_lines->fragments()) {
                 if (fragment.has_layout_node() && &fragment.layout_node() == &old_layout_node)
                     fragment.set_layout_node(new_layout_node);
