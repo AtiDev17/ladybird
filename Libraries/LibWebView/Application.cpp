@@ -35,6 +35,7 @@
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
@@ -131,7 +132,9 @@ static void append_autocomplete_bookmarks(Vector<AutocompleteBookmark>& bookmark
                 .url = bookmark.url.serialize(URL::ExcludeFragment::Yes),
                 .title = bookmark.title,
                 .folder = parent_folder,
-                .favicon_base64_png = bookmark.favicon_base64_png,
+                .favicon_png = bookmark.favicon_hash.has_value()
+                    ? Application::favicon_store(IsPrivate::No).favicon_png(*bookmark.favicon_hash)
+                    : OptionalNone {},
             });
             continue;
         }
@@ -177,6 +180,13 @@ Application::~Application()
     m_browser_process = nullptr;
 
     s_the = nullptr;
+}
+
+FaviconStore& Application::favicon_store(IsPrivate is_private)
+{
+    return is_private == IsPrivate::Yes
+        ? *the().ensure_private_browsing_session().favicon_store
+        : *the().m_favicon_store;
 }
 
 HistoryStore& Application::history_store(IsPrivate is_private)
@@ -624,11 +634,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         warnln("    Configured lists: {}", m_browser_options.content_blocker_list_paths);
     }
 
-    initialize_actions();
-
     if (!m_event_loop)
         m_event_loop = &create_platform_event_loop();
     TRY(launch_services());
+
+    initialize_actions();
 
     return {};
 }
@@ -789,6 +799,7 @@ PrivateBrowsingSession& Application::ensure_private_browsing_session()
             .cookie_jar = CookieJar::create(IsPrivate::Yes),
             .storage_jar = StorageJar::create(),
             .hsts_store = HSTSStore::create(),
+            .favicon_store = FaviconStore::create(),
             .history_store = HistoryStore::create_disabled(),
             .session_store = SessionStore::create(),
         });
@@ -1129,6 +1140,7 @@ ErrorOr<void> Application::launch_services()
     };
 
     Optional<ByteString> history_database_directory;
+    bool should_remove_unreferenced_favicons = false;
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         auto database_path = profile().paths().data;
@@ -1195,13 +1207,27 @@ ErrorOr<void> Application::launch_services()
         else
             m_download_store = DownloadStore::create_disabled();
 
-        auto history_outcome = TRY(HistoryStore::migrate_schema(*m_history_database));
-        if (history_outcome == Database::MigrationOutcome::Success) {
+        // The History database is shared by the favicon and history stores. Preflight both before applying either
+        // migration so a database that is too new remains untouched.
+        auto favicons_outcome = TRY(FaviconStore::migrate_schema(*m_history_database, Database::MigrationMode::CheckOnly));
+        auto history_outcome = TRY(HistoryStore::migrate_schema(*m_history_database, Database::MigrationMode::CheckOnly));
+
+        if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
+            favicons_outcome = TRY(FaviconStore::migrate_schema(*m_history_database));
+            history_outcome = favicons_outcome == Database::MigrationOutcome::Success
+                ? TRY(HistoryStore::migrate_schema(*m_history_database))
+                : Database::MigrationOutcome::DatabaseTooNew;
+        }
+
+        if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
+            m_favicon_store = TRY(FaviconStore::create(*m_history_database));
             m_history_store = TRY(HistoryStore::create(*m_history_database));
+            should_remove_unreferenced_favicons = true;
         } else {
-            dbgln("History database was created by a newer Ladybird version; history will not be persisted this session");
+            dbgln("History database was created by a newer Ladybird version; favicons and history will not be persisted this session");
             history_database_directory = {};
-            m_history_store = HistoryStore::create();
+            m_favicon_store = FaviconStore::create();
+            m_history_store = HistoryStore::create(*m_favicon_store);
         }
 
         // Fall back without modifying the existing Sessions database.
@@ -1221,11 +1247,19 @@ ErrorOr<void> Application::launch_services()
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
 
         m_cookie_jar = CookieJar::create();
+        m_favicon_store = FaviconStore::create();
         m_history_store = HistoryStore::create_disabled();
         m_hsts_store = HSTSStore::create();
         m_storage_jar = StorageJar::create();
         m_download_store = DownloadStore::create_disabled();
         m_session_store = SessionStore::create();
+    }
+
+    if (should_remove_unreferenced_favicons) {
+        auto referenced_hashes = m_bookmark_store->favicon_hashes();
+        for (auto& hash : m_history_store->referenced_favicon_hashes())
+            referenced_hashes.set(move(hash));
+        m_favicon_store->remove_unreferenced_favicons(referenced_hashes);
     }
 
     m_file_downloader.adopt_download_store({}, *m_download_store);
@@ -2118,7 +2152,7 @@ void Application::initialize_actions()
             ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkItem::Folder folder) mutable {
                 auto folder_id = m_bookmark_store->add_folder(move(folder.title));
                 for (auto& bookmark : bookmarks)
-                    m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_base64_png), folder_id);
+                    m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), folder_id);
             });
     }));
 
@@ -2297,7 +2331,7 @@ void Application::toggle_bookmark_for_view(ViewImplementation& view)
 
     display_add_bookmark_dialog()
         ->when_resolved([this](AddBookmarkDialogResult result) {
-            m_bookmark_store->add_bookmark(move(result.bookmark.url), move(result.bookmark.title), move(result.bookmark.favicon_base64_png), move(result.target_folder_id));
+            m_bookmark_store->add_bookmark(move(result.bookmark.url), move(result.bookmark.title), move(result.bookmark.favicon_hash), move(result.target_folder_id));
         });
 }
 
@@ -2368,7 +2402,9 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
                         open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
                 });
 
-                action->set_base64_png_icon(bookmark.favicon_base64_png);
+                action->set_png_icon(bookmark.favicon_hash.has_value()
+                        ? favicon_store(IsPrivate::No).favicon_png(*bookmark.favicon_hash)
+                        : OptionalNone {});
                 action->set_tooltip(bookmark.url.serialize());
 
                 action->add_property("id"sv, item.id);
@@ -2407,7 +2443,7 @@ Vector<BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_current_wi
         bookmarks.append(WebView::BookmarkItem::Bookmark {
             .url = view.url(),
             .title = view.title().is_empty() ? Optional<String> {} : view.title().to_utf8(),
-            .favicon_base64_png = view.favicon_base64_png(),
+            .favicon_hash = view.favicon_hash(),
         });
     }
 

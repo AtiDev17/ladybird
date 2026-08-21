@@ -79,9 +79,14 @@ pub struct PaintRecorder<'a> {
     hit_test_list_generation: u64,
     pub(crate) has_blocking_wheel_event_listeners: bool,
     spliced_capture_count: usize,
+    uncacheable_paint_generation: u64,
     list: HitTestList,
-    paintable_facts_cache: HashMap<u32, FfiHitTestPaintableFacts>,
+    base_paint_facts_cache: Vec<Option<(PaintableSlotId, BasePaintFacts)>>,
+    paintable_facts_cache: Vec<Option<(PaintableSlotId, FfiHitTestPaintableFacts)>>,
     text_node_facts_cache: HashMap<u32, FfiHitTestTextNodeFacts>,
+    font_resource_id_cache: HashMap<usize, u64>,
+    text_control_selection_cache: HashMap<u32, crate::painting::host::FfiTextControlSelection>,
+    selection_style_cache: HashMap<u32, Rc<paint::text::SelectionStyleAnswer>>,
     pub(crate) wheel_hit_test_target_cache: HashMap<PaintableSlotId, usize>,
 }
 
@@ -94,6 +99,13 @@ pub(crate) struct BasePaintFacts {
 }
 
 impl<'a> PaintRecorder<'a> {
+    pub(crate) fn prevent_descendant_subtree_caching(&mut self) {
+        self.uncacheable_paint_generation = self
+            .uncacheable_paint_generation
+            .checked_add(1)
+            .expect("uncacheable paint generation overflowed");
+    }
+
     pub(crate) fn data(&self, paintable: PaintableSlotId) -> PaintableData {
         self.paintables.data_ref(paintable)
     }
@@ -107,13 +119,56 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn paintable_facts(&mut self, paintable: PaintableSlotId) -> FfiHitTestPaintableFacts {
-        let key = paintable.index;
-        if let Some(facts) = self.paintable_facts_cache.get(&key) {
-            return *facts;
+        let index = paintable.slot_index() as usize;
+        if let Some((memoized_id, facts)) = self.paintable_facts_cache[index]
+            && memoized_id == paintable
+        {
+            return facts;
         }
         let facts = self.host.paintable_facts(self.shell(paintable));
-        self.paintable_facts_cache.insert(key, facts);
+        self.paintable_facts_cache[index] = Some((paintable, facts));
         facts
+    }
+
+    pub(crate) fn register_font(&mut self, font: *const std::ffi::c_void) -> u64 {
+        let key = font as usize;
+        if let Some(font_id) = self.font_resource_id_cache.get(&key) {
+            return *font_id;
+        }
+        let font_id = self.paint_host.register_font(font);
+        self.font_resource_id_cache.insert(key, font_id);
+        font_id
+    }
+
+    pub(crate) fn text_control_selection(
+        &mut self,
+        node: crate::layout::node_data::NodeSlotId,
+    ) -> crate::painting::host::FfiTextControlSelection {
+        let key = node.index;
+        if let Some(facts) = self.text_control_selection_cache.get(&key) {
+            return *facts;
+        }
+        let facts = self
+            .paint_host
+            .text_control_selection(self.layout_arena.shell_if_live(node));
+        self.text_control_selection_cache.insert(key, facts);
+        facts
+    }
+
+    pub(crate) fn selection_style(
+        &mut self,
+        node: crate::layout::node_data::NodeSlotId,
+    ) -> Rc<paint::text::SelectionStyleAnswer> {
+        let key = node.index;
+        if let Some(answer) = self.selection_style_cache.get(&key) {
+            return answer.clone();
+        }
+        let (facts, shadows) = self
+            .paint_host
+            .selection_style_facts(self.layout_arena.shell_if_live(node));
+        let answer = Rc::new(paint::text::SelectionStyleAnswer { facts, shadows });
+        self.selection_style_cache.insert(key, answer.clone());
+        answer
     }
 
     pub(crate) fn nested_recording_session(
@@ -144,9 +199,14 @@ impl<'a> PaintRecorder<'a> {
             hit_test_list_generation: self.hit_test_list_generation,
             has_blocking_wheel_event_listeners: false,
             spliced_capture_count: 0,
+            uncacheable_paint_generation: 0,
             list: HitTestList::default(),
-            paintable_facts_cache: HashMap::new(),
+            base_paint_facts_cache: vec![None; self.paintables.slot_count()],
+            paintable_facts_cache: vec![None; self.paintables.slot_count()],
             text_node_facts_cache: HashMap::new(),
+            font_resource_id_cache: HashMap::new(),
+            text_control_selection_cache: HashMap::new(),
+            selection_style_cache: HashMap::new(),
             wheel_hit_test_target_cache: HashMap::new(),
         }
     }
@@ -168,42 +228,46 @@ impl<'a> PaintRecorder<'a> {
     }
 
     pub(crate) fn base_paint_facts(&mut self, paintable: PaintableSlotId) -> BasePaintFacts {
+        let index = paintable.slot_index() as usize;
+        if let Some((memoized_id, facts)) = self.base_paint_facts_cache[index]
+            && memoized_id == paintable
+        {
+            return facts;
+        }
         let data = self.data(paintable);
         let Some(style) = self.layout_arena.node_style_if_live(data.layout_node) else {
-            return BasePaintFacts::default();
+            let facts = BasePaintFacts::default();
+            self.base_paint_facts_cache[index] = Some((paintable, facts));
+            return facts;
         };
         let effects = style.effects();
         let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE && effects.opacity != 0.0;
-        let empty_cells_property_applies = style.display().is_internal_table()
+        let empty_cells_property_applies = self.display(paintable).is_internal_table()
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
             && self.paintables.first_child(paintable).is_none();
         let has_backdrop_filter = effects.backdrop_filter.operations.length != 0;
         let paints_border_image = crate::painting::style_queries::handle_value(&style.border().border_image_source)
             .is_some_and(|source| matches!(source, crate::css::style_value::StyleValueData::Image { .. }));
-        BasePaintFacts {
+        let facts = BasePaintFacts {
             is_visible,
             empty_cells_property_applies,
             has_backdrop_filter,
             paints_border_image,
-        }
+        };
+        self.base_paint_facts_cache[index] = Some((paintable, facts));
+        facts
     }
 
     fn has_stacking_context(&self, paintable: PaintableSlotId) -> bool {
         self.data(paintable).stacking_context != NO_STACKING_CONTEXT
     }
 
-    fn layout_flags(&self, paintable: PaintableSlotId) -> u32 {
-        self.layout_arena.node_flags_if_live(self.data(paintable).layout_node)
-    }
-
     fn layout_kind(&self, paintable: PaintableSlotId) -> Option<NodeKind> {
         self.layout_arena.node_kind_if_live(self.data(paintable).layout_node)
     }
 
-    fn display(&self, paintable: PaintableSlotId) -> Option<crate::css::display::FfiDisplay> {
-        self.layout_arena
-            .node_style_if_live(self.data(paintable).layout_node)
-            .map(|style| style.display())
+    fn display(&self, paintable: PaintableSlotId) -> crate::css::display::FfiDisplay {
+        crate::css::display::FfiDisplay::from_raw(self.data(paintable).display)
     }
 
     fn visibility_is_visible(&self, paintable: PaintableSlotId) -> bool {
@@ -221,8 +285,8 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn is_replaced_box(&self, paintable: PaintableSlotId) -> bool {
-        self.layout_kind(paintable)
-            .is_some_and(crate::layout::kind_is_replaced_box)
+        self.data(paintable)
+            .has_flag(crate::painting::paintable_data::PaintableFlag::ReplacedBox)
     }
 
     pub(crate) fn own_context_index(&self, paintable: PaintableSlotId) -> usize {

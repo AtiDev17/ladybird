@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::painting::display_list::builder::CommandRange;
 use crate::painting::hit_test::HitTestItem;
 use crate::painting::record::PaintPhase;
+use crate::painting::record::traversal::StackingContextPaintPhase;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CachedCommands {
@@ -34,25 +36,70 @@ pub struct CachedHitTestItems {
     pub recorded_context_for_descendants_index: usize,
 }
 
-// Paint commands and hit-test items are stamped independently within a frame, so each setter
-// must only ever assign its own sub-struct of the shared entry.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PhaseCacheEntry {
-    pub commands: Option<CachedCommands>,
-    pub hit_test_items: Option<CachedHitTestItems>,
+pub struct CachedDescendantSubtree {
+    pub source_display_list_id: u64,
+    pub command_range: CommandRange,
+    pub source_hit_test_display_list_id: u64,
+    pub hit_test_start: u32,
+    pub hit_test_count: u32,
 }
 
-#[derive(Clone, Debug, Default)]
 pub struct PaintCache {
-    pub phases: [PhaseCacheEntry; PaintPhase::COUNT],
+    commands: [Cell<Option<CachedCommands>>; PaintPhase::COUNT],
+    hit_test_items: [Cell<Option<CachedHitTestItems>>; PaintPhase::COUNT],
+    descendant_subtrees: [Cell<Option<CachedDescendantSubtree>>; StackingContextPaintPhase::COUNT],
+}
+
+impl Default for PaintCache {
+    fn default() -> Self {
+        Self {
+            commands: std::array::from_fn(|_| Cell::new(None)),
+            hit_test_items: std::array::from_fn(|_| Cell::new(None)),
+            descendant_subtrees: std::array::from_fn(|_| Cell::new(None)),
+        }
+    }
 }
 
 impl PaintCache {
-    pub fn entry(&self, phase: PaintPhase) -> &PhaseCacheEntry {
-        &self.phases[phase as usize]
+    pub fn commands(&self, phase: PaintPhase) -> Option<CachedCommands> {
+        self.commands[phase as usize].get()
     }
-    pub fn entry_mut(&mut self, phase: PaintPhase) -> &mut PhaseCacheEntry {
-        &mut self.phases[phase as usize]
+
+    pub fn hit_test_items(&self, phase: PaintPhase) -> Option<CachedHitTestItems> {
+        self.hit_test_items[phase as usize].get()
+    }
+
+    pub fn set_commands(&self, phase: PaintPhase, commands: CachedCommands) {
+        self.commands[phase as usize].set(Some(commands));
+    }
+
+    pub fn set_hit_test_items(&self, phase: PaintPhase, hit_test_items: CachedHitTestItems) {
+        self.hit_test_items[phase as usize].set(Some(hit_test_items));
+    }
+
+    pub(crate) fn descendant_subtree(&self, phase: StackingContextPaintPhase) -> Option<CachedDescendantSubtree> {
+        self.descendant_subtrees[phase as usize].get()
+    }
+
+    pub(crate) fn set_descendant_subtree(&self, phase: StackingContextPaintPhase, subtree: CachedDescendantSubtree) {
+        self.descendant_subtrees[phase as usize].set(Some(subtree));
+    }
+
+    pub fn clear_descendant_subtrees(&self) {
+        for subtree in &self.descendant_subtrees {
+            subtree.set(None);
+        }
+    }
+
+    pub fn clear(&self) {
+        for commands in &self.commands {
+            commands.set(None);
+        }
+        for hit_test_items in &self.hit_test_items {
+            hit_test_items.set(None);
+        }
+        self.clear_descendant_subtrees();
     }
 }
 

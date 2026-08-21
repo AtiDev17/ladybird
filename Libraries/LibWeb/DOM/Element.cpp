@@ -2571,15 +2571,23 @@ static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element c
 
     Vector<CSSPixelRect> rects;
     if (auto const* inline_paintable = as_if<Painting::InlinePaintable>(element.layout_node()->paintable().ptr())) {
-        inline_paintable->for_each_piece([&](Painting::InlineBoxPiece const& piece) {
-            if (piece.is_geometry_only_placeholder)
-                return;
-            auto absolute_rect = inline_paintable->absolute_piece_border_box_rect(piece);
+        Vector<CSSPixelRect> piece_border_box_rects;
+        Layout::RustFFI::layout_arena_inline_paintable_piece_border_box_rects(
+            inline_paintable->rust_arena().handle(), inline_paintable->rust_slot(), &piece_border_box_rects,
+            [](void* context, Layout::RustFFI::FfiCssPixelRect rect) {
+                static_cast<Vector<CSSPixelRect>*>(context)->append({
+                    CSSPixels::from_raw(rect.x),
+                    CSSPixels::from_raw(rect.y),
+                    CSSPixels::from_raw(rect.width),
+                    CSSPixels::from_raw(rect.height),
+                });
+            });
+        for (auto const& absolute_rect : piece_border_box_rects) {
             if (visual_context_transform == VisualContextTransform::Identity)
                 rects.append(absolute_rect);
             else
                 rects.append(inline_paintable->transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
-        });
+        }
         // An inline element whose content is only interrupting blocks generates no line fragments, but per CSSOM
         // we still report its (zero-sized) border area instead of an empty list.
         if (rects.is_empty())
@@ -4369,12 +4377,19 @@ GC::Ptr<HTML::CustomElementDefinition> Element::custom_element_definition() cons
 
 void Element::set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition> definition)
 {
+    auto old_definition = custom_element_definition();
+    bool was_form_associated = old_definition && old_definition->form_associated();
+    bool is_form_associated = definition && definition->form_associated();
+
     if (!definition) {
         if (auto* rare_data = element_rare_data())
             rare_data->custom_element_definition = nullptr;
-        return;
+    } else {
+        ensure_element_rare_data().custom_element_definition = definition;
     }
-    ensure_element_rare_data().custom_element_definition = definition;
+
+    if (was_form_associated != is_form_associated)
+        document().bump_form_associated_custom_element_version();
 }
 
 GC::Ptr<HTML::CustomElementRegistry> Element::custom_element_registry() const

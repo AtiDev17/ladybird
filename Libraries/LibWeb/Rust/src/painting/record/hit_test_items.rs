@@ -28,7 +28,7 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn is_anonymous(&self, paintable: PaintableSlotId) -> bool {
-        self.layout_flags(paintable) & NodeFlag::Anonymous as u32 != 0
+        self.data(paintable).has_flag(PaintableFlag::Anonymous)
     }
 
     fn is_generated_for_pseudo_element(&self, paintable: PaintableSlotId) -> bool {
@@ -37,14 +37,14 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn is_atomic_inline(&self, paintable: PaintableSlotId) -> bool {
-        if self.layout_flags(paintable) & NodeFlag::IsReplacedElement as u32 != 0 {
+        if self.data(paintable).has_flag(PaintableFlag::Replaced) {
             return true;
         }
         if self.layout_kind(paintable) == Some(NodeKind::ListItemMarkerBox) {
             return true;
         }
-        self.display(paintable)
-            .is_some_and(|display| display.is_inline_outside() && !display.is_flow_inside())
+        let display = self.display(paintable);
+        display.is_inline_outside() && !display.is_flow_inside()
     }
 
     pub(crate) fn record_foreign_object_descendant_hit_test_items(&mut self, paintable: PaintableSlotId) {
@@ -130,21 +130,16 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn record_empty_line_caret_items(&mut self, paintable: PaintableSlotId, context: usize) {
-        let targets = self.host.empty_line_caret_targets(self.shell(paintable));
+        let targets =
+            crate::painting::visual_lines::empty_line_caret_targets(self.layout_arena, self.paintables, paintable);
         for target in targets {
-            let rect = CssPixelRect::from(target.rect);
-            if target.is_line_break_boundary {
+            self.append_empty_line_for_fragment(paintable, 0, target.offset, target.line_index, target.rect, context);
+        }
+        if !self.paintables.side(paintable).fragments.is_empty() {
+            for target in self.host.line_break_caret_targets(self.shell(paintable)) {
+                let rect = CssPixelRect::from(target.rect);
                 let caret_node = self.data(paintable).layout_node;
                 self.append_empty_line_for_node(paintable, caret_node, target.caret_offset, rect, context);
-            } else {
-                self.append_empty_line_for_fragment(
-                    paintable,
-                    0,
-                    target.caret_offset,
-                    target.line_index,
-                    rect,
-                    context,
-                );
             }
         }
     }
@@ -417,15 +412,12 @@ impl<'a> PaintRecorder<'a> {
         } else {
             (None, None)
         };
-        let can_produce_caret_position = {
+        let can_produce_caret_position = (self.is_atomic_inline(target) || self.is_replaced_box(target)) && {
             let negative_z = crate::painting::style_queries::effective_z_index(self.layout_arena, &self.data(target))
                 .unwrap_or(0)
                 < 0;
             let target_node = self.data(target).layout_node;
-            !negative_z
-                && self.node_has_dom_node(target_node)
-                && self.paintable_facts(target).dom_node_has_parent
-                && (self.is_atomic_inline(target) || self.is_replaced_box(target))
+            !negative_z && self.node_has_dom_node(target_node) && self.paintable_facts(target).dom_node_has_parent
         };
         let item = HitTestItem {
             rect,

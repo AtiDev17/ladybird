@@ -36,10 +36,8 @@ pub struct FfiHitTestTextNodeFacts {
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub struct FfiEmptyLineCaretTarget {
-    pub is_line_break_boundary: bool,
+pub struct FfiLineBreakCaretTarget {
     pub caret_offset: usize,
-    pub line_index: usize,
     pub rect: crate::layout::FfiCssPixelRect,
 }
 
@@ -50,7 +48,7 @@ pub struct FfiHitTestHostCallbacks {
     pub paintable_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiHitTestPaintableFacts,
     pub text_node_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiHitTestTextNodeFacts,
     pub piece_border_radii: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, u8, *mut i32),
-    pub empty_line_caret_targets: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
+    pub line_break_caret_targets: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
 }
 
 impl FfiHitTestHostCallbacks {
@@ -83,10 +81,10 @@ impl FfiHitTestHostCallbacks {
         };
         radii
     }
-    pub(crate) fn empty_line_caret_targets(&self, paintable_shell: *mut c_void) -> Vec<FfiEmptyLineCaretTarget> {
-        let mut targets: Vec<FfiEmptyLineCaretTarget> = Vec::new();
+    pub(crate) fn line_break_caret_targets(&self, paintable_shell: *mut c_void) -> Vec<FfiLineBreakCaretTarget> {
+        let mut targets: Vec<FfiLineBreakCaretTarget> = Vec::new();
         // SAFETY: The C++ host pushes into the Vec through the exported sink function, synchronously.
-        unsafe { (self.empty_line_caret_targets)(self.context, paintable_shell, (&raw mut targets).cast()) };
+        unsafe { (self.line_break_caret_targets)(self.context, paintable_shell, (&raw mut targets).cast()) };
         targets
     }
 }
@@ -227,16 +225,7 @@ pub struct FfiHitTestItemExport {
     pub caret_offset: usize,
     pub rect: crate::layout::FfiCssPixelRect,
     pub caret_rect: crate::layout::FfiCssPixelRect,
-    pub has_caret_line_index: bool,
-    pub caret_line_index: usize,
-    pub has_caret_line_rect: bool,
-    pub caret_line_rect: crate::layout::FfiCssPixelRect,
-    pub has_block_container_margin_rect: bool,
-    pub block_container_margin_rect: crate::layout::FfiCssPixelRect,
     pub visual_context_index: usize,
-    pub border_radii: [i32; 8],
-    pub path: *const c_void,
-    pub winding_rule: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

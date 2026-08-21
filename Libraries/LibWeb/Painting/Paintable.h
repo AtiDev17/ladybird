@@ -64,6 +64,8 @@ WEB_API Gfx::FloatRect svg_viewport_user_rect(Paintable const& viewport_paintabl
 
 bool body_background_is_propagated_to_root(Layout::NodeWithStyle const&);
 
+void invalidate_descendant_styles_for_container_query_size_change(Paintable&, CSSPixelSize old_content_size, CSSPixelSize new_content_size);
+
 // Used grid track data captured at layout time as plain values; getComputedStyle
 // reflection mints style values from it on demand.
 struct UsedGridTrackList {
@@ -270,9 +272,7 @@ public:
     void scroll_ancestor_to_offset_into_view(size_t offset);
 
     using SelectionState = Painting::SelectionState;
-
     SelectionState selection_state() const { return static_cast<SelectionState>(rust_data().selection_state); }
-    void set_selection_state(SelectionState state);
 
     struct TextDecorationStyle {
         Vector<CSS::TextDecorationLine> line;
@@ -360,15 +360,7 @@ public:
     ScrollHandled scroll_by(double delta_x, double delta_y);
     void scroll_into_view(CSSPixelRect);
 
-    void set_offset(CSSPixelPoint);
-    void set_offset(float x, float y) { set_offset({ x, y }); }
-
     CSSPixelSize content_size() const;
-    void set_content_size(CSSPixelSize);
-    void set_content_size(CSSPixels width, CSSPixels height) { set_content_size({ width, height }); }
-
-    void set_content_width(CSSPixels width) { set_content_size(width, content_height()); }
-    void set_content_height(CSSPixels height) { set_content_size(content_width(), height); }
     CSSPixels content_width() const { return content_size().width(); }
     CSSPixels content_height() const { return content_size().height(); }
 
@@ -511,29 +503,15 @@ protected:
 
 public:
 protected:
-    CSSPixelRect compute_absolute_rect() const;
-    virtual CSSPixelRect compute_absolute_padding_box_rect() const;
-    virtual CSSPixelRect compute_absolute_border_box_rect() const;
-
     CSSPixels available_scrollbar_length(ScrollDirection direction, ChromeMetrics const& chrome_metrics) const;
 
 public:
     Optional<CSSPixelRect> absolute_resizer_rect(ChromeMetrics const& chrome_metrics) const;
 
 private:
-    friend class Layout::LayoutRustBridge;
-
-    enum class InvalidateDescendantGeometry {
-        No,
-        Yes,
-    };
-
     void detach_from_layout_node(Badge<Layout::Node>);
     void detach_chrome_widgets();
     GC::Ptr<DOM::EventTarget> scroll_event_target();
-
-    void invalidate_absolute_geometry_cache(InvalidateDescendantGeometry);
-    void translate_reused_subtree_absolute_geometry(CSSPixelPoint);
 
     bool has_flag(Layout::RustFFI::PaintableFlag flag) const { return (rust_data().flags & to_underlying(flag)) != 0; }
     Layout::RustFFI::PaintableData& rust_data() { return *m_rust_data; }
@@ -546,10 +524,6 @@ private:
     Layout::RustFFI::PaintableSlotId m_rust_slot {};
     u32 m_rust_slot_generation { 0 };
     Layout::RustFFI::PaintableData* m_rust_data { nullptr };
-
-    Optional<CSSPixelRect> mutable m_absolute_rect;
-    Optional<CSSPixelRect> mutable m_absolute_padding_box_rect;
-    Optional<CSSPixelRect> mutable m_absolute_border_box_rect;
 
     ResolvedCSSFilter m_filter;
 

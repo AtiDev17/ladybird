@@ -24,6 +24,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
+#include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
@@ -388,6 +389,7 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(Vie
             inputs.visual_viewport_offset_x = offset.x();
             inputs.visual_viewport_offset_y = offset.y();
             inputs.visual_viewport_scale = visual_viewport.scale();
+            inputs.may_have_default_scroll_shift_anchor = viewport_paintable.document().may_have_default_scroll_shift_anchor();
             return inputs;
         },
         .scroll_offset = [](void*, void* paintable_shell) -> Layout::RustFFI::FfiCssPixelPoint {
@@ -615,19 +617,9 @@ void mirror_rust_set_needs_to_refresh_scroll_state(ViewportPaintable& viewport_p
     Layout::RustFFI::layout_arena_set_needs_to_refresh_scroll_state(viewport_paintable.rust_arena().handle(), value);
 }
 
-void mirror_rust_clear_visual_context_tree(ViewportPaintable& viewport_paintable)
-{
-    Layout::RustFFI::layout_arena_clear_visual_context_tree(viewport_paintable.rust_arena().handle());
-}
-
 void mirror_rust_reset_visual_context_state(ViewportPaintable& viewport_paintable)
 {
     Layout::RustFFI::layout_arena_reset_visual_context_state(viewport_paintable.rust_arena().handle());
-}
-
-void mirror_rust_clear_paint_cache_sources(ViewportPaintable& viewport_paintable)
-{
-    Layout::RustFFI::layout_arena_clear_paint_cache_sources(viewport_paintable.rust_arena().handle());
 }
 
 void mirror_rust_invalidate_paint_cache(Paintable const& paintable)
@@ -740,20 +732,21 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
         },
         .piece_border_radii = [](void*, void* paintable_shell, i32 width_raw, i32 height_raw, u8 present_edges, i32* out) {
             auto const& inline_paintable = as<InlinePaintable>(*static_cast<Paintable const*>(paintable_shell));
-            InlineBoxPiece piece {};
-            piece.border_box_rect = { 0, 0, CSSPixels::from_raw(width_raw), CSSPixels::from_raw(height_raw) };
-            piece.present_edges = present_edges;
-            write_border_radii(inline_paintable.piece_border_radii_data(piece), out); },
-        .empty_line_caret_targets = [](void*, void* paintable_shell, void* sink) {
+            write_border_radii(inline_paintable.piece_border_radii_data({ CSSPixels::from_raw(width_raw), CSSPixels::from_raw(height_raw) }, present_edges), out); },
+        .line_break_caret_targets = [](void*, void* paintable_shell, void* sink) {
             auto const& paintable = as<PaintableWithLines>(*static_cast<Paintable const*>(paintable_shell));
-            paintable.for_each_empty_line_caret_item([&](PaintableWithLines::EmptyLineCaretItem const& item) {
-                Layout::RustFFI::FfiEmptyLineCaretTarget target {};
-                target.is_line_break_boundary = item.is_line_break_boundary;
-                target.caret_offset = item.caret_offset;
-                target.line_index = item.line_index;
-                target.rect = to_ffi_css_pixel_rect(item.rect);
-                Layout::RustFFI::layout_arena_hit_test_push_empty_line_caret_target(sink, target);
-            }); },
+            auto* dom_node = paintable.layout_node().dom_node();
+            if (!dom_node)
+                return;
+            for (auto* child = dom_node->first_child(); child; child = child->next_sibling()) {
+                auto* br = as_if<HTML::HTMLBRElement>(*child);
+                if (!br || !br->represents_empty_line())
+                    continue;
+                Layout::RustFFI::FfiLineBreakCaretTarget target {};
+                target.caret_offset = br->index();
+                target.rect = to_ffi_css_pixel_rect(paintable.caret_rect_for_child_offset(br->index()));
+                Layout::RustFFI::layout_arena_hit_test_push_line_break_caret_target(sink, target);
+            } },
     };
 }
 
@@ -936,58 +929,54 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto& context = *static_cast<PaintHostContext*>(context_pointer);
             return rust_root_background_source(context.viewport_paintable.document());
         },
-        .text_spans = [](void* context_pointer, void* paintable_shell, u32 const* owned_fragment_indices, size_t owned_fragment_index_count, void* sink) {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& block = as<PaintableWithLines>(*static_cast<Paintable const*>(paintable_shell));
-            auto spans = block.render_spans_for_paint(context.paint_generation_id, { owned_fragment_indices, owned_fragment_index_count });
-            for (auto const& span : spans) {
-                auto const& fragment = span.fragment;
-                Layout::RustFFI::FfiTextSpan ffi_span {};
-                ffi_span.fragment_index = block.index_of_fragment(fragment);
-                ffi_span.start_code_unit = span.start_code_unit;
-                ffi_span.end_code_unit = span.end_code_unit;
-                ffi_span.text_color = span.text_color.value();
-                ffi_span.background_color = span.background_color.value();
-                auto const& shadow_layers = span.shadow_layers.has_value() ? *span.shadow_layers : fragment.shadows();
-                ffi_span.shadow_layer_count = shadow_layers.size();
-                if (auto offsets = fragment.selection_offsets(); offsets.has_value()) {
-                    ffi_span.has_selection_offsets = true;
-                    ffi_span.selection_start = offsets->start;
-                    ffi_span.selection_end = offsets->end;
-                }
-                if (span.text_decoration.has_value()) {
-                    ffi_span.has_selection_text_decoration = true;
-                    ffi_span.selection_text_decoration_line_count = min(span.text_decoration->line.size(), array_size(ffi_span.selection_text_decoration_lines));
-                    for (size_t i = 0; i < ffi_span.selection_text_decoration_line_count; ++i)
-                        ffi_span.selection_text_decoration_lines[i] = to_underlying(span.text_decoration->line[i]);
-                    ffi_span.selection_text_decoration_style = to_underlying(span.text_decoration->style);
-                    ffi_span.selection_text_decoration_color = span.text_decoration->color.value();
-                }
-                Layout::RustFFI::layout_arena_paint_push_text_span(sink, ffi_span);
-                for (auto const& layer : shadow_layers) {
-                    Layout::RustFFI::FfiTextShadowLayer ffi_layer {};
-                    ffi_layer.color = layer.color.value();
-                    ffi_layer.offset_x = layer.offset_x.raw_value();
-                    ffi_layer.offset_y = layer.offset_y.raw_value();
-                    ffi_layer.blur_radius = layer.blur_radius.raw_value();
-                    Layout::RustFFI::layout_arena_paint_push_text_shadow(sink, ffi_layer);
-                }
-            } },
-        .glyph_run_facts = [](void* context_pointer, void* paintable_shell, u32 fragment_index, double scale) -> Layout::RustFFI::FfiGlyphRunFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& block = as<PaintableWithLines>(*static_cast<Paintable const*>(paintable_shell));
-            Layout::RustFFI::FfiGlyphRunFacts facts {};
-            auto const& fragment = block.fragments()[fragment_index];
-            auto glyph_run = fragment.glyph_run();
-            if (!glyph_run)
+        .text_control_selection = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiTextControlSelection {
+            Layout::RustFFI::FfiTextControlSelection result {};
+            auto const* layout_node = static_cast<Layout::Node const*>(layout_node_shell);
+            if (!layout_node)
+                return result;
+            auto const* text_control = as_if<HTML::FormAssociatedTextControlElement>(layout_node->document().focused_area().ptr());
+            if (!text_control)
+                return result;
+            if (GC::Ptr { layout_node->dom_node() } != text_control->form_associated_element_to_text_node())
+                return result;
+            auto selection_start = text_control->selection_start();
+            auto selection_end = text_control->selection_end();
+            if (selection_start == selection_end)
+                return result;
+            result.has_selection = true;
+            result.start = selection_start;
+            result.end = selection_end;
+            return result;
+        },
+        .selection_style_facts = [](void*, void* layout_node_shell, void* shadow_sink) -> Layout::RustFFI::FfiSelectionStyleFacts {
+            Layout::RustFFI::FfiSelectionStyleFacts facts {};
+            auto const* text_node = as_if<Layout::TextNode>(static_cast<Layout::Node const*>(layout_node_shell));
+            if (!text_node)
                 return facts;
-            auto bounds = glyph_run->bounding_box(static_cast<float>(scale));
-            facts.blob_bounds[0] = bounds.x();
-            facts.blob_bounds[1] = bounds.y();
-            facts.blob_bounds[2] = bounds.width();
-            facts.blob_bounds[3] = bounds.height();
-            facts.font_id = context.resource_storage.add_font(glyph_run->font()).value();
+            auto style = Paintable::selection_style_for_node(*text_node, text_node->dom_text());
+            facts.background_color = style.background_color.value();
+            if (style.text_color.has_value()) {
+                facts.has_text_color = true;
+                facts.text_color = style.text_color->value();
+            }
+            if (style.text_shadow.has_value()) {
+                facts.has_text_shadow = true;
+                for (auto const& layer : *style.text_shadow)
+                    Layout::RustFFI::layout_arena_paint_push_selection_shadow(shadow_sink, layer.color.value(), layer.offset_x.raw_value(), layer.offset_y.raw_value(), layer.blur_radius.raw_value());
+            }
+            if (style.text_decoration.has_value()) {
+                facts.has_text_decoration = true;
+                facts.text_decoration_line_count = min(style.text_decoration->line.size(), array_size(facts.text_decoration_lines));
+                for (size_t i = 0; i < facts.text_decoration_line_count; ++i)
+                    facts.text_decoration_lines[i] = to_underlying(style.text_decoration->line[i]);
+                facts.text_decoration_style = to_underlying(style.text_decoration->style);
+                facts.text_decoration_color = style.text_decoration->color.value();
+            }
             return facts;
+        },
+        .register_font = [](void* context_pointer, void const* font) -> u64 {
+            auto& context = *static_cast<PaintHostContext*>(context_pointer);
+            return context.resource_storage.add_font(*static_cast<Gfx::Font const*>(font)).value();
         },
         .cursor_facts = [](void*, void* paintable_shell, void* owner_shell) -> Layout::RustFFI::FfiCursorFacts {
             auto const& paintable = *static_cast<Paintable const*>(paintable_shell);
@@ -1004,13 +993,6 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             facts.color = caret->color.value();
             return facts;
         },
-        .glyph_intercepts = [](void*, void* paintable_shell, u32 fragment_index, double scale, float y_top, float y_bottom, void* sink) {
-            auto const& block = as<PaintableWithLines>(*static_cast<Paintable const*>(paintable_shell));
-            auto glyph_run = block.fragments()[fragment_index].glyph_run();
-            if (!glyph_run)
-                return;
-            for (auto value : glyph_run->get_glyph_intercepts(static_cast<float>(scale), y_top, y_bottom))
-                Layout::RustFFI::layout_arena_paint_push_glyph_intercept(sink, value); },
         .layer_image_prepare = [](void*, void* paintable_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index) -> Layout::RustFFI::FfiLayerImagePrepareFacts {
             auto const& paintable = *static_cast<Paintable const*>(paintable_shell);
             Layout::RustFFI::FfiLayerImagePrepareFacts facts {};

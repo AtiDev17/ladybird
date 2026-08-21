@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
@@ -15,6 +16,7 @@
 #include <LibDatabase/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HistoryVisitTransition.h>
 #include <LibWebView/OmniboxEngagement.h>
 
@@ -23,7 +25,7 @@ namespace WebView {
 struct WEBVIEW_API HistoryEntry {
     String url;
     Optional<String> title;
-    Optional<String> favicon_base64_png;
+    Optional<ByteBuffer> favicon_png;
     i64 visit_count { 0 };
     i64 direct_visit_count { 0 };
     UnixDateTime last_visited_time;
@@ -47,7 +49,7 @@ public:
     static ErrorOr<Database::MigrationOutcome> migrate_schema(Database::Database&, Database::MigrationMode = Database::MigrationMode::Apply);
 
     static ErrorOr<NonnullOwnPtr<HistoryStore>> create(Database::Database&);
-    static NonnullOwnPtr<HistoryStore> create();
+    static NonnullOwnPtr<HistoryStore> create(Optional<FaviconStore&> favicon_store = {});
     static NonnullOwnPtr<HistoryStore> create_disabled();
     static Optional<String> normalize_url(URL::URL const&);
 
@@ -55,11 +57,12 @@ public:
 
     void record_visit(URL::URL const&, Optional<String> title = {}, UnixDateTime visited_at = UnixDateTime::now(), HistoryVisitTransition = HistoryVisitTransition::Link);
     void update_title(URL::URL const&, String const& title);
-    void update_favicon(URL::URL const&, String const& favicon_base64_png);
+    void update_favicon(URL::URL const&, String const& favicon_hash);
 
     Optional<HistoryEntry> entry_for_url(URL::URL const&);
     Vector<HistoryEntry> autocomplete_entries(StringView query, size_t limit = 8);
     Vector<HistoryEntry> list_entries(StringView query = {}, size_t offset = 0, size_t limit = 50);
+    Vector<String> referenced_favicon_hashes();
 
     void record_omnibox_engagement(OmniboxEngagement const&, UnixDateTime used_at = UnixDateTime::now());
     Vector<StoredOmniboxEngagement> omnibox_engagements(StringView input, size_t limit = 50);
@@ -76,6 +79,7 @@ private:
         Database::StatementID get_entry { 0 };
         Database::StatementID search_entries { 0 };
         Database::StatementID list_entries { 0 };
+        Database::StatementID referenced_favicon_hashes { 0 };
         Database::StatementID delete_entry { 0 };
         Database::StatementID delete_entries_accessed_since { 0 };
         Database::StatementID all_urls { 0 };
@@ -93,11 +97,12 @@ private:
 
         virtual void record_visit(String const& url, Optional<String> const& title, UnixDateTime visited_at, HistoryVisitTransition) = 0;
         virtual void update_title(String const& url, String const& title) = 0;
-        virtual void update_favicon(String const& url, String const& favicon_base64_png) = 0;
+        virtual void update_favicon(String const& url, String const& favicon_hash) = 0;
 
         virtual Optional<HistoryEntry> entry_for_url(String const& url) = 0;
         virtual Vector<HistoryEntry> autocomplete_entries(StringView title_query, StringView url_query, size_t limit) = 0;
         virtual Vector<HistoryEntry> list_entries(StringView title_query, StringView url_query, size_t offset, size_t limit) = 0;
+        virtual Vector<String> referenced_favicon_hashes() = 0;
 
         virtual void record_omnibox_engagement(OmniboxEngagement const&, UnixDateTime used_at) = 0;
         virtual Vector<StoredOmniboxEngagement> omnibox_engagements(StringView normalized_url_input, StringView normalized_search_input, size_t limit) = 0;
@@ -109,17 +114,24 @@ private:
 
     class TransientStorage : public StorageImpl {
     public:
+        explicit TransientStorage(Optional<FaviconStore&> favicon_store = {})
+            : m_favicon_store(favicon_store)
+        {
+        }
+
         virtual ~TransientStorage() override = default;
 
         virtual StringView name() override { return "transient"sv; }
 
         virtual void record_visit(String const& url, Optional<String> const& title, UnixDateTime visited_at, HistoryVisitTransition) override;
         virtual void update_title(String const& url, String const& title) override;
-        virtual void update_favicon(String const& url, String const& favicon_base64_png) override;
+
+        virtual void update_favicon(String const& url, String const& favicon_hash) override;
 
         virtual Optional<HistoryEntry> entry_for_url(String const& url) override;
         virtual Vector<HistoryEntry> autocomplete_entries(StringView title_query, StringView url_query, size_t limit) override;
         virtual Vector<HistoryEntry> list_entries(StringView title_query, StringView url_query, size_t offset, size_t limit) override;
+        virtual Vector<String> referenced_favicon_hashes() override { return {}; }
 
         virtual void record_omnibox_engagement(OmniboxEngagement const&, UnixDateTime used_at) override;
         virtual Vector<StoredOmniboxEngagement> omnibox_engagements(StringView normalized_url_input, StringView normalized_search_input, size_t limit) override;
@@ -129,6 +141,7 @@ private:
         virtual void remove_entries_accessed_since(UnixDateTime since) override;
 
     private:
+        Optional<FaviconStore&> m_favicon_store;
         HashMap<String, HistoryEntry> m_entries;
         Vector<StoredOmniboxEngagement> m_omnibox_engagements;
     };
@@ -142,11 +155,12 @@ private:
 
         virtual void record_visit(String const& url, Optional<String> const& title, UnixDateTime visited_at, HistoryVisitTransition) override;
         virtual void update_title(String const& url, String const& title) override;
-        virtual void update_favicon(String const& url, String const& favicon_base64_png) override;
+        virtual void update_favicon(String const& url, String const& favicon_hash) override;
 
         virtual Optional<HistoryEntry> entry_for_url(String const& url) override;
         virtual Vector<HistoryEntry> autocomplete_entries(StringView title_query, StringView url_query, size_t limit) override;
         virtual Vector<HistoryEntry> list_entries(StringView title_query, StringView url_query, size_t offset, size_t limit) override;
+        virtual Vector<String> referenced_favicon_hashes() override;
 
         virtual void record_omnibox_engagement(OmniboxEngagement const&, UnixDateTime used_at) override;
         virtual Vector<StoredOmniboxEngagement> omnibox_engagements(StringView normalized_url_input, StringView normalized_search_input, size_t limit) override;
