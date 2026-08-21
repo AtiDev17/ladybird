@@ -5207,8 +5207,8 @@ pub unsafe extern "C" fn rust_compute_font_weight(
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_compute_context_anchor(_context: *const c_void) {}
 
-// The standalone cargo test binary has no C++ side, so the release callbacks
-// that StyleValueData's retained members call on drop are stubbed out here.
+// The standalone cargo test binary has no C++ side, so release callbacks are
+// stubbed out here.
 #[cfg(test)]
 mod ffi_test_stubs {
     #[unsafe(no_mangle)]
@@ -5227,7 +5227,15 @@ mod ffi_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_cascade_list_unref(_raw: *const std::ffi::c_void) {}
     #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_font_unref(_raw: *const std::ffi::c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_filter_destroy(_filter: *mut std::ffi::c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_glyph_run_unref(_retained: *mut std::ffi::c_void) {}
+    #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_path_destroy(_path: *mut std::ffi::c_void) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_layout_segmenter_destroy(_handle: *mut std::ffi::c_void) {}
 }
 
 #[cfg(test)]
