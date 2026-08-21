@@ -66,6 +66,7 @@
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
@@ -82,7 +83,6 @@
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/Painting/Paintable.h>
@@ -289,6 +289,21 @@ bool Internals::has_activity_root(JS::Object& object)
     return false;
 }
 
+WebIDL::UnsignedLongLong Internals::message_port_pending_outgoing_message_count(HTML::MessagePort& port)
+{
+    return port.pending_outgoing_message_count();
+}
+
+void Internals::fail_next_message_port_transfer(HTML::MessagePort& port)
+{
+    port.fail_next_transfer_for_testing();
+}
+
+bool Internals::message_ports_are_directly_entangled(HTML::MessagePort& first, HTML::MessagePort& second)
+{
+    return first.entangled_port().ptr() == &second && second.entangled_port().ptr() == &first;
+}
+
 GC::Ref<XHR::XMLHttpRequest> Internals::create_xml_http_request_for_document(DOM::Document& document)
 {
     VERIFY(document.window());
@@ -302,7 +317,7 @@ Optional<Painting::HitTestResult> Internals::hit_test(double x, double y)
     //       for stacking context traversal, might not exist if this call occurs between the tear_down_layout_tree()
     //       and update_layout() calls
     active_document.update_layout(DOM::UpdateLayoutReason::InternalsHitTest);
-    return active_document.hit_test({ x, y }, Painting::HitTestType::Exact);
+    return active_document.hit_test({ x, y });
 }
 
 struct WebDriverKeyData {

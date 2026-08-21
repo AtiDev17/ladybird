@@ -225,10 +225,10 @@ pub enum FfiScrollNodeKind {
 #[repr(C)]
 pub struct FfiViewportScrollbarFacts {
     pub present: bool,
-    pub gutter_rect: [i32; 4],
-    pub thumb_rect: [i32; 4],
-    pub expanded_gutter_rect: [i32; 4],
-    pub expanded_thumb_rect: [i32; 4],
+    pub gutter_rect: crate::layout::FfiCssPixelRect,
+    pub thumb_rect: crate::layout::FfiCssPixelRect,
+    pub expanded_gutter_rect: crate::layout::FfiCssPixelRect,
+    pub expanded_thumb_rect: crate::layout::FfiCssPixelRect,
     pub scroll_size: f64,
     pub expanded_scroll_size: f64,
     pub thumb_color: u32,
@@ -371,6 +371,13 @@ pub struct FfiStackingContextNodeExport {
     pub child_count: usize,
     pub has_effective_z_index: bool,
     pub effective_z_index: i32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiPaintTreeDumpEntry {
+    pub layout_node_shell: *mut c_void,
+    pub depth: u32,
 }
 
 #[derive(Clone, Copy)]

@@ -46,7 +46,10 @@ pub unsafe extern "C" fn layout_arena_paintable_shell_destroyed(
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.paintables().borrow_mut().shell_destroyed(slot, generation, shell);
+        arena
+            .paintables()
+            .borrow_mut()
+            .shell_destroyed(arena, slot, generation, shell);
     });
 }
 
@@ -61,7 +64,7 @@ pub unsafe extern "C" fn layout_arena_paintable_cleared_from_node(
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
-        arena.paintables().borrow_mut().node_cleared(layout_node, slot);
+        arena.paintables().borrow_mut().node_cleared(arena, layout_node, slot);
     });
 }
 
@@ -99,14 +102,56 @@ pub unsafe extern "C" fn layout_arena_paintable_transfer_fragments_to_replacemen
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_shell(arena: *mut c_void, slot: PaintableSlotId) -> *mut c_void {
+pub unsafe extern "C" fn layout_arena_paintable_event_dispatch_node_shell(
+    arena: *mut c_void,
+    slot: PaintableSlotId,
+) -> *mut c_void {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        let mut current = paintables.is_live(slot).then_some(slot);
+        while let Some(paintable) = current {
+            let layout_node = paintables.data_ref(paintable).layout_node;
+            let flags = arena.node_flags_if_live(layout_node);
+            if flags & crate::layout::node_data::NodeFlag::Anonymous as u32 == 0 {
+                return arena.shell_if_live(layout_node);
+            }
+            current = crate::painting::paint_order::paint_parent(arena, &paintables, paintable);
+        }
+        std::ptr::null_mut()
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_layout_node_shell(
+    arena: *mut c_void,
+    slot: PaintableSlotId,
+) -> *mut c_void {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
         if !paintables.is_live(slot) {
             return std::ptr::null_mut();
         }
-        paintables.data_ref(slot).shell
+        arena.shell_if_live(paintables.data_ref(slot).layout_node)
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_has_child_paintables(
+    arena: *mut c_void,
+    slot: PaintableSlotId,
+) -> bool {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        crate::painting::paint_order::first_paint_child(arena, &paintables, slot).is_some()
     })
 }
 
@@ -707,6 +752,7 @@ pub enum FfiImagePaintRecordKind {
 #[repr(C)]
 pub struct FfiImagePaintRecordInputs {
     pub kind: FfiImagePaintRecordKind,
+    pub device_pixels_per_css_pixel: f64,
     pub dest_rect: [f32; 4],
     pub frame_id: u64,
     pub scaling_mode: i32,
@@ -719,9 +765,9 @@ pub struct FfiImagePaintRecordInputs {
     pub rectangular_color_space: u8,
     pub polar_color_space: u8,
     pub hue_interpolation_method: u8,
-    pub center: [i32; 2],
-    pub size: [i32; 2],
-    pub position: [i32; 2],
+    pub center: crate::layout::FfiCssPixelPoint,
+    pub size: crate::layout::FfiCssPixelSize,
+    pub position: crate::layout::FfiCssPixelPoint,
     pub color_stop_colors: *const u32,
     pub color_stop_positions: *const f32,
     pub color_stop_count: usize,
@@ -743,7 +789,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     };
     use libgfx_rust::{
         CompositingAndBlendingOperator, FloatRect, GradientInterpolationMethod, GradientInterpolationType,
-        HueInterpolationMethod, IntPoint, IntRect, IntSize, PolarColorSpace, RectangularColorSpace, ScalingMode,
+        HueInterpolationMethod, IntRect, IntSize, PolarColorSpace, RectangularColorSpace, ScalingMode,
     };
     abort_on_panic(|| {
         let inputs = unsafe { &*inputs };
@@ -815,33 +861,34 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
                     interpolation_method,
                 },
             ),
-            FfiImagePaintRecordKind::RadialGradient => recorder.fill_rect_with_radial_gradient(
-                dest_int_rect,
-                &RadialGradientData {
-                    color_stops: color_stops(),
-                    interpolation_method,
-                },
-                IntPoint {
-                    x: inputs.center[0],
-                    y: inputs.center[1],
-                },
-                IntSize {
-                    width: inputs.size[0],
-                    height: inputs.size[1],
-                },
-            ),
-            FfiImagePaintRecordKind::ConicGradient => recorder.fill_rect_with_conic_gradient(
-                dest_int_rect,
-                &ConicGradientData {
-                    start_angle: inputs.gradient_angle,
-                    color_stops: color_stops(),
-                    interpolation_method,
-                },
-                IntPoint {
-                    x: inputs.position[0],
-                    y: inputs.position[1],
-                },
-            ),
+            FfiImagePaintRecordKind::RadialGradient => {
+                let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(
+                    inputs.device_pixels_per_css_pixel,
+                );
+                recorder.fill_rect_with_radial_gradient(
+                    dest_int_rect,
+                    &RadialGradientData {
+                        color_stops: color_stops(),
+                        interpolation_method,
+                    },
+                    converter.rounded_device_point(inputs.center.into()),
+                    converter.rounded_device_size(inputs.size.into()),
+                );
+            }
+            FfiImagePaintRecordKind::ConicGradient => {
+                let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(
+                    inputs.device_pixels_per_css_pixel,
+                );
+                recorder.fill_rect_with_conic_gradient(
+                    dest_int_rect,
+                    &ConicGradientData {
+                        start_angle: inputs.gradient_angle,
+                        color_stops: color_stops(),
+                        interpolation_method,
+                    },
+                    converter.rounded_device_point(inputs.position.into()),
+                );
+            }
         }
         let bytes = recorder.into_builder().into_bytes();
         unsafe { consume(context, bytes.as_ptr(), bytes.len()) };
@@ -947,7 +994,32 @@ pub unsafe extern "C" fn layout_arena_paintable_invalidate_paint_cache(
         if propagated_text_decorations {
             paintables.invalidate_propagated_text_decoration_caches(arena, paintable);
         } else {
-            paintables.invalidate_paint_cache(paintable);
+            paintables.invalidate_paint_cache(arena, paintable);
+        }
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_invalidate_for_repaint(arena: *mut c_void, paintable: PaintableSlotId) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        arena.paintables().borrow().invalidate_for_repaint(arena, paintable);
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_invalidate_all_paint_caches(arena: *mut c_void) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        for cache in &paintables.paint_caches {
+            cache.clear();
         }
     });
 }
@@ -979,8 +1051,8 @@ pub struct FfiCaretRectResult {
     pub found: bool,
     pub rect: FfiCssPixelRect,
     pub style_source: *mut c_void,
-    pub owner_paintable: *mut c_void,
-    pub nearest_self_painting_inline: *mut c_void,
+    pub owner_paintable: PaintableSlotId,
+    pub nearest_self_painting_inline: PaintableSlotId,
 }
 
 /// # Safety
@@ -1000,8 +1072,8 @@ pub unsafe extern "C" fn layout_arena_text_caret_rect_for_position(
             found: false,
             rect: FfiCssPixelRect::default(),
             style_source: std::ptr::null_mut(),
-            owner_paintable: std::ptr::null_mut(),
-            nearest_self_painting_inline: std::ptr::null_mut(),
+            owner_paintable: PaintableSlotId::INVALID,
+            nearest_self_painting_inline: PaintableSlotId::INVALID,
         };
         let arena = unsafe { arena_from_handle(arena) };
         let paintables = arena.paintables().borrow();
@@ -1019,10 +1091,10 @@ pub unsafe extern "C" fn layout_arena_text_caret_rect_for_position(
         result.found = true;
         result.rect = answer.rect.into();
         result.style_source = arena.shell_if_live(answer.style_source);
-        result.owner_paintable = paintables.data_ref(answer.owner).shell;
+        result.owner_paintable = answer.owner;
         result.nearest_self_painting_inline =
             crate::painting::fragment_ownership::nearest_self_painting_inline_box(arena, &paintables, answer.node)
-                .map_or(std::ptr::null_mut(), |inline_box| paintables.data_ref(inline_box).shell);
+                .unwrap_or(PaintableSlotId::INVALID);
         result
     })
 }
@@ -1319,9 +1391,7 @@ pub unsafe extern "C" fn layout_arena_text_has_rendered_text_after(
         let arena = unsafe { arena_from_handle(arena) };
         // SAFETY: The caller guarantees the slot span is valid for this synchronous call.
         let node_slots = unsafe { ffi_slice(node_slots, node_slot_count) };
-        has_rendered_text_matching(arena, node_slots, |fragment| {
-            fragment.dom_start_offset_in_node + fragment.length_in_code_units > offset
-        })
+        has_rendered_text_matching(arena, node_slots, |fragment| fragment.dom_end_offset_in_node > offset)
     })
 }
 
@@ -1432,9 +1502,8 @@ pub unsafe extern "C" fn layout_arena_paintable_fragment_text_facts(
         };
         facts.layout_node = arena.shell_if_live(fragment.layout_node);
         facts.dom_start_offset_in_node = fragment.dom_start_offset_in_node;
-        facts.dom_end_offset_in_node = fragment.dom_start_offset_in_node + fragment.length_in_code_units;
-        facts.dom_end_offset_with_trailing_whitespace =
-            facts.dom_end_offset_in_node + fragment.trailing_whitespace_length_in_code_units;
+        facts.dom_end_offset_in_node = fragment.dom_end_offset_in_node;
+        facts.dom_end_offset_with_trailing_whitespace = fragment.dom_end_offset_with_trailing_whitespace;
         facts
     })
 }
@@ -1524,6 +1593,7 @@ pub unsafe extern "C" fn layout_arena_paintable_fragment_caret_range_rect(
             return FfiCssPixelRect::default();
         };
         let offsets = crate::painting::text_fragment::compute_selection_offsets(
+            arena,
             fragment,
             SELECTION_STATE_START_AND_END,
             offset,
@@ -1567,7 +1637,7 @@ pub unsafe extern "C" fn layout_arena_text_range_rects(
         let node_slots = unsafe { ffi_slice(node_slots, node_slot_count) };
         crate::painting::text_fragment::for_each_fragment_of_nodes(arena, &paintables, node_slots, |_, _, fragment| {
             let fragment_dom_start = fragment.dom_start_offset_in_node;
-            let fragment_dom_end = fragment_dom_start + fragment.length_in_code_units;
+            let fragment_dom_end = fragment.dom_end_offset_in_node;
             if fragment_dom_end <= filter_dom_start || fragment_dom_start >= filter_dom_end {
                 return true;
             }
@@ -1639,7 +1709,7 @@ pub unsafe extern "C" fn layout_arena_for_each_subtree_fragment_rect(
         if !paintables.is_live(root) {
             return;
         }
-        paintables.for_each_in_subtree(root, |current| {
+        crate::painting::paint_order::for_each_in_paint_subtree(arena, &paintables, root, |current| {
             for fragment in &paintables.side(current).fragments {
                 let shell = arena.shell_if_live(fragment.layout_node);
                 let rect = crate::painting::text_fragment::absolute_rect(arena, &paintables, fragment).into();
@@ -1953,10 +2023,9 @@ pub unsafe extern "C" fn layout_arena_export_hit_test_items(
                 paintables.is_live(item.paintable),
                 "exporting a hit-test item for a non-live paintable"
             );
-            let paintable_shell = paintables.data_ref(item.paintable).shell;
             *output = crate::painting::host::FfiHitTestItemExport {
                 kind: item.kind as u8,
-                paintable_shell,
+                paintable: item.paintable,
                 chrome_widget_kind: item.chrome_widget_kind,
                 has_text_fragment_index: item.text_fragment_index.is_some(),
                 text_fragment_index: item.text_fragment_index.unwrap_or(0),
@@ -1967,6 +2036,73 @@ pub unsafe extern "C" fn layout_arena_export_hit_test_items(
                 visual_context_index: item.visual_context_index,
             };
         }
+    });
+}
+
+fn paint_tree_dump_entries(
+    arena: &LayoutNodeArena,
+    paintables: &crate::painting::paintable_arena::PaintableArena,
+    root: PaintableSlotId,
+) -> Vec<crate::painting::host::FfiPaintTreeDumpEntry> {
+    fn visit(
+        arena: &LayoutNodeArena,
+        paintables: &crate::painting::paintable_arena::PaintableArena,
+        slot: PaintableSlotId,
+        depth: u32,
+        entries: &mut Vec<crate::painting::host::FfiPaintTreeDumpEntry>,
+    ) {
+        entries.push(crate::painting::host::FfiPaintTreeDumpEntry {
+            layout_node_shell: arena.shell_if_live(paintables.data_ref(slot).layout_node),
+            depth,
+        });
+        crate::painting::paint_order::for_each_paint_child(arena, paintables, slot, |current| {
+            visit(arena, paintables, current, depth + 1, entries);
+        });
+    }
+
+    if !paintables.is_live(root) {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    visit(arena, paintables, root, 0, &mut entries);
+    entries
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paint_tree_dump_entry_count(arena: *mut c_void, root: PaintableSlotId) -> usize {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        paint_tree_dump_entries(arena, &paintables, root).len()
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`; `output` must point to writable
+/// storage for exactly `output_length` items, matching the current paint-tree dump entry count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_export_paint_tree_dump_entries(
+    arena: *mut c_void,
+    root: PaintableSlotId,
+    output: *mut crate::painting::host::FfiPaintTreeDumpEntry,
+    output_length: usize,
+) {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintables = arena.paintables().borrow();
+        let entries = paint_tree_dump_entries(arena, &paintables, root);
+        assert_eq!(entries.len(), output_length);
+        if entries.is_empty() {
+            return;
+        }
+        assert!(!output.is_null());
+        // SAFETY: The caller provides writable storage for exactly `output_length` exports.
+        let output = unsafe { std::slice::from_raw_parts_mut(output, output_length) };
+        output.copy_from_slice(&entries);
     });
 }
 

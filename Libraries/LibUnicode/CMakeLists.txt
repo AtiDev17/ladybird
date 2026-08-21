@@ -3,12 +3,14 @@ set(SOURCES
     Calendar.cpp
     Calendars/AdjustedEraCalendar.cpp
     Calendars/ChineseDangiCalendar.cpp
+    CaseMapping.cpp
     CharacterTypes.cpp
     Collator.cpp
     CurrencyCode.cpp
     DateTimeFormat.cpp
     DisplayNames.cpp
     DurationFormat.cpp
+    FullwidthMapping.cpp
     ICU.cpp
     IDNA.cpp
     ListFormat.cpp

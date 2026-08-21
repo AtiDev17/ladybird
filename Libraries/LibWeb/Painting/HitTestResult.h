@@ -13,6 +13,8 @@
 #include <LibGC/Ptr.h>
 #include <LibWeb/DOM/AbstractRange.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/TextAffinity.h>
 
@@ -22,33 +24,27 @@ class ChromeWidget;
 class Paintable;
 
 struct HitTestResult {
-    NonnullRefPtr<Paintable> paintable;
+    GC::Ptr<DOM::Node> node;
+    Layout::RustFFI::PaintableSlotId box;
+    NonnullRefPtr<Layout::NodeArena> arena;
     RefPtr<ChromeWidget> chrome_widget {};
-    GC::Ptr<DOM::Node> dom_node_override {};
     size_t index_in_node { 0 };
     bool is_text_fragment { false };
-    enum InternalPosition {
-        None,
-        Before,
-        Inside,
-        After,
-    };
-    InternalPosition internal_position { None };
 
-    DOM::Node* dom_node();
-    DOM::Node const* dom_node() const;
+    DOM::Node* dom_node() { return node.ptr(); }
+    DOM::Node const* dom_node() const { return node.ptr(); }
+    RefPtr<Paintable> paintable() const;
 };
 
 struct CaretPosition {
-    NonnullRefPtr<Paintable> paintable;
+    Layout::RustFFI::PaintableSlotId box;
+    NonnullRefPtr<Layout::NodeArena> arena;
     DOM::BoundaryPoint boundary;
     TextAffinity affinity { TextAffinity::Downstream };
     Optional<DOM::BoundaryPoint> secondary_boundary {};
     Optional<CSSPixelRect> debug_rect {};
-};
 
-enum class HitTestType : u8 {
-    Exact, // Exact matches only
+    RefPtr<Paintable> paintable() const;
 };
 
 }

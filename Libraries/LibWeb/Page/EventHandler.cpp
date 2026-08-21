@@ -174,7 +174,8 @@ static Optional<Painting::CaretPosition> caret_position_from_editable_hit_node(D
         return {};
 
     return Painting::CaretPosition {
-        .paintable = *paintable,
+        .box = paintable->rust_slot(),
+        .arena = paintable->rust_arena(),
         .boundary = { *boundary_node, 0 },
     };
 }
@@ -215,22 +216,16 @@ void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const
 
 static GC::Ptr<DOM::Node> dom_node_for_event_dispatch(Painting::Paintable& paintable)
 {
-    if (auto node = paintable.dom_node())
-        return node;
-    auto parent = paintable.parent();
-    while (parent) {
-        if (auto node = parent->dom_node())
-            return node;
-        parent = parent->parent();
-    }
-    return nullptr;
+    return event_dispatch_dom_node_for(paintable);
 }
 
 static CSS::UserSelect user_select_used_value_for_caret_position(Painting::CaretPosition const& caret_position)
 {
     if (auto* layout_node = caret_position.boundary.node->layout_node())
         return layout_node->user_select_used_value();
-    return caret_position.paintable->layout_node().user_select_used_value();
+    if (auto caret_paintable = caret_position.paintable(); caret_paintable && caret_paintable->has_layout_node())
+        return caret_paintable->layout_node().user_select_used_value();
+    return CSS::UserSelect::Auto;
 }
 
 static Optional<EventResult> dispatch_event_to_nested_navigable(Painting::Paintable& paintable, CSSPixelPoint viewport_position, Function<EventResult(EventHandler&, CSSPixelPoint)> dispatch)
@@ -429,12 +424,15 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
         auto caret_position = document->caret_position_from_point(visual_viewport_position);
         if (caret_position.has_value()) {
             document->set_caret_hit_test_debug_rect(caret_position->debug_rect);
+            auto paintable_description = "(gone)"_string;
+            if (auto caret_paintable = caret_position->paintable())
+                paintable_description = caret_paintable->debug_description();
             dbgln("Caret hit test: point=({}, {}) boundary=({}, {}) paintable={} debug_rect={}",
                 visual_viewport_position.x(),
                 visual_viewport_position.y(),
                 caret_position->boundary.node->debug_description(),
                 caret_position->boundary.offset,
-                caret_position->paintable->debug_description(),
+                paintable_description,
                 caret_position->debug_rect);
         } else {
             document->set_caret_hit_test_debug_rect({});
@@ -787,7 +785,8 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
                 if (handled_scroll_event)
                     return EventResult::Handled;
 
-                containing_block = containing_block->containing_block();
+                auto* containing_block_box = containing_block->layout_node().containing_block();
+                containing_block = containing_block_box ? containing_block_box->paintable() : nullptr;
             }
 
             auto document = m_navigable->active_document();
@@ -1332,7 +1331,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         while (containing_block) {
             if (containing_block->handle_mousewheel({}, {}, 0, 0, delta_x, delta_y))
                 return true;
-            containing_block = containing_block->containing_block();
+            auto* containing_block_box = containing_block->layout_node().containing_block();
+            containing_block = containing_block_box ? containing_block_box->paintable() : nullptr;
         }
         return false;
     };
@@ -2119,14 +2119,18 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
     if (!document)
         return {};
 
-    if (auto result = document->hit_test(position, Painting::HitTestType::Exact); result.has_value())
+    if (auto result = document->hit_test(position); result.has_value()) {
+        auto paintable = result->paintable();
+        if (!paintable)
+            return {};
         return Target {
-            .paintable = result->paintable.ptr(),
+            .paintable = move(paintable),
             .chrome_widget = result->chrome_widget,
             .dom_node = result->dom_node(),
             .index_in_node = result->index_in_node,
             .is_text_fragment = result->is_text_fragment,
         };
+    }
     return {};
 }
 
@@ -2141,7 +2145,7 @@ GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint po
 
 GC::Ptr<DOM::Node> EventHandler::focus_candidate_for_position(CSSPixelPoint visual_viewport_position) const
 {
-    auto exact_hit = m_navigable->active_document()->hit_test(visual_viewport_position, Painting::HitTestType::Exact);
+    auto exact_hit = m_navigable->active_document()->hit_test(visual_viewport_position);
     if (!exact_hit.has_value())
         return {};
 
@@ -2168,7 +2172,7 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
         if (!m_navigable->page().enable_autoscroll())
             return;
 
-        auto hit = document.hit_test(visual_viewport_position, Painting::HitTestType::Exact);
+        auto hit = document.hit_test(visual_viewport_position);
         if (!hit.has_value())
             return;
 
@@ -2179,8 +2183,10 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
                 return;
         }
 
-        if (auto container = MiddleButtonScrollHandler::find_scrollable_ancestor(document, *hit->paintable))
-            m_middle_button_scroll_handler = make<MiddleButtonScrollHandler>(*container, visual_viewport_position);
+        if (auto hit_paintable = hit->paintable()) {
+            if (auto container = MiddleButtonScrollHandler::find_scrollable_ancestor(document, *hit_paintable))
+                m_middle_button_scroll_handler = make<MiddleButtonScrollHandler>(*container, visual_viewport_position);
+        }
 
         return;
     }
@@ -2224,8 +2230,10 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
 
     // NB: Initiating the selection may run script (setting a selection inside an editing host runs the focusing
     //     steps on it), which may have rebuilt the layout tree and detached the caret position's paintable.
-    if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
-        m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
+    if (auto caret_paintable = caret_position->paintable()) {
+        if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_paintable))
+            m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
+    }
 }
 
 Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Document& document, CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position)
@@ -2240,7 +2248,7 @@ Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Doc
     // NOTE: Note that focusing is not an activation behavior, i.e. calling the click() method on an element or
     //       dispatching a synthetic click event on it won't cause the element to get focused.
     GC::Ptr<DOM::Node> editable_hit_node_before_focus;
-    if (auto hit_before_focus = document.hit_test(visual_viewport_position, Painting::HitTestType::Exact); hit_before_focus.has_value()) {
+    if (auto hit_before_focus = document.hit_test(visual_viewport_position); hit_before_focus.has_value()) {
         if (auto* hit_node = hit_before_focus->dom_node())
             editable_hit_node_before_focus = *hit_node;
     }
@@ -2389,8 +2397,10 @@ void EventHandler::start_selection_from_preserved_mousedown(DOM::Document& docum
     if (!initiate_character_selection(document, *caret_position, user_select, false))
         return;
 
-    if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
-        m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
+    if (auto caret_paintable = caret_position->paintable()) {
+        if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_paintable))
+            m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
+    }
 }
 
 void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& document, CSSPixelPoint visual_viewport_position)

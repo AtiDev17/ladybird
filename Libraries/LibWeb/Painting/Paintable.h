@@ -7,7 +7,6 @@
 
 #pragma once
 
-#include <AK/IterationDecision.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
@@ -28,8 +27,6 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/BorderRadiiData.h>
-#include <LibWeb/Painting/BordersData.h>
 #include <LibWeb/Painting/BoxModelMetrics.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/ChromeWidget.h>
@@ -41,7 +38,6 @@
 #include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/TextAffinity.h>
-#include <LibWeb/TreeTraversal.h>
 
 namespace Web::Painting {
 
@@ -61,6 +57,9 @@ ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView computed_filter, Pa
 WEB_API Paintable const* nearest_svg_viewport_paintable_of(Layout::Node const&);
 // The viewport's rect in its own user units: the active viewBox rect, else {0,0} + the used size.
 WEB_API Gfx::FloatRect svg_viewport_user_rect(Paintable const& viewport_paintable);
+
+GC::Ptr<DOM::Node> event_dispatch_dom_node_for(Paintable const&);
+RefPtr<Paintable> paintable_for_slot(void* arena_handle, Layout::RustFFI::PaintableSlotId);
 
 bool body_background_is_propagated_to_root(Layout::NodeWithStyle const&);
 
@@ -99,113 +98,6 @@ public:
 
     bool has_stacking_context() const;
 
-    Paintable* parent_ptr() { return shell_from_slot(rust_data().parent); }
-    Paintable const* parent_ptr() const { return shell_from_slot(rust_data().parent); }
-    RefPtr<Paintable> parent() { return parent_ptr(); }
-    RefPtr<Paintable const> parent() const { return parent_ptr(); }
-    Paintable* first_child_ptr() { return shell_from_slot(rust_data().first_child); }
-    Paintable const* first_child_ptr() const { return shell_from_slot(rust_data().first_child); }
-    RefPtr<Paintable> first_child() { return first_child_ptr(); }
-    RefPtr<Paintable const> first_child() const { return first_child_ptr(); }
-    Paintable* next_sibling_ptr() { return shell_from_slot(rust_data().next_sibling); }
-    Paintable const* next_sibling_ptr() const { return shell_from_slot(rust_data().next_sibling); }
-    RefPtr<Paintable> next_sibling() { return next_sibling_ptr(); }
-    RefPtr<Paintable const> next_sibling() const { return next_sibling_ptr(); }
-    bool has_children() const { return rust_data().first_child.index != Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX; }
-
-    template<typename Callback>
-    TraversalDecision for_each_in_inclusive_subtree(Callback callback)
-    {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::Yes, move(callback));
-    }
-    template<typename Callback>
-    TraversalDecision for_each_in_inclusive_subtree(Callback callback) const
-    {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::Yes, move(callback));
-    }
-    template<typename U, typename Callback>
-    TraversalDecision for_each_in_inclusive_subtree_of_type(Callback callback)
-    {
-        return for_each_in_inclusive_subtree([callback = move(callback)](Paintable& paintable) {
-            if (auto* paintable_of_type = as_if<U>(paintable))
-                return callback(*paintable_of_type);
-            return TraversalDecision::Continue;
-        });
-    }
-    template<typename U, typename Callback>
-    TraversalDecision for_each_in_inclusive_subtree_of_type(Callback callback) const
-    {
-        return for_each_in_inclusive_subtree([callback = move(callback)](Paintable const& paintable) {
-            if (auto const* paintable_of_type = as_if<U>(paintable))
-                return callback(*paintable_of_type);
-            return TraversalDecision::Continue;
-        });
-    }
-    template<typename Callback>
-    TraversalDecision for_each_in_subtree(Callback callback)
-    {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::No, move(callback));
-    }
-    template<typename Callback>
-    TraversalDecision for_each_in_subtree(Callback callback) const
-    {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::No, move(callback));
-    }
-    template<typename U, typename Callback>
-    TraversalDecision for_each_in_subtree_of_type(Callback callback)
-    {
-        return for_each_in_subtree([callback = move(callback)](Paintable& paintable) {
-            if (auto* paintable_of_type = as_if<U>(paintable))
-                return callback(*paintable_of_type);
-            return TraversalDecision::Continue;
-        });
-    }
-    template<typename U, typename Callback>
-    TraversalDecision for_each_in_subtree_of_type(Callback callback) const
-    {
-        return for_each_in_subtree([callback = move(callback)](Paintable const& paintable) {
-            if (auto const* paintable_of_type = as_if<U>(paintable))
-                return callback(*paintable_of_type);
-            return TraversalDecision::Continue;
-        });
-    }
-    template<typename Callback>
-    void for_each_child(Callback callback)
-    {
-        for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            if (callback(*child) == IterationDecision::Break)
-                return;
-        }
-    }
-    template<typename Callback>
-    void for_each_child(Callback callback) const
-    {
-        for (auto const* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            if (callback(*child) == IterationDecision::Break)
-                return;
-        }
-    }
-    template<typename U, typename Callback>
-    void for_each_child_of_type(Callback callback)
-    {
-        for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            if (auto* child_of_type = as_if<U>(*child)) {
-                if (callback(*child_of_type) == IterationDecision::Break)
-                    return;
-            }
-        }
-    }
-    template<typename U, typename Callback>
-    void for_each_child_of_type(Callback callback) const
-    {
-        for (auto const* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            if (auto const* child_of_type = as_if<U>(*child)) {
-                if (callback(*child_of_type) == IterationDecision::Break)
-                    return;
-            }
-        }
-    }
-
     bool has_layout_node() const { return m_layout_node; }
     Layout::NodeWithStyle const& layout_node() const
     {
@@ -223,9 +115,6 @@ public:
     bool visible_for_hit_testing() const;
 
     GC::Ptr<HTML::LocalNavigable> navigable() const;
-
-    RefPtr<Paintable> containing_block() const;
-    Paintable const* containing_block_ptr() const;
 
     template<typename T>
     bool fast_is() const = delete;
@@ -400,7 +289,7 @@ public:
     Optional<CachedOverflowData> cached_overflow_data() const;
     void clear_cached_overflow_data();
 
-    virtual void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
+    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
 
     virtual bool handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y);
 
@@ -432,10 +321,7 @@ public:
 
     bool uses_collapsing_borders_model() const { return rust_data().uses_collapsing_borders_model; }
 
-    BorderRadiiData border_radii_data() const;
-
-    Optional<BordersData> outline_data() const;
-    Optional<BordersData> outline_data(CSS::ComputedValues const&) const;
+    Optional<CSS::BorderData> outline_data(CSS::ComputedValues const&) const;
     CSSPixels outline_offset() const;
 
     void set_filter(ResolvedCSSFilter filter) { m_filter = move(filter); }
@@ -515,8 +401,6 @@ private:
 
     bool has_flag(Layout::RustFFI::PaintableFlag flag) const { return (rust_data().flags & to_underlying(flag)) != 0; }
     Layout::RustFFI::PaintableData& rust_data() { return *m_rust_data; }
-    Paintable* shell_from_slot(Layout::RustFFI::PaintableSlotId) const;
-
     GC::Weak<DOM::Node> m_dom_node;
     WeakPtr<Layout::NodeWithStyle const> m_layout_node;
 
@@ -534,7 +418,5 @@ private:
 
 template<>
 inline bool Paintable::fast_is<PaintableWithLines>() const { return is_paintable_with_lines(); }
-
-WEB_API Painting::BorderRadiiData normalize_border_radii_data(CSSPixelRect const& border_rect, CSSPixelRect const& reference_rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius);
 
 }

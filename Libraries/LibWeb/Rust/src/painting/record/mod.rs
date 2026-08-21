@@ -211,20 +211,27 @@ impl<'a> PaintRecorder<'a> {
         }
     }
 
+    pub(crate) fn border_radii(&mut self, paintable: PaintableSlotId) -> BorderRadii {
+        let Some(style) = self.layout_arena.node_style_if_live(self.data(paintable).layout_node) else {
+            return BorderRadii::default();
+        };
+        crate::painting::visual_context::node_values::border_radii_data(style, self.paintables, paintable)
+    }
+
     pub(crate) fn piece_border_radii(
         &mut self,
         paintable: PaintableSlotId,
         piece: &InlineBoxPieceRecord,
     ) -> BorderRadii {
-        if !self.paintable_facts(paintable).has_noninitial_border_radii {
+        let Some(style) = self.layout_arena.node_style_if_live(self.data(paintable).layout_node) else {
             return BorderRadii::default();
-        }
-        BorderRadii::from_raw(self.host.piece_border_radii(
-            self.shell(paintable),
-            piece.border_box_rect.width.raw_value(),
-            piece.border_box_rect.height.raw_value(),
+        };
+        crate::painting::visual_context::node_values::piece_border_radii_data(
+            style,
+            piece.border_box_rect.width,
+            piece.border_box_rect.height,
             piece.present_edges,
-        ))
+        )
     }
 
     pub(crate) fn base_paint_facts(&mut self, paintable: PaintableSlotId) -> BasePaintFacts {
@@ -244,7 +251,7 @@ impl<'a> PaintRecorder<'a> {
         let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE && effects.opacity != 0.0;
         let empty_cells_property_applies = self.display(paintable).is_internal_table()
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
-            && self.paintables.first_child(paintable).is_none();
+            && crate::painting::paint_order::first_paint_child(self.layout_arena, self.paintables, paintable).is_none();
         let has_backdrop_filter = effects.backdrop_filter.operations.length != 0;
         let paints_border_image = crate::painting::style_queries::handle_value(&style.border().border_image_source)
             .is_some_and(|source| matches!(source, crate::css::style_value::StyleValueData::Image { .. }));

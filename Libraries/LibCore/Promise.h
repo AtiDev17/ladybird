@@ -31,11 +31,27 @@ public:
     virtual ~Promise() = default;
     static NonnullRefPtr<Promise> construct() { return adopt_ref(*new Promise()); }
 
-    Function<ErrorOr<void, TError>(Result&)> on_resolution;
+    template<typename R = Result>
+    static NonnullRefPtr<Promise> resolved(R&& result)
+    {
+        auto promise = construct();
+        promise->resolve(forward<R>(result));
+        return promise;
+    }
+
+    template<typename E = ErrorType>
+    static NonnullRefPtr<Promise> rejected(E&& error)
+    {
+        auto promise = construct();
+        promise->reject(forward<E>(error));
+        return promise;
+    }
+
+    Function<ErrorOr<void, ErrorType>(Result&)> on_resolution;
     Function<void(ErrorType&)> on_rejection;
 
-    template<typename U>
-    static NonnullRefPtr<Promise> after(Vector<NonnullRefPtr<Promise<U>>> promises)
+    template<typename U, typename E>
+    static NonnullRefPtr<Promise> after(Vector<NonnullRefPtr<Promise<U, E>>> promises)
     {
         auto promise = Promise::construct();
         struct Resolved : RefCounted<Resolved> {
@@ -46,35 +62,42 @@ public:
 
             size_t count { 0 };
             size_t needed { 0 };
-            Optional<Error> error;
+            Optional<E> error;
         };
 
-        auto resolved = make_ref_counted<Resolved>(promises.size());
-        auto weak_promise = promise->template make_weak_ptr<Promise>();
-        for (auto p : promises) {
-            p->when_resolved([weak_promise, resolved](auto&&) -> ErrorOr<void> {
-                if (!weak_promise || weak_promise->is_rejected())
+        if (!promises.is_empty()) {
+            auto resolved = make_ref_counted<Resolved>(promises.size());
+            auto weak_promise = promise->template make_weak_ptr<Promise>();
+            for (auto p : promises) {
+                p->when_resolved([weak_promise, resolved](auto&&) -> ErrorOr<void, E> {
+                    if (!weak_promise || weak_promise->is_rejected())
+                        return {};
+
+                    if (++resolved->count == resolved->needed) {
+                        if (resolved->error.has_value())
+                            weak_promise->reject(ErrorType(resolved->error.release_value()));
+                        else
+                            weak_promise->resolve({});
+                    }
                     return {};
+                });
 
-                if (++resolved->count == resolved->needed) {
-                    if (resolved->error.has_value())
-                        weak_promise->reject(resolved->error.release_value());
-                    else
-                        weak_promise->resolve({});
-                }
-                return {};
-            });
+                p->when_rejected([weak_promise, resolved](auto&& error) {
+                    ++resolved->count;
+                    if (!resolved->error.has_value())
+                        resolved->error = move(error);
 
-            p->when_rejected([weak_promise, resolved](auto&& error) {
-                resolved->error = move(error);
-                if (!weak_promise)
-                    return;
+                    if (!weak_promise)
+                        return;
 
-                if (++resolved->count == resolved->needed)
-                    weak_promise->reject(resolved->error.release_value());
-            });
+                    if (resolved->count == resolved->needed)
+                        weak_promise->reject(ErrorType(resolved->error.release_value()));
+                });
 
-            promise->add_child(*p);
+                promise->add_child(*p);
+            }
+        } else {
+            promise->resolve({});
         }
 
         return promise;
@@ -83,19 +106,24 @@ public:
     template<typename R = Result>
     void resolve(R&& result)
     {
+        auto protector = NonnullRefPtr { *this };
         m_result_or_rejection = forward<R>(result);
 
         if (on_resolution) {
             auto handler_result = on_resolution(m_result_or_rejection->value());
             possibly_handle_rejection(handler_result);
         }
+
+        m_children.clear();
     }
 
     template<typename E = ErrorType>
     void reject(E&& error)
     {
+        auto protector = NonnullRefPtr { *this };
         m_result_or_rejection = forward<E>(error);
         possibly_handle_rejection(*m_result_or_rejection);
+        m_children.clear();
     }
 
     bool is_rejected()
@@ -127,7 +155,7 @@ public:
         if (is_rejected())
             new_promise->reject(m_result_or_rejection->release_error());
 
-        on_resolution = [new_promise, func = move(func)](Result& result) -> ErrorOr<void> {
+        on_resolution = [new_promise, func = move(func)](Result& result) -> ErrorOr<void, ErrorType> {
             new_promise->resolve(func(result));
             return {};
         };
@@ -140,13 +168,13 @@ public:
     template<CallableAs<void, Result&> F>
     Promise& when_resolved(F handler)
     {
-        return when_resolved([handler = move(handler)](Result& result) mutable -> ErrorOr<void> {
+        return when_resolved([handler = move(handler)](Result& result) mutable -> ErrorOr<void, ErrorType> {
             handler(result);
             return {};
         });
     }
 
-    template<CallableAs<ErrorOr<void>, Result&> F>
+    template<CallableAs<ErrorOr<void, ErrorType>, Result&> F>
     Promise& when_resolved(F handler)
     {
         on_resolution = move(handler);
@@ -172,7 +200,7 @@ public:
 
 private:
     template<typename T>
-    void possibly_handle_rejection(ErrorOr<T, TError>& result)
+    void possibly_handle_rejection(ErrorOr<T, ErrorType>& result)
     {
         if (result.is_error() && on_rejection)
             on_rejection(result.error());

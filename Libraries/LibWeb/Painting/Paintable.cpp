@@ -48,7 +48,6 @@
 #include <LibWeb/Page/MiddleButtonScrollHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
-#include <LibWeb/Painting/DisplayListRecordingContext.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/GridInspectorOverlay.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
@@ -130,21 +129,6 @@ DOM::Document& Paintable::document()
     return layout_node().document();
 }
 
-RefPtr<Paintable> Paintable::containing_block() const
-{
-    return const_cast<Paintable*>(containing_block_ptr());
-}
-
-Paintable const* Paintable::containing_block_ptr() const
-{
-    return shell_from_slot(rust_data().containing_block);
-}
-
-Paintable* Paintable::shell_from_slot(Layout::RustFFI::PaintableSlotId slot) const
-{
-    return static_cast<Paintable*>(Layout::RustFFI::layout_arena_paintable_shell(m_rust_arena->handle(), slot));
-}
-
 bool Paintable::is_visible() const
 {
     return layout_node().visibility() == CSS::Visibility::Visible && layout_node().opacity() != 0;
@@ -187,87 +171,35 @@ bool Paintable::has_stacking_context() const
     return rust_data().stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT;
 }
 
-DOM::Node* HitTestResult::dom_node()
+GC::Ptr<DOM::Node> event_dispatch_dom_node_for(Paintable const& paintable)
 {
-    if (dom_node_override)
-        return dom_node_override.ptr();
-
-    for (auto* current = paintable.ptr(); current; current = current->parent()) {
-        if (auto node = current->dom_node())
-            return node.ptr();
-    }
-    return nullptr;
+    auto* layout_node_shell = Layout::RustFFI::layout_arena_paintable_event_dispatch_node_shell(paintable.rust_arena().handle(), paintable.rust_slot());
+    if (!layout_node_shell)
+        return nullptr;
+    return static_cast<Layout::Node*>(layout_node_shell)->dom_node();
 }
 
-DOM::Node const* HitTestResult::dom_node() const
+RefPtr<Paintable> paintable_for_slot(void* arena_handle, Layout::RustFFI::PaintableSlotId slot)
 {
-    if (dom_node_override)
-        return dom_node_override.ptr();
+    auto* layout_node_shell = Layout::RustFFI::layout_arena_paintable_layout_node_shell(arena_handle, slot);
+    if (!layout_node_shell)
+        return nullptr;
+    return static_cast<Layout::Node*>(layout_node_shell)->paintable();
+}
 
-    for (auto const* current = paintable.ptr(); current; current = current->parent()) {
-        if (auto node = current->dom_node())
-            return node.ptr();
-    }
-    return nullptr;
+RefPtr<Paintable> HitTestResult::paintable() const
+{
+    return paintable_for_slot(arena->handle(), box);
+}
+
+RefPtr<Paintable> CaretPosition::paintable() const
+{
+    return paintable_for_slot(arena->handle(), box);
 }
 
 CSSPixelPoint Paintable::box_type_agnostic_position() const
 {
     return absolute_position();
-}
-
-Painting::BorderRadiiData normalize_border_radii_data(CSSPixelRect const& border_rect, CSSPixelRect const& reference_rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius)
-{
-    Painting::BorderRadiiData radii_px {
-        .top_left = {
-            top_left_radius.horizontal_radius.to_px(reference_rect.width()),
-            top_left_radius.vertical_radius.to_px(reference_rect.height()) },
-        .top_right = { top_right_radius.horizontal_radius.to_px(reference_rect.width()), top_right_radius.vertical_radius.to_px(reference_rect.height()) },
-        .bottom_right = { bottom_right_radius.horizontal_radius.to_px(reference_rect.width()), bottom_right_radius.vertical_radius.to_px(reference_rect.height()) },
-        .bottom_left = { bottom_left_radius.horizontal_radius.to_px(reference_rect.width()), bottom_left_radius.vertical_radius.to_px(reference_rect.height()) }
-    };
-
-    // Scale overlapping curves according to https://www.w3.org/TR/css-backgrounds-3/#corner-overlap
-    // Let f = min(Li/Si), where i ∈ {top, right, bottom, left},
-    // Si is the sum of the two corresponding radii of the corners on side i,
-    // and Ltop = Lbottom = the width of the box, and Lleft = Lright = the height of the box.
-    //
-    // NOTE: We iterate twice as a form of iterative refinement. A single scaling pass using
-    // fixed-point arithmetic can result in small rounding errors, causing the scaled radii to
-    // still slightly overflow the box dimensions. A second pass corrects this remaining error.
-    auto border_width = max(CSSPixels(0), border_rect.width());
-    auto border_height = max(CSSPixels(0), border_rect.height());
-    for (int iteration = 0; iteration < 2; ++iteration) {
-        auto s_top = radii_px.top_left.horizontal_radius + radii_px.top_right.horizontal_radius;
-        auto s_right = radii_px.top_right.vertical_radius + radii_px.bottom_right.vertical_radius;
-        auto s_bottom = radii_px.bottom_right.horizontal_radius + radii_px.bottom_left.horizontal_radius;
-        auto s_left = radii_px.bottom_left.vertical_radius + radii_px.top_left.vertical_radius;
-
-        CSSPixelFraction f = 1;
-        if (s_top > 0 && s_top > border_width)
-            f = min(f, border_width / s_top);
-        if (s_right > 0 && s_right > border_height)
-            f = min(f, border_height / s_right);
-        if (s_bottom > 0 && s_bottom > border_width)
-            f = min(f, border_width / s_bottom);
-        if (s_left > 0 && s_left > border_height)
-            f = min(f, border_height / s_left);
-
-        // If f is 1 or more, the radii fit perfectly and no more scaling is needed
-        if (f >= 1)
-            break;
-
-        Painting::BorderRadiusData* corners[] = {
-            &radii_px.top_left, &radii_px.top_right, &radii_px.bottom_right, &radii_px.bottom_left
-        };
-
-        for (auto* corner : corners) {
-            corner->horizontal_radius *= f;
-            corner->vertical_radius *= f;
-        }
-    }
-
-    return radii_px;
 }
 
 // https://drafts.csswg.org/css-pseudo-4/#highlight-styling
@@ -440,7 +372,8 @@ void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offse
             cursor_rect.set_y(cursor_rect.y() - 1);
         cursor_rect.set_height(1);
     }
-    for (auto* ancestor = static_cast<Paintable*>(result.owner_paintable); ancestor; ancestor = ancestor->containing_block().ptr()) {
+    auto owner = paintable_for_slot(layout_node->arena_handle(), result.owner_paintable);
+    for (auto* ancestor = owner.ptr(); ancestor;) {
         if (ancestor->has_scrollable_overflow()) {
             if (scroll_block_direction == ScrollBlockDirection::No) {
                 auto snapport = ancestor->scroll_snapport_rect();
@@ -455,6 +388,8 @@ void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offse
             ancestor->scroll_into_view(cursor_rect);
             return;
         }
+        auto* containing_block_box = ancestor->layout_node().containing_block();
+        ancestor = containing_block_box ? containing_block_box->paintable_ptr() : nullptr;
     }
 }
 
@@ -1427,14 +1362,7 @@ bool Paintable::resizer_contains(CSSPixelPoint adjusted_position, ChromeMetrics 
 void Paintable::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
     if (should_invalidate_display_list == InvalidateDisplayList::Yes) {
-        invalidate_paint_cache();
-
-        // Recurse into anonymous child nodes so we properly invalidate nested contents of e.g. <button>s.
-        for_each_child_of_type<Paintable>([&](auto& child) {
-            if (child.layout_node().is_anonymous())
-                child.set_needs_repaint(should_invalidate_display_list);
-            return IterationDecision::Continue;
-        });
+        Layout::RustFFI::layout_arena_paintable_invalidate_for_repaint(rust_arena().handle(), rust_slot());
 
         // The root element paints the body's propagated background, so a body repaint must also refresh the
         // root's cached background. A root repaint can conversely flip whether propagation applies, changing
@@ -1521,17 +1449,7 @@ CSSPixelRect Paintable::transform_reference_box() const
     VERIFY_NOT_REACHED();
 }
 
-BorderRadiiData Paintable::border_radii_data() const
-{
-    if (!layout_node().has_noninitial_border_radii())
-        return {};
-    CSSPixelRect const border_rect { 0, 0, border_box_width(), border_box_height() };
-    return normalize_border_radii_data(border_rect, border_rect,
-        layout_node().border_top_left_radius(), layout_node().border_top_right_radius(),
-        layout_node().border_bottom_right_radius(), layout_node().border_bottom_left_radius());
-}
-
-static Optional<BordersData> borders_data_for_outline(Layout::Node const& layout_node, Color outline_color, CSS::OutlineStyle outline_style, CSSPixels outline_width)
+static Optional<CSS::BorderData> border_data_for_outline(Layout::Node const& layout_node, Color outline_color, CSS::OutlineStyle outline_style, CSSPixels outline_width)
 {
     CSS::LineStyle line_style;
     if (outline_style == CSS::OutlineStyle::Auto) {
@@ -1545,30 +1463,20 @@ static Optional<BordersData> borders_data_for_outline(Layout::Node const& layout
     if (outline_color.alpha() == 0 || line_style == CSS::LineStyle::None || outline_width == 0)
         return {};
 
-    CSS::BorderData border_data {
+    return CSS::BorderData {
         .color = outline_color,
         .line_style = line_style,
         .width = outline_width,
     };
-    return BordersData { border_data, border_data, border_data, border_data };
 }
 
-Optional<BordersData> Paintable::outline_data() const
-{
-    // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
-    if (layout_node().outline_style() == CSS::OutlineStyle::Auto && (!navigable() || !navigable()->is_focused()))
-        return {};
-
-    return borders_data_for_outline(layout_node(), layout_node().outline_color(), layout_node().outline_style(), layout_node().outline_width());
-}
-
-Optional<BordersData> Paintable::outline_data(CSS::ComputedValues const& computed_values) const
+Optional<CSS::BorderData> Paintable::outline_data(CSS::ComputedValues const& computed_values) const
 {
     // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
     if (computed_values.outline_style() == CSS::OutlineStyle::Auto && (!navigable() || !navigable()->is_focused()))
         return {};
 
-    return borders_data_for_outline(layout_node(), computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
+    return border_data_for_outline(layout_node(), computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
 }
 
 CSSPixels Paintable::outline_offset() const
@@ -1578,13 +1486,16 @@ CSSPixels Paintable::outline_offset() const
 
 RefPtr<Paintable const> Paintable::nearest_scrollable_ancestor() const
 {
-    auto paintable = this->containing_block();
-    while (paintable) {
+    if (!has_layout_node())
+        return nullptr;
+    for (auto const* box = layout_node().containing_block(); box; box = box->containing_block()) {
+        auto const* paintable = box->paintable_ptr();
+        if (!paintable)
+            return nullptr;
         if (paintable->could_be_scrolled_by_wheel_event())
             return paintable;
         if (paintable->is_fixed_position())
             return nullptr;
-        paintable = paintable->containing_block();
     }
     return nullptr;
 }

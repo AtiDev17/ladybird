@@ -237,6 +237,8 @@ void WebDriverConnection::driver_execution_complete(Web::WebDriver::Response res
     if (!m_current_command_id.has_value())
         return;
 
+    m_pending_window_rect_requests.clear();
+
     auto command_id = m_current_command_id.release_value();
     m_page_client->webdriver_command_complete(command_id, move(response));
 }
@@ -477,7 +479,7 @@ Web::WebDriver::Response WebDriverConnection::close_window()
             // context has no document or navigable left to reach its traversable through.
             if (ensure_current_top_level_browsing_context_is_open().is_error())
                 return;
-            current_top_level_browsing_context()->top_level_traversable()->close_top_level_traversable();
+            current_top_level_browsing_context()->top_level_traversable()->close_top_level_traversable(Web::HTML::LocalTraversableNavigable::PromptToUnload::No);
         }));
 
         driver_execution_complete(JsonValue {});
@@ -783,18 +785,18 @@ Web::WebDriver::Response WebDriverConnection::set_window_rect(JsonValue payload)
             if (width.has_value() && height.has_value()) {
                 // a. Set the width, in CSS pixels, of the operating system window containing the current top-level browsing context, including any browser chrome and externally drawn window decorations to a value that is as close as possible to width.
                 // b. Set the height, in CSS pixels, of the operating system window containing the current top-level browsing context, including any browser chrome and externally drawn window decorations to a value that is as close as possible to height.
-                page.client().page_did_request_resize_window({ *width, *height });
-                ++m_pending_window_rect_requests;
+                auto request_id = register_window_rect_request();
+                page.client().page_did_request_resize_window({ *width, *height }, request_id);
             }
 
             // 12. If x and y are not null:
             if (x.has_value() && y.has_value()) {
                 // a. Run the implementation-specific steps to set the position of the operating system level window containing the current top-level browsing context to the position given by the x and y coordinates.
-                page.client().page_did_request_reposition_window({ *x, *y });
-                ++m_pending_window_rect_requests;
+                auto request_id = register_window_rect_request();
+                page.client().page_did_request_reposition_window({ *x, *y }, request_id);
             }
 
-            if (m_pending_window_rect_requests == 0)
+            if (m_pending_window_rect_requests.is_empty())
                 driver_execution_complete(serialize_rect(compute_window_rect(page)));
         }));
     });
@@ -874,11 +876,15 @@ Web::WebDriver::Response WebDriverConnection::fullscreen_window()
             auto& realm = document->relevant_settings_object().realm();
             auto promise = Web::WebIDL::create_promise(realm);
             document->document_element()->request_fullscreen(promise, Web::DOM::Element::FullscreenRequester::WebDriver);
-            ++m_pending_window_rect_requests;
+
+            Web::WebIDL::upon_fulfillment(promise, GC::create_function(GC::Heap::the(), [this, document](JS::Value) -> Web::WebIDL::ExceptionOr<JS::Value> {
+                driver_execution_complete(serialize_rect(compute_window_rect(document->page())));
+
+                return JS::js_undefined();
+            }));
 
             Web::WebIDL::upon_rejection(promise, GC::create_function(GC::Heap::the(), [this, document](JS::Value) -> Web::WebIDL::ExceptionOr<JS::Value> {
                 driver_execution_complete(serialize_rect(compute_window_rect(document->page())));
-                --m_pending_window_rect_requests;
 
                 return JS::js_undefined();
             }));
@@ -2481,15 +2487,22 @@ Web::WebDriver::Response WebDriverConnection::take_screenshot()
             auto root_rect = calculate_absolute_rect_of_element(*document->document_element());
 
             // b. Let screenshot result be the result of trying to call draw a bounding box from the framebuffer, given root rect as an argument.
-            // c. Let canvas be a canvas element of screenshot result's data.
-            auto canvas = WEBDRIVER_TRY(Web::WebDriver::draw_bounding_box_from_the_framebuffer(*current_top_level_browsing_context(), *document->document_element(), root_rect));
+            Web::WebDriver::draw_bounding_box_from_the_framebuffer(*current_top_level_browsing_context(), *document->document_element(), root_rect, [this](auto canvas_or_error) mutable {
+                if (canvas_or_error.is_error()) {
+                    driver_execution_complete(canvas_or_error.release_error());
+                    return;
+                }
 
-            // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
-            // e. Let encoded string be encoding result's data.
-            auto encoded_string = Web::WebDriver::encode_canvas_element(canvas);
+                // c. Let canvas be a canvas element of screenshot result's data.
+                auto canvas = canvas_or_error.release_value();
 
-            // 3. Return success with data encoded string.
-            driver_execution_complete(move(encoded_string));
+                // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
+                // e. Let encoded string be encoding result's data.
+                auto encoded_string = Web::WebDriver::encode_canvas_element(*canvas);
+
+                // 3. Return success with data encoded string.
+                driver_execution_complete(move(encoded_string));
+            });
         }));
         document->page().client().request_frame();
     });
@@ -2520,15 +2533,22 @@ Web::WebDriver::Response WebDriverConnection::take_element_screenshot(String ele
             auto element_rect = calculate_absolute_rect_of_element(element);
 
             // b. Let screenshot result be the result of trying to call draw a bounding box from the framebuffer, given element rect as an argument.
-            // c. Let canvas be a canvas element of screenshot result's data.
-            auto canvas = WEBDRIVER_TRY(Web::WebDriver::draw_bounding_box_from_the_framebuffer(current_browsing_context(), element, element_rect));
+            Web::WebDriver::draw_bounding_box_from_the_framebuffer(current_browsing_context(), element, element_rect, [this](auto canvas_or_error) mutable {
+                if (canvas_or_error.is_error()) {
+                    driver_execution_complete(canvas_or_error.release_error());
+                    return;
+                }
 
-            // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
-            // e. Let encoded string be encoding result's data.
-            auto encoded_string = Web::WebDriver::encode_canvas_element(canvas);
+                // c. Let canvas be a canvas element of screenshot result's data.
+                auto canvas = canvas_or_error.release_value();
 
-            // 6. Return success with data encoded string.
-            driver_execution_complete(move(encoded_string));
+                // d. Let encoding result be the result of trying encoding a canvas as Base64 canvas.
+                // e. Let encoded string be encoding result's data.
+                auto encoded_string = Web::WebDriver::encode_canvas_element(*canvas);
+
+                // 6. Return success with data encoded string.
+                driver_execution_complete(move(encoded_string));
+            });
         }));
         document->page().client().request_frame();
     });
@@ -2570,8 +2590,8 @@ void WebDriverConnection::set_current_top_level_browsing_context(Web::HTML::Brow
     m_current_top_level_browsing_context = browsing_context;
 
     if (m_current_top_level_browsing_context) {
-        m_current_top_level_browsing_context->page().set_window_rect_observer(GC::create_function(GC::Heap::the(), [this](Web::DevicePixelRect rect) {
-            if (m_pending_window_rect_requests > 0 && --m_pending_window_rect_requests == 0)
+        m_current_top_level_browsing_context->page().set_window_rect_observer(GC::create_function(GC::Heap::the(), [this](Web::DevicePixelRect rect, u64 request_id) {
+            if (m_pending_window_rect_requests.remove(request_id) && m_pending_window_rect_requests.is_empty())
                 driver_execution_complete(serialize_rect(rect.to_type<int>()));
         }));
     }
@@ -2724,8 +2744,15 @@ void WebDriverConnection::maximize_the_window()
     // To maximize the window, given an operating system level window with an associated top-level browsing context, run
     // the implementation-specific steps to transition the operating system level window into the maximized window state.
     // Return when the window has completed the transition, or within an implementation-defined timeout.
-    current_top_level_browsing_context()->page().client().page_did_request_maximize_window();
-    ++m_pending_window_rect_requests;
+    auto request_id = register_window_rect_request();
+    current_top_level_browsing_context()->page().client().page_did_request_maximize_window(request_id);
+}
+
+u64 WebDriverConnection::register_window_rect_request()
+{
+    auto request_id = m_next_window_rect_request_id++;
+    m_pending_window_rect_requests.set(request_id);
+    return request_id;
 }
 
 // https://w3c.github.io/webdriver/#dfn-iconify-the-window

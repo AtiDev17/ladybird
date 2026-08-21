@@ -24,12 +24,6 @@ pub struct FfiPreparedPaintable {
     pub reused: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CommitAnchors {
-    pub parent_paintable: PaintableSlotId,
-    pub insert_before_paintable: PaintableSlotId,
-}
-
 pub(crate) fn paintable_kind_for_node(facts: &NodeFacts<'_>, kind: NodeKind) -> PaintableKind {
     match kind {
         NodeKind::Viewport => PaintableKind::ViewportPaintable,
@@ -144,113 +138,32 @@ impl<'a> PaintableCommit<'a> {
             return;
         }
         let arena = self.arena.borrow();
+        let layout_arena = self.callbacks.arena();
         let offsets_before_commit = self.offsets_before_commit.borrow();
         for &root in roots.iter() {
             let delta = reused_subtree_absolute_position_delta(&arena, &offsets_before_commit, root);
             if delta == FfiCssPixelPoint::default() {
                 continue;
             }
-            arena.for_each_in_subtree(root, |slot| {
+            crate::painting::paint_order::for_each_in_paint_subtree(layout_arena, &arena, root, |slot| {
                 arena.update_data(slot, |data| {
                     if data.has_overflow {
                         data.overflow.rect.x += delta.x;
                         data.overflow.rect.y += delta.y;
                     }
                 });
-                arena.invalidate_paint_cache(slot);
+                arena.invalidate_paint_cache(layout_arena, slot);
             });
         }
     }
 
-    pub(crate) fn begin_commit(&self, root: Node) -> CommitAnchors {
+    pub(crate) fn begin_commit(&self, root: Node) {
         let arena = self.arena.borrow();
         arena.clear_absolute_rect_memo();
         if self.callbacks.node_data(root).kind == NodeKind::Viewport {
-            return CommitAnchors::default();
+            return;
         }
-        let parent = self.derived_commit_parent(&arena, root);
-        let insert_before = self.derived_commit_insert_before(&arena, root, parent);
-        let replaced = arena.paintable_of_node(root);
-        if !replaced.is_invalid() && arena.is_live(replaced) {
-            if let Some(replaced_parent) = arena.parent(replaced) {
-                assert_eq!(
-                    parent, replaced_parent,
-                    "derived commit parent disagrees with the replaced paintable's parent"
-                );
-            }
-            arena.remove_from_tree(replaced);
-        }
-        CommitAnchors {
-            parent_paintable: parent,
-            insert_before_paintable: insert_before,
-        }
-    }
-
-    fn derived_commit_parent(&self, arena: &PaintableArena, root: Node) -> PaintableSlotId {
-        let mut ancestor = self.callbacks.parent(root);
-        while !ancestor.is_invalid() {
-            let paintable = arena.paintable_of_node(ancestor);
-            if !paintable.is_invalid() {
-                return paintable;
-            }
-            if !NodeFacts::new(self.callbacks, ancestor).is_fragmented_inline() {
-                return PaintableSlotId::INVALID;
-            }
-            ancestor = self.callbacks.parent(ancestor);
-        }
-        PaintableSlotId::INVALID
-    }
-
-    fn derived_commit_insert_before(
-        &self,
-        arena: &PaintableArena,
-        root: Node,
-        parent: PaintableSlotId,
-    ) -> PaintableSlotId {
-        if parent.is_invalid() {
-            return PaintableSlotId::INVALID;
-        }
-        let mut current = root;
-        let mut descend = false;
-        loop {
-            let mut next = Node::INVALID;
-            if descend {
-                next = self.callbacks.first_child(current);
-            }
-            if next.is_invalid() {
-                let mut node = current;
-                loop {
-                    let sibling = self.callbacks.next_sibling(node);
-                    if !sibling.is_invalid() {
-                        next = sibling;
-                        break;
-                    }
-                    let ancestor = self.callbacks.parent(node);
-                    if ancestor.is_invalid() {
-                        return PaintableSlotId::INVALID;
-                    }
-                    let ancestor_paintable = arena.paintable_of_node(ancestor);
-                    if !ancestor_paintable.is_invalid() {
-                        assert_eq!(
-                            ancestor_paintable, parent,
-                            "commit insertion scan escaped the derived parent's scope"
-                        );
-                        return PaintableSlotId::INVALID;
-                    }
-                    node = ancestor;
-                }
-            }
-            current = next;
-            let paintable = arena.paintable_of_node(current);
-            if !paintable.is_invalid() {
-                if arena.parent(paintable) == Some(parent) {
-                    return paintable;
-                }
-                descend = false;
-            } else {
-                descend = NodeFacts::new(self.callbacks, current).is_fragmented_inline();
-            }
-        }
+        arena.clear_descendant_subtree_caches_from_layout_node(self.callbacks.arena(), root);
     }
 
     pub(crate) fn prepare_node(
@@ -291,7 +204,6 @@ impl<'a> PaintableCommit<'a> {
                 .borrow_mut()
                 .insert(slot, arena.data_ref(slot).offset);
             self.reused_subtree_roots.borrow_mut().push(slot);
-            arena.remove_from_tree(slot);
             return slot;
         }
         let style = self.callbacks.computed_values_view_if_styled(node);
@@ -513,7 +425,12 @@ impl<'a> PaintableCommit<'a> {
                         retained,
                     }
                 });
-                let (dom_start_offset_in_node, trailing_whitespace_length_in_code_units) = self.fragment_dom_offsets(
+                let (
+                    dom_start_offset_in_node,
+                    dom_end_offset_in_node,
+                    dom_end_offset_with_trailing_whitespace,
+                    trailing_whitespace_length_in_code_units,
+                ) = self.fragment_dom_offsets(
                     fragment.layout_node,
                     fragment.start,
                     fragment.length_in_code_units,
@@ -527,6 +444,8 @@ impl<'a> PaintableCommit<'a> {
                     start_offset: fragment.start,
                     length_in_code_units: fragment.length_in_code_units,
                     dom_start_offset_in_node,
+                    dom_end_offset_in_node,
+                    dom_end_offset_with_trailing_whitespace,
                     trailing_whitespace_length_in_code_units,
                     baseline: fragment.baseline,
                     accumulated_vertical_shift: fragment.accumulated_vertical_shift,
@@ -565,13 +484,17 @@ impl<'a> PaintableCommit<'a> {
         start_offset: usize,
         length_in_code_units: usize,
         has_trailing_whitespace: bool,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let data = self.callbacks.node_data(layout_node);
         if !crate::layout::kind_is_text(data.kind) {
-            return (start_offset, 0);
+            return (
+                start_offset,
+                start_offset + length_in_code_units,
+                start_offset + length_in_code_units,
+                0,
+            );
         }
         let content = self.callbacks.text_content(layout_node);
-        let dom_start_offset_in_node = content.dom_start_offset + start_offset;
         let mut trailing_whitespace_length = 0;
         if has_trailing_whitespace {
             let position = start_offset + length_in_code_units;
@@ -582,7 +505,36 @@ impl<'a> PaintableCommit<'a> {
                 trailing_whitespace_length += 1;
             }
         }
-        (dom_start_offset_in_node, trailing_whitespace_length)
+        let arena = self.callbacks.arena();
+        let dom_start_offset_in_node = arena.dom_offset_for_rendered_text_offset(
+            layout_node,
+            start_offset,
+            crate::layout::RenderedTextBoundary::Start,
+        );
+        let dom_end_offset_in_node = if length_in_code_units == 0 {
+            dom_start_offset_in_node
+        } else {
+            arena.dom_offset_for_rendered_text_offset(
+                layout_node,
+                start_offset + length_in_code_units,
+                crate::layout::RenderedTextBoundary::End,
+            )
+        };
+        let dom_end_offset_with_trailing_whitespace = if trailing_whitespace_length == 0 {
+            dom_end_offset_in_node
+        } else {
+            arena.dom_offset_for_rendered_text_offset(
+                layout_node,
+                start_offset + length_in_code_units + trailing_whitespace_length,
+                crate::layout::RenderedTextBoundary::End,
+            )
+        };
+        (
+            dom_start_offset_in_node,
+            dom_end_offset_in_node,
+            dom_end_offset_with_trailing_whitespace,
+            trailing_whitespace_length,
+        )
     }
 
     pub(crate) fn set_svg_viewport_transform(
@@ -658,26 +610,10 @@ impl<'a> PaintableCommit<'a> {
         self.arena.borrow_mut().side_mut(slot).collapsed_table_borders = Some(borders.clone());
     }
 
-    pub(crate) fn finish_node(
-        &self,
-        node: Node,
-        slot: PaintableSlotId,
-        parent: PaintableSlotId,
-        insert_before: PaintableSlotId,
-    ) -> PaintableSlotId {
+    pub(crate) fn stamp_containing_block(&self, node: Node, slot: PaintableSlotId) {
         let arena = self.arena.borrow();
         if slot.is_invalid() {
-            let facts = NodeFacts::new(self.callbacks, node);
-            return if facts.is_fragmented_inline() {
-                parent
-            } else {
-                PaintableSlotId::INVALID
-            };
-        }
-        let kind = arena.data_ref(slot).kind;
-        if !parent.is_invalid() && !kind.forms_unconnected_subtree() {
-            assert!(arena.parent(slot).is_none(), "committed paintable is already parented");
-            arena.insert_before(parent, slot, insert_before);
+            return;
         }
         let containing_block = self.callbacks.node_data(node).containing_block;
         let containing_block = if containing_block.is_invalid() {
@@ -686,7 +622,6 @@ impl<'a> PaintableCommit<'a> {
             arena.paintable_of_node(containing_block)
         };
         arena.update_data(slot, |data| data.containing_block = containing_block);
-        slot
     }
 
     pub(crate) fn assign_inline_box_geometry(&self, slot: PaintableSlotId) {

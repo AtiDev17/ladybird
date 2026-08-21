@@ -22,7 +22,6 @@ namespace Web {
 
 class AutoScrollHandler;
 class CSSPixels;
-class DisplayListRecordingContext;
 class DragAndDropEventHandler;
 class ElementResizeAction;
 class EventHandler;
@@ -60,7 +59,6 @@ class Canvas2DCommandStream;
 struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
 class CanvasSurfaceRegistry;
-class DevicePixelConverter;
 class DisplayList;
 class DisplayListPlayerSkia;
 class DisplayListResourceStorage;
@@ -1076,8 +1074,6 @@ class ScrollStateSnapshot;
 class ViewportPaintable;
 
 enum class PaintPhase;
-struct BorderRadiiData;
-struct BorderRadiusData;
 struct LinearGradientData;
 
 }

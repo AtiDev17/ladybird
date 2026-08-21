@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::layout::node_data::NodeSlotId;
+use crate::layout::node_data::{NodeFlag, NodeSlotId};
 use crate::layout::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, LayoutNodeArena};
 use crate::painting::paintable_data::*;
 use std::cell::Cell;
@@ -112,21 +112,6 @@ impl PaintableArena {
         (!root.is_invalid() && self.is_live(root) && self.data_ref(root).kind.has_lines()).then_some(root)
     }
 
-    pub(crate) fn for_each_in_subtree(&self, root: PaintableSlotId, mut callback: impl FnMut(PaintableSlotId)) {
-        let mut stack = vec![root];
-        while let Some(current) = stack.pop() {
-            if let Some(next) = self.next_sibling(current)
-                && current != root
-            {
-                stack.push(next);
-            }
-            if let Some(first_child) = self.first_child(current) {
-                stack.push(first_child);
-            }
-            callback(current);
-        }
-    }
-
     pub fn row_for_node(&mut self, layout_node: NodeSlotId, shell: *mut c_void) -> PaintableAllocation {
         let index = layout_node.slot_index();
         assert!(
@@ -160,7 +145,13 @@ impl PaintableArena {
         }
     }
 
-    pub fn shell_destroyed(&mut self, id: PaintableSlotId, generation: u32, shell: *mut c_void) {
+    pub(crate) fn shell_destroyed(
+        &mut self,
+        layout_arena: &LayoutNodeArena,
+        id: PaintableSlotId,
+        generation: u32,
+        shell: *mut c_void,
+    ) {
         assert!(!id.is_invalid(), "invalid paintable arena slot ID");
         assert_eq!(
             u32::from(id.generation()),
@@ -170,15 +161,14 @@ impl PaintableArena {
         if !self.is_live(id) || self.data_ref(id).shell != shell {
             return;
         }
-        self.reset_row(id);
+        self.reset_row(Some(layout_arena), id);
     }
 
-    fn reset_row(&mut self, id: PaintableSlotId) {
-        self.clear_absolute_rect_memo();
-        self.remove_from_tree(id);
-        while let Some(child) = self.first_child(id) {
-            self.remove_from_tree(child);
+    fn reset_row(&mut self, layout_arena: Option<&LayoutNodeArena>, id: PaintableSlotId) {
+        if let Some(layout_arena) = layout_arena {
+            self.clear_descendant_subtree_caches_along_paint_chain(layout_arena, id);
         }
+        self.clear_absolute_rect_memo();
         let index = id.slot_index();
         *self.data_mut_by_index(index) = PaintableData::default();
         self.side_data[index as usize] = PaintableSideData::default();
@@ -193,14 +183,19 @@ impl PaintableArena {
         if generation == 0 {
             return;
         }
-        self.reset_row(PaintableSlotId::new(layout_slot_index, generation));
+        self.reset_row(None, PaintableSlotId::new(layout_slot_index, generation));
     }
 
-    pub fn node_cleared(&mut self, layout_node: NodeSlotId, id: PaintableSlotId) {
+    pub(crate) fn node_cleared(
+        &mut self,
+        layout_arena: &LayoutNodeArena,
+        layout_node: NodeSlotId,
+        id: PaintableSlotId,
+    ) {
         if self.paintable_of_node(layout_node) != id {
             return;
         }
-        self.reset_row(id);
+        self.reset_row(Some(layout_arena), id);
     }
 
     pub fn is_live(&self, id: PaintableSlotId) -> bool {
@@ -265,15 +260,81 @@ impl PaintableArena {
         chunk.slots[index % PAINTABLE_SLOTS_PER_CHUNK].get_mut()
     }
 
-    pub fn invalidate_paint_cache(&self, id: PaintableSlotId) {
+    pub(crate) fn invalidate_paint_cache(&self, layout_arena: &LayoutNodeArena, id: PaintableSlotId) {
         if !self.is_live(id) {
             return;
         }
         self.paint_caches[id.slot_index() as usize].clear();
-        let mut ancestor = self.data_ref(id).parent;
-        while !ancestor.is_invalid() {
-            self.paint_caches[ancestor.slot_index() as usize].clear_descendant_subtrees();
-            ancestor = self.data_ref(ancestor).parent;
+        let mut ancestor = crate::painting::paint_order::paint_parent(layout_arena, self, id);
+        while let Some(current) = ancestor {
+            self.paint_caches[current.slot_index() as usize].clear_descendant_subtrees();
+            ancestor = crate::painting::paint_order::paint_parent(layout_arena, self, current);
+        }
+    }
+
+    pub(crate) fn clear_descendant_subtree_caches_along_paint_chain(
+        &self,
+        layout_arena: &LayoutNodeArena,
+        id: PaintableSlotId,
+    ) {
+        if !self.is_live(id) {
+            return;
+        }
+        let mut current = Some(id);
+        while let Some(slot) = current {
+            self.paint_caches[slot.slot_index() as usize].clear_descendant_subtrees();
+            current = crate::painting::paint_order::paint_parent(layout_arena, self, slot);
+        }
+    }
+
+    pub(crate) fn clear_descendant_subtree_caches_from_layout_node(
+        &self,
+        layout_arena: &LayoutNodeArena,
+        mut node: NodeSlotId,
+    ) {
+        loop {
+            let paintable = self.paintable_of_node(node);
+            if !paintable.is_invalid() {
+                self.clear_descendant_subtree_caches_along_paint_chain(layout_arena, paintable);
+                return;
+            }
+            if !crate::painting::fragment_ownership::node_is_fragmented_inline(layout_arena, node) {
+                return;
+            }
+            let Some(parent) = layout_arena.node_parent_if_live(node) else {
+                return;
+            };
+            node = parent;
+        }
+    }
+
+    pub(crate) fn invalidate_for_repaint(&self, layout_arena: &LayoutNodeArena, id: PaintableSlotId) {
+        if !self.is_live(id) {
+            return;
+        }
+        self.invalidate_paint_cache(layout_arena, id);
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            let mut child = crate::painting::paint_order::first_paint_child(layout_arena, self, current);
+            while let Some(child_slot) = child {
+                let child_layout_node = self.data_ref(child_slot).layout_node;
+                let child_flags = layout_arena.node_flags_if_live(child_layout_node);
+                if child_flags & NodeFlag::Anonymous as u32 != 0 {
+                    self.paint_caches[child_slot.slot_index() as usize].clear();
+                    stack.push(child_slot);
+                }
+                child = crate::painting::paint_order::next_paint_sibling(layout_arena, self, child_slot);
+            }
+        }
+        if self.data_ref(id).kind == PaintableKind::InlinePaintable {
+            let mut ancestor = crate::painting::paint_order::paint_parent(layout_arena, self, id);
+            while let Some(current) = ancestor {
+                self.invalidate_paint_cache(layout_arena, current);
+                if self.data_ref(current).kind.has_lines() {
+                    break;
+                }
+                ancestor = crate::painting::paint_order::paint_parent(layout_arena, self, current);
+            }
         }
     }
 
@@ -287,11 +348,11 @@ impl PaintableArena {
         }
 
         let mut stack = Vec::new();
-        if let Some(first_child) = self.first_child(root) {
+        if let Some(first_child) = crate::painting::paint_order::first_paint_child(layout_arena, self, root) {
             stack.push(first_child);
         }
         while let Some(current) = stack.pop() {
-            if let Some(next_sibling) = self.next_sibling(current) {
+            if let Some(next_sibling) = crate::painting::paint_order::next_paint_sibling(layout_arena, self, current) {
                 stack.push(next_sibling);
             }
 
@@ -303,14 +364,14 @@ impl PaintableArena {
             if data.kind.has_lines() || data.kind == PaintableKind::InlinePaintable {
                 self.paint_caches[current.slot_index() as usize].clear();
             }
-            if let Some(first_child) = self.first_child(current) {
+            if let Some(first_child) = crate::painting::paint_order::first_paint_child(layout_arena, self, current) {
                 stack.push(first_child);
             }
         }
-        let mut ancestor = root;
-        while !ancestor.is_invalid() {
-            self.paint_caches[ancestor.slot_index() as usize].clear_descendant_subtrees();
-            ancestor = self.data_ref(ancestor).parent;
+        let mut ancestor = Some(root);
+        while let Some(current) = ancestor {
+            self.paint_caches[current.slot_index() as usize].clear_descendant_subtrees();
+            ancestor = crate::painting::paint_order::paint_parent(layout_arena, self, current);
         }
     }
 
@@ -337,112 +398,8 @@ impl PaintableArena {
         paintable
     }
 
-    pub fn parent(&self, id: PaintableSlotId) -> Option<PaintableSlotId> {
-        let parent = self.data_ref(id).parent;
-        (!parent.is_invalid()).then_some(parent)
-    }
-
-    pub fn first_child(&self, id: PaintableSlotId) -> Option<PaintableSlotId> {
-        let child = self.data_ref(id).first_child;
-        (!child.is_invalid()).then_some(child)
-    }
-
-    pub fn next_sibling(&self, id: PaintableSlotId) -> Option<PaintableSlotId> {
-        let sibling = self.data_ref(id).next_sibling;
-        (!sibling.is_invalid()).then_some(sibling)
-    }
-
-    pub fn insert_before(&self, parent: PaintableSlotId, child: PaintableSlotId, before: PaintableSlotId) {
-        assert!(
-            self.data_ref(child).parent.is_invalid(),
-            "paintable inserted while still parented"
-        );
-        if before.is_invalid() {
-            self.append_child(parent, child);
-            return;
-        }
-        self.clear_descendant_subtree_caches_inclusive(child);
-        self.clear_descendant_subtree_caches_inclusive(parent);
-        assert_eq!(
-            self.data_ref(before).parent,
-            parent,
-            "insert_before sibling is not a child of parent"
-        );
-        let prev = self.data_ref(before).prev_sibling;
-        self.update_data(child, |child_data| {
-            child_data.parent = parent;
-            child_data.next_sibling = before;
-            child_data.prev_sibling = prev;
-        });
-        self.update_data(before, |data| data.prev_sibling = child);
-        if prev.is_invalid() {
-            self.update_data(parent, |data| data.first_child = child);
-        } else {
-            self.update_data(prev, |data| data.next_sibling = child);
-        }
-    }
-
-    pub fn append_child(&self, parent: PaintableSlotId, child: PaintableSlotId) {
-        assert!(
-            self.data_ref(child).parent.is_invalid(),
-            "paintable appended while still parented"
-        );
-        self.clear_descendant_subtree_caches_inclusive(child);
-        self.clear_descendant_subtree_caches_inclusive(parent);
-        let last = self.data_ref(parent).last_child;
-        self.update_data(child, |child_data| {
-            child_data.parent = parent;
-            child_data.prev_sibling = last;
-            child_data.next_sibling = PaintableSlotId::INVALID;
-        });
-        if last.is_invalid() {
-            self.update_data(parent, |data| data.first_child = child);
-        } else {
-            self.update_data(last, |data| data.next_sibling = child);
-        }
-        self.update_data(parent, |data| data.last_child = child);
-    }
-
-    pub fn remove_from_tree(&self, id: PaintableSlotId) {
-        let (parent, prev, next) = {
-            let data = self.data_ref(id);
-            (data.parent, data.prev_sibling, data.next_sibling)
-        };
-        if parent.is_invalid() {
-            return;
-        }
-        self.clear_descendant_subtree_caches_inclusive(id);
-        if prev.is_invalid() {
-            self.update_data(parent, |data| data.first_child = next);
-        } else {
-            self.update_data(prev, |data| data.next_sibling = next);
-        }
-        if next.is_invalid() {
-            self.update_data(parent, |data| data.last_child = prev);
-        } else {
-            self.update_data(next, |data| data.prev_sibling = prev);
-        }
-        self.update_data(id, |data| {
-            data.parent = PaintableSlotId::INVALID;
-            data.prev_sibling = PaintableSlotId::INVALID;
-            data.next_sibling = PaintableSlotId::INVALID;
-        });
-    }
-
-    fn clear_descendant_subtree_caches_inclusive(&self, id: PaintableSlotId) {
-        let mut current = id;
-        while !current.is_invalid() {
-            self.paint_caches[current.slot_index() as usize].clear_descendant_subtrees();
-            current = self.data_ref(current).parent;
-        }
-    }
-
     pub fn reset_for_relayout(&mut self, id: PaintableSlotId) {
         self.clear_absolute_rect_memo();
-        self.remove_from_tree(id);
-        while let Some(child) = self.first_child(id) {
-            self.remove_from_tree(child);
-        }
         self.update_data(id, |data| {
             data.containing_block = PaintableSlotId::INVALID;
             data.offset = FfiCssPixelPoint::default();

@@ -6,7 +6,6 @@
 
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize};
-use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::commands::*;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
@@ -43,10 +42,6 @@ fn css_rect_to_device_rect(rect: CssPixelRect, device_pixels_per_css_pixel: f64)
 
 fn css_inset_to_device_inset(inset: Option<CssPixels>, device_pixels_per_css_pixel: f64) -> OptionalF32 {
     OptionalF32::from(inset.map(|inset| inset.to_float() * device_pixels_per_css_pixel as f32))
-}
-
-fn int_rect(values: [i32; 4]) -> IntRect {
-    IntRect::new(values[0], values[1], values[2], values[3])
 }
 
 impl PaintRecorder<'_> {
@@ -169,8 +164,7 @@ impl PaintRecorder<'_> {
             return;
         }
         let target_scroll_node_index = self.wheel_hit_test_target_scroll_node_index_for(paintable);
-        let corner_radii =
-            BorderRadii::from_raw(self.hit_test_facts(paintable).border_radii).as_corners(&self.converter);
+        let corner_radii = self.border_radii(paintable).as_corners(&self.converter);
         let document_id = UniqueNodeId(self.inputs.document_id);
         if corner_radii.has_any_radius() {
             self.recorder.compositor_wheel_hit_test_target_with_corner_radii(
@@ -295,10 +289,18 @@ impl PaintRecorder<'_> {
                 .compositor_viewport_scrollbar(CompositorViewportScrollbar {
                     document_id: UniqueNodeId(self.inputs.document_id),
                     scroll_node_index,
-                    gutter_rect: int_rect(scrollbar.gutter_rect),
-                    thumb_rect: int_rect(scrollbar.thumb_rect),
-                    expanded_gutter_rect: int_rect(scrollbar.expanded_gutter_rect),
-                    expanded_thumb_rect: int_rect(scrollbar.expanded_thumb_rect),
+                    gutter_rect: self
+                        .converter
+                        .rounded_device_rect(CssPixelRect::from(scrollbar.gutter_rect)),
+                    thumb_rect: self
+                        .converter
+                        .rounded_device_rect(CssPixelRect::from(scrollbar.thumb_rect)),
+                    expanded_gutter_rect: self
+                        .converter
+                        .rounded_device_rect(CssPixelRect::from(scrollbar.expanded_gutter_rect)),
+                    expanded_thumb_rect: self
+                        .converter
+                        .rounded_device_rect(CssPixelRect::from(scrollbar.expanded_thumb_rect)),
                     scroll_size: scrollbar.scroll_size,
                     expanded_scroll_size: scrollbar.expanded_scroll_size,
                     min_scroll_offset: if vertical {

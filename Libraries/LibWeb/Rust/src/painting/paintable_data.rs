@@ -181,11 +181,6 @@ pub struct FfiOverflowData {
 #[repr(C)]
 pub struct PaintableData {
     pub layout_node: NodeSlotId,
-    pub parent: PaintableSlotId,
-    pub first_child: PaintableSlotId,
-    pub last_child: PaintableSlotId,
-    pub prev_sibling: PaintableSlotId,
-    pub next_sibling: PaintableSlotId,
     pub containing_block: PaintableSlotId,
     pub kind: PaintableKind,
     pub selection_state: u8,
@@ -236,11 +231,6 @@ impl Default for PaintableData {
     fn default() -> Self {
         Self {
             layout_node: NodeSlotId::INVALID,
-            parent: PaintableSlotId::INVALID,
-            first_child: PaintableSlotId::INVALID,
-            last_child: PaintableSlotId::INVALID,
-            prev_sibling: PaintableSlotId::INVALID,
-            next_sibling: PaintableSlotId::INVALID,
             containing_block: PaintableSlotId::INVALID,
             kind: PaintableKind::None,
             selection_state: 0,
@@ -341,6 +331,8 @@ pub struct FragmentRecord {
     pub start_offset: usize,
     pub length_in_code_units: usize,
     pub dom_start_offset_in_node: usize,
+    pub dom_end_offset_in_node: usize,
+    pub dom_end_offset_with_trailing_whitespace: usize,
     pub trailing_whitespace_length_in_code_units: usize,
     pub baseline: CssPixels,
     pub accumulated_vertical_shift: CssPixels,
