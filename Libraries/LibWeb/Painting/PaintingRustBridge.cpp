@@ -43,15 +43,14 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/Blending.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/ImagePaint.h>
-#include <LibWeb/Painting/InlinePaintable.h>
 #include <LibWeb/Painting/PaintStyle.h>
 #include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/PaintingRustFFI.h>
 #include <LibWeb/Painting/ResizeHandle.h>
@@ -642,13 +641,13 @@ static void dump_stacking_context_node(StringBuilder& builder, void* arena, size
     for (int i = 0; i < indent; ++i)
         builder.append(' ');
     if (auto const* paintable = static_cast<Paintable const*>(node.paintable_shell)) {
-        builder.appendff("SC for {} {} (z-index: ", paintable->layout_node().debug_description(), paintable->absolute_rect());
+        builder.appendff("SC for {} {} (z-index: ", paintable->layout_node().debug_description(), absolute_rect(paintable->layout_node()));
         if (node.has_effective_z_index)
             builder.appendff("{}", node.effective_z_index);
         else
             builder.append("auto"sv);
         builder.append(')');
-        if (paintable->has_css_transform())
+        if (has_css_transform(paintable->layout_node()))
             builder.append(", has_transform"sv);
     } else {
         builder.append("SC for (gone)"sv);
@@ -677,7 +676,7 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
             auto const& layout_node = paintable.layout_node();
             Layout::RustFFI::FfiHitTestPaintableFacts facts {};
             facts.opacity_is_zero = layout_node.opacity() == 0;
-            facts.visible_for_hit_testing = paintable.visible_for_hit_testing();
+            facts.visible_for_hit_testing = visible_for_hit_testing(layout_node);
             auto dom_node = paintable.dom_node();
             facts.dom_node_has_parent = dom_node && dom_node->parent();
             facts.is_editable_or_editing_host = dom_node && dom_node->is_editable_or_editing_host();
@@ -716,8 +715,9 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
             };
         },
         .line_break_caret_targets = [](void*, void* paintable_shell, void* sink) {
-            auto const& paintable = as<PaintableWithLines>(*static_cast<Paintable const*>(paintable_shell));
-            auto* dom_node = paintable.layout_node().dom_node();
+            auto const& layout_node = static_cast<Paintable const*>(paintable_shell)->layout_node();
+            VERIFY(is_paintable_with_lines(layout_node));
+            auto* dom_node = layout_node.dom_node();
             if (!dom_node)
                 return;
             for (auto* child = dom_node->first_child(); child; child = child->next_sibling()) {
@@ -726,7 +726,7 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
                     continue;
                 Layout::RustFFI::FfiLineBreakCaretTarget target {};
                 target.caret_offset = br->index();
-                target.rect = to_ffi_css_pixel_rect(paintable.caret_rect_for_child_offset(br->index()));
+                target.rect = to_ffi_css_pixel_rect(caret_rect_for_child_offset(layout_node, br->index()));
                 Layout::RustFFI::layout_arena_hit_test_push_line_break_caret_target(sink, target);
             } },
     };
@@ -864,8 +864,8 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 auto const* image_element = as_if<HTML::HTMLImageElement>(paintable.dom_node().ptr());
                 if (map_element && image_element && map_element->first_painted_image_with_focusable_shapes().ptr() == image_element) {
                     if (auto area_computed_values = area_element->computed_style(); area_computed_values && area_computed_values->outline_style() == CSS::OutlineStyle::Auto) {
-                        if (auto outline_data = paintable.outline_data(*area_computed_values); outline_data.has_value()) {
-                            if (auto path = area_element->shape_path(paintable.absolute_rect().size()); path.has_value()) {
+                        if (auto outline_data = Painting::outline_data(paintable.layout_node(), *area_computed_values); outline_data.has_value()) {
+                            if (auto path = area_element->shape_path(absolute_rect(paintable.layout_node()).size()); path.has_value()) {
                                 facts.paints_focused_area_outline = true;
                                 facts.focused_area_path = new Gfx::Path(path.release_value());
                                 facts.focused_area_color = outline_data->color.value();
@@ -934,7 +934,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto const* text_node = as_if<Layout::TextNode>(static_cast<Layout::Node const*>(layout_node_shell));
             if (!text_node)
                 return facts;
-            auto style = Paintable::selection_style_for_node(*text_node, text_node->dom_text());
+            auto style = selection_style_for_node(*text_node, text_node->dom_text());
             facts.background_color = style.background_color.value();
             if (style.text_color.has_value()) {
                 facts.has_text_color = true;
@@ -960,13 +960,18 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             return context.resource_storage.add_font(*static_cast<Gfx::Font const*>(font)).value();
         },
         .cursor_facts = [](void*, void* paintable_shell, void* owner_shell) -> Layout::RustFFI::FfiCursorFacts {
-            auto const& paintable = *static_cast<Paintable const*>(paintable_shell);
+            auto const& layout_node = static_cast<Paintable const*>(paintable_shell)->layout_node();
             Layout::RustFFI::FfiCursorFacts facts {};
-            if (!paintable.document().cursor_position())
+            if (!layout_node.document().cursor_position())
                 return facts;
-            auto caret = is<InlinePaintable>(paintable)
-                ? static_cast<InlinePaintable const&>(paintable).resolve_empty_editable_caret_paint()
-                : as<PaintableWithLines>(paintable).resolve_caret_paint(static_cast<InlinePaintable const*>(owner_shell));
+            auto const* owner_layout_node = owner_shell ? &static_cast<Paintable const*>(owner_shell)->layout_node() : nullptr;
+            Optional<CaretPaint> caret;
+            if (is_inline_paintable(layout_node)) {
+                caret = resolve_empty_editable_caret_paint(layout_node);
+            } else {
+                VERIFY(is_paintable_with_lines(layout_node));
+                caret = resolve_caret_paint(layout_node, owner_layout_node);
+            }
             if (!caret.has_value())
                 return facts;
             facts.paints = true;
@@ -1064,8 +1069,8 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                     facts.natural_aspect_ratio_numerator = aspect_ratio->numerator().raw_value();
                     facts.natural_aspect_ratio_denominator = aspect_ratio->denominator().raw_value();
                 }
-                if (paintable.selection_state() != Paintable::SelectionState::None)
-                    facts.selection_background_color = paintable.selection_style().background_color.value();
+                if (selection_state(paintable.layout_node()) != SelectionState::None)
+                    facts.selection_background_color = selection_style(layout_node).background_color.value();
             } else if (paintable.kind() == Layout::RustFFI::PaintableKind::CanvasPaintable) {
                 auto& canvas_element = as<HTML::HTMLCanvasElement>(*paintable.dom_node());
                 if (auto content_size = canvas_element.canvas_surface_content_size(); content_size.has_value()) {
@@ -1278,7 +1283,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 },
                 [&](SVG::SVGGraphicsElement::PatternPaintServer const& pattern) {
                     style.kind = Layout::RustFFI::FfiSvgPaintStyleKind::Pattern;
-                    style.pattern_paintable = pattern.pattern_paintable->rust_slot();
+                    style.pattern_paintable = pattern.pattern_paintable->paintable_ptr()->rust_slot();
                     write_matrix(pattern.tile_content_transform.matrix, style.tile_content_transform);
                     style.tile_rect[0] = pattern.tile_rect.x();
                     style.tile_rect[1] = pattern.tile_rect.y();
@@ -1317,9 +1322,9 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             Utf16String text;
             if (paintable_shell) {
                 auto const& paintable = *static_cast<Paintable const*>(paintable_shell);
-                auto border_rect = paintable.absolute_border_box_rect();
+                auto border_rect = absolute_border_box_rect(paintable.layout_node());
                 Utf16StringBuilder builder;
-                builder.appendff("{}", paintable.debug_description());
+                builder.appendff("{}", debug_description(paintable.layout_node()));
                 builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
                 text = builder.to_string();
             } else if (utf16_fly_string_raw) {

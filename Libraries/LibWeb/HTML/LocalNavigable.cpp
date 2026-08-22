@@ -76,6 +76,7 @@
 #include <LibWeb/Loader/DownloadFilename.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DisplayListDamage.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintableTypes.h>
@@ -3668,13 +3669,13 @@ CSSPixelPoint LocalNavigable::to_top_level_position(CSSPixelPoint a_position)
             break;
         if (!ancestor->container())
             return {};
-        auto paintable = ancestor->container()->paintable();
-        if (!paintable)
+        auto const* layout_node = ancestor->container()->layout_node();
+        if (!layout_node || !Painting::has_committed_box(*layout_node))
             return {};
 
-        auto point = paintable->absolute_position();
+        auto point = Painting::absolute_position(*layout_node);
         point.translate_by(position);
-        position = paintable->transform_rect_to_viewport({ point, { 0, 0 } }).location();
+        position = Painting::transform_rect_to_viewport(*layout_node, { point, { 0, 0 } }).location();
 
         auto parent = ancestor->parent();
         ancestor = parent ? &as<LocalNavigable>(*parent) : nullptr;
@@ -3720,12 +3721,13 @@ void LocalNavigable::clamp_viewport_scroll_offset()
     auto document = active_document();
     if (!document || !document->layout_is_up_to_date())
         return;
-    if (!document->paintable_box())
+    auto paintable_box = document->paintable_box();
+    if (!paintable_box)
         return;
-    if (!document->paintable_box()->scrollable_overflow_rect().has_value())
+    if (!Painting::scrollable_overflow_rect(paintable_box->layout_node()).has_value())
         return;
-    auto minimum_scroll_offset = document->paintable_box()->minimum_scroll_offset();
-    auto maximum_scroll_offset = document->paintable_box()->maximum_scroll_offset();
+    auto minimum_scroll_offset = paintable_box->minimum_scroll_offset();
+    auto maximum_scroll_offset = paintable_box->maximum_scroll_offset();
     CSSPixelPoint clamped = {
         clamp(m_viewport_scroll_offset.x(), minimum_scroll_offset.x(), maximum_scroll_offset.x()),
         clamp(m_viewport_scroll_offset.y(), minimum_scroll_offset.y(), maximum_scroll_offset.y()),

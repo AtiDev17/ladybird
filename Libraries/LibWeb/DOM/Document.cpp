@@ -203,6 +203,7 @@
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
@@ -580,9 +581,9 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
                     return;
                 m_cursor_blink_state = !m_cursor_blink_state;
                 layout_text_node->set_needs_repaint();
-            } else if (node->unsafe_paintable()) {
+            } else if (auto const* layout_node = node->unsafe_layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
                 m_cursor_blink_state = !m_cursor_blink_state;
-                node->set_needs_repaint();
+                Painting::set_needs_repaint(*layout_node);
             }
         }));
     }
@@ -2466,7 +2467,7 @@ static void rebuild_sticky_insets(Layout::Node const& root)
         auto nearest_scrollable_ancestor = box_paintable->nearest_scrollable_ancestor();
         CSSPixelSize scrollport_size;
         if (nearest_scrollable_ancestor)
-            scrollport_size = nearest_scrollable_ancestor->absolute_rect().size();
+            scrollport_size = Painting::absolute_rect(nearest_scrollable_ancestor->layout_node()).size();
 
         if (!inset.top().is_auto())
             sticky_insets->top = inset.top().to_px_or_zero(scrollport_size.height());
@@ -2476,7 +2477,7 @@ static void rebuild_sticky_insets(Layout::Node const& root)
             sticky_insets->bottom = inset.bottom().to_px_or_zero(scrollport_size.height());
         if (!inset.left().is_auto())
             sticky_insets->left = inset.left().to_px_or_zero(scrollport_size.width());
-        box_paintable->set_sticky_insets(move(sticky_insets));
+        Painting::set_sticky_insets(layout_node, move(sticky_insets));
         return TraversalDecision::Continue;
     });
 }
@@ -2486,7 +2487,7 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     // For every box that will be re-measured, the overflow data it had before, so the diff below
     // can tell what actually changed; an empty value means the box's paintable was reset by a
     // subtree layout commit and the old data is unknown.
-    HashMap<Layout::Box const*, Optional<Painting::Paintable::OverflowData>> old_overflow_data_by_box;
+    HashMap<Layout::Box const*, Optional<Painting::OverflowData>> old_overflow_data_by_box;
 
     auto pending_paintables = move(m_paintable_boxes_needing_scrollable_overflow_recalculation);
     auto needs_full_recalculation = exchange(m_needs_full_scrollable_overflow_recalculation, false);
@@ -2523,13 +2524,12 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     }
 
     auto record_and_clear_overflow_data = [&](Layout::Box const& box) {
-        auto box_paintable = box.paintable_box();
-        if (!box_paintable)
+        if (!Painting::has_committed_box(box))
             return true;
         if (old_overflow_data_by_box.contains(&box))
             return false;
-        old_overflow_data_by_box.set(&box, box_paintable->overflow_data());
-        const_cast<Painting::Paintable&>(*box_paintable).clear_overflow_data();
+        old_overflow_data_by_box.set(&box, Painting::overflow_data(box));
+        Painting::clear_overflow_data(box);
         return true;
     };
 
@@ -2547,8 +2547,7 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
             auto const* box = as_if<Layout::Box>(paintable->layout_node());
             if (!box)
                 continue;
-            auto box_paintable = box->paintable_box();
-            bool was_reset_by_subtree_layout_commit = box_paintable && !box_paintable->overflow_data().has_value();
+            bool was_reset_by_subtree_layout_commit = Painting::has_committed_box(*box) && !Painting::overflow_data(*box).has_value();
             if (was_reset_by_subtree_layout_commit) {
                 box->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& subtree_box) {
                     record_and_clear_overflow_data(subtree_box);
@@ -2556,8 +2555,8 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
                 });
             }
             for (auto const* containing_block = box->containing_block(); containing_block; containing_block = containing_block->containing_block()) {
-                if (auto containing_block_paintable = containing_block->paintable_box())
-                    const_cast<Painting::Paintable&>(*containing_block_paintable).clear_cached_overflow_data();
+                if (Painting::has_committed_box(*containing_block))
+                    Painting::clear_cached_overflow_data(*containing_block);
                 if (!record_and_clear_overflow_data(*containing_block))
                     break;
             }
@@ -2585,23 +2584,24 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     bool any_overflow_changed = false;
     bool any_has_scrollable_overflow_flipped = false;
     for (auto const& [box, old_overflow_data] : old_overflow_data_by_box) {
-        auto box_paintable = box->paintable_box();
-        if (!box_paintable || !box_paintable->overflow_data().has_value())
+        if (!Painting::has_committed_box(*box))
+            continue;
+        auto new_overflow_data = Painting::overflow_data(*box);
+        if (!new_overflow_data.has_value())
             continue;
         // A box with no prior overflow data was just created or reset by the layout commit, so
         // its paint cache is already clean.
         if (!old_overflow_data.has_value())
             continue;
-        auto const& new_overflow_data = *box_paintable->overflow_data();
-        bool rect_changed = old_overflow_data->scrollable_overflow_rect != new_overflow_data.scrollable_overflow_rect;
-        bool has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data.has_scrollable_overflow;
+        bool rect_changed = old_overflow_data->scrollable_overflow_rect != new_overflow_data->scrollable_overflow_rect;
+        bool has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data->has_scrollable_overflow;
         if (!rect_changed && !has_scrollable_overflow_flipped)
             continue;
         // Cached paint commands and hit-test items capture scrollbar geometry and per-direction
         // scrollability derived from the overflow rect, so they cannot be reused once it changes.
         // This must also run for the after-layout-commit path: a subtree relayout re-measures a
         // surviving ancestor's overflow without resetting the ancestor's paintable.
-        box_paintable->invalidate_paint_cache();
+        Painting::invalidate_paint_cache(*box);
         any_overflow_changed = true;
         any_has_scrollable_overflow_flipped |= has_scrollable_overflow_flipped;
     }
@@ -2632,7 +2632,7 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
 void Document::ensure_scrollable_overflow_is_measured(Layout::Box const& box) const
 {
     auto paintable = box.paintable_box();
-    if (!paintable || paintable->overflow_data().has_value() || paintable->cached_overflow_data().has_value())
+    if (!paintable || Painting::overflow_data(box).has_value() || Painting::cached_overflow_data(box).has_value())
         return;
     Painting::rust_measure_scrollable_overflow(*paintable);
 }
@@ -2850,14 +2850,14 @@ void Document::set_highlighted_node(GC::Ptr<Node> node, Optional<CSS::PseudoElem
     if (m_highlighted_node == node && m_highlighted_pseudo_element == pseudo_element)
         return;
 
-    if (auto layout_node = highlighted_layout_node(); layout_node && layout_node->paintable())
-        layout_node->paintable()->set_needs_repaint();
+    if (auto layout_node = highlighted_layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        Painting::set_needs_repaint(*layout_node);
 
     m_highlighted_node = node;
     m_highlighted_pseudo_element = pseudo_element;
 
-    if (auto layout_node = highlighted_layout_node(); layout_node && layout_node->paintable())
-        layout_node->paintable()->set_needs_repaint();
+    if (auto layout_node = highlighted_layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        Painting::set_needs_repaint(*layout_node);
 }
 
 void Document::set_grid_highlighted_node(GC::Ptr<Node> node, Painting::GridInspectorOverlayOptions options)
@@ -2996,24 +2996,24 @@ static CSSPixelPoint hover_event_page_offset(Optional<HoverEventData> const& hov
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
-static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting::Paintable const& paintable)
+static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Layout::Node const& layout_node)
 {
-    auto inverse_transform_point = [](Painting::Paintable const& paintable_box, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
-        auto viewport_paintable = paintable_box.document().unsafe_paintable();
+    auto inverse_transform_point = [](Layout::Node const& layout_node, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
+        auto viewport_paintable = layout_node.document().unsafe_paintable();
         if (!viewport_paintable)
             return {};
-        auto pixel_ratio = static_cast<float>(paintable_box.document().page().client().device_pixels_per_css_pixel());
+        auto pixel_ratio = static_cast<float>(layout_node.document().page().client().device_pixels_per_css_pixel());
         auto const& visual_context_tree = viewport_paintable->visual_context_tree();
         auto transformed_position = visual_context_tree.inverse_transform_point(
-            paintable_box.accumulated_visual_context_index(), position.to_type<float>() * pixel_ratio);
+            Painting::accumulated_visual_context_index(layout_node), position.to_type<float>() * pixel_ratio);
         return (transformed_position / pixel_ratio).to_type<CSSPixels>();
     };
 
     CSSPixelPoint offset_position = position;
-    if (auto transformed_position = inverse_transform_point(paintable, position); transformed_position.has_value())
+    if (auto transformed_position = inverse_transform_point(layout_node, position); transformed_position.has_value())
         offset_position = *transformed_position;
 
-    auto const top_left_of_layout_node = paintable.box_type_agnostic_position();
+    auto const top_left_of_layout_node = Painting::box_type_agnostic_position(layout_node);
     return offset_position - top_left_of_layout_node;
 }
 
@@ -3029,11 +3029,10 @@ static CSSPixelPoint hover_event_offset_for_target(Optional<HoverEventData> cons
     if (!layout_node)
         return hover_event_data->viewport_position;
 
-    auto paintable = layout_node->paintable();
-    if (!paintable)
+    if (!Painting::has_committed_box(*layout_node))
         return hover_event_data->viewport_position;
 
-    return compute_mouse_event_offset(hover_event_data->page_offset, *paintable);
+    return compute_mouse_event_offset(hover_event_data->page_offset, *layout_node);
 }
 
 static void mark_mouse_transition_event_as_trusted_if_needed(Event& event, Optional<HoverEventData> const& hover_event_data)
@@ -5262,8 +5261,9 @@ void Document::set_page_showing(bool page_showing)
 void Document::invalidate_stacking_context_tree()
 {
     // NB: Called during stacking context invalidation.
-    if (auto paintable_box = this->unsafe_paintable_box())
-        paintable_box->invalidate_stacking_context();
+    auto const* layout_node = this->unsafe_layout_node();
+    if (layout_node && Painting::has_committed_box(*layout_node))
+        Painting::invalidate_stacking_context(*layout_node);
 }
 
 void Document::check_favicon_after_loading_link_resource()
@@ -6442,23 +6442,20 @@ void Document::queue_an_intersection_observer_entry(IntersectionObserver::Inters
 }
 
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
-static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, RefPtr<Painting::Paintable> root_paintable, CSSPixelRect const& root_bounds)
+static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds)
 {
     // 1. Let intersectionRect be the result of getting the bounding box for target.
     auto intersection_rect = target_rect;
 
     // 2. Let container be the containing block of target.
     // 3. While container is not root:
-    if (auto target_paintable = target->paintable_box()) {
-        Layout::Box* root_layout_box = nullptr;
-        if (root_paintable && root_paintable->has_layout_node())
-            root_layout_box = as<Layout::Box>(&root_paintable->layout_node());
-        for (auto* container_box = target_paintable->layout_node().containing_block(); container_box; container_box = container_box->containing_block()) {
+    auto const* target_layout_node = target->layout_node();
+    if (target_layout_node && Painting::has_committed_box(*target_layout_node)) {
+        for (auto const* container_box = target_layout_node->containing_block(); container_box; container_box = container_box->containing_block()) {
             // Stop when we reach the intersection root.
             if (container_box == root_layout_box)
                 break;
-            auto container = container_box->paintable();
-            if (!container)
+            if (!Painting::has_committed_box(*container_box))
                 break;
 
             // FIXME: 3.1. If container is the document of a nested browsing context, update
@@ -6474,16 +6471,15 @@ static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect t
             // 3.4. If container has a content clip or a css clip-path property, update intersectionRect
             //      by applying container’s clip.
             // FIXME: Handle clip-path.
-            auto overflow_x = container->layout_node().overflow_x();
-            auto overflow_y = container->layout_node().overflow_y();
+            auto overflow_x = container_box->overflow_x();
+            auto overflow_y = container_box->overflow_y();
             bool has_content_clip = overflow_x != CSS::Overflow::Visible || overflow_y != CSS::Overflow::Visible;
             if (has_content_clip) {
-                auto clip_rect = container->transform_rect_to_viewport(container->absolute_padding_box_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+                auto clip_rect = Painting::transform_rect_to_viewport(*container_box, Painting::absolute_padding_box_rect(*container_box), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
 
                 // Apply scroll margin to expand the scrollport for scroll containers.
                 auto& scroll_margin = observer.scroll_margin_values();
-                auto const& layout_node = container->layout_node();
-                if (layout_node.is_scroll_container() && !scroll_margin.is_empty()) {
+                if (container_box->is_scroll_container() && !scroll_margin.is_empty()) {
                     clip_rect.inflate(
                         scroll_margin[0].to_px(clip_rect.height()),
                         scroll_margin[1].to_px(clip_rect.width()),
@@ -6527,7 +6523,9 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 
         // Pre-compute per-observer values to avoid repeated work in the per-target loop.
         auto intersection_root_node = observer->intersection_root_node();
-        auto root_paintable = intersection_root_node->paintable_box();
+        Layout::Box const* root_layout_box = nullptr;
+        if (auto const* root_layout_node = intersection_root_node->layout_node(); root_layout_node && Painting::has_committed_box(*root_layout_node))
+            root_layout_box = as<Layout::Box>(root_layout_node);
         bool is_implicit_root = observer->is_implicit_root();
         bool root_is_element = intersection_root_node->is_element();
 
@@ -6564,7 +6562,7 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 
                 // 5. Let intersectionRect be the result of running the compute the intersection algorithm on target and
                 //    observer’s intersection root.
-                intersection_rect = compute_intersection(target, target_rect, *observer, root_paintable, root_bounds);
+                intersection_rect = compute_intersection(target, target_rect, *observer, root_layout_box, root_bounds);
 
                 // 6. Let targetArea be targetRect’s area.
                 auto target_area = target_rect.width() * target_rect.height();
@@ -6901,6 +6899,16 @@ RefPtr<Painting::ViewportPaintable> Document::unsafe_paintable()
     if (!paintable)
         return nullptr;
     return as<Painting::ViewportPaintable>(*paintable);
+}
+
+Painting::AccumulatedVisualContextTree const& Document::visual_context_tree() const
+{
+    return paintable()->visual_context_tree();
+}
+
+Painting::ScrollStateSnapshot const& Document::scroll_state_snapshot() const
+{
+    return paintable()->scroll_state_snapshot();
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-the-history-object-state
@@ -8812,11 +8820,10 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     // Empty editable elements have no fragments; fall back to the caret position for the cursor's child offset
     // (which accounts for empty lines rendered by <br>), or the padding-box corner.
     if (auto* node_with_style = as_if<Layout::NodeWithStyle>(*layout_node)) {
-        auto paintable = node_with_style->paintable();
-        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(paintable.ptr()))
-            return to_viewport_rect(with_lines->caret_rect_for_child_offset(position->offset()));
-        if (auto const* box = paintable.ptr()) {
-            auto content_box = box->absolute_padding_box_rect();
+        if (Painting::is_paintable_with_lines(*node_with_style))
+            return to_viewport_rect(Painting::caret_rect_for_child_offset(*node_with_style, position->offset()));
+        if (Painting::has_committed_box(*node_with_style)) {
+            auto content_box = Painting::absolute_padding_box_rect(*node_with_style);
             return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->line_height() });
         }
     }
@@ -8961,8 +8968,8 @@ void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& la
 
     if (auto const* box = as_if<Layout::Box>(layout_node)) {
         for (auto const* containing_box = box; containing_box; containing_box = containing_box->containing_block()) {
-            if (auto paintable = containing_box->paintable_box())
-                const_cast<Painting::Paintable&>(*paintable).clear_cached_overflow_data();
+            if (Painting::has_committed_box(*containing_box))
+                Painting::clear_cached_overflow_data(*containing_box);
         }
     }
 
@@ -9550,7 +9557,7 @@ Utf16String Document::dump_display_list()
     if (!display_list)
         return "No display list"_utf16;
 
-    HashMap<size_t, RefPtr<Painting::Paintable const>> context_id_to_paintable;
+    HashMap<size_t, Layout::Node const*> context_id_to_layout_node;
     auto entry_count = Layout::RustFFI::layout_arena_paint_tree_dump_entry_count(viewport_paintable->rust_arena().handle(), viewport_paintable->rust_slot());
     Vector<Layout::RustFFI::FfiPaintTreeDumpEntry> entries;
     entries.resize(entry_count);
@@ -9559,11 +9566,10 @@ Utf16String Document::dump_display_list()
         if (!entry.layout_node_shell)
             continue;
         auto& layout_node = *static_cast<Layout::Node*>(entry.layout_node_shell);
-        auto paintable = layout_node.paintable();
-        if (!paintable)
+        if (!Painting::has_committed_box(layout_node))
             continue;
-        auto visual_context_index = paintable->accumulated_visual_context_index();
-        (void)context_id_to_paintable.try_set(visual_context_index.value(), paintable);
+        auto visual_context_index = Painting::accumulated_visual_context_index(layout_node);
+        (void)context_id_to_layout_node.try_set(visual_context_index.value(), &layout_node);
     }
 
     StringBuilder builder;
@@ -9592,8 +9598,8 @@ Utf16String Document::dump_display_list()
         builder.append_repeated(' ', indent * 2);
         builder.appendff("[{}] ", node_index);
         visual_context_tree.dump(Painting::VisualContextIndex(node_index), builder);
-        if (auto it = context_id_to_paintable.find(node_index); it != context_id_to_paintable.end())
-            builder.appendff(" ({})", it->value->debug_description());
+        if (auto it = context_id_to_layout_node.find(node_index); it != context_id_to_layout_node.end())
+            builder.appendff(" ({})", Painting::debug_description(*it->value));
         builder.append('\n');
         for (auto child_node_index : children.get(node_index).value_or({}))
             dump_context(child_node_index, indent + 1);

@@ -137,9 +137,7 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/InlinePaintable.h>
-#include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/PaintableWithLines.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -1799,14 +1797,15 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
 
 void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
-    if (invalidation.needs_layout_tree_rebuild() || !unsafe_layout_node())
+    auto* layout_node = unsafe_layout_node();
+    if (invalidation.needs_layout_tree_rebuild() || !layout_node)
         return;
 
     // If we're keeping the layout tree, we can just apply the new style to the existing layout tree.
     VERIFY(has_style());
-    unsafe_layout_node()->apply_style(style_record_identity());
-    if (auto paintable = unsafe_layout_node()->paintable())
-        paintable->repaint_after_style_change(invalidation);
+    layout_node->apply_style(style_record_identity());
+    if (Painting::has_committed_box(*layout_node))
+        Painting::repaint_after_style_change(*layout_node, invalidation);
 
     apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(invalidation);
 }
@@ -1822,8 +1821,8 @@ void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS
 
         if (auto node_with_style = pseudo_element.unsafe_layout_node()) {
             node_with_style->apply_style(style_record_identity(pseudo_element_type));
-            if (auto paintable = node_with_style->paintable())
-                paintable->repaint_after_style_change(invalidation);
+            if (Painting::has_committed_box(*node_with_style))
+                Painting::repaint_after_style_change(*node_with_style, invalidation);
         }
     });
 }
@@ -2643,20 +2642,21 @@ enum class VisualContextTransform {
     Identity,
 };
 
-static void append_border_box_rect(Vector<CSSPixelRect>& rects, Painting::Paintable const& paintable_box, VisualContextTransform visual_context_transform)
+static void append_border_box_rect(Vector<CSSPixelRect>& rects, Layout::Node const& layout_node, VisualContextTransform visual_context_transform)
 {
-    auto absolute_rect = paintable_box.absolute_border_box_rect();
+    auto absolute_rect = Painting::absolute_border_box_rect(layout_node);
     if (visual_context_transform == VisualContextTransform::Identity)
         rects.append(absolute_rect);
     else
-        rects.append(paintable_box.transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+        rects.append(Painting::transform_rect_to_viewport(layout_node, absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
 }
 
 static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element const& element, VisualContextTransform visual_context_transform = VisualContextTransform::Apply)
 {
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
     //    object and stop this algorithm.
-    if (!element.layout_node())
+    auto const* layout_node = element.layout_node();
+    if (!layout_node)
         return {};
 
     // FIXME: 2. If the element has an associated SVG layout box return a DOMRectList object containing a single
@@ -2672,36 +2672,24 @@ static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element c
     //          are left in the final list.
 
     Vector<CSSPixelRect> rects;
-    if (auto const* inline_paintable = as_if<Painting::InlinePaintable>(element.layout_node()->paintable().ptr())) {
+    if (Painting::is_inline_paintable(*layout_node)) {
         Vector<CSSPixelRect> piece_border_box_rects;
-        Layout::RustFFI::layout_arena_inline_paintable_piece_border_box_rects(
-            inline_paintable->rust_arena().handle(), inline_paintable->rust_slot(), &piece_border_box_rects,
-            [](void* context, Layout::RustFFI::FfiCssPixelRect rect) {
-                static_cast<Vector<CSSPixelRect>*>(context)->append({
-                    CSSPixels::from_raw(rect.x),
-                    CSSPixels::from_raw(rect.y),
-                    CSSPixels::from_raw(rect.width),
-                    CSSPixels::from_raw(rect.height),
-                });
-            });
+        Painting::inline_piece_border_box_rects(*layout_node, piece_border_box_rects);
         for (auto const& absolute_rect : piece_border_box_rects) {
             if (visual_context_transform == VisualContextTransform::Identity)
                 rects.append(absolute_rect);
             else
-                rects.append(inline_paintable->transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+                rects.append(Painting::transform_rect_to_viewport(*layout_node, absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
         }
         // An inline element whose content is only interrupting blocks generates no line fragments, but per CSSOM
         // we still report its (zero-sized) border area instead of an empty list.
         if (rects.is_empty())
-            append_border_box_rect(rects, *inline_paintable, visual_context_transform);
+            append_border_box_rect(rects, *layout_node, visual_context_transform);
         return rects;
     }
 
-    if (auto paintable_box = element.paintable_box()) {
-        append_border_box_rect(rects, *paintable_box, visual_context_transform);
-    } else if (element.paintable()) {
-        dbgln("FIXME: Failed to get client rects for element ({})", element.debug_description());
-    }
+    if (Painting::has_committed_box(*layout_node))
+        append_border_box_rect(rects, *layout_node, visual_context_transform);
 
     return rects;
 }
@@ -2806,12 +2794,13 @@ int Element::client_width() const
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientWidth);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
-    if (!paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 3. Return the width of the padding edge excluding the width of any rendered scrollbar between the padding edge and the border edge,
     // ignoring any transforms that apply to the element and its ancestors.
-    return paintable_box()->absolute_padding_box_rect().width().to_int();
+    return Painting::absolute_padding_box_rect(*layout_node).width().to_int();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
@@ -2831,12 +2820,13 @@ int Element::client_height() const
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementClientHeight);
 
     // 1. If the element has no associated CSS layout box or if the CSS layout box is inline, return zero.
-    if (!paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 3. Return the height of the padding edge excluding the height of any rendered scrollbar between the padding edge and the border edge,
     //    ignoring any transforms that apply to the element and its ancestors.
-    return paintable_box()->absolute_padding_box_rect().height().to_int();
+    return Painting::absolute_padding_box_rect(*layout_node).height().to_int();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-currentcsszoom
@@ -3497,12 +3487,15 @@ int Element::scroll_width()
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     document.update_layout(UpdateLayoutReason::ElementScrollWidth);
-    VERIFY(document.paintable_box() && document.paintable()->scrollable_overflow_rect().has_value());
+    auto const* viewport_layout_node = document.layout_node();
+    VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
+    auto viewport_scrollable_overflow_rect = Painting::scrollable_overflow_rect(*viewport_layout_node);
+    VERIFY(viewport_scrollable_overflow_rect.has_value());
 
     // 3. Let viewport width be the width of the viewport excluding the width of the scroll bar, if any,
     //    or zero if there is no viewport.
     auto viewport_width = document.viewport_rect().width().to_int();
-    auto viewport_scrolling_area_width = document.paintable()->scrollable_overflow_rect()->width().to_int();
+    auto viewport_scrolling_area_width = viewport_scrollable_overflow_rect->width().to_int();
 
     // 4. If the element is the root element and document is not in quirks mode
     //    return max(viewport scrolling area width, viewport width).
@@ -3515,11 +3508,12 @@ int Element::scroll_width()
         return max(viewport_scrolling_area_width, viewport_width);
 
     // 6. If the element does not have any associated box return zero and terminate these steps.
-    if (!paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 7. Return the width of the element’s scrolling area.
-    if (auto scrollable_overflow_rect = paintable_box()->scrollable_overflow_rect(); scrollable_overflow_rect.has_value())
+    if (auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node); scrollable_overflow_rect.has_value())
         return scrollable_overflow_rect->width().to_int();
 
     return 0;
@@ -3537,12 +3531,15 @@ int Element::scroll_height()
 
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     document.update_layout(UpdateLayoutReason::ElementScrollHeight);
-    VERIFY(document.paintable_box() && document.paintable()->scrollable_overflow_rect().has_value());
+    auto const* viewport_layout_node = document.layout_node();
+    VERIFY(viewport_layout_node && Painting::has_committed_box(*viewport_layout_node));
+    auto viewport_scrollable_overflow_rect = Painting::scrollable_overflow_rect(*viewport_layout_node);
+    VERIFY(viewport_scrollable_overflow_rect.has_value());
 
     // 3. Let viewport height be the height of the viewport excluding the height of the scroll bar, if any,
     //    or zero if there is no viewport.
     auto viewport_height = document.viewport_rect().height().to_int();
-    auto viewport_scrolling_area_height = document.paintable()->scrollable_overflow_rect()->height().to_int();
+    auto viewport_scrolling_area_height = viewport_scrollable_overflow_rect->height().to_int();
 
     // 4. If the element is the root element and document is not in quirks mode
     //    return max(viewport scrolling area height, viewport height).
@@ -3555,11 +3552,12 @@ int Element::scroll_height()
         return max(viewport_scrolling_area_height, viewport_height);
 
     // 6. If the element does not have any associated box return zero and terminate these steps.
-    if (!paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return 0;
 
     // 7. Return the height of the element’s scrolling area.
-    if (auto scrollable_overflow_rect = paintable_box()->scrollable_overflow_rect(); scrollable_overflow_rect.has_value()) {
+    if (auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node); scrollable_overflow_rect.has_value()) {
         return scrollable_overflow_rect->height().to_int();
     }
     return 0;
@@ -3975,7 +3973,9 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
         current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
     } else if (auto paintable_box = scrolling_box.paintable_box()) {
         current_scroll_position = paintable_box->scroll_offset();
-        scrolling_box_rect = paintable_box->transform_rect_to_viewport(paintable_box->scroll_snapport_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+        auto const* layout_node = scrolling_box.layout_node();
+        VERIFY(layout_node);
+        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, paintable_box->scroll_snapport_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
         return {};
     }
@@ -4130,7 +4130,8 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
     auto* ancestor = target.parent();
     Vector<Node&> scrolling_boxes;
     while (ancestor) {
-        if (ancestor->paintable_box() && ancestor->paintable_box()->has_scrollable_overflow())
+        auto const* ancestor_layout_node = ancestor->layout_node();
+        if (ancestor_layout_node && Painting::has_committed_box(*ancestor_layout_node) && Painting::has_scrollable_overflow(*ancestor_layout_node))
             scrolling_boxes.append(*ancestor);
         ancestor = ancestor->parent();
     }
@@ -4155,7 +4156,9 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
             if (auto paintable_box = scrolling_box.paintable_box()) {
                 target_bounding_border_box.translate_by(paintable_box->scroll_offset() - paintable_box->clamp_scroll_offset(position));
 
-                auto scrollport_rect = paintable_box->transform_rect_to_viewport(paintable_box->absolute_padding_box_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+                auto const* layout_node = scrolling_box.layout_node();
+                VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+                auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
                 if (!visible_rect.is_empty())
                     target_bounding_border_box = visible_rect;
@@ -5135,7 +5138,8 @@ bool Element::check_visibility(CheckVisibilityOptions const& options)
     document().update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementCheckVisibility);
 
     // 1. If this does not have an associated box, return false.
-    if (!paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return false;
 
     // 2. If an ancestor of this in the flat tree has content-visibility: hidden, return false.
@@ -5194,7 +5198,7 @@ void Element::determine_proximity_to_the_viewport()
     // viewport soon. A margin of 50% is suggested as a reasonable default.
     viewport_rect.inflate(viewport_rect.width(), viewport_rect.height());
     // FIXME: We don't have paint containment or the overflow clip edge yet, so this is just using the absolute rect for now.
-    if (paintable_box()->absolute_rect().intersects(viewport_rect)) {
+    if (Painting::absolute_rect(*unsafe_layout_node()).intersects(viewport_rect)) {
         ensure_element_rare_data().proximity_to_the_viewport = ProximityToTheViewport::CloseToTheViewport;
         return;
     }
@@ -5999,7 +6003,8 @@ void Element::invalidate_lang_value()
 bool Element::not_rendered() const
 {
     // An element is not rendered if it does not have an associated box.
-    if (!layout_node() || !paintable_box())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return true;
 
     return false;

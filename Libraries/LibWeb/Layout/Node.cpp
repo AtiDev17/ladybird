@@ -30,6 +30,7 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/InlinePaintable.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
@@ -191,8 +192,8 @@ void Node::bump_fragment_cache_epoch_of_self_and_ancestors()
     for (auto* node = this; node; node = node->parent_ptr()) {
         if (fragment_cache_epochs_enabled())
             ++node->node_data().fragment_cache_epoch;
-        if (auto* box = as_if<Box>(*node); box && box->paintable_box())
-            const_cast<Painting::Paintable&>(*box->paintable_box()).clear_cached_overflow_data();
+        if (auto* box = as_if<Box>(*node))
+            Painting::clear_cached_overflow_data(*box);
     }
 }
 
@@ -255,8 +256,8 @@ Box* Node::containing_block()
 
 static void invalidate_paint_caches(Node& node)
 {
-    if (auto paintable = node.paintable())
-        paintable->invalidate_paint_cache();
+    if (Painting::has_committed_box(node))
+        Painting::invalidate_paint_cache(node);
 }
 
 void Node::pin_style_record_for_detachment()
@@ -620,8 +621,8 @@ void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleV
 {
     VERIFY(m_owner);
 
-    if (auto paintable = m_owner->paintable())
-        paintable->set_needs_repaint();
+    if (Painting::has_committed_box(*m_owner))
+        Painting::set_needs_repaint(*m_owner);
 }
 
 NodeWithStyle::~NodeWithStyle()

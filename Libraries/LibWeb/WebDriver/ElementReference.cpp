@@ -19,8 +19,10 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/WebDriver/ElementReference.h>
 
 namespace Web::WebDriver {
@@ -266,8 +268,8 @@ bool is_element_pointer_interactable(Web::HTML::BrowsingContext const& browsing_
     if (!document)
         return false;
 
-    auto paint_root = document->paintable_box();
-    if (!paint_root)
+    auto const* layout_root = document->layout_node();
+    if (!layout_root || !Painting::has_committed_box(*layout_root))
         return false;
 
     auto viewport = browsing_context.page().top_level_traversable()->viewport_rect();
@@ -380,7 +382,8 @@ bool is_element_in_view(ReadonlySpan<GC::Ref<Web::DOM::Element>> paint_tree, Web
 {
     // An element is in view if it is a member of its own pointer-interactable paint tree, given the pretense that its
     // pointer events are not disabled.
-    if (!element.paintable() || !element.paintable()->is_visible() || !element.paintable()->visible_for_hit_testing())
+    auto const* layout_node = element.layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node) || !Painting::is_visible(*layout_node) || !Painting::visible_for_hit_testing(*layout_node))
         return false;
 
     return paint_tree.contains_slow(GC::Ref { element });

@@ -213,9 +213,11 @@ define_named_types! {
         ObjectPropertyIteratorCacheData => "ObjectPropertyIteratorCacheData", Some(8), true;
         ObjectPropertyIteratorCache => "ObjectPropertyIteratorCache", Some(8), true;
         PrototypeChainValidity => "PrototypeChainValidity", Some(8), true;
+        Accessor => "Accessor", Some(8), true;
         FunctionObject => "FunctionObject", Some(8), true;
         ECMAScriptFunctionObject => "ECMAScriptFunctionObject", Some(8), true;
         RawNativeFunction => "RawNativeFunction", Some(8), true;
+        DirectGetterFunction => "DirectGetterFunction", Some(8), true;
         SharedFunctionInstanceData => "SharedFunctionInstanceData", Some(8), true;
         ScriptOrModule => "ScriptOrModule", Some(8), true;
         PropertyStorage => "PropertyStorage", Some(8), true;
