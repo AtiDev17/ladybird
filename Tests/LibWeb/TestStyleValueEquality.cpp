@@ -72,6 +72,27 @@ static StyleValueFFI::StyleValueData const* create_test_image(StringView url)
         0, nullptr, 0, false, false, false, false);
 }
 
+TEST_CASE(rust_serialization_transfers_a_native_utf16_string)
+{
+    auto value = StringStyleValue::create(Utf16FlyString::from_utf8("hello 😀"sv));
+    auto text = StyleValueFFI::rust_style_value_serialize(
+        value->rust_style_value_data(), to_underlying(SerializationMode::Normal));
+
+    EXPECT(text.has_value);
+    auto serialized = Utf16String::adopt_raw(text.raw);
+    EXPECT_EQ(serialized, u"\"hello 😀\""sv);
+    EXPECT(!serialized.has_ascii_storage());
+
+    auto ascii_value = StringStyleValue::create(Utf16FlyString::from_utf8("abc"sv));
+    auto ascii_text = StyleValueFFI::rust_style_value_serialize(
+        ascii_value->rust_style_value_data(), to_underlying(SerializationMode::Normal));
+
+    EXPECT(ascii_text.has_value);
+    auto ascii_serialized = Utf16String::adopt_raw(ascii_text.raw);
+    EXPECT_EQ(ascii_serialized, u"\"abc\""sv);
+    EXPECT(ascii_serialized.has_ascii_storage());
+}
+
 TEST_CASE(rust_composites_scalar_style_values)
 {
     auto underlying_number = NumberStyleValue::create(2);
@@ -1026,7 +1047,7 @@ TEST_CASE(rust_counter_definition_handles_retain_value_data)
 {
     auto value = IntegerStyleValue::create(2);
     StyleValueFFI::RetainedCounterDefinition definition {
-        { Utf16FlyString::from_utf8("item"sv).to_raw_leaked(), nullptr },
+        { Utf16FlyString::from_utf8("item"sv).to_raw_leaked() },
         false,
         { StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()) },
     };
@@ -1270,7 +1291,7 @@ TEST_CASE(rust_image_set_handles_retain_option_data)
         { create_test_image("candidate.png"sv) },
         { StyleValueFFI::rust_style_value_create_resolution(1, 0) },
         false,
-        { 0, nullptr },
+        { 0 },
     };
     auto image_set = StyleValue::adopt_rust_style_value_data(
         StyleValueFFI::rust_style_value_create_image_set(&option, 1));

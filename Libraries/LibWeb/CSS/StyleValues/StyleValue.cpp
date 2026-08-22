@@ -99,8 +99,14 @@
 #include <LibWeb/Layout/Node.h>
 
 extern "C" void ladybird_utf16_fly_string_unref(size_t);
-extern "C" Web::CSS::StyleValueFFI::FfiFlyStringView ladybird_utf16_fly_string_view(size_t, u8*);
 extern "C" void ladybird_string_unref(size_t);
+
+static_assert(sizeof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
+static_assert(alignof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
+static_assert(offsetof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString, raw) == 0);
+static_assert(sizeof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
+static_assert(alignof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
+static_assert(offsetof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString, raw) == 0);
 
 namespace Web::CSS {
 
@@ -347,12 +353,12 @@ void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
 {
     // The Rust serializer covers the ported types; everything else falls back to the
     // per-class C++ serializers until the port is complete.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.storage) {
-        if (text.ascii)
-            builder.append(StringView { reinterpret_cast<char const*>(text.ascii), text.length });
+    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
+        auto string = Utf16String::adopt_raw(text.raw);
+        if (string.has_ascii_storage())
+            builder.append(string.ascii_view());
         else
-            builder.append(Utf16View { reinterpret_cast<char16_t const*>(text.utf16), text.length });
-        StyleValueFFI::rust_serialized_text_release(text.storage);
+            builder.append(string.utf16_view());
         return;
     }
 
@@ -440,12 +446,9 @@ void StyleValue::serialize(Utf16StringBuilder& builder, SerializationMode mode) 
 {
     // Rust serializes natively into ASCII-or-UTF-16, so ported types never round-trip
     // through UTF-8 here.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.storage) {
-        if (text.ascii)
-            builder.append_ascii(StringView { reinterpret_cast<char const*>(text.ascii), text.length });
-        else
-            builder.append(Utf16View { reinterpret_cast<char16_t const*>(text.utf16), text.length });
-        StyleValueFFI::rust_serialized_text_release(text.storage);
+    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
+        auto string = Utf16String::adopt_raw(text.raw);
+        builder.append(string.utf16_view());
         return;
     }
 
@@ -672,25 +675,6 @@ Keyword StyleValue::to_keyword() const
 extern "C" void ladybird_utf16_fly_string_unref(size_t raw)
 {
     Utf16FlyString::unref_raw(raw);
-}
-
-// Called when the Rust serializer reads a retained Utf16FlyString's contents. Short strings are
-// decoded into the caller-provided buffer (which must hold at least 16 bytes); long strings
-// return their heap storage, which the retained reference keeps alive across the call.
-extern "C" Web::CSS::StyleValueFFI::FfiFlyStringView ladybird_utf16_fly_string_view(size_t raw, u8* short_buffer)
-{
-    auto string = Utf16FlyString::from_raw(raw);
-    auto view = string.view();
-    if (view.has_ascii_storage()) {
-        auto span = view.ascii_span();
-        if (span.size() <= AK::Detail::MAX_SHORT_STRING_BYTE_COUNT) {
-            __builtin_memcpy(short_buffer, span.data(), span.size());
-            return { short_buffer, span.size(), true };
-        }
-        return { span.data(), span.size(), true };
-    }
-    auto span = view.utf16_span();
-    return { span.data(), span.size(), false };
 }
 
 // Called when Rust-owned style value data drops a retained String.

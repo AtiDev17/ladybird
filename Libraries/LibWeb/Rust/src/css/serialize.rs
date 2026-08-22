@@ -8,9 +8,9 @@
 //!
 //! Serializes Rust-owned [`StyleValueData`] into text without crossing the FFI per component.
 //! The output stays ASCII until the first non-ASCII code unit forces UTF-16 storage, matching
-//! AK::Utf16String's ASCII-or-UTF16 representation so C++ can adopt the buffer without
-//! transcoding. Value types whose serialization has not been ported yet return the null
-//! serialization, and the C++ dispatcher falls back to the legacy per-class serializer.
+//! AK::Utf16String's ASCII-or-UTF16 representation, then moves a native string owner to C++.
+//! Value types whose serialization has not been ported yet return no string, and the C++
+//! dispatcher falls back to the legacy per-class serializer.
 
 use std::ffi::c_void;
 
@@ -36,32 +36,6 @@ impl SerializationMode {
     }
 }
 
-unsafe extern "C" {
-    /// Reads the contents of a retained Utf16FlyString. Short strings are decoded into
-    /// `short_buffer`, which must hold at least 16 bytes; long strings return a pointer into
-    /// the refcounted heap data the retained reference keeps alive.
-    fn ladybird_utf16_fly_string_view(raw: usize, short_buffer: *mut u8) -> FfiFlyStringView;
-}
-
-#[repr(C)]
-pub(crate) struct FfiFlyStringView {
-    data: *const c_void,
-    length: usize,
-    is_ascii: bool,
-}
-
-impl FfiFlyStringView {
-    /// The empty view, used by the cargo-test bridge stub.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self {
-            data: std::ptr::null(),
-            length: 0,
-            is_ascii: true,
-        }
-    }
-}
-
 /// The decoded storage of a fly string: ASCII bytes or UTF-16 code units.
 pub(crate) enum StringUnits<'a> {
     Ascii(&'a [u8]),
@@ -70,22 +44,10 @@ pub(crate) enum StringUnits<'a> {
 
 /// Calls `f` with a view of the fly string's contents.
 pub(crate) fn with_fly_string_units<R>(string: &RetainedUtf16FlyString, f: impl FnOnce(StringUnits) -> R) -> R {
-    if string.raw() == 0 {
-        return f(StringUnits::Ascii(&[]));
-    }
-    let mut short_buffer = [0u8; 16];
-    // SAFETY: The retained reference keeps the fly string alive; the buffer outlives the view.
-    let view = unsafe { ladybird_utf16_fly_string_view(string.raw(), short_buffer.as_mut_ptr()) };
-    if view.length == 0 {
-        return f(StringUnits::Ascii(&[]));
-    }
-    let units = if view.is_ascii {
-        // SAFETY: `data` points either at `short_buffer` or at heap storage kept alive by the
-        // retained reference for the duration of this call.
-        StringUnits::Ascii(unsafe { std::slice::from_raw_parts(view.data.cast::<u8>(), view.length) })
-    } else {
-        // SAFETY: Non-ASCII storage is never short, so `data` is stable heap storage.
-        StringUnits::Utf16(unsafe { std::slice::from_raw_parts(view.data.cast::<u16>(), view.length) })
+    // SAFETY: The retained owner remains borrowed for the returned view's lifetime.
+    let units = match unsafe { ak::utf16_string_units(string.raw_word()) } {
+        ak::Utf16StringUnits::Ascii(bytes) => StringUnits::Ascii(bytes),
+        ak::Utf16StringUnits::Utf16(units) => StringUnits::Utf16(units),
     };
     f(units)
 }
@@ -255,24 +217,13 @@ pub(crate) fn serialize_computed_size(size: &crate::css::computed_value_types::C
 }
 
 pub(crate) fn fly_string_raw_to_string(raw: usize) -> String {
-    if raw == 0 {
-        return String::new();
-    }
-    let mut short_buffer = [0u8; 16];
     // SAFETY: Callers hold a retained fly-string owner while converting the raw value.
-    let view = unsafe { ladybird_utf16_fly_string_view(raw, short_buffer.as_mut_ptr()) };
-    if view.length == 0 {
-        return String::new();
-    }
-    if view.is_ascii {
-        // SAFETY: The view points to ASCII bytes that remain live for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(view.data.cast::<u8>(), view.length) };
-        // SAFETY: ASCII is valid UTF-8.
-        unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
-    } else {
-        // SAFETY: The view points to UTF-16 units that remain live for this call.
-        let units = unsafe { std::slice::from_raw_parts(view.data.cast::<u16>(), view.length) };
-        String::from_utf16_lossy(units)
+    match unsafe { ak::utf16_string_units(&raw) } {
+        ak::Utf16StringUnits::Ascii(bytes) => {
+            // SAFETY: ASCII is valid UTF-8.
+            unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+        }
+        ak::Utf16StringUnits::Utf16(units) => String::from_utf16_lossy(units),
     }
 }
 
@@ -3490,55 +3441,33 @@ fn serialize_shorthand(
     default_serialize(sink)
 }
 
-/// A serialized text buffer handed to C++. Exactly one of `ascii` and `utf16` is set when
-/// `storage` is non-null; a null `storage` means the value's serialization is not ported.
+/// A native `AK::Utf16String` ownership reference handed to C++ without copying.
 #[repr(C)]
 pub struct FfiSerializedText {
-    pub ascii: *const u8,
-    pub utf16: *const u16,
-    pub length: usize,
-    pub storage: *mut c_void,
+    pub raw: usize,
+    pub has_value: bool,
 }
 
 impl FfiSerializedText {
     fn unported() -> Self {
         Self {
-            ascii: std::ptr::null(),
-            utf16: std::ptr::null(),
-            length: 0,
-            storage: std::ptr::null_mut(),
+            raw: 0,
+            has_value: false,
         }
     }
 }
 
-struct SerializedTextStorage {
-    ascii: Vec<u8>,
-    utf16: Vec<u16>,
-}
-
 pub(crate) fn sink_into_ffi(sink: TextSink) -> FfiSerializedText {
-    let storage = Box::new(SerializedTextStorage {
-        ascii: sink.ascii,
-        utf16: sink.utf16,
-    });
-    let result = if sink.is_ascii {
-        FfiSerializedText {
-            ascii: storage.ascii.as_ptr(),
-            utf16: std::ptr::null(),
-            length: storage.ascii.len(),
-            storage: std::ptr::null_mut(),
-        }
+    let string = if sink.is_ascii {
+        // SAFETY: The ASCII representation is valid UTF-8.
+        let text = unsafe { str::from_utf8_unchecked(&sink.ascii) };
+        ak::Utf16String::from_utf8(text)
     } else {
-        FfiSerializedText {
-            ascii: std::ptr::null(),
-            utf16: storage.utf16.as_ptr(),
-            length: storage.utf16.len(),
-            storage: std::ptr::null_mut(),
-        }
+        ak::Utf16String::from_utf16(&sink.utf16)
     };
     FfiSerializedText {
-        storage: Box::into_raw(storage).cast(),
-        ..result
+        raw: string.into_raw(),
+        has_value: true,
     }
 }
 
@@ -3558,14 +3487,6 @@ pub unsafe extern "C" fn rust_style_value_serialize(value: *const c_void, mode: 
         }
         sink_into_ffi(sink)
     })
-}
-
-/// # Safety
-/// `storage` must be a non-null storage returned by a serialization entry point that has not
-/// been released.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_serialized_text_release(storage: *mut c_void) {
-    drop(unsafe { Box::from_raw(storage.cast::<SerializedTextStorage>()) });
 }
 
 #[cfg(test)]

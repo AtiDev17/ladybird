@@ -6,6 +6,7 @@
 
 #include <LibTest/TestCase.h>
 
+#include <AK/FFIHelpers.h>
 #include <AK/Utf16FlyString.h>
 
 static_assert(AK::Concepts::HashCompatible<Utf16String, Utf16FlyString>);
@@ -13,6 +14,32 @@ static_assert(AK::Concepts::HashCompatible<Utf16FlyString, Utf16String>);
 
 static_assert(AK::Concepts::HashCompatible<Utf16View, Utf16FlyString>);
 static_assert(AK::Concepts::HashCompatible<Utf16FlyString, Utf16View>);
+
+TEST_CASE(ffi_constructors_use_the_native_intern_table)
+{
+    auto first = Utf16FlyString::adopt_raw(ladybird_utf16_fly_string_from_utf8(
+        reinterpret_cast<u8 const*>("this is a shared fly string"), 27));
+    auto second = Utf16FlyString::adopt_raw(ladybird_utf16_fly_string_from_utf16(
+        reinterpret_cast<u16 const*>(u"this is a shared fly string"), 27));
+
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(first.raw_identity(), second.raw_identity());
+    EXPECT_EQ(Utf16FlyString::number_of_utf16_fly_strings(), 1u);
+
+    EXPECT_EQ(ladybird_utf16_fly_string_from_utf8(nullptr, 0), Utf16FlyString {}.raw_identity());
+    EXPECT_DEATH("Passing an invalid UTF-8 range", (void)ladybird_utf16_fly_string_from_utf8(nullptr, 1));
+
+    auto empty_raw = ladybird_utf16_fly_string_from_utf16(nullptr, 0);
+    EXPECT_EQ(empty_raw, Utf16FlyString {}.raw_identity());
+
+    auto empty = Utf16FlyString::adopt_raw(empty_raw);
+    EXPECT(empty.is_empty());
+    EXPECT(empty.to_utf16_string().has_short_ascii_storage());
+    EXPECT_EQ(empty.to_raw_leaked(), empty_raw);
+
+    Optional<Utf16FlyString> optional_empty { empty };
+    EXPECT(optional_empty.has_value());
+}
 
 TEST_CASE(short_ascii_literal_is_constexpr)
 {
@@ -141,6 +168,48 @@ TEST_CASE(moved_fly_string_becomes_empty)
     EXPECT(fly2.is_empty());
     EXPECT_EQ(fly1, "thisisdefinitelymorethan7bytes"sv);
     EXPECT_EQ(Utf16FlyString::number_of_utf16_fly_strings(), 1u);
+}
+
+TEST_CASE(raw_ownership_transfer)
+{
+    {
+        auto string = "short"_utf16_fly_string;
+        auto raw = move(string).into_raw();
+
+        EXPECT(string.is_empty());
+
+        auto adopted_string = Utf16FlyString::adopt_raw(raw);
+        EXPECT_EQ(adopted_string, "short"sv);
+        EXPECT_EQ(adopted_string.raw_identity(), raw);
+    }
+
+    {
+        auto string = "this is a long fly string"_utf16_fly_string;
+        auto raw = string.raw_identity();
+        auto const* header = reinterpret_cast<AK::Detail::Utf16StringDataHeader const*>(raw);
+
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        EXPECT_EQ(move(string).into_raw(), raw);
+        EXPECT(string.is_empty());
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        auto adopted_string = Utf16FlyString::adopt_raw(raw);
+        EXPECT_EQ(adopted_string, "this is a long fly string"sv);
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        Utf16FlyString::ref_raw(raw);
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 2u);
+        Utf16FlyString::unref_raw(raw);
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+
+        {
+            auto copied_string = Utf16FlyString::from_raw(raw);
+            EXPECT_EQ(copied_string, adopted_string);
+            EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 2u);
+        }
+        EXPECT_EQ(AK::atomic_load(&header->reference_count, AK::memory_order_relaxed), 1u);
+    }
 }
 
 TEST_CASE(is_one_of)
