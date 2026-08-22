@@ -12,13 +12,19 @@ namespace Media {
 
 struct Subsampling {
 public:
-    Subsampling(bool x, bool y)
+    static constexpr Subsampling yuv420() { return { true, true }; }
+    static constexpr Subsampling yuv422() { return { true, false }; }
+    static constexpr Subsampling yuv444() { return { false, false }; }
+
+    constexpr Subsampling(bool x, bool y)
         : m_x(x)
         , m_y(y)
     {
     }
 
     Subsampling() = default;
+
+    bool operator==(Subsampling const&) const = default;
 
     bool x() const { return m_x; }
     bool y() const { return m_y; }

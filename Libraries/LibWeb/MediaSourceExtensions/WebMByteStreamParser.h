@@ -9,6 +9,7 @@
 #include <AK/OwnPtr.h>
 #include <AK/Vector.h>
 #include <LibMedia/Containers/Matroska/Document.h>
+#include <LibMedia/Containers/Matroska/TrackBlockContext.h>
 #include <LibMedia/Containers/Matroska/Utilities.h>
 #include <LibMedia/Track.h>
 #include <LibWeb/MediaSourceExtensions/ByteStreamParser.h>
@@ -21,10 +22,13 @@ public:
     WebMByteStreamParser();
     virtual ~WebMByteStreamParser() override;
 
+    static bool supports_codec(StringView, Media::CodecID);
+
     virtual Media::DecoderErrorOr<void> skip_ignored_bytes(Media::MediaStreamCursor&) override;
     virtual Media::DecoderErrorOr<SegmentType> sniff_segment_type(Media::MediaStreamCursor&) override;
     virtual Media::DecoderErrorOr<void> parse_initialization_segment(Media::MediaStreamCursor&) override;
     virtual Media::DecoderErrorOr<ParseMediaSegmentResult> parse_media_segment(Media::MediaStreamCursor&) override;
+    virtual void reset_parser_state() override;
 
     virtual Optional<AK::Duration> duration() const override
     {
@@ -41,10 +45,10 @@ public:
         auto entry = m_track_entries.get(track_number);
         if (!entry.has_value())
             return Media::CodecID::Unknown;
-        return Media::Matroska::codec_id_from_matroska_id_string((*entry)->codec_id());
+        return Media::Matroska::codec_id_from_matroska_track_entry(*entry.value());
     }
 
-    virtual ReadonlyBytes codec_initialization_data_for_track(u64 track_number) const override
+    ReadonlyBytes codec_initialization_data_for_track(u64 track_number) const
     {
         auto entry = m_track_entries.get(track_number);
         if (!entry.has_value())
@@ -59,6 +63,7 @@ public:
 private:
     Optional<Media::Matroska::SegmentInformation> m_segment_information;
     OrderedHashMap<u64, NonnullRefPtr<Media::Matroska::TrackEntry>> m_track_entries;
+    HashTable<u64> m_tracks_needing_codec_configuration;
     Media::Matroska::TrackBlockContexts m_track_block_contexts;
 
     Vector<Media::Track> m_video_tracks;

@@ -10,7 +10,7 @@ use crate::layout::{
     FfiAffineTransform, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, FfiDrawGlyph, FlexLayoutData,
     GridLayoutData, OwnedUsedGridTracks,
 };
-use std::ffi::c_void;
+use std::cell::Cell;
 use std::rc::Rc;
 
 pub const INVALID_PAINTABLE_SLOT_INDEX: u32 = u32::MAX;
@@ -223,8 +223,6 @@ pub struct PaintableData {
     /// Range of visual context nodes this box appended during the last tree build.
     pub visual_context_nodes_begin: usize,
     pub visual_context_nodes_end: usize,
-
-    pub shell: *mut c_void,
 }
 
 impl Default for PaintableData {
@@ -268,7 +266,6 @@ impl Default for PaintableData {
             has_fixed_background_visual_context: false,
             visual_context_nodes_begin: 0,
             visual_context_nodes_end: 0,
-            shell: std::ptr::null_mut(),
         }
     }
 }
@@ -289,18 +286,9 @@ impl PaintableData {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct PaintableAllocation {
-    pub slot: PaintableSlotId,
-    pub data: *mut PaintableData,
-    pub generation: u32,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
 pub struct FfiSelectionEntry {
     pub is_text_node_entry: bool,
     pub layout_node: NodeSlotId,
-    pub paintable: PaintableSlotId,
     pub state: u8,
 }
 
@@ -309,6 +297,14 @@ pub const SELECTION_STATE_START: u8 = 1;
 pub const SELECTION_STATE_END: u8 = 2;
 pub const SELECTION_STATE_START_AND_END: u8 = 3;
 pub const SELECTION_STATE_FULL: u8 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PaintableRowResetKind {
+    RelayoutReuse = 0,
+    Cleared = 1,
+    Freed = 2,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LineRecord {
@@ -384,6 +380,7 @@ pub struct PaintableSideData {
     pub(crate) piece_indices: Vec<u32>,
     pub(crate) computed_svg_path: Option<Rc<libgfx_rust::path::OwnedPath>>,
     pub(crate) computed_svg_path_identity: u64,
+    pub(crate) svg_filter_bounds: Cell<Option<FfiCssPixelRect>>,
     // Only meaningful while is_self_painting(); assigned by the containing block's
     // assign_fragment_ownership().
     pub(crate) fragment_ownership: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,

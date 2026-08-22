@@ -16,7 +16,6 @@
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/Layout/Box.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/Selection/SelectionModifier.h>
 
@@ -645,16 +644,8 @@ void Selection::scroll_focus_into_view()
 
     m_document->update_layout(DOM::UpdateLayoutReason::ScrollCursorIntoView);
 
-    if (auto* text = as_if<DOM::Text>(*focus)) {
-        Painting::Paintable::scroll_text_offset_into_view(*text, focus_offset(), m_focus_affinity);
-        return;
-    }
-
-    auto paintable = focus->paintable();
-    if (!paintable)
-        return;
-
-    paintable->scroll_ancestor_to_offset_into_view(focus_offset());
+    if (auto* text = as_if<DOM::Text>(*focus))
+        Painting::scroll_text_offset_into_view(*text, focus_offset(), m_focus_affinity);
 }
 
 }

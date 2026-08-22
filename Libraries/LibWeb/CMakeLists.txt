@@ -828,6 +828,7 @@ set(SOURCES
     MediaCapture/MediaStreamTrackEvent.cpp
     MediaSourceExtensions/BufferedChangeEvent.cpp
     MediaSourceExtensions/EventNames.cpp
+    MediaSourceExtensions/ISOBMFFByteStreamParser.cpp
     MediaSourceExtensions/ManagedMediaSource.cpp
     MediaSourceExtensions/ManagedSourceBuffer.cpp
     MediaSourceExtensions/MediaSource.cpp
@@ -867,18 +868,16 @@ set(SOURCES
     Painting/DisplayListPlayerSkia.cpp
     Painting/DisplayListResourceTransaction.cpp
     Painting/DisplayListResourceStorage.cpp
+    Painting/DocumentPaintState.cpp
     Painting/HitTestDisplayList.cpp
-    Painting/InlinePaintable.cpp
-    Painting/Paintable.cpp
     Painting/PaintStyle.cpp
-    Painting/PaintableWithLines.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResolvedCSSFilter.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
+    Painting/Scrolling.cpp
     Painting/ScrollState.cpp
     Painting/SVGMasking.cpp
-    Painting/ViewportPaintable.cpp
     PerformanceTimeline/EntryTypes.cpp
     PerformanceTimeline/EventNames.cpp
     PerformanceTimeline/PerformanceEntry.cpp

@@ -10,7 +10,7 @@ interface SourceBuffer : EventTarget {
     [ImplementedAs=mode] attribute AppendMode mode;
     readonly  attribute boolean updating;
     [NeedsCallerRealm] readonly attribute TimeRanges buffered;
-    [FIXME] attribute double timestampOffset;
+    attribute double timestampOffset;
     [FIXME] readonly  attribute AudioTrackList audioTracks;
     [FIXME] readonly  attribute VideoTrackList videoTracks;
     [FIXME] readonly  attribute TextTrackList textTracks;
@@ -26,5 +26,5 @@ interface SourceBuffer : EventTarget {
     undefined appendBuffer(BufferSource data);
     undefined abort();
     undefined changeType(DOMString type);
-    [FIXME] undefined remove(double start, unrestricted double end);
+    undefined remove(double start, unrestricted double end);
 };

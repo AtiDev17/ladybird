@@ -11,8 +11,6 @@
 #include <LibWeb/Dump.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 
 namespace Web::Layout {
 

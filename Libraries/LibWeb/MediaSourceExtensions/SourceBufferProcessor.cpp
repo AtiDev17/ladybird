@@ -8,6 +8,7 @@
 #include <AK/Math.h>
 #include <AK/NonnullOwnPtr.h>
 #include <LibMedia/DecoderError.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/ReadonlyBytesCursor.h>
 #include <LibWeb/MediaSourceExtensions/ByteStreamParser.h>
 #include <LibWeb/MediaSourceExtensions/SourceBufferProcessor.h>
@@ -42,6 +43,16 @@ bool SourceBufferProcessor::generate_timestamps_flag() const
     return m_generate_timestamps_flag;
 }
 
+AK::Duration SourceBufferProcessor::timestamp_offset() const
+{
+    return m_timestamp_offset;
+}
+
+void SourceBufferProcessor::set_timestamp_offset(AK::Duration timestamp_offset)
+{
+    m_timestamp_offset = timestamp_offset;
+}
+
 AK::Duration SourceBufferProcessor::group_end_timestamp() const
 {
     return m_group_end_timestamp;
@@ -66,7 +77,6 @@ size_t SourceBufferProcessor::total_buffered_bytes() const
 
 size_t SourceBufferProcessor::capacity_in_bytes() const
 {
-    VERIFY(!m_track_buffers.is_empty());
     size_t total = 0;
     for (auto const& [track_id, track_buffer] : m_track_buffers) {
         switch (track_buffer->demuxer().track().type()) {
@@ -296,6 +306,9 @@ void SourceBufferProcessor::reset_parser_state()
         // FIXME: Process any complete coded frames
     }
 
+    if (m_parser)
+        m_parser->reset_parser_state();
+
     // 2. Unset the last decode timestamp on all track buffers.
     // 3. Unset the last frame duration on all track buffers.
     // 4. Unset the highest end timestamp on all track buffers.
@@ -347,14 +360,40 @@ bool SourceBufferProcessor::initialization_segment_received()
 
     // 3. If the [[first initialization segment received flag]] is true, then run the following steps:
     if (m_first_initialization_segment_received_flag) {
-        // FIXME: 1. Verify the following properties. If any of the checks fail then run the append error algorithm
-        //           and abort these steps.
-        //               - The number of audio, video, and text tracks match what was in the first initialization segment.
-        //               - If more than one track for a single type are present (e.g., 2 audio tracks), then the Track IDs
-        //                 match the ones in the first initialization segment.
-        //               - The codecs for each track are supported by the user agent.
+        // 1. Verify the following properties. If any of the checks fail then run the append error algorithm
+        //    and abort these steps.
+        //        - The number of audio, video, and text tracks match what was in the first initialization segment.
+        //        - If more than one track for a single type are present (e.g., 2 audio tracks), then the Track IDs
+        //          match the ones in the first initialization segment.
+        //        - The codecs for each track are supported by the user agent.
+        // NB: Track buffers are keyed by Track ID, so finding one of a matching type for every track in this segment
+        //     and counting the same number of them covers both of the first two checks.
+        size_t track_count = 0;
+        for (auto const* tracks : { &m_parser->audio_tracks(), &m_parser->video_tracks(), &m_parser->text_tracks() }) {
+            for (auto const& track : *tracks) {
+                track_count++;
+                auto track_buffer = m_track_buffers.get(track.identifier());
+                if (!track_buffer.has_value() || track_buffer.value()->demuxer().track().type() != track.type()) {
+                    m_append_error_callback();
+                    return false;
+                }
+                if (track.type() == Media::TrackType::Subtitles)
+                    continue;
+                auto codec_id = m_parser->codec_id_for_track(track.identifier());
+                if (!Media::decoder_capabilities(Media::ParsedCodec { codec_id }).has_value()) {
+                    m_append_error_callback();
+                    return false;
+                }
+            }
+        }
+        if (track_count != m_track_buffers.size()) {
+            m_append_error_callback();
+            return false;
+        }
 
-        // FIXME: 2. Add the appropriate track descriptions from this initialization segment to each of the track buffers.
+        // 2. Add the appropriate track descriptions from this initialization segment to each of the track buffers.
+        // NB: A track's description travels with its coded frames, since the parser gives the first frame that
+        //     follows an initialization segment the codec and configuration that it selects.
 
         // 3. Set the need random access point flag on all track buffers to true.
         set_need_random_access_point_flag_on_all_track_buffers(true);
@@ -379,9 +418,7 @@ bool SourceBufferProcessor::initialization_segment_received()
 
                 // 7. Create a new track buffer to store coded frames for this track.
                 // 8. Add the track description for this track to the track buffer.
-                auto codec_id = m_parser->codec_id_for_track(track.identifier());
-                auto codec_init_data = MUST(ByteBuffer::copy(m_parser->codec_initialization_data_for_track(track.identifier())));
-                auto demuxer = make_ref_counted<TrackBufferDemuxer>(track, codec_id, move(codec_init_data));
+                auto demuxer = make_ref_counted<TrackBufferDemuxer>(track);
                 auto track_buffer = make<TrackBuffer>(demuxer);
                 m_track_buffers.set(track.identifier(), move(track_buffer));
 
@@ -430,10 +467,8 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
         //               of the coded frame's presentation timestamp in seconds.
         //            2. Let decode timestamp be a double precision floating point representation
         //               of the coded frame's decode timestamp in seconds.
-        auto presentation_timestamp = frame.timestamp();
-        // FIXME: For VP9, decode timestamp equals presentation timestamp. This will need to differ when H.264 is
-        //        supported by MSE.
-        auto decode_timestamp = frame.timestamp();
+        auto presentation_timestamp = frame.presentation_timestamp();
+        auto decode_timestamp = frame.decode_timestamp();
 
         // 2. Let frame duration be a double precision floating point representation of the coded
         //    frame's duration in seconds.
@@ -441,7 +476,13 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
 
         // FIXME: 3. If mode equals "sequence" and group start timestamp is set, then run the following steps:
 
-        // FIXME: 4. If timestampOffset is not 0, then run the following steps:
+        // 4. If timestampOffset is not 0, then run the following steps:
+        if (!m_timestamp_offset.is_zero()) {
+            // 1. Add timestampOffset to the presentation timestamp.
+            presentation_timestamp += m_timestamp_offset;
+            // 2. Add timestampOffset to the decode timestamp.
+            decode_timestamp += m_timestamp_offset;
+        }
 
         // 5. Let track buffer equal the track buffer that the coded frame will be added to.
         auto maybe_track_buffer = m_track_buffers.get(demuxed_frame.track_number);
@@ -455,6 +496,7 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
 
         auto last_decode_timestamp = track_buffer.last_decode_timestamp();
         auto last_frame_duration = track_buffer.last_frame_duration();
+        VERIFY(last_decode_timestamp.has_value() == last_frame_duration.has_value());
 
         // 6.
         if (
@@ -470,12 +512,12 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
                 && decode_timestamp - last_decode_timestamp.value() > (last_frame_duration.value() + last_frame_duration.value()))) {
             // 1. -> If mode equals "segments":
             if (m_mode == AppendMode::Segments) {
-                // Set [[group end timestamp]] to presentation timestamp.
+                //       Set [[group end timestamp]] to presentation timestamp.
                 m_group_end_timestamp = presentation_timestamp;
             }
             //    -> If mode equals "sequence":
-            if (m_mode == AppendMode::Sequence) {
-                // -> Set [[group start timestamp]] equal to the [[group end timestamp]].
+            else if (m_mode == AppendMode::Sequence) {
+                //       Set [[group start timestamp]] equal to the [[group end timestamp]].
                 m_group_start_timestamp = m_group_end_timestamp;
             }
 
@@ -522,12 +564,25 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
         // FIXME: 13. If last decode timestamp for track buffer is unset and presentation timestamp falls within
         //            the presentation interval of a coded frame in track buffer, then run the following steps:
 
-        // 14. Remove all coded frames from track buffer that have a presentation timestamp greater than
-        //     or equal to presentation timestamp and less than frame end timestamp.
-        // 15. Remove all possible decoding dependencies on the coded frames removed in the previous step
-        //     by removing all coded frames from track buffer between those frames removed in the previous
-        //     step and the next random access point after those removed frames.
-        demuxer.remove_coded_frames_and_dependants_in_range(presentation_timestamp, frame_end_timestamp);
+        // 14. Remove existing coded frames in track buffer:
+        auto highest_end_timestamp = track_buffer.highest_end_timestamp();
+        // -> If highest end timestamp for track buffer is not set:
+        if (!highest_end_timestamp.has_value()) {
+            //    Remove all coded frames from track buffer that have a presentation timestamp greater than
+            //    or equal to presentation timestamp and less than frame end timestamp.
+            demuxer.remove_coded_frames_and_dependants_in_range(presentation_timestamp, frame_end_timestamp);
+        }
+        // -> If highest end timestamp for track buffer is set and less than or equal to presentation timestamp:
+        else if (highest_end_timestamp.value() <= presentation_timestamp) {
+            //    Remove all coded frames from track buffer that have a presentation timestamp greater than
+            //    or equal to highest end timestamp and less than frame end timestamp.
+            demuxer.remove_coded_frames_and_dependants_in_range(highest_end_timestamp.value(), frame_end_timestamp);
+        }
+
+        // 15. Remove all possible decoding dependencies on the coded frames removed in the previous two
+        //     steps by removing all coded frames from track buffer between those frames removed in the
+        //     previous two steps and the next random access point after those removed frames.
+        // NB: This step is done as part of the removal above.
 
         // 16. If spliced audio frame is set:
         //         Add spliced audio frame to the track buffer.
@@ -536,6 +591,8 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
         //     Otherwise:
         //         Add the coded frame with the presentation timestamp, decode timestamp, and frame
         //         duration to the track buffer.
+        frame.set_presentation_timestamp(presentation_timestamp);
+        frame.set_decode_timestamp(decode_timestamp);
         demuxer.add_coded_frame(move(frame));
 
         // 17. Set last decode timestamp for track buffer to decode timestamp.
@@ -563,6 +620,69 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
 
     // AD-HOC: Steps 2-5 are handled by the callback, as they mutate the DOM.
     m_coded_frame_processing_done_callback();
+}
+
+// https://w3c.github.io/media-source/#dfn-coded-frame-removal
+void SourceBufferProcessor::run_coded_frame_removal(AK::Duration start, AK::Duration end)
+{
+    // 1. Let start be the starting presentation timestamp for the removal range.
+    // 2. Let end be the end presentation timestamp for the removal range.
+
+    // 3. For each track buffer in this SourceBuffer, run the following steps:
+    for (auto& [track_id, track_buffer] : m_track_buffers) {
+        // 1. Let remove end timestamp be the current value of duration
+        // 2. If this track buffer has a random access point timestamp that is greater than or equal to end, then
+        //    update remove end timestamp to that random access point timestamp.
+        // NB: The removal below runs on to the next random access point, which is where remove end timestamp
+        //     would land.
+
+        // 3. Remove all media data, from this track buffer, that contain starting timestamps greater than or
+        //    equal to start and less than the remove end timestamp.
+        auto removed_frame_presentation_timestamp = track_buffer->demuxer().remove_coded_frames_and_dependants_in_range_returning_presentation_timestamp_at(start, end, track_buffer->last_decode_timestamp());
+
+        //     1. For each removed frame, if the frame has a decode timestamp equal to the last decode timestamp
+        //        for the frame's track, run the following steps:
+        if (removed_frame_presentation_timestamp.has_value()) {
+            // -> If mode equals "segments":
+            if (m_mode == AppendMode::Segments) {
+                //    Set [[group end timestamp]] to presentation timestamp.
+                m_group_end_timestamp = removed_frame_presentation_timestamp.value();
+            }
+            // -> If mode equals "sequence":
+            else if (m_mode == AppendMode::Sequence) {
+                //    Set [[group start timestamp]] equal to the [[group end timestamp]].
+                m_group_start_timestamp = m_group_end_timestamp;
+            }
+
+            // AD-HOC: The spec doesn't nest the steps below under step 1's if statement, but clearing the last
+            //         decode timestamp upon every removal here would potentially force a RAP unexpectedly.
+            //         https://github.com/w3c/media-source/issues/290
+
+            // 2. Unset the last decode timestamp on all track buffers.
+            // 3. Unset the last frame duration on all track buffers.
+            // 4. Unset the highest end timestamp on all track buffers.
+            unset_all_track_buffer_timestamps();
+            // 5. Set the need random access point flag on all track buffers to true.
+            set_need_random_access_point_flag_on_all_track_buffers(true);
+        }
+
+        // 4. Remove all possible decoding dependencies on the coded frames removed in the previous step by
+        //    removing all coded frames from this track buffer between those frames removed in the previous step
+        //    and the next random access point after those removed frames.
+        // NB: This is taken care of by the TrackBufferDemuxer above.
+
+        // 5. If this object is in activeSourceBuffers, the current playback position is greater than or equal to
+        //    start and less than the remove end timestamp, and HTMLMediaElement's readyState is greater than
+        //    HAVE_METADATA, then set the HTMLMediaElement's readyState attribute to HAVE_METADATA and stall
+        //    playback.
+        // NB: SourceBuffer invokes the unified readyState update method on HTMLMediaElement once this algorithm
+        //     has removed frames from every track buffer.
+    }
+
+    // 4. If the [[buffer full flag]] equals true and this object is ready to accept more bytes, then set the
+    //    [[buffer full flag]] to false.
+    if (total_buffered_bytes() < capacity_in_bytes())
+        m_buffer_full_flag = false;
 }
 
 // https://w3c.github.io/media-source/#sourcebuffer-coded-frame-eviction
@@ -618,7 +738,7 @@ void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::D
         }
         if (!oldest_track_buffer)
             break;
-        bytes_evicted += oldest_track_buffer->demuxer().take_earliest_frame();
+        bytes_evicted += oldest_track_buffer->demuxer().take_earliest_frame_and_dependants();
     }
 
     while (bytes_evicted < bytes_to_evict) {
@@ -636,7 +756,8 @@ void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::D
         if (!latest_track_buffer)
             break;
         auto last_decode_timestamp = latest_track_buffer->last_decode_timestamp();
-        bytes_evicted += latest_track_buffer->demuxer().take_latest_frame();
+        auto removed_frame = latest_track_buffer->demuxer().take_latest_frame();
+        bytes_evicted += removed_frame.byte_size;
 
         // https://w3c.github.io/media-source/#dfn-coded-frame-removal
         // AD-HOC: Steps starting from 3.3.1 are implemented here.
@@ -646,7 +767,7 @@ void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::D
         // AD-HOC: The spec doesn't nest steps 2-5 below under step 1's if statement, but clearing the last decode
         //         timestamp upon every removal here would potentially force a RAP unexpectedly.
         //         https://github.com/w3c/media-source/issues/290
-        if (last_decode_timestamp.has_value() && latest_timestamp == last_decode_timestamp.value()) {
+        if (last_decode_timestamp.has_value() && removed_frame.decode_timestamp == last_decode_timestamp.value()) {
             // -> If mode equals "segments":
             if (m_mode == AppendMode::Segments) {
                 // Set [[group end timestamp]] to presentation timestamp.

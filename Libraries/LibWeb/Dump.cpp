@@ -371,11 +371,9 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
 
     if (auto const* block_container = as_if<Layout::BlockContainer>(layout_node);
         block_container && block_container->children_are_inline() && Painting::is_paintable_with_lines(layout_node)) {
-        auto paintable = layout_node.paintable();
-        VERIFY(paintable);
         Layout::RustFFI::layout_arena_paintable_dump_block_fragments(
             layout_node.arena_handle(),
-            paintable->rust_slot(),
+            Painting::committed_row_slot(layout_node),
             indent,
             interactive,
             &builder,
@@ -383,11 +381,9 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
     }
 
     if (Painting::is_inline_paintable(layout_node)) {
-        auto paintable = layout_node.paintable();
-        VERIFY(paintable);
         Layout::RustFFI::layout_arena_paintable_dump_inline_piece_fragments(
             layout_node.arena_handle(),
-            paintable->rust_slot(),
+            Painting::committed_row_slot(layout_node),
             indent,
             interactive,
             &builder,
@@ -493,14 +489,14 @@ void dump_sheet(StringBuilder& builder, CSS::StyleSheet const& sheet, int indent
         dump_rule(builder, rule, indent_levels + 1);
 }
 
-void dump_tree(Painting::Paintable const& paintable)
+void dump_paint_tree(Layout::Node const& layout_node)
 {
     StringBuilder builder;
-    dump_tree(builder, paintable, true);
+    dump_paint_tree(builder, layout_node, true);
     dbgln("{}", builder.string_view());
 }
 
-void dump_tree(StringBuilder& builder, Painting::Paintable const& paintable, bool colorize, int indent)
+void dump_paint_tree(StringBuilder& builder, Layout::Node const& root, bool colorize, int indent)
 {
     StringView paintable_with_lines_color_on = ""sv;
     StringView paintable_box_color_on = ""sv;
@@ -512,16 +508,16 @@ void dump_tree(StringBuilder& builder, Painting::Paintable const& paintable, boo
         color_off = "\033[0m"sv;
     }
 
-    auto entry_count = Layout::RustFFI::layout_arena_paint_tree_dump_entry_count(paintable.rust_arena().handle(), paintable.rust_slot());
+    auto slot = Painting::committed_row_slot(root);
+    auto entry_count = Layout::RustFFI::layout_arena_paint_tree_dump_entry_count(root.arena_handle(), slot);
     Vector<Layout::RustFFI::FfiPaintTreeDumpEntry> entries;
     entries.resize(entry_count);
-    Layout::RustFFI::layout_arena_export_paint_tree_dump_entries(paintable.rust_arena().handle(), paintable.rust_slot(), entries.data(), entries.size());
+    Layout::RustFFI::layout_arena_export_paint_tree_dump_entries(root.arena_handle(), slot, entries.data(), entries.size());
     for (auto const& entry : entries) {
         if (!entry.layout_node_shell)
             continue;
         auto& layout_node = *static_cast<Layout::Node*>(entry.layout_node_shell);
-        auto entry_paintable = layout_node.paintable();
-        if (!entry_paintable)
+        if (!Painting::has_committed_box(layout_node))
             continue;
 
         auto entry_indent = indent + static_cast<int>(entry.depth);
@@ -540,8 +536,8 @@ void dump_tree(StringBuilder& builder, Painting::Paintable const& paintable, boo
         if (Painting::has_scrollable_overflow(layout_node))
             builder.appendff(" overflow: {}", Painting::scrollable_overflow_rect(layout_node));
 
-        if (!entry_paintable->scroll_offset().is_zero())
-            builder.appendff(" scroll-offset: {}", entry_paintable->scroll_offset());
+        if (!Painting::scroll_offset(layout_node).is_zero())
+            builder.appendff(" scroll-offset: {}", Painting::scroll_offset(layout_node));
         builder.append("\n"sv);
     }
 }

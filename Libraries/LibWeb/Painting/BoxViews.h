@@ -6,7 +6,15 @@
 
 #pragma once
 
-#include <LibWeb/Painting/Paintable.h>
+#include <LibGfx/AffineTransform.h>
+#include <LibGfx/Forward.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/InvalidateDisplayList.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Painting/AccumulatedVisualContext.h>
+#include <LibWeb/Painting/BoxModelMetrics.h>
+#include <LibWeb/Painting/PaintableTypes.h>
+#include <LibWeb/Painting/ResolvedCSSFilter.h>
 
 namespace Web::Painting {
 
@@ -15,7 +23,23 @@ struct CaretPaint {
     Color color;
 };
 
+WEB_API void set_paint_viewport_scrollbars(bool enabled);
+bool should_paint_viewport_scrollbars();
+ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView, Layout::NodeWithStyle const&);
+
+// Walks layout ancestors so it also covers content of unconnected resource subtrees.
+WEB_API Layout::Node const* nearest_svg_viewport_of(Layout::Node const&);
+// The viewport's rect in its own user units: the active viewBox rect, else {0,0} + the used size.
+WEB_API Gfx::FloatRect svg_viewport_user_rect(Layout::Node const& viewport);
+
+bool body_background_is_propagated_to_root(Layout::NodeWithStyle const&);
+
+Layout::RustFFI::PaintableSlotId committed_row_slot(Layout::Node const&);
+Layout::RustFFI::PaintableSlotId viewport_row_slot(DOM::Document const&);
+Layout::RustFFI::PaintableData const* committed_row(Layout::Node const&);
+
 WEB_API bool has_committed_box(Layout::Node const&);
+WEB_API Layout::Node* layout_node_for_committed_slot(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
 
 WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
@@ -37,6 +61,9 @@ WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
 WEB_API Optional<OverflowData> overflow_data(Layout::Node const&);
 WEB_API Optional<CachedOverflowData> cached_overflow_data(Layout::Node const&);
+WEB_API Optional<CSSPixelRect> mask_area(Layout::Node const&);
+WEB_API Optional<Gfx::MaskKind> mask_type(Layout::Node const&);
+WEB_API Optional<CSSPixelRect> clip_area(Layout::Node const&);
 
 WEB_API bool is_visible(Layout::Node const&);
 WEB_API bool visible_for_hit_testing(Layout::Node const&);

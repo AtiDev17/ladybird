@@ -58,6 +58,7 @@ class BackingStore;
 class Canvas2DCommandStream;
 struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
+class ChromeWidgetRegistry;
 class CanvasSurfaceRegistry;
 class DisplayList;
 class DisplayListPlayerSkia;
@@ -1066,13 +1067,9 @@ class Notification;
 
 namespace Web::Painting {
 
-class AudioPaintable;
 class BoxViewRepaintAccess;
-class MediaPaintable;
-class Paintable;
-class PaintableWithLines;
+class DocumentPaintState;
 class ScrollStateSnapshot;
-class ViewportPaintable;
 
 enum class PaintPhase;
 struct LinearGradientData;

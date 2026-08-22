@@ -19,6 +19,7 @@
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/GridTrackPlacement.h>
 #include <LibWeb/CSS/GridTrackSize.h>
+#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
@@ -38,6 +39,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
 #include <LibWeb/SVG/SVGImageElement.h>
@@ -493,64 +495,42 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box)
     }
 }
 
+static bool content_size_change_affects_container_queries(NodeWithStyle const& layout_node, CSSPixelSize old_size, CSSPixelSize new_size)
+{
+    auto container_type = layout_node.container_type();
+    if (container_type.is_size_container)
+        return old_size != new_size;
+    if (!container_type.is_inline_size_container)
+        return false;
+    if (layout_node.writing_mode() == CSS::WritingMode::HorizontalTb)
+        return old_size.width() != new_size.width();
+    return old_size.height() != new_size.height();
+}
+
+static void invalidate_descendant_styles_for_container_query_size_change(GC::Ptr<DOM::Node> node, CSSPixelSize old_size, CSSPixelSize new_size)
+{
+    auto* element = as_if<DOM::Element>(node.ptr());
+    if (!element)
+        return;
+    auto const* layout_node = element->unsafe_layout_node();
+    if (!layout_node || !content_size_change_affects_container_queries(*layout_node, old_size, new_size))
+        return;
+    CSS::Invalidation::invalidate_descendant_styles_depending_on_size_container_query(*element);
+}
+
 RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
 {
     return {
         .context = this,
-        .finish_commit = [](void* context) {
-            auto& bridge = *static_cast<LayoutRustBridge*>(context);
-            for (auto& navigable_container_viewport : bridge.m_committed_navigable_container_viewports)
-                as<Box>(navigable_container_viewport->layout_node()).notify_content_navigable_of_committed_viewport();
-            bridge.m_committed_navigable_container_viewports.clear(); },
-        .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> RustFFI::FfiPreparedPaintable {
-            auto& bridge = *static_cast<LayoutRustBridge*>(context);
-            auto& node = *static_cast<Node*>(node_pointer);
-
-            RefPtr<Painting::Paintable> paintable;
-            bool reused = false;
-            if (has_used_values || (node.is_fragmented_inline() && node.dom_node())) {
-                // Inline boxes that never went through inline layout (so they have no used values) still
-                // need a paintable so DOM geometry queries have something to answer from.
-                paintable = node.paintable();
-                if (reuses_committed_subtree) {
-                    VERIFY(paintable);
-                } else if (paintable) {
-                    paintable->reset_for_relayout();
-                    reused = true;
-                } else {
-                    paintable = node.create_paintable();
-                }
-                node.set_paintable(paintable);
-                if (node.kind() == RustFFI::NodeKind::NavigableContainerViewport && paintable)
-                    bridge.m_committed_navigable_container_viewports.append(*paintable);
-            } else if (node.paintable_ptr()) {
-                // A paintable surviving from a previous layout on a node this pass did not lay out is
-                // stale; drop it so the layout tree only points into the paint tree built by this commit.
-                node.clear_paintable();
-            }
-            return RustFFI::FfiPreparedPaintable {
-                .paintable = paintable.ptr(),
-                .slot = paintable ? paintable->rust_slot() : RustFFI::PaintableSlotId { RustFFI::INVALID_PAINTABLE_SLOT_INDEX },
-                .reused = reused,
-            };
-        },
-        .content_size_changed = [](void*, void* paintable_pointer, RustFFI::FfiCssPixelSize old_size, RustFFI::FfiCssPixelSize new_size) {
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            Painting::invalidate_descendant_styles_for_container_query_size_change(
-                paintable.dom_node(),
+        .content_size_changed = [](void*, void* layout_node_shell, RustFFI::FfiCssPixelSize old_size, RustFFI::FfiCssPixelSize new_size) {
+            auto& layout_node = *static_cast<Node*>(layout_node_shell);
+            invalidate_descendant_styles_for_container_query_size_change(
+                layout_node.dom_node(),
                 { CSSPixels::from_raw(old_size.width), CSSPixels::from_raw(old_size.height) },
                 { CSSPixels::from_raw(new_size.width), CSSPixels::from_raw(new_size.height) }); },
-        .finish_node = [](void*, void* node_pointer, void* paintable_pointer) {
-            auto& node = *static_cast<Node*>(node_pointer);
-            auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
-            auto* dom_node = node.dom_node();
-            if (paintable) {
-                paintable->set_dom_node(dom_node);
-                if (dom_node)
-                    dom_node->set_paintable(paintable);
-            } else if (dom_node) {
-                dom_node->clear_paintable();
-            } },
+        .finish_commit = [](void*, void* const* viewport_shells, size_t viewport_count) {
+            for (size_t index = 0; index < viewport_count; ++index)
+                as<Box>(*static_cast<Node*>(viewport_shells[index])).notify_content_navigable_of_committed_viewport(); },
     };
 }
 

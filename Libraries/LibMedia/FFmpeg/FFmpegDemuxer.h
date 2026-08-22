@@ -13,6 +13,7 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/OwnPtr.h>
 #include <LibMedia/CodecID.h>
+#include <LibMedia/ContainerID.h>
 #include <LibMedia/Containers/ContainerNavigator.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerScanThread.h>
@@ -25,7 +26,10 @@ namespace Media::FFmpeg {
 
 class MEDIA_API FFmpegDemuxer : public Demuxer {
 public:
-    static DecoderErrorOr<NonnullRefPtr<FFmpegDemuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool should_attempt(NonnullRefPtr<MediaStream> const&);
+    static DecoderErrorOr<NonnullRefPtr<Demuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool supports_container_mime_type(ContainerMimeType);
+    static bool supports_codec_in_container(ContainerID, CodecID);
 
     virtual ~FFmpegDemuxer() override;
 
@@ -43,10 +47,6 @@ public:
 
     virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
     virtual void set_scan_state_change_handler(Function<void()>) override;
-
-    virtual DecoderErrorOr<CodecID> get_codec_id_for_track(Track const&) override;
-
-    virtual DecoderErrorOr<ReadonlyBytes> get_codec_initialization_data_for_track(Track const&) override;
 
     virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) override;
 
@@ -79,6 +79,7 @@ private:
         AVPacket* packet { nullptr };
         bool is_seekable { true };
         bool peeked_packet_already { false };
+        bool needs_codec_configuration { true };
         Optional<AK::Duration> pending_timestamp_offset;
         AK::Duration timestamp_offset;
     };

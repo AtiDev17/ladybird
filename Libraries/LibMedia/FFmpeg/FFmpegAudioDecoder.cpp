@@ -4,13 +4,35 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <LibCore/System.h>
 #include <LibMedia/AudioBlock.h>
+#include <LibMedia/CodedFrame.h>
 #include <LibMedia/FFmpeg/FFmpegHelpers.h>
 
 #include "FFmpegAudioDecoder.h"
 
 namespace Media::FFmpeg {
+
+static bool aac_audio_object_type_is_supported(ParsedCodec const& codec)
+{
+    auto parameters = codec.aac_parameters();
+    if (!parameters.has_value() || !parameters->audio_object_type.has_value())
+        return true;
+    // We can't ask FFmpeg which variants of AAC are supported, so we use a set here that is likely supported instead.
+    return first_is_one_of(*parameters->audio_object_type, 2u, 5u, 29u);
+}
+
+Optional<DecoderCapabilities> FFmpegAudioDecoder::capabilities(ParsedCodec const& codec)
+{
+    if (track_type_from_codec_id(codec.codec_id()) != TrackType::Audio)
+        return {};
+    if (codec.codec_id() == CodecID::AAC && !aac_audio_object_type_is_supported(codec))
+        return {};
+    if (!avcodec_find_decoder(ffmpeg_codec_id_from_media_codec_id(codec.codec_id())))
+        return {};
+    return DecoderCapabilities { .smooth = true, .power_efficient = false };
+}
 
 DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create(CodecID codec_id, Audio::SampleSpecification const& sample_specification, ReadonlyBytes codec_initialization_data)
 {
@@ -89,14 +111,20 @@ FFmpegAudioDecoder::~FFmpegAudioDecoder()
     avcodec_free_context(&m_codec_context);
 }
 
-DecoderErrorOr<void> FFmpegAudioDecoder::receive_coded_data(AK::Duration timestamp, ReadonlyBytes coded_data)
+DecoderErrorOr<void> FFmpegAudioDecoder::receive_coded_data(CodedFrame const& coded_frame)
 {
+    auto coded_data = coded_frame.data();
     VERIFY(coded_data.size() < NumericLimits<int>::max());
 
     m_packet->data = const_cast<u8*>(coded_data.data());
     m_packet->size = static_cast<int>(coded_data.size());
-    m_packet->pts = timestamp.to_microseconds();
-    m_packet->dts = m_packet->pts;
+    m_packet->pts = coded_frame.presentation_timestamp().to_microseconds();
+    m_packet->dts = coded_frame.decode_timestamp().to_microseconds();
+
+    ScopeGuard clear_packet_side_data { [&] { av_packet_free_side_data(m_packet); } };
+    auto new_codec_configuration = coded_frame.new_codec_configuration();
+    if (new_codec_configuration.has_value() && !new_codec_configuration->is_empty())
+        TRY(add_new_extradata_to_packet(*m_packet, *new_codec_configuration));
 
     auto result = avcodec_send_packet(m_codec_context, m_packet);
     switch (result) {

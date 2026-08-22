@@ -5,12 +5,15 @@
  */
 
 #include <AK/Checked.h>
+#include <AK/OwnPtr.h>
 #include <LibMedia/AudioBlock.h>
+#include <LibMedia/AudioDecoder.h>
+#include <LibMedia/CodedFrame.h>
 #include <LibMedia/DecodeAudioStream.h>
+#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
-#include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
-#include <LibMedia/PlaybackManager.h>
 #include <LibMedia/Track.h>
 
 namespace Media {
@@ -48,7 +51,7 @@ static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, Decode
 // changes mid-stream come out uniform.
 DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const& stream, Optional<u32> output_sample_rate)
 {
-    auto demuxer = TRY(PlaybackManager::create_demuxer_for_stream(stream));
+    auto demuxer = TRY(create_demuxer(stream));
     auto track = TRY(demuxer->get_preferred_track_for_type(TrackType::Audio));
     if (!track.has_value()) {
         // NB: Not all containers mark a default track; fall back to the first audio track in that case.
@@ -59,9 +62,7 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
     }
     TRY(demuxer->create_context_for_track(*track));
 
-    auto codec_id = TRY(demuxer->get_codec_id_for_track(*track));
-    auto codec_initialization_data = TRY(demuxer->get_codec_initialization_data_for_track(*track));
-    auto decoder = TRY(FFmpeg::FFmpegAudioDecoder::try_create(codec_id, track->audio_data().sample_specification, codec_initialization_data));
+    OwnPtr<AudioDecoder> decoder;
     auto converter = DECODER_TRY_ALLOC(FFmpeg::FFmpegAudioConverter::try_create());
 
     DecodedAudioData data;
@@ -108,10 +109,18 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
         if (sample_result.is_error()) {
             if (sample_result.error().category() != DecoderErrorCategory::EndOfStream)
                 return sample_result.release_error();
+            if (!decoder)
+                break;
             decoder->signal_end_of_stream();
         } else {
             auto sample = sample_result.release_value();
-            TRY(decoder->receive_coded_data(sample.timestamp(), sample.data()));
+            if (!decoder) {
+                auto codec_initialization_data = sample.new_codec_configuration();
+                if (!codec_initialization_data.has_value())
+                    return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Coded frame starting a decode sequence carries no codec configuration"sv);
+                decoder = TRY(create_audio_decoder(sample.codec_id(), track->audio_data().sample_specification, *codec_initialization_data));
+            }
+            TRY(decoder->receive_coded_data(sample));
         }
 
         while (true) {

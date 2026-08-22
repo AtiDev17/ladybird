@@ -2,24 +2,32 @@ include(audio)
 
 set(TEST_SOURCES
     TestAudioBlockTimingRing.cpp
-    TestCICP.cpp
     TestBufferedRanges.cpp
+    TestCICP.cpp
+    TestCodecConfigurations.cpp
+    TestCodecParameters.cpp
+    TestContainerID.cpp
     TestDecodedAudioProducer.cpp
+    TestDecodedVideoProducer.cpp
+    TestDecoderRegistry.cpp
+    TestDemuxerRegistry.cpp
     TestDisplayingVideoSink.cpp
     TestFFmpegAudioNormalization.cpp
     TestFFmpegDemuxer.cpp
     TestH264Decode.cpp
     TestIncrementallyPopulatedStream.cpp
+    TestISOBMFF.cpp
     TestMatroskaDemuxer.cpp
+    TestMediaSupport.cpp
+    TestMediaTime.cpp
     TestParseMatroska.cpp
     TestPipelineNodes.cpp
-    TestRemoteVideoNode.cpp
-    TestMediaTime.cpp
     TestPlaybackStream.cpp
+    TestRemoteVideoNode.cpp
+    TestTimeRanges.cpp
     TestVideoEdgeQueue.cpp
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp
-    TestTimeRanges.cpp
     TestVP9Decode.cpp
     TestWav.cpp
 )

@@ -78,9 +78,8 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DisplayListDamage.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintableTypes.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputTypes.h>
@@ -3721,13 +3720,13 @@ void LocalNavigable::clamp_viewport_scroll_offset()
     auto document = active_document();
     if (!document || !document->layout_is_up_to_date())
         return;
-    auto paintable_box = document->paintable_box();
-    if (!paintable_box)
+    auto* layout_node = document->layout_node();
+    if (!layout_node)
         return;
-    if (!Painting::scrollable_overflow_rect(paintable_box->layout_node()).has_value())
+    if (!Painting::scrollable_overflow_rect(*layout_node).has_value())
         return;
-    auto minimum_scroll_offset = paintable_box->minimum_scroll_offset();
-    auto maximum_scroll_offset = paintable_box->maximum_scroll_offset();
+    auto minimum_scroll_offset = Painting::minimum_scroll_offset(*layout_node);
+    auto maximum_scroll_offset = Painting::maximum_scroll_offset(*layout_node);
     CSSPixelPoint clamped = {
         clamp(m_viewport_scroll_offset.x(), minimum_scroll_offset.x(), maximum_scroll_offset.x()),
         clamp(m_viewport_scroll_offset.y(), minimum_scroll_offset.y(), maximum_scroll_offset.y()),
@@ -3918,18 +3917,18 @@ bool LocalNavigable::set_scroll_offset_for(Compositor::AsyncScrollNodeStableID s
         return false;
     document->update_layout(DOM::UpdateLayoutReason::ElementScroll);
     Optional<CSS::PseudoElement> pseudo_element = pseudo_element_from_async_scroll_node_stable_id(stable_node_id);
-    RefPtr<Painting::Paintable> paintable;
+    Layout::Node* layout_node = nullptr;
     if (pseudo_element.has_value()) {
         auto synthetic_pseudo_element = element->get_synthetic_pseudo_element(*pseudo_element);
         if (!synthetic_pseudo_element.has_value() || !synthetic_pseudo_element->layout_node())
             return false;
-        paintable = synthetic_pseudo_element->layout_node()->paintable();
+        layout_node = synthetic_pseudo_element->layout_node();
     } else {
-        paintable = element->paintable_box();
+        layout_node = element->layout_node();
     }
-    if (!paintable)
+    if (!layout_node)
         return false;
-    return paintable->set_scroll_offset(scroll_offset) == Painting::Paintable::ScrollHandled::Yes;
+    return Painting::set_scroll_offset(*layout_node, scroll_offset) == Painting::ScrollHandled::Yes;
 }
 
 static GC::Ptr<DOM::EventTarget> scroll_event_target_for_async_scroll_node(DOM::Document& document, Compositor::AsyncScrollNodeStableID stable_node_id)
@@ -4718,32 +4717,31 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
     Painting::DisplayListResourceSet display_list_resources;
     Painting::DisplayListResourceTransaction resource_transaction;
     Optional<Painting::AccumulatedVisualContextTree> visual_context_tree;
+    auto& document_paint_state = document->paint_state();
     if (should_record_display_list) {
         display_list = document->record_display_list(paint_config, m_display_list_resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
         if (!display_list)
             return false;
-        auto recorded_document_paintable = document->paintable();
-        VERIFY(recorded_document_paintable);
-        visual_context_tree = recorded_document_paintable->visual_context_tree();
-        if (recorded_document_paintable->display_list_used_as_paint_command_cache_source() == display_list.ptr()) {
-            display_list_resources.include(recorded_document_paintable->paint_command_cache_source_referenced_resources());
+        VERIFY(document->has_committed_viewport_box());
+        visual_context_tree = document_paint_state.visual_context_tree(*document);
+        if (document_paint_state.display_list_used_as_paint_command_cache_source() == display_list.ptr()) {
+            display_list_resources.include(document_paint_state.paint_command_cache_source_referenced_resources());
         } else {
             // A recording downgraded to cache-read-only leaves the retained source and the cached ranges
             // into it live, so the resources they reference must survive the pruning below.
             display_list_resources = m_display_list_resource_storage.collect_referenced_resources(*display_list);
-            recorded_document_paintable->append_paint_command_cache_source_resources(display_list_resources);
+            document_paint_state.append_paint_command_cache_source_resources(display_list_resources);
         }
         resource_transaction = m_display_list_resource_storage.create_transaction(
             m_compositor_display_list_resources,
             display_list_resources);
     }
 
-    auto document_paintable = document->paintable();
-    VERIFY(document_paintable);
-    auto visual_context_tree_needs_compositor_update = document_paintable->visual_context_tree_needs_compositor_update();
-    document_paintable->refresh_scroll_state();
+    VERIFY(document->has_committed_viewport_box());
+    auto visual_context_tree_needs_compositor_update = document_paint_state.visual_context_tree_needs_compositor_update();
+    document_paint_state.refresh_scroll_state(*document);
 
-    Painting::ScrollStateSnapshot scroll_state_snapshot { document_paintable->scroll_state_snapshot() };
+    Painting::ScrollStateSnapshot scroll_state_snapshot { document_paint_state.scroll_state_snapshot() };
     auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
     Gfx::IntRect surface_rect { {}, viewport_rect.size() };
     if (damage_rect)
@@ -4772,16 +4770,16 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
         m_compositor_scroll_state_snapshot = scroll_state_snapshot;
         m_compositor_display_list_visual_context_tree_version = display_list->compatible_visual_context_tree_version();
         compositor_context().update_display_list(*display_list, visual_context_tree.release_value(), move(resource_transaction), move(scroll_state_snapshot));
-        document_paintable->did_update_visual_context_tree_in_compositor();
+        document_paint_state.did_update_visual_context_tree_in_compositor();
         m_display_list_resource_storage.retain_only(display_list_resources);
         m_compositor_display_list_resources = move(display_list_resources);
         m_needs_to_record_display_list = false;
         m_compositor_display_list_paint_config = paint_config;
     } else {
         if (visual_context_tree_needs_compositor_update) {
-            VERIFY(document_paintable->visual_context_tree().version() == m_compositor_display_list_visual_context_tree_version);
-            compositor_context().update_visual_context_tree(document_paintable->visual_context_tree());
-            document_paintable->did_update_visual_context_tree_in_compositor();
+            VERIFY(document_paint_state.visual_context_tree(*document).version() == m_compositor_display_list_visual_context_tree_version);
+            compositor_context().update_visual_context_tree(document_paint_state.visual_context_tree(*document));
+            document_paint_state.did_update_visual_context_tree_in_compositor();
         }
         compositor_context().update_scroll_state(move(scroll_state_snapshot));
     }
@@ -5007,8 +5005,8 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_the_viewport(CSSPix
     // NB: Must update layout before accessing paintables.
     doc->update_layout(DOM::UpdateLayoutReason::NavigableViewportScroll);
 
-    auto minimum_scroll_offset = doc->paintable_box()->minimum_scroll_offset().to_type<double>();
-    auto maximum_scroll_offset = doc->paintable_box()->maximum_scroll_offset().to_type<double>();
+    auto minimum_scroll_offset = Painting::minimum_scroll_offset(*doc->layout_node()).to_type<double>();
+    auto maximum_scroll_offset = Painting::maximum_scroll_offset(*doc->layout_node()).to_type<double>();
     auto new_viewport_scroll_offset = m_viewport_scroll_offset.to_type<double>() + Gfx::Point(layout_dx, layout_dy);
     // NOTE: Clamp to the scrolling area.
     new_viewport_scroll_offset.set_x(clamp(new_viewport_scroll_offset.x(), minimum_scroll_offset.x(), maximum_scroll_offset.x()));

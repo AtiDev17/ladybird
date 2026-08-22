@@ -6,11 +6,21 @@
 
 #include <LibCore/System.h>
 #include <LibGfx/YUVData.h>
+#include <LibMedia/CodedFrame.h>
 
 #include "FFmpegHelpers.h"
 #include "FFmpegVideoDecoder.h"
 
 namespace Media::FFmpeg {
+
+Optional<DecoderCapabilities> FFmpegVideoDecoder::capabilities(ParsedCodec const& codec)
+{
+    if (track_type_from_codec_id(codec.codec_id()) != TrackType::Video)
+        return {};
+    if (!avcodec_find_decoder(ffmpeg_codec_id_from_media_codec_id(codec.codec_id())))
+        return {};
+    return DecoderCapabilities { .smooth = true, .power_efficient = false };
+}
 
 static AVPixelFormat negotiate_output_format(AVCodecContext*, AVPixelFormat const* formats)
 {
@@ -104,24 +114,25 @@ FFmpegVideoDecoder::~FFmpegVideoDecoder()
     avcodec_free_context(&m_codec_context);
 }
 
-DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data, Optional<AK::Duration> decode_timestamp)
+DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(CodedFrame const& coded_frame)
 {
+    auto coded_data = coded_frame.data();
     VERIFY(coded_data.size() < NumericLimits<int>::max());
 
     m_packet->data = const_cast<u8*>(coded_data.data());
     m_packet->size = static_cast<int>(coded_data.size());
-    m_packet->pts = timestamp.to_microseconds();
-    m_packet->dts = decode_timestamp.value_or(timestamp).to_microseconds();
-    m_packet->duration = duration.to_microseconds();
-    auto packet_pts = m_packet->pts;
+    m_packet->pts = coded_frame.presentation_timestamp().to_microseconds();
+    m_packet->dts = coded_frame.decode_timestamp().to_microseconds();
+    m_packet->duration = coded_frame.duration().to_microseconds();
+
+    ScopeGuard clear_packet_side_data { [&] { av_packet_free_side_data(m_packet); } };
+    auto new_codec_configuration = coded_frame.new_codec_configuration();
+    if (new_codec_configuration.has_value() && !new_codec_configuration->is_empty())
+        TRY(add_new_extradata_to_packet(*m_packet, *new_codec_configuration));
 
     auto result = avcodec_send_packet(m_codec_context, m_packet);
     switch (result) {
     case 0:
-        // Some FFmpeg decoders do not propagate packet duration to decoded frames, so
-        // remember the accepted packet duration by PTS and consume it on output.
-        if (!duration.is_zero())
-            m_frame_durations.set(packet_pts, duration);
         return {};
     case AVERROR(EAGAIN):
         return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "FFmpeg decoder cannot decode any more data until frames have been retrieved"sv);
@@ -155,14 +166,6 @@ DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIn
         switch (result) {
         case 0:
             m_has_pending_frame = true;
-            // Some FFmpeg decoders do not propagate packet duration to decoded frames, so fill the
-            // frame's duration from the map once here, keeping repeated peeks of this frame stable.
-            if (m_frame->duration == 0) {
-                if (auto packet_duration = m_frame_durations.take(m_frame->pts); packet_duration.has_value())
-                    m_frame->duration = packet_duration->to_microseconds();
-            } else {
-                m_frame_durations.remove(m_frame->pts);
-            }
             break;
         case AVERROR(EAGAIN):
             return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "FFmpeg decoder has no frames available, send more input"sv);
@@ -219,17 +222,17 @@ DecoderErrorOr<VideoFrameMetadata> FFmpegVideoDecoder::peek_next_output(CodingIn
         case AV_PIX_FMT_YUV420P10:
         case AV_PIX_FMT_YUV420P12:
         case AV_PIX_FMT_YUVJ420P:
-            return { true, true };
+            return Subsampling::yuv420();
         case AV_PIX_FMT_YUV422P:
         case AV_PIX_FMT_YUV422P10:
         case AV_PIX_FMT_YUV422P12:
         case AV_PIX_FMT_YUVJ422P:
-            return { true, false };
+            return Subsampling::yuv422();
         case AV_PIX_FMT_YUV444P:
         case AV_PIX_FMT_YUV444P10:
         case AV_PIX_FMT_YUV444P12:
         case AV_PIX_FMT_YUVJ444P:
-            return { false, false };
+            return Subsampling::yuv444();
         default:
             VERIFY_NOT_REACHED();
         }
@@ -286,7 +289,6 @@ DecoderErrorOr<void> FFmpegVideoDecoder::take_next_output_into(Gfx::YUVData& yuv
 
 void FFmpegVideoDecoder::flush()
 {
-    m_frame_durations.clear();
     avcodec_flush_buffers(m_codec_context);
     m_has_pending_frame = false;
 }

@@ -286,7 +286,13 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
 
     while (!segment_contents_end.has_value() || streamer.position() < segment_contents_end.value()) {
         auto found_element_position = streamer.position();
-        auto found_element_id = TRY(streamer.read_element_id());
+        auto found_element_id_or_error = streamer.read_element_id();
+        if (found_element_id_or_error.is_error()) {
+            if (found_element_id_or_error.error().category() != DecoderErrorCategory::EndOfStream)
+                return found_element_id_or_error.release_error();
+            break;
+        }
+        auto found_element_id = found_element_id_or_error.release_value();
         dbgln_if(MATROSKA_TRACE_DEBUG, "Found element ID {:#010x} with position {}.", found_element_id, found_element_position);
 
         if (found_element_id == SEEK_HEAD_ELEMENT_ID) {
@@ -310,9 +316,7 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
             return position;
         }
 
-        TRY(streamer.read_unknown_element());
-
-        m_last_top_level_element_position = streamer.position();
+        auto found_element_size = TRY(streamer.read_element_size());
 
         DECODER_TRY_ALLOC(m_seek_entries.try_set(found_element_id, found_element_position, AK::HashSetExistingEntryBehavior::Keep));
 
@@ -320,6 +324,15 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
             position = found_element_position;
             break;
         }
+
+        if (!found_element_size.has_value())
+            break;
+
+        if (!segment_contents_end.has_value() && found_element_id == CLUSTER_ELEMENT_ID)
+            break;
+
+        TRY(streamer.seek_to_position(AK::saturating_add(streamer.position(), found_element_size.value())));
+        m_last_top_level_element_position = streamer.position();
 
         dbgln_if(MATROSKA_TRACE_DEBUG, "Skipped to position {}.", m_last_top_level_element_position);
     }
@@ -500,7 +513,7 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
             break;
         case TRACK_CODEC_PRIVATE_ID: {
             auto codec_private_data = TRY(streamer.read_raw_octets(TRY(streamer.read_variable_size_integer())));
-            DECODER_TRY_ALLOC(track_entry->set_codec_private_data(codec_private_data));
+            track_entry->set_codec_private_data(move(codec_private_data));
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Track's CodecPrivateData element");
             break;
         }
@@ -540,7 +553,7 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
     if (track_entry->track_type() == TrackEntry::TrackType::Complex) {
         // A mix of different other TrackType. The codec needs to define how the Matroska Player
         // should interpret such data.
-        auto codec_track_type = track_type_from_codec_id(codec_id_from_matroska_id_string(track_entry->codec_id()));
+        auto codec_track_type = track_type_from_codec_id(codec_id_from_matroska_track_entry(*track_entry));
         switch (codec_track_type) {
         case TrackType::Video:
             track_entry->set_track_type(TrackEntry::TrackType::Video);
@@ -637,7 +650,7 @@ void Reader::fix_ffmpeg_webm_quirk()
         for (auto& [id, track] : m_tracks) {
             auto delay = track->codec_delay();
 
-            if (codec_id_from_matroska_id_string(track->codec_id()) == CodecID::Opus && track->audio_track().has_value()) {
+            if (codec_id_from_matroska_track_entry(track) == CodecID::Opus && track->audio_track().has_value()) {
                 auto sampling_frequency = AK::clamp_to<u64>(track->audio_track()->sampling_frequency);
                 if (sampling_frequency == 0)
                     return;
@@ -743,7 +756,7 @@ static AK::Duration block_timestamp_to_duration(AK::Duration cluster_timestamp, 
     timestamp_offset_in_cluster_offset = saturating_sub(timestamp_offset_in_cluster_offset, AK::clamp_to<i64>(context.codec_delay));
     // This is only mentioned in the elements specification under TrackOffset.
     // https://www.matroska.org/technical/elements.html
-    timestamp_offset_in_cluster_offset = saturating_add(timestamp_offset_in_cluster_offset, AK::clamp_to<i64>(context.timestamp_offset));
+    timestamp_offset_in_cluster_offset = saturating_add(timestamp_offset_in_cluster_offset, context.timestamp_offset);
     return cluster_timestamp + AK::Duration::from_nanoseconds(timestamp_offset_in_cluster_offset);
 }
 
@@ -757,7 +770,7 @@ static DecoderErrorOr<void> maybe_parse_opus_frame_duration(Streamer& streamer, 
 {
     if (block.lacing() != Block::Lacing::None)
         return {};
-    if (codec_id_from_matroska_id_string(context.codec_id) != CodecID::Opus)
+    if (context.codec_id != CodecID::Opus)
         return {};
 
     block.set_duration(TRY(Codecs::Opus::parse_frame_duration(streamer.cursor(), block.data_size())));

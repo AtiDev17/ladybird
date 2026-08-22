@@ -27,6 +27,14 @@ pub struct FfiVisualContextTreeInputs {
     pub may_have_default_scroll_shift_anchor: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiResolvedEffectsFilter {
+    pub gfx_filter: *mut c_void,
+    pub has_svg_filter_bounds: bool,
+    pub svg_filter_bounds: crate::layout::FfiCssPixelRect,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiVisualContextHostCallbacks {
@@ -38,7 +46,7 @@ pub struct FfiVisualContextHostCallbacks {
     pub svg_additional_element_transform: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut f32) -> bool,
     pub root_background_source: unsafe extern "C" fn(*mut c_void) -> FfiRootBackgroundSource,
     pub svg_mask_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgMaskFacts,
-    pub resolve_effects_filter: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+    pub resolve_effects_filter: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiResolvedEffectsFilter,
     pub default_scroll_shift_anchor:
         unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::node_data::NodeSlotId,
 }
@@ -48,45 +56,45 @@ impl FfiVisualContextHostCallbacks {
         // SAFETY: The C++ host answers synchronously.
         unsafe { (self.tree_inputs)(self.context) }
     }
-    pub(crate) fn scroll_offset(&self, paintable_shell: *mut c_void) -> crate::layout::FfiCssPixelPoint {
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.scroll_offset)(self.context, paintable_shell) }
+    pub(crate) fn scroll_offset(&self, layout_node_shell: *mut c_void) -> crate::layout::FfiCssPixelPoint {
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.scroll_offset)(self.context, layout_node_shell) }
     }
     pub(crate) fn svg_transform_view_box_rect(
         &self,
-        paintable_shell: *mut c_void,
+        layout_node_shell: *mut c_void,
     ) -> Option<crate::layout::FfiCssPixelRect> {
         let mut rect = crate::layout::FfiCssPixelRect::default();
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.svg_transform_view_box_rect)(self.context, paintable_shell, &raw mut rect) }.then_some(rect)
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.svg_transform_view_box_rect)(self.context, layout_node_shell, &raw mut rect) }.then_some(rect)
     }
     pub(crate) fn svg_additional_element_transform(
         &self,
-        paintable_shell: *mut c_void,
+        layout_node_shell: *mut c_void,
     ) -> Option<libgfx_rust::AffineTransform> {
         let mut values = [0.0f32; 6];
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.svg_additional_element_transform)(self.context, paintable_shell, values.as_mut_ptr()) }
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.svg_additional_element_transform)(self.context, layout_node_shell, values.as_mut_ptr()) }
             .then_some(libgfx_rust::AffineTransform { values })
     }
     pub(crate) fn root_background_source(&self) -> FfiRootBackgroundSource {
         // SAFETY: The C++ host answers synchronously.
         unsafe { (self.root_background_source)(self.context) }
     }
-    pub(crate) fn svg_mask_facts(&self, paintable_shell: *mut c_void) -> FfiSvgMaskFacts {
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.svg_mask_facts)(self.context, paintable_shell) }
+    pub(crate) fn svg_mask_facts(&self, layout_node_shell: *mut c_void) -> FfiSvgMaskFacts {
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.svg_mask_facts)(self.context, layout_node_shell) }
     }
-    pub(crate) fn resolve_effects_filter(&self, paintable_shell: *mut c_void) -> *mut c_void {
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.resolve_effects_filter)(self.context, paintable_shell) }
+    pub(crate) fn resolve_effects_filter(&self, layout_node_shell: *mut c_void) -> FfiResolvedEffectsFilter {
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.resolve_effects_filter)(self.context, layout_node_shell) }
     }
     pub(crate) fn default_scroll_shift_anchor(
         &self,
-        paintable_shell: *mut c_void,
+        layout_node_shell: *mut c_void,
     ) -> crate::layout::node_data::NodeSlotId {
-        // SAFETY: The C++ host answers synchronously from a live paintable shell.
-        unsafe { (self.default_scroll_shift_anchor)(self.context, paintable_shell) }
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.default_scroll_shift_anchor)(self.context, layout_node_shell) }
     }
 }
 

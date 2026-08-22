@@ -5,10 +5,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
+#include <AK/Array.h>
+#include <AK/GenericShorthands.h>
 #include <AK/Math.h>
 #include <AK/MemoryStream.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/QuickSort.h>
 #include <AK/Stream.h>
+#include <AK/StringBuilder.h>
 #include <AK/Time.h>
 #include <LibMedia/Containers/ConstantBitrateContainerNavigator.h>
 #include <LibMedia/Containers/FLACNavigator.h>
@@ -25,6 +30,90 @@ extern "C" {
 }
 
 namespace Media::FFmpeg {
+
+bool FFmpegDemuxer::supports_container_mime_type(ContainerMimeType mime_type)
+{
+    switch (mime_type.container_id) {
+    case ContainerID::Ogg:
+        return true;
+    case ContainerID::ISOBMFF:
+        return mime_type.media_type != ContainerMediaType::Application;
+    case ContainerID::MPEGAudio:
+    case ContainerID::ADTS:
+    case ContainerID::FLAC:
+    case ContainerID::WAV:
+        return mime_type.media_type == ContainerMediaType::Audio;
+    case ContainerID::Matroska:
+    case ContainerID::WebM:
+        return false;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+bool FFmpegDemuxer::supports_codec_in_container(ContainerID container_id, CodecID codec_id)
+{
+    switch (container_id) {
+    case ContainerID::ISOBMFF:
+        return first_is_one_of(codec_id, CodecID::VP8, CodecID::VP9, CodecID::H264, CodecID::H265, CodecID::MP3, CodecID::AAC, CodecID::AV1, CodecID::Opus, CodecID::FLAC);
+    case ContainerID::Ogg:
+        return first_is_one_of(codec_id, CodecID::Theora, CodecID::Vorbis, CodecID::Opus, CodecID::FLAC);
+    case ContainerID::MPEGAudio:
+        return codec_id == CodecID::MP3;
+    case ContainerID::ADTS:
+        return codec_id == CodecID::AAC;
+    case ContainerID::FLAC:
+        return codec_id == CodecID::FLAC;
+    case ContainerID::WAV:
+        return first_is_one_of(codec_id, CodecID::U8, CodecID::S16LE, CodecID::S24LE, CodecID::S32LE, CodecID::F32LE, CodecID::ALaw, CodecID::MuLaw);
+    case ContainerID::Matroska:
+    case ContainerID::WebM:
+        return false;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static ByteString create_codec_whitelist()
+{
+    static constexpr Array codec_ids {
+        CodecID::VP8,
+        CodecID::VP9,
+        CodecID::H264,
+        CodecID::H265,
+        CodecID::MP3,
+        CodecID::AAC,
+        CodecID::AV1,
+        CodecID::Theora,
+        CodecID::Vorbis,
+        CodecID::Opus,
+        CodecID::FLAC,
+        CodecID::U8,
+        CodecID::S16LE,
+        CodecID::S24LE,
+        CodecID::S32LE,
+        CodecID::F32LE,
+        CodecID::ALaw,
+        CodecID::MuLaw,
+    };
+
+    StringBuilder whitelist;
+    void* iterator = nullptr;
+    while (auto const* decoder = av_codec_iterate(&iterator)) {
+        if (!av_codec_is_decoder(decoder))
+            continue;
+        if (!any_of(codec_ids, [&](auto codec_id) { return decoder->id == ffmpeg_codec_id_from_media_codec_id(codec_id); }))
+            continue;
+        if (!whitelist.is_empty())
+            whitelist.append(',');
+        whitelist.append(StringView(decoder->name, strlen(decoder->name)));
+    }
+    return MUST(whitelist.to_string()).to_byte_string();
+}
+
+static ByteString const& codec_whitelist()
+{
+    static NeverDestroyed<ByteString> whitelist { create_codec_whitelist() };
+    return *whitelist;
+}
 
 FFmpegDemuxer::FFmpegDemuxer(NonnullRefPtr<MediaStream> const& stream)
     : m_stream(stream)
@@ -48,10 +137,22 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
     if (format_context == nullptr)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate format context"sv);
     format_context->pb = &io_context;
+    format_context->flags |= AVFMT_FLAG_CUSTOM_IO;
     format_context->flags |= AVFMT_FLAG_FAST_SEEK;
+
+    ArmedScopeGuard close_input = [&] {
+        avformat_close_input(&format_context);
+    };
 
     AVDictionary* options = nullptr;
     ScopeGuard free_options = [&] { av_dict_free(&options); };
+
+    if (av_dict_set(&options, "format_whitelist", "flac,mov,mp3,ogg,wav", 0) < 0)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg format whitelist"sv);
+
+    auto const& codecs = codec_whitelist();
+    if (av_dict_set(&options, "codec_whitelist", codecs.characters(), 0) < 0)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg codec whitelist"sv);
 
     // Reduce the maximum packet size for the WAV demuxer, so that playback begins sooner.
     av_dict_set(&options, "max_size", "4096", 0);
@@ -64,6 +165,7 @@ static DecoderErrorOr<void> initialize_format_context(AVFormatContext*& format_c
     if (avformat_find_stream_info(format_context, nullptr) < 0)
         return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Failed to find stream info"sv);
 
+    close_input.disarm();
     return {};
 }
 
@@ -138,12 +240,21 @@ static DecoderErrorOr<Track> create_track_from_stream(AVStream const& stream, St
     return track;
 }
 
-DecoderErrorOr<NonnullRefPtr<FFmpegDemuxer>> FFmpegDemuxer::from_stream(NonnullRefPtr<MediaStream> const& stream)
+bool FFmpegDemuxer::should_attempt(NonnullRefPtr<MediaStream> const&)
+{
+    // FIXME: Sniff the stream so that a format we cannot demux is rejected before a demuxer is created.
+    return true;
+}
+
+DecoderErrorOr<NonnullRefPtr<Demuxer>> FFmpegDemuxer::from_stream(NonnullRefPtr<MediaStream> const& stream)
 {
     auto io_context = DECODER_TRY_ALLOC(Media::FFmpeg::FFmpegIOContext::create(stream->create_cursor()));
 
     AVFormatContext* format_context = nullptr;
     TRY(initialize_format_context(format_context, *io_context->avio_context()));
+    ScopeGuard close_input = [&] {
+        avformat_close_input(&format_context);
+    };
 
     auto demuxer = DECODER_TRY_ALLOC(adopt_nonnull_ref_or_enomem(new (nothrow) FFmpegDemuxer(stream)));
     demuxer->m_total_duration = AK::Duration::from_time_units(format_context->duration, 1, AV_TIME_BASE);
@@ -191,7 +302,6 @@ DecoderErrorOr<NonnullRefPtr<FFmpegDemuxer>> FFmpegDemuxer::from_stream(NonnullR
 
     demuxer->start_buffered_scan_thread(*format_context);
 
-    avformat_close_input(&format_context);
     return demuxer;
 }
 
@@ -446,7 +556,7 @@ AK::Duration FFmpegDemuxer::select_fast_seek_target_for_track(Track const&, AK::
     return target;
 }
 
-DecoderErrorOr<DemuxerSeekResult> FFmpegDemuxer::seek_to_most_recent_keyframe(Track const& track, AK::Duration timestamp, DemuxerSeekOptions)
+DecoderErrorOr<DemuxerSeekResult> FFmpegDemuxer::seek_to_most_recent_keyframe(Track const& track, AK::Duration timestamp, DemuxerSeekOptions options)
 {
     auto& track_context = get_track_context(track);
     auto& format_context = *track_context.format_context;
@@ -494,19 +604,9 @@ DecoderErrorOr<DemuxerSeekResult> FFmpegDemuxer::seek_to_most_recent_keyframe(Tr
         }
     }
 
+    if (has_flag(options, DemuxerSeekOptions::NeedCodecConfiguration))
+        track_context.needs_codec_configuration = true;
     return DemuxerSeekResult::MovedPosition;
-}
-
-DecoderErrorOr<CodecID> FFmpegDemuxer::get_codec_id_for_track(Track const& track)
-{
-    auto const& track_info = get_track_info(track);
-    return track_info.codec_id;
-}
-
-DecoderErrorOr<ReadonlyBytes> FFmpegDemuxer::get_codec_initialization_data_for_track(Track const& track)
-{
-    auto const& track_info = get_track_info(track);
-    return track_info.codec_initialization_data.bytes();
 }
 
 DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track const& track)
@@ -533,20 +633,16 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track const&
             av_packet_unref(&packet);
             continue;
         }
+        ScopeGuard clear_packet { [&] { av_packet_unref(&packet); } };
 
-        auto auxiliary_data = [&]() -> CodedFrame::AuxiliaryData {
-            if (track.type() == TrackType::Video) {
-                return CodedVideoFrameData();
-            }
-            if (track.type() == TrackType::Audio) {
-                return CodedAudioFrameData();
-            }
-            VERIFY_NOT_REACHED();
-        }();
-
-        // Copy the packet data so that we have a permanent reference to it whilst the Sample is alive, which allows us
-        // to wipe the packet afterwards.
-        auto packet_data = DECODER_TRY_ALLOC(ByteBuffer::copy(packet.data, packet.size));
+        auto packet_data = DECODER_TRY_ALLOC(FixedArray<u8>::create(ReadonlyBytes { packet.data, static_cast<size_t>(packet.size) }));
+        Optional<FixedArray<u8>> new_codec_configuration;
+        size_t new_extradata_size = 0;
+        if (auto* new_extradata = av_packet_get_side_data(&packet, AV_PKT_DATA_NEW_EXTRADATA, &new_extradata_size); new_extradata && new_extradata_size > 0)
+            new_codec_configuration = DECODER_TRY_ALLOC(FixedArray<u8>::create(ReadonlyBytes { new_extradata, new_extradata_size }));
+        if (!new_codec_configuration.has_value() && track_context.needs_codec_configuration)
+            new_codec_configuration = DECODER_TRY_ALLOC(FixedArray<u8>::create(get_track_info(track).codec_initialization_data.bytes()));
+        track_context.needs_codec_configuration = false;
 
         if (track_context.pending_timestamp_offset.has_value() && packet.pts == 0)
             track_context.timestamp_offset = track_context.pending_timestamp_offset.release_value();
@@ -558,15 +654,22 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track const&
         if (duration.is_zero() && track.type() == TrackType::Video)
             duration = frame_duration_from_frame_rate(av_guess_frame_rate(&format_context, &stream, nullptr));
 
+        auto presentation_timestamp = track_context.timestamp_offset + time_units_to_duration(packet.pts, stream.time_base);
+        auto decode_timestamp = presentation_timestamp;
+        if (packet.dts != AV_NOPTS_VALUE)
+            decode_timestamp = track_context.timestamp_offset + time_units_to_duration(packet.dts, stream.time_base);
+
+        auto const& track_info = get_track_info(track);
+
         auto sample = CodedFrame(
-            track_context.timestamp_offset + time_units_to_duration(packet.pts, stream.time_base),
+            track_info.codec_id,
+            presentation_timestamp,
+            decode_timestamp,
             duration,
             flags,
             move(packet_data),
-            auxiliary_data);
+            move(new_codec_configuration));
 
-        // Wipe the packet now that the data is safe.
-        av_packet_unref(&packet);
         return sample;
     }
 }

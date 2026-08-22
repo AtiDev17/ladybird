@@ -13,7 +13,9 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
+#include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 
 namespace Web::CSS {
 
@@ -227,8 +229,8 @@ void VisualViewport::reset()
 
 void VisualViewport::update_accumulated_visual_context()
 {
-    if (auto paintable = m_document->unsafe_paintable(); paintable && paintable->has_visual_context_tree()) {
-        paintable->update_visual_viewport_accumulated_visual_context();
+    if (m_document->has_committed_viewport_box() && m_document->paint_state().has_visual_context_tree()) {
+        m_document->paint_state().update_visual_viewport_accumulated_visual_context(*m_document);
         return;
     }
 

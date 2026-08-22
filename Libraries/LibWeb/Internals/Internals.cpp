@@ -48,6 +48,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NodeList.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOMURL/DOMURL.h>
@@ -85,9 +86,8 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/HitTestResult.h>
-#include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -128,20 +128,18 @@ void Internals::set_test_timeout(double milliseconds)
 void Internals::force_incompatible_visual_context_tree_rebuild()
 {
     auto& document = window().associated_document();
-    auto paintable = document.paintable();
-    if (!paintable)
+    if (!document.has_committed_viewport_box())
         return;
-    paintable->set_force_incompatible_visual_context_tree_rebuild_for_testing();
+    document.paint_state().set_force_incompatible_visual_context_tree_rebuild_for_testing();
     document.set_needs_accumulated_visual_contexts_update(true);
 }
 
 u64 Internals::visual_context_tree_node_count()
 {
     auto& document = window().associated_document();
-    auto paintable = document.paintable();
-    if (!paintable || !paintable->has_visual_context_tree())
+    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
         return 0;
-    return paintable->visual_context_tree().nodes().size();
+    return document.paint_state().visual_context_tree(document).nodes().size();
 }
 
 void Internals::send_mismatched_visual_context_tree_update_to_compositor()
@@ -150,19 +148,19 @@ void Internals::send_mismatched_visual_context_tree_update_to_compositor()
     auto navigable = document.navigable();
     if (!navigable || !navigable->has_compositor_context())
         return;
-    auto paintable = document.paintable();
-    if (!paintable || !paintable->has_visual_context_tree())
+    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
         return;
+    auto& document_paint_state = document.paint_state();
 
     // Force a fresh, incompatible rebuild — so the tree is minted with a new version that the Compositor's installed
     // display list was never recorded against.
-    paintable->set_force_incompatible_visual_context_tree_rebuild_for_testing();
+    document_paint_state.set_force_incompatible_visual_context_tree_rebuild_for_testing();
     document.set_needs_accumulated_visual_contexts_update(true);
     document.update_paint_and_hit_testing_properties_if_needed();
 
     // Send a bare visual-context-tree update carrying that new version *without* re-recording the display list —
     // deliberately reproducing the peer inconsistency behind issue #10368.
-    navigable->compositor_context().update_visual_context_tree(paintable->visual_context_tree());
+    navigable->compositor_context().update_visual_context_tree(document_paint_state.visual_context_tree(document));
 }
 
 // https://web-platform-tests.org/writing-tests/reftests.html#components-of-a-reftest
@@ -293,6 +291,11 @@ bool Internals::has_activity_root(JS::Object& object)
 WebIDL::UnsignedLongLong Internals::message_port_pending_outgoing_message_count(HTML::MessagePort& port)
 {
     return port.pending_outgoing_message_count();
+}
+
+WebIDL::UnsignedLongLong Internals::html_collection_cache_generation(DOM::HTMLCollection& collection)
+{
+    return collection.cache_generation_for_testing();
 }
 
 void Internals::fail_next_message_port_transfer(HTML::MessagePort& port)
@@ -687,10 +690,10 @@ WebIDL::UnsignedLongLong Internals::layout_run_cache_hit_count()
 
 WebIDL::UnsignedLongLong Internals::accumulated_visual_context_tree_build_count()
 {
-    auto paintable = window().associated_document().unsafe_paintable();
-    if (!paintable)
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box())
         return 0;
-    return paintable->accumulated_visual_context_tree_build_count();
+    return document.paint_state().accumulated_visual_context_tree_build_count();
 }
 
 void Internals::set_autoplay_policy(Utf16String const& policy)
@@ -822,12 +825,12 @@ Utf16String Internals::dump_paintable_tree(GC::Ref<DOM::Node> node)
 {
     node->document().update_layout(DOM::UpdateLayoutReason::Debugging);
 
-    auto paintable = node->paintable();
-    if (!paintable)
+    auto* layout_node = node->layout_node();
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
         return "(no paintable)"_utf16;
 
     StringBuilder builder;
-    Web::dump_tree(builder, *paintable);
+    Web::dump_paint_tree(builder, *layout_node);
     return dump_string_to_utf16(builder.to_string_without_validation());
 }
 
@@ -1499,15 +1502,14 @@ struct AsyncScrollingStateSnapshot {
     Compositor::AsyncScrollingState state;
     RefPtr<Painting::DisplayList const> display_list;
     Painting::AccumulatedVisualContextTree visual_context_tree;
-    RefPtr<Painting::ViewportPaintable> document_paintable;
+    GC::Root<DOM::Document> document;
 };
 
 static Optional<AsyncScrollingStateSnapshot> capture_async_scrolling_state(DOM::Document& document)
 {
     document.update_layout(DOM::UpdateLayoutReason::InternalsHitTest);
     auto navigable = document.navigable();
-    auto document_paintable = document.paintable();
-    if (!navigable || !document_paintable)
+    if (!navigable || !document.has_committed_viewport_box())
         return {};
     auto display_list = document.record_display_list(HTML::PaintConfig {}, navigable->display_list_resource_storage(), Painting::PaintCommandCacheMode::ReadWrite);
     if (!display_list)
@@ -1515,8 +1517,8 @@ static Optional<AsyncScrollingStateSnapshot> capture_async_scrolling_state(DOM::
     return AsyncScrollingStateSnapshot {
         .state = Compositor::async_scrolling_state_from_display_list(*display_list),
         .display_list = display_list,
-        .visual_context_tree = document_paintable->visual_context_tree(),
-        .document_paintable = document_paintable,
+        .visual_context_tree = document.paint_state().visual_context_tree(document),
+        .document = GC::make_root(document),
     };
 }
 
@@ -1533,7 +1535,7 @@ bool Internals::async_scrolling_state_blocks_wheel_event_at(double x, double y)
     auto snapshot = capture_async_scrolling_state(window().associated_document());
     if (!snapshot.has_value())
         return false;
-    return Compositor::blocks_wheel_event_at_position(snapshot->state, snapshot->display_list, &snapshot->visual_context_tree, snapshot->document_paintable->scroll_state_snapshot(), { static_cast<float>(x), static_cast<float>(y) });
+    return Compositor::blocks_wheel_event_at_position(snapshot->state, snapshot->display_list, &snapshot->visual_context_tree, snapshot->document->scroll_state_snapshot(), { static_cast<float>(x), static_cast<float>(y) });
 }
 
 Utf16String Internals::async_scrolling_state_wheel_routing_admission()
@@ -1552,7 +1554,7 @@ static Compositor::WheelScrollAdmission wheel_scroll_admission_at(DOM::Document&
         snapshot->state,
         snapshot->display_list,
         &snapshot->visual_context_tree,
-        snapshot->document_paintable->scroll_state_snapshot(),
+        snapshot->document->scroll_state_snapshot(),
         { static_cast<float>(x), static_cast<float>(y) },
         { static_cast<float>(delta_x), static_cast<float>(delta_y) },
         snapshot->state.has_blocking_wheel_event_listeners && !force_stale_wheel_event_regions);
@@ -1594,7 +1596,7 @@ Utf16String Internals::async_scrolling_state_wheel_target_at(double x, double y,
 
     Compositor::AsyncScrollTree scroll_tree;
     scroll_tree.set_state(move(snapshot->state));
-    scroll_tree.rebuild_wheel_hit_test_targets(snapshot->display_list, &snapshot->visual_context_tree, snapshot->document_paintable->scroll_state_snapshot());
+    scroll_tree.rebuild_wheel_hit_test_targets(snapshot->display_list, &snapshot->visual_context_tree, snapshot->document->scroll_state_snapshot());
 
     auto target = scroll_tree.hit_test_scroll_node_for_wheel(
         { static_cast<float>(x), static_cast<float>(y) },

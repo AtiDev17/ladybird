@@ -5,6 +5,7 @@
  */
 
 #include <AK/Math.h>
+#include <AK/ScopeGuard.h>
 #include <LibMedia/Containers/Matroska/ElementIDs.h>
 #include <LibMedia/Containers/Matroska/Reader.h>
 #include <LibMedia/MediaStream.h>
@@ -17,40 +18,43 @@ using namespace Media::Matroska;
 WebMByteStreamParser::WebMByteStreamParser() = default;
 WebMByteStreamParser::~WebMByteStreamParser() = default;
 
+bool WebMByteStreamParser::supports_codec(StringView, Media::CodecID codec_id)
+{
+    return Media::Matroska::supports_codec_in_container(Media::ContainerID::WebM, codec_id);
+}
+
 Media::DecoderErrorOr<void> WebMByteStreamParser::skip_ignored_bytes(Media::MediaStreamCursor& cursor)
 {
+    // AD-HOC: The cursor sits within a partly read Cluster, not at an element that could be skipped.
+    if (m_current_media_segment_data.has_value())
+        return {};
+
     Streamer streamer { cursor };
 
-    if (!m_segment_information.has_value() || !m_cluster_has_been_read) {
-        // https://w3c.github.io/mse-byte-stream-format-webm/#webm-init-segments
-        // The user agent MUST accept and ignore any elements other than an EBML Header or a Cluster that occur before,
-        // in between, or after the Segment Information and Track elements.
-        while (true) {
-            auto position_before = cursor.position();
-            auto element_id = TRY(streamer.read_element_id());
+    while (true) {
+        ArmedScopeGuard restore_position = [&cursor, position_before = cursor.position()] {
+            MUST(cursor.seek(position_before, SeekMode::SetPosition));
+        };
 
-            if (element_id == EBML_MASTER_ELEMENT_ID
-                || element_id == CLUSTER_ELEMENT_ID) {
-                TRY(cursor.seek(position_before, SeekMode::SetPosition));
-                break;
-            }
+        auto element_id = TRY(streamer.read_element_id());
 
-            TRY(streamer.read_unknown_element());
-        }
-    } else if (m_cluster_has_been_read && !m_current_media_segment_data.has_value()) {
-        // https://www.w3.org/TR/mse-byte-stream-format-webm/#webm-media-segments
-        // The user agent MUST accept and ignore Cues or Chapters elements that follow a Cluster element.
-        while (true) {
-            auto position_before = cursor.position();
-            auto element_id = TRY(streamer.read_element_id());
+        auto element_is_ignored = [&] {
+            // https://w3c.github.io/mse-byte-stream-format-webm/#webm-init-segments
+            // The user agent MUST accept and ignore any elements other than an EBML Header or a Cluster that occur before,
+            // in between, or after the Segment Information and Track elements.
+            if (!m_cluster_has_been_read)
+                return !first_is_one_of(element_id, EBML_MASTER_ELEMENT_ID, CLUSTER_ELEMENT_ID);
 
-            if (!first_is_one_of(element_id, CUES_ID, CHAPTERS_ELEMENT_ID)) {
-                TRY(cursor.seek(position_before, SeekMode::SetPosition));
-                break;
-            }
+            // https://www.w3.org/TR/mse-byte-stream-format-webm/#webm-media-segments
+            // The user agent MUST accept and ignore Cues or Chapters elements that follow a Cluster element.
+            return first_is_one_of(element_id, CUES_ID, CHAPTERS_ELEMENT_ID);
+        }();
 
-            TRY(streamer.read_unknown_element());
-        }
+        if (!element_is_ignored)
+            break;
+
+        TRY(streamer.read_unknown_element());
+        restore_position.disarm();
     }
     return {};
 }
@@ -187,9 +191,11 @@ Media::DecoderErrorOr<void> WebMByteStreamParser::parse_initialization_segment(M
         auto& tracks_for_type = *maybe_tracks_for_type;
         tracks_for_type.append(track_from_track_entry(track_entry, tracks_for_type.is_empty()));
         m_track_block_contexts.set(track_number, TrackBlockContext::from_track_entry(track_entry));
+        m_tracks_needing_codec_configuration.set(track_number);
     }
 
     m_current_media_segment_data.clear();
+    m_cluster_has_been_read = false;
     restore_position.disarm();
     return {};
 }
@@ -268,21 +274,22 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
                 auto frame_data = TRY(streamer.read_raw_octets(data_size));
                 TRY(cursor.seek(current_position, SeekMode::SetPosition));
 
-                auto track_entry = m_track_entries.get(block.track_number());
-                auto is_video = track_entry.has_value() && (*track_entry)->track_type() == Media::Matroska::TrackEntry::TrackType::Video;
-
-                Media::CodedFrame::AuxiliaryData aux_data = is_video
-                    ? Media::CodedFrame::AuxiliaryData { Media::CodedVideoFrameData {} }
-                    : Media::CodedFrame::AuxiliaryData { Media::CodedAudioFrameData {} };
+                // Every decode sequence begins with the track's configuration, so that a decoder can be created
+                // for the frame that starts it.
+                Optional<FixedArray<u8>> codec_configuration;
+                if (m_tracks_needing_codec_configuration.remove(block.track_number()))
+                    codec_configuration = MUST(FixedArray<u8>::create(codec_initialization_data_for_track(block.track_number())));
 
                 result.coded_frames.append({
                     .track_number = block.track_number(),
                     .coded_frame = Media::CodedFrame(
+                        codec_id_for_track(block.track_number()),
+                        block.timestamp().value(),
                         block.timestamp().value(),
                         block.duration().value_or(AK::Duration::zero()),
                         block.only_keyframes() ? Media::FrameFlags::Keyframe : Media::FrameFlags::None,
                         move(frame_data),
-                        aux_data),
+                        move(codec_configuration)),
                 });
                 return IterationDecision::Continue;
             }
@@ -323,6 +330,11 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
 
     result.completed_segment = true;
     return result;
+}
+
+void WebMByteStreamParser::reset_parser_state()
+{
+    m_current_media_segment_data.clear();
 }
 
 }

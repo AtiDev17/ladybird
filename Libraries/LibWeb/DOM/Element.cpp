@@ -138,7 +138,6 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/SVG/SVGAElement.h>
@@ -1379,6 +1378,9 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
             if (local_name == HTML::AttributeNames::id || local_name == HTML::AttributeNames::class_)
                 invalidate_content_blocker_style_if_needed(*this);
         }
+        auto html_collection_invalidation_types = document().html_collection_attribute_invalidation_types_for_attribute(local_name, namespace_);
+        if (html_collection_invalidation_types != 0)
+            invalidate_html_collection_caches_in_ancestors_for_attribute_change(html_collection_invalidation_types);
         document().bump_dom_tree_version();
     }
 }
@@ -3115,7 +3117,7 @@ void Element::clear_synthetic_pseudo_element_layout_nodes()
     for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
         if (auto layout_node = pseudo_element.layout_node()) {
             layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
-                node.clear_paintable();
+                node.clear_committed_box();
                 return TraversalDecision::Continue;
             });
             layout_node->prepare_subtree_for_detach_from_layout_tree();
@@ -3306,13 +3308,13 @@ double Element::scroll_top() const
     // 8. If the element does not have any associated box, return zero and terminate these steps.
     // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
     //     stored scroll offset from when it was one for restoration when it becomes one again.
-    auto paintable_box = this->paintable_box();
-    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !layout_node->is_scroll_container())
         return 0.0;
 
     // 9. Return the y-coordinate of the scrolling area at the alignment point with the top of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box->scroll_offset().y().to_double();
+    return Painting::scroll_offset(*layout_node).y().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -3351,13 +3353,13 @@ double Element::scroll_left() const
     // 8. If the element does not have any associated box, return zero and terminate these steps.
     // NB: A box that is not a scroll container is never scrolled away from its default alignment, even if it keeps a
     //     stored scroll offset from when it was one for restoration when it becomes one again.
-    auto paintable_box = this->paintable_box();
-    if (!paintable_box || !paintable_box->layout_node().is_scroll_container())
+    auto const* layout_node = this->layout_node();
+    if (!layout_node || !layout_node->is_scroll_container())
         return 0.0;
 
     // 9. Return the x-coordinate of the scrolling area at the alignment point with the left of the padding edge of the element.
     // FIXME: Is this correct?
-    return paintable_box->scroll_offset().x().to_double();
+    return Painting::scroll_offset(*layout_node).x().to_double();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -3403,16 +3405,17 @@ void Element::set_scroll_left(double x)
     }
 
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
-    if (!paintable_box())
+    auto* layout_node = this->layout_node();
+    if (!layout_node)
         return;
 
-    if (!paintable_box()->layout_node().is_scroll_container())
+    if (!layout_node->is_scroll_container())
         return;
 
     // FIXME: or the element has no overflow.
 
     // 11. Scroll the element to x,scrollTop, with the scroll behavior being "auto".
-    auto scroll_offset = paintable_box()->scroll_offset();
+    auto scroll_offset = Painting::scroll_offset(*layout_node);
     scroll_offset.set_x(CSSPixels::nearest_value_for(x));
     if (auto navigable = document.navigable())
         navigable->perform_a_scroll_of_an_element(*this, scroll_offset, Bindings::ScrollBehavior::Auto);
@@ -3460,16 +3463,17 @@ void Element::set_scroll_top(double y)
     }
 
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
-    if (!paintable_box())
+    auto* layout_node = this->layout_node();
+    if (!layout_node)
         return;
 
-    if (!paintable_box()->layout_node().is_scroll_container())
+    if (!layout_node->is_scroll_container())
         return;
 
     // FIXME: or the element has no overflow.
 
     // 11. Scroll the element to scrollLeft,y, with the scroll behavior being "auto".
-    auto scroll_offset = paintable_box()->scroll_offset();
+    auto scroll_offset = Painting::scroll_offset(*layout_node);
     scroll_offset.set_y(CSSPixels::nearest_value_for(y));
     if (auto navigable = document.navigable())
         navigable->perform_a_scroll_of_an_element(*this, scroll_offset, Bindings::ScrollBehavior::Auto);
@@ -3968,14 +3972,12 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, CS
             CSSPixels::nearest_value_for(visual_viewport.height()),
         };
         scrolling_box_rect = { visual_viewport.offset(), visible_size };
-        if (auto paintable_box = document.paintable_box())
-            scrolling_box_rect = paintable_box->scroll_snapport_rect(scrolling_box_rect);
+        if (auto* layout_node = document.layout_node())
+            scrolling_box_rect = Painting::scroll_snapport_rect(*layout_node, scrolling_box_rect);
         current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
-    } else if (auto paintable_box = scrolling_box.paintable_box()) {
-        current_scroll_position = paintable_box->scroll_offset();
-        auto const* layout_node = scrolling_box.layout_node();
-        VERIFY(layout_node);
-        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, paintable_box->scroll_snapport_rect(), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+    } else if (auto* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+        current_scroll_position = Painting::scroll_offset(*layout_node);
+        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
         return {};
     }
@@ -4153,11 +4155,8 @@ static void scroll_an_element_into_view(Element& target, Element::ScrollBehavior
         //         are considered, so move the target to where this scroll is going to leave it. The viewport is always
         //         the outermost scrolling box, so its own scroll cannot affect a later iteration.
         if (!scrolling_box.is_document()) {
-            if (auto paintable_box = scrolling_box.paintable_box()) {
-                target_bounding_border_box.translate_by(paintable_box->scroll_offset() - paintable_box->clamp_scroll_offset(position));
-
-                auto const* layout_node = scrolling_box.layout_node();
-                VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+            if (auto const* layout_node = scrolling_box.layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
+                target_bounding_border_box.translate_by(Painting::scroll_offset(*layout_node) - Painting::clamp_scroll_offset(*layout_node, position));
                 auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
                 if (!visible_rect.is_empty())
@@ -4494,7 +4493,7 @@ void Element::set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinitio
     }
 
     if (was_form_associated != is_form_associated)
-        document().bump_form_associated_custom_element_version();
+        document().bump_form_controls_version();
 }
 
 GC::Ptr<HTML::CustomElementRegistry> Element::custom_element_registry() const
@@ -5074,7 +5073,8 @@ void Element::scroll(Bindings::ScrollToOptions options, GC::Ptr<WebIDL::Promise>
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element
     //     has no overflow, return a resolved Promise and abort the remaining steps.
     // FIXME: or the element has no overflow
-    if (!paintable_box() || !paintable_box()->layout_node().is_scroll_container()) {
+    auto* layout_node = this->layout_node();
+    if (!layout_node || !layout_node->is_scroll_container()) {
         if (promise)
             WebIDL::resolve_promise(*promise);
         return;

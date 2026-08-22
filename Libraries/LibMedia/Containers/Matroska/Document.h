@@ -128,19 +128,15 @@ public:
     String codec_id() const { return m_codec_id; }
     void set_codec_id(String const& codec_id) { m_codec_id = codec_id; }
     ReadonlyBytes codec_private_data() const LIFETIME_BOUND { return m_codec_private_data.span(); }
-    ErrorOr<void> set_codec_private_data(ReadonlyBytes codec_private_data)
-    {
-        m_codec_private_data = TRY(FixedArray<u8>::create(codec_private_data));
-        return {};
-    }
+    void set_codec_private_data(FixedArray<u8>&& codec_private_data) { m_codec_private_data = move(codec_private_data); }
     double timestamp_scale() const { return m_timestamp_scale; }
     void set_timestamp_scale(double timestamp_scale) { m_timestamp_scale = timestamp_scale; }
     u64 codec_delay() const { return m_codec_delay; }
     void set_codec_delay(u64 codec_delay) { m_codec_delay = codec_delay; }
     u64 seek_pre_roll() const { return m_seek_pre_roll; }
     void set_seek_pre_roll(u64 seek_pre_roll) { m_seek_pre_roll = seek_pre_roll; }
-    u64 timestamp_offset() const { return m_timestamp_offset; }
-    void set_timestamp_offset(u64 timestamp_offset) { m_timestamp_offset = timestamp_offset; }
+    i64 timestamp_offset() const { return m_timestamp_offset; }
+    void set_timestamp_offset(i64 timestamp_offset) { m_timestamp_offset = timestamp_offset; }
     u64 default_duration() const { return m_default_duration; }
     void set_default_duration(u64 default_duration) { m_default_duration = default_duration; }
     Optional<VideoTrack> video_track() const { return m_video_track; }
@@ -162,35 +158,12 @@ private:
     double m_timestamp_scale { 1 };
     u64 m_codec_delay { 0 };
     u64 m_seek_pre_roll { 0 };
-    u64 m_timestamp_offset { 0 };
+    i64 m_timestamp_offset { 0 };
     u64 m_default_duration { 0 };
     bool m_flag_default { true };
     Optional<VideoTrack> m_video_track;
     Optional<AudioTrack> m_audio_track;
 };
-
-struct TrackBlockContext {
-    String codec_id;
-    double timestamp_scale { 1 };
-    u64 codec_delay { 0 };
-    u64 seek_pre_roll { 0 };
-    u64 timestamp_offset { 0 };
-    u64 default_duration { 0 };
-
-    static TrackBlockContext from_track_entry(TrackEntry const& entry)
-    {
-        return {
-            .codec_id = entry.codec_id(),
-            .timestamp_scale = entry.timestamp_scale(),
-            .codec_delay = entry.codec_delay(),
-            .seek_pre_roll = entry.seek_pre_roll(),
-            .timestamp_offset = entry.timestamp_offset(),
-            .default_duration = entry.default_duration(),
-        };
-    }
-};
-
-using TrackBlockContexts = HashMap<u64, TrackBlockContext>;
 
 inline TrackType track_type_from_matroska_track_type(TrackEntry::TrackType type)
 {

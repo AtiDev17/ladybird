@@ -16,10 +16,10 @@
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintStyle.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/AttributeParser.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -56,7 +56,7 @@ Optional<SVGGraphicsElement::PaintServer> SVGGraphicsElement::svg_paint_computed
         if (!geometry.has_value())
             return {};
         return PaintServer { PatternPaintServer {
-            .pattern_paintable = geometry->pattern_paintable,
+            .pattern_layout_node = geometry->pattern_layout_node,
             .tile_rect = geometry->tile_rect,
             .content_scale = geometry->content_scale,
             .tile_content_transform = geometry->tile_content_transform,
@@ -463,8 +463,7 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     // NB: We currently require committed box data connected to the document's visual-context tree to compute this matrix.
     //     This also excludes geometry in resource-only subtrees such as masks, clip paths, and patterns.
     auto const* layout_node = this->layout_node();
-    auto viewport_paintable = document().paintable();
-    if (!layout_node || !Painting::has_committed_box(*layout_node) || !viewport_paintable)
+    if (!layout_node || !Painting::has_committed_box(*layout_node) || !document().has_committed_viewport_box())
         return {};
 
     // 3. Let ctm be a matrix that transforms the coordinate space of the current element (including its transform

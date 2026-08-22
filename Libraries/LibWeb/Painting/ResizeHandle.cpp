@@ -6,8 +6,8 @@
 
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/ElementResizeAction.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/ResizeHandle.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/MouseButton.h>
@@ -15,34 +15,34 @@
 
 namespace Web::Painting {
 
-NonnullRefPtr<ResizeHandle> ResizeHandle::create(Paintable& paintable_box)
+NonnullRefPtr<ResizeHandle> ResizeHandle::create(Layout::NodeArena& arena, Layout::RustFFI::PaintableSlotId slot)
 {
-    return adopt_ref(*new ResizeHandle(paintable_box));
+    return adopt_ref(*new ResizeHandle(arena, slot));
 }
 
-ResizeHandle::ResizeHandle(Paintable& paintable_box)
-    : ChromeWidget(paintable_box)
-    , m_element(as<DOM::Element>(*paintable_box.dom_node()))
+ResizeHandle::ResizeHandle(Layout::NodeArena& arena, Layout::RustFFI::PaintableSlotId slot)
+    : ChromeWidget(arena, slot)
+    , m_element(as<DOM::Element>(*layout_node()->dom_node()))
 {
 }
 
 bool ResizeHandle::contains(CSSPixelPoint position, ChromeMetrics const& metrics) const
 {
-    auto paintable_box = paintable();
-    if (!paintable_box)
+    auto* node = layout_node();
+    if (!node)
         return false;
-    return paintable_box->resizer_contains(position, metrics);
+    return resizer_contains(*node, position, metrics);
 }
 
 Optional<CSS::CursorPredefined> ResizeHandle::cursor() const
 {
-    auto paintable_box = paintable();
-    if (!paintable_box)
+    auto* node = layout_node();
+    if (!node)
         return {};
-    auto axes = paintable_box->physical_resize_axes();
+    auto axes = physical_resize_axes(*node);
     if (axes.vertical) {
         if (axes.horizontal) {
-            if (paintable_box->is_chrome_mirrored())
+            if (is_chrome_mirrored(*node))
                 return CSS::CursorPredefined::SwResize;
             return CSS::CursorPredefined::SeResize;
         }

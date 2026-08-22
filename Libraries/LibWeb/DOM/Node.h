@@ -19,6 +19,7 @@
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/DOM/FragmentSerializationMode.h>
+#include <LibWeb/DOM/HTMLCollectionCacheRegistration.h>
 #include <LibWeb/DOM/NodeType.h>
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/Export.h>
@@ -361,8 +362,13 @@ public:
             Removal,
             Mutation,
         };
+        enum class AffectsElements {
+            No,
+            Yes,
+        };
         Type type {};
         GC::Ref<Node> node;
+        AffectsElements affects_elements { AffectsElements::No };
     };
     // FIXME: It would be good if we could always provide this metadata for use in optimizations.
     virtual void children_changed(ChildrenChangedMetadata const&) { }
@@ -381,24 +387,11 @@ public:
         return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(inclusive_ancestor));
     }
 
-    RefPtr<Painting::Paintable const> paintable_box() const;
-    RefPtr<Painting::Paintable> paintable_box();
-    RefPtr<Painting::Paintable const> paintable() const;
-    RefPtr<Painting::Paintable> paintable();
-
-    RefPtr<Painting::Paintable const> unsafe_paintable_box() const;
-    RefPtr<Painting::Paintable> unsafe_paintable_box();
-    RefPtr<Painting::Paintable const> unsafe_paintable() const;
-    RefPtr<Painting::Paintable> unsafe_paintable();
-
-    void set_paintable(WeakPtr<Painting::Paintable>);
-    void clear_paintable();
-
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
     void set_needs_layout_update(SetNeedsLayoutReason);
     void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
-    void clear_layout_node_and_paintable(Badge<Document>);
+    void clear_layout_node(Badge<Document>);
     void set_layout_node(Badge<Layout::Node>, Layout::Node&);
     void detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>);
 
@@ -542,6 +535,8 @@ public:
     }
 
 protected:
+    friend class HTMLCollection;
+
     struct RareData {
         virtual ~RareData();
         virtual void visit_edges(Cell::Visitor&);
@@ -555,7 +550,12 @@ protected:
 
         GC::Ptr<NodeList> child_nodes;
         GC::Ptr<HTMLCollection> children;
+        OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
     };
+
+    void register_html_collection_with_valid_cache(HTMLCollection&);
+    void invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadata::AffectsElements);
+    void invalidate_html_collection_caches_in_ancestors_for_attribute_change(HTMLCollectionCacheRegistration::AttributeInvalidationTypes);
 
     Node(Document&, NodeType);
 
@@ -572,7 +572,6 @@ protected:
 
     GC::Ptr<Document> m_document;
     WeakPtr<Layout::Node> m_layout_node;
-    WeakPtr<Painting::Paintable> m_paintable;
     NodeType m_type { NodeType::INVALID };
     bool m_needs_layout_tree_update { false };
     bool m_child_needs_layout_tree_update { false };
@@ -595,7 +594,7 @@ private:
     void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
-    void clear_layout_node_paintable();
+    void clear_committed_layout_box();
 
     static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 

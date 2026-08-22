@@ -38,7 +38,6 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Page/EventHandler.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/VisualLines.h>
 
@@ -173,14 +172,18 @@ void FormAssociatedElement::reset_algorithm()
 
 void FormAssociatedElement::set_form(HTMLFormElement* form)
 {
-    if (auto* old_form = this->form())
-        old_form->remove_associated_element({}, form_associated_element_to_html_element());
+    auto& element = form_associated_element_to_html_element();
+    GC::Ptr<HTMLFormElement> old_form { this->form() };
+    if (old_form)
+        old_form->remove_associated_element({}, element);
     if (form)
         ensure_form_associated_rare_data().form = form;
     else if (auto* rare_data = form_associated_rare_data())
         rare_data->form = nullptr;
     if (form)
-        form->add_associated_element({}, form_associated_element_to_html_element());
+        form->add_associated_element({}, element);
+    if (old_form.ptr() != form)
+        element.document().bump_form_controls_version();
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-validity
@@ -1324,9 +1327,9 @@ void FormAssociatedTextControlElement::scroll_cursor_into_view()
     // https://drafts.csswg.org/css-ui-4/#input-rules
     // * The content is clipped in the block direction to the padding edge
     auto scroll_block_direction = is<HTMLInputElement>(element)
-        ? Painting::Paintable::ScrollBlockDirection::No
-        : Painting::Paintable::ScrollBlockDirection::Yes;
-    Painting::Paintable::scroll_text_offset_into_view(*text_node, m_selection_end, m_selection_end_affinity, scroll_block_direction);
+        ? Painting::ScrollBlockDirection::No
+        : Painting::ScrollBlockDirection::Yes;
+    Painting::scroll_text_offset_into_view(*text_node, m_selection_end, m_selection_end_affinity, scroll_block_direction);
 }
 
 void FormAssociatedTextControlElement::selection_was_changed(SelectionSource source)

@@ -8,29 +8,43 @@ set(SOURCES
     Audio/WSOLAAlgorithm.cpp
     Audio/WSOLAInternals.cpp
     Audio/WSOLATimeStretcher.cpp
+    CodecParameters.cpp
+    Codecs/AV1.cpp
     Codecs/FLAC.cpp
+    Codecs/H264.cpp
+    Codecs/H265.cpp
+    Codecs/MPEG4Audio.cpp
     Codecs/Opus.cpp
     Codecs/Vorbis.cpp
+    Codecs/VP9.cpp
+    ContainerID.cpp
     Containers/ConstantBitrateContainerNavigator.cpp
     Containers/FLACNavigator.cpp
     Containers/IndexedContainerNavigator.cpp
-    Containers/MP3Navigator.cpp
-    Containers/OggNavigator.cpp
+    Containers/ISOBMFF/FragmentSampleIterator.cpp
+    Containers/ISOBMFF/Reader.cpp
+    Containers/ISOBMFF/Streamer.cpp
     Containers/Matroska/MatroskaDemuxer.cpp
     Containers/Matroska/Reader.cpp
     Containers/Matroska/SampleIterator.cpp
     Containers/Matroska/Streamer.cpp
+    Containers/Matroska/TrackBlockContext.cpp
+    Containers/MP3Navigator.cpp
+    Containers/OggNavigator.cpp
     DecodeAudioStream.cpp
+    DecoderRegistry.cpp
+    DemuxerRegistry.cpp
     IncrementallyPopulatedStream.cpp
+    MediaSupport.cpp
     MediaTime.cpp
     MonotonicMediaClock.cpp
     PlaybackManager.cpp
     PlaybackStates/BufferingStateHandler.cpp
-    PlaybackStates/PlayingStateHandler.cpp
-    PlaybackStates/StartingStateHandler.cpp
     PlaybackStates/PausedStateHandler.cpp
     PlaybackStates/PlaybackStateHandler.cpp
+    PlaybackStates/PlayingStateHandler.cpp
     PlaybackStates/ResumingStateHandler.cpp
+    PlaybackStates/StartingStateHandler.cpp
     Processors/AudioMixer.cpp
     Processors/AudioTimeStretchProcessor.cpp
     Producers/DecodedAudioProducer.cpp
@@ -39,14 +53,14 @@ set(SOURCES
     Sinks/AudioPlaybackSink.cpp
     Sinks/DisplayingVideoSink.cpp
     Sinks/RemoteVideoSink.cpp
-    VideoPresentation/PresentedFramePage.cpp
-    VideoPresentation/VideoPresentationClientConnection.cpp
-    VideoPresentation/VideoPresentationServerConnection.cpp
     TimeRanges.cpp
     VideoEdgeQueue.cpp
     VideoFrame.cpp
     VideoFrameHandle.cpp
     VideoFramePool.cpp
+    VideoPresentation/PresentedFramePage.cpp
+    VideoPresentation/VideoPresentationClientConnection.cpp
+    VideoPresentation/VideoPresentationServerConnection.cpp
 )
 
 set(GENERATED_SOURCES

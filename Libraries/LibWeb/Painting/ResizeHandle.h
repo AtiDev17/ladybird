@@ -8,13 +8,12 @@
 
 #include <LibGC/Weak.h>
 #include <LibWeb/Painting/ChromeWidget.h>
-#include <LibWeb/Painting/Paintable.h>
 
 namespace Web::Painting {
 
 class ResizeHandle final : public ChromeWidget {
 public:
-    static NonnullRefPtr<ResizeHandle> create(Paintable&);
+    static NonnullRefPtr<ResizeHandle> create(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
 
     virtual bool contains(CSSPixelPoint position, ChromeMetrics const&) const override;
 
@@ -25,7 +24,7 @@ public:
     virtual Optional<CSS::CursorPredefined> cursor() const override;
 
 private:
-    ResizeHandle(Paintable&);
+    ResizeHandle(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
 
     GC::Weak<DOM::Element> m_element;
     OwnPtr<ElementResizeAction> m_resize_action;

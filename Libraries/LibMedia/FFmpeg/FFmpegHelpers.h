@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <AK/Span.h>
 #include <LibMedia/Audio/ChannelMap.h>
 #include <LibMedia/CodecID.h>
+#include <LibMedia/DecoderError.h>
 #include <LibMedia/Track.h>
 
 extern "C" {
@@ -23,13 +25,6 @@ static inline AVCodecID ffmpeg_codec_id_from_media_codec_id(CodecID codec)
         return AV_CODEC_ID_VP8;
     case CodecID::VP9:
         return AV_CODEC_ID_VP9;
-    case CodecID::H261:
-        return AV_CODEC_ID_H261;
-    case CodecID::MPEG1:
-    case CodecID::H262:
-        return AV_CODEC_ID_MPEG2VIDEO;
-    case CodecID::H263:
-        return AV_CODEC_ID_H263;
     case CodecID::H264:
         return AV_CODEC_ID_H264;
     case CodecID::H265:
@@ -56,12 +51,8 @@ static inline AVCodecID ffmpeg_codec_id_from_media_codec_id(CodecID codec)
         return AV_CODEC_ID_PCM_S24LE;
     case CodecID::S32LE:
         return AV_CODEC_ID_PCM_S32LE;
-    case CodecID::S64LE:
-        return AV_CODEC_ID_PCM_S64LE;
     case CodecID::F32LE:
         return AV_CODEC_ID_PCM_F32LE;
-    case CodecID::F64LE:
-        return AV_CODEC_ID_PCM_F64LE;
     case CodecID::ALaw:
         return AV_CODEC_ID_PCM_ALAW;
     case CodecID::MuLaw:
@@ -79,13 +70,6 @@ static inline CodecID media_codec_id_from_ffmpeg_codec_id(AVCodecID codec)
         return CodecID::VP8;
     case AV_CODEC_ID_VP9:
         return CodecID::VP9;
-    case AV_CODEC_ID_H261:
-        return CodecID::H261;
-    case AV_CODEC_ID_MPEG2VIDEO:
-        // FIXME: This could also map to CodecID::MPEG1
-        return CodecID::H262;
-    case AV_CODEC_ID_H263:
-        return CodecID::H263;
     case AV_CODEC_ID_H264:
         return CodecID::H264;
     case AV_CODEC_ID_HEVC:
@@ -112,12 +96,8 @@ static inline CodecID media_codec_id_from_ffmpeg_codec_id(AVCodecID codec)
         return CodecID::S24LE;
     case AV_CODEC_ID_PCM_S32LE:
         return CodecID::S32LE;
-    case AV_CODEC_ID_PCM_S64LE:
-        return CodecID::S64LE;
     case AV_CODEC_ID_PCM_F32LE:
         return CodecID::F32LE;
-    case AV_CODEC_ID_PCM_F64LE:
-        return CodecID::F64LE;
     case AV_CODEC_ID_PCM_ALAW:
         return CodecID::ALaw;
     case AV_CODEC_ID_PCM_MULAW:
@@ -160,6 +140,8 @@ static inline TrackType track_type_from_ffmpeg_media_type(AVMediaType media_type
     }
     VERIFY_NOT_REACHED();
 }
+
+DecoderErrorOr<void> add_new_extradata_to_packet(AVPacket&, ReadonlyBytes);
 
 ErrorOr<Audio::ChannelMap> av_channel_layout_to_channel_map(AVChannelLayout const&);
 ErrorOr<AVChannelLayout> channel_map_to_av_channel_layout(Audio::ChannelMap const&);

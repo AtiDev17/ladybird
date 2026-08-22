@@ -14,11 +14,9 @@
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ResizeHandle.h>
 #include <LibWeb/Painting/Scrollbar.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 
 namespace Web::Painting {
 
@@ -77,10 +75,10 @@ static bool local_point_is_before_box(Layout::NodeWithStyle const& layout_node, 
         : inline_coordinate <= inline_middle;
 }
 
-NonnullRefPtr<HitTestDisplayList> HitTestDisplayList::create_from_rust_recording(u64 visual_context_tree_version, Layout::NodeArena& arena)
+NonnullRefPtr<HitTestDisplayList> HitTestDisplayList::create_from_rust_recording(u64 visual_context_tree_version, Layout::NodeArena& arena, ChromeWidgetRegistry& chrome_widget_registry)
 {
     auto* arena_handle = arena.handle();
-    auto list = adopt_ref(*new HitTestDisplayList(visual_context_tree_version, arena, Layout::RustFFI::layout_arena_hit_test_list_generation(arena_handle)));
+    auto list = adopt_ref(*new HitTestDisplayList(visual_context_tree_version, arena, chrome_widget_registry, Layout::RustFFI::layout_arena_hit_test_list_generation(arena_handle)));
     auto item_count = Layout::RustFFI::layout_arena_hit_test_item_count(arena_handle);
     list->m_items.ensure_capacity(item_count);
     Vector<Layout::RustFFI::FfiHitTestItemExport> exported_items;
@@ -88,19 +86,18 @@ NonnullRefPtr<HitTestDisplayList> HitTestDisplayList::create_from_rust_recording
     Layout::RustFFI::layout_arena_export_hit_test_items(arena_handle, exported_items.data(), exported_items.size());
     for (auto const& exported : exported_items) {
         VERIFY(exported.paintable.index != Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX);
-        auto paintable = paintable_for_slot(arena_handle, exported.paintable);
-        VERIFY(paintable);
+        VERIFY(Layout::RustFFI::layout_arena_paintable_row(arena_handle, exported.paintable));
         switch (static_cast<ChromeWidgetKind>(exported.chrome_widget_kind)) {
         case ChromeWidgetKind::None:
             break;
         case ChromeWidgetKind::ResizeHandle:
-            (void)paintable->ensure_resize_handle();
+            (void)chrome_widget_registry.get_or_create_resize_handle(arena, exported.paintable);
             break;
         case ChromeWidgetKind::HorizontalScrollbar:
-            (void)paintable->ensure_scrollbar(Paintable::ScrollDirection::Horizontal);
+            (void)chrome_widget_registry.get_or_create_scrollbar(arena, exported.paintable, ScrollDirection::Horizontal);
             break;
         case ChromeWidgetKind::VerticalScrollbar:
-            (void)paintable->ensure_scrollbar(Paintable::ScrollDirection::Vertical);
+            (void)chrome_widget_registry.get_or_create_scrollbar(arena, exported.paintable, ScrollDirection::Vertical);
             break;
         }
         list->m_items.unchecked_append(Item {
@@ -118,9 +115,10 @@ NonnullRefPtr<HitTestDisplayList> HitTestDisplayList::create_from_rust_recording
     return list;
 }
 
-HitTestDisplayList::HitTestDisplayList(u64 visual_context_tree_version, Layout::NodeArena& arena, u64 rust_generation)
+HitTestDisplayList::HitTestDisplayList(u64 visual_context_tree_version, Layout::NodeArena& arena, ChromeWidgetRegistry& chrome_widget_registry, u64 rust_generation)
     : m_visual_context_tree_version(visual_context_tree_version)
     , m_arena(arena)
+    , m_chrome_widget_registry(chrome_widget_registry)
     , m_rust_generation(rust_generation)
 {
 }
@@ -161,41 +159,41 @@ void HitTestDisplayList::ensure_caret_lines() const
     }
 }
 
-static Optional<Gfx::FloatPoint> local_float_point_for_visual_context(VisualContextIndex visual_context_index, CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior clip_behavior)
+static Optional<Gfx::FloatPoint> local_float_point_for_visual_context(VisualContextIndex visual_context_index, CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior clip_behavior)
 {
     auto pixel_ratio = static_cast<float>(device_pixels_per_css_pixel);
-    auto const& visual_context_tree = viewport_paintable.visual_context_tree();
-    auto result = visual_context_tree.transform_point_for_hit_test(visual_context_index, point.to_type<float>() * pixel_ratio, viewport_paintable.scroll_state_snapshot(), clip_behavior);
+    auto const& visual_context_tree = document.visual_context_tree();
+    auto result = visual_context_tree.transform_point_for_hit_test(visual_context_index, point.to_type<float>() * pixel_ratio, document.scroll_state_snapshot(), clip_behavior);
     if (!result.has_value())
         return {};
     return *result / pixel_ratio;
 }
 
-Optional<CSSPixelPoint> HitTestDisplayList::local_point_for_visual_context(VisualContextIndex visual_context_index, CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel) const
+Optional<CSSPixelPoint> HitTestDisplayList::local_point_for_visual_context(VisualContextIndex visual_context_index, CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel) const
 {
-    return local_float_point_for_visual_context(visual_context_index, point, viewport_paintable, device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior::Respect)
+    return local_float_point_for_visual_context(visual_context_index, point, document, device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior::Respect)
         .map([](auto float_point) { return float_point.template to_type<CSSPixels>(); });
 }
 
-CSSPixelRect HitTestDisplayList::viewport_rect_for_context(VisualContextIndex visual_context_index, CSSPixelRect const& rect, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel) const
+CSSPixelRect HitTestDisplayList::viewport_rect_for_context(VisualContextIndex visual_context_index, CSSPixelRect const& rect, DOM::Document const& document, double device_pixels_per_css_pixel) const
 {
     auto pixel_ratio = static_cast<float>(device_pixels_per_css_pixel);
-    auto const& visual_context_tree = viewport_paintable.visual_context_tree();
-    auto result = visual_context_tree.transform_rect_to_viewport(visual_context_index, rect.to_type<float>() * pixel_ratio, viewport_paintable.scroll_state_snapshot());
+    auto const& visual_context_tree = document.visual_context_tree();
+    auto result = visual_context_tree.transform_rect_to_viewport(visual_context_index, rect.to_type<float>() * pixel_ratio, document.scroll_state_snapshot());
     return result.scaled(1.0f / pixel_ratio).to_type<CSSPixels>();
 }
 
-SortingContexts const& HitTestDisplayList::ensure_sorting_contexts(ViewportPaintable const& viewport_paintable) const
+SortingContexts const& HitTestDisplayList::ensure_sorting_contexts(DOM::Document const& document) const
 {
     // The version check at every entry point guarantees the tree still matches this list.
     if (!m_sorting_contexts.has_value())
-        m_sorting_contexts = viewport_paintable.visual_context_tree().resolve_sorting_contexts();
+        m_sorting_contexts = document.visual_context_tree().resolve_sorting_contexts();
     return *m_sorting_contexts;
 }
 
 struct HitTestDisplayList::QueryContext {
     HitTestDisplayList const& list;
-    ViewportPaintable const* viewport_paintable { nullptr };
+    GC::Ptr<DOM::Document const> document;
     double device_pixels_per_css_pixel { 1 };
     ChromeMetrics const* chrome_metrics { nullptr };
     GC::Ptr<DOM::Node const> scope { nullptr };
@@ -207,30 +205,31 @@ struct HitTestDisplayList::QueryContext {
             .context = this,
             .local_point_for_visual_context = [](void* context_pointer, size_t index, i32 x_raw, i32 y_raw, bool respect_clip, float* out) -> bool {
                 auto& context = *static_cast<QueryContext*>(context_pointer);
-                VERIFY(context.viewport_paintable);
+                VERIFY(context.document);
                 auto clip_behavior = respect_clip ? AccumulatedVisualContextTree::ClipBehavior::Respect : AccumulatedVisualContextTree::ClipBehavior::Ignore;
-                auto local_point = local_float_point_for_visual_context(VisualContextIndex { index }, { CSSPixels::from_raw(x_raw), CSSPixels::from_raw(y_raw) }, *context.viewport_paintable, context.device_pixels_per_css_pixel, clip_behavior);
+                auto local_point = local_float_point_for_visual_context(VisualContextIndex { index }, { CSSPixels::from_raw(x_raw), CSSPixels::from_raw(y_raw) }, *context.document, context.device_pixels_per_css_pixel, clip_behavior);
                 if (!local_point.has_value())
                     return false;
                 out[0] = local_point->x();
                 out[1] = local_point->y();
                 return true;
             },
-            .chrome_widget_contains = [](void* context_pointer, void* paintable_shell, u8 kind, i32 x_raw, i32 y_raw) -> bool {
+            .chrome_widget_contains = [](void* context_pointer, void* layout_node_shell, u8 kind, i32 x_raw, i32 y_raw) -> bool {
                 auto& context = *static_cast<QueryContext*>(context_pointer);
                 VERIFY(context.chrome_metrics);
-                auto const& paintable = *static_cast<Paintable const*>(paintable_shell);
+                auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
+                auto paintable_slot = committed_row_slot(layout_node);
                 CSSPixelPoint local_point { CSSPixels::from_raw(x_raw), CSSPixels::from_raw(y_raw) };
                 auto contains = [&](auto widget) { return widget && widget->contains(local_point, *context.chrome_metrics); };
                 switch (static_cast<ChromeWidgetKind>(kind)) {
                 case ChromeWidgetKind::None:
                     return false;
                 case ChromeWidgetKind::ResizeHandle:
-                    return contains(paintable.resize_handle());
+                    return contains(context.list.m_chrome_widget_registry->resize_handle(paintable_slot));
                 case ChromeWidgetKind::HorizontalScrollbar:
-                    return contains(paintable.scrollbar(Paintable::ScrollDirection::Horizontal));
+                    return contains(context.list.m_chrome_widget_registry->scrollbar(paintable_slot, ScrollDirection::Horizontal));
                 case ChromeWidgetKind::VerticalScrollbar:
-                    return contains(paintable.scrollbar(Paintable::ScrollDirection::Vertical));
+                    return contains(context.list.m_chrome_widget_registry->scrollbar(paintable_slot, ScrollDirection::Vertical));
                 }
                 VERIFY_NOT_REACHED();
             },
@@ -241,8 +240,8 @@ struct HitTestDisplayList::QueryContext {
             },
             .sorting_context_group = [](void* context_pointer, size_t index, size_t* out) -> bool {
                 auto& context = *static_cast<QueryContext*>(context_pointer);
-                VERIFY(context.viewport_paintable);
-                auto const& sorting_contexts = context.list.ensure_sorting_contexts(*context.viewport_paintable);
+                VERIFY(context.document);
+                auto const& sorting_contexts = context.list.ensure_sorting_contexts(*context.document);
                 if (sorting_contexts.is_empty() || sorting_contexts.leaf_by_node[index] == NO_SORTING_CONTEXT)
                     return false;
                 *out = sorting_contexts.outermost_context_of(sorting_contexts.context_by_node[index]).value();
@@ -250,8 +249,8 @@ struct HitTestDisplayList::QueryContext {
             },
             .plane_depth_key = [](void* context_pointer, size_t index, i32 x_raw, i32 y_raw, i64* out) -> bool {
                 auto& context = *static_cast<QueryContext*>(context_pointer);
-                VERIFY(context.viewport_paintable);
-                auto const& sorting_contexts = context.list.ensure_sorting_contexts(*context.viewport_paintable);
+                VERIFY(context.document);
+                auto const& sorting_contexts = context.list.ensure_sorting_contexts(*context.document);
                 if (sorting_contexts.is_empty())
                     return false;
                 auto leaf = sorting_contexts.leaf_by_node[index];
@@ -261,7 +260,7 @@ struct HitTestDisplayList::QueryContext {
                 auto depth_key = context.depth_key_by_plane.ensure(leaf.value(), [&]() -> Optional<i64> {
                     CSSPixelPoint point { CSSPixels::from_raw(x_raw), CSSPixels::from_raw(y_raw) };
                     auto device_point = point.to_type<float>() * static_cast<float>(context.device_pixels_per_css_pixel);
-                    auto depth = context.viewport_paintable->visual_context_tree().plane_depth_at_point_for_hit_test(leaf, device_point, context.viewport_paintable->scroll_state_snapshot());
+                    auto depth = context.document->visual_context_tree().plane_depth_at_point_for_hit_test(leaf, device_point, context.document->scroll_state_snapshot());
                     if (!depth.has_value())
                         return {};
                     static constexpr float depth_limit = 16777216.0f;
@@ -283,23 +282,23 @@ Optional<HitTestDisplayList::TopmostItem> HitTestDisplayList::topmost_item_from(
     return TopmostItem { item.index, { CSSPixels::from_raw(item.local_x), CSSPixels::from_raw(item.local_y) } };
 }
 
-Optional<HitTestDisplayList::TopmostItem> HitTestDisplayList::find_topmost_item(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
+Optional<HitTestDisplayList::TopmostItem> HitTestDisplayList::find_topmost_item(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
 {
-    QueryContext context { *this, &viewport_paintable, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
+    QueryContext context { *this, &document, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
     return topmost_item_from(Layout::RustFFI::layout_arena_hit_test_find_topmost_item(m_arena->handle(), context.callbacks(), point.x().raw_value(), point.y().raw_value()));
 }
 
-void HitTestDisplayList::find_topmost_items_for_caret(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, Optional<TopmostItem>& caret_item, Optional<TopmostItem>& hit_item) const
+void HitTestDisplayList::find_topmost_items_for_caret(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, Optional<TopmostItem>& caret_item, Optional<TopmostItem>& hit_item) const
 {
-    QueryContext context { *this, &viewport_paintable, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
+    QueryContext context { *this, &document, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
     auto items = Layout::RustFFI::layout_arena_hit_test_find_topmost_items_for_caret(m_arena->handle(), context.callbacks(), point.x().raw_value(), point.y().raw_value());
     caret_item = topmost_item_from(items.caret_item);
     hit_item = topmost_item_from(items.hit_item);
 }
 
-Vector<size_t> HitTestDisplayList::hit_item_indices_topmost_first(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
+Vector<size_t> HitTestDisplayList::hit_item_indices_topmost_first(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
 {
-    QueryContext context { *this, &viewport_paintable, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
+    QueryContext context { *this, &document, device_pixels_per_css_pixel, &chrome_metrics, nullptr };
     Vector<size_t> indices;
     Layout::RustFFI::layout_arena_hit_test_all(m_arena->handle(), context.callbacks(), point.x().raw_value(), point.y().raw_value(), &indices, [](void* sink, size_t index) {
         static_cast<Vector<size_t>*>(sink)->append(index);
@@ -325,9 +324,9 @@ bool HitTestDisplayList::item_is_inline_adjacent_to_line(size_t item_index, size
     return Layout::RustFFI::layout_arena_hit_test_item_is_inline_adjacent_to_line(m_arena->handle(), item_index, line_index);
 }
 
-HitTestDisplayList::ClosestLine HitTestDisplayList::find_closest_line(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, CaretPositionMode mode, DOM::Node const* scope_dom_node, AccumulatedVisualContextTree::ClipBehavior clip_behavior) const
+HitTestDisplayList::ClosestLine HitTestDisplayList::find_closest_line(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, CaretPositionMode mode, DOM::Node const* scope_dom_node, AccumulatedVisualContextTree::ClipBehavior clip_behavior) const
 {
-    QueryContext context { *this, &viewport_paintable, device_pixels_per_css_pixel, nullptr, scope_dom_node };
+    QueryContext context { *this, &document, device_pixels_per_css_pixel, nullptr, scope_dom_node };
     auto result = Layout::RustFFI::layout_arena_hit_test_find_closest_line(m_arena->handle(), context.callbacks(), point.x().raw_value(), point.y().raw_value(), to_underlying(mode), scope_dom_node != nullptr, clip_behavior == AccumulatedVisualContextTree::ClipBehavior::Respect);
     ClosestLine closest_line;
     if (result.has_index)
@@ -351,28 +350,20 @@ static Layout::Node const* fragment_layout_node(Layout::RustFFI::FfiFragmentText
 
 Layout::Node const* HitTestDisplayList::layout_node_for_item(Item const& item) const
 {
-    return static_cast<Layout::Node const*>(Layout::RustFFI::layout_arena_paintable_layout_node_shell(m_arena->handle(), item.box));
-}
-
-RefPtr<Paintable> HitTestDisplayList::paintable_for_item(Item const& item) const
-{
-    return paintable_for_slot(m_arena->handle(), item.box);
+    return layout_node_for_committed_slot(*m_arena, item.box);
 }
 
 RefPtr<ChromeWidget> HitTestDisplayList::chrome_widget_for_item(Item const& item) const
 {
-    auto paintable = paintable_for_item(item);
-    if (!paintable)
-        return nullptr;
     switch (item.chrome_widget_kind) {
     case ChromeWidgetKind::None:
         return nullptr;
     case ChromeWidgetKind::ResizeHandle:
-        return paintable->resize_handle();
+        return m_chrome_widget_registry->resize_handle(item.box);
     case ChromeWidgetKind::HorizontalScrollbar:
-        return paintable->scrollbar(Paintable::ScrollDirection::Horizontal);
+        return m_chrome_widget_registry->scrollbar(item.box, ScrollDirection::Horizontal);
     case ChromeWidgetKind::VerticalScrollbar:
-        return paintable->scrollbar(Paintable::ScrollDirection::Vertical);
+        return m_chrome_widget_registry->scrollbar(item.box, ScrollDirection::Vertical);
     }
     VERIFY_NOT_REACHED();
 }
@@ -391,14 +382,14 @@ bool HitTestDisplayList::item_can_produce_caret_position(Item const& item) const
         return layout_node && layout_node->dom_node();
     }
     case ItemKind::Box: {
-        auto paintable_box = paintable_for_item(item);
-        if (!paintable_box)
+        auto const* layout_node = layout_node_for_item(item);
+        if (!layout_node)
             return false;
-        if (Painting::effective_z_index(paintable_box->layout_node()).value_or(0) < 0)
+        if (Painting::effective_z_index(*layout_node).value_or(0) < 0)
             return false;
-        return paintable_box->dom_node()
-            && paintable_box->dom_node()->parent()
-            && (paintable_box->layout_node().is_atomic_inline() || paintable_box->layout_node().is_replaced_box());
+        return layout_node->dom_node()
+            && layout_node->dom_node()->parent()
+            && (layout_node->is_atomic_inline() || layout_node->is_replaced_box());
     }
     case ItemKind::SvgPath:
     case ItemKind::ChromeWidget:
@@ -454,9 +445,9 @@ bool HitTestDisplayList::item_is_direct_caret_target(Item const& item) const
 }
 
 // https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
-static GC::Ptr<DOM::Node> image_map_area_for_point(Paintable& paintable, CSSPixelPoint local_point)
+static GC::Ptr<DOM::Node> image_map_area_for_point(Layout::Node const& layout_node, CSSPixelPoint local_point)
 {
-    auto* image_element = as_if<HTML::HTMLImageElement>(paintable.dom_node().ptr());
+    auto* image_element = as_if<HTML::HTMLImageElement>(const_cast<DOM::Node*>(layout_node.dom_node()));
     if (!image_element)
         return {};
 
@@ -466,7 +457,7 @@ static GC::Ptr<DOM::Node> image_map_area_for_point(Paintable& paintable, CSSPixe
 
     // For historical reasons, the coordinates must be interpreted relative to the displayed image after any stretching
     // caused by the CSS 'width' and 'height' properties.
-    auto image_rect = Painting::absolute_rect(paintable.layout_node());
+    auto image_rect = Painting::absolute_rect(layout_node);
     return map_element->area_for_point(local_point - image_rect.location(), image_rect.size());
 }
 
@@ -475,8 +466,8 @@ HitTestResult HitTestDisplayList::hit_test_result_for_item(Item const& item, CSS
     switch (item.kind) {
     case ItemKind::Box: {
         GC::Ptr<DOM::Node> node;
-        if (auto paintable = paintable_for_item(item))
-            node = image_map_area_for_point(*paintable, local_point);
+        if (auto const* layout_node = layout_node_for_item(item))
+            node = image_map_area_for_point(*layout_node, local_point);
         if (!node)
             node = const_cast<DOM::Node*>(event_dispatch_dom_node_for_item(item));
         return HitTestResult {
@@ -780,9 +771,9 @@ bool HitTestDisplayList::line_contains_descendant_of(CaretLine const& line, DOM:
     return false;
 }
 
-Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, CaretPositionMode mode, GC::Ptr<DOM::Node const> constraint_scope) const
+Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, CaretPositionMode mode, GC::Ptr<DOM::Node const> constraint_scope) const
 {
-    if (m_visual_context_tree_version != viewport_paintable.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
         return {};
     ensure_caret_lines();
 
@@ -792,7 +783,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
     //        planes inside 3D rendering contexts.
     Optional<TopmostItem> topmost_item;
     Optional<TopmostItem> topmost_hit_item;
-    find_topmost_items_for_caret(point, viewport_paintable, device_pixels_per_css_pixel, chrome_metrics, topmost_item, topmost_hit_item);
+    find_topmost_items_for_caret(point, document, device_pixels_per_css_pixel, chrome_metrics, topmost_item, topmost_hit_item);
 
     // A constrained search only accepts direct hits inside the constraint scope.
     if (constraint_scope && topmost_item.has_value()) {
@@ -811,7 +802,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
         auto const& item = m_items[topmost_item->index];
         if (auto caret_position = caret_position_for_item(item, topmost_item->local_point); caret_position.has_value()) {
             if (caret_position->debug_rect.has_value())
-                caret_position->debug_rect = viewport_rect_for_context(item.visual_context_index, *caret_position->debug_rect, viewport_paintable, device_pixels_per_css_pixel);
+                caret_position->debug_rect = viewport_rect_for_context(item.visual_context_index, *caret_position->debug_rect, document, device_pixels_per_css_pixel);
             return caret_position;
         }
     }
@@ -831,11 +822,11 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
     // a selection outside a textarea), so it transforms points without rejecting them against clips.
     auto clip_behavior = constraint_scope ? AccumulatedVisualContextTree::ClipBehavior::Ignore : AccumulatedVisualContextTree::ClipBehavior::Respect;
 
-    auto closest_line = find_closest_line(point, viewport_paintable, device_pixels_per_css_pixel, mode, line_scope_dom_node, clip_behavior);
+    auto closest_line = find_closest_line(point, document, device_pixels_per_css_pixel, mode, line_scope_dom_node, clip_behavior);
     if (line_scope_dom_node && !constraint_scope) {
         // The scoped search is only a guard against unrelated nearby content. If there is a plainly closer line
         // outside the scope, use it instead.
-        auto unscoped_closest_line = find_closest_line(point, viewport_paintable, device_pixels_per_css_pixel, mode, nullptr, clip_behavior);
+        auto unscoped_closest_line = find_closest_line(point, document, device_pixels_per_css_pixel, mode, nullptr, clip_behavior);
         if (!closest_line.index.has_value()
             || (unscoped_closest_line.index.has_value() && unscoped_closest_line.block_distance < closest_line.block_distance)) {
             closest_line = unscoped_closest_line;
@@ -847,7 +838,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
             auto const& item = m_items[topmost_hit_item->index];
             auto caret_position = caret_position_for_hit_container(item);
             if (caret_position.has_value() && caret_position->debug_rect.has_value())
-                caret_position->debug_rect = viewport_rect_for_context(item.visual_context_index, *caret_position->debug_rect, viewport_paintable, device_pixels_per_css_pixel);
+                caret_position->debug_rect = viewport_rect_for_context(item.visual_context_index, *caret_position->debug_rect, document, device_pixels_per_css_pixel);
             return caret_position;
         }
         return {};
@@ -856,7 +847,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
     if (!caret_position.has_value())
         return {};
     if (caret_position->debug_rect.has_value())
-        caret_position->debug_rect = viewport_rect_for_context(m_caret_lines[*closest_line.index].visual_context_index, *caret_position->debug_rect, viewport_paintable, device_pixels_per_css_pixel);
+        caret_position->debug_rect = viewport_rect_for_context(m_caret_lines[*closest_line.index].visual_context_index, *caret_position->debug_rect, document, device_pixels_per_css_pixel);
 
     if (!constraint_scope && topmost_hit_item.has_value()) {
         auto const& topmost_hit_item_value = m_items[topmost_hit_item->index];
@@ -864,7 +855,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
             if (item_can_produce_caret_position(topmost_hit_item_value) && item_is_direct_caret_target(topmost_hit_item_value)) {
                 auto caret_position_for_topmost_hit_item = caret_position_for_item(topmost_hit_item_value, topmost_hit_item->local_point);
                 if (caret_position_for_topmost_hit_item.has_value() && caret_position_for_topmost_hit_item->debug_rect.has_value())
-                    caret_position_for_topmost_hit_item->debug_rect = viewport_rect_for_context(topmost_hit_item_value.visual_context_index, *caret_position_for_topmost_hit_item->debug_rect, viewport_paintable, device_pixels_per_css_pixel);
+                    caret_position_for_topmost_hit_item->debug_rect = viewport_rect_for_context(topmost_hit_item_value.visual_context_index, *caret_position_for_topmost_hit_item->debug_rect, document, device_pixels_per_css_pixel);
                 return caret_position_for_topmost_hit_item;
             }
             if (item_is_inline_adjacent_to_line(topmost_hit_item->index, *closest_line.index))
@@ -876,25 +867,25 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
     return caret_position;
 }
 
-Optional<HitTestResult> HitTestDisplayList::hit_test(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
+Optional<HitTestResult> HitTestDisplayList::hit_test(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
 {
-    if (m_visual_context_tree_version != viewport_paintable.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
         return {};
 
-    auto topmost_item = find_topmost_item(point, viewport_paintable, device_pixels_per_css_pixel, chrome_metrics);
+    auto topmost_item = find_topmost_item(point, document, device_pixels_per_css_pixel, chrome_metrics);
     if (!topmost_item.has_value())
         return {};
     return hit_test_result_for_item(m_items[topmost_item->index], topmost_item->local_point);
 }
 
-TraversalDecision HitTestDisplayList::hit_test_all(CSSPixelPoint point, ViewportPaintable const& viewport_paintable, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, Function<TraversalDecision(HitTestResult)> const& callback) const
+TraversalDecision HitTestDisplayList::hit_test_all(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, Function<TraversalDecision(HitTestResult)> const& callback) const
 {
-    if (m_visual_context_tree_version != viewport_paintable.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
         return TraversalDecision::Continue;
 
-    for (auto item_index : hit_item_indices_topmost_first(point, viewport_paintable, device_pixels_per_css_pixel, chrome_metrics)) {
+    for (auto item_index : hit_item_indices_topmost_first(point, document, device_pixels_per_css_pixel, chrome_metrics)) {
         auto const& item = m_items[item_index];
-        auto local_point = local_point_for_visual_context(item.visual_context_index, point, viewport_paintable, device_pixels_per_css_pixel);
+        auto local_point = local_point_for_visual_context(item.visual_context_index, point, document, device_pixels_per_css_pixel);
         if (!local_point.has_value())
             continue;
         if (callback(hit_test_result_for_item(item, *local_point)) == TraversalDecision::Break)

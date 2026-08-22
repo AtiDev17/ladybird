@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <LibMedia/ContainerID.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerScanThread.h>
 #include <LibMedia/Export.h>
@@ -20,7 +21,10 @@ namespace Media::Matroska {
 
 class MEDIA_API MatroskaDemuxer final : public Demuxer {
 public:
-    static DecoderErrorOr<NonnullRefPtr<MatroskaDemuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool should_attempt(NonnullRefPtr<MediaStream> const&);
+    static DecoderErrorOr<NonnullRefPtr<Demuxer>> from_stream(NonnullRefPtr<MediaStream> const&);
+    static bool supports_container_mime_type(ContainerMimeType);
+    static bool supports_codec_in_container(ContainerID, CodecID);
 
     MatroskaDemuxer(NonnullRefPtr<MediaStream> const& stream, Reader&& reader);
     ~MatroskaDemuxer();
@@ -38,10 +42,6 @@ public:
 
     virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
     virtual void set_scan_state_change_handler(Function<void()>) override;
-
-    virtual DecoderErrorOr<CodecID> get_codec_id_for_track(Track const&) override;
-
-    virtual DecoderErrorOr<ReadonlyBytes> get_codec_initialization_data_for_track(Track const&) override;
 
     virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) override;
 
@@ -61,8 +61,9 @@ private:
     struct TrackStatus {
         SampleIterator iterator;
         Optional<Block> block;
-        Vector<ByteBuffer, 4> frames;
+        SampleIterator::Frames frames;
         size_t frame_index { 0 };
+        bool needs_codec_configuration { true };
 
         TrackStatus(SampleIterator&& iterator)
             : iterator(iterator)

@@ -75,9 +75,9 @@
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/Selection/Selection.h>
@@ -569,19 +569,19 @@ void ConnectionFromClient::debug_request(u64 page_id, ByteString request, ByteSt
 
     if (request == "dump-paint-tree") {
         if (auto* doc = page->page().top_level_browsing_context().active_document()) {
-            if (auto paintable = doc->paintable())
-                Web::dump_tree(*paintable);
+            if (doc->has_committed_viewport_box())
+                Web::dump_paint_tree(*doc->layout_node());
         }
         return;
     }
 
     if (request == "dump-stacking-context-tree") {
         if (auto* doc = page->page().top_level_browsing_context().active_document()) {
-            if (auto* viewport = doc->layout_node()) {
-                auto& viewport_paintable = static_cast<Web::Painting::ViewportPaintable&>(*viewport->paintable_box());
-                viewport_paintable.build_stacking_context_tree_if_needed();
+            if (doc->layout_node()) {
+                VERIFY(doc->has_committed_viewport_box());
+                doc->paint_state().build_stacking_context_tree_if_needed(*doc);
                 StringBuilder builder;
-                Web::Painting::dump_stacking_context_tree(builder, viewport_paintable);
+                Web::Painting::dump_stacking_context_tree(builder, *doc);
                 dbgln("{}", builder.string_view());
             }
         }
@@ -1813,12 +1813,12 @@ static void append_paint_tree(Web::Page& page, StringBuilder& builder)
         builder.append("(no layout tree)"sv);
         return;
     }
-    if (!layout_root->paintable()) {
+    if (!document->has_committed_viewport_box()) {
         builder.append("(no paint tree)"sv);
         return;
     }
 
-    Web::dump_tree(builder, *layout_root->paintable());
+    Web::dump_paint_tree(builder, *layout_root);
 }
 
 static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder)
@@ -1836,14 +1836,13 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
         builder.append("(no layout tree)"sv);
         return;
     }
-    if (!layout_root->paintable()) {
+    if (!document->has_committed_viewport_box()) {
         builder.append("(no paint tree)"sv);
         return;
     }
 
-    auto& viewport_paintable = static_cast<Web::Painting::ViewportPaintable&>(*layout_root->paintable_box());
-    viewport_paintable.build_stacking_context_tree_if_needed();
-    Web::Painting::dump_stacking_context_tree(builder, viewport_paintable);
+    document->paint_state().build_stacking_context_tree_if_needed(*document);
+    Web::Painting::dump_stacking_context_tree(builder, *document);
 }
 
 static void append_gc_graph(StringBuilder& builder)

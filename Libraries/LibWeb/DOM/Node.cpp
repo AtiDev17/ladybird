@@ -40,6 +40,7 @@
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/EventDispatcher.h>
+#include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/IDLEventListener.h>
 #include <LibWeb/DOM/LiveNodeList.h>
 #include <LibWeb/DOM/MutationObserver.h>
@@ -86,7 +87,6 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
 #include <LibWeb/XLink/AttributeNames.h>
@@ -172,6 +172,60 @@ void Node::RareData::visit_edges(Cell::Visitor& visitor)
     visitor.visit(children);
     if (registered_observer_list)
         visitor.visit(*registered_observer_list);
+}
+
+void Node::register_html_collection_with_valid_cache(HTMLCollection& collection)
+{
+    auto& collections = ensure_rare_data().html_collections_with_valid_caches;
+    if (!collections)
+        collections = make<HTMLCollectionCacheRegistration::List>();
+    collections->append(collection.m_cache_registration);
+}
+
+void Node::invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadata::AffectsElements affects_elements)
+{
+    if (affects_elements == ChildrenChangedMetadata::AffectsElements::No || !document().has_valid_html_collection_caches())
+        return;
+
+    for (auto* ancestor = this; ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
+            continue;
+
+        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
+            collections.append(registration.collection());
+        for (auto& collection : collections)
+            collection->invalidate_cache_for_tree_mutation(*this);
+    }
+}
+
+void Node::invalidate_html_collection_caches_in_ancestors_for_attribute_change(HTMLCollectionCacheRegistration::AttributeInvalidationTypes invalidation_types)
+{
+    auto& element = as<Element>(*this);
+    for (auto* ancestor = this; ancestor; ancestor = ancestor->parent()) {
+        if (!ancestor->m_rare_data || !ancestor->m_rare_data->html_collections_with_valid_caches)
+            continue;
+
+        GC::RootVector<GC::Ref<HTMLCollection>> collections;
+        for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
+            collections.append(registration.collection());
+        for (auto& collection : collections)
+            collection->invalidate_cache_for_attribute_change(element, invalidation_types);
+    }
+}
+
+static Node::ChildrenChangedMetadata::AffectsElements mutation_affects_elements(ReadonlySpan<GC::Root<Node>> nodes)
+{
+    for (auto const& node : nodes) {
+        if (is<Element>(*node))
+            return Node::ChildrenChangedMetadata::AffectsElements::Yes;
+    }
+    return Node::ChildrenChangedMetadata::AffectsElements::No;
+}
+
+static Node::ChildrenChangedMetadata::AffectsElements mutation_affects_elements(Node& node)
+{
+    return is<Element>(node) ? Node::ChildrenChangedMetadata::AffectsElements::Yes : Node::ChildrenChangedMetadata::AffectsElements::No;
 }
 
 size_t Node::RareData::external_memory_size() const
@@ -733,6 +787,10 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     if (count == 0)
         return;
 
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(nodes.span());
+
     // 4. If node is a DocumentFragment node:
     if (is<DocumentFragment>(*node)) {
         // 1. Remove its children with suppressObservers set to true.
@@ -863,8 +921,9 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     }
 
     // 9. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node };
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node, affects_elements };
     children_changed(metadata);
+    invalidate_html_collection_caches_in_ancestors(affects_elements);
 
     // 10. Let staticNodeList be a list of nodes, initially « ».
     // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
@@ -1118,7 +1177,7 @@ void Node::remove(bool suppress_observers)
             } else if (can_detach_layout_subtree_for_removal(*this, *parent)) {
                 RefPtr<Layout::Node> layout_node = unsafe_layout_node();
                 layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
-                    node.clear_paintable();
+                    node.clear_committed_box();
                     return TraversalDecision::Continue;
                 });
                 layout_node->prepare_subtree_for_detach_from_layout_tree();
@@ -1226,8 +1285,12 @@ void Node::remove(bool suppress_observers)
     }
 
     // 17. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this };
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(*this);
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this, affects_elements };
     parent->children_changed(metadata);
+    parent->invalidate_html_collection_caches_in_ancestors(affects_elements);
 
     document().bump_dom_tree_version();
 }
@@ -1434,6 +1497,10 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     // 8. Assert: oldParent is non-null.
     VERIFY(old_parent);
 
+    auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
+    if (document().has_valid_html_collection_caches())
+        affects_elements = mutation_affects_elements(*this);
+
     struct PreviousReadWriteState {
         GC::Ptr<Element> element;
         bool value;
@@ -1628,6 +1695,9 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 26. Queue a tree mutation record for newParent with « node », « », newPreviousSibling, and child.
     new_parent.queue_tree_mutation_record({ *this }, {}, new_previous_sibling, child);
+
+    old_parent->invalidate_html_collection_caches_in_ancestors(affects_elements);
+    new_parent.invalidate_html_collection_caches_in_ancestors(affects_elements);
 
     document().bump_dom_tree_version();
 
@@ -1940,12 +2010,11 @@ void Node::set_layout_node(Badge<Layout::Node>, Layout::Node& layout_node)
     m_layout_node = layout_node;
 }
 
-void Node::clear_layout_node_and_paintable(Badge<Document>)
+void Node::clear_layout_node(Badge<Document>)
 {
     if (m_layout_node)
         m_layout_node->prepare_for_detach_from_layout_tree();
     m_layout_node = nullptr;
-    m_paintable = nullptr;
 }
 
 void Node::detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>)
@@ -2121,12 +2190,12 @@ void Node::inserted()
     }
 }
 
-void Node::clear_layout_node_paintable()
+void Node::clear_committed_layout_box()
 {
     if (!m_layout_node)
         return;
 
-    m_layout_node->clear_paintable();
+    m_layout_node->clear_committed_box();
 }
 
 void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
@@ -2148,7 +2217,7 @@ void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
     m_inside_blocking_wheel_event_handler = false;
     if (m_layout_node)
         m_layout_node->pin_style_record_for_detachment();
-    clear_layout_node_paintable();
+    clear_committed_layout_box();
     // A top layer element's box is a viewport child rather than part of the parent's box
     // subtree, so the parent rebuild triggered by this removal can never detach it.
     if (m_layout_node) {
@@ -2158,7 +2227,6 @@ void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
         }
     }
     m_layout_node = nullptr;
-    m_paintable = nullptr;
 
     if (auto* element = as_if<Element>(*this))
         element->clear_synthetic_pseudo_element_layout_nodes(Badge<Node> {});
@@ -2466,7 +2534,7 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
         auto const* layout_node = this->layout_node();
         if (layout_node && Painting::has_committed_box(*layout_node)) {
             MUST(object.add("display"sv, Painting::display(*layout_node).to_string()));
-            if (paintable_box()->could_be_scrolled_by_wheel_event()) {
+            if (Painting::could_be_scrolled_by_wheel_event(*layout_node)) {
                 MUST(object.add("scrollable"sv, true));
             }
             if (!Painting::is_visible(*layout_node)) {
@@ -3090,16 +3158,6 @@ Layout::Node* Node::layout_node()
     return m_layout_node;
 }
 
-void Node::set_paintable(WeakPtr<Painting::Paintable> paintable)
-{
-    m_paintable = paintable;
-}
-
-void Node::clear_paintable()
-{
-    m_paintable = nullptr;
-}
-
 void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
     if (auto* layout_node = unsafe_layout_node()) {
@@ -3123,50 +3181,6 @@ void Node::set_needs_layout_update(SetNeedsLayoutReason reason, Layout::LayoutUp
         node->set_needs_layout_update(reason, propagation);
         document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
     }
-}
-
-RefPtr<Painting::Paintable const> Node::paintable() const
-{
-    if (m_paintable)
-        VERIFY(document().layout_is_up_to_date());
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::paintable()
-{
-    if (m_paintable)
-        VERIFY(document().layout_is_up_to_date());
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable const> Node::unsafe_paintable() const
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::unsafe_paintable()
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable const> Node::paintable_box() const
-{
-    return paintable();
-}
-
-RefPtr<Painting::Paintable> Node::paintable_box()
-{
-    return paintable();
-}
-
-RefPtr<Painting::Paintable const> Node::unsafe_paintable_box() const
-{
-    return m_paintable.strong_ref();
-}
-
-RefPtr<Painting::Paintable> Node::unsafe_paintable_box()
-{
-    return m_paintable.strong_ref();
 }
 
 // https://dom.spec.whatwg.org/#queue-a-mutation-record

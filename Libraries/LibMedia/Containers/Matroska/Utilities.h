@@ -6,21 +6,19 @@
 
 #pragma once
 
-#include <AK/String.h>
 #include <LibMedia/CodecID.h>
+#include <LibMedia/ContainerID.h>
+#include <LibMedia/Containers/Matroska/Document.h>
 
 namespace Media::Matroska {
 
-static constexpr CodecID codec_id_from_matroska_id_string(String const& codec_id)
+inline CodecID codec_id_from_matroska_track_entry(TrackEntry const& track)
 {
+    auto codec_id = track.codec_id();
     if (codec_id == "V_VP8")
         return CodecID::VP8;
     if (codec_id == "V_VP9")
         return CodecID::VP9;
-    if (codec_id == "V_MPEG1")
-        return CodecID::MPEG1;
-    if (codec_id == "V_MPEG2")
-        return CodecID::H262;
     if (codec_id == "V_MPEG4/ISO/AVC")
         return CodecID::H264;
     if (codec_id == "V_MPEGH/ISO/HEVC")
@@ -41,7 +39,75 @@ static constexpr CodecID codec_id_from_matroska_id_string(String const& codec_id
         return CodecID::Opus;
     if (codec_id == "A_FLAC")
         return CodecID::FLAC;
+
+    auto audio_track = track.audio_track();
+    if (!audio_track.has_value())
+        return CodecID::Unknown;
+
+    auto bit_depth = audio_track->bit_depth;
+    if (codec_id == "A_PCM/FLOAT/IEEE")
+        return bit_depth == 32 ? CodecID::F32LE : CodecID::Unknown;
+
+    if (codec_id == "A_PCM/INT/BIG")
+        return bit_depth == 8 ? CodecID::U8 : CodecID::Unknown;
+
+    if (codec_id == "A_PCM/INT/LIT") {
+        switch (bit_depth) {
+        case 8:
+            return CodecID::U8;
+        case 16:
+            return CodecID::S16LE;
+        case 24:
+            return CodecID::S24LE;
+        case 32:
+            return CodecID::S32LE;
+        default:
+            return CodecID::Unknown;
+        }
+    }
+
     return CodecID::Unknown;
+}
+
+constexpr bool supports_codec_in_container(ContainerID container_id, CodecID codec_id)
+{
+    if (container_id == ContainerID::WebM) {
+        switch (codec_id) {
+        case CodecID::VP8:
+        case CodecID::VP9:
+        case CodecID::AV1:
+        case CodecID::Vorbis:
+        case CodecID::Opus:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (container_id != ContainerID::Matroska)
+        return false;
+
+    switch (codec_id) {
+    case CodecID::VP8:
+    case CodecID::VP9:
+    case CodecID::H264:
+    case CodecID::H265:
+    case CodecID::MP3:
+    case CodecID::AAC:
+    case CodecID::AV1:
+    case CodecID::Theora:
+    case CodecID::Vorbis:
+    case CodecID::Opus:
+    case CodecID::FLAC:
+    case CodecID::U8:
+    case CodecID::S16LE:
+    case CodecID::S24LE:
+    case CodecID::S32LE:
+    case CodecID::F32LE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 }

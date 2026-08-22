@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
@@ -55,6 +56,7 @@
 #include <LibWeb/HTML/VisibilityState.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/Forward.h>
 #include <LibWeb/Painting/GridInspectorOverlay.h>
@@ -277,11 +279,19 @@ public:
     u64 dom_tree_version() const { return m_dom_tree_version; }
     void bump_dom_tree_version() { ++m_dom_tree_version; }
 
-    u64 form_associated_custom_element_version() const { return m_form_associated_custom_element_version; }
-    void bump_form_associated_custom_element_version() { ++m_form_associated_custom_element_version; }
+    u64 form_controls_version() const { return m_form_controls_version; }
+    void bump_form_controls_version() { ++m_form_controls_version; }
 
     u64 option_selectedness_version() const { return m_option_selectedness_version; }
     void bump_option_selectedness_version() { ++m_option_selectedness_version; }
+
+    using HTMLCollectionAttributeInvalidationType = HTMLCollectionCacheRegistration::AttributeInvalidationType;
+    using HTMLCollectionAttributeInvalidationTypes = HTMLCollectionCacheRegistration::AttributeInvalidationTypes;
+
+    void register_valid_html_collection_cache(HTMLCollectionAttributeInvalidationType) const;
+    void unregister_valid_html_collection_cache(HTMLCollectionAttributeInvalidationType) const;
+    bool has_valid_html_collection_caches() const { return m_html_collection_attribute_invalidation_types != 0; }
+    HTMLCollectionAttributeInvalidationTypes html_collection_attribute_invalidation_types_for_attribute(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_) const;
 
     // Everything a style input record cannot name by an identity of its own: a stylesheet rule's
     // declarations changing under a block that has not moved, a font finishing loading, the
@@ -487,7 +497,6 @@ public:
         HandledByAfterLayoutCommit,
         HandledByFullLayoutCommit,
     };
-    void ensure_scrollable_overflow_is_measured(Layout::Box const&) const;
     void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
     void update_paint_and_hit_testing_properties_if_needed();
     void update_animated_style_if_needed();
@@ -508,13 +517,10 @@ public:
 
     Layout::Viewport const* unsafe_layout_node() const;
     Layout::Viewport* unsafe_layout_node();
+    bool has_committed_viewport_box() const;
 
-    RefPtr<Painting::ViewportPaintable const> paintable() const;
-    RefPtr<Painting::ViewportPaintable> paintable();
-
-    RefPtr<Painting::ViewportPaintable const> unsafe_paintable() const;
-    RefPtr<Painting::ViewportPaintable> unsafe_paintable();
-
+    Painting::DocumentPaintState& paint_state();
+    Painting::DocumentPaintState const& paint_state() const;
     Painting::AccumulatedVisualContextTree const& visual_context_tree() const;
     Painting::ScrollStateSnapshot const& scroll_state_snapshot() const;
 
@@ -808,6 +814,8 @@ public:
     void set_needs_full_layout_tree_update(bool b) { m_needs_full_layout_tree_update = b; }
 
     [[nodiscard]] Layout::NodeArena& layout_node_arena();
+    Painting::ChromeWidgetRegistry& chrome_widget_registry() { return *m_chrome_widget_registry; }
+    Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
     // Attribution of pending updates for partial relayout. Invariant: every update recorded
     // since the last layout pass is either attributed to a boundary in the registered root
@@ -1429,12 +1437,13 @@ private:
 
     virtual void finalize() override final;
 
-    void clear_layout_and_paintable_nodes_for_inactive_document();
+    void clear_layout_nodes_for_inactive_document();
+    void set_layout_root(Layout::Viewport&);
     void tear_down_layout_tree();
     void process_pending_top_layer_layout_changes();
 
     void update_active_element();
-    void collect_paintable_boxes_with_auto_content_visibility();
+    void collect_boxes_with_auto_content_visibility();
     bool needs_style_update_after_layout();
     bool any_anchor_names_are_registered() const;
     PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
@@ -1506,6 +1515,8 @@ private:
     GC::Ref<DOM::EventTarget> m_relevant_global_event_target;
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
+    OwnPtr<Painting::DocumentPaintState> m_paint_state;
+    NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
     RefPtr<Layout::Viewport> m_layout_root;
     bool m_may_have_content_visibility_auto_style { false };
     bool m_may_have_default_scroll_shift_anchor { false };
@@ -1818,10 +1829,10 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
-    Vector<WeakPtr<Painting::Paintable>> m_paintable_boxes_needing_visual_context_value_update;
+    Vector<Layout::RustFFI::PaintableSlotId> m_boxes_needing_visual_context_value_update;
 
     bool m_needs_full_scrollable_overflow_recalculation { false };
-    Vector<WeakPtr<Painting::Paintable>> m_paintable_boxes_needing_scrollable_overflow_recalculation;
+    Vector<Layout::RustFFI::PaintableSlotId> m_boxes_needing_scrollable_overflow_recalculation;
     CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     // The previous recording's list, retained so cached per-paintable item ranges can be spliced into
@@ -1845,8 +1856,10 @@ private:
     Optional<AK::UnixDateTime> m_last_modified;
 
     u64 m_dom_tree_version { 0 };
-    u64 m_form_associated_custom_element_version { 0 };
+    u64 m_form_controls_version { 0 };
     u64 m_option_selectedness_version { 0 };
+    mutable Array<u64, to_underlying(HTMLCollectionAttributeInvalidationType::Count)> m_html_collection_attribute_invalidation_type_counts {};
+    mutable HTMLCollectionAttributeInvalidationTypes m_html_collection_attribute_invalidation_types { 0 };
     u64 m_style_environment_version { 0 };
     u64 m_next_counter_style_environment_identity { 1 };
     u64 m_character_data_version { 0 };

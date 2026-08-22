@@ -84,7 +84,6 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/RequestIdleCallback/IdleDeadline.h>
 #include <LibWeb/Selection/Selection.h>
@@ -1782,7 +1781,7 @@ void Window::scroll(ScrollToOptions const& options, GC::Ptr<WebIDL::Promise> pro
         auto const* layout_node = document->layout_node();
         VERIFY(layout_node && Painting::has_committed_box(*layout_node));
         auto scrolling_area = Painting::scrollable_overflow_rect(*layout_node).value().to_type<float>();
-        auto overflow_directions = Painting::rust_physical_overflow_directions(*document->paintable_box());
+        auto overflow_directions = Painting::rust_physical_overflow_directions(*layout_node);
 
         // 7. -> If the viewport has rightward overflow direction
         //       Let x be max(0, min(x, viewport scrolling area width - viewport width)).
@@ -2213,8 +2212,7 @@ Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCol
         if ((is<HTMLEmbedElement>(element) || is<HTMLFormElement>(element) || is<HTMLImageElement>(element) || is<HTMLObjectElement>(element))
             && (element.name() == name))
             return true;
-        return element.id() == name;
-    });
+        return element.id() == name; }, DOM::HTMLCollection::AttributeInvalidationType::IdOrName);
     return collection;
 }
 

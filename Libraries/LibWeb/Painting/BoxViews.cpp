@@ -14,26 +14,181 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
+#include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
+#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
+#include <LibWeb/SVG/SVGFilterElement.h>
+#include <LibWeb/SVG/SVGFitToViewBox.h>
+#include <LibWeb/SVG/SVGSVGElement.h>
 
 namespace Web::Painting {
 
-bool has_committed_box(Layout::Node const& node)
+static bool g_paint_viewport_scrollbars = true;
+
+void set_paint_viewport_scrollbars(bool enabled)
 {
-    return node.paintable_ptr();
+    g_paint_viewport_scrollbars = enabled;
 }
 
-static bool has_flag(Paintable const& paintable, Layout::RustFFI::PaintableFlag flag)
+bool should_paint_viewport_scrollbars()
 {
-    return (paintable.rust_data().flags & to_underlying(flag)) != 0;
+    return g_paint_viewport_scrollbars;
+}
+
+bool body_background_is_propagated_to_root(Layout::NodeWithStyle const& layout_node)
+{
+    if (!layout_node.is_body())
+        return false;
+    // Reachable at invalidation time, when the root element's layout node may already be detached.
+    auto const* html_element = layout_node.document().html_element();
+    return html_element && html_element->unsafe_layout_node() && html_element->should_use_body_background_properties();
+}
+
+Layout::Node const* nearest_svg_viewport_of(Layout::Node const& layout_node)
+{
+    for (auto const* ancestor = layout_node.parent(); ancestor; ancestor = ancestor->parent()) {
+        if (svg_viewport_transform(*ancestor).has_value())
+            return ancestor;
+    }
+    return nullptr;
+}
+
+// active_view_box covers <view> redirection and the svg-as-image fallback viewBox, which
+// layout used to build the geometry these callers interpret.
+static Gfx::FloatRect svg_svg_box_view_box_or_viewport_rect(Layout::Box const& svg_svg_box)
+{
+    if (auto view_box = as<SVG::SVGSVGElement>(*svg_svg_box.dom_node()).active_view_box(); view_box.has_value())
+        return { view_box->min_x, view_box->min_y, view_box->width, view_box->height };
+    if (auto const* row = committed_row(svg_svg_box))
+        return { {}, { CSSPixels::from_raw(row->svg_viewport_size.width).to_float(), CSSPixels::from_raw(row->svg_viewport_size.height).to_float() } };
+    return {};
+}
+
+Gfx::FloatRect svg_viewport_user_rect(Layout::Node const& viewport)
+{
+    if (viewport.is_svg_svg_box())
+        return svg_svg_box_view_box_or_viewport_rect(static_cast<Layout::Box const&>(viewport));
+    if (auto const* dom_node = viewport.dom_node()) {
+        if (auto const* fit_to_view_box = as_if<SVG::SVGFitToViewBox>(*dom_node)) {
+            if (auto view_box = fit_to_view_box->view_box(); view_box.has_value())
+                return { static_cast<float>(view_box->min_x), static_cast<float>(view_box->min_y), static_cast<float>(view_box->width), static_cast<float>(view_box->height) };
+        }
+    }
+    return { {}, absolute_rect(viewport).size().to_type<float>() };
+}
+
+ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView computed_filter, Layout::NodeWithStyle const& layout_node)
+{
+    ResolvedCSSFilter result;
+    bool failed = false;
+    computed_filter.for_each_operation([&](auto const& operation) {
+        if (failed)
+            return;
+        if (auto const* url = operation.template get_pointer<CSS::Filter::Url>()) {
+            if (url->fragment.is_empty()) {
+                failed = true;
+                return;
+            }
+            auto maybe_filter = layout_node.document().get_element_by_id(url->fragment);
+            if (!maybe_filter) {
+                failed = true;
+                return;
+            }
+            if (auto* filter_element = as_if<SVG::SVGFilterElement>(*maybe_filter)) {
+                // Filter primitive lengths are specified in the filtered element's user coordinate system, but the
+                // resulting filter operates in device pixels. Compute the user-unit-to-device-pixel scale so the
+                // filter can convert its lengths accordingly.
+                // The replay-time layer maps filter parameters through the accumulated transform,
+                // so only the device pixel ratio — which lives in recorded coordinates, not in the
+                // transform chain — converts here.
+                auto device_pixels_per_css_pixel = layout_node.document().page().client().device_pixels_per_css_pixel();
+                auto filter_scale = Gfx::FloatPoint { device_pixels_per_css_pixel, device_pixels_per_css_pixel };
+                result.svg_filter = filter_element->gfx_filter(layout_node, filter_scale);
+                // The bounds live in the filtered element's user space; an element without
+                // geometry of its own falls back to the whole enclosing viewport rect there.
+                auto bounds = absolute_border_box_rect(layout_node);
+                if (bounds.is_empty()) {
+                    if (auto const* viewport = nearest_svg_viewport_of(layout_node))
+                        result.svg_filter_bounds = svg_viewport_user_rect(*viewport).to_type<CSSPixels>();
+                }
+                if (!bounds.is_empty())
+                    result.svg_filter_bounds = bounds;
+            } else {
+                failed = true;
+            }
+            return;
+        }
+
+        operation.visit(
+            [&](CSS::Filter::Blur const& blur) {
+                result.operations.empend(ResolvedCSSFilter::Blur {
+                    .radius = CSSPixels::nearest_value_for(blur.resolved_radius),
+                });
+            },
+            [&](CSS::Filter::DropShadow const& drop_shadow) {
+                result.operations.empend(ResolvedCSSFilter::DropShadow {
+                    .offset_x = drop_shadow.offset_x,
+                    .offset_y = drop_shadow.offset_y,
+                    .radius = drop_shadow.radius,
+                    .color = drop_shadow.color,
+                });
+            },
+            [&](CSS::Filter::ColorOperation const& color_operation) {
+                result.operations.empend(ResolvedCSSFilter::Color {
+                    .operation = color_operation.operation,
+                    .amount = color_operation.resolved_amount,
+                });
+            },
+            [&](CSS::Filter::HueRotate const& hue_rotate) {
+                result.operations.empend(ResolvedCSSFilter::HueRotate {
+                    .angle_degrees = hue_rotate.angle_degrees,
+                });
+            },
+            [&](CSS::Filter::Url const&) {});
+    });
+    if (failed)
+        return {};
+    return result;
+}
+
+static_assert(Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX == Layout::RustFFI::INVALID_NODE_SLOT_INDEX);
+
+Layout::RustFFI::PaintableSlotId committed_row_slot(Layout::Node const& node)
+{
+    return { Layout::Node::slot_id(&node).index };
+}
+
+Layout::RustFFI::PaintableSlotId viewport_row_slot(DOM::Document const& document)
+{
+    return { Layout::Node::slot_id(document.unsafe_layout_node()).index };
+}
+
+Layout::RustFFI::PaintableData const* committed_row(Layout::Node const& node)
+{
+    return Layout::RustFFI::layout_arena_paintable_row(node.arena_handle(), committed_row_slot(node));
+}
+
+bool has_committed_box(Layout::Node const& node)
+{
+    return committed_row(node) != nullptr;
+}
+
+Layout::Node* layout_node_for_committed_slot(Layout::NodeArena& arena, Layout::RustFFI::PaintableSlotId slot)
+{
+    return static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_paintable_layout_node_shell(arena.handle(), slot));
+}
+
+static bool has_flag(Layout::RustFFI::PaintableData const& row, Layout::RustFFI::PaintableFlag flag)
+{
+    return (row.flags & to_underlying(flag)) != 0;
 }
 
 static PixelBox pixel_box_from_ffi(Layout::RustFFI::FfiPixelBox const& box)
@@ -43,26 +198,17 @@ static PixelBox pixel_box_from_ffi(Layout::RustFFI::FfiPixelBox const& box)
 
 CSSPixelRect absolute_rect(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
-    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_rect(paintable->rust_arena().handle(), paintable->rust_slot()));
+    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_rect(node.arena_handle(), committed_row_slot(node)));
 }
 
 CSSPixelRect absolute_padding_box_rect(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
-    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_padding_box_rect(paintable->rust_arena().handle(), paintable->rust_slot()));
+    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_padding_box_rect(node.arena_handle(), committed_row_slot(node)));
 }
 
 CSSPixelRect absolute_border_box_rect(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
-    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_border_box_rect(paintable->rust_arena().handle(), paintable->rust_slot()));
+    return from_ffi_css_pixel_rect(Layout::RustFFI::layout_arena_paintable_absolute_border_box_rect(node.arena_handle(), committed_row_slot(node)));
 }
 
 CSSPixelPoint absolute_position(Layout::Node const& node)
@@ -82,18 +228,18 @@ CSSPixels absolute_y(Layout::Node const& node)
 
 CSSPixelPoint offset(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    return { CSSPixels::from_raw(paintable->rust_data().offset.x), CSSPixels::from_raw(paintable->rust_data().offset.y) };
+    return { CSSPixels::from_raw(row->offset.x), CSSPixels::from_raw(row->offset.y) };
 }
 
 CSSPixelSize content_size(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    return { CSSPixels::from_raw(paintable->rust_data().content_size.width), CSSPixels::from_raw(paintable->rust_data().content_size.height) };
+    return { CSSPixels::from_raw(row->content_size.width), CSSPixels::from_raw(row->content_size.height) };
 }
 
 CSSPixels content_width(Layout::Node const& node)
@@ -108,14 +254,14 @@ CSSPixels content_height(Layout::Node const& node)
 
 BoxModelMetrics box_model(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     return {
-        .margin = pixel_box_from_ffi(paintable->rust_data().margin),
-        .padding = pixel_box_from_ffi(paintable->rust_data().padding),
-        .border = pixel_box_from_ffi(paintable->rust_data().border),
-        .inset = pixel_box_from_ffi(paintable->rust_data().inset),
+        .margin = pixel_box_from_ffi(row->margin),
+        .padding = pixel_box_from_ffi(row->padding),
+        .border = pixel_box_from_ffi(row->border),
+        .inset = pixel_box_from_ffi(row->inset),
     };
 }
 
@@ -133,51 +279,57 @@ CSSPixels border_box_height(Layout::Node const& node)
 
 Optional<OverflowData> overflow_data(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable || !paintable->rust_data().has_overflow)
+    auto const* row = committed_row(node);
+    if (!row || !row->has_overflow)
         return {};
-    return OverflowData { from_ffi_css_pixel_rect(paintable->rust_data().overflow.rect), paintable->rust_data().overflow.has_scrollable_overflow };
+    return OverflowData { from_ffi_css_pixel_rect(row->overflow.rect), row->overflow.has_scrollable_overflow };
 }
 
 Optional<CachedOverflowData> cached_overflow_data(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable || !paintable->rust_data().has_cached_overflow)
+    auto const* row = committed_row(node);
+    if (!row || !row->has_cached_overflow)
         return {};
-    return CachedOverflowData { from_ffi_css_pixel_rect(paintable->rust_data().cached_overflow.rect), paintable->rust_data().cached_overflow.has_scrollable_overflow };
+    return CachedOverflowData { from_ffi_css_pixel_rect(row->cached_overflow.rect), row->cached_overflow.has_scrollable_overflow };
+}
+
+static void measure_scrollable_overflow_if_missing(Layout::Node const& node, Layout::RustFFI::PaintableData const& row)
+{
+    if (row.has_overflow || row.has_cached_overflow)
+        return;
+    if (auto const* box = as_if<Layout::Box>(node))
+        rust_measure_scrollable_overflow(*box);
 }
 
 bool has_scrollable_overflow(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return false;
-    if (auto const* box = as_if<Layout::Box>(node))
-        node.document().ensure_scrollable_overflow_is_measured(*box);
-    if (paintable->rust_data().has_overflow)
-        return paintable->rust_data().overflow.has_scrollable_overflow;
-    return paintable->rust_data().has_cached_overflow && paintable->rust_data().cached_overflow.has_scrollable_overflow;
+    measure_scrollable_overflow_if_missing(node, *row);
+    if (row->has_overflow)
+        return row->overflow.has_scrollable_overflow;
+    return row->has_cached_overflow && row->cached_overflow.has_scrollable_overflow;
 }
 
 Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    if (auto const* box = as_if<Layout::Box>(node))
-        node.document().ensure_scrollable_overflow_is_measured(*box);
-    if (paintable->rust_data().has_overflow)
-        return from_ffi_css_pixel_rect(paintable->rust_data().overflow.rect);
-    if (!paintable->rust_data().has_cached_overflow)
+    measure_scrollable_overflow_if_missing(node, *row);
+    if (row->has_overflow)
+        return from_ffi_css_pixel_rect(row->overflow.rect);
+    if (!row->has_cached_overflow)
         return {};
-    auto rect = from_ffi_css_pixel_rect(paintable->rust_data().cached_overflow.rect);
+    auto rect = from_ffi_css_pixel_rect(row->cached_overflow.rect);
     rect.translate_by(absolute_padding_box_rect(node).location());
     return rect;
 }
 
 bool is_visible(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return false;
     auto const& styled_node = as<Layout::NodeWithStyle>(node);
     return styled_node.visibility() == CSS::Visibility::Visible && styled_node.opacity() != 0;
@@ -185,92 +337,91 @@ bool is_visible(Layout::Node const& node)
 
 bool visible_for_hit_testing(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    if (!has_committed_box(node))
         return false;
-    if (auto dom_node = paintable->dom_node(); dom_node && dom_node->is_inert())
+    if (auto dom_node = node.dom_node(); dom_node && dom_node->is_inert())
         return false;
     return as<Layout::NodeWithStyle>(node).pointer_events() != CSS::PointerEvents::None;
 }
 
 bool has_stacking_context(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->rust_data().stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT;
+    auto const* row = committed_row(node);
+    return row && row->stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT;
 }
 
 CSS::Display display(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    return CSS::display_from_ffi_display(CSS::decode_ffi_display(paintable->rust_data().display));
+    return CSS::display_from_ffi_display(CSS::decode_ffi_display(row->display));
 }
 
 bool is_positioned(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::Positioned);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::Positioned);
 }
 
 bool is_fixed_position(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::FixedPosition);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::FixedPosition);
 }
 
 bool is_sticky_position(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::StickyPosition);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::StickyPosition);
 }
 
 bool is_absolutely_positioned(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::AbsolutelyPositioned);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::AbsolutelyPositioned);
 }
 
 bool is_floating(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::Floating);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::Floating);
 }
 
 bool is_inline(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::Inline);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::Inline);
 }
 
 bool has_css_transform(Layout::Node const& node)
 {
-    return node.paintable_ptr() && as<Layout::NodeWithStyle>(node).has_css_transform();
+    return has_committed_box(node) && as<Layout::NodeWithStyle>(node).has_css_transform();
 }
 
 bool has_non_invertible_css_transform(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && has_flag(*paintable, Layout::RustFFI::PaintableFlag::HasNonInvertibleCssTransform);
+    auto const* row = committed_row(node);
+    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::HasNonInvertibleCssTransform);
 }
 
 bool uses_collapsing_borders_model(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->rust_data().uses_collapsing_borders_model;
+    auto const* row = committed_row(node);
+    return row && row->uses_collapsing_borders_model;
 }
 
 SelectionState selection_state(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    return static_cast<SelectionState>(paintable->rust_data().selection_state);
+    return static_cast<SelectionState>(row->selection_state);
 }
 
 CSS::StyleRecordID style_record_identity(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return {};
     return as<Layout::NodeWithStyle>(node).style_record_identity();
 }
@@ -323,35 +474,36 @@ static StringView class_name_for_kind(Layout::RustFFI::PaintableKind kind)
 
 StringView class_name(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable ? class_name_for_kind(paintable->kind()) : StringView {};
+    auto const* row = committed_row(node);
+    return row ? class_name_for_kind(row->kind) : StringView {};
 }
 
 String debug_description(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    return MUST(String::formatted("{}({})", class_name(node), node.debug_description()));
+    return MUST(String::formatted("{}({})", class_name_for_kind(row->kind), node.debug_description()));
 }
 
 bool is_navigable_container_viewport_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::NavigableContainerViewportPaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::NavigableContainerViewportPaintable;
 }
 
 bool is_viewport_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::ViewportPaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::ViewportPaintable;
 }
 
 bool is_paintable_with_lines(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return false;
-    auto kind = paintable->kind();
+    auto kind = row->kind;
     return kind == Layout::RustFFI::PaintableKind::PaintableWithLines
         || kind == Layout::RustFFI::PaintableKind::ViewportPaintable
         || kind == Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable;
@@ -359,16 +511,16 @@ bool is_paintable_with_lines(Layout::Node const& node)
 
 bool is_inline_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::InlinePaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::InlinePaintable;
 }
 
 bool is_svg_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return false;
-    switch (paintable->kind()) {
+    switch (row->kind) {
     case Layout::RustFFI::PaintableKind::SVGGraphicsPaintable:
     case Layout::RustFFI::PaintableKind::SVGPathPaintable:
     case Layout::RustFFI::PaintableKind::SVGImagePaintable:
@@ -383,102 +535,96 @@ bool is_svg_paintable(Layout::Node const& node)
 
 bool is_svg_svg_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::SVGSVGPaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::SVGSVGPaintable;
 }
 
 bool is_svg_path_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::SVGPathPaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::SVGPathPaintable;
 }
 
 bool is_svg_foreign_object_paintable(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->kind() == Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable;
+    auto const* row = committed_row(node);
+    return row && row->kind == Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable;
 }
 
 Optional<int> effective_z_index(Layout::Node const& node)
 {
-    if (!node.paintable_ptr() || !is_positioned(node))
+    if (!is_positioned(node))
         return {};
     return as<Layout::NodeWithStyle>(node).z_index();
 }
 
 bool has_accumulated_visual_context(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->rust_data().has_accumulated_visual_context;
+    auto const* row = committed_row(node);
+    return row && row->has_accumulated_visual_context;
 }
 
 VisualContextIndex accumulated_visual_context_index(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable ? VisualContextIndex { paintable->rust_data().accumulated_visual_context_index } : VisualContextIndex {};
+    auto const* row = committed_row(node);
+    return row ? VisualContextIndex { row->accumulated_visual_context_index } : VisualContextIndex {};
 }
 
 VisualContextIndex accumulated_visual_context_for_descendants_index(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable ? VisualContextIndex { paintable->rust_data().accumulated_visual_context_for_descendants_index } : VisualContextIndex {};
+    auto const* row = committed_row(node);
+    return row ? VisualContextIndex { row->accumulated_visual_context_for_descendants_index } : VisualContextIndex {};
 }
 
 Optional<VisualContextIndex> fixed_background_visual_context(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable || !paintable->rust_data().has_fixed_background_visual_context)
+    auto const* row = committed_row(node);
+    if (!row || !row->has_fixed_background_visual_context)
         return {};
-    return VisualContextIndex { paintable->rust_data().fixed_background_visual_context };
+    return VisualContextIndex { row->fixed_background_visual_context };
 }
 
 VisualContextIndex enclosing_scroll_node_index(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable ? VisualContextIndex { paintable->rust_data().enclosing_scroll_node_index } : VisualContextIndex {};
+    auto const* row = committed_row(node);
+    return row ? VisualContextIndex { row->enclosing_scroll_node_index } : VisualContextIndex {};
 }
 
 VisualContextIndex own_scroll_node_index(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable ? VisualContextIndex { paintable->rust_data().own_scroll_node_index } : VisualContextIndex {};
+    auto const* row = committed_row(node);
+    return row ? VisualContextIndex { row->own_scroll_node_index } : VisualContextIndex {};
 }
 
 Gfx::Path const* committed_svg_path(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return nullptr;
-    return static_cast<Gfx::Path const*>(Layout::RustFFI::layout_arena_paintable_computed_svg_path(paintable->rust_arena().handle(), paintable->rust_slot()));
+    return static_cast<Gfx::Path const*>(Layout::RustFFI::layout_arena_paintable_computed_svg_path(node.arena_handle(), committed_row_slot(node)));
 }
 
 CSSPixelSize svg_viewport_size(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     return {
-        CSSPixels::from_raw(paintable->rust_data().svg_viewport_size.width),
-        CSSPixels::from_raw(paintable->rust_data().svg_viewport_size.height),
+        CSSPixels::from_raw(row->svg_viewport_size.width),
+        CSSPixels::from_raw(row->svg_viewport_size.height),
     };
 }
 
 Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable || !paintable->rust_data().has_svg_viewport_transform)
+    auto const* row = committed_row(node);
+    if (!row || !row->has_svg_viewport_transform)
         return {};
-    auto const& transform = paintable->rust_data().svg_viewport_transform;
+    auto const& transform = row->svg_viewport_transform;
     return Gfx::AffineTransform { transform.a, transform.b, transform.c, transform.d, transform.e, transform.f };
 }
 
 Optional<UsedGridTrackList> used_values_for_grid_template_columns(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
     Optional<UsedGridTrackList> result;
-    Layout::RustFFI::layout_arena_paintable_used_grid_tracks(paintable->rust_arena().handle(), paintable->rust_slot(), &result,
+    Layout::RustFFI::layout_arena_paintable_used_grid_tracks(node.arena_handle(), committed_row_slot(node), &result,
         [](void* context, Layout::RustFFI::FfiUsedGridTrackList const* columns, Layout::RustFFI::FfiUsedGridTrackList const*) {
             *static_cast<Optional<UsedGridTrackList>*>(context) = Layout::build_used_grid_track_list(*columns);
         });
@@ -487,11 +633,8 @@ Optional<UsedGridTrackList> used_values_for_grid_template_columns(Layout::Node c
 
 Optional<UsedGridTrackList> used_values_for_grid_template_rows(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
     Optional<UsedGridTrackList> result;
-    Layout::RustFFI::layout_arena_paintable_used_grid_tracks(paintable->rust_arena().handle(), paintable->rust_slot(), &result,
+    Layout::RustFFI::layout_arena_paintable_used_grid_tracks(node.arena_handle(), committed_row_slot(node), &result,
         [](void* context, Layout::RustFFI::FfiUsedGridTrackList const*, Layout::RustFFI::FfiUsedGridTrackList const* rows) {
             *static_cast<Optional<UsedGridTrackList>*>(context) = Layout::build_used_grid_track_list(*rows);
         });
@@ -500,11 +643,11 @@ Optional<UsedGridTrackList> used_values_for_grid_template_rows(Layout::Node cons
 
 CSSPixelPoint box_type_agnostic_position(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    if (paintable->kind() == Layout::RustFFI::PaintableKind::InlinePaintable) {
-        auto result = Layout::RustFFI::layout_arena_inline_paintable_first_piece_position(paintable->rust_arena().handle(), paintable->rust_slot());
+    if (row->kind == Layout::RustFFI::PaintableKind::InlinePaintable) {
+        auto result = Layout::RustFFI::layout_arena_inline_paintable_first_piece_position(node.arena_handle(), committed_row_slot(node));
         if (result.has_value)
             return { CSSPixels::from_raw(result.x), CSSPixels::from_raw(result.y) };
     }
@@ -513,25 +656,24 @@ CSSPixelPoint box_type_agnostic_position(Layout::Node const& node)
 
 SelectionStyle selection_style(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    if (!has_committed_box(node))
         return {};
-    return selection_style_for_node(node, paintable->dom_node());
+    return selection_style_for_node(node, node.dom_node());
 }
 
 bool has_sticky_insets(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    return paintable && paintable->rust_data().has_sticky_insets;
+    auto const* row = committed_row(node);
+    return row && row->has_sticky_insets;
 }
 
 StickyInsets sticky_insets(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
-    VERIFY(has_sticky_insets(node));
-    auto const& insets = paintable->rust_data().sticky_insets;
+    VERIFY(row->has_sticky_insets);
+    auto const& insets = row->sticky_insets;
     auto side = [](i32 raw, bool present) -> Optional<CSSPixels> {
         if (!present)
             return {};
@@ -542,7 +684,7 @@ StickyInsets sticky_insets(Layout::Node const& node)
 
 bool should_paint_cursor(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return false;
 
     auto const& document = node.document();
@@ -567,7 +709,9 @@ bool should_paint_cursor(Layout::Node const& node)
 Layout::Node const* nearest_self_painting_inline_box(Layout::Node const& node)
 {
     for (auto const* ancestor = node.nearest_fragmented_inline_ancestor(); ancestor; ancestor = ancestor->nearest_fragmented_inline_ancestor()) {
-        if (is_inline_paintable(*ancestor) && (has_stacking_context(*ancestor) || is_positioned(*ancestor)))
+        auto const* row = committed_row(*ancestor);
+        if (row && row->kind == Layout::RustFFI::PaintableKind::InlinePaintable
+            && (row->stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT || has_flag(*row, Layout::RustFFI::PaintableFlag::Positioned)))
             return ancestor;
     }
     return nullptr;
@@ -575,22 +719,17 @@ Layout::Node const* nearest_self_painting_inline_box(Layout::Node const& node)
 
 bool has_content(Layout::Node const& node)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return false;
-
     // Interrupting block-in-inline children produce only placeholder pieces, so any child
     // paintable also counts as content.
-    return Layout::RustFFI::layout_arena_inline_paintable_has_content_pieces(paintable->rust_arena().handle(), paintable->rust_slot())
-        || Layout::RustFFI::layout_arena_paintable_has_child_paintables(paintable->rust_arena().handle(), paintable->rust_slot());
+    return Layout::RustFFI::layout_arena_inline_paintable_has_content_pieces(node.arena_handle(), committed_row_slot(node))
+        || Layout::RustFFI::layout_arena_paintable_has_child_paintables(node.arena_handle(), committed_row_slot(node));
 }
 
 // Caret rect for a cursor parked on this paintable's DOM node at the given child offset, e.g. on an empty line
 // rendered by a <br> child or in an empty editable element.
 CSSPixelRect caret_rect_for_child_offset(Layout::Node const& block, size_t offset)
 {
-    auto const* paintable = block.paintable_ptr();
-    if (!paintable)
+    if (!has_committed_box(block))
         return {};
     auto const& styled_block = as<Layout::NodeWithStyle>(block);
 
@@ -607,7 +746,7 @@ CSSPixelRect caret_rect_for_child_offset(Layout::Node const& block, size_t offse
         auto* previous_child = dom_node->child_at_index(offset - 1);
         auto const* previous_layout_node = previous_child ? previous_child->unsafe_layout_node() : nullptr;
         if (previous_layout_node && previous_layout_node->is_atomic_inline()) {
-            auto result = Layout::RustFFI::layout_arena_paintable_first_fragment_rect_for_node(paintable->rust_arena().handle(), paintable->rust_slot(), Layout::Node::slot_id(previous_layout_node));
+            auto result = Layout::RustFFI::layout_arena_paintable_first_fragment_rect_for_node(block.arena_handle(), committed_row_slot(block), Layout::Node::slot_id(previous_layout_node));
             if (result.has_value) {
                 auto fragment_rect = from_ffi_css_pixel_rect(result.rect);
                 if (styled_block.writing_mode() == CSS::WritingMode::HorizontalTb)
@@ -631,7 +770,7 @@ CSSPixelRect caret_rect_for_child_offset(Layout::Node const& block, size_t offse
         Optional<CSSPixels> preceding_content_bottom;
     } preceding_context { const_cast<DOM::Node&>(*child), {} };
     Layout::RustFFI::layout_arena_for_each_subtree_fragment_rect(
-        paintable->rust_arena().handle(), paintable->rust_slot(), &preceding_context,
+        block.arena_handle(), committed_row_slot(block), &preceding_context,
         [](void* context_pointer, void* fragment_layout_node_shell, Layout::RustFFI::FfiCssPixelRect rect) {
             auto& context = *static_cast<PrecedingContentContext*>(context_pointer);
             auto const* fragment_layout_node = static_cast<Layout::Node const*>(fragment_layout_node_shell);
@@ -664,8 +803,7 @@ static bool layout_node_is_visible(Layout::NodeWithStyle const& layout_node)
 
 Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node const* owner_inline)
 {
-    auto const* paintable = block.paintable_ptr();
-    if (!paintable || !should_paint_cursor(block))
+    if (!should_paint_cursor(block))
         return {};
     auto const& styled_block = as<Layout::NodeWithStyle>(block);
 
@@ -680,12 +818,11 @@ Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node
 
     if (!text_slots.is_empty()) {
         auto result = Layout::RustFFI::layout_arena_text_caret_rect_for_position(
-            paintable->rust_arena().handle(), text_slots.data(), text_slots.size(), cursor_position->offset(),
+            block.arena_handle(), text_slots.data(), text_slots.size(), cursor_position->offset(),
             cursor_position->affinity() == TextAffinity::Downstream);
-        if (result.found && result.owner_paintable.index == paintable->rust_slot().index) {
-            auto const* owner_paintable = owner_inline ? owner_inline->paintable_ptr() : nullptr;
-            auto owner_slot = owner_paintable ? owner_paintable->rust_slot()
-                                              : Layout::RustFFI::PaintableSlotId { Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
+        if (result.found && result.owner_paintable.index == committed_row_slot(block).index) {
+            auto owner_slot = owner_inline ? committed_row_slot(*owner_inline)
+                                           : Layout::RustFFI::PaintableSlotId { Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
             if (result.nearest_self_painting_inline.index != owner_slot.index)
                 return {};
             auto const* style_source = static_cast<Layout::NodeWithStyle const*>(result.style_source);
@@ -709,7 +846,7 @@ Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node
 
     if (!text_slots.is_empty()) {
         auto empty_line = Layout::RustFFI::layout_arena_paintable_empty_line_caret_rect(
-            paintable->rust_arena().handle(), paintable->rust_slot(), text_slots.data(), text_slots.size(), cursor_position->offset());
+            block.arena_handle(), committed_row_slot(block), text_slots.data(), text_slots.size(), cursor_position->offset());
         if (empty_line.has_value) {
             auto const* style_source = static_cast<Layout::NodeWithStyle const*>(empty_line.style_source);
             if (!style_source)
@@ -728,12 +865,9 @@ Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node
 
 Optional<CaretPaint> resolve_empty_editable_caret_paint(Layout::Node const& node)
 {
-    if (!node.paintable_ptr() || has_content(node))
+    if (!should_paint_cursor(node) || has_content(node))
         return {};
     auto const& styled_node = as<Layout::NodeWithStyle>(node);
-
-    if (!should_paint_cursor(node))
-        return {};
 
     auto cursor_position = node.document().cursor_position();
     VERIFY(cursor_position);
@@ -772,7 +906,7 @@ static Optional<CSS::BorderData> border_data_for_outline(Layout::Node const& lay
 
 Optional<CSS::BorderData> outline_data(Layout::Node const& node, CSS::ComputedValues const& computed_values)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return {};
 
     // The `auto` outline is the UA focus ring; like native controls, it is only shown while the window has focus.
@@ -785,14 +919,14 @@ Optional<CSS::BorderData> outline_data(Layout::Node const& node, CSS::ComputedVa
 
 CSSPixels outline_offset(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return {};
     return as<Layout::NodeWithStyle>(node).outline_offset();
 }
 
 CSSPixelRect transform_reference_box(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return {};
 
     auto transform_box = as<Layout::NodeWithStyle>(node).transform_box();
@@ -850,7 +984,7 @@ CSSPixelRect transform_reference_box(Layout::Node const& node)
         // FIXME: If a viewBox attribute is specified for the SVG viewport creating element:
         //  - The reference box is positioned at the origin of the coordinate system established by the viewBox attribute.
         //  - The dimension of the reference box is set to the width and height values of the viewBox attribute.
-        auto const* viewport_paintable = nearest_svg_viewport_paintable_of(node);
+        auto const* viewport_paintable = nearest_svg_viewport_of(node);
         if (!viewport_paintable)
             return absolute_border_box_rect(node);
         return svg_viewport_user_rect(*viewport_paintable).to_type<CSSPixels>();
@@ -861,28 +995,30 @@ CSSPixelRect transform_reference_box(Layout::Node const& node)
 
 CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
 {
-    if (!node.paintable_ptr())
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     auto const& document = node.document();
-    if (!document.paintable())
+    if (!document.layout_node() || !has_committed_box(*document.layout_node()))
         return rect;
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
     auto result = document.visual_context_tree().transform_rect_to_viewport(
-        accumulated_visual_context_index(node), rect.to_type<float>() * pixel_ratio,
+        VisualContextIndex { row->accumulated_visual_context_index }, rect.to_type<float>() * pixel_ratio,
         document.scroll_state_snapshot(), include_visual_viewport_transform);
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
 }
 
 Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
 {
-    if (!node.paintable_ptr())
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     auto const& document = node.document();
-    if (!document.paintable())
+    if (!document.layout_node() || !has_committed_box(*document.layout_node()))
         return position;
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
     auto result = document.visual_context_tree().transform_point_for_hit_test(
-        accumulated_visual_context_index(node), position.to_type<float>() * pixel_ratio,
+        VisualContextIndex { row->accumulated_visual_context_index }, position.to_type<float>() * pixel_ratio,
         document.scroll_state_snapshot());
     if (!result.has_value())
         return {};
@@ -891,14 +1027,15 @@ Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPi
 
 Optional<CSSPixelPoint> transform_point_to_local_for_descendants(Layout::Node const& node, CSSPixelPoint position)
 {
-    if (!node.paintable_ptr())
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     auto const& document = node.document();
-    if (!document.paintable())
+    if (!document.layout_node() || !has_committed_box(*document.layout_node()))
         return position;
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
     auto result = document.visual_context_tree().transform_point_for_hit_test(
-        accumulated_visual_context_for_descendants_index(node), position.to_type<float>() * pixel_ratio,
+        VisualContextIndex { row->accumulated_visual_context_for_descendants_index }, position.to_type<float>() * pixel_ratio,
         document.scroll_state_snapshot());
     if (!result.has_value())
         return {};
@@ -907,30 +1044,28 @@ Optional<CSSPixelPoint> transform_point_to_local_for_descendants(Layout::Node co
 
 CSSPixelPoint inverse_transform_point(Layout::Node const& node, CSSPixelPoint position)
 {
-    if (!node.paintable_ptr())
+    auto const* row = committed_row(node);
+    if (!row)
         return {};
     auto const& document = node.document();
-    if (!document.paintable())
+    if (!document.layout_node() || !has_committed_box(*document.layout_node()))
         return position;
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto result = document.visual_context_tree().inverse_transform_point(accumulated_visual_context_index(node), position.to_type<float>() * pixel_ratio);
+    auto result = document.visual_context_tree().inverse_transform_point(VisualContextIndex { row->accumulated_visual_context_index }, position.to_type<float>() * pixel_ratio);
     return (result / pixel_ratio).to_type<CSSPixels>();
 }
 
 CSSPixelPoint transform_to_local_coordinates(Layout::Node const& node, CSSPixelPoint position)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return {};
     return transform_point_to_local(node, position).value_or(position);
 }
 
 Optional<String> grid_layout_json(Layout::Node const& node, UniqueNodeID container_node_id)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
     Optional<String> result;
-    Layout::RustFFI::layout_arena_paintable_grid_layout_json(paintable->rust_arena().handle(), paintable->rust_slot(), container_node_id.value(), &result,
+    Layout::RustFFI::layout_arena_paintable_grid_layout_json(node.arena_handle(), committed_row_slot(node), container_node_id.value(), &result,
         [](void* context, u8 const* bytes, size_t length) {
             *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
@@ -939,11 +1074,8 @@ Optional<String> grid_layout_json(Layout::Node const& node, UniqueNodeID contain
 
 Optional<String> flex_layout_json(Layout::Node const& node, UniqueNodeID container_node_id)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return {};
     Optional<String> result;
-    Layout::RustFFI::layout_arena_paintable_flex_layout_json(paintable->rust_arena().handle(), paintable->rust_slot(), container_node_id.value(), &result,
+    Layout::RustFFI::layout_arena_paintable_flex_layout_json(node.arena_handle(), committed_row_slot(node), container_node_id.value(), &result,
         [](void* context, u8 const* bytes, size_t length) {
             *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
@@ -1049,13 +1181,12 @@ public:
 
 void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_invalidate_display_list)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
+    if (!has_committed_box(node))
         return;
 
     auto& document = const_cast<DOM::Document&>(node.document());
     if (should_invalidate_display_list == InvalidateDisplayList::Yes) {
-        Layout::RustFFI::layout_arena_paintable_invalidate_for_repaint(paintable->rust_arena().handle(), paintable->rust_slot());
+        Layout::RustFFI::layout_arena_paintable_invalidate_for_repaint(node.arena_handle(), committed_row_slot(node));
 
         // The root element paints the body's propagated background, so a body repaint must also refresh the
         // root's cached background. A root repaint can conversely flip whether propagation applies, changing
@@ -1077,46 +1208,36 @@ void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_in
 
 void invalidate_paint_cache(Layout::Node const& node)
 {
-    if (auto const* paintable = node.paintable_ptr())
-        mirror_rust_invalidate_paint_cache(*paintable);
+    mirror_rust_invalidate_paint_cache(node);
 }
 
 void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return;
     if (invalidation.needs_repaint())
         set_needs_repaint(node);
     if (invalidation.repaint_propagated_text_decorations)
-        rust_invalidate_propagated_text_decoration_caches(*paintable);
+        rust_invalidate_propagated_text_decoration_caches(node);
 }
 
 void invalidate_stacking_context(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
+    if (!has_committed_box(node))
         return;
-    if (auto viewport_paintable = node.document().unsafe_paintable())
-        const_cast<ViewportPaintable&>(*viewport_paintable).invalidate_stacking_context_tree();
+    const_cast<DOM::Document&>(node.document()).paint_state().invalidate_stacking_context_tree();
 }
 
 void clear_overflow_data(Layout::Node const& node)
 {
-    if (auto const* paintable = node.paintable_ptr())
-        Layout::RustFFI::layout_arena_paintable_clear_overflow_data(paintable->rust_arena().handle(), paintable->rust_slot());
+    Layout::RustFFI::layout_arena_paintable_clear_overflow_data(node.arena_handle(), committed_row_slot(node));
 }
 
 void clear_cached_overflow_data(Layout::Node const& node)
 {
-    if (auto const* paintable = node.paintable_ptr())
-        Layout::RustFFI::layout_arena_paintable_clear_cached_overflow_data(paintable->rust_arena().handle(), paintable->rust_slot());
+    Layout::RustFFI::layout_arena_paintable_clear_cached_overflow_data(node.arena_handle(), committed_row_slot(node));
 }
 
 void set_sticky_insets(Layout::Node const& node, OwnPtr<StickyInsets> sticky_insets)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return;
     Layout::RustFFI::FfiStickyInsets ffi_insets {};
     if (sticky_insets) {
         auto pack = [](Optional<CSSPixels> const& value, i32& raw, bool& present) {
@@ -1128,25 +1249,21 @@ void set_sticky_insets(Layout::Node const& node, OwnPtr<StickyInsets> sticky_ins
         pack(sticky_insets->bottom, ffi_insets.bottom, ffi_insets.has_bottom);
         pack(sticky_insets->left, ffi_insets.left, ffi_insets.has_left);
     }
-    Layout::RustFFI::layout_arena_paintable_set_sticky_insets(paintable->rust_arena().handle(), paintable->rust_slot(), ffi_insets, !!sticky_insets);
+    Layout::RustFFI::layout_arena_paintable_set_sticky_insets(node.arena_handle(), committed_row_slot(node), ffi_insets, !!sticky_insets);
 }
 
 void transfer_fragments_to_replacement_node(Layout::Node const& containing_block, Layout::Node const& old_node, Layout::Node const& new_node)
 {
-    auto const* paintable = containing_block.paintable_ptr();
-    if (!paintable || !is_paintable_with_lines(containing_block))
+    if (!is_paintable_with_lines(containing_block))
         return;
     Layout::RustFFI::layout_arena_paintable_transfer_fragments_to_replacement_node(
-        paintable->rust_arena().handle(), paintable->rust_slot(), Layout::Node::slot_id(&old_node), Layout::Node::slot_id(&new_node));
+        containing_block.arena_handle(), committed_row_slot(containing_block), Layout::Node::slot_id(&old_node), Layout::Node::slot_id(&new_node));
 }
 
 void inline_piece_border_box_rects(Layout::Node const& node, Vector<CSSPixelRect>& rects)
 {
-    auto const* paintable = node.paintable_ptr();
-    if (!paintable)
-        return;
     Layout::RustFFI::layout_arena_inline_paintable_piece_border_box_rects(
-        paintable->rust_arena().handle(), paintable->rust_slot(), &rects,
+        node.arena_handle(), committed_row_slot(node), &rects,
         [](void* context, Layout::RustFFI::FfiCssPixelRect rect) {
             static_cast<Vector<CSSPixelRect>*>(context)->append({
                 CSSPixels::from_raw(rect.x),
@@ -1159,12 +1276,10 @@ void inline_piece_border_box_rects(Layout::Node const& node, Vector<CSSPixelRect
 
 CSSPixelPoint cumulative_scroll_compensation(Layout::Node const& node)
 {
-    if (!node.paintable_ptr())
-        return {};
     auto index = enclosing_scroll_node_index(node);
     if (!index.value())
         return {};
-    return node.document().paintable()->cumulative_scroll_offset_for_node(index);
+    return node.document().paint_state().cumulative_scroll_offset_for_node(node.document(), index);
 }
 
 }

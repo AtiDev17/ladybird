@@ -8,14 +8,16 @@
 
 #include <AK/Badge.h>
 #include <AK/EnumBits.h>
+#include <AK/HashMap.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16FlyString.h>
-#include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
 #include <LibGC/Cell.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Painting/Scrolling.h>
 #include <LibWeb/PixelUnits.h>
 
 namespace Web {
@@ -41,6 +43,57 @@ enum class ChromeWidgetKind : u8 {
     VerticalScrollbar,
 };
 
+struct ScrollbarData {
+    CSSPixelRect gutter_rect;
+    CSSPixelRect thumb_rect;
+    CSSPixelRect track_rect;
+    CSSPixelFraction thumb_travel_to_scroll_ratio { 0 };
+};
+
+enum class ScrollbarSizing {
+    Regular,
+    Enlarged,
+};
+
+struct PhysicalResizeAxes {
+    bool horizontal;
+    bool vertical;
+};
+
+CSS::ScrollbarColorData scrollbar_colors_for_paint(Layout::NodeWithStyle const&);
+Optional<ScrollbarData> compute_scrollbar_data(Layout::Node const&, ScrollDirection, ChromeMetrics const&, ScrollStateSnapshot const* = nullptr, ScrollbarSizing = ScrollbarSizing::Regular);
+Optional<CSSPixelRect> absolute_scrollbar_rect(Layout::Node const&, ScrollDirection, bool with_gutter, ChromeMetrics const&);
+bool resizer_contains(Layout::Node const&, CSSPixelPoint, ChromeMetrics const&);
+Optional<CSSPixelRect> absolute_resizer_rect(Layout::Node const&, ChromeMetrics const&);
+bool has_resizer(Layout::Node const&);
+bool is_chrome_mirrored(Layout::Node const&);
+PhysicalResizeAxes physical_resize_axes(Layout::Node const&);
+
+class Scrollbar;
+class ResizeHandle;
+
+class ChromeWidgetRegistry : public RefCounted<ChromeWidgetRegistry> {
+public:
+    ChromeWidgetRegistry();
+    ~ChromeWidgetRegistry();
+
+    RefPtr<Scrollbar> scrollbar(Layout::RustFFI::PaintableSlotId, ScrollDirection) const;
+    NonnullRefPtr<Scrollbar> get_or_create_scrollbar(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId, ScrollDirection);
+    RefPtr<ResizeHandle> resize_handle(Layout::RustFFI::PaintableSlotId) const;
+    NonnullRefPtr<ResizeHandle> get_or_create_resize_handle(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
+    void drop_widgets_for_slot(Layout::RustFFI::PaintableSlotId);
+    void clear();
+
+private:
+    struct Entry {
+        RefPtr<Scrollbar> horizontal_scrollbar;
+        RefPtr<Scrollbar> vertical_scrollbar;
+        RefPtr<ResizeHandle> resize_handle;
+    };
+
+    HashMap<u32, Entry> m_entries;
+};
+
 class ChromeWidget
     : public RefCounted<ChromeWidget>
     , public Weakable<ChromeWidget> {
@@ -55,17 +108,18 @@ public:
     virtual Optional<CSS::CursorPredefined> cursor() const { return {}; }
 
 protected:
-    explicit ChromeWidget(Paintable&);
+    ChromeWidget(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
 
-    RefPtr<Paintable> paintable() const;
+    Layout::Node* layout_node() const;
 
 private:
-    friend class Paintable;
+    friend class ChromeWidgetRegistry;
 
-    void detach_from_paintable(Badge<Paintable>);
-    virtual void did_detach_from_paintable() { }
+    void detach(Badge<ChromeWidgetRegistry>);
+    virtual void did_detach() { }
 
-    WeakPtr<Paintable> m_paintable;
+    NonnullRefPtr<Layout::NodeArena> m_arena;
+    Layout::RustFFI::PaintableSlotId m_slot;
 };
 
 }

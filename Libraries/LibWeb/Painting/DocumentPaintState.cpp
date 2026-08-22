@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -11,55 +10,41 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
-#include <LibWeb/Painting/ScrollState.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
-#include <LibWeb/Selection/Selection.h>
 
 namespace Web::Painting {
 
-NonnullRefPtr<ViewportPaintable> ViewportPaintable::create(Layout::Viewport const& layout_viewport)
+DocumentPaintState::DocumentPaintState(Layout::NodeArena& layout_node_arena)
+    : m_layout_node_arena(layout_node_arena)
 {
-    return adopt_ref(*new ViewportPaintable(layout_viewport));
 }
 
-ViewportPaintable::ViewportPaintable(Layout::Viewport const& layout_viewport)
-    : PaintableWithLines(layout_viewport)
+void DocumentPaintState::ensure_visual_context_tree(DOM::Document const& document) const
 {
-    mirror_rust_reset_visual_context_state(*this);
+    const_cast<DOM::Document&>(document).update_paint_and_hit_testing_properties_if_needed();
 }
 
-ViewportPaintable::~ViewportPaintable() = default;
-
-void ViewportPaintable::ensure_visual_context_tree() const
+AccumulatedVisualContextTree const& DocumentPaintState::visual_context_tree(DOM::Document const& document) const
 {
-    const_cast<DOM::Document&>(document()).update_paint_and_hit_testing_properties_if_needed();
-}
-
-AccumulatedVisualContextTree const& ViewportPaintable::visual_context_tree() const
-{
-    ensure_visual_context_tree();
+    ensure_visual_context_tree(document);
     VERIFY(m_visual_context_tree.has_value());
     return *m_visual_context_tree;
 }
 
-AccumulatedVisualContextTree& ViewportPaintable::visual_context_tree()
+AccumulatedVisualContextTree& DocumentPaintState::visual_context_tree(DOM::Document& document)
 {
-    ensure_visual_context_tree();
+    ensure_visual_context_tree(document);
     VERIFY(m_visual_context_tree.has_value());
     return *m_visual_context_tree;
 }
 
-BlockingWheelEventRegionState ViewportPaintable::collect_root_blocking_wheel_event_regions()
+BlockingWheelEventRegionState DocumentPaintState::collect_root_blocking_wheel_event_regions(DOM::Document& document)
 {
-    auto& document = this->document();
     GC::Ptr<DOM::EventTarget> roots[] = {
         document.navigable() ? document.navigable()->active_window() : nullptr,
         &document,
@@ -77,124 +62,121 @@ BlockingWheelEventRegionState ViewportPaintable::collect_root_blocking_wheel_eve
     return {};
 }
 
-void ViewportPaintable::reset_for_relayout()
+void DocumentPaintState::viewport_row_was_reset(DOM::Document& document)
 {
-    PaintableWithLines::reset_for_relayout();
-    clear_scroll_state();
-    m_paintable_boxes_with_auto_content_visibility.clear();
+    clear_scroll_state(document);
+    m_boxes_with_auto_content_visibility.clear();
     m_visual_context_tree_needs_compositor_update = false;
 }
 
-void ViewportPaintable::build_stacking_context_tree_if_needed()
+void DocumentPaintState::build_stacking_context_tree_if_needed(DOM::Document& document)
 {
     if (m_stacking_context_tree_is_valid)
         return;
-    rust_build_stacking_context_tree(*this);
+    rust_build_stacking_context_tree(document);
     m_stacking_context_tree_is_valid = true;
 }
 
-void ViewportPaintable::invalidate_stacking_context_tree()
+void DocumentPaintState::invalidate_stacking_context_tree()
 {
     m_stacking_context_tree_is_valid = false;
 }
 
-void ViewportPaintable::refresh_sticky_constraints()
+void DocumentPaintState::refresh_sticky_constraints(DOM::Document& document)
 {
     m_needs_to_refresh_scroll_state = true;
-    mirror_rust_refresh_sticky_constraints(*this);
+    mirror_rust_refresh_sticky_constraints(document);
 }
 
-void ViewportPaintable::set_needs_to_refresh_scroll_state(bool value)
+void DocumentPaintState::set_needs_to_refresh_scroll_state(DOM::Document& document, bool value)
 {
     m_needs_to_refresh_scroll_state = value;
-    mirror_rust_set_needs_to_refresh_scroll_state(*this, value);
+    mirror_rust_set_needs_to_refresh_scroll_state(document, value);
 }
 
-void ViewportPaintable::clear_scroll_state()
+void DocumentPaintState::clear_scroll_state(DOM::Document& document)
 {
     m_scroll_state_snapshot = {};
     m_needs_to_refresh_scroll_state = true;
-    mirror_rust_clear_scroll_state(*this);
+    mirror_rust_clear_scroll_state(document);
 }
 
-CSSPixelPoint ViewportPaintable::cumulative_scroll_offset_for_node(VisualContextIndex scroll_node_index) const
+CSSPixelPoint DocumentPaintState::cumulative_scroll_offset_for_node(DOM::Document const& document, VisualContextIndex scroll_node_index) const
 {
-    return rust_cumulative_scroll_offset_for_node(*this, scroll_node_index);
+    return rust_cumulative_scroll_offset_for_node(document, scroll_node_index);
 }
 
-void ViewportPaintable::assign_accumulated_visual_contexts()
+void DocumentPaintState::assign_accumulated_visual_contexts(DOM::Document& document)
 {
-    clear_scroll_state();
+    clear_scroll_state(document);
     ++m_accumulated_visual_context_tree_build_count;
     auto forced_incompatible_rebuild = m_force_incompatible_visual_context_tree_rebuild_for_testing;
     m_force_incompatible_visual_context_tree_rebuild_for_testing = false;
-    auto is_compatible = rust_assign_accumulated_visual_contexts(*this, forced_incompatible_rebuild);
-    auto visual_context_tree = materialize_rust_main_visual_context_tree(*this);
+    auto is_compatible = rust_assign_accumulated_visual_contexts(document, forced_incompatible_rebuild);
+    auto visual_context_tree = materialize_rust_main_visual_context_tree(document);
     if (is_compatible) {
         visual_context_tree.reuse_version_from(*m_visual_context_tree);
     } else {
-        document().set_needs_to_record_display_list();
+        document.set_needs_to_record_display_list();
     }
     m_visual_context_tree = move(visual_context_tree);
     m_visual_context_tree_needs_compositor_update = true;
 }
 
-bool ViewportPaintable::update_accumulated_visual_context_values(Paintable& paintable_box)
+bool DocumentPaintState::update_accumulated_visual_context_values(DOM::Document& document, Layout::RustFFI::PaintableSlotId paintable_slot)
 {
     if (!m_visual_context_tree.has_value())
         return false;
     if (m_force_incompatible_visual_context_tree_rebuild_for_testing)
         return false;
-    if (!rust_update_accumulated_visual_context_values(*this, paintable_box))
+    if (!rust_update_accumulated_visual_context_values(document, paintable_slot))
         return false;
-    patch_rust_visual_context_nodes(*this, *m_visual_context_tree, paintable_box.visual_context_nodes_begin(), paintable_box.visual_context_nodes_end());
+    auto const* row = Layout::RustFFI::layout_arena_paintable_row(m_layout_node_arena->handle(), paintable_slot);
+    if (!row)
+        return false;
+    patch_rust_visual_context_nodes(document, *m_visual_context_tree, row->visual_context_nodes_begin, row->visual_context_nodes_end);
     m_visual_context_tree_needs_compositor_update = true;
     return true;
 }
 
-void ViewportPaintable::update_visual_viewport_accumulated_visual_context()
+void DocumentPaintState::update_visual_viewport_accumulated_visual_context(DOM::Document& document)
 {
     if (!m_visual_context_tree.has_value()) {
-        assign_accumulated_visual_contexts();
+        assign_accumulated_visual_contexts(document);
         return;
     }
-    rust_update_visual_viewport_transform(*this);
-    patch_rust_visual_context_nodes(*this, *m_visual_context_tree, VISUAL_VIEWPORT_NODE_INDEX.value(), VISUAL_VIEWPORT_NODE_INDEX.value() + 1);
+    rust_update_visual_viewport_transform(document);
+    patch_rust_visual_context_nodes(document, *m_visual_context_tree, VISUAL_VIEWPORT_NODE_INDEX.value(), VISUAL_VIEWPORT_NODE_INDEX.value() + 1);
     m_visual_context_tree_needs_compositor_update = true;
 }
 
-void ViewportPaintable::append_paint_command_cache_source_resources(DisplayListResourceSet& retained_resources) const
+void DocumentPaintState::append_paint_command_cache_source_resources(DisplayListResourceSet& retained_resources) const
 {
     retained_resources.include(m_paint_command_cache_source_referenced_resources);
 }
 
-void ViewportPaintable::invalidate_all_cached_paint()
+void DocumentPaintState::invalidate_all_cached_paint(DOM::Document& document)
 {
-    Layout::RustFFI::layout_arena_invalidate_all_paint_caches(rust_arena().handle());
-    Painting::set_needs_repaint(layout_node());
+    Layout::RustFFI::layout_arena_invalidate_all_paint_caches(m_layout_node_arena->handle());
+    Painting::set_needs_repaint(*document.unsafe_layout_node());
 }
 
-void ViewportPaintable::refresh_scroll_state()
+void DocumentPaintState::refresh_scroll_state(DOM::Document& document)
 {
     if (!m_needs_to_refresh_scroll_state)
         return;
     m_needs_to_refresh_scroll_state = false;
     // https://drafts.csswg.org/css-position/#sticky-pos
-    rust_refresh_scroll_state(*this);
-    m_scroll_state_snapshot = rust_scroll_state_snapshot(*this);
+    rust_refresh_scroll_state(document);
+    m_scroll_state_snapshot = rust_scroll_state_snapshot(document);
 }
 
-GC::Ptr<Selection::Selection> ViewportPaintable::selection() const
+void DocumentPaintState::reset_selection_states(DOM::Document& document)
 {
-    return document().get_selection();
+    Layout::RustFFI::layout_arena_selection_clear(m_layout_node_arena->handle(), viewport_row_slot(document));
 }
 
-void ViewportPaintable::reset_selection_states()
-{
-    Layout::RustFFI::layout_arena_selection_clear(rust_arena().handle(), rust_slot());
-}
-
-void ViewportPaintable::recompute_selection_states(DOM::Range& range)
+void DocumentPaintState::recompute_selection_states(DOM::Document& document, DOM::Range& range)
 {
     Vector<Layout::RustFFI::FfiSelectionEntry> entries;
     auto set_selection_state_on_all_slices = [&](DOM::Node& container, SelectionState state) {
@@ -204,25 +186,23 @@ void ViewportPaintable::recompute_selection_states(DOM::Range& range)
                 entries.append({
                     .is_text_node_entry = true,
                     .layout_node = Layout::Node::slot_id(&slice),
-                    .paintable = {},
                     .state = to_underlying(state),
                 });
             });
             return;
         }
         if (auto* layout_node = container.unsafe_layout_node()) {
-            if (auto paintable = layout_node->paintable()) {
+            if (has_committed_box(*layout_node)) {
                 entries.append({
                     .is_text_node_entry = false,
-                    .layout_node = {},
-                    .paintable = paintable->rust_slot(),
+                    .layout_node = Layout::Node::slot_id(layout_node),
                     .state = to_underlying(state),
                 });
             }
         }
     };
     auto apply_entries = [&] {
-        Layout::RustFFI::layout_arena_selection_apply(rust_arena().handle(), rust_slot(), entries.data(), entries.size(), range.start_offset(), range.end_offset());
+        Layout::RustFFI::layout_arena_selection_apply(m_layout_node_arena->handle(), viewport_row_slot(document), entries.data(), entries.size(), range.start_offset(), range.end_offset());
     };
 
     // https://drafts.csswg.org/css-ui/#valdef-user-select-none
@@ -289,11 +269,6 @@ void ViewportPaintable::recompute_selection_states(DOM::Range& range)
     }
 
     apply_entries();
-}
-
-bool ViewportPaintable::handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigned, unsigned, double, double)
-{
-    return false;
 }
 
 }
