@@ -19,6 +19,7 @@ class [[nodiscard]] Utf16FlyString {
 
 public:
     constexpr Utf16FlyString() = default;
+    ALWAYS_INLINE ~Utf16FlyString() = default;
 
     static Utf16FlyString from_utf8(StringView);
     static Utf16FlyString from_utf8(String const& string) { return from_utf8_without_validation(string); }
@@ -242,8 +243,12 @@ struct SentinelOptionalTraits<Utf16FlyString> {
 
 template<>
 class Optional<Utf16FlyString> : public SentinelOptional<Utf16FlyString> {
+    AK_MAKE_DEFAULT_MOVABLE(Optional);
+    AK_MAKE_DEFAULT_COPYABLE(Optional);
+
 public:
     using SentinelOptional::SentinelOptional;
+    ALWAYS_INLINE ~Optional() = default;
 };
 
 template<>

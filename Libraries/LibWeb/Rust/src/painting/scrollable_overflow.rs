@@ -231,7 +231,7 @@ fn padding_inflated_scrollable_overflow(
 ) -> CssPixelRect {
     let content_box = paintable_geometry::absolute_rect(paintables, box_paintable);
     let padding_box = paintable_geometry::absolute_padding_box_rect(paintables, box_paintable);
-    let padding = paintables.data_ref(box_paintable).padding;
+    let padding = paintable_geometry::committed_padding(paintables, box_paintable);
     let overflow_directions = physical_overflow_directions(layout_arena, box_node);
 
     let mut left = in_flow_and_floated_content_bounds.left();
@@ -404,18 +404,16 @@ pub(crate) fn measure_scrollable_overflow(
                 && !child_has_css_transform
                 && child_data.has_cached_overflow
             {
-                let border = child_data.border;
+                let border = crate::painting::paintable_geometry::committed_border(paintables, child_paintable);
                 let zero = CssPixels::from_raw(0);
                 let has_border =
                     border.top != zero || border.right != zero || border.bottom != zero || border.left != zero;
                 if !has_border {
-                    let padding = child_data.padding;
-                    let content_box_relative_to_padding_box = CssPixelRect::new(
-                        padding.left,
-                        padding.top,
-                        child_data.content_size.width,
-                        child_data.content_size.height,
-                    );
+                    let padding = crate::painting::paintable_geometry::committed_padding(paintables, child_paintable);
+                    let content_size =
+                        crate::painting::paintable_geometry::committed_content_size(paintables, child_paintable);
+                    let content_box_relative_to_padding_box =
+                        CssPixelRect::new(padding.left, padding.top, content_size.width, content_size.height);
                     // The committed line fragment already contributes this content box. A box with no border whose
                     // cached overflow fits inside the content box cannot expand its containing block's overflow.
                     if content_box_relative_to_padding_box.contains_rect(child_data.cached_overflow.rect.into()) {

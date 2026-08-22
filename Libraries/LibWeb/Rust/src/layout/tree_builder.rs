@@ -1526,10 +1526,10 @@ fn update_principal_node_after_entry(
                     arena.set_saved_abspos_layout_inputs(new_data, Some(inputs));
                 }
                 // SAFETY: data() returned pointers to live slots.
-                if unsafe { (*old_data).kind == NodeKind::SVGSVGBox && (*new_data).kind == NodeKind::SVGSVGBox }
-                    && let Some(geometry) = arena.saved_committed_geometry(old_data)
+                if unsafe { node_kind_is_box((*old_data).kind) && node_kind_is_box((*new_data).kind) }
+                    && let Some(link) = arena.take_committed_fragment_link(old_data)
                 {
-                    arena.set_saved_committed_geometry(new_data, geometry);
+                    arena.set_committed_fragment_link(new_data, link);
                 }
             }
             unsafe {

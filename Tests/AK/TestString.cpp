@@ -14,6 +14,7 @@
 #include <AK/MemoryStream.h>
 #include <AK/StringBuilder.h>
 #include <AK/Try.h>
+#include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
 #include <AK/Vector.h>
 #include <ctype.h>
@@ -203,22 +204,12 @@ TEST_CASE(with_replacement_character)
     EXPECT_EQ(string7, "\ufffdWHF!"sv);
 }
 
-TEST_CASE(from_utf16_be_with_replacement_character)
+TEST_CASE(from_utf16_with_replacement_character)
 {
-    // UTF-16 BE for "A" is 0x00 0x41
-    Array<u8, 2> valid_be { 0x00, 0x41 };
-    auto string1 = MUST(String::from_utf16_be_with_replacement_character(valid_be));
-    EXPECT_EQ(string1, "A"sv);
-
-    // Invalid surrogate pair in BE: high surrogate 0xD800 without low surrogate
-    // In BE: 0xD8 0x00
-    Array<u8, 2> invalid_be { 0xD8, 0x00 };
-    auto string2 = MUST(String::from_utf16_be_with_replacement_character(invalid_be));
-    EXPECT_EQ(string2, "\ufffd"sv);
-
-    // Same bytes interpreted as LE would be 0x00D8 which is valid (U+00D8 = Ø)
-    auto string3 = MUST(String::from_utf16_le_with_replacement_character(invalid_be));
-    EXPECT_EQ(string3, "Ø"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(Utf16View { "hello!"sv })), "hello!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u"hello 😀!"sv)), "hello 😀!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u"hello \xd800!"sv)), "hello �!"sv);
+    EXPECT_EQ(MUST(String::from_utf16_with_replacement_character(u""sv)), ""sv);
 }
 
 TEST_CASE(from_code_points)

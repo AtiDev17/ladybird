@@ -46,11 +46,11 @@ pub fn compute_svg_viewport_transform_data(
     }
 }
 
-pub(crate) fn svg_viewport_transform_of(data: &PaintableData) -> Option<AffineTransform> {
-    if !data.has_svg_viewport_transform {
-        return None;
-    }
-    let t = data.svg_viewport_transform;
+pub(crate) fn svg_viewport_transform_of(
+    paintables: &crate::painting::paintable_arena::PaintableArena,
+    slot: PaintableSlotId,
+) -> Option<AffineTransform> {
+    let t = crate::painting::paintable_geometry::committed_svg_viewport_transform(paintables, slot)?;
     Some(AffineTransform {
         values: [t.a, t.b, t.c, t.d, t.e, t.f],
     })
@@ -302,6 +302,8 @@ impl Builder<'_> {
         self.paintables.update_data(slot, |data| {
             data.enclosing_scroll_node_index = 0;
             data.own_scroll_node_index = 0;
+            data.fixed_background_visual_context = 0;
+            data.has_fixed_background_visual_context = false;
         });
 
         let mut nearest_scroll_nodes_for_descendants = if is_fixed {
@@ -663,7 +665,7 @@ impl Builder<'_> {
         // out in the box's own coordinate space, not the viewport's user units, so they hang
         // above the viewport transform node.
         let state_for_positioned_descendants = state_for_descendants;
-        if let Some(svg_viewport_transform) = svg_viewport_transform_of(&self.paintables.data_ref(slot)) {
+        if let Some(svg_viewport_transform) = svg_viewport_transform_of(self.paintables, slot) {
             let mut viewport_transform_data =
                 compute_svg_viewport_transform_data(self.paintables, slot, svg_viewport_transform, self.pixel_ratio);
             viewport_transform_data.flattens_inherited_transform = descendants_flatten_inherited_transform;
@@ -914,7 +916,7 @@ pub(crate) fn update_visual_context_values(
     let effects = super::node_values::compute_effects_data(layout_arena, paintables, callbacks, slot);
     let perspective =
         super::node_values::compute_perspective_data(layout_arena, paintables, callbacks, slot, pixel_ratio);
-    let svg_viewport_transform_data = svg_viewport_transform_of(&paintables.data_ref(slot))
+    let svg_viewport_transform_data = svg_viewport_transform_of(paintables, slot)
         .map(|transform| compute_svg_viewport_transform_data(paintables, slot, transform, pixel_ratio));
 
     paintables.update_data(slot, |data| {

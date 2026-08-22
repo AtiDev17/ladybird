@@ -665,7 +665,7 @@ Layout::NodeArena& Document::layout_node_arena()
             [](void* context, Layout::RustFFI::PaintableSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
                 auto& document = *static_cast<Document*>(context);
                 document.chrome_widget_registry().drop_widgets_for_slot(slot);
-                if (kind == Layout::RustFFI::PaintableRowResetKind::RelayoutReuse && Painting::viewport_row_slot(document).index == slot.index)
+                if (kind == Layout::RustFFI::PaintableRowResetKind::Recommitted && Painting::viewport_row_slot(document).index == slot.index)
                     document.paint_state().viewport_row_was_reset(document);
             });
     }
@@ -3440,11 +3440,11 @@ HTML::EnvironmentSettingsObject& Document::relevant_settings_object() const
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createelement
-WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16String const& local_name, ElementCreationOptions const& options)
+WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16FlyString const& local_name, ElementCreationOptions const& options)
 {
     auto normalized_local_name = local_name;
     // 1. If localName is not a valid element local name, then throw an "InvalidCharacterError" DOMException.
-    if (!is_valid_element_local_name(local_name.utf16_view()))
+    if (!is_valid_element_local_name(local_name.view()))
         return WebIDL::InvalidCharacterError::create("Invalid character in tag name."_utf16);
 
     // 2. If this is an HTML document, then set localName to localName in ASCII lowercase.
@@ -3461,10 +3461,10 @@ WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16String const
         namespace_ = Namespace::HTML;
 
     // 5. Return the result of creating an element given this, localName, namespace, null, is, true, and registry.
-    return TRY(DOM::create_element(*this, Utf16FlyString::from_utf16(normalized_local_name.utf16_view()), move(namespace_), {}, move(is_value), true, registry));
+    return TRY(DOM::create_element(*this, move(normalized_local_name), move(namespace_), {}, move(is_value), true, registry));
 }
 
-WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16String const& local_name, Variant<Utf16String, ElementCreationOptions> const& options)
+WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16FlyString const& local_name, Variant<Utf16String, ElementCreationOptions> const& options)
 {
     ElementCreationOptions element_creation_options;
     options.visit(
@@ -3697,7 +3697,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Document::import_node(GC::Ref<Node> node, Imp
 
     // 5. If registry is null, then set registry to the result of looking up a custom element registry given this.
     if (!registry)
-        registry = HTML::look_up_a_custom_element_registry(*this);
+        registry = custom_element_registry();
 
     // 6. Return the result of cloning a node given node with document set to this, subtree set to subtree, and
     //   fallbackRegistry set to registry.
@@ -9311,7 +9311,7 @@ void Document::run_csp_initialization() const
 WebIDL::ExceptionOr<Document::RegistryAndIs> Document::flatten_element_creation_options(ElementCreationOptions const& options) const
 {
     // 1. Let registry be the result of looking up a custom element registry given document.
-    GC::Ptr<HTML::CustomElementRegistry> registry = HTML::look_up_a_custom_element_registry(*this);
+    GC::Ptr<HTML::CustomElementRegistry> registry = custom_element_registry();
 
     // 2. Let is be null.
     Optional<Utf16FlyString> is;

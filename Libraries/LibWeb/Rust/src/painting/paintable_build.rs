@@ -9,8 +9,7 @@ use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::{
-    FfiCommittedBoxMetrics, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, FfiLayoutFcCallbacks, LineData, Node,
-    NodeFacts,
+    FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, FfiLayoutFcCallbacks, FragmentLink, LineData, Node, NodeFacts,
 };
 use crate::painting::paintable_arena::PaintableArena;
 use crate::painting::paintable_data::*;
@@ -179,6 +178,7 @@ impl<'a> PaintableCommit<'a> {
             && expected_kind != PaintableKind::None;
         let existing_slot = self.arena.borrow().paintable_of_node(node);
         if !wants_paintable {
+            self.callbacks.arena().clear_committed_fragment_link(node);
             if !existing_slot.is_invalid() {
                 let reset = {
                     let arena = self.arena.borrow();
@@ -215,6 +215,9 @@ impl<'a> PaintableCommit<'a> {
                 row_existed_before_this_commit: true,
             };
         }
+        if !has_used_values {
+            self.callbacks.arena().clear_committed_fragment_link(node);
+        }
         let style = self.callbacks.computed_values_view_if_styled(node);
         let (position, floating, has_z_index, display) = match style {
             Some(style) => {
@@ -245,10 +248,10 @@ impl<'a> PaintableCommit<'a> {
             self.offsets_before_commit
                 .borrow_mut()
                 .insert(existing_slot, arena.data_ref(existing_slot).offset);
-            let reset = arena.prepare_reset_for_relayout(existing_slot);
+            let notification = arena.prepare_recommit_notification(existing_slot);
             drop(arena);
-            reset.invoke_callback();
-            self.arena.borrow_mut().reset_for_relayout(reset);
+            notification.invoke_callback();
+            self.arena.borrow_mut().begin_row_recommit(existing_slot);
             existing_slot
         } else {
             let mut arena = self.arena.borrow_mut();
@@ -295,7 +298,6 @@ impl<'a> PaintableCommit<'a> {
                 PaintableFlag::ReplacedBox,
                 crate::layout::kind_is_replaced_box(data.kind),
             );
-            paintable.set_flag(PaintableFlag::PreparedByCommit, true);
             paintable.display = display.encoded();
         });
         PreparedPaintable {
@@ -312,62 +314,54 @@ impl<'a> PaintableCommit<'a> {
             .collect()
     }
 
-    pub(crate) fn set_box_metrics(
+    pub(crate) fn replace_committed_fragment_link(
         &self,
+        node: Node,
         slot: PaintableSlotId,
-        metrics: &FfiCommittedBoxMetrics,
+        link: &FragmentLink,
+        reuses_committed_subtree: bool,
     ) -> Option<(FfiCssPixelSize, FfiCssPixelSize)> {
-        let arena = self.arena.borrow();
+        let fragment = &link.fragment;
+        let new_content_size = FfiCssPixelSize {
+            width: fragment.content_inline_size,
+            height: fragment.content_block_size,
+        };
         let mut content_size_change = None;
-        arena.update_data(slot, |data| {
-            if data.layout_fragment_identity != metrics.fragment_identity {
-                data.layout_fragment_identity = metrics.fragment_identity;
-                data.cached_overflow = FfiOverflowData::default();
-                data.has_cached_overflow = false;
-            }
-            data.inset = FfiPixelBox {
-                top: metrics.inset_top,
-                right: metrics.inset_right,
-                bottom: metrics.inset_bottom,
-                left: metrics.inset_left,
+        {
+            let arena = self.arena.borrow();
+            let (old_identity, old_content_size) = arena.with_committed_fragment_link(slot, |old_link| {
+                old_link.map_or((0, FfiCssPixelSize::default()), |old_link| {
+                    (
+                        old_link.fragment.identity,
+                        FfiCssPixelSize {
+                            width: old_link.fragment.content_inline_size,
+                            height: old_link.fragment.content_block_size,
+                        },
+                    )
+                })
+            });
+            let previous_content_size_for_diff = if reuses_committed_subtree {
+                old_content_size
+            } else {
+                FfiCssPixelSize::default()
             };
-            data.padding = FfiPixelBox {
-                top: metrics.padding_top,
-                right: metrics.padding_right,
-                bottom: metrics.padding_bottom,
-                left: metrics.padding_left,
-            };
-            data.border = FfiPixelBox {
-                top: metrics.border_top,
-                right: metrics.border_right,
-                bottom: metrics.border_bottom,
-                left: metrics.border_left,
-            };
-            data.margin = FfiPixelBox {
-                top: metrics.margin_top,
-                right: metrics.margin_right,
-                bottom: metrics.margin_bottom,
-                left: metrics.margin_left,
-            };
-            let new_content_size = FfiCssPixelSize {
-                width: metrics.content_inline_size,
-                height: metrics.content_block_size,
-            };
-            if data.content_size != new_content_size {
+            if previous_content_size_for_diff != new_content_size {
                 assert!(
-                    !metrics.reuses_committed_subtree,
+                    !reuses_committed_subtree,
                     "a reused committed subtree changed its content size"
                 );
-                content_size_change = Some((data.content_size, new_content_size));
+                content_size_change = Some((previous_content_size_for_diff, new_content_size));
             }
-            data.content_size = new_content_size;
-            data.offset = metrics.content_offset;
-            if metrics.has_containing_line_box_index {
-                data.containing_line_box_index = metrics.containing_line_box_index;
-                data.has_containing_line_box_index = true;
-            }
-            data.uses_collapsing_borders_model = metrics.uses_collapsing_borders_model;
-        });
+            arena.update_data(slot, |data| {
+                if old_identity != fragment.identity {
+                    data.cached_overflow = FfiOverflowData::default();
+                    data.has_cached_overflow = false;
+                }
+                data.content_size = new_content_size;
+                data.offset = link.committed_offset;
+            });
+        }
+        self.callbacks.set_committed_fragment_link(node, link.clone());
         content_size_change
     }
 
@@ -572,79 +566,6 @@ impl<'a> PaintableCommit<'a> {
         )
     }
 
-    pub(crate) fn set_svg_viewport_transform(
-        &self,
-        slot: PaintableSlotId,
-        transform: crate::layout::FfiAffineTransform,
-    ) {
-        let arena = self.arena.borrow();
-        arena.update_data(slot, |data| {
-            data.svg_viewport_transform = transform;
-            data.has_svg_viewport_transform = true;
-        });
-    }
-
-    pub(crate) fn set_svg_viewport_size(&self, slot: PaintableSlotId, size: FfiCssPixelSize) {
-        let arena = self.arena.borrow();
-        arena.update_data(slot, |data| {
-            if data.kind == PaintableKind::SVGSVGPaintable {
-                data.svg_viewport_size = size;
-            }
-        });
-    }
-
-    pub(crate) fn set_computed_svg_path(
-        &self,
-        slot: PaintableSlotId,
-        path: &std::rc::Rc<libgfx_rust::path::OwnedPath>,
-    ) {
-        let mut arena = self.arena.borrow_mut();
-        if arena.data_ref(slot).kind != PaintableKind::SVGPathPaintable {
-            return;
-        }
-        let side = arena.side_mut(slot);
-        if path.identity() != 0
-            && path.identity() == side.computed_svg_path_identity
-            && side.computed_svg_path.is_some()
-        {
-            return;
-        }
-        side.computed_svg_path = Some(path.clone());
-        side.computed_svg_path_identity = path.identity();
-    }
-
-    pub(crate) fn set_grid_layout_data(
-        &self,
-        slot: PaintableSlotId,
-        data: &std::rc::Rc<crate::layout::GridLayoutData>,
-    ) {
-        self.arena.borrow_mut().side_mut(slot).grid_layout_data = Some(data.clone());
-    }
-
-    pub(crate) fn set_flex_layout_data(
-        &self,
-        slot: PaintableSlotId,
-        data: &std::rc::Rc<crate::layout::FlexLayoutData>,
-    ) {
-        self.arena.borrow_mut().side_mut(slot).flex_layout_data = Some(data.clone());
-    }
-
-    pub(crate) fn set_used_grid_tracks(
-        &self,
-        slot: PaintableSlotId,
-        tracks: &std::rc::Rc<crate::layout::OwnedUsedGridTracks>,
-    ) {
-        self.arena.borrow_mut().side_mut(slot).used_grid_tracks = Some(tracks.clone());
-    }
-
-    pub(crate) fn set_collapsed_table_borders(
-        &self,
-        slot: PaintableSlotId,
-        borders: &std::rc::Rc<crate::layout::OwnedCollapsedTableBorders>,
-    ) {
-        self.arena.borrow_mut().side_mut(slot).collapsed_table_borders = Some(borders.clone());
-    }
-
     pub(crate) fn stamp_containing_block(&self, node: Node, slot: PaintableSlotId) {
         let arena = self.arena.borrow();
         if slot.is_invalid() {
@@ -677,10 +598,8 @@ impl<'a> PaintableCommit<'a> {
             {
                 continue;
             }
-            let (padding_widths, border_widths) = {
-                let data = arena.data_ref(inline_paintable);
-                (data.padding, data.border)
-            };
+            let padding_widths = crate::painting::paintable_geometry::committed_padding(&arena, inline_paintable);
+            let border_widths = crate::painting::paintable_geometry::committed_border(&arena, inline_paintable);
             let mut content_union: Option<CssPixelRect> = None;
             let mut padding_union: Option<CssPixelRect> = None;
             let mut border_union: Option<CssPixelRect> = None;

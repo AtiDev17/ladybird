@@ -95,8 +95,7 @@ public:
     [[nodiscard]] static String from_string_builder_without_validation(Badge<StringBuilder>, StringBuilder&);
 
     // Creates a new String from a sequence of UTF-16 encoded code points.
-    static ErrorOr<String> from_utf16_le_with_replacement_character(ReadonlyBytes);
-    static ErrorOr<String> from_utf16_be_with_replacement_character(ReadonlyBytes);
+    static ErrorOr<String> from_utf16_with_replacement_character(Utf16View const&);
 
     // Creates a new String by reading byte_count bytes from a UTF-8 encoded Stream.
     static ErrorOr<String> from_stream(Stream&, size_t byte_count);

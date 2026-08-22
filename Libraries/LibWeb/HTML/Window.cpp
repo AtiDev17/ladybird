@@ -131,9 +131,13 @@ WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window& window,
 {
     auto& global_object = realm.global_object();
 
-    Bindings::add_window_exposed_interfaces(global_object);
-
     WEB_SET_PROTOTYPE_FOR_INTERFACE_ON(global_object, Window);
+
+    // OPTIMIZATION: The Window wrapper becomes the internal prototype of its WindowProxy. Mark it
+    // as a prototype before adding its many own properties so that attaching it does not copy them.
+    global_object.convert_to_prototype_if_needed();
+
+    Bindings::add_window_exposed_interfaces(global_object);
 
     Bindings::WindowGlobalMixin window_global_mixin;
     window_global_mixin.initialize(realm, global_object);
@@ -1056,15 +1060,18 @@ Utf16String Window::name() const
 void Window::set_name(Utf16View name)
 {
     // 1. If this's navigable is null, then return.
-    if (!navigable())
+    auto navigable = this->navigable();
+    if (!navigable)
         return;
 
     // 2. Set this's navigable's active session history entry's document state's navigable target name to the given value.
+    if (navigable->target_name() == name)
+        return;
     auto navigable_target_name = Utf16String::from_utf16(name);
-    auto active_session_history_entry = navigable()->active_session_history_entry();
+    auto active_session_history_entry = navigable->active_session_history_entry();
     active_session_history_entry->document_state()->set_navigable_target_name(navigable_target_name);
-    navigable()->page().client().page_did_update_session_history_entry_document_state_navigable_target_name(
-        navigable()->id(), active_session_history_entry->navigation_api_key(), navigable_target_name);
+    navigable->page().client().page_did_update_session_history_entry_document_state_navigable_target_name(
+        navigable->id(), active_session_history_entry->navigation_api_key(), navigable_target_name);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-status
