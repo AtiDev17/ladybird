@@ -34,19 +34,17 @@ WEB_API Gfx::FloatRect svg_viewport_user_rect(Layout::Node const& viewport);
 
 bool body_background_is_propagated_to_root(Layout::NodeWithStyle const&);
 
-Layout::RustFFI::PaintableSlotId committed_row_slot(Layout::Node const&);
-Layout::RustFFI::PaintableSlotId viewport_row_slot(DOM::Document const&);
+Layout::RustFFI::NodeSlotId committed_row_slot(Layout::Node const&);
+Layout::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const&);
 Layout::RustFFI::PaintableData const* committed_row(Layout::Node const&);
 
 WEB_API bool has_committed_box(Layout::Node const&);
-WEB_API Layout::Node* layout_node_for_committed_slot(Layout::NodeArena&, Layout::RustFFI::PaintableSlotId);
+WEB_API Layout::Node* layout_node_for_committed_slot(Layout::NodeArena&, Layout::RustFFI::NodeSlotId);
 
 WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_border_box_rect(Layout::Node const&);
 WEB_API CSSPixelPoint absolute_position(Layout::Node const&);
-WEB_API CSSPixels absolute_x(Layout::Node const&);
-WEB_API CSSPixels absolute_y(Layout::Node const&);
 WEB_API CSSPixelPoint offset(Layout::Node const&);
 WEB_API CSSPixelSize content_size(Layout::Node const&);
 WEB_API CSSPixels content_width(Layout::Node const&);
@@ -60,7 +58,6 @@ WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
 WEB_API Optional<OverflowData> overflow_data(Layout::Node const&);
-WEB_API Optional<CachedOverflowData> cached_overflow_data(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> mask_area(Layout::Node const&);
 WEB_API Optional<Gfx::MaskKind> mask_type(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> clip_area(Layout::Node const&);
@@ -77,7 +74,6 @@ WEB_API bool is_absolutely_positioned(Layout::Node const&);
 WEB_API bool is_floating(Layout::Node const&);
 WEB_API bool is_inline(Layout::Node const&);
 WEB_API bool has_css_transform(Layout::Node const&);
-WEB_API bool has_non_invertible_css_transform(Layout::Node const&);
 WEB_API bool uses_collapsing_borders_model(Layout::Node const&);
 WEB_API SelectionState selection_state(Layout::Node const&);
 WEB_API CSS::StyleRecordID style_record_identity(Layout::Node const&);
@@ -90,11 +86,9 @@ WEB_API bool is_inline_paintable(Layout::Node const&);
 WEB_API bool is_svg_paintable(Layout::Node const&);
 WEB_API bool is_svg_svg_paintable(Layout::Node const&);
 WEB_API bool is_svg_path_paintable(Layout::Node const&);
-WEB_API bool is_svg_foreign_object_paintable(Layout::Node const&);
 
 WEB_API CSSPixelRect transform_rect_to_viewport(Layout::Node const&, CSSPixelRect const&, AccumulatedVisualContextTree::IncludeVisualViewportTransform = AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
 WEB_API Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const&, CSSPixelPoint);
-WEB_API Optional<CSSPixelPoint> transform_point_to_local_for_descendants(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint inverse_transform_point(Layout::Node const&, CSSPixelPoint);
 WEB_API CSSPixelPoint transform_to_local_coordinates(Layout::Node const&, CSSPixelPoint);
 

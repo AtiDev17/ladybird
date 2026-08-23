@@ -5,11 +5,10 @@
  */
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::{DisplayListGlyph, FontResourceId};
 use crate::painting::display_list::recorder::GlyphRunForRecording;
-use crate::painting::paintable_data::{
-    FragmentRecord, PaintableSlotId, SELECTION_STATE_NONE, SELECTION_STATE_START_AND_END,
-};
+use crate::painting::paintable_data::{FragmentRecord, SELECTION_STATE_NONE, SELECTION_STATE_START_AND_END};
 use crate::painting::record::PaintRecorder;
 use crate::painting::text_fragment::{self, SelectionOffsets};
 use libgfx_rust::{Color, FloatPoint, IntRect, Orientation};
@@ -63,7 +62,7 @@ fn selection_offsets_for_fragment(
     if fragment.selection_state == SELECTION_STATE_NONE {
         return None;
     }
-    let range = recorder.paintables.selection?;
+    let range = recorder.paint_state.selection?;
     drop_degenerate(text_fragment::compute_selection_offsets(
         recorder.layout_arena,
         fragment,
@@ -75,14 +74,14 @@ fn selection_offsets_for_fragment(
 
 fn compute_render_spans(
     recorder: &mut PaintRecorder<'_>,
-    block: PaintableSlotId,
+    block: NodeSlotId,
     owned_fragment_indices: &[u32],
 ) -> Vec<RenderSpan> {
     let arena = recorder.layout_arena;
-    let paintables = recorder.paintables;
+    let layout_arena = recorder.layout_arena;
     let mut spans: Vec<RenderSpan> = Vec::new();
     for &fragment_index in owned_fragment_indices {
-        let fragment = &paintables.side(block).fragments[fragment_index as usize];
+        let fragment = &layout_arena.paintable_side_data(block).fragments[fragment_index as usize];
         if text_fragment::is_block_level_box(arena, fragment) {
             continue;
         }
@@ -245,11 +244,11 @@ pub(crate) fn glyph_run_emission(
 
 pub(crate) fn paint_fragments_foreground(
     recorder: &mut PaintRecorder<'_>,
-    block: PaintableSlotId,
-    owner: Option<PaintableSlotId>,
+    block: NodeSlotId,
+    owner: Option<NodeSlotId>,
 ) {
-    let filter = crate::painting::fragment_ownership::effective_filter(recorder.paintables, owner.unwrap_or(block));
-    let fragment_count = recorder.paintables.side(block).fragments.len();
+    let filter = crate::painting::fragment_ownership::effective_filter(recorder.layout_arena, owner.unwrap_or(block));
+    let fragment_count = recorder.layout_arena.paintable_side_data(block).fragments.len();
     let mut owned_fragment_indices = Vec::with_capacity(fragment_count);
     filter.for_each_owned_fragment_index(fragment_count, |index| owned_fragment_indices.push(index as u32));
     let spans = compute_render_spans(recorder, block, &owned_fragment_indices);
@@ -275,21 +274,21 @@ pub(crate) fn paint_fragments_foreground(
     }
 }
 
-fn selection_rect(recorder: &PaintRecorder<'_>, block: PaintableSlotId, span: &RenderSpan) -> CssPixelRect {
+fn selection_rect(recorder: &PaintRecorder<'_>, block: NodeSlotId, span: &RenderSpan) -> CssPixelRect {
     let Some(offsets) = span.selection_offsets else {
         return CssPixelRect::default();
     };
-    let fragment = &recorder.paintables.side(block).fragments[span.fragment_index as usize];
-    text_fragment::rect_for_selection_offsets(recorder.layout_arena, recorder.paintables, fragment, offsets, || {
+    let fragment = &recorder.layout_arena.paintable_side_data(block).fragments[span.fragment_index as usize];
+    text_fragment::rect_for_selection_offsets(recorder.layout_arena, fragment, offsets, || {
         text_fragment::first_available_font(recorder.layout_arena, fragment)
     })
 }
 
-fn paint_text_shadow(recorder: &mut PaintRecorder<'_>, block: PaintableSlotId, span: &RenderSpan) {
+fn paint_text_shadow(recorder: &mut PaintRecorder<'_>, block: NodeSlotId, span: &RenderSpan) {
     if span.shadow_layers.is_empty() {
         return;
     }
-    let fragment = &recorder.paintables.side(block).fragments[span.fragment_index as usize];
+    let fragment = &recorder.layout_arena.paintable_side_data(block).fragments[span.fragment_index as usize];
     let Some(run) = &fragment.glyph_run else {
         return;
     };
@@ -324,7 +323,7 @@ fn paint_text_shadow(recorder: &mut PaintRecorder<'_>, block: PaintableSlotId, s
     let fragment_width = converter.enclosing_device_pixels(fragment.size.width);
     let fragment_height = converter.enclosing_device_pixels(fragment.size.height);
     let fragment_baseline = converter.rounded_device_pixels(fragment.baseline);
-    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, recorder.paintables, fragment);
+    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, fragment);
     let font_id = recorder.register_font(run.font.as_raw());
 
     // Shadow layers are ordered front-to-back, so we paint them in reverse.
@@ -368,17 +367,17 @@ fn paint_text_shadow(recorder: &mut PaintRecorder<'_>, block: PaintableSlotId, s
 
 fn paint_text_fragment(
     recorder: &mut PaintRecorder<'_>,
-    block: PaintableSlotId,
+    block: NodeSlotId,
     span: &RenderSpan,
     decoration_sets: &[crate::painting::record::paint::text_decoration::TextDecorationSet],
 ) {
     if span.start_code_unit == span.end_code_unit {
         return;
     }
-    let fragment = &recorder.paintables.side(block).fragments[span.fragment_index as usize];
+    let fragment = &recorder.layout_arena.paintable_side_data(block).fragments[span.fragment_index as usize];
     if recorder.inputs.should_show_line_box_borders {
         let converter = recorder.converter;
-        let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, recorder.paintables, fragment);
+        let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, fragment);
         let fragment_absolute_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
         recorder
             .recorder
@@ -407,7 +406,7 @@ fn paint_text_fragment(
     };
     let converter = recorder.converter;
     let scale = recorder.inputs.device_pixels_per_css_pixel;
-    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, recorder.paintables, fragment);
+    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, fragment);
     let fragment_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
     let font_id = recorder.register_font(run.font.as_raw());
     let GlyphRunEmission {
@@ -437,7 +436,6 @@ fn paint_text_fragment(
     } else {
         let range_rect = text_fragment::rect_for_selection_offsets(
             recorder.layout_arena,
-            recorder.paintables,
             fragment,
             SelectionOffsets {
                 start: span.start_code_unit,
@@ -475,7 +473,7 @@ fn paint_text_fragment(
 
 // Paints the caret when it sits in a fragment owned by `owner`; the block itself
 // (owner == None) also handles blank lines and empty editable elements.
-pub(crate) fn paint_cursor(recorder: &mut PaintRecorder<'_>, block: PaintableSlotId, owner: Option<PaintableSlotId>) {
+pub(crate) fn paint_cursor(recorder: &mut PaintRecorder<'_>, block: NodeSlotId, owner: Option<NodeSlotId>) {
     let owner_shell = owner.map_or(std::ptr::null_mut(), |owner| recorder.layout_node_shell(owner));
     let facts = recorder
         .paint_host

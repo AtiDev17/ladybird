@@ -14,6 +14,7 @@ pub mod traversal;
 use crate::css::css_enums;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeKind;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
@@ -22,8 +23,7 @@ use crate::painting::host::{
     FfiHitTestHostCallbacks, FfiHitTestPaintableFacts, FfiHitTestTextNodeFacts, FfiPaintHostCallbacks,
     FfiRecordingInputs, FfiVisualContextHostCallbacks,
 };
-use crate::painting::paintable_arena::PaintableArena;
-use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData, PaintableSlotId};
+use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::stacking_context::{NO_STACKING_CONTEXT, StackingContextTree};
 use crate::painting::visual_context::nested::NestedAssignments;
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ pub(crate) struct NestedRecordingState {
 
 pub struct PaintRecorder<'a> {
     pub(crate) layout_arena: &'a LayoutNodeArena,
-    pub(crate) paintables: &'a PaintableArena,
+    pub(crate) paint_state: &'a crate::painting::paint_state::PaintState,
     stacking_contexts: &'a StackingContextTree,
     pub(crate) host: &'a FfiHitTestHostCallbacks,
     pub(crate) paint_host: &'a FfiPaintHostCallbacks,
@@ -72,7 +72,7 @@ pub struct PaintRecorder<'a> {
     pub(crate) nested: Option<NestedRecordingState>,
     pub(crate) nested_tree: Option<crate::painting::visual_context::VisualContextTree>,
     pub(crate) prerecorded: crate::painting::record::masks::PrerecordedNestedDisplayLists,
-    pub(crate) viewport: PaintableSlotId,
+    pub(crate) viewport: NodeSlotId,
     command_cache_source: Option<Rc<RecordingOutput>>,
     item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
     display_list_id: u64,
@@ -81,13 +81,13 @@ pub struct PaintRecorder<'a> {
     spliced_capture_count: usize,
     uncacheable_paint_generation: u64,
     list: HitTestList,
-    base_paint_facts_cache: Vec<Option<(PaintableSlotId, BasePaintFacts)>>,
-    paintable_facts_cache: Vec<Option<(PaintableSlotId, FfiHitTestPaintableFacts)>>,
+    base_paint_facts_cache: Vec<Option<(NodeSlotId, BasePaintFacts)>>,
+    paintable_facts_cache: Vec<Option<(NodeSlotId, FfiHitTestPaintableFacts)>>,
     text_node_facts_cache: HashMap<u32, FfiHitTestTextNodeFacts>,
     font_resource_id_cache: HashMap<usize, u64>,
     text_control_selection_cache: HashMap<u32, crate::painting::host::FfiTextControlSelection>,
     selection_style_cache: HashMap<u32, Rc<paint::text::SelectionStyleAnswer>>,
-    pub(crate) wheel_hit_test_target_cache: HashMap<PaintableSlotId, usize>,
+    pub(crate) wheel_hit_test_target_cache: HashMap<NodeSlotId, usize>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -106,19 +106,19 @@ impl<'a> PaintRecorder<'a> {
             .expect("uncacheable paint generation overflowed");
     }
 
-    pub(crate) fn data(&self, paintable: PaintableSlotId) -> PaintableData {
-        self.paintables.data_ref(paintable)
+    pub(crate) fn data(&self, paintable: NodeSlotId) -> PaintableData {
+        self.layout_arena.paintable_data(paintable)
     }
 
-    pub(crate) fn layout_node_shell(&self, paintable: PaintableSlotId) -> *mut std::ffi::c_void {
-        self.layout_arena.shell_if_live(self.data(paintable).layout_node)
+    pub(crate) fn layout_node_shell(&self, paintable: NodeSlotId) -> *mut std::ffi::c_void {
+        self.layout_arena.shell_if_live(paintable)
     }
 
-    pub(crate) fn hit_test_facts(&mut self, paintable: PaintableSlotId) -> FfiHitTestPaintableFacts {
+    pub(crate) fn hit_test_facts(&mut self, paintable: NodeSlotId) -> FfiHitTestPaintableFacts {
         self.paintable_facts(paintable)
     }
 
-    fn paintable_facts(&mut self, paintable: PaintableSlotId) -> FfiHitTestPaintableFacts {
+    fn paintable_facts(&mut self, paintable: NodeSlotId) -> FfiHitTestPaintableFacts {
         let index = paintable.slot_index() as usize;
         if let Some((memoized_id, facts)) = self.paintable_facts_cache[index]
             && memoized_id == paintable
@@ -180,7 +180,7 @@ impl<'a> PaintRecorder<'a> {
     ) -> PaintRecorder<'a> {
         PaintRecorder {
             layout_arena: self.layout_arena,
-            paintables: self.paintables,
+            paint_state: self.paint_state,
             stacking_contexts: self.stacking_contexts,
             host: self.host,
             paint_host: self.paint_host,
@@ -201,8 +201,8 @@ impl<'a> PaintRecorder<'a> {
             spliced_capture_count: 0,
             uncacheable_paint_generation: 0,
             list: HitTestList::default(),
-            base_paint_facts_cache: vec![None; self.paintables.slot_count()],
-            paintable_facts_cache: vec![None; self.paintables.slot_count()],
+            base_paint_facts_cache: vec![None; self.layout_arena.paintable_row_count()],
+            paintable_facts_cache: vec![None; self.layout_arena.paintable_row_count()],
             text_node_facts_cache: HashMap::new(),
             font_resource_id_cache: HashMap::new(),
             text_control_selection_cache: HashMap::new(),
@@ -211,19 +211,15 @@ impl<'a> PaintRecorder<'a> {
         }
     }
 
-    pub(crate) fn border_radii(&mut self, paintable: PaintableSlotId) -> BorderRadii {
-        let Some(style) = self.layout_arena.node_style_if_live(self.data(paintable).layout_node) else {
+    pub(crate) fn border_radii(&mut self, paintable: NodeSlotId) -> BorderRadii {
+        let Some(style) = self.layout_arena.node_style_if_live(paintable) else {
             return BorderRadii::default();
         };
-        crate::painting::visual_context::node_values::border_radii_data(style, self.paintables, paintable)
+        crate::painting::visual_context::node_values::border_radii_data(style, self.layout_arena, paintable)
     }
 
-    pub(crate) fn piece_border_radii(
-        &mut self,
-        paintable: PaintableSlotId,
-        piece: &InlineBoxPieceRecord,
-    ) -> BorderRadii {
-        let Some(style) = self.layout_arena.node_style_if_live(self.data(paintable).layout_node) else {
+    pub(crate) fn piece_border_radii(&mut self, paintable: NodeSlotId, piece: &InlineBoxPieceRecord) -> BorderRadii {
+        let Some(style) = self.layout_arena.node_style_if_live(paintable) else {
             return BorderRadii::default();
         };
         crate::painting::visual_context::node_values::piece_border_radii_data(
@@ -234,15 +230,14 @@ impl<'a> PaintRecorder<'a> {
         )
     }
 
-    pub(crate) fn base_paint_facts(&mut self, paintable: PaintableSlotId) -> BasePaintFacts {
+    pub(crate) fn base_paint_facts(&mut self, paintable: NodeSlotId) -> BasePaintFacts {
         let index = paintable.slot_index() as usize;
         if let Some((memoized_id, facts)) = self.base_paint_facts_cache[index]
             && memoized_id == paintable
         {
             return facts;
         }
-        let data = self.data(paintable);
-        let Some(style) = self.layout_arena.node_style_if_live(data.layout_node) else {
+        let Some(style) = self.layout_arena.node_style_if_live(paintable) else {
             let facts = BasePaintFacts::default();
             self.base_paint_facts_cache[index] = Some((paintable, facts));
             return facts;
@@ -251,7 +246,7 @@ impl<'a> PaintRecorder<'a> {
         let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE && effects.opacity != 0.0;
         let empty_cells_property_applies = self.display(paintable).is_internal_table()
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
-            && crate::painting::paint_order::first_paint_child(self.layout_arena, self.paintables, paintable).is_none();
+            && crate::painting::paint_order::first_paint_child(self.layout_arena, paintable).is_none();
         let has_backdrop_filter = effects.backdrop_filter.operations.length != 0;
         let paints_border_image = crate::painting::style_queries::handle_value(&style.border().border_image_source)
             .is_some_and(|source| matches!(source, crate::css::style_value::StyleValueData::Image { .. }));
@@ -265,38 +260,38 @@ impl<'a> PaintRecorder<'a> {
         facts
     }
 
-    fn has_stacking_context(&self, paintable: PaintableSlotId) -> bool {
+    fn has_stacking_context(&self, paintable: NodeSlotId) -> bool {
         self.data(paintable).stacking_context != NO_STACKING_CONTEXT
     }
 
-    fn layout_kind(&self, paintable: PaintableSlotId) -> Option<NodeKind> {
-        self.layout_arena.node_kind_if_live(self.data(paintable).layout_node)
+    fn layout_kind(&self, paintable: NodeSlotId) -> Option<NodeKind> {
+        self.layout_arena.node_kind_if_live(paintable)
     }
 
-    fn display(&self, paintable: PaintableSlotId) -> crate::css::display::FfiDisplay {
+    fn display(&self, paintable: NodeSlotId) -> crate::css::display::FfiDisplay {
         crate::css::display::FfiDisplay::from_raw(self.data(paintable).display)
     }
 
-    fn visibility_is_visible(&self, paintable: PaintableSlotId) -> bool {
+    fn visibility_is_visible(&self, paintable: NodeSlotId) -> bool {
         self.layout_arena
-            .node_style_if_live(self.data(paintable).layout_node)
+            .node_style_if_live(paintable)
             .is_none_or(|style| style.visibility() == css_enums::visibility::VISIBLE)
     }
 
-    pub(crate) fn is_visible(&mut self, paintable: PaintableSlotId) -> bool {
+    pub(crate) fn is_visible(&mut self, paintable: NodeSlotId) -> bool {
         self.visibility_is_visible(paintable) && !self.paintable_facts(paintable).opacity_is_zero
     }
 
-    pub(crate) fn visible_for_hit_testing(&mut self, paintable: PaintableSlotId) -> bool {
+    pub(crate) fn visible_for_hit_testing(&mut self, paintable: NodeSlotId) -> bool {
         self.paintable_facts(paintable).visible_for_hit_testing
     }
 
-    fn is_replaced_box(&self, paintable: PaintableSlotId) -> bool {
+    fn is_replaced_box(&self, paintable: NodeSlotId) -> bool {
         self.data(paintable)
             .has_flag(crate::painting::paintable_data::PaintableFlag::ReplacedBox)
     }
 
-    pub(crate) fn own_context_index(&self, paintable: PaintableSlotId) -> usize {
+    pub(crate) fn own_context_index(&self, paintable: NodeSlotId) -> usize {
         if let Some(nested) = &self.nested
             && let Some((own, _)) = nested.assignments.paintable_indices.get(&paintable.index)
         {
@@ -309,19 +304,16 @@ impl<'a> PaintRecorder<'a> {
         self.paint_host.accumulated_2d_scale(self.nested_tree.as_ref(), index)
     }
 
-    pub(crate) fn own_accumulated_2d_scale(&self, paintable: PaintableSlotId) -> libgfx_rust::FloatSize {
+    pub(crate) fn own_accumulated_2d_scale(&self, paintable: NodeSlotId) -> libgfx_rust::FloatSize {
         self.accumulated_2d_scale_at(self.own_context_index(paintable))
     }
 
-    pub(crate) fn is_chrome_mirrored(&self, paintable: PaintableSlotId) -> bool {
-        self.layout_arena
-            .node_style_if_live(self.data(paintable).layout_node)
-            .is_some_and(|style| {
-                let writing_mode = style.writing_mode();
-                (writing_mode == css_enums::writing_mode::HORIZONTAL_TB
-                    && style.direction() == css_enums::direction::RTL)
-                    || writing_mode == css_enums::writing_mode::VERTICAL_RL
-                    || writing_mode == css_enums::writing_mode::SIDEWAYS_RL
-            })
+    pub(crate) fn is_chrome_mirrored(&self, paintable: NodeSlotId) -> bool {
+        self.layout_arena.node_style_if_live(paintable).is_some_and(|style| {
+            let writing_mode = style.writing_mode();
+            (writing_mode == css_enums::writing_mode::HORIZONTAL_TB && style.direction() == css_enums::direction::RTL)
+                || writing_mode == css_enums::writing_mode::VERTICAL_RL
+                || writing_mode == css_enums::writing_mode::SIDEWAYS_RL
+        })
     }
 }

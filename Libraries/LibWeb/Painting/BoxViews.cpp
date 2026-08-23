@@ -161,16 +161,14 @@ ResolvedCSSFilter resolve_css_filter(CSS::ComputedFilterView computed_filter, La
     return result;
 }
 
-static_assert(Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX == Layout::RustFFI::INVALID_NODE_SLOT_INDEX);
-
-Layout::RustFFI::PaintableSlotId committed_row_slot(Layout::Node const& node)
+Layout::RustFFI::NodeSlotId committed_row_slot(Layout::Node const& node)
 {
-    return { Layout::Node::slot_id(&node).index };
+    return Layout::Node::slot_id(&node);
 }
 
-Layout::RustFFI::PaintableSlotId viewport_row_slot(DOM::Document const& document)
+Layout::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const& document)
 {
-    return { Layout::Node::slot_id(document.unsafe_layout_node()).index };
+    return Layout::Node::slot_id(document.unsafe_layout_node());
 }
 
 Layout::RustFFI::PaintableData const* committed_row(Layout::Node const& node)
@@ -183,7 +181,7 @@ bool has_committed_box(Layout::Node const& node)
     return committed_row(node) != nullptr;
 }
 
-Layout::Node* layout_node_for_committed_slot(Layout::NodeArena& arena, Layout::RustFFI::PaintableSlotId slot)
+Layout::Node* layout_node_for_committed_slot(Layout::NodeArena& arena, Layout::RustFFI::NodeSlotId slot)
 {
     return static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_paintable_layout_node_shell(arena.handle(), slot));
 }
@@ -216,16 +214,6 @@ CSSPixelRect absolute_border_box_rect(Layout::Node const& node)
 CSSPixelPoint absolute_position(Layout::Node const& node)
 {
     return absolute_rect(node).location();
-}
-
-CSSPixels absolute_x(Layout::Node const& node)
-{
-    return absolute_rect(node).x();
-}
-
-CSSPixels absolute_y(Layout::Node const& node)
-{
-    return absolute_rect(node).y();
 }
 
 CSSPixelPoint offset(Layout::Node const& node)
@@ -279,14 +267,6 @@ Optional<OverflowData> overflow_data(Layout::Node const& node)
     if (!row || !row->has_overflow)
         return {};
     return OverflowData { from_ffi_css_pixel_rect(row->overflow.rect), row->overflow.has_scrollable_overflow };
-}
-
-Optional<CachedOverflowData> cached_overflow_data(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    if (!row || !row->has_cached_overflow)
-        return {};
-    return CachedOverflowData { from_ffi_css_pixel_rect(row->cached_overflow.rect), row->cached_overflow.has_scrollable_overflow };
 }
 
 static void measure_scrollable_overflow_if_missing(Layout::Node const& node, Layout::RustFFI::PaintableData const& row)
@@ -393,12 +373,6 @@ bool is_inline(Layout::Node const& node)
 bool has_css_transform(Layout::Node const& node)
 {
     return has_committed_box(node) && as<Layout::NodeWithStyle>(node).has_css_transform();
-}
-
-bool has_non_invertible_css_transform(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    return row && has_flag(*row, Layout::RustFFI::PaintableFlag::HasNonInvertibleCssTransform);
 }
 
 bool uses_collapsing_borders_model(Layout::Node const& node)
@@ -538,12 +512,6 @@ bool is_svg_path_paintable(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
     return row && row->kind == Layout::RustFFI::PaintableKind::SVGPathPaintable;
-}
-
-bool is_svg_foreign_object_paintable(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable;
 }
 
 Optional<int> effective_z_index(Layout::Node const& node)
@@ -812,7 +780,7 @@ Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node
             cursor_position->affinity() == TextAffinity::Downstream);
         if (result.found && result.owner_paintable.index == committed_row_slot(block).index) {
             auto owner_slot = owner_inline ? committed_row_slot(*owner_inline)
-                                           : Layout::RustFFI::PaintableSlotId { Layout::RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
+                                           : Layout::RustFFI::NodeSlotId { Layout::RustFFI::INVALID_NODE_SLOT_INDEX };
             if (result.nearest_self_painting_inline.index != owner_slot.index)
                 return {};
             auto const* style_source = static_cast<Layout::NodeWithStyle const*>(result.style_source);
@@ -1009,23 +977,6 @@ Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPi
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
     auto result = document.visual_context_tree().transform_point_for_hit_test(
         VisualContextIndex { row->accumulated_visual_context_index }, position.to_type<float>() * pixel_ratio,
-        document.scroll_state_snapshot());
-    if (!result.has_value())
-        return {};
-    return (*result / pixel_ratio).to_type<CSSPixels>();
-}
-
-Optional<CSSPixelPoint> transform_point_to_local_for_descendants(Layout::Node const& node, CSSPixelPoint position)
-{
-    auto const* row = committed_row(node);
-    if (!row)
-        return {};
-    auto const& document = node.document();
-    if (!document.layout_node() || !has_committed_box(*document.layout_node()))
-        return position;
-    auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto result = document.visual_context_tree().transform_point_for_hit_test(
-        VisualContextIndex { row->accumulated_visual_context_for_descendants_index }, position.to_type<float>() * pixel_ratio,
         document.scroll_state_snapshot());
     if (!result.has_value())
         return {};

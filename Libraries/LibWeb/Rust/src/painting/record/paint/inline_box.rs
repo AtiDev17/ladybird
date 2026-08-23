@@ -6,7 +6,7 @@
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
-use crate::painting::paintable_data::PaintableSlotId;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::paintable_data::{PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT, PIECE_EDGE_RIGHT, PIECE_EDGE_TOP};
 use crate::painting::paintable_geometry;
 use crate::painting::record::paint::border::paint_box_borders;
@@ -14,25 +14,28 @@ use crate::painting::record::paint::border::{BorderDataDevicePixels, BordersData
 use crate::painting::record::paint::{background, outline, text};
 use crate::painting::record::{PaintPhase, PaintRecorder};
 
-pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId, phase: PaintPhase) {
+pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, phase: PaintPhase) {
     let root = {
         let block = recorder.data(paintable).containing_block;
-        if block.is_invalid() || !recorder.paintables.is_live(block) || !recorder.data(block).kind.has_lines() {
+        if block.is_invalid()
+            || !recorder.layout_arena.paintable_row_is_populated(block)
+            || !recorder.data(block).kind.has_lines()
+        {
             return;
         }
         block
     };
-    let root_position = paintable_geometry::absolute_position(recorder.paintables, root);
-    let paintables = recorder.paintables;
-    let piece_indices = &paintables.side(paintable).piece_indices;
-    let root_pieces = &paintables.side(root).inline_box_pieces;
+    let root_position = paintable_geometry::absolute_position(recorder.layout_arena, root);
+    let layout_arena = recorder.layout_arena;
+    let piece_indices = &layout_arena.paintable_side_data(paintable).piece_indices;
+    let root_pieces = &layout_arena.paintable_side_data(root).inline_box_pieces;
     let facts = recorder.base_paint_facts(paintable);
     let data = recorder.data(paintable);
 
     if phase == PaintPhase::Background && facts.is_visible {
         crate::painting::record::paint::paint_backdrop_filter(recorder, paintable, &facts);
         let background_is_propagated_to_root = {
-            let node_flags = recorder.layout_arena.node_flags_if_live(data.layout_node);
+            let node_flags = recorder.layout_arena.node_flags_if_live(paintable);
             node_flags & crate::layout::node_data::NodeFlag::IsBody as u32 != 0
                 && recorder
                     .paint_host
@@ -40,7 +43,7 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
                     .use_body_background_properties
         };
         let has_borders = {
-            let style = recorder.layout_arena.node_style_if_live(data.layout_node);
+            let style = recorder.layout_arena.node_style_if_live(paintable);
             let zero = CssPixels::from_raw(0);
             style.is_some_and(|style| {
                 style.border_top_width() != zero
@@ -57,7 +60,7 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
             let border_box_rect = CssPixelRect::from(piece.border_box_rect).translated_by(root_position);
             let padding_box_rect = piece.shrunken_by_present_edges(
                 border_box_rect,
-                crate::painting::paintable_geometry::committed_border(recorder.paintables, paintable),
+                crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable),
             );
             let border_radii = recorder.piece_border_radii(paintable, piece);
             if !background_is_propagated_to_root {
@@ -80,7 +83,7 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
 
     if phase == PaintPhase::Border && facts.is_visible {
         let converter = recorder.converter;
-        let Some(style) = recorder.layout_arena.node_style_if_live(data.layout_node) else {
+        let Some(style) = recorder.layout_arena.node_style_if_live(paintable) else {
             return;
         };
         let zero = CssPixels::from_raw(0);
@@ -102,7 +105,7 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
                 },
             )
         };
-        let border = crate::painting::paintable_geometry::committed_border(recorder.paintables, paintable);
+        let border = crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable);
         for piece_index in piece_indices {
             let piece = &root_pieces[*piece_index as usize];
             if piece.is_geometry_only_placeholder {
@@ -153,7 +156,7 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
     }
 
     if phase == PaintPhase::Outline && facts.is_visible {
-        let node = recorder.data(paintable).layout_node;
+        let node = paintable;
         let outline = crate::painting::style_queries::outline_data(
             recorder.layout_arena,
             node,

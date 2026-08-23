@@ -5,16 +5,16 @@
  */
 
 use crate::css::css_pixels::CssPixels;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::recorder::{PaintStyleOrColor, StrokePathParams};
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::paintable_geometry;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::border::{BorderDataDevicePixels, BordersDataDevicePixels, paint_all_borders};
 use libgfx_rust::{CapStyle, Color, JoinStyle, ShouldAntiAlias};
 
-pub(crate) fn paint_outline_phase(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
-    let node = recorder.data(paintable).layout_node;
+pub(crate) fn paint_outline_phase(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
+    let node = paintable;
     let outline = crate::painting::style_queries::outline_data(
         recorder.layout_arena,
         node,
@@ -22,7 +22,7 @@ pub(crate) fn paint_outline_phase(recorder: &mut PaintRecorder<'_>, paintable: P
         recorder.inputs.outline_auto_color,
     );
     let outline_offset = crate::painting::style_queries::outline_offset(recorder.layout_arena, node);
-    let border_box_rect = paintable_geometry::absolute_border_box_rect(recorder.paintables, paintable);
+    let border_box_rect = paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
     let border_radii = recorder.border_radii(paintable);
     paint_outline(recorder, outline, outline_offset, border_box_rect, border_radii);
     let facts = recorder.paint_host.outline_facts(recorder.layout_node_shell(paintable));
@@ -90,7 +90,7 @@ pub(crate) fn paint_outline(
 
 fn paint_focused_area_outline(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     facts: &crate::painting::host::FfiOutlineFacts,
 ) {
     // https://html.spec.whatwg.org/multipage/interaction.html#focusable-area
@@ -104,7 +104,7 @@ fn paint_focused_area_outline(
     // SAFETY: The host hands out a heap-allocated Gfx::Path the receiver owns.
     let path = unsafe { libgfx_rust::path::OwnedPath::adopt(facts.focused_area_path) };
     let converter = recorder.converter;
-    let image_rect = paintable_geometry::absolute_rect(recorder.paintables, paintable);
+    let image_rect = paintable_geometry::absolute_rect(recorder.layout_arena, paintable);
     let scale = recorder.inputs.device_pixels_per_css_pixel as f32;
     let device_origin = converter.rounded_device_point(image_rect.location());
     let transformed = path.copy_transformed([scale, 0.0, 0.0, scale, device_origin.x as f32, device_origin.y as f32]);

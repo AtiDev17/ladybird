@@ -12,11 +12,10 @@ use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
 use crate::css::style_value::StyleValueData;
 use crate::layout::LayoutNodeArena;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::host::{FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
-use crate::painting::paintable_arena::PaintableArena;
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::paintable_geometry;
 use crate::painting::style_queries;
 use libgfx_rust::{
@@ -49,13 +48,12 @@ pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs
 pub(crate) fn transform_reference_box(
     style: ComputedValuesView<'_>,
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     callbacks: &FfiVisualContextHostCallbacks,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
 ) -> CssPixelRect {
     use css_enums::transform_box::{BORDER_BOX, CONTENT_BOX, FILL_BOX, STROKE_BOX, VIEW_BOX};
     let mut transform_box = style.transform().transform_box;
-    let data = paintables.data_ref(slot);
+    let data = layout_arena.paintable_data(slot);
     if paintable_geometry::is_svg_paintable(data.kind) {
         transform_box = match transform_box {
             CONTENT_BOX => FILL_BOX,
@@ -70,12 +68,12 @@ pub(crate) fn transform_reference_box(
         };
     }
     match transform_box {
-        CONTENT_BOX | FILL_BOX => paintable_geometry::absolute_rect(paintables, slot),
+        CONTENT_BOX | FILL_BOX => paintable_geometry::absolute_rect(layout_arena, slot),
         VIEW_BOX => callbacks
-            .svg_transform_view_box_rect(layout_arena.shell_if_live(data.layout_node))
+            .svg_transform_view_box_rect(layout_arena.shell_if_live(slot))
             .map(CssPixelRect::from)
-            .unwrap_or_else(|| paintable_geometry::absolute_border_box_rect(paintables, slot)),
-        _ => paintable_geometry::absolute_border_box_rect(paintables, slot),
+            .unwrap_or_else(|| paintable_geometry::absolute_border_box_rect(layout_arena, slot)),
+        _ => paintable_geometry::absolute_border_box_rect(layout_arena, slot),
     }
 }
 
@@ -116,13 +114,10 @@ fn resolved_transform_to_matrix(
 // https://drafts.csswg.org/css-transforms-2/#ctm
 pub(crate) fn compute_transform(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     callbacks: &FfiVisualContextHostCallbacks,
-    slot: PaintableSlotId,
+    node: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<(TransformData, bool)> {
-    let data = paintables.data_ref(slot);
-    let node = data.layout_node;
     let style = layout_arena.node_style_if_live(node)?;
     let node_kind = layout_arena.node_kind_if_live(node)?;
 
@@ -143,7 +138,7 @@ pub(crate) fn compute_transform(
 
     // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
     // offset properties as follows:
-    let reference_box = transform_reference_box(style, layout_arena, paintables, callbacks, slot);
+    let reference_box = transform_reference_box(style, layout_arena, callbacks, node);
     let origin_lp = |handle: &ComputedStyleValueHandle| {
         handle
             .length_percentage()
@@ -206,12 +201,11 @@ pub(crate) fn compute_transform(
 // https://drafts.csswg.org/css-transforms-2/#perspective-matrix
 pub(crate) fn compute_perspective_data(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     callbacks: &FfiVisualContextHostCallbacks,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<PerspectiveData> {
-    let node = paintables.data_ref(slot).layout_node;
+    let node = slot;
     let style = layout_arena.node_style_if_live(node)?;
     let transform_values = style.transform();
     if !transform_values.has_perspective || !style_queries::is_transformable(layout_arena, node) {
@@ -224,7 +218,7 @@ pub(crate) fn compute_perspective_data(
     // 2. Translate by the computed X and Y values of 'perspective-origin'
     // https://drafts.csswg.org/css-transforms-2/#perspective-origin-property
     // Percentages: refer to the size of the reference box
-    let reference_box = transform_reference_box(style, layout_arena, paintables, callbacks, slot);
+    let reference_box = transform_reference_box(style, layout_arena, callbacks, slot);
     let origin_x = transform_values
         .perspective_origin_x
         .length_percentage()
@@ -256,16 +250,15 @@ pub(crate) fn compute_perspective_data(
 
 pub(crate) fn compute_css_clip_data(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<ClipData> {
-    let node = paintables.data_ref(slot).layout_node;
+    let node = slot;
     let style = layout_arena.node_style_if_live(node)?;
     if !style.effects().clip_is_rect || !style.is_absolutely_positioned() {
         return None;
     }
-    let border_box = paintable_geometry::absolute_border_box_rect(paintables, slot);
+    let border_box = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
     let [top_edge, right_edge, bottom_edge, left_edge] = &style.effects().clip_edges;
     let left = border_box.x + resolved_clip_edge_px(left_edge, CssPixels::from_raw(0));
     let top = border_box.y + resolved_clip_edge_px(top_edge, CssPixels::from_raw(0));
@@ -340,8 +333,8 @@ fn border_radius_is_initial(handle: &ComputedStyleValueHandle) -> bool {
 
 pub(crate) fn border_radii_data(
     style: ComputedValuesView<'_>,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
+    layout_arena: &LayoutNodeArena,
+    slot: NodeSlotId,
 ) -> BorderRadii {
     let border = style.border();
     let has_noninitial_radii = !border_radius_is_initial(&border.border_bottom_left_radius)
@@ -351,7 +344,7 @@ pub(crate) fn border_radii_data(
     if !has_noninitial_radii {
         return BorderRadii::default();
     }
-    let border_box = paintable_geometry::absolute_border_box_rect(paintables, slot);
+    let border_box = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
     let border_rect = CssPixelRect::new(
         CssPixels::from_raw(0),
         CssPixels::from_raw(0),
@@ -421,21 +414,17 @@ pub(crate) fn piece_border_radii_data(
     crate::painting::border_radii::scale_radii_to_fit(border_rect, radii)
 }
 
-fn overflow_property_applies(
-    layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
-) -> bool {
+fn overflow_property_applies(layout_arena: &LayoutNodeArena, slot: NodeSlotId) -> bool {
     // https://drafts.csswg.org/css-overflow-3/#overflow-control
     // Overflow properties apply to block containers, flex containers and grid containers.
     // FIXME: Ideally we would check whether overflow applies positively rather than listing exceptions. However,
     // not all elements that should support overflow are currently identifiable that way.
-    let data = paintables.data_ref(slot);
+    let data = layout_arena.paintable_data(slot);
     if paintable_geometry::is_svg_paintable(data.kind) {
         return false;
     }
     let display = crate::css::display::FfiDisplay::from_raw(data.display);
-    if crate::painting::fragment_ownership::node_is_fragmented_inline(layout_arena, data.layout_node) {
+    if crate::painting::fragment_ownership::node_is_fragmented_inline(layout_arena, slot) {
         return false;
     }
     if display.is_ruby_inside() {
@@ -451,8 +440,7 @@ fn overflow_property_applies(
 fn overflow_clip_edge_rect(
     style: ComputedValuesView<'_>,
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
 ) -> CssPixelRect {
     use crate::css::css_enums::background_box::{BORDER_BOX, CONTENT_BOX};
     let overflow_clip_margin = &style.misc_reset().overflow_clip_margin;
@@ -465,7 +453,7 @@ fn overflow_clip_edge_rect(
     let visual_box = if top_side.has_visual_box {
         top_side.visual_box
     } else {
-        let node_kind = layout_arena.node_kind_if_live(paintables.data_ref(slot).layout_node);
+        let node_kind = layout_arena.node_kind_if_live(slot);
         if node_kind.is_some_and(crate::layout::kind_is_replaced_box) {
             CONTENT_BOX
         } else {
@@ -473,9 +461,9 @@ fn overflow_clip_edge_rect(
         }
     };
     let overflow_clip_edge = match visual_box {
-        CONTENT_BOX => paintable_geometry::absolute_rect(paintables, slot),
-        BORDER_BOX => paintable_geometry::absolute_border_box_rect(paintables, slot),
-        _ => paintable_geometry::absolute_padding_box_rect(paintables, slot),
+        CONTENT_BOX => paintable_geometry::absolute_rect(layout_arena, slot),
+        BORDER_BOX => paintable_geometry::absolute_border_box_rect(layout_arena, slot),
+        _ => paintable_geometry::absolute_padding_box_rect(layout_arena, slot),
     };
     // '<length [0,∞]>'
     // The specified offset dictates how much the overflow clip edge is expanded from the specified box edge
@@ -517,14 +505,12 @@ pub(crate) fn mix_blend_mode_to_compositing_and_blending_operator(
 
 pub(crate) fn compute_effects_data(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     callbacks: &FfiVisualContextHostCallbacks,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
 ) -> Option<EffectsData> {
     use crate::css::css_enums::mix_blend_mode;
-    let data = paintables.data_ref(slot);
-    let resolved_filter = callbacks.resolve_effects_filter(layout_arena.shell_if_live(data.layout_node));
-    paintables.side(slot).svg_filter_bounds.set(
+    let resolved_filter = callbacks.resolve_effects_filter(layout_arena.shell_if_live(slot));
+    layout_arena.paintable_side_data(slot).svg_filter_bounds.set(
         resolved_filter
             .has_svg_filter_bounds
             .then_some(resolved_filter.svg_filter_bounds),
@@ -536,7 +522,7 @@ pub(crate) fn compute_effects_data(
         // SAFETY: The host hands over a heap-allocated Gfx::Filter for us to own.
         Some(std::rc::Rc::new(unsafe { super::FilterHandle::adopt(filter_raw) }))
     };
-    let style = layout_arena.node_style_if_live(data.layout_node)?;
+    let style = layout_arena.node_style_if_live(slot)?;
     let effects_values = style.effects();
     if filter.is_none() && effects_values.opacity == 1.0 && effects_values.mix_blend_mode == mix_blend_mode::NORMAL {
         return None;
@@ -572,12 +558,10 @@ fn any_background_layer_has_a_fixed_attachment_image(style: ComputedValuesView<'
 
 pub(crate) fn wants_fixed_background_visual_context(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     root_background_source: crate::painting::host::FfiRootBackgroundSource,
-    slot: PaintableSlotId,
+    node: NodeSlotId,
     may_be_root_element: bool,
 ) -> bool {
-    let node = paintables.data_ref(slot).layout_node;
     let is_root_element = may_be_root_element && style_queries::node_is_root_element(layout_arena, node);
     let mut background_layers_node = node;
     if is_root_element && root_background_source.use_body_background_properties {
@@ -640,16 +624,15 @@ fn mask_kind_from(value: i32) -> libgfx_rust::MaskKind {
 
 pub(crate) fn mask_layer_presence(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
     callbacks: &FfiVisualContextHostCallbacks,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
     include_css_mask_layers: bool,
 ) -> Vec<MaskLayerPresenceEntry> {
     use super::MaskLayerOrigin;
     let mut layers = Vec::new();
-    let data = paintables.data_ref(slot);
+    let data = layout_arena.paintable_data(slot);
     if include_css_mask_layers {
-        let node = data.layout_node;
+        let node = slot;
         if let Some(style) = layout_arena.node_style_if_live(node)
             && style_queries::mask_layers_have_image(style.mask())
             && layout_arena
@@ -659,13 +642,13 @@ pub(crate) fn mask_layer_presence(
         {
             layers.push(MaskLayerPresenceEntry {
                 origin: MaskLayerOrigin::CssMaskLayers,
-                area: paintable_geometry::absolute_border_box_rect(paintables, slot),
+                area: paintable_geometry::absolute_border_box_rect(layout_arena, slot),
                 kind: libgfx_rust::MaskKind::Alpha,
             });
         }
     }
     if kind_overrides_svg_mask_virtuals(data.kind) {
-        let svg_facts = callbacks.svg_mask_facts(layout_arena.shell_if_live(data.layout_node));
+        let svg_facts = callbacks.svg_mask_facts(layout_arena.shell_if_live(slot));
         if svg_facts.has_mask_area {
             layers.push(MaskLayerPresenceEntry {
                 origin: MaskLayerOrigin::SvgMask,
@@ -684,13 +667,8 @@ pub(crate) fn mask_layer_presence(
     layers
 }
 
-pub(crate) fn backface_hidden(
-    layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
-) -> bool {
+pub(crate) fn backface_hidden(layout_arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
     use crate::css::css_enums::backface_visibility;
-    let node = paintables.data_ref(slot).layout_node;
     let Some(style) = layout_arena.node_style_if_live(node) else {
         return false;
     };
@@ -698,13 +676,8 @@ pub(crate) fn backface_hidden(
         && style_queries::is_transformable(layout_arena, node)
 }
 
-pub(crate) fn may_have_clip(
-    layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
-) -> bool {
+pub(crate) fn may_have_clip(layout_arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
     use crate::css::css_enums::{content_visibility, overflow};
-    let node = paintables.data_ref(slot).layout_node;
     let Some(style) = layout_arena.node_style_if_live(node) else {
         return false;
     };
@@ -717,12 +690,11 @@ pub(crate) fn may_have_clip(
 
 pub(crate) fn compute_clip_data(
     layout_arena: &LayoutNodeArena,
-    paintables: &PaintableArena,
-    slot: PaintableSlotId,
+    slot: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<ClipData> {
     use crate::css::css_enums::{content_visibility, overflow};
-    let node = paintables.data_ref(slot).layout_node;
+    let node = slot;
     let style = layout_arena.node_style_if_live(node)?;
     let box_values = style.box_values();
     let mut overflow_x = box_values.overflow_x;
@@ -749,12 +721,12 @@ pub(crate) fn compute_clip_data(
     // 'clip'
     // This value indicates that the box’s content is clipped to its overflow clip edge
     let has_hidden_overflow = overflow_x != overflow::VISIBLE || overflow_y != overflow::VISIBLE;
-    if !has_hidden_overflow || !overflow_property_applies(layout_arena, paintables, slot) {
+    if !has_hidden_overflow || !overflow_property_applies(layout_arena, slot) {
         return None;
     }
 
-    let padding_box = paintable_geometry::absolute_padding_box_rect(paintables, slot);
-    let overflow_clip_edge = overflow_clip_edge_rect(style, layout_arena, paintables, slot);
+    let padding_box = paintable_geometry::absolute_padding_box_rect(layout_arena, slot);
+    let overflow_clip_edge = overflow_clip_edge_rect(style, layout_arena, slot);
     let extent_limit = CssPixels::from_integer(crate::css::css_pixels::MAX_INTEGER_VALUE as i64);
     let (left, right) = match overflow_x {
         overflow::VISIBLE => (CssPixels::from_raw(0), extent_limit),
@@ -781,7 +753,7 @@ pub(crate) fn compute_clip_data(
     // FIXME: Adjust the border radii for the overflow-clip-margin case.
     //        (see https://drafts.csswg.org/css-overflow-4/#valdef-overflow-clip-margin-length-0 )
     let radii = if overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE {
-        border_radii_data(style, paintables, slot).shrunken(
+        border_radii_data(style, layout_arena, slot).shrunken(
             style.border_top_width(),
             style.border_right_width(),
             style.border_bottom_width(),

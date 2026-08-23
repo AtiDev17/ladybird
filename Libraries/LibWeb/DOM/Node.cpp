@@ -122,6 +122,7 @@ Node* Node::from_unique_id(UniqueNodeID unique_id)
 Node::Node(Document& document, NodeType type)
     : EventTarget()
     , m_document(&document)
+    , m_root(this)
     , m_type(type)
 {
     // A Document is its own shadow-including root, so it is always connected.
@@ -267,6 +268,7 @@ void Node::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     TreeNode::visit_edges(visitor);
     visitor.visit(m_document);
+    visitor.visit(m_root);
     if (m_rare_data)
         m_rare_data->visit_edges(visitor);
 }
@@ -787,6 +789,13 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     if (count == 0)
         return;
 
+    // OPTIMIZATION: Geometry reads defer replayable selector facts, but a tree mutation changes
+    //               authoritative relationships. Consume that style-change boundary while the old
+    //               tree is still intact.
+    document().flush_deferred_style_change_event();
+    if (&node->document() != &document())
+        node->document().flush_deferred_style_change_event();
+
     auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
     if (document().has_valid_html_collection_caches())
         affects_elements = mutation_affects_elements(nodes.span());
@@ -1130,6 +1139,8 @@ void Node::remove(bool suppress_observers)
 
     // 2. Assert: parent is non-null.
     VERIFY(parent);
+
+    document().flush_deferred_style_change_event();
 
     // 3. Run the live range pre-remove steps, given node.
     live_range_pre_remove();
@@ -1496,6 +1507,8 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 8. Assert: oldParent is non-null.
     VERIFY(old_parent);
+
+    document().flush_deferred_style_change_event();
 
     auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
     if (document().has_valid_html_collection_caches())
@@ -3279,6 +3292,7 @@ void Node::append_child_impl(GC::Ref<Node> node)
         return;
 
     TreeNode::append_child(node);
+    node->set_root_for_subtree(root());
 }
 
 void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
@@ -3286,11 +3300,21 @@ void Node::insert_before_impl(GC::Ref<Node> node, GC::Ptr<Node> child)
     if (!child)
         return append_child_impl(move(node));
     TreeNode::insert_before(node, child);
+    node->set_root_for_subtree(root());
 }
 
 void Node::remove_child_impl(GC::Ref<Node> node)
 {
     TreeNode::remove_child(node);
+    node->set_root_for_subtree(node);
+}
+
+void Node::set_root_for_subtree(Node& new_root)
+{
+    for_each_in_inclusive_subtree([&](Node& node) {
+        node.m_root = new_root;
+        return TraversalDecision::Continue;
+    });
 }
 
 void Node::build_accessibility_tree(AccessibilityTreeNode& parent)

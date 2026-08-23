@@ -7,13 +7,14 @@
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::commands::{
     DisplayListResourceId, ImageFrameResourceId, OptionalAffineTransform, VisualContextIndex,
 };
 use crate::painting::display_list::recorder::{DisplayListRecorder, FillPathParams, PaintStyle, PaintStyleOrColor};
 use crate::painting::host::{FfiImagePaintFacts, FfiLayerImagePrepareFacts};
-use crate::painting::paintable_data::{PaintableKind, PaintableSlotId};
+use crate::painting::paintable_data::PaintableKind;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::gradient_resolution::{gradient_paint_value, record_gradient_fill};
 use libgfx_rust::{
@@ -34,7 +35,7 @@ impl BackgroundBox {
     }
 }
 
-pub(crate) fn paint_background(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_background(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let Some(inputs) =
         crate::painting::record::paint::background_resolution::resolve_background_for_paint(recorder, paintable)
     else {
@@ -52,12 +53,12 @@ pub(crate) fn paint_background(recorder: &mut PaintRecorder<'_>, paintable: Pain
 
 pub(crate) fn paint_background_within(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     background_rect: CssPixelRect,
     border_radii: BorderRadii,
 ) {
     let layout_arena = recorder.layout_arena;
-    let Some(style) = layout_arena.node_style_if_live(recorder.data(paintable).layout_node) else {
+    let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return;
     };
     let resolved = crate::painting::record::paint::background_resolution::resolve_background_layers(
@@ -82,7 +83,7 @@ pub(crate) fn paint_background_within(
 
 pub(crate) fn paint_resolved_background(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     resolved: &crate::painting::record::paint::background_resolution::ResolvedBackground<'_>,
     image_rendering: u8,
     is_root_element: bool,
@@ -144,8 +145,7 @@ pub(crate) fn paint_resolved_background(
     // Shrink the effective clip rect to account for the bits the borders will definitely paint
     // over (if they all have alpha == 255).
     let (border_widths, borders_opaque) = {
-        let data = recorder.data(paintable);
-        let style = recorder.layout_arena.node_style_if_live(data.layout_node);
+        let style = recorder.layout_arena.node_style_if_live(paintable);
         match style {
             Some(style) => {
                 let opaque = libgfx_rust::Color(style.border_top_color()).alpha() == 255
@@ -267,15 +267,15 @@ pub(crate) fn background_box_for(
     box_clip: u8,
     border_box: BackgroundBox,
     recorder: &PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
 ) -> BackgroundBox {
     let mut background_box = border_box;
     if box_clip == css_enums::background_box::CONTENT_BOX {
-        let padding = crate::painting::paintable_geometry::committed_padding(recorder.paintables, paintable);
+        let padding = crate::painting::paintable_geometry::committed_padding(recorder.layout_arena, paintable);
         background_box.shrink(padding.top, padding.right, padding.bottom, padding.left);
     }
     if box_clip == css_enums::background_box::CONTENT_BOX || box_clip == css_enums::background_box::PADDING_BOX {
-        let border = crate::painting::paintable_geometry::committed_border(recorder.paintables, paintable);
+        let border = crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable);
         background_box.shrink(border.top, border.right, border.bottom, border.left);
     }
     background_box
@@ -337,7 +337,7 @@ pub(crate) fn paint_image(
 #[allow(clippy::too_many_arguments)]
 fn paint_image_layer(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     layer: &crate::painting::record::paint::background_resolution::ResolvedBackgroundLayer<'_>,
     image_rendering: u8,
     css_clip_rect: CssPixelRect,
@@ -446,7 +446,7 @@ fn paint_image_layer(
     let resolved_gradient = gradient_paint_value(&image).map(|gradient_value| {
         let style = recorder
             .layout_arena
-            .node_style_if_live(recorder.data(paintable).layout_node)
+            .node_style_if_live(paintable)
             .expect("a painted layer's layout node is live");
         crate::painting::record::paint::gradient_resolution::resolve_gradient_paint(
             style,
@@ -774,12 +774,12 @@ fn source_rect_for_visible_image_part(
     )
 }
 
-fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let converter = recorder.converter;
     let scale = recorder.inputs.device_pixels_per_css_pixel;
 
-    let append_fragment = |recorder: &mut PaintRecorder<'_>, owner: PaintableSlotId, fragment_index: usize| {
-        let fragment = &recorder.paintables.side(owner).fragments[fragment_index];
+    let append_fragment = |recorder: &mut PaintRecorder<'_>, owner: NodeSlotId, fragment_index: usize| {
+        let fragment = &recorder.layout_arena.paintable_side_data(owner).fragments[fragment_index];
         let is_text = recorder
             .layout_arena
             .node_kind_if_live(fragment.layout_node)
@@ -793,8 +793,7 @@ fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: Paintable
         if run.glyphs.is_empty() {
             return;
         }
-        let fragment_absolute_rect =
-            crate::painting::text_fragment::absolute_rect(recorder.layout_arena, recorder.paintables, fragment);
+        let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.layout_arena, fragment);
         let fragment_absolute_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
         let font_id = recorder.register_font(run.font.as_raw());
         let emission =
@@ -816,10 +815,13 @@ fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: Paintable
     let data = recorder.data(paintable);
     if data.kind == PaintableKind::InlinePaintable {
         let root = data.containing_block;
-        if !root.is_invalid() && recorder.paintables.is_live(root) && recorder.data(root).kind.has_lines() {
-            let paintables = recorder.paintables;
-            for piece_index in &paintables.side(paintable).piece_indices {
-                let piece = &paintables.side(root).inline_box_pieces[*piece_index as usize];
+        if !root.is_invalid()
+            && recorder.layout_arena.paintable_row_is_populated(root)
+            && recorder.data(root).kind.has_lines()
+        {
+            let layout_arena = recorder.layout_arena;
+            for piece_index in &layout_arena.paintable_side_data(paintable).piece_indices {
+                let piece = &layout_arena.paintable_side_data(root).inline_box_pieces[*piece_index as usize];
                 for fragment_index in piece.first_fragment_index..piece.first_fragment_index + piece.fragment_count {
                     append_fragment(recorder, root, fragment_index as usize);
                 }
@@ -835,22 +837,18 @@ fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: Paintable
                 .has_flag(crate::painting::paintable_data::PaintableFlag::AbsolutelyPositioned)
                 || current_data.has_flag(crate::painting::paintable_data::PaintableFlag::FixedPosition))
                 && !current_data.has_flag(crate::painting::paintable_data::PaintableFlag::Floating);
-            if let Some(next) =
-                crate::painting::paint_order::next_paint_sibling(recorder.layout_arena, recorder.paintables, current)
-            {
+            if let Some(next) = crate::painting::paint_order::next_paint_sibling(recorder.layout_arena, current) {
                 stack.push(next);
             }
             if out_of_flow_not_floating {
                 continue;
             }
         }
-        if let Some(first_child) =
-            crate::painting::paint_order::first_paint_child(recorder.layout_arena, recorder.paintables, current)
-        {
+        if let Some(first_child) = crate::painting::paint_order::first_paint_child(recorder.layout_arena, current) {
             stack.push(first_child);
         }
         if recorder.data(current).kind.has_lines() {
-            let count = recorder.paintables.side(current).fragments.len();
+            let count = recorder.layout_arena.paintable_side_data(current).fragments.len();
             for fragment_index in 0..count {
                 append_fragment(recorder, current, fragment_index);
             }

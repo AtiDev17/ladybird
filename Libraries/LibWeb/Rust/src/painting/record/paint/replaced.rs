@@ -7,11 +7,11 @@
 use crate::css::css_enums::{image_rendering, object_fit};
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::{
     CanvasId, CompositorContextId, ImageFrameResourceId, VideoSinkResourceId,
 };
 use crate::painting::host::FfiReplacedPaintFacts;
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::{paint_image, to_gfx_scaling_mode};
@@ -133,14 +133,14 @@ pub(crate) fn run_default_sizing_algorithm(
 
 pub(crate) fn get_replaced_box_painting_area(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     mut object_fit: u8,
     content_size: CssPixelSize,
 ) -> IntRect {
     if content_size.is_empty() {
         return IntRect::default();
     }
-    let paintable_rect = absolute_rect(recorder.paintables, paintable);
+    let paintable_rect = absolute_rect(recorder.layout_arena, paintable);
     if paintable_rect.is_empty() {
         return IntRect::default();
     }
@@ -193,9 +193,7 @@ pub(crate) fn get_replaced_box_painting_area(
     // https://drafts.csswg.org/css-images/#the-object-position
     // The computed object-position stores offsets normalized to the left/top edges.
     let (offset_x, offset_y) = {
-        let style = recorder
-            .layout_arena
-            .node_style_if_live(recorder.data(paintable).layout_node);
+        let style = recorder.layout_arena.node_style_if_live(paintable);
         let zero = crate::css::css_pixels::CssPixels::from_raw(0);
         match style {
             Some(style) => {
@@ -221,25 +219,25 @@ pub(crate) fn get_replaced_box_painting_area(
     ))
 }
 
-fn replaced_facts(recorder: &PaintRecorder<'_>, paintable: PaintableSlotId) -> FfiReplacedPaintFacts {
+fn replaced_facts(recorder: &PaintRecorder<'_>, paintable: NodeSlotId) -> FfiReplacedPaintFacts {
     recorder
         .paint_host
         .replaced_paint_facts(recorder.layout_node_shell(paintable))
 }
 
-fn replaced_style(recorder: &PaintRecorder<'_>, paintable: PaintableSlotId) -> (u8, u8) {
+fn replaced_style(recorder: &PaintRecorder<'_>, paintable: NodeSlotId) -> (u8, u8) {
     recorder
         .layout_arena
-        .node_style_if_live(recorder.data(paintable).layout_node)
+        .node_style_if_live(paintable)
         .map_or((object_fit::FILL, image_rendering::AUTO), |style| {
             (style.misc_reset().object_fit, style.image_rendering())
         })
 }
 
-pub(crate) fn paint_image_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_image_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = replaced_facts(recorder, paintable);
     let (object_fit, image_rendering) = replaced_style(recorder, paintable);
-    let image_rect = absolute_rect(recorder.paintables, paintable);
+    let image_rect = absolute_rect(recorder.layout_arena, paintable);
     let image_rect_device_pixels = recorder.converter.rounded_device_rect(image_rect);
     if facts.has_decoded_image_data {
         let radii = border_radii_shrunk_for_borders(recorder, paintable);
@@ -297,12 +295,12 @@ pub(crate) fn paint_image_foreground(recorder: &mut PaintRecorder<'_>, paintable
     }
 }
 
-pub(crate) fn paint_canvas_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_canvas_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = replaced_facts(recorder, paintable);
     let (_, image_rendering) = replaced_style(recorder, paintable);
     let canvas_rect = recorder
         .converter
-        .rounded_device_rect(absolute_rect(recorder.paintables, paintable));
+        .rounded_device_rect(absolute_rect(recorder.layout_arena, paintable));
     let radii = border_radii_shrunk_for_borders(recorder, paintable);
     let corner_clip = begin_corner_clip(recorder, canvas_rect, &radii, libgfx_rust::CornerClip::Outside);
     if facts.has_canvas_content {
@@ -321,13 +319,13 @@ pub(crate) fn paint_canvas_foreground(recorder: &mut PaintRecorder<'_>, paintabl
     end_corner_clip(recorder, corner_clip);
 }
 
-pub(crate) fn paint_video_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_video_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = replaced_facts(recorder, paintable);
     let (object_fit, image_rendering) = replaced_style(recorder, paintable);
     recorder.recorder.save();
     let video_rect = recorder
         .converter
-        .rounded_device_rect(absolute_rect(recorder.paintables, paintable));
+        .rounded_device_rect(absolute_rect(recorder.layout_arena, paintable));
     recorder.recorder.add_clip_rect_int(video_rect);
     let radii = border_radii_shrunk_for_borders(recorder, paintable);
     let corner_clip = begin_corner_clip(recorder, video_rect, &radii, libgfx_rust::CornerClip::Outside);
@@ -391,9 +389,9 @@ pub(crate) fn paint_video_foreground(recorder: &mut PaintRecorder<'_>, paintable
     recorder.recorder.restore();
 }
 
-pub(crate) fn paint_navigable_container_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_navigable_container_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = replaced_facts(recorder, paintable);
-    let absolute_rect = absolute_rect(recorder.paintables, paintable);
+    let absolute_rect = absolute_rect(recorder.layout_arena, paintable);
     let clip_rect = recorder.converter.rounded_device_rect(absolute_rect);
     let radii = border_radii_shrunk_for_borders(recorder, paintable);
     let corner_clip = begin_corner_clip(recorder, clip_rect, &radii, libgfx_rust::CornerClip::Outside);

@@ -6,9 +6,9 @@
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::commands::{PaintInnerBoxShadow, PaintOuterBoxShadow};
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::{begin_corner_clip, end_corner_clip};
 use libgfx_rust::{Color, CornerClip, CornerRadii, IntRect};
@@ -40,13 +40,13 @@ fn adjust_corners_for_spread_distance(corner_radii: &mut CornerRadii, spread_dis
 
 pub(crate) fn paint_box_shadow(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     bordered_content_rect: CssPixelRect,
     borderless_content_rect: CssPixelRect,
     border_radii: BorderRadii,
 ) {
     let layout_arena = recorder.layout_arena;
-    let Some(style) = layout_arena.node_style_if_live(recorder.data(paintable).layout_node) else {
+    let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return;
     };
     let layers = style.effects().box_shadows.as_slice();

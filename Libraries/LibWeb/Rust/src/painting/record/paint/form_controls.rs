@@ -8,9 +8,9 @@ use libgfx_rust::path::{OwnedPath, PathBuilder};
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::recorder::{FillPathParams, PaintStyleOrColor};
 use crate::painting::host::FfiReplacedPaintFacts;
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
 use libgfx_rust::{Color, IntRect, ShouldAntiAlias, WindingRule};
@@ -86,7 +86,7 @@ fn check_mark_path(checkbox_rect: IntRect) -> OwnedPath {
     path.copy_transformed([scale_x, 0.0, 0.0, scale_y, 0.0, 0.0])
 }
 
-pub(crate) fn paint_check_box_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_check_box_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = recorder
         .paint_host
         .replaced_paint_facts(recorder.layout_node_shell(paintable));
@@ -94,7 +94,7 @@ pub(crate) fn paint_check_box_foreground(recorder: &mut PaintRecorder<'_>, paint
     let canvas_color = Color(facts.canvas_color);
 
     // Keep checkboxes painted as square, centered within the space they occupy.
-    let outer_rect = absolute_rect(recorder.paintables, paintable);
+    let outer_rect = absolute_rect(recorder.layout_arena, paintable);
     let checkbox_size = outer_rect.width.min(outer_rect.height);
     let checkbox_rect = centered_square_device_rect(recorder, outer_rect, checkbox_size);
     let checkbox_radius = checkbox_rect.width / 5;
@@ -180,7 +180,7 @@ pub(crate) fn paint_check_box_foreground(recorder: &mut PaintRecorder<'_>, paint
     }
 }
 
-pub(crate) fn paint_radio_button_foreground(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId) {
+pub(crate) fn paint_radio_button_foreground(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId) {
     let facts = recorder
         .paint_host
         .replaced_paint_facts(recorder.layout_node_shell(paintable));
@@ -212,7 +212,7 @@ pub(crate) fn paint_radio_button_foreground(recorder: &mut PaintRecorder<'_>, pa
     };
 
     // Keep radio buttons painted as circles, centered within the space they occupy.
-    let outer_rect = absolute_rect(recorder.paintables, paintable);
+    let outer_rect = absolute_rect(recorder.layout_arena, paintable);
     let radio_button_size = outer_rect.width.min(outer_rect.height);
 
     // This is based on a 1px outer border and 2px inner border when drawn at 13x13.

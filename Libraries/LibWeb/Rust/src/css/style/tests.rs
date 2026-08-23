@@ -5,6 +5,7 @@
  */
 
 use super::batch_matcher::insert_scope_rule;
+use super::capacity::ShallowCapacityBytes;
 use super::index::CandidateEntries;
 use super::index::ParentDispatchFacts;
 use super::index::SelectorPostingKey;
@@ -16,6 +17,7 @@ use super::transaction::InputKind;
 use super::tree::PseudoElementKind;
 use super::tree::PseudoElementTarget;
 use super::*;
+use crate::css::property_metadata::property_id;
 
 #[test]
 fn dense_program_staging_freezes_before_until_release() {
@@ -40,6 +42,38 @@ fn dense_program_staging_freezes_before_until_release() {
     assert_eq!(staged.current(rule, || 50), 50);
     assert_eq!(staged.rows.capacity(), 0);
     assert_eq!(staged.touched.capacity(), 0);
+}
+
+#[test]
+fn pending_paint_only_local_inputs_preserve_layout_geometry() {
+    let (mut engine, nodes) = linear_document();
+    let paint_only = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), paint_only);
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], true);
+    discard_transaction(&mut engine);
+
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(paint_only));
+    assert!(!engine.pending_transaction_may_affect_layout_geometry());
+    assert!(engine.has_pending_transaction());
+}
+
+#[test]
+fn pending_layout_and_incomplete_local_inputs_may_change_geometry() {
+    for (property, declarations_are_complete) in [
+        (property_id::WIDTH, true),
+        (property_id::TRANSFORM, true),
+        (property_id::COLOR, true),
+        (property_id::BACKGROUND_COLOR, false),
+    ] {
+        let (mut engine, nodes) = linear_document();
+        let target = StyleAtomID(200);
+        let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+        engine.set_rule_declared_properties(rule, &[(property, false)], declarations_are_complete);
+        discard_transaction(&mut engine);
+
+        add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+        assert!(engine.pending_transaction_may_affect_layout_geometry());
+    }
 }
 
 fn test_nth_position(argument: &str, of_type: bool) -> selector::NthPosition {
@@ -1738,6 +1772,27 @@ fn sibling_only_tree_staging_does_not_recompute_the_sibling_subtree_depth() {
 
     assert_eq!(engine.tree.take_depth_recompute_visits(), 1);
     assert_eq!(engine.tree.depth(nodes[3]), 3);
+}
+
+#[test]
+fn depth_recompute_membership_is_sparse_for_high_node_identities() {
+    let engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let relations = Some(TreeRelations::detached(TreeScopeID::DOCUMENT));
+    let low_rows = [
+        (StyleNodeID::element(1), None, relations),
+        (StyleNodeID::element(2), None, relations),
+    ];
+    let high_rows = [
+        (StyleNodeID::element(1_000_000), None, relations),
+        (StyleNodeID::element(u32::MAX), None, relations),
+    ];
+    let low_nodes = engine.depth_recompute_nodes(&low_rows);
+    let high_nodes = engine.depth_recompute_nodes(&high_rows);
+
+    assert_eq!(high_nodes.len(), 2);
+    assert!(high_nodes.contains(&StyleNodeID::element(1_000_000)));
+    assert!(high_nodes.contains(&StyleNodeID::element(u32::MAX)));
+    assert_eq!(high_nodes.shallow_capacity_bytes(), low_nodes.shallow_capacity_bytes());
 }
 
 #[test]
@@ -5374,7 +5429,6 @@ fn reused_element_identity_does_not_inherit_a_prefix_transition() {
     let mut planned = Vec::new();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
 
-    engine.tree.release_retired_identities(&mut engine.memory);
     let mut reused_raw = [0_u32; 1];
     engine.allocate_style_nodes(&mut reused_raw);
     assert_eq!(reused_raw[0], nodes[3].raw());

@@ -6,7 +6,7 @@
 
 use crate::css::css_enums::line_style;
 use crate::layout::CollapsedBorderEdge;
-use crate::painting::paintable_data::PaintableSlotId;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::record::PaintRecorder;
 use libgfx_rust::{Color, IntPoint, IntRect, LineStyle};
 
@@ -154,11 +154,11 @@ fn to_device_edge(recorder: &PaintRecorder<'_>, edge: CollapsedBorderEdge) -> De
     }
 }
 
-pub(crate) fn paint_table_borders(recorder: &mut PaintRecorder<'_>, table_paintable: PaintableSlotId) {
+pub(crate) fn paint_table_borders(recorder: &mut PaintRecorder<'_>, table_paintable: NodeSlotId) {
     // Painting according to the collapsing border model:
     // https://www.w3.org/TR/CSS22/tables.html#collapsing-borders
     let Some(borders) =
-        crate::painting::paintable_geometry::committed_collapsed_table_borders(recorder.paintables, table_paintable)
+        crate::painting::paintable_geometry::committed_collapsed_table_borders(recorder.layout_arena, table_paintable)
     else {
         return;
     };
@@ -174,7 +174,7 @@ pub(crate) fn paint_table_borders(recorder: &mut PaintRecorder<'_>, table_painta
     debug_assert_eq!(borders.horizontal_edges.len(), (rows + 1) * columns);
     debug_assert_eq!(borders.vertical_edges.len(), (columns + 1) * rows);
 
-    let origin = crate::painting::paintable_geometry::absolute_rect(recorder.paintables, table_paintable).location();
+    let origin = crate::painting::paintable_geometry::absolute_rect(recorder.layout_arena, table_paintable).location();
     let xs: Vec<i32> = borders
         .column_offsets
         .iter()

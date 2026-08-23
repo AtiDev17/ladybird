@@ -6,10 +6,10 @@
 
 use crate::css::css_enums::line_style;
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::recorder::{
     DisplayListRecorder, FillPathParams, PaintStyleOrColor, StrokePathParams,
 };
-use crate::painting::paintable_data::PaintableSlotId;
 use crate::painting::record::{BasePaintFacts, PaintRecorder};
 use libgfx_rust::path::PathBuilder;
 use libgfx_rust::{
@@ -1121,10 +1121,9 @@ pub fn paint_all_borders(
 
 pub(crate) fn paint_box_borders_from_style(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     facts: &BasePaintFacts,
 ) {
-    let data = recorder.data(paintable);
     let converter = recorder.converter;
     let device_side = |color: u32, style: u8, width: CssPixels| BorderDataDevicePixels {
         color: Color(color),
@@ -1136,11 +1135,11 @@ pub(crate) fn paint_box_borders_from_style(
         line_style: line_style::NONE,
         width: 0,
     };
-    let Some(style) = recorder.layout_arena.node_style_if_live(data.layout_node) else {
+    let Some(style) = recorder.layout_arena.node_style_if_live(paintable) else {
         return;
     };
     let zero = CssPixels::from_raw(0);
-    let border = crate::painting::paintable_geometry::committed_border(recorder.paintables, paintable);
+    let border = crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable);
     let borders_data = BordersDataDevicePixels {
         top: if border.top == zero {
             default_side
@@ -1201,7 +1200,8 @@ pub(crate) fn paint_box_borders_from_style(
             style.border_left_width()
         },
     ];
-    let border_box_rect = crate::painting::paintable_geometry::absolute_border_box_rect(recorder.paintables, paintable);
+    let border_box_rect =
+        crate::painting::paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
     let border_radii = recorder.border_radii(paintable);
     paint_box_borders(
         recorder,
@@ -1216,7 +1216,7 @@ pub(crate) fn paint_box_borders_from_style(
 
 pub(crate) fn paint_box_borders(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     facts: &BasePaintFacts,
     border_box_rect: CssPixelRect,
     css_border_widths: [CssPixels; 4],

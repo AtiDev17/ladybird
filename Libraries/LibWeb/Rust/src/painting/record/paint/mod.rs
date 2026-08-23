@@ -22,10 +22,11 @@ pub mod table_borders;
 pub mod text;
 pub mod text_decoration;
 
-use crate::painting::paintable_data::{PaintableKind, PaintableSlotId};
+use crate::layout::node_data::NodeSlotId;
+use crate::painting::paintable_data::PaintableKind;
 use crate::painting::record::{PaintPhase, PaintRecorder};
 
-pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId, phase: PaintPhase) {
+pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, phase: PaintPhase) {
     let kind = recorder.data(paintable).kind;
     match kind {
         PaintableKind::PaintableWithLines
@@ -94,10 +95,10 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId
 
 pub(crate) fn border_radii_shrunk_for_borders(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
 ) -> crate::painting::border_radii::BorderRadii {
     let mut radii = recorder.border_radii(paintable);
-    let layout_node = recorder.data(paintable).layout_node;
+    let layout_node = paintable;
     if let Some(style) = recorder.layout_arena.node_style_if_live(layout_node) {
         radii.shrink(
             style.border_top_width(),
@@ -130,15 +131,15 @@ pub(crate) fn end_corner_clip(recorder: &mut PaintRecorder<'_>, applied: bool) {
     }
 }
 
-pub(crate) fn paint_base(recorder: &mut PaintRecorder<'_>, paintable: PaintableSlotId, phase: PaintPhase) {
+pub(crate) fn paint_base(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, phase: PaintPhase) {
     paint_base_with(recorder, paintable, phase, background::paint_background);
 }
 
 pub(crate) fn paint_base_with(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     phase: PaintPhase,
-    paint_background: fn(&mut PaintRecorder<'_>, PaintableSlotId),
+    paint_background: fn(&mut PaintRecorder<'_>, NodeSlotId),
 ) {
     if phase == PaintPhase::Foreground {
         return;
@@ -151,14 +152,17 @@ pub(crate) fn paint_base_with(
         paint_backdrop_filter(recorder, paintable, &facts);
         paint_background(recorder, paintable);
         let border_box_rect =
-            crate::painting::paintable_geometry::absolute_border_box_rect(recorder.paintables, paintable);
+            crate::painting::paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
         let padding_box_rect =
-            crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.paintables, paintable);
+            crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.layout_arena, paintable);
         let border_radii = recorder.border_radii(paintable);
         shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
     }
     if phase == PaintPhase::Border
-        && !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(recorder.paintables, paintable)
+        && !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(
+            recorder.layout_arena,
+            paintable,
+        )
         && !facts.empty_cells_property_applies
     {
         border::paint_box_borders_from_style(recorder, paintable, &facts);
@@ -176,7 +180,7 @@ pub(crate) fn paint_base_with(
 
 pub(crate) fn paint_backdrop_filter(
     recorder: &mut PaintRecorder<'_>,
-    paintable: PaintableSlotId,
+    paintable: NodeSlotId,
     facts: &crate::painting::record::BasePaintFacts,
 ) {
     if !facts.has_backdrop_filter {
@@ -186,7 +190,7 @@ pub(crate) fn paint_backdrop_filter(
         recorder
             .converter
             .rounded_device_rect(crate::painting::paintable_geometry::absolute_border_box_rect(
-                recorder.paintables,
+                recorder.layout_arena,
                 paintable,
             ));
     let border_radii = recorder.border_radii(paintable);
