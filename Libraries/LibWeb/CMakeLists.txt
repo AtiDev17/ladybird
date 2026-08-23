@@ -210,6 +210,7 @@ set(SOURCES
     CSS/Parser/ComponentValue.cpp
     CSS/Parser/DescriptorParsing.cpp
     CSS/Parser/ErrorReporter.cpp
+    CSS/Parser/FastColorParsing.cpp
     CSS/Parser/GradientParsing.cpp
     CSS/Parser/Helpers.cpp
     CSS/Parser/MediaParsing.cpp
@@ -729,6 +730,7 @@ set(SOURCES
     HTML/SharedWorkerGlobalScope.cpp
     HTML/SourceSet.cpp
     HTML/SourceSnapshotParams.cpp
+    HTML/TargetSnapshotParams.cpp
     HTML/Storage.cpp
     HTML/StorageEvent.cpp
     HTML/StructuredSerialize.cpp
