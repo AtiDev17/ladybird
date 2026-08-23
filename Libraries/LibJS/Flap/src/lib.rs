@@ -646,6 +646,8 @@ const BOOLEAN_TAG = 0x7FF9
 const INT32_TAG_SHIFTED = 0x7FFA000000000000
 const NAN_BASE_TAG = 0x7FF8
 const CANON_NAN_BITS = 0x7FF8000000000000
+const VM_HEAP_REGION_BASE = 16664
+const HEAP_REGION_OFFSET_MASK = 0x3FFFFFFFFFF
 "#;
 
     fn compiler(architecture: Architecture) -> Compiler {
@@ -982,7 +984,7 @@ specialize Clear(dst: Undefined);
         assert!(
             emission_error
                 .message
-                .contains("required runtime constant 'INT32_TAG_SHIFTED'")
+                .contains("required runtime constant 'VM_RUNNING_EXECUTION_CONTEXT'")
         );
     }
 

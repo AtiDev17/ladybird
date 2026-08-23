@@ -20,21 +20,15 @@
 
 namespace Web {
 
-struct PushHistoryOperationParameters {
+struct FinalizeCrossDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
     HTML::CrossProcessId pending_document_state_id;
-    HTML::UserNavigationInvolvement user_involvement;
-};
-
-struct ReplaceHistoryOperationParameters {
-    HTML::CrossProcessId navigable_id;
-    HTML::CrossProcessId pending_document_state_id;
+    HTML::HistoryHandlingBehavior history_handling;
     HTML::UserNavigationInvolvement user_involvement;
 };
 
 struct CrossDocumentNavigationFinalization {
     HTML::PendingSessionHistoryEntryDescriptor history_entry;
-    Optional<Utf16String> entry_to_replace_navigation_api_key;
 };
 
 using HistoryOperationReadyResult = Variant<
@@ -96,7 +90,7 @@ struct NavigableDestructionHistoryOperationParameters {
 struct FinalizeSameDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
     HTML::SameDocumentNavigationEntry target_entry;
-    Optional<Utf16String> entry_to_replace_navigation_api_key;
+    Optional<HTML::SessionHistoryEntryIdentity> entry_to_replace;
     Optional<HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state;
     HTML::HistoryHandlingBehavior history_handling;
     HTML::UserNavigationInvolvement user_involvement;
@@ -115,8 +109,7 @@ struct FlushSessionHistoryTraversalQueueOperationParameters {
 };
 
 using HistoryOperationParameters = Variant<
-    PushHistoryOperationParameters,
-    ReplaceHistoryOperationParameters,
+    FinalizeCrossDocumentNavigationHistoryOperationParameters,
     ReloadHistoryOperationParameters,
     TraverseByDeltaHistoryOperationParameters,
     TraverseToStepHistoryOperationParameters,
@@ -134,14 +127,9 @@ using HistoryOperationParameters = Variant<
 namespace IPC {
 
 template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::PushHistoryOperationParameters const&);
+WEB_API ErrorOr<void> encode(Encoder&, Web::FinalizeCrossDocumentNavigationHistoryOperationParameters const&);
 template<>
-WEB_API ErrorOr<Web::PushHistoryOperationParameters> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::ReplaceHistoryOperationParameters const&);
-template<>
-WEB_API ErrorOr<Web::ReplaceHistoryOperationParameters> decode(Decoder&);
+WEB_API ErrorOr<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::CrossDocumentNavigationFinalization const&);

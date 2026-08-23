@@ -110,7 +110,6 @@ pub(crate) fn pinned_constant(runtime: &RuntimeConstants, value: i64) -> Option<
     [
         (runtime.get(KnownLayoutConstant::Int32Tag), X22),
         (runtime.get(KnownLayoutConstant::BooleanTag), X23),
-        (runtime.get(KnownLayoutConstant::NanBaseTag), X24),
     ]
     .into_iter()
     .find_map(|(constant, register)| (constant == Some(value)).then_some(register))
@@ -1097,8 +1096,23 @@ impl Backend for Aarch64Backend {
         );
     }
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister) {
-        emit!(emit.output, Aarch64; Opcode::And64Immediate => [register destination, register source, immediate 0xffff_ffff_ffff];);
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError> {
+        let heap_region_offset_mask = emit.constant(KnownLayoutConstant::HeapRegionOffsetMask)?;
+        emit!(emit.output, Aarch64;
+            Opcode::And64Immediate => [register destination, register source, immediate heap_region_offset_mask];
+        );
+        emit!(emit.output, Aarch64;
+            Opcode::AddSubtractRegister {
+                operation: AddSubtractOperation::Add,
+                flags: FlagUpdate::Preserve,
+            } => [register destination, register destination, register X24];
+        );
+        Ok(())
     }
 
     fn float_operation(

@@ -25,7 +25,10 @@ use crate::target::finalize_support::{
 use crate::target::finalize_support::{memory_branch, push_plain_move};
 use crate::target::ir::{AllocatedOperand, MachineInstruction, MachineMemoryAddress, MachineOpcode, MachineOperand};
 use crate::target::machine_verify::emit_machine_instructions as emit;
-use crate::target::registers::{PhysicalRegister, x86_64::R15};
+use crate::target::registers::{
+    PhysicalRegister,
+    x86_64::{R11, R15},
+};
 use crate::{CompileError, ObjectFormat};
 
 fn machine_instruction(opcode: Opcode, operands: Vec<MachineOperand>) -> MachineInstruction {
@@ -458,14 +461,14 @@ fn vm_load(emit: &mut Emit<'_>, destination: PhysicalRegister) {
     use crate::target::registers::x86_64::RBP;
 
     let displacement = match emit.object_format {
-        ObjectFormat::Coff => -64,
-        ObjectFormat::Elf | ObjectFormat::MachO => -48,
+        ObjectFormat::Coff => super::WIN64_VM_SLOT_OFFSET,
+        ObjectFormat::Elf | ObjectFormat::MachO => super::SYSV_VM_SLOT_OFFSET,
     };
     emit!(emit.output, X86_64;
         Opcode::Load {
         width: MemoryWidth::DoubleWord,
         signed: false,
-    } => [register destination, address MachineMemoryAddress::offset(RBP, displacement)];
+    } => [register destination, address MachineMemoryAddress::offset(RBP, i64::from(displacement))];
     );
 }
 
@@ -782,10 +785,14 @@ impl Backend for X86_64Backend {
         source: PhysicalRegister,
         clean: bool,
     ) -> Result<(), CompileError> {
+        let int32_tag_shifted = emit.constant(KnownLayoutConstant::Int32TagShifted)?;
         if !clean || destination != source {
             emit!(emit.output, X86_64; if clean { Opcode::Move64Register } else { Opcode::Move32Register } => [register destination, register source];);
         }
-        emit!(emit.output, X86_64; Opcode::Or64Register => [register destination, register R15];);
+        emit!(emit.output, X86_64;
+            Opcode::MoveAbsolute64Immediate => [register R11, immediate int32_tag_shifted];
+            Opcode::Or64Register => [register destination, register R11];
+        );
         Ok(())
     }
 
@@ -800,13 +807,24 @@ impl Backend for X86_64Backend {
         emit!(emit.output, X86_64; Opcode::ShiftImmediate { operation: ShiftOperation::RightLogical, width: IntegerWidth::U64 } => [register destination, immediate 48];);
     }
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister) {
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError> {
         if destination != source {
             emit!(emit.output, X86_64; Opcode::Move64Register => [register destination, register source];);
         }
-        for operation in [ShiftOperation::Left, ShiftOperation::RightLogical] {
-            emit!(emit.output, X86_64; Opcode::ShiftImmediate { operation, width: IntegerWidth::U64 } => [register destination, immediate 16];);
-        }
+        let heap_region_offset_mask = emit.constant(KnownLayoutConstant::HeapRegionOffsetMask)?;
+        emit!(emit.output, X86_64;
+            Opcode::MoveAbsolute64Immediate => [register R11, immediate heap_region_offset_mask];
+            Opcode::AluRegister { operation: super::AluOperation::And, width: IntegerWidth::U64 } => [register destination, register R11];
+        );
+        emit!(emit.output, X86_64;
+            Opcode::AluRegister { operation: super::AluOperation::Add, width: IntegerWidth::U64 } => [register destination, register R15];
+        );
+        Ok(())
     }
 
     fn float_operation(

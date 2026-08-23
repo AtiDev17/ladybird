@@ -407,6 +407,10 @@ struct CanonicalTraversable::HistoryOperation {
     RefPtr<Core::Promise<Empty>> queue_promise;
 
     bool is_browser_traversal() const { return was_initiated_by_browser; }
+    bool was_initiated_by(WebContentClient const& client, u64 page_id) const
+    {
+        return initiating_client.ptr() == &client && initiating_page_id == page_id;
+    }
 };
 
 CanonicalTraversable::~CanonicalTraversable() = default;
@@ -532,7 +536,7 @@ void CanonicalTraversable::start_pending_browser_history_traversal(u64 generatio
     VERIFY(view.has_value());
     auto canceled_replacement_process_navigation = false;
     auto canceled_uncommitted_navigation = m_pending_browser_history_traversal->check_for_cancelation == CheckForCancelation::Yes
-        && view->has_uncommitted_top_level_navigation();
+        && has_uncommitted_navigation();
     if (canceled_uncommitted_navigation)
         canceled_replacement_process_navigation = view->cancel_uncommitted_top_level_navigation_for_browser_traversal();
 
@@ -588,7 +592,7 @@ void CanonicalTraversable::supersede_browser_history_traversal(HistoryOperation&
 
     auto view = ViewImplementation::find_view_for_traversable(*this);
     VERIFY(view.has_value());
-    if (view->has_uncommitted_top_level_navigation()) {
+    if (has_uncommitted_navigation()) {
         if (view->cancel_uncommitted_top_level_navigation_for_browser_traversal())
             set_current_session_history_entry_identity({});
     }
@@ -841,6 +845,11 @@ void CanonicalTraversable::recover_from_web_content_process_crash(Optional<Histo
 
 CanonicalTraversable::HistoryJobEndpoint CanonicalTraversable::history_job_endpoint_for(CanonicalNavigable const& navigable) const
 {
+    // A remote child is reported by the process containing its frame, but its active document lives in the
+    // embedded page. Apply and commit work must follow the active document.
+    if (navigable.has_remote_host())
+        return { &navigable.remote_host_client(), navigable.remote_host_page_id() };
+
     if (auto* client = navigable.reporting_client_if_any())
         return { client, navigable.reporting_page_id() };
 
@@ -1255,8 +1264,10 @@ void CanonicalTraversable::start_history_operation(HistoryOperation& operation, 
         auto child_navigable = find(parameters.navigable_id);
         auto current_step = m_session_history.current_step();
         if (child_navigable.has_value() && current_step.has_value()) {
-            if (auto const* target_entry = m_session_history.get_the_target_history_entry(*child_navigable, *current_step))
+            if (auto const* target_entry = m_session_history.get_the_target_history_entry(*child_navigable, *current_step)) {
+                child_navigable->set_active_session_history_entry(*target_entry);
                 creation_target_entry = *target_entry;
+            }
         }
     }
     operation.initiating_client->async_history_operation_started(
@@ -1264,10 +1275,12 @@ void CanonicalTraversable::start_history_operation(HistoryOperation& operation, 
         move(creation_target_entry));
 }
 
-void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id, Web::HistoryOperationReadyResult result)
+void CanonicalTraversable::did_receive_history_operation_ready(WebContentClient& source_client, u64 source_page_id, u64 operation_id, Web::HistoryOperationReadyResult result)
 {
     auto* operation = find_history_operation(operation_id);
     if (!operation || operation->algorithm)
+        return;
+    if (!operation->was_initiated_by(source_client, source_page_id))
         return;
 
     if (result.has<Web::HTML::HistoryStepResult>()) {
@@ -1288,8 +1301,7 @@ void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id,
     VERIFY(!operation->is_browser_traversal());
     auto const& request = operation->parameters;
     auto result_matches_request = request.visit(
-        [&](Web::PushHistoryOperationParameters const&) { return result.has<Web::CrossDocumentNavigationFinalization>(); },
-        [&](Web::ReplaceHistoryOperationParameters const&) { return result.has<Web::CrossDocumentNavigationFinalization>(); },
+        [&](Web::FinalizeCrossDocumentNavigationHistoryOperationParameters const&) { return result.has<Web::CrossDocumentNavigationFinalization>(); },
         [&](Web::NavigableCreationHistoryOperationParameters const&) { return result.has<Web::HTML::CrossProcessId>(); },
         [&](Web::FinalizeSameDocumentNavigationHistoryOperationParameters const&) { return result.has<Web::HTML::SameDocumentNavigationEntry>(); },
         [&](Web::CloseTopLevelTraversableHistoryOperationParameters const&) { return false; },
@@ -1301,7 +1313,7 @@ void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id,
         return;
     }
 
-    auto finalize_cross_document_navigation = [&](Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId pending_document_state_id) {
+    auto finalize_cross_document_navigation = [&](Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId pending_document_state_id, Web::HTML::HistoryHandlingBehavior history_handling) {
         auto finalization = move(result.get<Web::CrossDocumentNavigationFinalization>());
         if (finalization.history_entry.document_state.id != pending_document_state_id) {
             finish_history_operation(operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
@@ -1315,25 +1327,21 @@ void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id,
         }
 
         auto target_step = m_session_history.finalize_cross_document_navigation(
-            nested_history_id_for(*navigable), move(finalization.history_entry),
-            move(finalization.entry_to_replace_navigation_api_key));
+            *navigable, move(finalization.history_entry), history_handling);
         if (!target_step.has_value())
             finish_history_operation(operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
         return target_step;
     };
 
     request.visit(
-        [&](Web::PushHistoryOperationParameters const& parameters) {
-            auto target_step = finalize_cross_document_navigation(parameters.navigable_id, parameters.pending_document_state_id);
+        [&](Web::FinalizeCrossDocumentNavigationHistoryOperationParameters const& parameters) {
+            auto target_step = finalize_cross_document_navigation(parameters.navigable_id, parameters.pending_document_state_id, parameters.history_handling);
             if (!target_step.has_value())
                 return;
-            apply_history_step(*operation, *target_step, false, {}, parameters.user_involvement, Web::Bindings::NavigationType::Push);
-        },
-        [&](Web::ReplaceHistoryOperationParameters const& parameters) {
-            auto target_step = finalize_cross_document_navigation(parameters.navigable_id, parameters.pending_document_state_id);
-            if (!target_step.has_value())
-                return;
-            apply_history_step(*operation, *target_step, false, {}, parameters.user_involvement, Web::Bindings::NavigationType::Replace);
+            auto navigation_type = parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Push
+                ? Web::Bindings::NavigationType::Push
+                : Web::Bindings::NavigationType::Replace;
+            apply_history_step(*operation, *target_step, false, {}, parameters.user_involvement, navigation_type);
         },
         [&](Web::ReloadHistoryOperationParameters const& parameters) {
             auto current_step = m_session_history.current_step();
@@ -1379,7 +1387,7 @@ void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id,
             update_for_navigable_creation_or_destruction(*operation);
         },
         [&](Web::FinalizeSameDocumentNavigationHistoryOperationParameters const& parameters) {
-            VERIFY(parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Push || parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Replace);
+            VERIFY(parameters.entry_to_replace.has_value() == (parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Replace));
             auto& finalization = result.get<Web::HTML::SameDocumentNavigationEntry>();
             if (finalization.document_state_id != parameters.target_entry.document_state_id
                 || finalization.navigation_api_key != parameters.target_entry.navigation_api_key
@@ -1394,18 +1402,18 @@ void CanonicalTraversable::did_receive_history_operation_ready(u64 operation_id,
                 return;
             }
 
-            navigable->set_active_session_history_entry_identity(Web::HTML::SessionHistoryEntryIdentity {
-                .document_state_id = finalization.document_state_id,
-                .navigation_api_id = finalization.navigation_api_id,
-            });
-
             auto target_step = m_session_history.finalize_same_document_navigation(
                 *navigable, move(finalization),
-                parameters.entry_to_replace_navigation_api_key);
+                parameters.entry_to_replace);
             if (!target_step.has_value()) {
                 finish_history_operation(operation_id, Web::HTML::HistoryStepResult::NoMatchingEntry, {});
                 return;
             }
+
+            navigable->set_active_session_history_entry_identity(Web::HTML::SessionHistoryEntryIdentity {
+                .document_state_id = parameters.target_entry.document_state_id,
+                .navigation_api_id = parameters.target_entry.navigation_api_id,
+            });
 
             auto navigation_type = parameters.history_handling == Web::HTML::HistoryHandlingBehavior::Replace
                 ? Web::Bindings::NavigationType::Replace
@@ -1485,9 +1493,11 @@ void CanonicalTraversable::abandon_history_operations()
     }
 }
 
-void CanonicalTraversable::did_receive_history_step_unload_cancelation_result(u64 operation_id, Web::HTML::HistoryStepResult result)
+void CanonicalTraversable::did_receive_history_step_unload_cancelation_result(WebContentClient& source_client, u64 source_page_id, u64 operation_id, Web::HTML::HistoryStepResult result)
 {
     if (auto* operation = find_history_operation(operation_id)) {
+        if (!operation->was_initiated_by(source_client, source_page_id))
+            return;
         if (operation->is_browser_traversal() && result == Web::HTML::HistoryStepResult::CanceledPendingNavigation)
             result = Web::HTML::HistoryStepResult::Applied;
         if (auto pending = move(operation->pending_unload_cancelation))
@@ -1569,8 +1579,6 @@ void CanonicalTraversable::did_receive_changing_navigable_continuation_applied(W
             if (navigable.has_value()) {
                 activated_navigable_state->active_session_history_entry_identity = Web::HTML::session_history_entry_identity(pending_job.value()->job.target_entry);
                 auto active_document_url = activated_navigable_state->active_document_url;
-                if (navigable_id != id() && navigable->has_remote_host())
-                    SiteIsolationManager::the().transition_child_frame_to_local(*navigable);
                 navigable->did_commit_navigation(activated_navigable_state.release_value());
 
                 if (navigable_id == id()) {

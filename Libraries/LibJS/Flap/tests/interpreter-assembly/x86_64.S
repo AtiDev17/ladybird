@@ -1580,9 +1580,9 @@ CSYM(js_interpreter):
     mov r14, rdi          # pb = bytecode base
     mov r13d, esi         # pc = entry_point
     mov rbx, rdx          # values
-    movabs r15, 9221683186994511872  # INT32_TAG_SHIFTED
+    mov r15, QWORD PTR [rcx + 16664]  # heap region base
     mov QWORD PTR [rbp - 48], rcx  # save VM*
-    cmp QWORD PTR [rcx + 16712], 0
+    cmp QWORD PTR [rcx + 16720], 0
     lea r12, [rip + asm_dispatch_table]
     je .Ldispatch_table_ready
     lea r12, [rip + asm_debug_dispatch_table]
@@ -1656,7 +1656,8 @@ asm_handler_Add:
     jne .Lasm_Add.ssa_block_8
     add edx, ecx
     jo .Lasm_Add.ssa_checked_6_failure
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -1680,7 +1681,8 @@ asm_handler_Sub:
     jne .Lasm_Sub.ssa_block_8
     sub edx, ecx
     jo .Lasm_Sub.ssa_checked_6_failure
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -1710,7 +1712,8 @@ asm_handler_Mul:
     or ecx, edx
     js .Lasm_Mul.ssa_block_3
 .Lasm_Mul.ssa_block_13:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -2328,7 +2331,8 @@ asm_handler_Increment:
     jne .Lasm_Increment.ssa_block_2
     inc ecx
     jo .Lasm_Increment.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -2345,7 +2349,8 @@ asm_handler_Decrement:
     jne .Lasm_Decrement.ssa_block_2
     dec ecx
     jo .Lasm_Decrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -2481,11 +2486,13 @@ asm_handler_End_hot_end:
 
 .p2align 6
 asm_handler_GetLexicalEnvironment:
-    mov rax, QWORD PTR [rbx - 88]
-    movabs rcx, -2251799813685248
-    or rax, rcx
+    mov rcx, QWORD PTR [rbx - 88]
+    movabs rax, 4398046511103
+    and rcx, rax
+    movabs rax, -2251799813685248
+    or rcx, rax
     mov r11d, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + r11 * 8], rax
+    mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
@@ -2495,8 +2502,9 @@ asm_handler_GetLexicalEnvironment_hot_end:
 asm_handler_SetLexicalEnvironment:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rax, QWORD PTR [rbx + rax * 8]
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     mov QWORD PTR [rbx - 88], rax
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -3001,7 +3009,8 @@ asm_handler_PostfixIncrement:
     mov QWORD PTR [rbx + r11 * 8], rcx
     inc ecx
     jo .Lasm_PostfixIncrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
@@ -3050,7 +3059,8 @@ asm_handler_Div:
     test eax, eax
     jz .Lasm_Div.ssa_block_2
 .Lasm_Div.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -3219,7 +3229,8 @@ asm_handler_BitwiseXor:
     cmp r11w, 32762
     jne .Lasm_BitwiseXor.ssa_block_2
     xor esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -3290,7 +3301,8 @@ asm_handler_BitwiseNot:
     cmp r11w, 32762
     jne .Lasm_BitwiseNot.ssa_block_2
     not eax
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -3313,7 +3325,8 @@ asm_handler_BitwiseAnd:
     cmp r11w, 32762
     jne .Lasm_BitwiseAnd.ssa_block_2
     and esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -3336,7 +3349,8 @@ asm_handler_BitwiseOr:
     cmp r11w, 32762
     jne .Lasm_BitwiseOr.ssa_block_2
     or esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -3359,7 +3373,8 @@ asm_handler_LeftShift:
     cmp r11w, 32762
     jne .Lasm_LeftShift.ssa_block_1
     shl edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -3382,7 +3397,8 @@ asm_handler_RightShift:
     cmp r11w, 32762
     jne .Lasm_RightShift.ssa_block_1
     sar edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -3407,7 +3423,8 @@ asm_handler_UnsignedRightShift:
     shr edx, cl
     test edx, edx
     js .Lasm_UnsignedRightShift.ssa_block_2
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -3436,7 +3453,8 @@ asm_handler_Mod:
     mov eax, ecx
     cdq
     idiv esi
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -3881,7 +3899,8 @@ asm_handler_UnaryMinus:
     jz .Lasm_UnaryMinus.ssa_block_1
     neg eax
     jo .Lasm_UnaryMinus.ssa_block_2
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -3901,7 +3920,8 @@ asm_handler_PostfixDecrement:
     mov QWORD PTR [rbx + r11 * 8], rcx
     dec ecx
     jo .Lasm_PostfixDecrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
@@ -3940,8 +3960,9 @@ asm_handler_PutByValue:
     cmp r11w, 32762
     jne .Lasm_PutByValue.ssa_block_1
     mov eax, eax
-    shl rcx, 16
-    shr rcx, 16
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
     movzx edx, WORD PTR [rcx + 10]
     test edx, 8
     jnz .Lasm_PutByValue.ssa_block_7
@@ -4195,42 +4216,43 @@ asm_handler_PutByValue_hot_end:
 .p2align 6
 asm_handler_GetById:
     mov eax, DWORD PTR [r14 + r13 + 8]
-    mov rsi, QWORD PTR [rbx + rax * 8]
-    mov r11, rsi
+    mov rdx, QWORD PTR [rbx + rax * 8]
+    mov r11, rdx
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_GetById.ssa_block_1
-    shl rsi, 16
-    shr rsi, 16
-    mov rcx, QWORD PTR [rsi + 24]
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
+    mov rsi, QWORD PTR [rdx + 24]
     mov rax, QWORD PTR [rbx - 40]
     mov rax, QWORD PTR [rax + 112]
-    mov edx, DWORD PTR [r14 + r13 + 20]
-    mov rdx, QWORD PTR [rax + rdx * 8]
-    test rdx, rdx
+    mov ecx, DWORD PTR [r14 + r13 + 20]
+    mov rcx, QWORD PTR [rax + rcx * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_1
-    and rdx, -4
-    mov rdi, QWORD PTR [rdx + 24]
-    mov rax, QWORD PTR [rdx + 32]
-    cmp rdi, rcx
+    and rcx, -4
+    mov rdi, QWORD PTR [rcx + 24]
+    mov rax, QWORD PTR [rcx + 32]
+    cmp rdi, rsi
     jne .Lasm_GetById.ssa_block_1
-    mov edi, DWORD PTR [rdx]
+    mov edi, DWORD PTR [rcx]
     cmp edi, 6
     je .Lasm_GetById.ssa_block_1
     test rax, rax
     jnz .Lasm_GetById.ssa_block_10
-    mov rax, rsi
+    mov rax, rdx
     jmp .Lasm_GetById.ssa_block_11
 .Lasm_GetById.ssa_block_10:
-    mov rdi, QWORD PTR [rdx + 40]
+    mov rdi, QWORD PTR [rcx + 40]
     test rdi, rdi
     jz .Lasm_GetById.ssa_block_1
     cmp BYTE PTR [rdi + 10], 0
     jz .Lasm_GetById.ssa_block_1
 .Lasm_GetById.ssa_block_11:
-    mov edi, DWORD PTR [rdx + 4]
-    mov r8d, DWORD PTR [rdx + 8]
-    cmp DWORD PTR [rcx + 92], r8d
+    mov edi, DWORD PTR [rcx + 4]
+    mov r8d, DWORD PTR [rcx + 8]
+    cmp DWORD PTR [rsi + 92], r8d
     jne .Lasm_GetById.ssa_block_1
     mov rax, QWORD PTR [rax + 32]
     mov rax, QWORD PTR [rax + rdi * 8]
@@ -4244,57 +4266,57 @@ asm_handler_GetById:
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 .Lasm_GetById.ssa_block_13:
-    cmp BYTE PTR [rdx + 12], 0
+    cmp BYTE PTR [rcx + 12], 0
     jz .Lasm_GetById.ssa_block_3
-    mov eax, DWORD PTR [rcx + 108]
-    mov rax, QWORD PTR [rsi + rax * 8]
-    test rax, rax
+    mov ecx, DWORD PTR [rax + 108]
+    mov rcx, QWORD PTR [rdx + rcx * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_3
-    mov edx, DWORD PTR [rcx + 116]
-    mov r8, QWORD PTR [rax + rdx * 8]
+    mov esi, DWORD PTR [rax + 116]
+    mov r8, QWORD PTR [rcx + rsi * 8]
     test r8, r8
     jz .Lasm_GetById.ssa_block_3
-    mov edi, DWORD PTR [rcx + 120]
+    mov edi, DWORD PTR [rax + 120]
     mov r8, QWORD PTR [r8 + rdi * 8]
-    cmp r8, rsi
+    cmp r8, rdx
     jne .Lasm_GetById.ssa_block_3
-    mov ecx, DWORD PTR [rcx + 112]
-    mov rax, QWORD PTR [rax + rcx * 8]
+    mov eax, DWORD PTR [rax + 112]
+    mov rax, QWORD PTR [rcx + rax * 8]
     test rax, rax
     jnz .Lasm_GetById.ssa_block_25
-    movabs rax, 9223090561878065152
+    movabs rcx, 9223090561878065152
     jmp .Lasm_GetById.ssa_block_26
 .Lasm_GetById.ssa_block_25:
-    mov rax, QWORD PTR [rax + rdx * 8]
+    mov rax, QWORD PTR [rax + rsi * 8]
     test rax, rax
     jz .Lasm_GetById.ssa_block_3
-    mov rax, QWORD PTR [rax + rdi * 8]
-    test rax, rax
+    mov rcx, QWORD PTR [rax + rdi * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_3
-    movzx ecx, WORD PTR [rax + 10]
-    test ecx, 2048
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 2048
     jnz .Lasm_GetById.ssa_block_3
-    shl rax, 16
-    shr rax, 16
-    movabs rcx, -1970324836974592
-    or rax, rcx
+    movabs rax, 4398046511103
+    and rcx, rax
+    movabs rax, -1970324836974592
+    or rcx, rax
 .Lasm_GetById.ssa_block_26:
     mov r11d, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + r11 * 8], rax
+    mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 24
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 .Lasm_GetById.ssa_block_14:
-    mov edx, DWORD PTR [rcx + 104]
-    mov rax, QWORD PTR [rbp - 48]
-    mov rax, QWORD PTR [rax + 16688]
-    shl rdx, 4
-    add rdx, rax
-    mov edi, DWORD PTR [rdx + 8]
-    mov rax, QWORD PTR [rbp - 48]
-    mov r9, QWORD PTR [rax + 15376]
-    mov rax, QWORD PTR [rax + 15368]
-    lea r8, [rax + 120]
+    mov esi, DWORD PTR [rax + 104]
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rcx, QWORD PTR [rcx + 16696]
+    shl rsi, 4
+    add rsi, rcx
+    mov edi, DWORD PTR [rsi + 8]
+    mov rcx, QWORD PTR [rbp - 48]
+    mov r9, QWORD PTR [rcx + 15376]
+    mov rcx, QWORD PTR [rcx + 15368]
+    lea r8, [rcx + 120]
     cmp r8, r9
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
@@ -4305,48 +4327,48 @@ asm_handler_GetById:
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
     mov QWORD PTR [r9 + 15368], r8
-    mov DWORD PTR [rax + 108], edi
-    mov DWORD PTR [rax + 112], edi
-    mov DWORD PTR [rax + 96], 0
-    mov rdi, QWORD PTR [rcx + 24]
+    mov DWORD PTR [rcx + 108], edi
+    mov DWORD PTR [rcx + 112], edi
+    mov DWORD PTR [rcx + 96], 0
+    mov rdi, QWORD PTR [rax + 24]
     mov rdi, QWORD PTR [rdi + 16]
-    mov QWORD PTR [rax], rcx
-    mov QWORD PTR [rax + 8], rdi
-    mov rcx, QWORD PTR [rbx - 88]
+    mov QWORD PTR [rcx], rax
+    mov QWORD PTR [rcx + 8], rdi
+    mov rax, QWORD PTR [rbx - 88]
     mov rdi, QWORD PTR [rbx - 80]
-    mov QWORD PTR [rax + 32], rcx
-    mov QWORD PTR [rax + 40], rdi
-    mov rcx, QWORD PTR [rbx - 72]
-    mov QWORD PTR [rax + 48], rcx
-    shl rsi, 16
-    shr rsi, 16
-    movabs rcx, -1970324836974592
-    or rsi, rcx
-    mov QWORD PTR [rax + 72], rsi
-    xor rcx, rcx
-    lea rsi, [rax + 16]
-    mov QWORD PTR [rsi], rcx
-    mov QWORD PTR [rsi + 8], rcx
-    mov QWORD PTR [rax + 80], 0
-    mov DWORD PTR [rax + 56], 0
-    mov DWORD PTR [rax + 60], 0
-    mov DWORD PTR [rax + 64], 4294967295
-    mov BYTE PTR [rax + 68], 0
-    mov BYTE PTR [rax + 69], 0
-    mov BYTE PTR [rax + 70], 0
-    mov ecx, r13d
-    mov esi, DWORD PTR [r14 + r13 + 4]
+    mov QWORD PTR [rcx + 32], rax
+    mov QWORD PTR [rcx + 40], rdi
+    mov rax, QWORD PTR [rbx - 72]
+    mov QWORD PTR [rcx + 48], rax
+    movabs rax, 4398046511103
+    and rdx, rax
+    movabs rax, -1970324836974592
+    or rdx, rax
+    mov QWORD PTR [rcx + 72], rdx
+    xor rax, rax
+    lea rdx, [rcx + 16]
+    mov QWORD PTR [rdx], rax
+    mov QWORD PTR [rdx + 8], rax
+    mov QWORD PTR [rcx + 80], 0
+    mov DWORD PTR [rcx + 56], 0
+    mov DWORD PTR [rcx + 60], 0
+    mov DWORD PTR [rcx + 64], 4294967295
+    mov BYTE PTR [rcx + 68], 0
+    mov BYTE PTR [rcx + 69], 0
+    mov BYTE PTR [rcx + 70], 0
+    mov eax, r13d
+    mov edx, DWORD PTR [r14 + r13 + 4]
     mov edi, DWORD PTR [r14 + r13 + 8]
-    mov DWORD PTR [rbx - 64], ecx
+    mov DWORD PTR [rbx - 64], eax
     lea r11, [rbx - 120]
-    mov QWORD PTR [rax + 88], r11
-    lea rcx, [rcx + 1]
-    mov DWORD PTR [rax + 100], ecx
-    mov DWORD PTR [rax + 104], esi
-    mov rcx, QWORD PTR [rbp - 48]
-    mov QWORD PTR [rcx + 15288], rax
-    lea rbx, [rax + 120]
-    mov rdx, QWORD PTR [rdx]
+    mov QWORD PTR [rcx + 88], r11
+    lea rax, [rax + 1]
+    mov DWORD PTR [rcx + 100], eax
+    mov DWORD PTR [rcx + 104], edx
+    mov rax, QWORD PTR [rbp - 48]
+    mov QWORD PTR [rax + 15288], rcx
+    lea rbx, [rcx + 120]
+    mov rdx, QWORD PTR [rsi]
     mov r11, rdx
     mov rdi, QWORD PTR [rbp - 48]
     call r11
@@ -4399,8 +4421,9 @@ asm_handler_PutById:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_PutById.ssa_block_2
-    shl rsi, 16
-    shr rsi, 16
+    movabs r11, 4398046511103
+    and rsi, r11
+    add rsi, r15
     mov rdx, QWORD PTR [rsi + 24]
     mov rax, QWORD PTR [rbx - 40]
     mov rax, QWORD PTR [rax + 112]
@@ -4448,8 +4471,9 @@ asm_handler_GetByValue:
     cmp r11w, 32762
     jne .Lasm_GetByValue.ssa_block_1
     mov eax, eax
-    shl rsi, 16
-    shr rsi, 16
+    movabs r11, 4398046511103
+    and rsi, r11
+    add rsi, r15
     movzx ecx, WORD PTR [rsi + 10]
     test ecx, 8
     jnz .Lasm_GetByValue.ssa_block_13
@@ -4507,7 +4531,8 @@ asm_handler_GetByValue:
     and rdx, rax
     add rdx, rcx
     movzx eax, BYTE PTR [rdx]
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -4566,7 +4591,8 @@ asm_handler_GetByValue:
     test eax, eax
     js .Lasm_GetByValue.ssa_block_6
 .Lasm_GetByValue.ssa_block_5:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -4607,7 +4633,8 @@ asm_handler_GetByValue:
     jp .Lasm_GetByValue.ssa_block_4
     jne .Lasm_GetByValue.ssa_block_4
 .Lasm_GetByValue.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -4633,15 +4660,17 @@ asm_handler_GetLength:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_GetLength.ssa_block_1
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     movzx eax, WORD PTR [rdx + 10]
     test eax, 4
     jz .Lasm_GetLength.ssa_block_5
     mov eax, DWORD PTR [rdx + 16]
     test eax, eax
     js .Lasm_GetLength.ssa_block_2
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -4812,54 +4841,55 @@ asm_handler_Call:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_Call.ssa_block_1
-    shl rcx, 16
-    shr rcx, 16
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
     movzx eax, WORD PTR [rcx + 10]
     test eax, 128
     jz .Lasm_Call.ssa_block_1
     test eax, 64
     jz .Lasm_Call.ssa_block_3
     mov rax, QWORD PTR [rcx + 80]
-    mov rdx, QWORD PTR [rax + 48]
-    mov rax, QWORD PTR [rax + 56]
-    bt rax, 32
+    mov r8, QWORD PTR [rax + 48]
+    mov rdx, QWORD PTR [rax + 56]
+    bt rdx, 32
     jnc .Lasm_Call.ssa_block_1
-    bt rax, 33
+    bt rdx, 33
     jc .Lasm_Call.ssa_block_2
     movabs r9, 9221964661971222528
-    bt rax, 34
+    bt rdx, 34
     jnc .Lasm_Call.ssa_block_9
-    mov esi, DWORD PTR [r14 + r13 + 16]
-    mov r9, QWORD PTR [rbx + rsi * 8]
-    bt rax, 35
+    mov eax, DWORD PTR [r14 + r13 + 16]
+    mov r9, QWORD PTR [rbx + rax * 8]
+    bt rdx, 35
     jc .Lasm_Call.ssa_block_9
-    mov rsi, r9
-    shr rsi, 48
-    mov rdi, rsi
-    and di, 65534
-    cmp di, 32766
+    mov rax, r9
+    shr rax, 48
+    mov rsi, rax
+    and si, 65534
+    cmp si, 32766
     jne .Lasm_Call.ssa_block_13
-    mov rsi, QWORD PTR [rcx + 24]
-    mov rsi, QWORD PTR [rsi + 16]
-    mov rsi, QWORD PTR [rsi + 40]
-    mov r9, QWORD PTR [rsi + 32]
-    shl r9, 16
-    shr r9, 16
-    movabs rsi, -1970324836974592
-    or r9, rsi
+    mov rax, QWORD PTR [rcx + 24]
+    mov rax, QWORD PTR [rax + 16]
+    mov rax, QWORD PTR [rax + 40]
+    mov r9, QWORD PTR [rax + 32]
+    movabs rax, 4398046511103
+    and r9, rax
+    movabs rax, -1970324836974592
+    or r9, rax
     jmp .Lasm_Call.ssa_block_9
 .Lasm_Call.ssa_block_13:
-    cmp si, 65529
+    cmp ax, 65529
     jne .Lasm_Call.ssa_block_2
 .Lasm_Call.ssa_block_9:
-    mov edi, DWORD PTR [r14 + r13 + 20]
-    mov esi, eax
-    cmp rsi, rdi
+    mov eax, DWORD PTR [r14 + r13 + 20]
+    mov esi, edx
+    cmp rsi, rax
     jae .Lasm_Call.ssa_block_35
-    mov rsi, rdi
+    mov rsi, rax
 .Lasm_Call.ssa_block_35:
-    mov edi, DWORD PTR [rdx + 364]
-    mov r10d, DWORD PTR [rdx + 368]
+    mov edi, DWORD PTR [r8 + 364]
+    mov r10d, DWORD PTR [r8 + 368]
     mov eax, 4294967295
     sub rax, r10
     cmp rax, rsi
@@ -4868,29 +4898,29 @@ asm_handler_Call:
     mov r11, QWORD PTR [rax + 15376]
     mov rax, QWORD PTR [rax + 15368]
     add r10, rsi
-    mov r8, r10
-    shl r8, 3
-    lea r8, [r8 + 120]
-    add r8, rax
-    cmp r8, r11
+    mov rdx, r10
+    shl rdx, 3
+    lea rdx, [rdx + 120]
+    add rdx, rax
+    cmp rdx, r11
     ja .Lasm_Call.ssa_block_1
     mov r11, QWORD PTR [rbp - 48]
-    mov QWORD PTR [r11 + 15368], r8
+    mov QWORD PTR [r11 + 15368], rdx
     mov DWORD PTR [rax + 108], r10d
     mov DWORD PTR [rax + 112], esi
-    mov r8d, DWORD PTR [r14 + r13 + 20]
-    mov DWORD PTR [rax + 96], r8d
-    mov r8, QWORD PTR [rcx + 24]
-    mov r8, QWORD PTR [r8 + 16]
+    mov edx, DWORD PTR [r14 + r13 + 20]
+    mov DWORD PTR [rax + 96], edx
+    mov rdx, QWORD PTR [rcx + 24]
+    mov rdx, QWORD PTR [rdx + 16]
     mov QWORD PTR [rax], rcx
-    mov QWORD PTR [rax + 8], r8
-    mov r8, QWORD PTR [rcx + 104]
+    mov QWORD PTR [rax + 8], rdx
+    mov rdx, QWORD PTR [rcx + 104]
     mov r10, QWORD PTR [rcx + 112]
-    mov QWORD PTR [rax + 32], r8
-    mov QWORD PTR [rax + 40], r8
+    mov QWORD PTR [rax + 32], rdx
+    mov QWORD PTR [rax + 40], rdx
     mov QWORD PTR [rax + 48], r10
     mov QWORD PTR [rax + 72], r9
-    mov QWORD PTR [rax + 80], rdx
+    mov QWORD PTR [rax + 80], r8
     movabs rdx, 9221964661971222528
     mov QWORD PTR [rax + 120], rdx
     mov QWORD PTR [rax + 128], rdx
@@ -5053,7 +5083,7 @@ asm_handler_Call:
     mov QWORD PTR [rdx + 15288], rax
     lea rbx, [rax + 120]
     mov eax, DWORD PTR [rcx + 104]
-    mov rcx, QWORD PTR [rdx + 16688]
+    mov rcx, QWORD PTR [rdx + 16696]
     shl rax, 4
     add rax, rcx
     mov ecx, DWORD PTR [rax + 8]
@@ -5103,8 +5133,9 @@ asm_handler_CallBuiltinMathAbs:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathAbs.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathAbs.ssa_block_1
@@ -5135,7 +5166,8 @@ asm_handler_CallBuiltinMathAbs:
     neg ecx
     jo .Lasm_CallBuiltinMathAbs.ssa_block_2
 .Lasm_CallBuiltinMathAbs.ssa_block_7:
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 24
@@ -5151,8 +5183,9 @@ asm_handler_CallBuiltinMathFloor:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathFloor.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathFloor.ssa_block_1
@@ -5178,14 +5211,16 @@ asm_handler_CallBuiltinMathFloor:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathFloor.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathFloor.ssa_box_number_7_done
 .Lasm_CallBuiltinMathFloor.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathFloor.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathFloor.ssa_box_number_7_done
 .Lasm_CallBuiltinMathFloor.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -5208,8 +5243,9 @@ asm_handler_CallBuiltinMathCeil:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathCeil.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathCeil.ssa_block_1
@@ -5235,14 +5271,16 @@ asm_handler_CallBuiltinMathCeil:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathCeil.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathCeil.ssa_box_number_7_done
 .Lasm_CallBuiltinMathCeil.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathCeil.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathCeil.ssa_box_number_7_done
 .Lasm_CallBuiltinMathCeil.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -5265,8 +5303,9 @@ asm_handler_CallBuiltinMathSqrt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathSqrt.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathSqrt.ssa_block_1
@@ -5292,14 +5331,16 @@ asm_handler_CallBuiltinMathSqrt:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_done
 .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_done
 .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -5322,8 +5363,9 @@ asm_handler_CallBuiltinMathExp:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathExp.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathExp.ssa_block_1
@@ -5355,8 +5397,9 @@ asm_handler_CallBuiltinStringFromCharCode:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
@@ -5400,8 +5443,9 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
@@ -5424,8 +5468,9 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     movsxd rax, eax
     test eax, eax
     js .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     cmp BYTE PTR [rdx + 10], 0
     jnz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     mov rcx, QWORD PTR [rdx + 16]
@@ -5454,7 +5499,8 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     lea rcx, [rdx + 17]
     movzx eax, BYTE PTR [rcx + rax]
 .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -5470,8 +5516,9 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
@@ -5494,8 +5541,9 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     movsxd rax, eax
     test eax, eax
     js .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     cmp BYTE PTR [rdx + 10], 0
     jnz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     mov rcx, QWORD PTR [rdx + 16]
@@ -5543,8 +5591,9 @@ asm_handler_ObjectPropertyIteratorNext:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_ObjectPropertyIteratorNext.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx edi, BYTE PTR [rax + 168]
     cmp rdi, 0
     je .Lasm_ObjectPropertyIteratorNext.ssa_block_1
@@ -5633,8 +5682,9 @@ asm_handler_IsCallable:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_IsCallable.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx eax, WORD PTR [rax + 10]
     test eax, 128
     jz .Lasm_IsCallable.ssa_block_1
@@ -5759,7 +5809,8 @@ asm_handler_AddLhsInt32:
     jne .Lasm_AddLhsInt32.ssa_block_6
     add edx, ecx
     jo .Lasm_AddLhsInt32.ssa_block_8
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5777,7 +5828,8 @@ asm_handler_AddRhsInt32:
     jne .Lasm_AddRhsInt32.ssa_block_5
     add ecx, DWORD PTR [r14 + r13 + 12]
     jo .Lasm_AddRhsInt32.ssa_checked_6_failure
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 16
@@ -5795,7 +5847,8 @@ asm_handler_SubRhsInt32:
     jne .Lasm_SubRhsInt32.ssa_block_5
     sub ecx, DWORD PTR [r14 + r13 + 12]
     jo .Lasm_SubRhsInt32.ssa_checked_6_failure
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 16
@@ -5820,7 +5873,8 @@ asm_handler_MulRhsInt32:
     or eax, ecx
     js .Lasm_MulRhsInt32.ssa_block_3
 .Lasm_MulRhsInt32.ssa_block_11:
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5833,7 +5887,8 @@ asm_handler_ExpRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -5882,7 +5937,8 @@ asm_handler_DivRhsInt32:
     test eax, eax
     jz .Lasm_DivRhsInt32.ssa_block_2
 .Lasm_DivRhsInt32.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -5914,7 +5970,8 @@ asm_handler_BitwiseXorRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseXorRhsInt32.ssa_block_2
     xor edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5932,7 +5989,8 @@ asm_handler_BitwiseAndRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseAndRhsInt32.ssa_block_2
     and edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5950,7 +6008,8 @@ asm_handler_BitwiseOrRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseOrRhsInt32.ssa_block_2
     or edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5968,7 +6027,8 @@ asm_handler_LeftShiftRhsInt32:
     cmp r11w, 32762
     jne .Lasm_LeftShiftRhsInt32.ssa_block_1
     shl edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -5986,7 +6046,8 @@ asm_handler_RightShiftRhsInt32:
     cmp r11w, 32762
     jne .Lasm_RightShiftRhsInt32.ssa_block_1
     sar edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -6006,7 +6067,8 @@ asm_handler_UnsignedRightShiftRhsInt32:
     shr edx, cl
     test edx, edx
     js .Lasm_UnsignedRightShiftRhsInt32.ssa_block_2
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -6030,7 +6092,8 @@ asm_handler_ModRhsInt32:
     mov eax, ecx
     cdq
     idiv esi
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -6235,7 +6298,8 @@ asm_handler_StrictlyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6322,7 +6386,8 @@ asm_handler_StrictlyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6409,7 +6474,8 @@ asm_handler_LooselyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6490,7 +6556,8 @@ asm_handler_LooselyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6571,7 +6638,8 @@ asm_handler_JumpStrictlyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6652,7 +6720,8 @@ asm_handler_JumpStrictlyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6733,7 +6802,8 @@ asm_handler_JumpLooselyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6808,7 +6878,8 @@ asm_handler_JumpLooselyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -6933,14 +7004,16 @@ asm_handler_Add_cold:
     test rdx, rdx
     jz .Lasm_Add.ssa_box_number_37_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Add.ssa_box_number_37_done
 .Lasm_Add.ssa_box_number_37_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Add.ssa_box_number_37_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Add.ssa_box_number_37_done
 .Lasm_Add.ssa_box_number_37_not_integer:
     movq rax, xmm0
@@ -7027,14 +7100,16 @@ asm_handler_Sub_cold:
     test rdx, rdx
     jz .Lasm_Sub.ssa_box_number_37_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Sub.ssa_box_number_37_done
 .Lasm_Sub.ssa_box_number_37_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Sub.ssa_box_number_37_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Sub.ssa_box_number_37_done
 .Lasm_Sub.ssa_box_number_37_not_integer:
     movq rax, xmm0
@@ -7120,14 +7195,16 @@ asm_handler_Mul_cold:
     test rdx, rdx
     jz .Lasm_Mul.ssa_box_number_41_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Mul.ssa_box_number_41_done
 .Lasm_Mul.ssa_box_number_41_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Mul.ssa_box_number_41_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Mul.ssa_box_number_41_done
 .Lasm_Mul.ssa_box_number_41_not_integer:
     movq rax, xmm0
@@ -8481,7 +8558,8 @@ asm_handler_BitwiseXor_cold:
     movsxd rdi, edx
 .Lasm_BitwiseXor.ssa_block_13:
     xor eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -8861,7 +8939,8 @@ asm_handler_BitwiseAnd_cold:
     movsxd rdi, edx
 .Lasm_BitwiseAnd.ssa_block_13:
     and eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -8927,7 +9006,8 @@ asm_handler_BitwiseOr_cold:
     movsxd rdi, edx
 .Lasm_BitwiseOr.ssa_block_13:
     or eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -9306,7 +9386,8 @@ asm_handler_ToInt32_cold:
 .Lasm_ToInt32.ssa_block_4:
     movsxd rax, eax
 .Lasm_ToInt32.ssa_block_7:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -9379,15 +9460,16 @@ asm_handler_PutByValue_cold_end:
 asm_handler_GetById_cold:
 # Cold paths for GetById
 .Lasm_GetById.ssa_block_8:
-    shl rax, 16
-    shr rax, 16
-    mov rcx, QWORD PTR [rax + 16]
-    test rcx, rcx
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
+    mov rax, QWORD PTR [rax + 16]
+    test rax, rax
     jz .Lasm_GetById.ssa_block_5
-    movzx eax, WORD PTR [rcx + 10]
-    test eax, 2
+    movzx esi, WORD PTR [rax + 10]
+    test esi, 2
     jz .Lasm_GetById.ssa_block_3
-    test eax, 1024
+    test esi, 1024
     jz .Lasm_GetById.ssa_block_14
     jmp .Lasm_GetById.ssa_block_13
 .Lasm_GetById.ssa_block_3:
@@ -11290,7 +11372,8 @@ asm_handler_AddLhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_AddLhsInt32.ssa_block_5
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -11323,14 +11406,16 @@ asm_handler_AddLhsInt32_cold:
     test rdx, rdx
     jz .Lasm_AddLhsInt32.ssa_box_number_6_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddLhsInt32.ssa_box_number_6_done
 .Lasm_AddLhsInt32.ssa_box_number_6_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_AddLhsInt32.ssa_box_number_6_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddLhsInt32.ssa_box_number_6_done
 .Lasm_AddLhsInt32.ssa_box_number_6_not_integer:
     movq rax, xmm0
@@ -11391,14 +11476,16 @@ asm_handler_AddRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_AddRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddRhsInt32.ssa_box_number_8_done
 .Lasm_AddRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_AddRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddRhsInt32.ssa_box_number_8_done
 .Lasm_AddRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -11413,7 +11500,8 @@ asm_handler_AddRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_AddRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11467,14 +11555,16 @@ asm_handler_SubRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_SubRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_SubRhsInt32.ssa_box_number_8_done
 .Lasm_SubRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_SubRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_SubRhsInt32.ssa_box_number_8_done
 .Lasm_SubRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -11489,7 +11579,8 @@ asm_handler_SubRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_SubRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11518,7 +11609,8 @@ asm_handler_MulRhsInt32_cold:
     cmp dx, 32760
     jne .Lasm_MulRhsInt32.ssa_block_12
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11550,14 +11642,16 @@ asm_handler_MulRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_MulRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_MulRhsInt32.ssa_box_number_8_done
 .Lasm_MulRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_MulRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_MulRhsInt32.ssa_box_number_8_done
 .Lasm_MulRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -11599,7 +11693,8 @@ asm_handler_DivRhsInt32_cold:
 # Cold paths for DivRhsInt32
 .Lasm_DivRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11627,7 +11722,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseXorRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -11685,7 +11781,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseXorRhsInt32.ssa_block_13:
     xor eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -11698,7 +11795,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseAndRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -11756,7 +11854,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseAndRhsInt32.ssa_block_13:
     and eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -11769,7 +11868,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseOrRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -11827,7 +11927,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseOrRhsInt32.ssa_block_13:
     or eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -11838,7 +11939,8 @@ asm_handler_LeftShiftRhsInt32_cold:
 # Cold paths for LeftShiftRhsInt32
 .Lasm_LeftShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -11862,7 +11964,8 @@ asm_handler_RightShiftRhsInt32_cold:
 # Cold paths for RightShiftRhsInt32
 .Lasm_RightShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -11894,7 +11997,8 @@ asm_handler_UnsignedRightShiftRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_UnsignedRightShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -11918,7 +12022,8 @@ asm_handler_ModRhsInt32_cold:
 # Cold paths for ModRhsInt32
 .Lasm_ModRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11944,7 +12049,8 @@ asm_handler_LessThanRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_LessThanRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -11978,7 +12084,8 @@ asm_handler_LessThanEqualsRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_LessThanEqualsRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -12012,7 +12119,8 @@ asm_handler_GreaterThanRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_GreaterThanRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -12046,7 +12154,8 @@ asm_handler_GreaterThanEqualsRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_GreaterThanEqualsRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -12082,7 +12191,8 @@ asm_handler_JumpLessThanRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -12120,7 +12230,8 @@ asm_handler_JumpLessThanEqualsRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -12158,7 +12269,8 @@ asm_handler_JumpGreaterThanRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -12196,7 +12308,8 @@ asm_handler_JumpGreaterThanEqualsRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
