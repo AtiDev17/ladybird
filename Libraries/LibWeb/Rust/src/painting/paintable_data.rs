@@ -131,10 +131,9 @@ pub struct PaintableData {
     pub local_padding_box_union: FfiCssPixelRect,
     pub local_border_box_union: FfiCssPixelRect,
 
-    pub overflow: FfiOverflowData,
-    pub has_overflow: bool,
-    pub cached_overflow: FfiOverflowData,
-    pub has_cached_overflow: bool,
+    pub overflow_relative_to_padding_box: FfiOverflowData,
+    pub overflow_measured_this_commit: bool,
+    pub overflow_valid_across_recommits: bool,
     pub sticky_insets: FfiStickyInsets,
     pub has_sticky_insets: bool,
 
@@ -147,6 +146,7 @@ pub struct PaintableData {
     pub accumulated_visual_context_for_descendants_index: usize,
     pub fixed_background_visual_context: usize,
     pub has_fixed_background_visual_context: bool,
+    pub has_scroll_offset_dependent_background: bool,
     /// Range of visual context nodes this box appended during the last tree build.
     pub visual_context_nodes_begin: usize,
     pub visual_context_nodes_end: usize,
@@ -164,10 +164,9 @@ impl Default for PaintableData {
             content_size: FfiCssPixelSize::default(),
             local_padding_box_union: FfiCssPixelRect::default(),
             local_border_box_union: FfiCssPixelRect::default(),
-            overflow: FfiOverflowData::default(),
-            has_overflow: false,
-            cached_overflow: FfiOverflowData::default(),
-            has_cached_overflow: false,
+            overflow_relative_to_padding_box: FfiOverflowData::default(),
+            overflow_measured_this_commit: false,
+            overflow_valid_across_recommits: false,
             sticky_insets: FfiStickyInsets::default(),
             has_sticky_insets: false,
             stacking_context: u32::MAX,
@@ -178,6 +177,7 @@ impl Default for PaintableData {
             accumulated_visual_context_for_descendants_index: 0,
             fixed_background_visual_context: 0,
             has_fixed_background_visual_context: false,
+            has_scroll_offset_dependent_background: false,
             visual_context_nodes_begin: 0,
             visual_context_nodes_end: 0,
         }
