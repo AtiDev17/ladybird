@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::abort_on_panic;
+use crate::css::css_tokenizer::TokenizerInput;
 
 pub(crate) use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
 
@@ -70,6 +71,18 @@ impl PartialEq for RetainedStyleValueData {
 }
 
 impl RetainedStyleValueData {
+    pub(crate) fn none() -> Self {
+        Self {
+            pointer: std::ptr::null(),
+        }
+    }
+
+    pub(crate) fn from_owned(data: StyleValueData) -> Self {
+        let pointer = Arc::into_raw(Arc::new(data));
+        // SAFETY: Arc::into_raw transfers one strong reference to this handle.
+        unsafe { Self::from_retained_pointer(pointer) }
+    }
+
     pub(crate) fn pointer(&self) -> *const StyleValueData {
         self.pointer.cast()
     }
@@ -271,6 +284,13 @@ pub struct RetainedPropertyIdList {
 retained_list!(RetainedPropertyIdList, u16);
 
 impl RetainedPropertyIdList {
+    pub(crate) fn from_property_ids(property_ids: Vec<u16>) -> Self {
+        let slice = property_ids.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice).cast::<u16>();
+        Self { pointer, length }
+    }
+
     pub(crate) fn as_slice(&self) -> &[u16] {
         if self.pointer.is_null() {
             return &[];
@@ -283,6 +303,16 @@ impl RetainedPropertyIdList {
 /// copied bytes are Rust-owned and C++ materializes an AK::String when it consumes the value.
 struct StringStorage {
     raw: usize,
+}
+
+struct Utf16StringStorage {
+    raw: usize,
+}
+
+impl Drop for Utf16StringStorage {
+    fn drop(&mut self) {
+        crate::css::ffi_stats::release_utf16_fly_string(self.raw);
+    }
 }
 
 impl Drop for StringStorage {
@@ -305,15 +335,19 @@ impl RetainedString {
     /// # Safety
     /// `bytes` must point at `length` readable bytes.
     unsafe fn from_raw(raw: usize, bytes: *const u8, length: usize) -> Self {
-        let readable = unsafe { RetainedReadableString::from_raw(raw, bytes, length) };
-        let result = Self {
-            raw: readable.raw,
-            bytes: readable.bytes,
-            length: readable.length,
-            storage: readable.storage,
-        };
-        std::mem::forget(readable);
-        result
+        let source = unsafe { crate::bytes_from_raw(bytes, length) }.expect("invalid retained string bytes");
+        let bytes = source.to_vec().into_boxed_slice();
+        let length = bytes.len();
+        Self {
+            raw,
+            bytes: Box::into_raw(bytes).cast(),
+            length,
+            storage: if raw == 0 {
+                std::ptr::null()
+            } else {
+                Arc::into_raw(Arc::new(StringStorage { raw })).cast()
+            },
+        }
     }
 
     fn from_bytes(bytes: Vec<u8>) -> Self {
@@ -330,6 +364,10 @@ impl RetainedString {
 
     pub(crate) fn from_utf8(string: String) -> Self {
         Self::from_bytes(string.into_bytes())
+    }
+
+    pub(crate) fn from_utf16(string: &[u16]) -> Option<Self> {
+        String::from_utf16(string).ok().map(Self::from_utf8)
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -374,87 +412,93 @@ impl Drop for RetainedString {
     }
 }
 
-/// A retained AK::String accompanied by a Rust-owned copy of its UTF-8 bytes. This is used when
-/// Rust needs to inspect the string instead of only preserving it for C++ access.
+/// A retained AK::Utf16String accompanied by a Rust-owned copy in the same representation.
 #[repr(C)]
 pub struct RetainedReadableString {
     raw: usize,
-    bytes: *mut u8,
+    ascii_units: *mut u8,
+    code_units: *mut u16,
     length: usize,
     storage: *const c_void,
 }
 
 impl RetainedReadableString {
-    /// Takes ownership of a leaked AK::String reference and copies its bytes.
+    /// Takes ownership of a leaked AK::Utf16String reference and copies its units.
     ///
     /// # Safety
-    /// `bytes` must point at `length` readable bytes.
-    unsafe fn from_raw(raw: usize, bytes: *const u8, length: usize) -> Self {
-        let source = unsafe { crate::bytes_from_raw(bytes, length) }.expect("invalid readable string bytes");
-        if source.is_empty() {
-            return Self {
-                raw,
-                bytes: std::ptr::null_mut(),
-                length: 0,
-                storage: if raw == 0 {
-                    std::ptr::null()
-                } else {
-                    Arc::into_raw(Arc::new(StringStorage { raw })).cast()
-                },
-            };
-        }
-        let owned = source.to_vec().into_boxed_slice();
-        let length = owned.len();
-        let bytes = Box::into_raw(owned).cast::<u8>();
+    /// Exactly one non-empty unit pointer must identify `length` readable units.
+    unsafe fn from_raw(raw: usize, ascii_units: *const u8, code_units: *const u16, length: usize) -> Self {
+        let source = unsafe { TokenizerInput::from_raw_parts(ascii_units, code_units, length) }
+            .expect("invalid readable UTF-16 string");
+        Self::from_units_with_raw(source, raw)
+    }
+
+    fn from_units_with_raw(source: TokenizerInput<'_>, raw: usize) -> Self {
+        let (ascii_units, code_units, length) = match source {
+            TokenizerInput::Ascii(units) => {
+                let units = units.to_vec().into_boxed_slice();
+                let length = units.len();
+                (Box::into_raw(units).cast::<u8>(), std::ptr::null_mut(), length)
+            }
+            TokenizerInput::Utf16(units) => {
+                let units = units.to_vec().into_boxed_slice();
+                let length = units.len();
+                (std::ptr::null_mut(), Box::into_raw(units).cast::<u16>(), length)
+            }
+        };
         Self {
             raw,
-            bytes,
+            ascii_units,
+            code_units,
             length,
             storage: if raw == 0 {
                 std::ptr::null()
             } else {
-                Arc::into_raw(Arc::new(StringStorage { raw })).cast()
+                Arc::into_raw(Arc::new(Utf16StringStorage { raw })).cast()
             },
         }
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        if self.bytes.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.bytes, self.length) }
+    pub(crate) fn from_utf16(code_units: &[u16]) -> Self {
+        Self::from_units_with_raw(TokenizerInput::Utf16(code_units), 0)
+    }
+
+    pub(crate) fn as_units(&self) -> TokenizerInput<'_> {
+        unsafe { TokenizerInput::from_raw_parts(self.ascii_units, self.code_units, self.length) }.unwrap()
     }
 }
 
 impl PartialEq for RetainedReadableString {
     fn eq(&self, other: &Self) -> bool {
-        self.as_bytes() == other.as_bytes()
+        let mut left = Vec::with_capacity(self.length);
+        let mut right = Vec::with_capacity(other.length);
+        self.as_units().append_to(&mut left);
+        other.as_units().append_to(&mut right);
+        left == right
     }
 }
 
 impl Clone for RetainedReadableString {
     fn clone(&self) -> Self {
         if self.raw != 0 {
-            unsafe { Arc::increment_strong_count(self.storage.cast::<StringStorage>()) };
+            unsafe { Arc::increment_strong_count(self.storage.cast::<Utf16StringStorage>()) };
         }
-        let bytes = self.as_bytes().to_vec().into_boxed_slice();
-        let length = bytes.len();
-        Self {
-            raw: self.raw,
-            bytes: Box::into_raw(bytes).cast(),
-            length,
-            storage: self.storage,
-        }
+        let mut clone = Self::from_units_with_raw(self.as_units(), 0);
+        clone.raw = self.raw;
+        clone.storage = self.storage;
+        clone
     }
 }
 
 impl Drop for RetainedReadableString {
     fn drop(&mut self) {
         if self.raw != 0 {
-            unsafe { Arc::decrement_strong_count(self.storage.cast::<StringStorage>()) };
+            unsafe { Arc::decrement_strong_count(self.storage.cast::<Utf16StringStorage>()) };
         }
-        if !self.bytes.is_null() {
-            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.bytes, self.length)) });
+        if !self.ascii_units.is_null() {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ascii_units, self.length)) });
+        } else if !self.code_units.is_null() {
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.code_units, self.length)) });
         }
     }
 }
@@ -471,6 +515,22 @@ pub struct RetainedRequestUrlModifier {
 }
 
 impl RetainedRequestUrlModifier {
+    pub(crate) fn from_enum(modifier_type: u8, enum_value: u8) -> Self {
+        Self {
+            modifier_type,
+            enum_value,
+            string_value: RetainedUtf16FlyString::none(),
+        }
+    }
+
+    pub(crate) fn from_string(modifier_type: u8, string_value: RetainedUtf16FlyString) -> Self {
+        Self {
+            modifier_type,
+            enum_value: 0,
+            string_value,
+        }
+    }
+
     pub(crate) fn modifier_type(&self) -> u8 {
         self.modifier_type
     }
@@ -492,6 +552,13 @@ pub struct RetainedRequestUrlModifierList {
 }
 
 impl RetainedRequestUrlModifierList {
+    pub(crate) fn from_retained_modifiers(modifiers: Vec<RetainedRequestUrlModifier>) -> Self {
+        let slice = modifiers.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice) as *mut RetainedRequestUrlModifier;
+        Self { pointer, length }
+    }
+
     /// Takes ownership of each modifier's leaked string reference. C++ leaves
     /// the Rust storage pointer empty in this input array.
     unsafe fn from_raw(elements: *const RetainedRequestUrlModifier, length: usize) -> Self {
@@ -532,6 +599,13 @@ pub struct RetainedByteList {
 retained_list!(RetainedByteList, u8);
 
 impl RetainedByteList {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        let slice = bytes.into_boxed_slice();
+        let length = slice.len();
+        let pointer = Box::into_raw(slice).cast::<u8>();
+        Self { pointer, length }
+    }
+
     pub(crate) fn as_slice(&self) -> &[u8] {
         if self.pointer.is_null() {
             return &[];
@@ -551,6 +625,14 @@ pub struct RetainedCounterDefinition {
 }
 
 impl RetainedCounterDefinition {
+    pub(crate) fn new(name: RetainedUtf16FlyString, is_reversed: bool, value: RetainedStyleValueData) -> Self {
+        Self {
+            name,
+            is_reversed,
+            value,
+        }
+    }
+
     pub(crate) fn name(&self) -> &RetainedUtf16FlyString {
         &self.name
     }
@@ -670,6 +752,19 @@ impl RetainedCounterDefinition {
 }
 
 impl RetainedImageSetOption {
+    pub(crate) fn from_retained_values(
+        image: RetainedStyleValueData,
+        resolution: RetainedStyleValueData,
+        type_string: Option<RetainedUtf16FlyString>,
+    ) -> Self {
+        Self {
+            image,
+            resolution,
+            has_type: type_string.is_some(),
+            type_string: type_string.unwrap_or_else(RetainedUtf16FlyString::none),
+        }
+    }
+
     pub(crate) fn values(&self) -> [&RetainedStyleValueData; 2] {
         [&self.image, &self.resolution]
     }
@@ -821,6 +916,26 @@ pub struct RetainedGridArea {
 }
 
 impl RetainedGridArea {
+    pub(crate) fn new(
+        name: RetainedUtf16FlyString,
+        implicit_start_name: RetainedUtf16FlyString,
+        implicit_end_name: RetainedUtf16FlyString,
+        row_start: usize,
+        row_end: usize,
+        column_start: usize,
+        column_end: usize,
+    ) -> Self {
+        Self {
+            name,
+            implicit_start_name,
+            implicit_end_name,
+            row_start,
+            row_end,
+            column_start,
+            column_end,
+        }
+    }
+
     pub(crate) fn name(&self) -> &RetainedUtf16FlyString {
         &self.name
     }
@@ -874,7 +989,7 @@ impl RetainedGridAreaList {
         Self { pointer, length }
     }
 
-    fn from_retained_elements(elements: Vec<RetainedGridArea>) -> Self {
+    pub(crate) fn from_retained_elements(elements: Vec<RetainedGridArea>) -> Self {
         let slice = elements.into_boxed_slice();
         let length = slice.len();
         let pointer = Box::into_raw(slice) as *mut RetainedGridArea;
@@ -1085,6 +1200,79 @@ impl Clone for RetainedGridTrackEntryList {
 }
 
 impl RetainedGridTrackEntry {
+    pub(crate) fn line_names(names: Vec<RetainedUtf16FlyString>) -> Self {
+        Self {
+            kind: GridTrackEntryKind::LineNames,
+            names: RetainedUtf16FlyStringList::from_retained_strings(names),
+            size_value: RetainedStyleValueData::none(),
+            min_value: RetainedStyleValueData::none(),
+            max_value: RetainedStyleValueData::none(),
+            repeat_type: 0,
+            repeat_count: RetainedStyleValueData::none(),
+            repeat_is_subgrid: false,
+            repeat_preserve_line_name_sets: false,
+            repeat_entries_pointer: std::ptr::null_mut(),
+            repeat_entries_length: 0,
+        }
+    }
+
+    pub(crate) fn size(value: StyleValueData) -> Self {
+        Self {
+            kind: GridTrackEntryKind::Size,
+            names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            size_value: RetainedStyleValueData::from_owned(value),
+            min_value: RetainedStyleValueData::none(),
+            max_value: RetainedStyleValueData::none(),
+            repeat_type: 0,
+            repeat_count: RetainedStyleValueData::none(),
+            repeat_is_subgrid: false,
+            repeat_preserve_line_name_sets: false,
+            repeat_entries_pointer: std::ptr::null_mut(),
+            repeat_entries_length: 0,
+        }
+    }
+
+    pub(crate) fn minmax(min: StyleValueData, max: StyleValueData) -> Self {
+        Self {
+            kind: GridTrackEntryKind::MinMax,
+            names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            size_value: RetainedStyleValueData::none(),
+            min_value: RetainedStyleValueData::from_owned(min),
+            max_value: RetainedStyleValueData::from_owned(max),
+            repeat_type: 0,
+            repeat_count: RetainedStyleValueData::none(),
+            repeat_is_subgrid: false,
+            repeat_preserve_line_name_sets: false,
+            repeat_entries_pointer: std::ptr::null_mut(),
+            repeat_entries_length: 0,
+        }
+    }
+
+    pub(crate) fn repeat(
+        repeat_type: u8,
+        repeat_count: Option<StyleValueData>,
+        repeat_is_subgrid: bool,
+        repeat_preserve_line_name_sets: bool,
+        repeat_entries: Vec<Self>,
+    ) -> Self {
+        let repeat_entries = repeat_entries.into_boxed_slice();
+        let repeat_entries_length = repeat_entries.len();
+        let repeat_entries_pointer = Box::into_raw(repeat_entries).cast::<Self>();
+        Self {
+            kind: GridTrackEntryKind::Repeat,
+            names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            size_value: RetainedStyleValueData::none(),
+            min_value: RetainedStyleValueData::none(),
+            max_value: RetainedStyleValueData::none(),
+            repeat_type,
+            repeat_count: repeat_count.map_or_else(RetainedStyleValueData::none, RetainedStyleValueData::from_owned),
+            repeat_is_subgrid,
+            repeat_preserve_line_name_sets,
+            repeat_entries_pointer,
+            repeat_entries_length,
+        }
+    }
+
     pub(crate) fn repeat_entries(&self) -> &[RetainedGridTrackEntry] {
         if self.repeat_entries_pointer.is_null() {
             return &[];
@@ -1147,6 +1335,13 @@ impl RetainedNumericRangeList {
             pointer: std::ptr::null_mut(),
             length: 0,
         }
+    }
+
+    pub(crate) fn from_single_numeric_range(value_type: u8, min: f64, max: f64) -> Self {
+        let ranges = vec![RetainedNumericRangeByType { value_type, min, max }].into_boxed_slice();
+        let length = ranges.len();
+        let pointer = Box::into_raw(ranges) as *mut RetainedNumericRangeByType;
+        Self { pointer, length }
     }
 
     pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
@@ -1800,7 +1995,7 @@ pub unsafe extern "C" fn rust_style_value_computed_percentage(value: *const c_vo
 }
 
 impl StyleValueData {
-    pub(crate) fn unresolved_token_source(&self) -> Option<&[u8]> {
+    pub(crate) fn unresolved_token_source(&self) -> Option<TokenizerInput<'_>> {
         let Self::Unresolved {
             source_text,
             value_comparison_text,
@@ -1809,37 +2004,11 @@ impl StyleValueData {
         else {
             return None;
         };
-        if value_comparison_text.as_bytes().is_empty() {
-            Some(source_text.as_bytes())
+        if value_comparison_text.as_units().is_empty() {
+            Some(source_text.as_units())
         } else {
-            Some(value_comparison_text.as_bytes())
+            Some(value_comparison_text.as_units())
         }
-    }
-
-    pub(crate) fn unresolved_var_source(&self) -> Option<(&[u8], bool)> {
-        let Self::Unresolved {
-            presence_attr,
-            presence_dashed_function,
-            presence_env,
-            presence_if,
-            presence_inherit,
-            presence_var,
-            contains_attr_tainted_values,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        let cannot_resolve_natively = *presence_attr
-            || *presence_dashed_function
-            || *presence_env
-            || *presence_if
-            || *presence_inherit
-            || *contains_attr_tainted_values;
-        if cannot_resolve_natively {
-            return None;
-        }
-        Some((self.unresolved_token_source().unwrap_or_default(), *presence_var))
     }
 }
 
@@ -1868,6 +2037,20 @@ impl StyleValueData {
         }
         fn write_bool(hasher: &mut crate::css::style::fast_hash::FastHasher, value: bool) {
             hasher.write_u8(value as u8);
+        }
+        fn hash_string_units(hasher: &mut crate::css::style::fast_hash::FastHasher, units: TokenizerInput<'_>) {
+            match units {
+                TokenizerInput::Ascii(units) => {
+                    for &unit in units {
+                        hasher.write_u16(u16::from(unit));
+                    }
+                }
+                TokenizerInput::Utf16(units) => {
+                    for &unit in units {
+                        hasher.write_u16(unit);
+                    }
+                }
+            }
         }
         fn write_value(hasher: &mut crate::css::style::fast_hash::FastHasher, value: &RetainedStyleValueData) {
             match value.optional_data() {
@@ -2357,8 +2540,8 @@ impl StyleValueData {
                 contains_attr_tainted_values,
                 parsed_value: _,
             } => {
-                hasher.write(source_text.as_bytes());
-                hasher.write(value_comparison_text.as_bytes());
+                hash_string_units(hasher, source_text.as_units());
+                hash_string_units(hasher, value_comparison_text.as_units());
                 write_bool(hasher, *presence_attr);
                 write_bool(hasher, *presence_dashed_function);
                 write_bool(hasher, *presence_env);
@@ -3213,10 +3396,12 @@ pub unsafe extern "C" fn rust_style_value_create_color_scheme(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_unresolved(
     source_text: usize,
-    source_text_bytes: *const u8,
+    source_text_ascii_units: *const u8,
+    source_text_code_units: *const u16,
     source_text_length: usize,
     value_comparison_text: usize,
-    value_comparison_text_bytes: *const u8,
+    value_comparison_text_ascii_units: *const u8,
+    value_comparison_text_code_units: *const u16,
     value_comparison_text_length: usize,
     presence_attr: bool,
     presence_dashed_function: bool,
@@ -3230,12 +3415,18 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
     abort_on_panic(|| {
         Arc::into_raw(Arc::new(StyleValueData::Unresolved {
             source_text: unsafe {
-                RetainedReadableString::from_raw(source_text, source_text_bytes, source_text_length)
+                RetainedReadableString::from_raw(
+                    source_text,
+                    source_text_ascii_units,
+                    source_text_code_units,
+                    source_text_length,
+                )
             },
             value_comparison_text: unsafe {
                 RetainedReadableString::from_raw(
                     value_comparison_text,
-                    value_comparison_text_bytes,
+                    value_comparison_text_ascii_units,
+                    value_comparison_text_code_units,
                     value_comparison_text_length,
                 )
             },

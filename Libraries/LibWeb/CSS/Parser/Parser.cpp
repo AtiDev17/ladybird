@@ -26,6 +26,8 @@
 #include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
+#include <LibWeb/CSS/Parser/RustTokenizer.h>
 #include <LibWeb/CSS/PropertyName.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Sizing.h>
@@ -40,6 +42,143 @@ static void log_parse_error(SourceLocation const& location = SourceLocation::cur
 }
 
 namespace Web::CSS::Parser {
+
+enum class DeclarationValueNested : u8 {
+    No,
+    Yes,
+};
+
+static void consume_declaration_value(TokenStream<ComponentValue>& tokens, Optional<Token::Type> end_token_type, DeclarationValueNested nested, Parser::DisallowTopLevelCurlyBlocks disallow_top_level_curly_blocks)
+{
+    while (tokens.has_next_token()) {
+        auto const& peek = tokens.next_token();
+        if (peek.is_block() || peek.is_function()) {
+            auto const& values = peek.is_block() ? peek.block().value : peek.function().value;
+            TokenStream nested_tokens { values };
+            consume_declaration_value(nested_tokens, end_token_type, DeclarationValueNested::Yes, disallow_top_level_curly_blocks);
+            if (peek.is_block() && peek.block().is_curly() && nested == DeclarationValueNested::No && disallow_top_level_curly_blocks == Parser::DisallowTopLevelCurlyBlocks::Yes)
+                break;
+            if (nested_tokens.has_next_token())
+                break;
+            tokens.discard_a_token();
+            continue;
+        }
+        if (!peek.is_token()) {
+            tokens.discard_a_token();
+            continue;
+        }
+        auto type = peek.token().type();
+        bool valid = !first_is_one_of(type, Token::Type::Invalid, Token::Type::EndOfFile, Token::Type::BadString, Token::Type::BadUrl,
+            Token::Type::Function, Token::Type::OpenCurly, Token::Type::OpenParen, Token::Type::OpenSquare,
+            Token::Type::CloseCurly, Token::Type::CloseParen, Token::Type::CloseSquare);
+        if (type == Token::Type::Semicolon)
+            valid = nested == DeclarationValueNested::Yes;
+        else if (type == Token::Type::Delim)
+            valid = nested == DeclarationValueNested::Yes || peek.token().delim() != '!';
+        else if (nested == DeclarationValueNested::No && end_token_type.has_value() && peek.is(*end_token_type))
+            valid = false;
+        if (!valid)
+            break;
+        tokens.discard_a_token();
+    }
+}
+
+Optional<ReadonlySpan<ComponentValue>> Parser::parse_declaration_value_as_span(TokenStream<ComponentValue>& tokens, Optional<Token::Type> end_token_type, DisallowTopLevelCurlyBlocks disallow_top_level_curly_blocks)
+{
+    auto start = tokens.current_index();
+    consume_declaration_value(tokens, end_token_type, DeclarationValueNested::No, disallow_top_level_curly_blocks);
+    auto value = tokens.tokens_since(start);
+    return value.is_empty() ? OptionalNone {} : Optional<ReadonlySpan<ComponentValue>> { value };
+}
+
+Optional<Vector<ComponentValue>> Parser::parse_declaration_value(TokenStream<ComponentValue>& tokens, Optional<Token::Type> end_token_type)
+{
+    auto value = parse_declaration_value_as_span(tokens, end_token_type);
+    return value.has_value() ? Optional<Vector<ComponentValue>> { Vector<ComponentValue> { *value } } : OptionalNone {};
+}
+
+struct SyntaxDeclarationForVerification {
+    Utf16FlyString name;
+    Utf16String value;
+    Important important;
+
+    bool operator==(SyntaxDeclarationForVerification const&) const = default;
+};
+
+static void collect_syntax_declarations_for_verification(Rule const&, Vector<SyntaxDeclarationForVerification>&);
+
+static void collect_syntax_declarations_for_verification(ReadonlySpan<RuleOrListOfDeclarations> items, Vector<SyntaxDeclarationForVerification>& declarations)
+{
+    for (auto const& item : items) {
+        item.visit(
+            [&](Rule const& rule) { collect_syntax_declarations_for_verification(rule, declarations); },
+            [&](Vector<Declaration> const& declaration_list) {
+                for (auto const& declaration : declaration_list) {
+                    auto value = declaration.value_text;
+                    if (!declaration.value.is_empty())
+                        value = serialize_a_series_of_component_values(declaration.value);
+                    declarations.append({ declaration.name, move(value), declaration.important });
+                }
+            });
+    }
+}
+
+static void collect_syntax_declarations_for_verification(Rule const& rule, Vector<SyntaxDeclarationForVerification>& declarations)
+{
+    rule.visit(
+        [&](AtRule const& at_rule) {
+            collect_syntax_declarations_for_verification(at_rule.child_rules_and_lists_of_declarations, declarations);
+        },
+        [&](QualifiedRule const& qualified_rule) {
+            collect_syntax_declarations_for_verification(Vector<RuleOrListOfDeclarations> { qualified_rule.declarations }, declarations);
+            collect_syntax_declarations_for_verification(qualified_rule.child_rules, declarations);
+        });
+}
+
+static void verify_rust_syntax_declarations(ReadonlySpan<RuleOrListOfDeclarations> rust_items, ReadonlySpan<RuleOrListOfDeclarations> cpp_items)
+{
+    Vector<SyntaxDeclarationForVerification> rust_declarations;
+    Vector<SyntaxDeclarationForVerification> cpp_declarations;
+    collect_syntax_declarations_for_verification(rust_items, rust_declarations);
+    collect_syntax_declarations_for_verification(cpp_items, cpp_declarations);
+    if (rust_declarations == cpp_declarations)
+        return;
+    warnln("Rust CSS syntax parser mismatch: Rust produced {} declarations, C++ produced {}", rust_declarations.size(), cpp_declarations.size());
+    auto count = min(rust_declarations.size(), cpp_declarations.size());
+    for (size_t index = 0; index < count; ++index) {
+        if (rust_declarations[index] == cpp_declarations[index])
+            continue;
+        warnln("  first mismatch at {}: Rust '{}: {}' important={}, C++ '{}: {}' important={}",
+            index,
+            rust_declarations[index].name,
+            rust_declarations[index].value,
+            rust_declarations[index].important == Important::Yes,
+            cpp_declarations[index].name,
+            cpp_declarations[index].value,
+            cpp_declarations[index].important == Important::Yes);
+        break;
+    }
+}
+
+static void verify_rust_syntax_declarations(ReadonlySpan<Rule> rust_rules, ReadonlySpan<Rule> cpp_rules)
+{
+    Vector<RuleOrListOfDeclarations> rust_items;
+    Vector<RuleOrListOfDeclarations> cpp_items;
+    for (auto const& rule : rust_rules)
+        rust_items.append(rule);
+    for (auto const& rule : cpp_rules)
+        cpp_items.append(rule);
+    verify_rust_syntax_declarations(rust_items, cpp_items);
+}
+
+static bool should_verify_rust_syntax_parser()
+{
+    static bool const should_verify = [] {
+        auto* value = getenv("LIBWEB_VERIFY_RUST_SYNTAX_PARSER");
+        return value && StringView { value, strlen(value) } == "1"sv;
+    }();
+    return should_verify;
+}
 
 ParsingParams::ParsingParams(ParsingMode mode)
     : mode(mode)
@@ -64,26 +203,34 @@ ParsingParams::ParsingParams(DOM::Document const& document, ParsingMode mode)
 
 Parser Parser::create(ParsingParams const& context, StringView input, StringView encoding)
 {
-    auto tokens = Tokenizer::tokenize(input, encoding);
-    return Parser { context, move(tokens) };
+    auto source = RustTokenizer::normalize_input(input, encoding);
+    return Parser { context, move(source) };
 }
 
 Parser Parser::create(ParsingParams const& context, Utf16View input)
 {
-    auto tokens = Tokenizer::tokenize(input);
-    return Parser { context, move(tokens) };
+    auto source = RustTokenizer::normalize_input(input);
+    return Parser { context, move(source) };
 }
 
-Parser::Parser(ParsingParams const& context, Vector<Token> tokens)
+Parser::Parser(ParsingParams const& context, Utf16String source)
     : m_document(context.document)
     , m_parsing_mode(context.mode)
     , m_is_ua_style_sheet(context.is_ua_style_sheet)
-    , m_tokens(move(tokens))
-    , m_token_stream(m_tokens)
+    , m_source(move(source))
     , m_value_context(move(context.value_context))
     , m_rule_context(move(context.rule_context))
     , m_declared_namespaces(move(context.declared_namespaces))
 {
+}
+
+TokenStream<Token>& Parser::token_stream()
+{
+    if (!m_token_stream) {
+        m_tokens = RustTokenizer::tokenize(m_source);
+        m_token_stream = make<TokenStream<Token>>(m_tokens);
+    }
+    return *m_token_stream;
 }
 
 // https://drafts.csswg.org/css-syntax/#parse-stylesheet
@@ -175,14 +322,22 @@ GC::RootVector<GC::Ref<CSSRule>> Parser::convert_rules(Vector<Rule> const& raw_r
 
 GC::RootVector<GC::Ref<CSSRule>> Parser::parse_as_stylesheet_contents()
 {
-    return convert_rules(parse_a_stylesheets_contents(m_token_stream));
+    auto rules = RustSyntaxParser::parse_stylesheet(*this);
+    if (should_verify_rust_syntax_parser())
+        verify_rust_syntax_declarations(rules, parse_a_stylesheet(token_stream(), {}).rules);
+    return convert_rules(rules);
 }
 
 // https://drafts.csswg.org/css-syntax/#parse-a-css-stylesheet
 GC::Ref<CSS::CSSStyleSheet> Parser::parse_as_css_stylesheet(Optional<::URL::URL> location, GC::Ptr<MediaList> media_list)
 {
     // To parse a CSS stylesheet, first parse a stylesheet.
-    auto const& style_sheet = parse_a_stylesheet(m_token_stream, location);
+    ParsedStyleSheet style_sheet {
+        .location = location,
+        .rules = RustSyntaxParser::parse_stylesheet(*this),
+    };
+    if (should_verify_rust_syntax_parser())
+        verify_rust_syntax_declarations(style_sheet.rules, parse_a_stylesheet(token_stream(), location).rules);
 
     auto rule_list = CSSRuleList::create(convert_rules(style_sheet.rules));
     if (!media_list)
@@ -192,7 +347,7 @@ GC::Ref<CSS::CSSStyleSheet> Parser::parse_as_css_stylesheet(Optional<::URL::URL>
 
 RefPtr<Supports> Parser::parse_as_supports()
 {
-    return parse_a_supports(m_token_stream);
+    return parse_a_supports(token_stream());
 }
 
 template<typename T>
@@ -812,7 +967,7 @@ OwnPtr<GeneralEnclosed> Parser::parse_general_enclosed(TokenStream<ComponentValu
     auto serialize_general_enclosed = [](ComponentValue const& component_value) {
         auto original_source_text = component_value.original_source_text();
         if (!original_source_text.is_empty())
-            return Utf16String::from_utf8_without_validation(original_source_text.bytes_as_string_view());
+            return original_source_text;
         return component_value.to_string();
     };
 
@@ -967,6 +1122,7 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
     // Let rule be a new qualified rule with its prelude, declarations, and child rules all initially set to empty lists.
     QualifiedRule rule {
         .prelude = {},
+        .prelude_text = {},
         .declarations = {},
         .child_rules = {},
         .source_position = {},
@@ -1002,6 +1158,7 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
 
         // <{-token>
         if (token.is(Token::Type::OpenCurly)) {
+            rule.prelude_text = serialize_a_series_of_component_values_for_retokenization(rule.prelude);
             // If the first two non-<whitespace-token> values of rule’s prelude are an <ident-token> whose value starts with "--"
             // followed by a <colon-token>, then:
             TokenStream prelude_tokens { rule.prelude };
@@ -1472,6 +1629,9 @@ Optional<Declaration> Parser::consume_a_declaration(TokenStream<T>& input, Neste
         .original_value_text = {},
         .original_full_text = {},
         .source_position = {},
+        .value_text = {},
+        .parsed_property_id = {},
+        .parsed_value = {},
     };
     auto start_token_index = input.current_index();
 
@@ -1579,11 +1739,11 @@ Optional<Declaration> Parser::consume_a_declaration(TokenStream<T>& input, Neste
     if (is_a_custom_property_name_string(declaration.name)) {
         // TODO: If we could reach inside the source string that the TokenStream uses, we could grab this as
         //       a single substring instead of having to reconstruct it.
-        StringBuilder original_text;
+        Utf16StringBuilder original_text;
         for (auto const& value : declaration.value) {
             original_text.append(value.original_source_text());
         }
-        declaration.original_value_text = original_text.to_string_without_validation();
+        declaration.original_value_text = original_text.to_string();
     }
     //    Otherwise, if decl’s value contains a top-level simple block with an associated token of <{-token>,
     //    and also contains any other non-<whitespace-token> value, return nothing.
@@ -1652,7 +1812,7 @@ void Parser::consume_the_remnants_of_a_bad_declaration(TokenStream<T>& input, Ne
 CSSRule* Parser::parse_as_css_rule(bool nested)
 {
     auto nested_mode = nested ? Nested::Yes : Nested::No;
-    if (auto maybe_rule = parse_a_rule(m_token_stream, nested_mode); maybe_rule.has_value())
+    if (auto maybe_rule = parse_a_rule(token_stream(), nested_mode); maybe_rule.has_value())
         return convert_to_rule<CSSNestedDeclarations>(maybe_rule.value(), nested_mode).ptr();
     return {};
 }
@@ -1665,7 +1825,7 @@ GC::Ptr<CSSKeyframeRule> Parser::parse_as_keyframe_rule()
         VERIFY(last == RuleContext::AtKeyframes);
     };
 
-    auto maybe_rule = parse_a_rule(m_token_stream);
+    auto maybe_rule = parse_a_rule(token_stream());
     if (!maybe_rule.has_value() || !maybe_rule->has<QualifiedRule>())
         return {};
 
@@ -1674,7 +1834,7 @@ GC::Ptr<CSSKeyframeRule> Parser::parse_as_keyframe_rule()
 
 Vector<Percentage> Parser::parse_as_keyframe_selectors()
 {
-    auto component_values = parse_a_list_of_component_values(m_token_stream);
+    auto component_values = parse_a_list_of_component_values(token_stream());
     auto tokens = TokenStream { component_values };
     return parse_keyframe_selectors(tokens);
 }
@@ -1699,7 +1859,7 @@ Optional<Rule> Parser::parse_a_rule(TokenStream<T>& input, Nested nested)
     //    Otherwise, if the next token from input is an <at-keyword-token>,
     //    consume an at-rule from input, and let rule be the return value.
     else if (input.next_token().is(Token::Type::AtKeyword)) {
-        rule = consume_an_at_rule(m_token_stream, nested).map([](auto&& it) { return Rule { it }; });
+        rule = consume_an_at_rule(input, nested).map([](auto&& it) { return Rule { it }; });
     }
     //    Otherwise, consume a qualified rule from input and let rule be the return value.
     //    If nothing or an invalid rule error was returned, return a syntax error.
@@ -1753,7 +1913,7 @@ Optional<Declaration> Parser::parse_a_declaration(TokenStream<T>& input)
 
 Optional<ComponentValue> Parser::parse_as_component_value()
 {
-    return parse_a_component_value(m_token_stream);
+    return parse_a_component_value(token_stream());
 }
 
 // https://drafts.csswg.org/css-syntax/#parse-component-value
@@ -1853,7 +2013,9 @@ Parser::PropertiesAndCustomProperties Parser::parse_as_property_declaration_bloc
     };
 
     // 1. Let declarations be the returned declarations from invoking parse a block’s contents with string.
-    auto declarations_and_at_rules = parse_a_blocks_contents(m_token_stream);
+    auto declarations_and_at_rules = RustSyntaxParser::parse_block_contents(*this, m_rule_context, PreservePropertySourceText::Yes);
+    if (should_verify_rust_syntax_parser())
+        verify_rust_syntax_declarations(declarations_and_at_rules, parse_a_blocks_contents(token_stream()));
 
     // 2. Let parsed declarations be a new empty list.
     PropertiesAndCustomProperties parsed_declarations;
@@ -1880,7 +2042,7 @@ Parser::PropertiesAndCustomProperties Parser::parse_as_property_declaration_bloc
 
 Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_block()
 {
-    auto declarations_and_at_rules = parse_a_blocks_contents(m_token_stream);
+    auto declarations_and_at_rules = RustSyntaxParser::parse_block_contents(*this, m_rule_context);
 
     Vector<DevToolsStyleDeclaration> parsed_declarations;
     for (auto const& rule_or_list : declarations_and_at_rules) {
@@ -1888,13 +2050,9 @@ Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_
             for (auto const& declaration : *rule_declarations) {
                 auto property = PropertyNameAndID::from_name(declaration.name);
 
-                StringBuilder value_builder;
-                for (auto const& value : declaration.value)
-                    value_builder.append(value.original_source_text());
-
                 parsed_declarations.append(DevToolsStyleDeclaration {
                     .name = declaration.name,
-                    .value = value_builder.to_string_without_validation(),
+                    .value = declaration.value_text,
                     .important = declaration.important,
                     .is_custom_property = property.has_value() && property->is_custom_property(),
                     .is_name_valid = property.has_value(),
@@ -1950,7 +2108,7 @@ Vector<Descriptor> Parser::parse_as_descriptor_declaration_block(AtRuleID at_rul
 
     // 1. Let declarations be the returned declarations from invoking parse a block’s contents with string.
     m_rule_context.append(context_type);
-    auto declarations_and_at_rules = parse_a_blocks_contents(m_token_stream);
+    auto declarations_and_at_rules = RustSyntaxParser::parse_block_contents(*this, m_rule_context);
     m_rule_context.take_last();
 
     // 2. Let parsed declarations be a new empty list.
@@ -2204,16 +2362,39 @@ Optional<StylePropertyAndName> Parser::convert_to_style_property(Declaration con
     if (declaration.name.equals_ignoring_ascii_case("-webkit-box-orient"sv)) {
         // INTEROP: -webkit-box-orient predates flex-direction and uses horizontal and vertical
         //          for the values now represented by row and column, respectively.
-        auto legacy_value_token_stream = TokenStream(declaration.value);
-        legacy_value_token_stream.discard_whitespace();
-        auto const& token = legacy_value_token_stream.consume_a_token();
-        legacy_value_token_stream.discard_whitespace();
-        if (!legacy_value_token_stream.has_next_token()) {
-            if (token.is_ident("horizontal"_utf16))
+        if (declaration.parsed_property_id.has_value()) {
+            auto value = declaration.value_text.trim_ascii_whitespace();
+            if (value.equals_ignoring_ascii_case("horizontal"sv))
                 legacy_value = KeywordStyleValue::create(Keyword::Row);
-            else if (token.is_ident("vertical"_utf16))
+            else if (value.equals_ignoring_ascii_case("vertical"sv))
                 legacy_value = KeywordStyleValue::create(Keyword::Column);
+        } else {
+            auto legacy_value_token_stream = TokenStream(declaration.value);
+            legacy_value_token_stream.discard_whitespace();
+            auto const& token = legacy_value_token_stream.consume_a_token();
+            legacy_value_token_stream.discard_whitespace();
+            if (!legacy_value_token_stream.has_next_token()) {
+                if (token.is_ident("horizontal"_utf16))
+                    legacy_value = KeywordStyleValue::create(Keyword::Row);
+                else if (token.is_ident("vertical"_utf16))
+                    legacy_value = KeywordStyleValue::create(Keyword::Column);
+            }
         }
+    }
+
+    if (declaration.parsed_property_id.has_value()) {
+        auto value = legacy_value ? legacy_value : declaration.parsed_value;
+        if (!value) {
+            ErrorReporter::the().report(InvalidPropertyError {
+                .property_name = property->name(),
+                .value_string = declaration.value_text.to_utf8(),
+                .description = "Failed to parse."_string,
+            });
+            return {};
+        }
+        return property->is_custom_property()
+            ? StylePropertyAndName { StyleProperty { declaration.important, property->id(), value.release_nonnull() }, property->name() }
+            : StylePropertyAndName { StyleProperty { declaration.important, property->id(), value.release_nonnull() } };
     }
 
     auto value_token_stream = TokenStream(declaration.value);
@@ -2268,54 +2449,6 @@ RefPtr<StyleValue const> Parser::parse_source_size_value(TokenStream<ComponentVa
     return {};
 }
 
-bool Parser::context_allows_quirky_length() const
-{
-    if (!in_quirks_mode())
-        return false;
-
-    // https://drafts.csswg.org/css-values-4/#deprecated-quirky-length
-    // "When CSS is being parsed in quirks mode, <quirky-length> is a type of <length> that is only valid in certain properties:"
-    // (NOTE: List skipped for brevity; quirks data is assigned in Properties.json)
-    // "It is not valid in properties that include or reference these properties, such as the background shorthand,
-    // or inside functional notations such as calc(), except that they must be allowed in rect() in the clip property."
-
-    // So, it must be allowed in the top-level ValueParsingContext, and then not disallowed by any child contexts.
-
-    Optional<PropertyID> top_level_property;
-    if (!m_value_context.is_empty()) {
-        top_level_property = m_value_context.first().visit(
-            [](PropertyID const& property_id) -> Optional<PropertyID> { return property_id; },
-            [](auto const&) -> Optional<PropertyID> { return OptionalNone {}; });
-    }
-
-    bool unitless_length_allowed = top_level_property.has_value() && property_has_quirk(top_level_property.value(), Quirk::UnitlessLength);
-    for (auto i = 1u; i < m_value_context.size() && unitless_length_allowed; i++) {
-        unitless_length_allowed = m_value_context[i].visit(
-            [](PropertyID const& property_id) { return property_has_quirk(property_id, Quirk::UnitlessLength); },
-            [top_level_property](FunctionContext const& function_context) {
-                return function_context.name == "rect"sv && top_level_property == PropertyID::Clip;
-            },
-            [](auto const&) { return false; });
-    }
-
-    return unitless_length_allowed;
-}
-
-bool Parser::context_allows_tree_counting_functions() const
-{
-    for (auto context : m_value_context) {
-        if (context.has<DescriptorContext>())
-            return false;
-
-        if (auto const* special_context = context.get_pointer<SpecialContext>(); special_context && first_is_one_of(*special_context, SpecialContext::CanvasContextGenericValue, SpecialContext::DOMMatrixInitString, SpecialContext::MediaCondition))
-            return false;
-
-        // TODO: Handle other contexts where tree counting functions are not allowed
-    }
-
-    return true;
-}
-
 bool Parser::context_allows_random_functions() const
 {
     if (auto const* special_context = m_value_context.first().get_pointer<SpecialContext>(); special_context && first_is_one_of(*special_context, SpecialContext::CanvasContextGenericValue, SpecialContext::OnScreenCanvasContextFontValue))
@@ -2339,14 +2472,21 @@ Utf16FlyString Parser::random_value_sharing_auto_name() const
 
 Vector<ComponentValue> Parser::parse_as_list_of_component_values()
 {
-    return parse_a_list_of_component_values(m_token_stream);
+    return parse_a_list_of_component_values(token_stream());
 }
 
 RefPtr<StyleValue const> Parser::parse_as_css_value(PropertyID property_id)
 {
-    auto component_values = parse_a_list_of_component_values(m_token_stream);
-    auto tokens = TokenStream(component_values);
-    auto parsed_value = parse_css_value(property_id, tokens);
+    auto parsed_value = parse_css_value_from_source(property_id, m_source);
+    if (parsed_value.is_error())
+        return nullptr;
+    return parsed_value.release_value();
+}
+
+RefPtr<StyleValue const> Parser::parse_css_value_from_filtered_source(ParsingParams const& context, Utf16View source, PropertyID property_id)
+{
+    Parser parser { context, {} };
+    auto parsed_value = parser.parse_css_value_from_source(property_id, source);
     if (parsed_value.is_error())
         return nullptr;
     return parsed_value.release_value();
@@ -2354,7 +2494,7 @@ RefPtr<StyleValue const> Parser::parse_as_css_value(PropertyID property_id)
 
 RefPtr<StyleValue const> Parser::parse_as_descriptor_value(AtRuleID at_rule_id, DescriptorNameAndID const& descriptor_name_and_id)
 {
-    auto component_values = parse_a_list_of_component_values(m_token_stream);
+    auto component_values = parse_a_list_of_component_values(token_stream());
     auto tokens = TokenStream(component_values);
     auto parsed_value = parse_descriptor_value(at_rule_id, descriptor_name_and_id, tokens);
     if (parsed_value.is_error())
@@ -2364,7 +2504,7 @@ RefPtr<StyleValue const> Parser::parse_as_descriptor_value(AtRuleID at_rule_id, 
 
 RefPtr<StyleValue const> Parser::parse_as_type(ValueType value_type)
 {
-    auto component_values = parse_a_list_of_component_values(m_token_stream);
+    auto component_values = parse_a_list_of_component_values(token_stream());
     TokenStream tokens { component_values };
     auto parsed_value = parse_value(value_type, tokens);
 
@@ -2388,8 +2528,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
 
     // 1. Let unparsed sizes list be the result of parsing a comma-separated list of component values
     //    from the value of element's sizes attribute (or the empty string, if the attribute is absent).
-    // NOTE: The sizes attribute has already been tokenized into m_token_stream by this point.
-    auto unparsed_sizes_list = parse_a_comma_separated_list_of_component_values(m_token_stream);
+    auto unparsed_sizes_list = parse_a_comma_separated_list_of_component_values(token_stream());
 
     // 2. Let size be null.
     RefPtr<StyleValue const> size;
@@ -2410,7 +2549,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
             log_parse_error();
             ErrorReporter::the().report(InvalidValueError {
                 .value_type = "sizes attribute"_utf16_fly_string,
-                .value_string = m_token_stream.dump_string(),
+                .value_string = token_stream().dump_string(),
                 .description = "Failed in step 3.1; all whitespace"_string,
             });
             continue;
@@ -2428,7 +2567,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
             log_parse_error();
             ErrorReporter::the().report(InvalidValueError {
                 .value_type = "sizes attribute"_utf16_fly_string,
-                .value_string = m_token_stream.dump_string(),
+                .value_string = token_stream().dump_string(),
                 .description = "Failed in step 3.2; couldn't parse {} as a <source-size-value>"_string,
             });
             continue;
@@ -2457,7 +2596,7 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
                 log_parse_error();
                 ErrorReporter::the().report(InvalidValueError {
                     .value_type = "sizes attribute"_utf16_fly_string,
-                    .value_string = m_token_stream.dump_string(),
+                    .value_string = token_stream().dump_string(),
                     .description = MUST(String::formatted("Failed in step 3.4.1; is unparsed size #{}, count {}", i, unparsed_sizes_list.size())),
                 });
             }
@@ -2489,55 +2628,6 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
 
     // 4. Return 100vw.
     return LengthStyleValue::create(Length(100, LengthUnit::Vw));
-}
-
-Parser::ParseErrorOr<void> Parser::collect_arbitrary_substitution_function_presence(Vector<ComponentValue> const& component_values, SubstitutionFunctionsPresence& presence)
-{
-    for (auto const& component_value : component_values) {
-        if (collect_arbitrary_substitution_function_presence(component_value, presence).is_error())
-            return ParseError::SyntaxError;
-    }
-
-    return {};
-}
-
-Parser::ParseErrorOr<void> Parser::collect_arbitrary_substitution_function_presence(ComponentValue const& component_value, SubstitutionFunctionsPresence& presence)
-{
-    if (component_value.is_function()) {
-        auto const& function = component_value.function();
-        if (auto arbitrary_substitution_function = to_arbitrary_substitution_function(function.name); arbitrary_substitution_function.has_value()) {
-            if (!parse_according_to_argument_grammar(arbitrary_substitution_function.value(), function.value).has_value())
-                return ParseError::SyntaxError;
-
-            switch (arbitrary_substitution_function.value()) {
-            case ArbitrarySubstitutionFunction::Attr:
-                presence.attr = true;
-                break;
-            case ArbitrarySubstitutionFunction::DashedFunction:
-                presence.dashed_function = true;
-                break;
-            case ArbitrarySubstitutionFunction::Env:
-                presence.env = true;
-                break;
-            case ArbitrarySubstitutionFunction::If:
-                presence.if_ = true;
-                break;
-            case ArbitrarySubstitutionFunction::Inherit:
-                presence.inherit = true;
-                break;
-            case ArbitrarySubstitutionFunction::Var:
-                presence.var = true;
-                break;
-            }
-        }
-
-        return collect_arbitrary_substitution_function_presence(function.value, presence);
-    }
-
-    if (component_value.is_block())
-        return collect_arbitrary_substitution_function_presence(component_value.block().value, presence);
-
-    return {};
 }
 
 bool Parser::has_ignored_vendor_prefix(Utf16View string)

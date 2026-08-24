@@ -17,30 +17,35 @@ static Atomic<u64> s_next_custom_property_data_identity { 1 };
 static constexpr u8 max_ancestor_count = 32;
 static constexpr size_t absorb_threshold = 8;
 
-CustomPropertyData::CustomPropertyData(OrderedHashMap<Utf16FlyString, StyleProperty> own_values, RefPtr<CustomPropertyData const> parent, u8 ancestor_count, size_t declared_count)
+static ComputedValuesFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
+{
+    return {
+        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
+        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
+        .length = view.length_in_code_units(),
+    };
+}
+
+CustomPropertyData::CustomPropertyData(OrderedHashMap<Utf16FlyString, StyleProperty> own_values, RefPtr<CustomPropertyData const> parent, RefPtr<CustomPropertyData const> inheritance_parent, u8 ancestor_count, size_t declared_count)
     : m_own_values(move(own_values))
     , m_parent(move(parent))
     , m_ancestor_count(ancestor_count)
     , m_declared_count(declared_count)
     , m_identity(s_next_custom_property_data_identity.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
 {
-    Vector<String> names;
-    names.ensure_capacity(m_own_values.size());
     Vector<ComputedValuesFFI::FfiCustomPropertyStoreEntry> entries;
     entries.ensure_capacity(m_own_values.size());
     for (auto const& [name, property] : m_own_values) {
-        names.unchecked_append(MUST(name.view().to_utf8()));
-        auto const& name_utf8 = names.last();
         entries.unchecked_append({
             .name_raw = name.to_raw_leaked(),
-            .name_utf8 = name_utf8.bytes().data(),
-            .name_utf8_length = name_utf8.bytes().size(),
+            .name = ffi_utf16_view(name),
             .important = property.important == Important::Yes,
             .data = StyleValueFFI::rust_style_value_retain(property.value->rust_style_value_data()),
         });
     }
     m_rust_store = ComputedValuesFFI::rust_custom_property_store_create(
-        entries.data(), entries.size(), m_parent ? m_parent->rust_store() : nullptr);
+        entries.data(), entries.size(), m_parent ? m_parent->rust_store() : nullptr,
+        inheritance_parent ? inheritance_parent->rust_store() : nullptr);
 }
 
 CustomPropertyData::~CustomPropertyData()
@@ -55,7 +60,9 @@ NonnullRefPtr<CustomPropertyData> CustomPropertyData::create(
 {
     auto declared_count = own_values.size();
     if (!parent)
-        return adopt_ref(*new CustomPropertyData(move(own_values), nullptr, 0, declared_count));
+        return adopt_ref(*new CustomPropertyData(move(own_values), nullptr, nullptr, 0, declared_count));
+
+    auto inheritance_parent = parent;
 
     if (allow_parent_own_value_absorption == AllowParentOwnValueAbsorption::Yes) {
         // If parent chain is too deep, flatten by copying all ancestor values into own.
@@ -63,7 +70,7 @@ NonnullRefPtr<CustomPropertyData> CustomPropertyData::create(
             parent->for_each_property([&](Utf16FlyString const& name, StyleProperty const& property) {
                 own_values.ensure(name, [&] { return property; });
             });
-            return adopt_ref(*new CustomPropertyData(move(own_values), nullptr, 0, declared_count));
+            return adopt_ref(*new CustomPropertyData(move(own_values), nullptr, move(inheritance_parent), 0, declared_count));
         }
 
         // If parent has few own values, absorb them to shorten the chain.
@@ -72,12 +79,12 @@ NonnullRefPtr<CustomPropertyData> CustomPropertyData::create(
                 own_values.ensure(name, [&] { return property; });
             auto grandparent = parent->m_parent;
             u8 ancestor_count = grandparent ? grandparent->m_ancestor_count + 1 : 0;
-            return adopt_ref(*new CustomPropertyData(move(own_values), move(grandparent), ancestor_count, declared_count));
+            return adopt_ref(*new CustomPropertyData(move(own_values), move(grandparent), move(inheritance_parent), ancestor_count, declared_count));
         }
     }
 
     u8 ancestor_count = parent->m_ancestor_count + 1;
-    return adopt_ref(*new CustomPropertyData(move(own_values), move(parent), ancestor_count, declared_count));
+    return adopt_ref(*new CustomPropertyData(move(own_values), move(parent), move(inheritance_parent), ancestor_count, declared_count));
 }
 
 StyleProperty const* CustomPropertyData::get(Utf16FlyString const& name) const

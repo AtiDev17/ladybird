@@ -19,6 +19,59 @@ include!(concat!(env!("OUT_DIR"), "/property_metadata_generated.rs"));
 pub(crate) const NUMBER_OF_LONGHAND_PROPERTIES: usize =
     (LAST_LONGHAND_PROPERTY_ID - FIRST_LONGHAND_PROPERTY_ID + 1) as usize;
 
+pub(crate) fn property_name(property_id: u16) -> &'static str {
+    if property_id == 0 {
+        return "--custom";
+    }
+    PROPERTY_NAMES
+        .get(usize::from(property_id - 1))
+        .copied()
+        .unwrap_or("<unknown>")
+}
+
+pub(crate) fn property_accepted_keywords(property_id: u16) -> &'static [u16] {
+    PROPERTY_ACCEPTED_KEYWORDS[property_index(property_id)]
+}
+
+pub(crate) fn property_accepted_value_types(property_id: u16) -> &'static [u8] {
+    PROPERTY_ACCEPTED_VALUE_TYPES[property_index(property_id)]
+}
+
+pub(crate) fn property_custom_ident_blacklist(property_id: u16) -> &'static [&'static str] {
+    PROPERTY_CUSTOM_IDENT_BLACKLISTS[property_index(property_id)]
+}
+
+pub(crate) fn property_resolve_legacy_value_alias(property_id: u16, keyword: u16) -> u16 {
+    PROPERTY_KEYWORD_ALIASES[property_index(property_id)]
+        .iter()
+        .find_map(|&(alias, resolved)| (alias == keyword).then_some(resolved))
+        .unwrap_or(keyword)
+}
+
+pub(crate) fn property_accepts_only_keywords(property_id: u16) -> bool {
+    PROPERTY_ACCEPTS_ONLY_KEYWORDS[property_index(property_id)]
+}
+
+pub(crate) fn property_has_coordinating_list_multiplicity(property_id: u16) -> bool {
+    PROPERTY_HAS_COORDINATING_LIST_MULTIPLICITY[property_index(property_id)]
+}
+
+pub(crate) fn property_maximum_value_count(property_id: u16) -> usize {
+    PROPERTY_MAXIMUM_VALUE_COUNTS[property_index(property_id)] as usize
+}
+
+pub(crate) fn property_percentages_resolve_to(property_id: u16) -> Option<u8> {
+    PROPERTY_PERCENTAGES_RESOLVE_TO[property_index(property_id)]
+}
+
+pub(crate) fn property_has_unitless_length_quirk(property_id: u16) -> bool {
+    PROPERTY_HAS_UNITLESS_LENGTH_QUIRK[property_index(property_id)]
+}
+
+pub(crate) fn property_has_hashless_hex_color_quirk(property_id: u16) -> bool {
+    PROPERTY_HAS_HASHLESS_HEX_COLOR_QUIRK[property_index(property_id)]
+}
+
 /// How much of the computation a property needs, mirroring the C++
 /// requires-computation levels: 0 = never, 1 = with the cascaded value,
 /// 2 = with any non-inherited value, 3 = always.
@@ -57,6 +110,10 @@ pub fn property_may_affect_layout_geometry(property_id: u16) -> bool {
         return true;
     }
     PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY[longhand_index(property_id)]
+}
+
+pub(crate) fn property_initial_value(property_id: u16) -> &'static str {
+    PROPERTY_INITIAL_VALUES[longhand_index(property_id)]
 }
 
 pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: u16) -> bool {
@@ -114,28 +171,6 @@ pub extern "C" fn rust_property_metadata_animation_type(property_id: u16) -> u8 
     property_animation_type(property_id)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layout_geometry_effects_include_direct_and_indirect_effects() {
-        assert!(!property_may_affect_layout_geometry(property_id::BACKGROUND_COLOR));
-        assert!(property_may_affect_layout_geometry(property_id::COLOR));
-        assert!(property_may_affect_layout_geometry(property_id::WIDTH));
-        assert!(property_may_affect_layout_geometry(property_id::TRANSFORM));
-        assert!(property_may_affect_layout_geometry(property_id::OPACITY));
-        assert!(property_may_affect_layout_geometry(property_id::TEXT_RENDERING));
-        assert!(property_may_affect_layout_geometry(property_id::STROKE));
-        assert!(property_may_affect_layout_geometry(property_id::STROKE_WIDTH));
-        assert!(property_may_affect_layout_geometry(property_id::ANIMATION_NAME));
-        assert!(property_may_affect_layout_geometry(property_id::TRANSITION_PROPERTY));
-        assert!(property_may_affect_layout_geometry(property_id::SCROLL_TIMELINE_NAME));
-        assert!(property_may_affect_layout_geometry(property_id::CONTAINER_NAME));
-        assert!(property_may_affect_layout_geometry(property_id::CUSTOM));
-    }
-}
-
 /// # Safety
 /// `out_length` must be a valid pointer.
 #[unsafe(no_mangle)]
@@ -175,6 +210,10 @@ pub fn longhands_for_shorthand(property_id: u16) -> &'static [u16] {
         return &[];
     }
     SHORTHAND_EXPANSIONS[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+pub(crate) fn property_is_positional_value_list_shorthand(property_id: u16) -> bool {
+    POSITIONAL_VALUE_LIST_SHORTHANDS.binary_search(&property_id).is_ok()
 }
 
 fn property_index(property_id: u16) -> usize {
@@ -223,6 +262,74 @@ pub(crate) fn animation_property_is_preferred(a: u16, b: u16) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_animation_property_is_preferred(a: u16, b: u16) -> bool {
     animation_property_is_preferred(a, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::css_enums::keyword;
+
+    #[test]
+    fn layout_geometry_effects_include_direct_and_indirect_effects() {
+        assert!(!property_may_affect_layout_geometry(property_id::BACKGROUND_COLOR));
+        assert!(property_may_affect_layout_geometry(property_id::COLOR));
+        assert!(property_may_affect_layout_geometry(property_id::WIDTH));
+        assert!(property_may_affect_layout_geometry(property_id::TRANSFORM));
+        assert!(property_may_affect_layout_geometry(property_id::OPACITY));
+        assert!(property_may_affect_layout_geometry(property_id::TEXT_RENDERING));
+        assert!(property_may_affect_layout_geometry(property_id::STROKE));
+        assert!(property_may_affect_layout_geometry(property_id::STROKE_WIDTH));
+        assert!(property_may_affect_layout_geometry(property_id::ANIMATION_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::TRANSITION_PROPERTY));
+        assert!(property_may_affect_layout_geometry(property_id::SCROLL_TIMELINE_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::CONTAINER_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::CUSTOM));
+    }
+
+    #[test]
+    fn exposes_property_keyword_metadata() {
+        assert!(property_accepted_keywords(property_id::APPEARANCE).contains(&keyword::NONE));
+        assert!(!property_accepted_keywords(property_id::APPEARANCE).contains(&keyword::INHERIT));
+        assert!(property_accepts_only_keywords(property_id::APPEARANCE));
+        assert!(!property_accepts_only_keywords(property_id::ACCENT_COLOR));
+        assert!(property_has_coordinating_list_multiplicity(
+            property_id::ANIMATION_DIRECTION
+        ));
+        assert_eq!(property_maximum_value_count(property_id::BORDER_SPACING), 2);
+        assert_eq!(property_maximum_value_count(property_id::WIDTH), 1);
+    }
+
+    #[test]
+    fn exposes_property_numeric_parser_metadata() {
+        // ValueType codes are shared with the C++ enum: Integer = 24,
+        // Length = 25, Number = 27, OpacityValue = 28, Percentage = 31.
+        assert_eq!(property_accepted_value_types(property_id::Z_INDEX), &[24]);
+        assert_eq!(property_accepted_value_types(property_id::WIDTH), &[14, 25, 31]);
+        assert_eq!(property_accepted_value_types(property_id::OPACITY), &[28]);
+        assert_eq!(property_percentages_resolve_to(property_id::WIDTH), Some(25));
+        assert_eq!(property_percentages_resolve_to(property_id::OPACITY), None);
+        assert!(property_has_unitless_length_quirk(property_id::WIDTH));
+        assert!(!property_has_unitless_length_quirk(property_id::OPACITY));
+    }
+
+    #[test]
+    fn exposes_property_custom_ident_blacklists() {
+        assert_eq!(property_custom_ident_blacklist(property_id::ANIMATION_NAME), &["none"]);
+        assert_eq!(
+            property_custom_ident_blacklist(property_id::VIEW_TRANSITION_NAME),
+            &["auto", "none"]
+        );
+        assert!(property_custom_ident_blacklist(property_id::WIDTH).is_empty());
+    }
+
+    #[test]
+    fn resolves_legacy_property_keyword_aliases() {
+        assert!(property_accepted_keywords(property_id::OVERFLOW_X).contains(&keyword::OVERLAY));
+        assert_eq!(
+            property_resolve_legacy_value_alias(property_id::OVERFLOW_X, keyword::OVERLAY),
+            keyword::AUTO
+        );
+    }
 }
 
 /// FFI accessors for the parity test on the C++ side.

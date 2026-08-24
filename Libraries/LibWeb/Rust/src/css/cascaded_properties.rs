@@ -20,6 +20,10 @@ use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
 
 use crate::abort_on_panic;
+use crate::css::parser::value_parser::{
+    FfiPrecomputedSvgPath, FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, ParseOutcome,
+    parse_css_value_from_source, svg_path_strings_from_source,
+};
 use crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID;
 use crate::css::style_compute::expand_shorthands_with;
 use crate::css::style_value::RetainedStyleValueData;
@@ -667,8 +671,166 @@ pub struct FfiCustomPropertyDeclaration {
     pub data: *const c_void,
 }
 
+struct ResolvedStyleValue {
+    value: RetainedStyleValueData,
+    has_style_sheet_context: bool,
+}
+
+struct PrecomputedSvgPath {
+    source: Vec<u16>,
+    normalized: Option<Vec<u16>>,
+}
+
+struct WorkerParseInput {
+    in_quirks_mode: bool,
+    is_svg_presentation_attribute: bool,
+    contains_attr_tainted_values: bool,
+    document_url: Vec<u8>,
+    document_base_url: Vec<u8>,
+    property_id: u16,
+    source: Vec<u16>,
+    svg_paths: Vec<PrecomputedSvgPath>,
+}
+
+struct WorkerParseOutcome {
+    outcome: ParseOutcome,
+    source: Vec<u16>,
+}
+
+// SAFETY: Worker parsing has no C++ callbacks and cannot create non-zero AK fly-string handles.
+// Parsed values contain immutable Rust-owned data or the zero fly-string sentinel, and the result
+// is transferred without being inspected or destroyed on the worker.
+unsafe impl Send for WorkerParseOutcome {}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn parse_substituted_on_worker(
+    base_context: &ParseContext,
+    property_id: u16,
+    source: Vec<u16>,
+    contains_attr_tainted_values: bool,
+) -> WorkerParseOutcome {
+    let svg_paths = svg_path_strings_from_source(&source)
+        .into_iter()
+        .map(|path| {
+            let normalized = base_context.normalize_svg_path_data.and_then(|normalize| {
+                let raw = unsafe { normalize(path.as_ptr(), path.len()) };
+                if raw == 0 {
+                    return None;
+                }
+                let normalized = unsafe { RetainedUtf16FlyString::from_leaked_raw(raw) };
+                Some(match unsafe { ak::utf16_string_units(normalized.raw_word()) } {
+                    ak::Utf16StringUnits::Ascii(bytes) => bytes.iter().copied().map(u16::from).collect(),
+                    ak::Utf16StringUnits::Utf16(units) => units.to_vec(),
+                })
+            });
+            PrecomputedSvgPath {
+                source: path,
+                normalized,
+            }
+        })
+        .collect();
+    let input = WorkerParseInput {
+        in_quirks_mode: base_context.in_quirks_mode,
+        is_svg_presentation_attribute: base_context.is_svg_presentation_attribute,
+        contains_attr_tainted_values,
+        document_url: unsafe { crate::bytes_from_raw(base_context.document_url, base_context.document_url_length) }
+            .unwrap_or_default()
+            .to_vec(),
+        document_base_url: unsafe {
+            crate::bytes_from_raw(base_context.document_base_url, base_context.document_base_url_length)
+        }
+        .unwrap_or_default()
+        .to_vec(),
+        property_id,
+        source,
+        svg_paths,
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    crate::css::worker_pool::run(vec![move || {
+        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionWorkerParse);
+        let ffi_svg_paths: Vec<_> = input
+            .svg_paths
+            .iter()
+            .map(|path| FfiPrecomputedSvgPath {
+                source: path.source.as_ptr(),
+                source_length: path.source.len(),
+                normalized: path.normalized.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+                normalized_length: path.normalized.as_ref().map_or(0, Vec::len),
+            })
+            .collect();
+        let mut random_function_index = 0;
+        let value_context = FfiValueParsingContext {
+            kind: FfiValueParsingContextKind::Property,
+            value: input.property_id,
+            secondary_value: 0,
+            name: Default::default(),
+        };
+        let context = ParseContext {
+            in_quirks_mode: input.in_quirks_mode,
+            is_svg_presentation_attribute: input.is_svg_presentation_attribute,
+            is_substituted_value: true,
+            contains_attr_tainted_values: input.contains_attr_tainted_values,
+            value_contexts: &raw const value_context,
+            value_context_count: 1,
+            document_url: input.document_url.as_ptr(),
+            document_url_length: input.document_url.len(),
+            document_base_url: input.document_base_url.as_ptr(),
+            document_base_url_length: input.document_base_url.len(),
+            intern_utf16_fly_string: None,
+            normalize_svg_path_data: None,
+            precomputed_svg_paths: ffi_svg_paths.as_ptr(),
+            precomputed_svg_path_count: ffi_svg_paths.len(),
+            font_format_is_supported: None,
+            font_tech_is_supported: None,
+            random_function_index: &raw mut random_function_index,
+        };
+        let outcome = match parse_css_value_from_source(&context, input.property_id, &input.source) {
+            // A callback-free parse can report Invalid when an Option-returning grammar could not
+            // retain a string. Let the main thread distinguish that from a genuinely invalid value.
+            ParseOutcome::Invalid => {
+                ParseOutcome::NotHandled(&crate::css::parser::value_parser::SUBSTITUTION_NOT_PORTED)
+            }
+            outcome => outcome,
+        };
+        sender
+            .send(WorkerParseOutcome {
+                outcome,
+                source: input.source,
+            })
+            .unwrap();
+    }]);
+    receiver.recv().unwrap()
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn parse_substituted_on_main_thread(
+    base_context: &ParseContext,
+    property_id: u16,
+    source: &[u16],
+    contains_attr_tainted_values: bool,
+) -> std::sync::Arc<StyleValueData> {
+    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionMainThreadParseRequest);
+    let mut random_function_index = 0;
+    let value_context = FfiValueParsingContext {
+        kind: FfiValueParsingContextKind::Property,
+        value: property_id,
+        secondary_value: 0,
+        name: Default::default(),
+    };
+    let mut context = *base_context;
+    context.is_substituted_value = true;
+    context.contains_attr_tainted_values = contains_attr_tainted_values;
+    context.value_contexts = &raw const value_context;
+    context.value_context_count = 1;
+    context.random_function_index = &raw mut random_function_index;
+    match parse_css_value_from_source(&context, property_id, source) {
+        ParseOutcome::Parsed(value) => value,
+        ParseOutcome::Invalid | ParseOutcome::NotHandled(_) => std::sync::Arc::new(StyleValueData::GuaranteedInvalid),
+    }
+}
+
 /// Applies one declaration block to the cascade: filters by importance and applicability,
-/// consumes pre-resolved arbitrary-substitution values, downgrades invalid-at-computed-value-time
+/// resolves arbitrary-substitution values, downgrades invalid-at-computed-value-time
 /// declarations to unset, expands shorthands, and routes each longhand to the store as a set,
 /// revert, or revert-layer.
 #[allow(clippy::too_many_arguments)]
@@ -681,7 +843,8 @@ fn apply_declaration_block(
     source_shadow_root_identity: usize,
     unset_data: *const c_void,
     is_property_disallowed: &dyn Fn(u16) -> bool,
-    next_resolved_value: &mut impl FnMut() -> FfiResolvedStyleValue,
+    resolve_value: &mut impl FnMut(u32, u16, *const c_void, bool) -> ResolvedStyleValue,
+    style_engine_rule_id: u32,
     mut assign_source_slot: impl FnMut(u32),
 ) {
     let has_layer_name = layer_name.is_some();
@@ -706,11 +869,18 @@ fn apply_declaration_block(
 
         let mut data = declaration.data;
         let mut has_style_sheet_context = declaration.has_style_sheet_context;
+        let mut resolved_value = None;
 
         if declared_is_unresolved {
-            let resolved = next_resolved_value();
-            data = resolved.data;
+            let resolved = resolve_value(
+                style_engine_rule_id,
+                declaration.property_id,
+                declaration.data,
+                declaration.has_style_sheet_context,
+            );
+            data = resolved.value.pointer().cast();
             has_style_sheet_context = resolved.has_style_sheet_context;
+            resolved_value = Some(resolved.value);
         }
 
         if matches!(
@@ -800,6 +970,7 @@ fn apply_declaration_block(
                 }
             },
         );
+        drop(resolved_value);
     }
 }
 
@@ -858,31 +1029,24 @@ pub struct FfiCascadedCustomProperties {
     pub storage: *mut c_void,
 }
 
-/// One parser-dependent value resolution requested before the cascade. When
-/// `parse_substituted` is false, C++ resolves `unresolved_data` directly.
+/// Main-thread services used while resolving substituted values inside the Rust cascade.
 #[repr(C)]
-pub struct FfiCascadeResolutionRequest {
-    pub style_engine_rule_id: u32,
-    pub property_id: u16,
-    pub parse_substituted: bool,
-    pub unresolved_data: *const c_void,
-    pub source: *const u8,
-    pub source_length: usize,
-}
-
-/// An owned batch of parser-dependent resolution requests.
-#[repr(C)]
-pub struct FfiCascadeResolutionRequests {
-    pub requests: *const FfiCascadeResolutionRequest,
-    pub count: usize,
-    pub storage: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FfiResolvedStyleValue {
-    pub data: *const c_void,
-    pub has_style_sheet_context: bool,
+pub struct FfiCascadeResolutionContext {
+    pub parse_context: *const c_void,
+    pub custom_property_store: *const c_void,
+    pub inheritance_custom_property_store: *const c_void,
+    pub custom_property_registry: *const c_void,
+    pub attributes: *const crate::css::custom_properties::FfiSubstitutionAttribute,
+    pub attribute_count: usize,
+    pub attribute_names_are_ascii_case_insensitive: bool,
+    pub custom_functions: *const crate::css::custom_properties::FfiSubstitutionFunctionDefinition,
+    pub custom_function_count: usize,
+    pub custom_function_scope_identity: usize,
+    pub callback_context: *mut c_void,
+    pub note_substitution: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
+    pub lookup_cached_substitution: Option<unsafe extern "C" fn(*mut c_void, u32, u16) -> *const c_void>,
+    pub cache_parsed_substitution: Option<unsafe extern "C" fn(*mut c_void, u32, u16, *const c_void)>,
+    pub resolve_not_handled: Option<unsafe extern "C" fn(*mut c_void, u16, *const c_void) -> *const c_void>,
 }
 
 /// Source assignments produced by a completed cascade.
@@ -1080,106 +1244,139 @@ pub unsafe extern "C" fn rust_cascaded_custom_properties_destroy(storage: *mut c
     }
 }
 
-struct CascadeResolutionBatch {
-    requests: Vec<FfiCascadeResolutionRequest>,
-    _sources: Vec<Vec<u8>>,
-}
-
-/// Collects every parser-dependent value resolution in cascade application order. C++ resolves
-/// this batch before reentering Rust, so the cascade itself never calls back into C++.
-///
-/// # Safety
-/// `blocks` must point at `block_count` valid blocks whose declaration lists stay live for this
-/// call. `custom_property_store` and `custom_property_registry` must be null or valid stores.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_prepare_cascade_resolutions(
-    blocks: *const FfiCascadeBlock,
-    block_count: usize,
-    author_context_count: u32,
-    custom_property_store: *const c_void,
-    custom_property_registry: *const c_void,
-) -> FfiCascadeResolutionRequests {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CascadeResolutionEntry);
-    abort_on_panic(|| {
-        let blocks = if block_count == 0 {
-            &[]
+#[allow(clippy::arc_with_non_send_sync)]
+fn resolve_cascade_value(
+    resolution_context: &FfiCascadeResolutionContext,
+    style_engine_rule_id: u32,
+    property_id: u16,
+    unresolved_data: *const c_void,
+    has_style_sheet_context: bool,
+) -> ResolvedStyleValue {
+    let native_resolution = unsafe {
+        crate::css::custom_properties::resolve_vars(
+            resolution_context.custom_property_store,
+            resolution_context.inheritance_custom_property_store,
+            resolution_context.custom_property_registry,
+            unresolved_data,
+            resolution_context.attributes,
+            resolution_context.attribute_count,
+            resolution_context.attribute_names_are_ascii_case_insensitive,
+            resolution_context.custom_functions,
+            resolution_context.custom_function_count,
+            resolution_context.custom_function_scope_identity,
+        )
+    };
+    if matches!(
+        &native_resolution,
+        crate::css::custom_properties::NativeVarResolution::NotHandled
+    ) {
+        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionOracleCallback);
+        let data = resolution_context
+            .resolve_not_handled
+            .map_or(std::ptr::null(), |resolve| unsafe {
+                resolve(resolution_context.callback_context, property_id, unresolved_data)
+            });
+        let value = if data.is_null() {
+            RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid)
         } else {
-            unsafe { std::slice::from_raw_parts(blocks, block_count) }
+            unsafe {
+                RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(data.cast()))
+            }
         };
-        let mut requests = Vec::new();
-        let mut sources = Vec::new();
-        for (block_index, important, _) in cascade_application_order(blocks, author_context_count) {
-            let block = &blocks[block_index];
-            let declarations = if block.declaration_count == 0 {
-                &[]
+        return ResolvedStyleValue {
+            value,
+            has_style_sheet_context,
+        };
+    }
+
+    if let Some(note_substitution) = resolution_context.note_substitution {
+        unsafe { note_substitution(resolution_context.callback_context, unresolved_data) };
+    }
+
+    let substitution_is_cacheable = resolution_context.custom_function_count == 0
+        && !matches!(
+            native_resolution,
+            crate::css::custom_properties::NativeVarResolution::Resolved {
+                contains_attr_tainted_values: true,
+                ..
+            }
+        )
+        && !matches!(
+            unsafe { &*unresolved_data.cast::<StyleValueData>() },
+            StyleValueData::Unresolved {
+                presence_inherit: true,
+                ..
+            }
+        );
+    if substitution_is_cacheable
+        && style_engine_rule_id != 0
+        && let Some(lookup) = resolution_context.lookup_cached_substitution
+    {
+        let cached = unsafe { lookup(resolution_context.callback_context, style_engine_rule_id, property_id) };
+        if !cached.is_null() {
+            let cached = unsafe { &*cached.cast::<StyleValueData>() };
+            let value = if matches!(cached, StyleValueData::Shorthand { .. }) {
+                RetainedStyleValueData::from_owned(cached.clone())
             } else {
-                unsafe { std::slice::from_raw_parts(block.declarations, block.declaration_count) }
+                unsafe {
+                    RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(cached))
+                }
             };
-            for declaration in declarations {
-                if declaration.important != important {
-                    continue;
-                }
-                let value = unsafe { &*declaration.data.cast::<StyleValueData>() };
-                if !matches!(value, StyleValueData::Unresolved { .. }) {
-                    continue;
-                }
-                let native_resolution = unsafe {
-                    crate::css::custom_properties::resolve_vars(
-                        custom_property_store,
-                        custom_property_registry,
-                        declaration.data,
-                    )
+            return ResolvedStyleValue {
+                value,
+                has_style_sheet_context,
+            };
+        }
+    }
+
+    let parsed = match native_resolution {
+        crate::css::custom_properties::NativeVarResolution::Resolved {
+            source,
+            contains_attr_tainted_values,
+        } => {
+            let Some(base_context) = (unsafe { resolution_context.parse_context.cast::<ParseContext>().as_ref() })
+            else {
+                return ResolvedStyleValue {
+                    value: RetainedStyleValueData::from_owned(StyleValueData::GuaranteedInvalid),
+                    has_style_sheet_context,
                 };
-                let (parse_substituted, source) = match native_resolution {
-                    crate::css::custom_properties::NativeVarResolution::Resolved(source) => (true, source),
-                    crate::css::custom_properties::NativeVarResolution::Invalid => (true, Vec::new()),
-                    crate::css::custom_properties::NativeVarResolution::NotHandled => (false, Vec::new()),
-                };
-                crate::css::ffi_stats::bump(if parse_substituted {
-                    crate::css::ffi_stats::FfiOp::CascadeNativeSubstitutionRequest
-                } else {
-                    crate::css::ffi_stats::FfiOp::CascadeCppResolutionRequest
-                });
-                sources.push(source);
-                let source = sources.last().expect("new cascade resolution source");
-                requests.push(FfiCascadeResolutionRequest {
-                    style_engine_rule_id: block.style_engine_rule_id,
-                    property_id: declaration.property_id,
-                    parse_substituted,
-                    unresolved_data: declaration.data,
-                    source: source.as_ptr(),
-                    source_length: source.len(),
-                });
+            };
+            let contains_attr_tainted_values = contains_attr_tainted_values
+                || matches!(
+                    unsafe { &*unresolved_data.cast::<StyleValueData>() },
+                    StyleValueData::Unresolved {
+                        contains_attr_tainted_values: true,
+                        ..
+                    }
+                );
+            let WorkerParseOutcome { outcome, source } =
+                parse_substituted_on_worker(base_context, property_id, source, contains_attr_tainted_values);
+            match outcome {
+                ParseOutcome::Parsed(value) => value,
+                ParseOutcome::Invalid => std::sync::Arc::new(StyleValueData::GuaranteedInvalid),
+                ParseOutcome::NotHandled(_) => {
+                    parse_substituted_on_main_thread(base_context, property_id, &source, contains_attr_tainted_values)
+                }
             }
         }
-        if requests.is_empty() {
-            return FfiCascadeResolutionRequests {
-                requests: std::ptr::null(),
-                count: 0,
-                storage: std::ptr::null_mut(),
-            };
+        crate::css::custom_properties::NativeVarResolution::Invalid => {
+            std::sync::Arc::new(StyleValueData::GuaranteedInvalid)
         }
-        let storage = Box::new(CascadeResolutionBatch {
-            requests,
-            _sources: sources,
-        });
-        let requests = storage.requests.as_ptr();
-        let count = storage.requests.len();
-        let storage = Box::into_raw(storage).cast();
-        FfiCascadeResolutionRequests {
-            requests,
-            count,
-            storage,
+        crate::css::custom_properties::NativeVarResolution::NotHandled => unreachable!(),
+    };
+    if substitution_is_cacheable && let Some(cache) = resolution_context.cache_parsed_substitution {
+        unsafe {
+            cache(
+                resolution_context.callback_context,
+                style_engine_rule_id,
+                property_id,
+                std::sync::Arc::as_ptr(&parsed).cast(),
+            );
         }
-    })
-}
-
-/// # Safety
-/// `storage` must be null or a live pointer returned by `rust_prepare_cascade_resolutions`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_cascade_resolution_requests_destroy(storage: *mut c_void) {
-    if !storage.is_null() {
-        drop(unsafe { Box::from_raw(storage.cast::<CascadeResolutionBatch>()) });
+    }
+    ResolvedStyleValue {
+        value: unsafe { RetainedStyleValueData::from_retained_pointer(std::sync::Arc::into_raw(parsed)) },
+        has_style_sheet_context,
     }
 }
 
@@ -1200,8 +1397,9 @@ pub unsafe extern "C" fn rust_cascade_resolution_requests_destroy(storage: *mut 
 /// `store` must be a valid store, `blocks` must point at `block_count` valid
 /// blocks whose declaration lists stay live for the call and whose nonzero
 /// layer names each transfer one leaked fly-string reference,
-/// and `resolved_values` must contain `resolved_value_count` live values in
-/// the order requested by `rust_prepare_cascade_resolutions`.
+/// and a non-null `resolution_context` must point at live parser and callback
+/// state for the duration of this call. `resolution_context` may only be null
+/// when none of the declarations contain an unresolved value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_cascade_matched_blocks(
     store: *mut CascadedPropertyStore,
@@ -1210,8 +1408,7 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
     author_context_count: u32,
     pseudo_element: u8,
     unset_data: *const c_void,
-    resolved_values: *const FfiResolvedStyleValue,
-    resolved_value_count: usize,
+    resolution_context: *const FfiCascadeResolutionContext,
 ) -> FfiCascadeResult {
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CascadeBulkEntry);
     abort_on_panic(|| {
@@ -1221,11 +1418,7 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
         } else {
             unsafe { std::slice::from_raw_parts(blocks, block_count) }
         };
-        let resolved_values = if resolved_value_count == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(resolved_values, resolved_value_count) }
-        };
+        let resolution_context = unsafe { resolution_context.as_ref() };
 
         let application_order = cascade_application_order(blocks, author_context_count);
         let has_pseudo_element = pseudo_element != NO_PSEUDO_ELEMENT;
@@ -1239,8 +1432,6 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
             .collect();
 
         let mut source_slot_assignments: Vec<FfiSourceSlotAssignment> = Vec::new();
-        let mut resolved_value_index = 0;
-
         let mut apply = |block_index: usize, important: bool, use_layer_name: bool| {
             let block = &blocks[block_index];
             let declarations = if block.declaration_count == 0 {
@@ -1267,13 +1458,16 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
                 block.source_shadow_root_identity,
                 unset_data,
                 &is_property_disallowed,
-                &mut || {
-                    let resolved = *resolved_values
-                        .get(resolved_value_index)
-                        .expect("missing prepared cascade resolution");
-                    resolved_value_index += 1;
-                    resolved
+                &mut |style_engine_rule_id, property_id, unresolved_data, has_style_sheet_context| {
+                    resolve_cascade_value(
+                        resolution_context.expect("unresolved declarations require a resolution context"),
+                        style_engine_rule_id,
+                        property_id,
+                        unresolved_data,
+                        has_style_sheet_context,
+                    )
                 },
+                block.style_engine_rule_id,
                 |slot| {
                     source_slot_assignments.push(FfiSourceSlotAssignment {
                         slot,
@@ -1286,7 +1480,6 @@ pub unsafe extern "C" fn rust_cascade_matched_blocks(
         for &(block_index, important, use_layer_name) in &application_order {
             apply(block_index, important, use_layer_name);
         }
-        assert_eq!(resolved_value_index, resolved_values.len());
 
         if source_slot_assignments.is_empty() {
             return FfiCascadeResult {

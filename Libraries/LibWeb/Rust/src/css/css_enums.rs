@@ -10,3 +10,25 @@
 
 include!(concat!(env!("OUT_DIR"), "/keywords_generated.rs"));
 include!(concat!(env!("OUT_DIR"), "/css_enums_generated.rs"));
+
+pub(crate) fn keyword_from_ascii_case_insensitive(identifier: &[u16]) -> Option<u16> {
+    keyword::from_ascii_case_insensitive(identifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_up_keywords_case_insensitively() {
+        assert_eq!(
+            keyword_from_ascii_case_insensitive(&"ReVeRt-LaYeR".encode_utf16().collect::<Vec<_>>()),
+            Some(keyword::REVERT_LAYER)
+        );
+        assert_eq!(
+            keyword_from_ascii_case_insensitive(&"unknown".encode_utf16().collect::<Vec<_>>()),
+            None
+        );
+        assert_eq!(keyword_from_ascii_case_insensitive(&[0xe9]), None);
+    }
+}

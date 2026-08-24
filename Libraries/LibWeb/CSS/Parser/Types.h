@@ -43,6 +43,7 @@ struct AtRule {
 // https://drafts.csswg.org/css-syntax/#qualified-rule
 struct QualifiedRule {
     Vector<ComponentValue> prelude;
+    Utf16String prelude_text;
     Vector<Declaration> declarations;
     Vector<RuleOrListOfDeclarations> child_rules;
     Optional<SourcePosition> source_position = {};
@@ -55,9 +56,12 @@ struct Declaration {
     Utf16FlyString name;
     Vector<ComponentValue> value;
     Important important = Important::No;
-    Optional<String> original_value_text = {};
+    Optional<Utf16String> original_value_text = {};
     Optional<Utf16String> original_full_text = {};
     Optional<SourcePosition> source_position = {};
+    Utf16String value_text;
+    Optional<PropertyID> parsed_property_id;
+    RefPtr<StyleValue const> parsed_value;
 };
 
 struct SubstitutionFunctionsPresence {
@@ -82,7 +86,7 @@ public:
     StringView bracket_string() const;
     StringView bracket_mirror_string() const;
 
-    String const& original_source_text() const { return m_original_source_text; }
+    Utf16String const& original_source_text() const { return m_original_source_text; }
     SourcePosition const& start_position() const { return m_start_position; }
     SourcePosition const& end_position() const { return m_end_position; }
 
@@ -90,7 +94,7 @@ public:
 
 private:
     Token::Type m_type { Token::Type::Invalid };
-    String m_original_source_text;
+    Utf16String m_original_source_text;
     SourcePosition m_start_position;
     SourcePosition m_end_position;
 };
@@ -107,7 +111,7 @@ struct SimpleBlock {
 
     Utf16String to_string() const;
     void serialize_to(Utf16StringBuilder&) const;
-    String original_source_text() const;
+    Utf16String original_source_text() const;
 
     bool operator==(SimpleBlock const& other) const { return token == other.token && value == other.value; }
 };
@@ -121,7 +125,7 @@ struct Function {
 
     Utf16String to_string() const;
     void serialize_to(Utf16StringBuilder&) const;
-    String original_source_text() const;
+    Utf16String original_source_text() const;
 
     bool operator==(Function const& other) const { return name == other.name && value == other.value; }
 };
@@ -131,7 +135,7 @@ struct GuaranteedInvalidValue {
     GuaranteedInvalidValue() = default;
     Utf16String to_string() const { return {}; }
     void serialize_to(Utf16StringBuilder&) const { }
-    String original_source_text() const { return {}; }
+    Utf16String original_source_text() const { return {}; }
 
     bool operator==(GuaranteedInvalidValue const&) const = default;
 };

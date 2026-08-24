@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use std::char;
+use smallvec::SmallVec;
 use std::ffi::c_void;
 use std::ops::Range;
 use std::ptr;
+use std::rc::Rc;
 
 const REPLACEMENT_CHARACTER: u32 = 0xFFFD;
 const TOKENIZER_EOF: u32 = u32::MAX;
@@ -70,7 +71,8 @@ pub struct CssToken {
     pub delim: u32,
     pub value_ptr: *const u16,
     pub value_len: usize,
-    pub original_source_ptr: *const u8,
+    pub original_source_ascii_ptr: *const u8,
+    pub original_source_utf16_ptr: *const u16,
     pub original_source_len: usize,
     pub start_line: usize,
     pub start_column: usize,
@@ -84,14 +86,15 @@ pub struct CssToken {
 /// - Parameters provided to `callback` must be valid pointers
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_css_tokenize(
-    input: *const u8,
+    ascii_input: *const u8,
+    utf16_input: *const u16,
     input_len: usize,
     ctx: *mut c_void,
     callback: unsafe extern "C" fn(ctx: *mut c_void, token: *const CssToken),
 ) {
     unsafe {
         crate::abort_on_panic(|| {
-            let Some(input) = crate::bytes_from_raw(input, input_len) else {
+            let Some(input) = TokenizerInput::from_raw_parts(ascii_input, utf16_input, input_len) else {
                 return;
             };
 
@@ -104,10 +107,10 @@ pub unsafe extern "C" fn rust_css_tokenize(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Position {
-    line: usize,
-    column: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourcePosition {
+    pub line: usize,
+    pub column: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -119,13 +122,13 @@ struct NumericValue {
 pub(crate) struct Token {
     token_type: TokenType,
     original_source_range: Range<usize>,
-    range: Range<Position>,
+    range: Range<SourcePosition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OwnedTokenKind {
-    Ident(String),
-    Function(String),
+    Ident(Vec<u16>),
+    Function(Vec<u16>),
     AtKeyword,
     Hash,
     Url,
@@ -149,33 +152,198 @@ pub(crate) enum OwnedTokenKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OwnedToken {
     pub kind: OwnedTokenKind,
-    pub source: Vec<u8>,
+    pub source: ParserSource,
 }
 
-#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum TokenizerInput<'a> {
+    Ascii(&'a [u8]),
+    Utf16(&'a [u16]),
+}
+
+impl Default for TokenizerInput<'_> {
+    fn default() -> Self {
+        Self::Ascii(&[])
+    }
+}
+
+impl TokenizerInput<'_> {
+    /// # Safety
+    /// Exactly one non-empty input pointer must identify `length` readable units.
+    pub(crate) unsafe fn from_raw_parts(ascii: *const u8, utf16: *const u16, length: usize) -> Option<Self> {
+        if length == 0 {
+            return Some(Self::Ascii(&[]));
+        }
+        match (ascii.is_null(), utf16.is_null()) {
+            (false, true) => Some(Self::Ascii(unsafe { std::slice::from_raw_parts(ascii, length) })),
+            (true, false) => Some(Self::Utf16(unsafe { std::slice::from_raw_parts(utf16, length) })),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Ascii(units) => units.len(),
+            Self::Utf16(units) => units.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn append_to(self, output: &mut Vec<u16>) {
+        match self {
+            Self::Ascii(units) => output.extend(units.iter().copied().map(u16::from)),
+            Self::Utf16(units) => output.extend_from_slice(units),
+        }
+    }
+
+    fn slice(self, range: Range<usize>) -> Self {
+        match self {
+            Self::Ascii(units) => Self::Ascii(&units[range]),
+            Self::Utf16(units) => Self::Utf16(&units[range]),
+        }
+    }
+}
+
+impl<'a> From<ak::Utf16StringUnits<'a>> for TokenizerInput<'a> {
+    fn from(value: ak::Utf16StringUnits<'a>) -> Self {
+        match value {
+            ak::Utf16StringUnits::Ascii(units) => Self::Ascii(units),
+            ak::Utf16StringUnits::Utf16(units) => Self::Utf16(units),
+        }
+    }
+}
+
+impl<'a> From<&'a [u8]> for TokenizerInput<'a> {
+    fn from(value: &'a [u8]) -> Self {
+        assert!(value.is_ascii());
+        Self::Ascii(value)
+    }
+}
+
+impl<'a> From<&'a [u16]> for TokenizerInput<'a> {
+    fn from(value: &'a [u16]) -> Self {
+        Self::Utf16(value)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for TokenizerInput<'a> {
+    fn from(value: &'a [u8; N]) -> Self {
+        Self::from(value.as_slice())
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for TokenizerInput<'a> {
+    fn from(value: &'a Vec<u8>) -> Self {
+        Self::from(value.as_slice())
+    }
+}
+
+impl<'a> From<&'a Vec<u16>> for TokenizerInput<'a> {
+    fn from(value: &'a Vec<u16>) -> Self {
+        Self::Utf16(value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ParserString {
+    Inline(SmallVec<[u16; 16]>),
+    Owned(Box<[u16]>),
+    Shared { storage: Rc<[u16]>, range: Range<usize> },
+    Pending(Range<usize>),
+    Borrowed { data: *const u16, length: usize },
+}
+
+impl ParserString {
+    /// # Safety
+    /// `data` must remain readable for `length` code units while this value or
+    /// any clone of it exists.
+    pub(crate) unsafe fn from_raw_parts(data: *const u16, length: usize) -> Self {
+        Self::Borrowed { data, length }
+    }
+
+    fn finish_shared(&mut self, storage: Rc<[u16]>, offset: usize) {
+        let Self::Pending(range) = self else {
+            return;
+        };
+        *self = Self::Shared {
+            storage,
+            range: range.start + offset..range.end + offset,
+        };
+    }
+}
+
+impl AsRef<[u16]> for ParserString {
+    fn as_ref(&self) -> &[u16] {
+        match self {
+            Self::Inline(value) => value,
+            Self::Owned(value) => value,
+            Self::Shared { storage, range } => &storage[range.clone()],
+            Self::Pending(_) => unreachable!(),
+            Self::Borrowed { data, length } => {
+                // SAFETY: Borrowed parser strings are constructed from FFI
+                // storage that remains alive for the entire parse call.
+                unsafe { std::slice::from_raw_parts(*data, *length) }
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ParserString {
+    type Target = [u16];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl PartialEq for ParserString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl From<Box<[u16]>> for ParserString {
+    fn from(value: Box<[u16]>) -> Self {
+        Self::Owned(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParserTokenKind {
-    Ident(Box<[u16]>),
-    Function(Box<[u16]>),
+    EndOfFile,
+    Ident(ParserString),
+    Function(ParserString),
+    AtKeyword(ParserString),
     Hash {
-        value: Box<[u16]>,
+        value: ParserString,
         is_id: bool,
     },
-    String(Box<[u16]>),
+    String(ParserString),
     BadString,
+    Url(ParserString),
+    BadUrl,
     Delim(u32),
     Number {
         value: f64,
         number_type: CssNumberType,
     },
-    Percentage,
+    Percentage {
+        value: f64,
+        number_type: CssNumberType,
+    },
     Dimension {
         value: f64,
         number_type: CssNumberType,
-        unit: Box<[u16]>,
+        unit: ParserString,
     },
     Whitespace,
+    Cdo,
+    Cdc,
     Colon,
+    Semicolon,
     Comma,
     OpenSquare,
     CloseSquare,
@@ -183,46 +351,213 @@ pub(crate) enum ParserTokenKind {
     CloseParen,
     OpenCurly,
     CloseCurly,
-    Other,
 }
 
-#[allow(dead_code)]
+impl ParserTokenKind {
+    fn finish_shared_strings(&mut self, storage: Rc<[u16]>, offset: usize) {
+        let string = match self {
+            Self::Ident(value)
+            | Self::Function(value)
+            | Self::AtKeyword(value)
+            | Self::String(value)
+            | Self::Url(value) => Some(value),
+            Self::Hash { value, .. } => Some(value),
+            Self::Dimension { unit, .. } => Some(unit),
+            _ => None,
+        };
+        if let Some(string) = string {
+            string.finish_shared(storage, offset);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ParserToken {
     pub kind: ParserTokenKind,
-    pub source: Box<[u16]>,
+    pub source: ParserSource,
+    pub start_position: SourcePosition,
+    pub end_position: SourcePosition,
 }
 
-#[allow(dead_code)]
-pub(crate) fn tokenize_for_parser(input: &[u8]) -> Vec<ParserToken> {
-    let mut tokens = Vec::new();
-    tokenize(input, |token, filtered_input| {
+#[derive(Clone, Debug)]
+pub(crate) enum ParserSource {
+    Empty,
+    Owned(Box<[u16]>),
+    Shared {
+        storage: Rc<SourceStorage>,
+        range: Range<usize>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum SourceStorage {
+    Ascii(Box<[u8]>),
+    Utf16(Box<[u16]>),
+}
+
+pub(crate) enum ParserSourceIter<'a> {
+    Empty,
+    Owned(std::slice::Iter<'a, u16>),
+    Ascii(std::slice::Iter<'a, u8>),
+    Utf16(std::slice::Iter<'a, u16>),
+}
+
+impl Iterator for ParserSourceIter<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::Owned(units) | Self::Utf16(units) => units.next().copied(),
+            Self::Ascii(units) => units.next().copied().map(u16::from),
+        }
+    }
+}
+
+impl ParserSource {
+    pub(crate) fn empty() -> Self {
+        Self::Empty
+    }
+
+    fn shared(storage: Rc<SourceStorage>, range: Range<usize>) -> Self {
+        Self::Shared { storage, range }
+    }
+
+    pub(crate) fn covering(first: &Self, last: &Self) -> Option<Self> {
+        let Self::Shared {
+            storage: first_storage,
+            range: first_range,
+        } = first
+        else {
+            return None;
+        };
+        let Self::Shared {
+            storage: last_storage,
+            range: last_range,
+        } = last
+        else {
+            return None;
+        };
+        Rc::ptr_eq(first_storage, last_storage).then(|| Self::Shared {
+            storage: first_storage.clone(),
+            range: first_range.start..last_range.end,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Owned(source) => source.len(),
+            Self::Shared { range, .. } => range.len(),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> ParserSourceIter<'_> {
+        match self {
+            Self::Empty => ParserSourceIter::Empty,
+            Self::Owned(source) => ParserSourceIter::Owned(source.iter()),
+            Self::Shared { storage, range } => match storage.as_ref() {
+                SourceStorage::Ascii(source) => ParserSourceIter::Ascii(source[range.clone()].iter()),
+                SourceStorage::Utf16(source) => ParserSourceIter::Utf16(source[range.clone()].iter()),
+            },
+        }
+    }
+
+    pub(crate) fn append_to(&self, target: &mut Vec<u16>) {
+        match self {
+            Self::Empty => {}
+            Self::Owned(source) => target.extend_from_slice(source),
+            Self::Shared { storage, range } => match storage.as_ref() {
+                SourceStorage::Ascii(source) => target.extend(source[range.clone()].iter().copied().map(u16::from)),
+                SourceStorage::Utf16(source) => target.extend_from_slice(&source[range.clone()]),
+            },
+        }
+    }
+
+    pub(crate) fn equals_ascii(&self, expected: &[u8]) -> bool {
+        if self.len() != expected.len() {
+            return false;
+        }
+        match self {
+            Self::Empty => expected.is_empty(),
+            Self::Owned(source) => source
+                .iter()
+                .zip(expected)
+                .all(|(&left, &right)| left == u16::from(right)),
+            Self::Shared { storage, range } => match storage.as_ref() {
+                SourceStorage::Ascii(source) => &source[range.clone()] == expected,
+                SourceStorage::Utf16(source) => source[range.clone()]
+                    .iter()
+                    .zip(expected)
+                    .all(|(&left, &right)| left == u16::from(right)),
+            },
+        }
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<u16> {
+        let mut result = Vec::with_capacity(self.len());
+        self.append_to(&mut result);
+        result
+    }
+}
+
+impl PartialEq for ParserSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ParserSource {}
+
+pub(crate) fn tokenize_for_parser<'a>(input: impl Into<TokenizerInput<'a>>) -> Vec<ParserToken> {
+    tokenize_for_parser_internal(input, true)
+}
+
+pub(crate) fn tokenize_for_parser_without_source<'a>(input: impl Into<TokenizerInput<'a>>) -> SmallParserTokenList {
+    tokenize_for_parser_without_source_internal(input)
+}
+
+pub(crate) type SmallParserTokenList = SmallVec<[ParserToken; 8]>;
+
+fn tokenize_for_parser_without_source_internal<'a>(input: impl Into<TokenizerInput<'a>>) -> SmallParserTokenList {
+    let input = input.into();
+    let mut tokens = SmallParserTokenList::new();
+    tokenize(input, |token, _| {
         if matches!(token.token_type, TokenType::EndOfFile) {
             return;
         }
-        let string = |value: &str| value.encode_utf16().collect::<Vec<_>>().into_boxed_slice();
+        let string = |value: &TokenString| ParserString::Inline(value.clone());
         let kind = match &token.token_type {
             TokenType::Ident { value } => ParserTokenKind::Ident(string(value)),
             TokenType::Function { name } => ParserTokenKind::Function(string(name)),
+            TokenType::AtKeyword { name } => ParserTokenKind::AtKeyword(string(name)),
             TokenType::Hash { hash_type, value } => ParserTokenKind::Hash {
                 value: string(value),
                 is_id: *hash_type == CssHashType::Id,
             },
             TokenType::String { value } => ParserTokenKind::String(string(value)),
             TokenType::BadString => ParserTokenKind::BadString,
+            TokenType::Url { value } => ParserTokenKind::Url(string(value)),
+            TokenType::BadUrl => ParserTokenKind::BadUrl,
             TokenType::Delim { value } => ParserTokenKind::Delim(*value),
             TokenType::Number { number } => ParserTokenKind::Number {
                 value: number.value,
                 number_type: number.number_type,
             },
-            TokenType::Percentage { .. } => ParserTokenKind::Percentage,
+            TokenType::Percentage { number } => ParserTokenKind::Percentage {
+                value: number.value,
+                number_type: number.number_type,
+            },
             TokenType::Dimension { number, unit } => ParserTokenKind::Dimension {
                 value: number.value,
                 number_type: number.number_type,
                 unit: string(unit),
             },
             TokenType::Whitespace => ParserTokenKind::Whitespace,
+            TokenType::Cdo => ParserTokenKind::Cdo,
+            TokenType::Cdc => ParserTokenKind::Cdc,
             TokenType::Colon => ParserTokenKind::Colon,
+            TokenType::Semicolon => ParserTokenKind::Semicolon,
             TokenType::Comma => ParserTokenKind::Comma,
             TokenType::OpenSquare => ParserTokenKind::OpenSquare,
             TokenType::CloseSquare => ParserTokenKind::CloseSquare,
@@ -230,28 +565,116 @@ pub(crate) fn tokenize_for_parser(input: &[u8]) -> Vec<ParserToken> {
             TokenType::CloseParen => ParserTokenKind::CloseParen,
             TokenType::OpenCurly => ParserTokenKind::OpenCurly,
             TokenType::CloseCurly => ParserTokenKind::CloseCurly,
-            _ => ParserTokenKind::Other,
+            TokenType::EndOfFile => unreachable!(),
         };
-        let source = filtered_input.as_bytes()[token.original_source_range.clone()].to_vec();
-        let source = String::from_utf8(source)
-            .expect("token source must be UTF-8")
-            .encode_utf16()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        tokens.push(ParserToken { kind, source });
+        tokens.push(ParserToken {
+            kind,
+            source: ParserSource::Empty,
+            start_position: token.range.start,
+            end_position: token.range.end,
+        });
     });
     tokens
 }
 
-pub(crate) fn tokenize_owned(input: &[u8]) -> Vec<OwnedToken> {
+fn tokenize_for_parser_internal<'a>(
+    input: impl Into<TokenizerInput<'a>>,
+    retain_original_source: bool,
+) -> Vec<ParserToken> {
+    let input = input.into();
+    let estimated_token_count = input.len() / 3;
+    let mut tokens = Vec::with_capacity(estimated_token_count);
+    let mut string_storage = Vec::with_capacity(input.len() / 2);
+    let source_storage = Rc::new(match input {
+        TokenizerInput::Ascii(units) => SourceStorage::Ascii(units.into()),
+        TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
+    });
+    tokenize(input, |token, _| {
+        if matches!(token.token_type, TokenType::EndOfFile) {
+            return;
+        }
+        let mut string = |value: &[u16]| {
+            let start = string_storage.len();
+            string_storage.extend_from_slice(value);
+            ParserString::Pending(start..string_storage.len())
+        };
+        let kind = match &token.token_type {
+            TokenType::Ident { value } => ParserTokenKind::Ident(string(value)),
+            TokenType::Function { name } => ParserTokenKind::Function(string(name)),
+            TokenType::AtKeyword { name } => ParserTokenKind::AtKeyword(string(name)),
+            TokenType::Hash { hash_type, value } => ParserTokenKind::Hash {
+                value: string(value),
+                is_id: *hash_type == CssHashType::Id,
+            },
+            TokenType::String { value } => ParserTokenKind::String(string(value)),
+            TokenType::BadString => ParserTokenKind::BadString,
+            TokenType::Url { value } => ParserTokenKind::Url(string(value)),
+            TokenType::BadUrl => ParserTokenKind::BadUrl,
+            TokenType::Delim { value } => ParserTokenKind::Delim(*value),
+            TokenType::Number { number } => ParserTokenKind::Number {
+                value: number.value,
+                number_type: number.number_type,
+            },
+            TokenType::Percentage { number } => ParserTokenKind::Percentage {
+                value: number.value,
+                number_type: number.number_type,
+            },
+            TokenType::Dimension { number, unit } => ParserTokenKind::Dimension {
+                value: number.value,
+                number_type: number.number_type,
+                unit: string(unit),
+            },
+            TokenType::Whitespace => ParserTokenKind::Whitespace,
+            TokenType::Cdo => ParserTokenKind::Cdo,
+            TokenType::Cdc => ParserTokenKind::Cdc,
+            TokenType::Colon => ParserTokenKind::Colon,
+            TokenType::Semicolon => ParserTokenKind::Semicolon,
+            TokenType::Comma => ParserTokenKind::Comma,
+            TokenType::OpenSquare => ParserTokenKind::OpenSquare,
+            TokenType::CloseSquare => ParserTokenKind::CloseSquare,
+            TokenType::OpenParen => ParserTokenKind::OpenParen,
+            TokenType::CloseParen => ParserTokenKind::CloseParen,
+            TokenType::OpenCurly => ParserTokenKind::OpenCurly,
+            TokenType::CloseCurly => ParserTokenKind::CloseCurly,
+            TokenType::EndOfFile => unreachable!(),
+        };
+        let source = if retain_original_source {
+            token.original_source_range.clone()
+        } else {
+            0..0
+        };
+        tokens.push(ParserToken {
+            kind,
+            source: if retain_original_source {
+                ParserSource::shared(source_storage.clone(), source)
+            } else {
+                ParserSource::Empty
+            },
+            start_position: token.range.start,
+            end_position: token.range.end,
+        });
+    });
+    let string_storage: Rc<[u16]> = string_storage.into();
+    for token in &mut tokens {
+        token.kind.finish_shared_strings(string_storage.clone(), 0);
+    }
+    tokens
+}
+
+pub(crate) fn tokenize_owned<'a>(input: impl Into<TokenizerInput<'a>>) -> Vec<OwnedToken> {
+    let input = input.into();
+    let storage = Rc::new(match input {
+        TokenizerInput::Ascii(units) => SourceStorage::Ascii(units.into()),
+        TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
+    });
     let mut tokens = Vec::new();
-    tokenize(input, |token, filtered_input| {
+    tokenize(input, |token, _| {
         if matches!(token.token_type, TokenType::EndOfFile) {
             return;
         }
         let kind = match &token.token_type {
-            TokenType::Ident { value } => OwnedTokenKind::Ident(value.clone()),
-            TokenType::Function { name } => OwnedTokenKind::Function(name.clone()),
+            TokenType::Ident { value } => OwnedTokenKind::Ident(value.to_vec()),
+            TokenType::Function { name } => OwnedTokenKind::Function(name.to_vec()),
             TokenType::AtKeyword { .. } => OwnedTokenKind::AtKeyword,
             TokenType::Hash { .. } => OwnedTokenKind::Hash,
             TokenType::Url { .. } => OwnedTokenKind::Url,
@@ -273,26 +696,28 @@ pub(crate) fn tokenize_owned(input: &[u8]) -> Vec<OwnedToken> {
         };
         tokens.push(OwnedToken {
             kind,
-            source: filtered_input.as_bytes()[token.original_source_range.clone()].to_vec(),
+            source: ParserSource::shared(storage.clone(), token.original_source_range.clone()),
         });
     });
     tokens
 }
 
+type TokenString = SmallVec<[u16; 16]>;
+
 enum TokenType {
     EndOfFile,
-    Ident { value: String },
-    Function { name: String },
-    AtKeyword { name: String },
-    Hash { hash_type: CssHashType, value: String },
-    String { value: String },
+    Ident { value: TokenString },
+    Function { name: TokenString },
+    AtKeyword { name: TokenString },
+    Hash { hash_type: CssHashType, value: TokenString },
+    String { value: TokenString },
     BadString,
-    Url { value: String },
+    Url { value: TokenString },
     BadUrl,
     Delim { value: u32 },
     Number { number: NumericValue },
     Percentage { number: NumericValue },
-    Dimension { number: NumericValue, unit: String },
+    Dimension { number: NumericValue, unit: TokenString },
     Whitespace,
     Cdo,
     Cdc,
@@ -312,14 +737,16 @@ impl Token {
         Self {
             token_type,
             original_source_range,
-            range: Position::default()..Position::default(),
+            range: SourcePosition::default()..SourcePosition::default(),
         }
     }
 
-    pub(crate) fn as_ffi(&self, filtered_input: &str, value: &[u16]) -> CssToken {
-        let original_source =
-            &filtered_input.as_bytes()[self.original_source_range.start..self.original_source_range.end];
-        let (original_source_ptr, original_source_len) = bytes_parts(original_source);
+    pub(crate) fn as_ffi(&self, filtered_input: TokenizerInput<'_>, value: &[u16]) -> CssToken {
+        let original_source = filtered_input.slice(self.original_source_range.clone());
+        let (original_source_ascii_ptr, original_source_utf16_ptr, original_source_len) = match original_source {
+            TokenizerInput::Ascii(units) => (bytes_parts(units).0, ptr::null(), units.len()),
+            TokenizerInput::Utf16(units) => (ptr::null(), utf16_parts(units).0, units.len()),
+        };
         let (value_ptr, value_len) = utf16_parts(value);
 
         let mut css_token = CssToken {
@@ -330,7 +757,8 @@ impl Token {
             delim: 0,
             value_ptr,
             value_len,
-            original_source_ptr,
+            original_source_ascii_ptr,
+            original_source_utf16_ptr,
             original_source_len,
             start_line: self.range.start.line,
             start_column: self.range.start.column,
@@ -405,52 +833,43 @@ impl Token {
             | TokenType::Hash { value, .. }
             | TokenType::String { value }
             | TokenType::Url { value }
-            | TokenType::Dimension { unit: value, .. } => value.encode_utf16().collect(),
+            | TokenType::Dimension { unit: value, .. } => value.to_vec(),
             _ => Vec::new(),
         }
     }
 }
 
-pub fn tokenize<F>(filtered_input: &[u8], callback: F)
+pub(crate) fn tokenize<F>(filtered_input: TokenizerInput<'_>, callback: F)
 where
-    F: FnMut(&Token, &str),
+    F: FnMut(&Token, TokenizerInput<'_>),
 {
-    let filtered_input =
-        std::str::from_utf8(filtered_input).expect("rust_css_tokenize received non-UTF-8 input after C++ decoding");
     Tokenizer::new(filtered_input).tokenize(callback);
 }
 
 struct Tokenizer<'a> {
-    input: &'a str,
-    code_points: Vec<(usize, u32)>,
+    input: TokenizerInput<'a>,
     index: usize,
     prev_index: usize,
-    position: Position,
-    prev_position: Position,
+    current_code_point: u32,
+    position: SourcePosition,
+    prev_position: SourcePosition,
 }
 
 impl<'a> Tokenizer<'a> {
-    fn new(input: &'a str) -> Self {
-        let mut code_points = Vec::with_capacity(input.len());
-        code_points.extend(
-            input
-                .char_indices()
-                .map(|(offset, code_point)| (offset, code_point as u32)),
-        );
-
+    fn new(input: TokenizerInput<'a>) -> Self {
         Self {
             input,
-            code_points,
             index: 0,
             prev_index: 0,
-            position: Position::default(),
-            prev_position: Position::default(),
+            current_code_point: TOKENIZER_EOF,
+            position: SourcePosition::default(),
+            prev_position: SourcePosition::default(),
         }
     }
 
     fn tokenize<F>(mut self, mut callback: F)
     where
-        F: FnMut(&Token, &str),
+        F: FnMut(&Token, TokenizerInput<'a>),
     {
         loop {
             let token_start = self.position;
@@ -466,27 +885,22 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn current_byte_offset(&self) -> usize {
-        if let Some((offset, _)) = self.code_points.get(self.index) {
-            *offset
-        } else {
-            self.input.len()
-        }
+        self.index
     }
 
     fn current_code_point(&self) -> u32 {
-        self.code_points[self.prev_index].1
+        self.current_code_point
     }
 
     fn consume_code_point(&mut self) -> u32 {
-        if self.index >= self.code_points.len() {
+        let Some((code_point, length)) = self.code_point_at(self.index) else {
             return TOKENIZER_EOF;
-        }
+        };
 
         self.prev_index = self.index;
         self.prev_position = self.position;
-
-        let (_, code_point) = self.code_points[self.index];
-        self.index += 1;
+        self.current_code_point = code_point;
+        self.index += length;
 
         if is_newline(code_point) {
             self.position.line += 1;
@@ -499,10 +913,38 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn peek_code_point(&self, offset: usize) -> u32 {
-        self.code_points
-            .get(self.index + offset)
-            .map(|(_, code_point)| *code_point)
+        let mut index = self.index;
+        for _ in 0..offset {
+            let Some((_, length)) = self.code_point_at(index) else {
+                return TOKENIZER_EOF;
+            };
+            index += length;
+        }
+        self.code_point_at(index)
+            .map(|(code_point, _)| code_point)
             .unwrap_or(TOKENIZER_EOF)
+    }
+
+    fn code_point_at(&self, index: usize) -> Option<(u32, usize)> {
+        match self.input {
+            TokenizerInput::Ascii(units) => {
+                debug_assert!(units.is_ascii());
+                units.get(index).map(|unit| (u32::from(*unit), 1))
+            }
+            TokenizerInput::Utf16(units) => {
+                let first = *units.get(index)?;
+                if (0xD800..=0xDBFF).contains(&first)
+                    && let Some(&second) = units.get(index + 1)
+                    && (0xDC00..=0xDFFF).contains(&second)
+                {
+                    return Some((
+                        0x10000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00),
+                        2,
+                    ));
+                }
+                Some((u32::from(first), 1))
+            }
+        }
     }
 
     fn peek_twin(&self) -> (u32, u32) {
@@ -590,15 +1032,15 @@ impl<'a> Tokenizer<'a> {
 
         // hex digit
         if is_hex_digit(input) {
-            let mut repr = String::new();
-            append_code_point(&mut repr, input);
+            let mut repr = SmallVec::<[u8; 8]>::new();
+            append_ascii_code_point(&mut repr, input);
 
             // Consume as many hex digits as possible, but no more than 5.
             // Note that this means 1-6 hex digits have been consumed in total.
             let mut counter = 0usize;
             while is_hex_digit(self.peek_code_point(0)) && counter < 5 {
                 counter += 1;
-                append_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
             }
 
             // If the next input code point is whitespace, consume it as well.
@@ -607,7 +1049,7 @@ impl<'a> Tokenizer<'a> {
             }
 
             // Interpret the hex digits as a hexadecimal number.
-            let unhexed = u32::from_str_radix(&repr, 16).unwrap_or(0);
+            let unhexed = u32::from_str_radix(unsafe { std::str::from_utf8_unchecked(&repr) }, 16).unwrap_or(0);
             // If this number is zero, or is for a surrogate, or is greater than the maximum allowed
             // code point, return U+FFFD REPLACEMENT CHARACTER (�).
             if unhexed == 0 || is_unicode_surrogate(unhexed) || is_greater_than_maximum_allowed_code_point(unhexed) {
@@ -640,7 +1082,7 @@ impl<'a> Tokenizer<'a> {
 
         // If string’s value is an ASCII case-insensitive match for "url", and the next input code
         // point is U+0028 LEFT PARENTHESIS ((), consume it.
-        if string.eq_ignore_ascii_case("url") && is_left_paren(self.peek_code_point(0)) {
+        if utf16_equals_ascii_case_insensitive(&string, b"url") && is_left_paren(self.peek_code_point(0)) {
             self.consume_code_point();
 
             // While the next two input code points are whitespace, consume the next input code point.
@@ -700,7 +1142,7 @@ impl<'a> Tokenizer<'a> {
         // Execute the following steps in order:
 
         // 1. Initially set type to "integer". Let repr be the empty string.
-        let mut repr = String::new();
+        let mut repr = SmallVec::<[u8; 32]>::new();
         let mut number_type = CssNumberType::Integer;
 
         // 2. If the next input code point is U+002B PLUS SIGN (+) or U+002D HYPHEN-MINUS (-),
@@ -709,12 +1151,12 @@ impl<'a> Tokenizer<'a> {
         let next_input = self.peek_code_point(0);
         if is_plus_sign(next_input) || is_hyphen_minus(next_input) {
             has_explicit_sign = true;
-            append_code_point(&mut repr, self.consume_code_point());
+            append_ascii_code_point(&mut repr, self.consume_code_point());
         }
 
         // 3. While the next input code point is a digit, consume it and append it to repr.
         while is_digit(self.peek_code_point(0)) {
-            append_code_point(&mut repr, self.consume_code_point());
+            append_ascii_code_point(&mut repr, self.consume_code_point());
         }
 
         // 4. If the next 2 input code points are U+002E FULL STOP (.) followed by a digit, then:
@@ -722,15 +1164,15 @@ impl<'a> Tokenizer<'a> {
         if is_full_stop(first) && is_digit(second) {
             // 1. Consume them.
             // 2. Append them to repr.
-            append_code_point(&mut repr, self.consume_code_point());
-            append_code_point(&mut repr, self.consume_code_point());
+            append_ascii_code_point(&mut repr, self.consume_code_point());
+            append_ascii_code_point(&mut repr, self.consume_code_point());
 
             // 3. Set type to "number".
             number_type = CssNumberType::Number;
 
             // 4. While the next input code point is a digit, consume it and append it to repr.
             while is_digit(self.peek_code_point(0)) {
-                append_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
             }
         }
 
@@ -744,12 +1186,12 @@ impl<'a> Tokenizer<'a> {
             // 1. Consume them.
             // 2. Append them to repr.
             if (is_plus_sign(second) || is_hyphen_minus(second)) && is_digit(third) {
-                append_code_point(&mut repr, self.consume_code_point());
-                append_code_point(&mut repr, self.consume_code_point());
-                append_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
             } else if is_digit(second) {
-                append_code_point(&mut repr, self.consume_code_point());
-                append_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
             }
 
             // 3. Set type to "number".
@@ -757,12 +1199,12 @@ impl<'a> Tokenizer<'a> {
 
             // 4. While the next input code point is a digit, consume it and append it to repr.
             while is_digit(self.peek_code_point(0)) {
-                append_code_point(&mut repr, self.consume_code_point());
+                append_ascii_code_point(&mut repr, self.consume_code_point());
             }
         }
 
         // 6. Convert repr to a number, and set the value to the returned value.
-        let value = repr.parse::<f64>().unwrap();
+        let value = unsafe { std::str::from_utf8_unchecked(&repr) }.parse::<f64>().unwrap();
 
         // 7. Return value and type.
         if number_type == CssNumberType::Integer && has_explicit_sign {
@@ -776,7 +1218,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     // https://www.w3.org/TR/css-syntax-3/#consume-name
-    fn consume_an_ident_sequence(&mut self) -> String {
+    fn consume_an_ident_sequence(&mut self) -> TokenString {
         // This section describes how to consume an ident sequence from a stream of code points.
         // It returns a string containing the largest name that can be formed from adjacent
         // code points in the stream, starting from the first.
@@ -787,7 +1229,7 @@ impl<'a> Tokenizer<'a> {
         // calling this algorithm.
 
         // Let result initially be an empty string.
-        let mut result = String::new();
+        let mut result = TokenString::new();
 
         // Repeatedly consume the next input code point from the stream:
         loop {
@@ -832,7 +1274,7 @@ impl<'a> Tokenizer<'a> {
         // shouldn’t be called directly otherwise.
 
         // 1. Initially create a <url-token> with its value set to the empty string.
-        let mut value = String::new();
+        let mut value = TokenString::new();
 
         // 2. Consume as much whitespace as possible.
         self.consume_as_much_whitespace_as_possible();
@@ -996,7 +1438,7 @@ impl<'a> Tokenizer<'a> {
 
         // Initially create a <string-token> with its value set to the empty string.
         let start_byte_offset = self.current_byte_offset() - 1;
-        let mut value = String::new();
+        let mut value = TokenString::new();
 
         // Repeatedly consume the next input code point from the stream:
         loop {
@@ -1345,8 +1787,26 @@ fn utf16_parts(code_units: &[u16]) -> (*const u16, usize) {
     }
 }
 
-fn append_code_point(builder: &mut String, code_point: u32) {
-    builder.push(char::from_u32(code_point).unwrap_or(char::REPLACEMENT_CHARACTER));
+fn append_code_point(builder: &mut impl Extend<u16>, code_point: u32) {
+    if code_point < 0x10000 {
+        builder.extend(std::iter::once(code_point as u16));
+        return;
+    }
+    let value = code_point - 0x10000;
+    builder.extend([0xD800 + (value >> 10) as u16, 0xDC00 + (value & 0x3FF) as u16]);
+}
+
+fn append_ascii_code_point(builder: &mut impl Extend<u8>, code_point: u32) {
+    debug_assert!(code_point <= 0x7f);
+    builder.extend(std::iter::once(code_point as u8));
+}
+
+fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
+    value.len() == expected.len()
+        && value
+            .iter()
+            .zip(expected)
+            .all(|(&left, &right)| left <= 0x7f && (left as u8).eq_ignore_ascii_case(&right))
 }
 
 fn is_eof(code_point: u32) -> bool {
@@ -1574,4 +2034,36 @@ fn would_start_a_number((first, second, third): (u32, u32, u32)) -> bool {
     // anything else
     // Return false.
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_and_utf16_inputs_tokenize_equivalently() {
+        let ascii = b"color: rgb(1 2 3)";
+        let utf16 = ascii.iter().copied().map(u16::from).collect::<Vec<_>>();
+
+        assert_eq!(tokenize_owned(ascii), tokenize_owned(&utf16));
+    }
+
+    #[test]
+    fn token_sources_preserve_the_input_storage_representation() {
+        let ascii_tokens = tokenize_owned(b"color");
+        let ParserSource::Shared { storage, range } = &ascii_tokens[0].source else {
+            panic!("token source should use shared storage");
+        };
+        assert!(matches!(storage.as_ref(), SourceStorage::Ascii(_)));
+        assert_eq!(range.clone(), 0..5);
+
+        let utf16 = "café".encode_utf16().collect::<Vec<_>>();
+        let utf16_tokens = tokenize_owned(&utf16);
+        let ParserSource::Shared { storage, range } = &utf16_tokens[0].source else {
+            panic!("token source should use shared storage");
+        };
+        assert!(matches!(storage.as_ref(), SourceStorage::Utf16(_)));
+        assert_eq!(range.clone(), 0..utf16.len());
+        assert_eq!(utf16_tokens[0].source.to_vec(), utf16);
+    }
 }

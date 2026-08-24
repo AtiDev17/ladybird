@@ -14,10 +14,10 @@ namespace Web::CSS::Parser {
 template<typename T>
 Parser::ParseErrorOr<SelectorList> Parser::parse_a_selector_list(TokenStream<T>& tokens, SelectorType type, SelectorParsingMode mode)
 {
-    StringBuilder builder;
+    Utf16StringBuilder builder;
     while (tokens.has_next_token())
         builder.append(tokens.consume_a_token().original_source_text());
-    auto input = builder.to_string_without_validation();
+    auto input = builder.to_string();
     auto selectors = parse_selector_list_in_rust(input, m_declared_namespaces,
         type == SelectorType::Relative, mode == SelectorParsingMode::Forgiving);
     if (!selectors.has_value())
@@ -29,7 +29,7 @@ template Parser::ParseErrorOr<SelectorList> Parser::parse_a_selector_list(TokenS
 
 Optional<SelectorList> Parser::parse_as_selector(SelectorParsingMode mode)
 {
-    auto selectors = parse_a_selector_list(m_token_stream, SelectorType::Standalone, mode);
+    auto selectors = parse_a_selector_list(token_stream(), SelectorType::Standalone, mode);
     if (selectors.is_error())
         return {};
     return selectors.release_value();
@@ -37,7 +37,7 @@ Optional<SelectorList> Parser::parse_as_selector(SelectorParsingMode mode)
 
 Optional<SelectorList> Parser::parse_as_relative_selector(SelectorParsingMode mode)
 {
-    auto selectors = parse_a_selector_list(m_token_stream, SelectorType::Relative, mode);
+    auto selectors = parse_a_selector_list(token_stream(), SelectorType::Relative, mode);
     if (selectors.is_error())
         return {};
     return selectors.release_value();
@@ -45,11 +45,16 @@ Optional<SelectorList> Parser::parse_as_relative_selector(SelectorParsingMode mo
 
 Optional<Selector::PseudoElementSelector> Parser::parse_as_pseudo_element_selector()
 {
-    StringBuilder builder;
-    while (m_token_stream.has_next_token())
-        builder.append(m_token_stream.consume_a_token().original_source_text());
-    auto input = builder.to_string_without_validation();
-    auto parsed = SelectorFFI::rust_selector_parse_pseudo_element(input.bytes().data(), input.bytes().size());
+    Utf16StringBuilder builder;
+    while (token_stream().has_next_token())
+        builder.append(token_stream().consume_a_token().original_source_text());
+    auto input = builder.to_string();
+    auto input_view = input.utf16_view();
+    auto parsed = SelectorFFI::rust_selector_parse_pseudo_element({
+        .ascii = input_view.has_ascii_storage() ? reinterpret_cast<u8 const*>(input_view.ascii_span().data()) : nullptr,
+        .utf16 = input_view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(input_view.utf16_span().data()),
+        .length = input_view.length_in_code_units(),
+    });
     if (!parsed.selector)
         return {};
     auto selector = Selector::create(parsed.selector);
@@ -61,7 +66,7 @@ Optional<Selector::PseudoElementSelector> Parser::parse_as_pseudo_element_select
 
 Optional<PageSelectorList> Parser::parse_as_page_selector_list()
 {
-    auto selector_list = parse_a_page_selector_list(m_token_stream);
+    auto selector_list = parse_a_page_selector_list(token_stream());
     if (!selector_list.is_error())
         return selector_list.release_value();
     return {};

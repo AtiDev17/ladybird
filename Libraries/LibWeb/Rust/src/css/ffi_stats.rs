@@ -41,9 +41,6 @@ define_ffi_ops! {
     // Entries: C++ -> Rust.
     CascadeBulkEntry => "cascadeBulkEntries",
     CascadeCustomPropertyEntry => "cascadeCustomPropertyEntries",
-    CascadeResolutionEntry => "cascadeResolutionEntries",
-    CascadeNativeSubstitutionRequest => "cascadeNativeSubstitutionRequests",
-    CascadeCppResolutionRequest => "cascadeCppResolutionRequests",
     CascadedStoreQueryEntry => "cascadedStoreQueryEntries",
     CustomPropertyStoreLifecycleEntry => "customPropertyStoreLifecycleEntries",
     CustomPropertyStoreQueryEntry => "customPropertyStoreQueryEntries",
@@ -62,9 +59,12 @@ define_ffi_ops! {
     StyleGroupFreeEntry => "styleGroupFreeEntries",
     AnimationEvaluationEntry => "animationEvaluationEntries",
     TransitionDecisionEntry => "transitionDecisionEntries",
+    SubstitutionWorkerParse => "substitutionWorkerParses",
+    SubstitutionMainThreadParseRequest => "substitutionMainThreadParseRequests",
     // Ownership callbacks: Rust -> C++.
     StringRetainReleaseCallback => "stringRetainReleaseCallbacks",
     AnimatedPropertiesRetainReleaseCallback => "animatedPropertiesRetainReleaseCallbacks",
+    SubstitutionOracleCallback => "substitutionOracleCallbacks",
 }
 
 static COUNTERS: [AtomicU64; FFI_OP_COUNT] = [const { AtomicU64::new(0) }; FFI_OP_COUNT];

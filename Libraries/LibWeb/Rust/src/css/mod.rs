@@ -23,6 +23,9 @@ pub mod custom_properties;
 pub mod display;
 pub mod ffi_stats;
 pub mod ffi_support;
+pub(crate) mod math_functions;
+pub(crate) mod named_colors;
+pub(crate) mod parser;
 pub mod property_metadata;
 pub(crate) mod retained_fly_string;
 pub(crate) mod selector;
@@ -35,6 +38,7 @@ pub mod style_compute;
 pub(crate) mod style_value;
 pub mod table_group_builder;
 pub mod transition;
+pub(crate) mod worker_pool;
 
 pub use css_tokenizer::CssHashType;
 pub use css_tokenizer::CssNumberType;
