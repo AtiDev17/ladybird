@@ -3030,6 +3030,45 @@ fn resolve_calculated_without_context(
     resolve_calculated_with_length_resolution(calculated, percentage_basis, LengthResolution::default())
 }
 
+pub(crate) fn collapse_calculated_without_context(
+    calculated: &crate::css::style_value::StyleValueData,
+) -> Option<crate::css::style_value::StyleValueData> {
+    use crate::css::style_value::StyleValueData;
+    let (value, numeric_type, resolve_as) = resolve_calculated_without_context(calculated, None)?;
+    let canonical_unit = |ratios: &[f64]| ratios.iter().position(|&ratio| ratio == 1.0).map(|unit| unit as u8);
+    if numeric_type.matches_number(resolve_as) {
+        return Some(StyleValueData::Number { value });
+    }
+    if numeric_type.matches_percentage() {
+        return Some(StyleValueData::Percentage { value });
+    }
+    if numeric_type.matches_dimension(0, resolve_as) {
+        return Some(StyleValueData::Length {
+            value,
+            unit: crate::css::style_compute::px_length_unit(),
+        });
+    }
+    if numeric_type.matches_dimension(1, resolve_as) {
+        return Some(StyleValueData::Angle {
+            value,
+            unit: canonical_unit(&ANGLE_UNIT_CANONICAL_RATIOS)?,
+        });
+    }
+    if numeric_type.matches_dimension(2, resolve_as) {
+        return Some(StyleValueData::Time {
+            value,
+            unit: canonical_unit(&TIME_UNIT_CANONICAL_RATIOS)?,
+        });
+    }
+    if numeric_type.matches_dimension(4, resolve_as) {
+        return Some(StyleValueData::Resolution {
+            value,
+            unit: canonical_unit(&RESOLUTION_UNIT_CANONICAL_RATIOS)?,
+        });
+    }
+    None
+}
+
 /// Resolves a calculated value that must produce a number, with no external
 /// context; the equivalent of the C++ resolve_number with an empty context.
 pub(crate) fn resolve_calculated_number_without_context(
@@ -3344,17 +3383,6 @@ pub struct FfiCalcSerializationPiece {
     pub bytes: *const u8,
     pub length: usize,
     pub style_value: *const std::ffi::c_void,
-}
-
-#[repr(C)]
-pub struct FfiCalcSerialization {
-    pub pieces: *const FfiCalcSerializationPiece,
-    pub piece_count: usize,
-    pub storage: *mut std::ffi::c_void,
-}
-
-struct CalcSerializationStorage {
-    pieces: Box<[FfiCalcSerializationPiece]>,
 }
 
 impl CalcNumericValue {
@@ -4192,43 +4220,6 @@ pub(crate) fn serialize_math_function_pieces(
     };
     serializer.serialize_math_function(&root);
     serializer.pieces
-}
-
-/// Serializes a calculated style value's math function into an ordered piece batch. Literal
-/// structure comes from Rust, while C++ formats numeric and embedded style values after return.
-///
-/// # Safety
-/// `calculated` must point at Calculated style value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_serialize(
-    calculated: *const std::ffi::c_void,
-    resolved_mode: bool,
-) -> FfiCalcSerialization {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::CalcOperationEntry);
-    use crate::css::style_value::StyleValueData;
-    crate::abort_on_panic(|| {
-        let value = unsafe { &*(calculated as *const StyleValueData) };
-        let storage = Box::new(CalcSerializationStorage {
-            pieces: serialize_math_function_pieces(value, resolved_mode).into_boxed_slice(),
-        });
-        let result = FfiCalcSerialization {
-            pieces: storage.pieces.as_ptr(),
-            piece_count: storage.pieces.len(),
-            storage: std::ptr::null_mut(),
-        };
-        let storage = Box::into_raw(storage);
-        FfiCalcSerialization {
-            storage: storage.cast(),
-            ..result
-        }
-    })
-}
-
-/// # Safety
-/// `storage` must be a value returned by `rust_calc_serialize` that has not been released.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_calc_serialization_release(storage: *mut std::ffi::c_void) {
-    drop(unsafe { Box::from_raw(storage.cast::<CalcSerializationStorage>()) });
 }
 
 impl CalcNode {

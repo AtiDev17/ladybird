@@ -24,9 +24,341 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::abort_on_panic;
-use crate::css::css_tokenizer::TokenizerInput;
+use crate::css::css_tokenizer::{ParserSource, ParserTokenKind, SourcePosition, TokenizerInput};
+use crate::css::parser::component_value::{ComponentKind, ComponentSerializationMode, ComponentValue};
 
 pub(crate) use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
+
+/// A Rust-owned component-value slice. C++ retains the opaque allocation as part of an
+/// unresolved style value but never inspects its elements.
+#[repr(C)]
+pub struct RetainedComponentValueList {
+    pointer: *mut c_void,
+    length: usize,
+}
+
+impl RetainedComponentValueList {
+    pub(crate) fn from_values(values: Vec<ComponentValue>) -> Self {
+        let mut values = values.into_boxed_slice();
+        let result = Self {
+            pointer: values.as_mut_ptr().cast(),
+            length: values.len(),
+        };
+        std::mem::forget(values);
+        result
+    }
+
+    pub(crate) fn from_source(source: &[u16]) -> Self {
+        let values = crate::css::parser::component_value::consume_a_list_of_component_values(
+            crate::css::css_tokenizer::tokenize_for_parser(source),
+        )
+        .unwrap_or_default();
+        Self::from_values(values)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ComponentValue] {
+        if self.pointer.is_null() {
+            return &[];
+        }
+        // SAFETY: The allocation is owned by this handle and has `length` initialized elements.
+        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+    }
+}
+
+enum ReifiedUnresolvedSegment {
+    Text(Vec<u16>),
+    Variable {
+        name: Vec<u16>,
+        fallback: Option<Vec<ReifiedUnresolvedSegment>>,
+    },
+}
+
+fn synthetic_component(kind: ParserTokenKind) -> ComponentValue {
+    ComponentValue {
+        kind: ComponentKind::Token(kind),
+        original_source_text: ParserSource::empty(),
+        opening_source_length: 0,
+        closing_source_length: 0,
+        start_position: SourcePosition::default(),
+        end_position: SourcePosition::default(),
+    }
+}
+
+fn flush_reification_text(pending: &mut Vec<ComponentValue>, output: &mut Vec<ReifiedUnresolvedSegment>) {
+    if pending.is_empty() {
+        return;
+    }
+    output.push(ReifiedUnresolvedSegment::Text(
+        crate::css::serialize::serialize_component_values_to_utf16(pending, ComponentSerializationMode::Normalized),
+    ));
+    pending.clear();
+}
+
+fn component_values_without_whitespace(mut values: &[ComponentValue]) -> &[ComponentValue] {
+    while values.first().is_some_and(ComponentValue::is_whitespace) {
+        values = &values[1..];
+    }
+    while values.last().is_some_and(ComponentValue::is_whitespace) {
+        values = &values[..values.len() - 1];
+    }
+    values
+}
+
+fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
+    value.len() == expected.len()
+        && value
+            .iter()
+            .zip(expected)
+            .all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right)))
+}
+
+fn split_var_arguments(values: &[ComponentValue]) -> Option<(&[u16], Option<&[ComponentValue]>)> {
+    if !crate::css::parser::arbitrary_substitution::arguments_are_valid_for_ffi(5, values) {
+        return None;
+    }
+    let comma = values.iter().position(ComponentValue::is_comma);
+    let name_values = component_values_without_whitespace(&values[..comma.unwrap_or(values.len())]);
+    let [name_value] = name_values else {
+        return None;
+    };
+    let name = name_value.ident()?;
+    if name.len() < 2 || name[0] != u16::from(b'-') || name[1] != u16::from(b'-') {
+        return None;
+    }
+    Some((name, comma.map(|comma| &values[comma + 1..])))
+}
+
+fn append_reified_unresolved_segments(
+    values: &[ComponentValue],
+    pending: &mut Vec<ComponentValue>,
+    output: &mut Vec<ReifiedUnresolvedSegment>,
+) {
+    for value in values {
+        match &value.kind {
+            ComponentKind::Function { name, values }
+                if utf16_equals_ascii_case_insensitive(name, b"var") && split_var_arguments(values).is_some() =>
+            {
+                let (name, fallback) = split_var_arguments(values).expect("validated var arguments");
+                flush_reification_text(pending, output);
+                let fallback = fallback.map(reify_unresolved_segments);
+                output.push(ReifiedUnresolvedSegment::Variable {
+                    name: name.to_vec(),
+                    fallback,
+                });
+            }
+            ComponentKind::Function { name, values } => {
+                pending.push(synthetic_component(ParserTokenKind::Function(name.clone())));
+                append_reified_unresolved_segments(values, pending, output);
+                pending.push(synthetic_component(ParserTokenKind::CloseParen));
+            }
+            ComponentKind::SimpleBlock { opening, values } => {
+                pending.push(synthetic_component(opening.clone()));
+                append_reified_unresolved_segments(values, pending, output);
+                let closing = match opening {
+                    ParserTokenKind::OpenSquare => ParserTokenKind::CloseSquare,
+                    ParserTokenKind::OpenParen => ParserTokenKind::CloseParen,
+                    ParserTokenKind::OpenCurly => ParserTokenKind::CloseCurly,
+                    _ => unreachable!(),
+                };
+                pending.push(synthetic_component(closing));
+            }
+            ComponentKind::Token(_) => pending.push(value.clone()),
+        }
+    }
+}
+
+fn reify_unresolved_segments(values: &[ComponentValue]) -> Vec<ReifiedUnresolvedSegment> {
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    append_reified_unresolved_segments(values, &mut pending, &mut output);
+    flush_reification_text(&mut pending, &mut output);
+    output
+}
+
+fn visit_reified_unresolved_segments(
+    segments: &[ReifiedUnresolvedSegment],
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
+) {
+    for segment in segments {
+        match segment {
+            ReifiedUnresolvedSegment::Text(text) => unsafe {
+                visit(context, 0, text.as_ptr(), text.len(), false);
+            },
+            ReifiedUnresolvedSegment::Variable { name, fallback } => {
+                unsafe {
+                    visit(context, 1, name.as_ptr(), name.len(), fallback.is_some());
+                }
+                if let Some(fallback) = fallback {
+                    visit_reified_unresolved_segments(fallback, context, visit);
+                }
+                unsafe {
+                    visit(context, 2, std::ptr::null(), 0, false);
+                }
+            }
+        }
+    }
+}
+
+fn scan_custom_property_references(
+    values: &[ComponentValue],
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
+) -> bool {
+    let mut all_references_visible = true;
+    for value in values {
+        let ComponentKind::Function {
+            name,
+            values: function_values,
+        } = &value.kind
+        else {
+            if let ComponentKind::SimpleBlock { values, .. } = &value.kind {
+                all_references_visible &= scan_custom_property_references(values, context, visit);
+            }
+            continue;
+        };
+        if utf16_equals_ascii_case_insensitive(name, b"var") || utf16_equals_ascii_case_insensitive(name, b"inherit") {
+            let comma = function_values.iter().position(ComponentValue::is_comma);
+            let name_values =
+                component_values_without_whitespace(&function_values[..comma.unwrap_or(function_values.len())]);
+            if let [name_value] = name_values
+                && let Some(name) = name_value.ident()
+                && name.len() >= 2
+                && name[0] == u16::from(b'-')
+                && name[1] == u16::from(b'-')
+            {
+                unsafe { visit(context, name.as_ptr(), name.len()) };
+            } else {
+                all_references_visible = false;
+            }
+        }
+        all_references_visible &= scan_custom_property_references(function_values, context, visit);
+    }
+    all_references_visible
+}
+
+/// Visits the Typed OM reification of an unresolved style value. Event 0 appends a text segment,
+/// event 1 begins a variable reference, and event 2 ends its optional fallback.
+///
+/// # Safety
+/// `value` must point at live unresolved style value data, and `visit` must remain callable for
+/// the duration of this function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_unresolved_style_value_visit_reification(
+    value: *const c_void,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
+) {
+    abort_on_panic(|| {
+        let StyleValueData::Unresolved { components, .. } = (unsafe { &*value.cast::<StyleValueData>() }) else {
+            unreachable!("reification requires an unresolved style value");
+        };
+        let segments = reify_unresolved_segments(components.as_slice());
+        visit_reified_unresolved_segments(&segments, context, visit);
+    });
+}
+
+/// Visits literal custom-property references and reports whether every reference name was
+/// statically visible.
+///
+/// # Safety
+/// `value` and `visit` must be valid as for `rust_unresolved_style_value_visit_reification`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_unresolved_style_value_visit_custom_property_references(
+    value: *const c_void,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
+) -> bool {
+    abort_on_panic(|| {
+        let StyleValueData::Unresolved { components, .. } = (unsafe { &*value.cast::<StyleValueData>() }) else {
+            unreachable!("reference scanning requires an unresolved style value");
+        };
+        scan_custom_property_references(components.as_slice(), context, visit)
+    })
+}
+
+#[cfg(test)]
+mod unresolved_component_tests {
+    use super::*;
+
+    fn components(source: &str) -> Vec<ComponentValue> {
+        crate::css::parser::component_value::consume_a_list_of_component_values(
+            crate::css::css_tokenizer::tokenize_for_parser(source.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reification_extracts_nested_var_references() {
+        let segments = reify_unresolved_segments(&components("outer(var(--name, red))"));
+        assert!(matches!(&segments[..], [
+            ReifiedUnresolvedSegment::Text(before),
+            ReifiedUnresolvedSegment::Variable { name, fallback: Some(fallback) },
+            ReifiedUnresolvedSegment::Text(after),
+        ] if before == &"outer(".encode_utf16().collect::<Vec<_>>()
+            && name == &"--name".encode_utf16().collect::<Vec<_>>()
+            && matches!(&fallback[..], [ReifiedUnresolvedSegment::Text(text)] if text == &" red".encode_utf16().collect::<Vec<_>>())
+            && after == &")".encode_utf16().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn reification_descends_into_unrepresentable_var() {
+        let segments = reify_unresolved_segments(&components("var(var(--name))"));
+        assert!(matches!(&segments[..], [
+            ReifiedUnresolvedSegment::Text(before),
+            ReifiedUnresolvedSegment::Variable { name, fallback: None },
+            ReifiedUnresolvedSegment::Text(after),
+        ] if before == &"var(".encode_utf16().collect::<Vec<_>>()
+            && name == &"--name".encode_utf16().collect::<Vec<_>>()
+            && after == &")".encode_utf16().collect::<Vec<_>>()));
+    }
+
+    unsafe extern "C" fn collect_reference(context: *mut c_void, name: *const u16, name_length: usize) {
+        let names = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
+        names.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
+    }
+
+    #[test]
+    fn reference_scan_reports_dynamic_names() {
+        let values = components("var(--one) [inherit(--two)] var(var(--dynamic))");
+        let mut names: Vec<Vec<u16>> = Vec::new();
+        let all_visible = scan_custom_property_references(&values, (&raw mut names).cast(), collect_reference);
+        assert!(!all_visible);
+        assert_eq!(
+            names,
+            ["--one", "--two", "--dynamic"].map(|name| name.encode_utf16().collect::<Vec<_>>())
+        );
+    }
+}
+
+impl Clone for RetainedComponentValueList {
+    fn clone(&self) -> Self {
+        Self::from_values(self.as_slice().to_vec())
+    }
+}
+
+impl PartialEq for RetainedComponentValueList {
+    fn eq(&self, _other: &Self) -> bool {
+        // The retained tree is a parsing/serialization cache. Unresolved value identity is
+        // defined by the source and comparison text fields, as it was before this cache existed.
+        true
+    }
+}
+
+impl Drop for RetainedComponentValueList {
+    fn drop(&mut self) {
+        if self.pointer.is_null() {
+            return;
+        }
+        // SAFETY: `from_values` leaked exactly this boxed slice to the handle.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.pointer.cast::<ComponentValue>(),
+                self.length,
+            )));
+        }
+    }
+}
 
 #[cfg(any(test, feature = "style-replay"))]
 thread_local! {
@@ -423,16 +755,6 @@ pub struct RetainedReadableString {
 }
 
 impl RetainedReadableString {
-    /// Takes ownership of a leaked AK::Utf16String reference and copies its units.
-    ///
-    /// # Safety
-    /// Exactly one non-empty unit pointer must identify `length` readable units.
-    unsafe fn from_raw(raw: usize, ascii_units: *const u8, code_units: *const u16, length: usize) -> Self {
-        let source = unsafe { TokenizerInput::from_raw_parts(ascii_units, code_units, length) }
-            .expect("invalid readable UTF-16 string");
-        Self::from_units_with_raw(source, raw)
-    }
-
     fn from_units_with_raw(source: TokenizerInput<'_>, raw: usize) -> Self {
         let (ascii_units, code_units, length) = match source {
             TokenizerInput::Ascii(units) => {
@@ -825,8 +1147,6 @@ retained_list_as_slice!(RetainedGridAreaList, RetainedGridArea);
 macro_rules! retained_list_from_vec {
     ($list:ident, $element:ty) => {
         impl $list {
-            // Consumers arrive with the per-type absolutization and color ports.
-            #[allow(dead_code)]
             pub(crate) fn from_retained_elements(elements: Vec<$element>) -> Self {
                 let slice = elements.into_boxed_slice();
                 let length = slice.len();
@@ -1820,6 +2140,7 @@ pub enum StyleValueData {
     /// flags of each substitution function, the attr-taint flag, and an optional parsed value
     /// cached for an attr()-tainted registered custom property.
     Unresolved {
+        components: RetainedComponentValueList,
         source_text: RetainedReadableString,
         value_comparison_text: RetainedReadableString,
         presence_attr: bool,
@@ -1995,6 +2316,13 @@ pub unsafe extern "C" fn rust_style_value_computed_percentage(value: *const c_vo
 }
 
 impl StyleValueData {
+    pub(crate) fn unresolved_authored_source(&self) -> Option<TokenizerInput<'_>> {
+        let Self::Unresolved { source_text, .. } = self else {
+            return None;
+        };
+        Some(source_text.as_units())
+    }
+
     pub(crate) fn unresolved_token_source(&self) -> Option<TokenizerInput<'_>> {
         let Self::Unresolved {
             source_text,
@@ -2529,6 +2857,7 @@ impl StyleValueData {
                 write_bool(hasher, *only);
             }
             Self::Unresolved {
+                components: _,
                 source_text,
                 value_comparison_text,
                 presence_attr,
@@ -3392,17 +3721,20 @@ pub unsafe extern "C" fn rust_style_value_create_color_scheme(
     })
 }
 
-/// Takes ownership of one leaked reference to each string.
+/// Creates an unresolved value from borrowed token source. Rust derives the source and comparison
+/// strings according to the requested SourceTextMode and retains the component tree.
+///
+/// Takes ownership of one strong reference to `parsed_value` when it is non-null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_unresolved(
-    source_text: usize,
-    source_text_ascii_units: *const u8,
-    source_text_code_units: *const u16,
-    source_text_length: usize,
-    value_comparison_text: usize,
-    value_comparison_text_ascii_units: *const u8,
-    value_comparison_text_code_units: *const u16,
-    value_comparison_text_length: usize,
+pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
+    token_source_ascii_units: *const u8,
+    token_source_code_units: *const u16,
+    token_source_length: usize,
+    has_original_source_text: bool,
+    original_source_text_ascii_units: *const u8,
+    original_source_text_code_units: *const u16,
+    original_source_text_length: usize,
+    source_text_mode: u8,
     presence_attr: bool,
     presence_dashed_function: bool,
     presence_env: bool,
@@ -3413,23 +3745,61 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved(
     parsed_value: *const StyleValueData,
 ) -> *const StyleValueData {
     abort_on_panic(|| {
+        let token_source = unsafe {
+            TokenizerInput::from_raw_parts(token_source_ascii_units, token_source_code_units, token_source_length)
+        }
+        .unwrap_or_default();
+        let components = crate::css::parser::component_value::consume_a_list_of_component_values(
+            crate::css::css_tokenizer::tokenize_for_parser(token_source),
+        )
+        .unwrap_or_default();
+        let normalized = crate::css::serialize::serialize_component_values_to_utf16(
+            &components,
+            crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+        );
+        let (source_text, value_comparison_text) = if has_original_source_text {
+            let original_source_text = unsafe {
+                TokenizerInput::from_raw_parts(
+                    original_source_text_ascii_units,
+                    original_source_text_code_units,
+                    original_source_text_length,
+                )
+            }
+            .unwrap_or_default();
+            let mut source_text = Vec::with_capacity(original_source_text.len());
+            original_source_text.append_to(&mut source_text);
+            (
+                crate::css::serialize::trim_ascii_whitespace(&source_text).to_vec(),
+                crate::css::serialize::trim_ascii_whitespace(&normalized).to_vec(),
+            )
+        } else {
+            let source_text = match source_text_mode {
+                0 | 1 => crate::css::serialize::serialize_component_values_to_utf16(
+                    &components,
+                    crate::css::parser::component_value::ComponentSerializationMode::PreserveNumericSource,
+                ),
+                2 => crate::css::serialize::original_component_values_source(&components)
+                    .unwrap_or_else(|| normalized.clone()),
+                _ => unreachable!("unknown unresolved source text mode"),
+            };
+            let source_text = if source_text_mode == 0 {
+                crate::css::serialize::trim_ascii_whitespace(&source_text)
+            } else if source_text_mode == 1 {
+                crate::css::serialize::trim_ascii_whitespace_start(&source_text)
+            } else {
+                &source_text
+            };
+            (source_text.to_vec(), Vec::new())
+        };
+        let component_source = if value_comparison_text.is_empty() {
+            &source_text
+        } else {
+            &value_comparison_text
+        };
         Arc::into_raw(Arc::new(StyleValueData::Unresolved {
-            source_text: unsafe {
-                RetainedReadableString::from_raw(
-                    source_text,
-                    source_text_ascii_units,
-                    source_text_code_units,
-                    source_text_length,
-                )
-            },
-            value_comparison_text: unsafe {
-                RetainedReadableString::from_raw(
-                    value_comparison_text,
-                    value_comparison_text_ascii_units,
-                    value_comparison_text_code_units,
-                    value_comparison_text_length,
-                )
-            },
+            components: RetainedComponentValueList::from_source(component_source),
+            source_text: RetainedReadableString::from_utf16(&source_text),
+            value_comparison_text: RetainedReadableString::from_utf16(&value_comparison_text),
             presence_attr,
             presence_dashed_function,
             presence_env,
@@ -4015,18 +4385,6 @@ pub unsafe extern "C" fn rust_style_value_retain(value: *const StyleValueData) -
     abort_on_panic(|| unsafe { retain_style_value(value) })
 }
 
-/// Clones a parsed value into a distinct allocation. Repeated direct children retain their alias
-/// pattern so shorthand expansion observes the same graph shape produced by parsing.
-///
-/// # Safety
-/// `value` must point at live `StyleValueData` allocated by this module.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_clone_for_substitution(
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    abort_on_panic(|| Arc::into_raw(Arc::new(unsafe { (*value).clone() })))
-}
-
 #[cfg(test)]
 mod substitution_clone_tests {
     use super::*;
@@ -4045,7 +4403,7 @@ mod substitution_clone_tests {
                 children.len(),
             )
         };
-        let cloned_shorthand = unsafe { rust_style_value_clone_for_substitution(shorthand) };
+        let cloned_shorthand = Arc::into_raw(Arc::new(unsafe { (*shorthand).clone() }));
 
         let StyleValueData::Shorthand { values: original, .. } = (unsafe { &*shorthand }) else {
             unreachable!()

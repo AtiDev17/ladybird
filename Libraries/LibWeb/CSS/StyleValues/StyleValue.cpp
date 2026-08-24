@@ -516,43 +516,6 @@ bool StyleValue::has_auto() const
     return is_keyword() && as_keyword().keyword() == Keyword::Auto;
 }
 
-Vector<Parser::ComponentValue> StyleValue::tokenize() const
-{
-    // Only types whose tokens observably differ from re-parsing their serialization keep a bespoke
-    // implementation: dimensions and numbers (ResolvedValue serialization canonicalizes units and
-    // rounds numbers to 6 decimals per CSSOM), value lists (collapsible lists serialize collapsed,
-    // and their items may be dimensions), and the identity/marker types (Unresolved's stored
-    // tokens, GuaranteedInvalidValue markers, EmptyOptional's deliberate crash). Everything else
-    // round-trips through its serialization exactly.
-    switch (type()) {
-    case Type::Angle:
-    case Type::Flex:
-    case Type::Frequency:
-    case Type::Length:
-    case Type::Percentage:
-    case Type::Resolution:
-    case Type::Time:
-        return as_dimension().tokenize();
-    case Type::EmptyOptional:
-        return as_empty_optional().tokenize();
-    case Type::GuaranteedInvalid:
-        return as_guaranteed_invalid().tokenize();
-    case Type::Number:
-        return as_number().tokenize();
-    case Type::PendingSubstitution:
-        return as_pending_substitution().tokenize();
-    case Type::Ratio:
-        return as_ratio().tokenize();
-    case Type::Unresolved:
-        return as_unresolved().tokenize();
-    case Type::ValueList:
-        return as_value_list().tokenize();
-    default:
-        break;
-    }
-    return Parser::Parser::create(Parser::ParsingParams {}, to_string(SerializationMode::ResolvedValue)).parse_as_list_of_component_values();
-}
-
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-as-a-cssstylevalue
 GC::Ref<CSSStyleValue> StyleValue::reify(Utf16FlyString const& associated_property) const
 {

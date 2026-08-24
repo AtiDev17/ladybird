@@ -63,17 +63,6 @@ struct InvalidRuleError {
     }
 };
 
-struct InvalidQueryError {
-    Utf16FlyString query_type { "@media"_utf16_fly_string };
-    String value_string;
-    String description;
-    bool operator==(InvalidQueryError const&) const = default;
-    unsigned hash() const
-    {
-        return pair_int_hash(query_type.hash(), pair_int_hash(value_string.hash(), description.hash()));
-    }
-};
-
 struct InvalidRuleLocationError {
     Utf16FlyString outer_rule_name;
     Utf16FlyString inner_rule_name;
@@ -84,7 +73,25 @@ struct InvalidRuleLocationError {
     }
 };
 
-using ParsingError = Variant<UnknownPropertyError, UnknownRuleError, InvalidPropertyError, InvalidValueError, InvalidRuleError, InvalidQueryError, InvalidRuleLocationError>;
+enum class SyntaxDiagnosticCode : u8 {
+    BadString,
+    BadUrl,
+};
+
+struct SyntaxDiagnosticError {
+    SyntaxDiagnosticCode code;
+    u32 start_line;
+    u32 start_column;
+    u32 end_line;
+    u32 end_column;
+    bool operator==(SyntaxDiagnosticError const&) const = default;
+    unsigned hash() const
+    {
+        return pair_int_hash(to_underlying(code), pair_int_hash(pair_int_hash(start_line, start_column), pair_int_hash(end_line, end_column)));
+    }
+};
+
+using ParsingError = Variant<UnknownPropertyError, UnknownRuleError, InvalidPropertyError, InvalidValueError, InvalidRuleError, InvalidRuleLocationError, SyntaxDiagnosticError>;
 
 String serialize_parsing_error(ParsingError const&);
 

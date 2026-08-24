@@ -10,7 +10,6 @@
 #include <AK/RefCounted.h>
 #include <LibWeb/CSS/BooleanExpression.h>
 #include <LibWeb/CSS/FeatureQuery.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 
 namespace Web::CSS {
@@ -65,10 +64,10 @@ private:
 // https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
 class StyleFeature final : public BooleanExpression {
 public:
-    using StyleRangeValue = Variant<PropertyNameAndID, Vector<Parser::ComponentValue>>;
+    using StyleRangeValue = Variant<PropertyNameAndID, Utf16String>;
 
     static NonnullOwnPtr<StyleFeature> create_boolean(PropertyNameAndID);
-    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value, Optional<Utf16String> original_value_text = {});
+    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Utf16String value, Optional<Utf16String> original_value_text = {});
     static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison comparison, StyleRangeValue right);
     static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison left_comparison, StyleRangeValue middle, FeatureComparison right_comparison, StyleRangeValue right);
 
@@ -79,7 +78,7 @@ public:
 
     struct StyleFeaturePlain {
         PropertyNameAndID property;
-        Optional<Vector<Parser::ComponentValue>> value;
+        Optional<Utf16String> value;
         Optional<Utf16String> original_value_text;
     };
 
@@ -127,5 +126,7 @@ Optional<SizeFeatureID> size_feature_id_from_string(Utf16View);
 StringView string_from_size_feature_id(SizeFeatureID);
 bool size_feature_type_is_range(SizeFeatureID);
 bool container_name_matches(DOM::Element const&, Optional<Utf16FlyString> const& container_name);
+void prepare_for_style_query_evaluation();
+bool style_query_cycle_detected();
 
 }

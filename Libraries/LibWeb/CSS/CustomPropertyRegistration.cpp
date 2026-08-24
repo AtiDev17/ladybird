@@ -8,7 +8,6 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/Length.h>
-#include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/Parser/Syntax.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -61,7 +60,7 @@ NonnullRefPtr<StyleValue const> initial_custom_property_value(Optional<CustomPro
     return GuaranteedInvalidStyleValue::create();
 }
 
-NonnullRefPtr<StyleValue const> inherited_custom_property_value(Optional<CustomPropertyRegistration const&> registration, AbstractOrHypotheticalElement const& element, Utf16FlyString const& name, ComputedStyleWorkingSet const* computed_style_for_custom_property_resolution, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+NonnullRefPtr<StyleValue const> inherited_custom_property_value(Optional<CustomPropertyRegistration const&> registration, AbstractOrHypotheticalElement const& element, Utf16FlyString const& name, ComputedStyleWorkingSet const* computed_style_for_custom_property_resolution)
 {
     if (auto element_to_inherit_style_from = element.element_to_inherit_style_from(); element_to_inherit_style_from.has_value()) {
         if (auto parent_property = element_to_inherit_style_from->get_custom_property(name)) {
@@ -77,17 +76,19 @@ NonnullRefPtr<StyleValue const> inherited_custom_property_value(Optional<CustomP
             //     contains a value which inherits a different, not yet computed, custom property's value.
 
             // FIXME: We probably need to compute this against the declaring element rather than the parent element.
-            auto computed_parent_value = element.document().style_computer().compute_value_of_custom_property(computed_style_for_custom_property_resolution, element_to_inherit_style_from.value(), name, guarded_contexts);
+            auto computed_parent_value = element.document().style_computer().compute_value_of_custom_property(computed_style_for_custom_property_resolution, element_to_inherit_style_from.value(), name);
 
             // https://drafts.csswg.org/css-mixins/#resolve-function-styles
             // inherit
             //   Resolves like an inherit() function with the custom property name as its one and only argument.
             // Note: This ensures that a function parameter defaulted to inherit is reinterpreted using the local parameter type.
-            auto inherited_value_tokens = computed_parent_value->tokenize();
-            if (contains_guaranteed_invalid_value(inherited_value_tokens))
+            if (computed_parent_value->is_guaranteed_invalid())
                 return GuaranteedInvalidStyleValue::create();
 
-            return UnresolvedStyleValue::create(move(inherited_value_tokens), {});
+            return UnresolvedStyleValue::create(computed_parent_value->is_unresolved()
+                    ? computed_parent_value->as_unresolved().token_source()
+                    : computed_parent_value->to_utf16_string(SerializationMode::ResolvedValueForReparse),
+                {});
         }
     }
 

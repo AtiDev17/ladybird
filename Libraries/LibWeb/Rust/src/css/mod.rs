@@ -20,6 +20,7 @@ pub mod css_enums;
 pub mod css_pixels;
 pub(crate) mod css_tokenizer;
 pub mod custom_properties;
+pub(crate) mod descriptor_metadata;
 pub mod display;
 pub mod ffi_stats;
 pub mod ffi_support;
@@ -42,5 +43,4 @@ pub(crate) mod worker_pool;
 
 pub use css_tokenizer::CssHashType;
 pub use css_tokenizer::CssNumberType;
-pub use css_tokenizer::CssToken;
 pub use css_tokenizer::CssTokenType;
