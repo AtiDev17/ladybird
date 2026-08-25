@@ -338,6 +338,42 @@ pub(crate) fn simplify_parsed_calculation(
     Some((simplified, numeric_type))
 }
 
+pub(crate) fn serialize_context_free_calculation(
+    name: &[u16],
+    values: &[crate::css::parser::component_value::ComponentValue],
+    expected_base_type: usize,
+) -> Option<Vec<u16>> {
+    let root = crate::css::parser::calc_parser::parse_a_calc_function_node(
+        name,
+        values,
+        crate::css::parser::calc_parser::CalcParserContext {
+            percentages_resolve_as: None,
+            property: 0,
+            random_function_index: std::ptr::null_mut(),
+            intern_utf16_fly_string: None,
+            allowed_color_channels: 0,
+            allow_random_functions: false,
+            parse_context: std::ptr::null(),
+        },
+    )
+    .ok()?;
+    let (_, numeric_type) = simplify_parsed_calculation(root.clone(), None)?;
+    if !numeric_type.matches_dimension(expected_base_type, None) {
+        return None;
+    }
+    let calculated = crate::css::style_value::StyleValueData::Calculated {
+        rust_calculation: CalcNodeHandle::from_arc(root),
+        resolve_as_is_number: false,
+        resolve_as_base: 0,
+        resolved_type: FfiNumericType::from_calc(Some(numeric_type)),
+        has_percentages_resolve_as: false,
+        percentages_resolve_as: 0,
+        resolve_numbers_as_integers: false,
+        accepted_ranges: crate::css::style_value::RetainedNumericRangeList::empty(),
+    };
+    crate::css::serialize::serialize_style_value_to_utf16(&calculated)
+}
+
 /// The result of evaluating a calculation: the numeric value in canonical
 /// units and the numeric type it carries.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -3219,6 +3255,57 @@ pub(crate) fn resolve_calculated_integer_without_context(
         return Some(if value > 0.0 { i32::MAX } else { i32::MIN });
     }
     Some((value + 0.5).floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32)
+}
+
+/// Resolves a calculated value that must produce an integer using length metrics for math
+/// functions whose intermediate values contain relative lengths.
+pub(crate) fn resolve_calculated_integer_with_context(
+    calculated: &crate::css::style_value::StyleValueData,
+    context: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> Option<i32> {
+    let (value, numeric_type, resolve_as) = resolve_calculated_with_length_resolution(
+        calculated,
+        None,
+        LengthResolution {
+            context: Some(context),
+            fallback: None,
+        },
+    )?;
+    if !numeric_type.matches_number(resolve_as) {
+        return None;
+    }
+    if value.is_nan() {
+        return Some(0);
+    }
+    if value.is_infinite() {
+        return Some(if value > 0.0 { i32::MAX } else { i32::MIN });
+    }
+    Some((value + 0.5).floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32)
+}
+
+/// Resolves a calculated value that must produce a resolution. Returns dots per pixel.
+pub(crate) fn resolve_calculated_resolution_without_context(
+    calculated: &crate::css::style_value::StyleValueData,
+) -> Option<f64> {
+    let (value, numeric_type, resolve_as) = resolve_calculated_without_context(calculated, None)?;
+    numeric_type.matches_dimension(4, resolve_as).then_some(value)
+}
+
+/// Resolves a calculated resolution using length metrics for math functions whose intermediate
+/// values contain relative lengths. Returns dots per pixel.
+pub(crate) fn resolve_calculated_resolution_with_context(
+    calculated: &crate::css::style_value::StyleValueData,
+    context: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> Option<f64> {
+    let (value, numeric_type, resolve_as) = resolve_calculated_with_length_resolution(
+        calculated,
+        None,
+        LengthResolution {
+            context: Some(context),
+            fallback: None,
+        },
+    )?;
+    numeric_type.matches_dimension(4, resolve_as).then_some(value)
 }
 
 /// Resolves a calculated value that must produce a flex value, with no

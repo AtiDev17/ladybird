@@ -295,26 +295,30 @@ static u8 evaluate_condition_for_substitution(AbstractOrHypotheticalElement elem
 {
     auto source_view = utf16_view(source);
     auto parser = Parser::Parser::create(Parser::ParsingParams { element.document() }, source_view);
-    OwnPtr<BooleanExpression> expression;
+    Optional<RustQueryHandle> query;
     if (kind == 0) {
-        expression = Parser::RustQueryParser::parse_media_feature(parser, source_view);
-        if (!expression)
-            expression = Parser::RustQueryParser::parse_media_condition(parser, source_view);
+        query = Parser::RustQueryParser::parse_media_feature(parser, source_view);
+        if (!query.has_value())
+            query = Parser::RustQueryParser::parse_media_condition(parser, source_view);
     } else if (kind == 1) {
-        expression = Parser::RustQueryParser::parse_supports_declaration(parser, source_view);
-        if (!expression)
-            expression = Parser::RustQueryParser::parse_supports_condition(parser, source_view);
+        query = Parser::RustQueryParser::parse_supports_declaration(parser, source_view);
+        if (!query.has_value())
+            query = Parser::RustQueryParser::parse_supports_condition(parser, source_view);
     } else {
         VERIFY(kind == 2);
-        expression = Parser::RustQueryParser::parse_style_query(parser, source_view);
+        query = Parser::RustQueryParser::parse_style_query(parser, source_view);
     }
-    if (!expression)
+    if (!query.has_value())
         return 2;
     prepare_for_style_query_evaluation();
-    auto matches = expression->evaluate_to_boolean({
-        .document = &element.document(),
-        .style_query_element = element,
-    });
+    bool matches = false;
+    if (kind == 0) {
+        matches = evaluate_media_condition(*query, MediaEnvironmentSnapshot { element.document() }) == MatchResult::True;
+    } else if (kind == 1) {
+        matches = supports_condition_matches(*query);
+    } else {
+        matches = evaluate_style_query(*query, element) == MatchResult::True;
+    }
     return style_query_cycle_detected() ? 3 : matches;
 }
 
@@ -407,6 +411,19 @@ ComputedStyleRecordView StyleComputer::computed_style_record_view(StyleRecordID 
     pin_style_record(style_record_identity);
     ++m_computed_style_record_view_pin_count;
     return ComputedStyleRecordView { view, *this, style_record_identity };
+}
+
+StyleComputer::StyleRecordStatus StyleComputer::style_record_status(StyleRecordID style_record_identity) const
+{
+    if (!style_record_identity)
+        return {};
+    auto view = m_style_engine.style_record_view(style_record_identity);
+    if (!view.present)
+        return {};
+    return {
+        .present = true,
+        .in_display_none_subtree = (view.dependency_flags & to_underlying(StyleRecordDependencyFlag::InDisplayNoneSubtree)) != 0,
+    };
 }
 
 void const* StyleComputer::style_record_payloads(StyleRecordID style_record_identity) const
@@ -3905,9 +3922,9 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
     for (size_t index = 0; index < payloads.size(); ++index)
         payloads[index] = payload_source.style_group_payload(static_cast<StyleGroupIndex>(index));
     auto custom_property_environment = abstract_element.has_value() ? abstract_element->custom_property_data() : nullptr;
-    u8 dependency_flags = static_cast<u8>(base.depends_on_viewport_metrics())
-        | (static_cast<u8>(base.font_metrics_depend_on_viewport_metrics()) << 1)
-        | (static_cast<u8>(base.in_display_none_subtree()) << 2);
+    u8 dependency_flags = (base.depends_on_viewport_metrics() ? to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics) : 0)
+        | (base.font_metrics_depend_on_viewport_metrics() ? to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics) : 0)
+        | (base.in_display_none_subtree() ? to_underlying(StyleRecordDependencyFlag::InDisplayNoneSubtree) : 0);
     if (abstract_element.has_value() && !abstract_element->pseudo_element().has_value()) {
         auto& element = abstract_element->element();
         bool const inherited_group_swap_eligible = element.style_input_record()

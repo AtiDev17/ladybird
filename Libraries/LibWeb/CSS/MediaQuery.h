@@ -6,42 +6,43 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
-#include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/Utf16FlyString.h>
-#include <LibWeb/CSS/BooleanExpression.h>
-#include <LibWeb/CSS/FeatureQuery.h>
 #include <LibWeb/CSS/MediaFeatureID.h>
+#include <LibWeb/CSS/Query.h>
+#include <LibWeb/CSS/RustQueryHandle.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
+#include <LibWeb/Forward.h>
 
 namespace Web::CSS {
+
+class MediaEnvironmentSnapshot {
+public:
+    explicit MediaEnvironmentSnapshot(DOM::Document const&);
+
+    Parser::ValueParserFFI::FfiMediaEnvironment ffi_environment() const
+    {
+        return {
+            .values = m_values.data(),
+            .value_count = m_values.size(),
+            .length_resolution_context = m_length_resolution_context.has_value() ? &*m_length_resolution_context : nullptr,
+        };
+    }
+
+private:
+    static_assert(media_feature_count == to_underlying(MediaFeatureID::Width) + 1);
+    Array<Parser::ValueParserFFI::FfiMediaFeatureValue, media_feature_count> m_values {};
+    Optional<ComputedValuesFFI::FfiLengthResolutionContext> m_length_resolution_context;
+};
 
 namespace Parser {
 
 class RustQueryParser;
 
 }
-
-// https://www.w3.org/TR/mediaqueries-4/#mq-features
-class MediaFeature final : public FeatureQuery<MediaFeature, MediaFeatureID> {
-public:
-    using Base = FeatureQuery<MediaFeature, MediaFeatureID>;
-
-    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
-    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
-
-    static StringView serialize_feature_id(MediaFeatureID);
-    static bool keyword_is_falsey(MediaFeatureID, Keyword);
-
-private:
-    friend Base;
-
-    MediaFeature(Type type, MediaFeatureID id, Variant<Empty, FeatureValue, Range> value = {})
-        : Base(type, id, move(value))
-    {
-    }
-};
 
 class MediaQuery : public RefCounted<MediaQuery> {
     friend class Parser::Parser;
@@ -50,55 +51,35 @@ class MediaQuery : public RefCounted<MediaQuery> {
 public:
     ~MediaQuery() = default;
 
-    // https://www.w3.org/TR/mediaqueries-4/#media-types
-    enum class KnownMediaType : u8 {
-        All,
-        Print,
-        Screen,
-    };
-    struct MediaType {
-        Utf16FlyString name;
-        Optional<KnownMediaType> known_type;
-    };
-
     static NonnullRefPtr<MediaQuery> create_not_all();
-    static NonnullRefPtr<MediaQuery> create() { return adopt_ref(*new MediaQuery); }
+    static NonnullRefPtr<MediaQuery> create(RustQueryHandle handle) { return adopt_ref(*new MediaQuery(move(handle))); }
 
     bool matches() const { return m_matches; }
     bool evaluate(DOM::Document const&);
+    bool evaluate(MediaEnvironmentSnapshot const&);
     Utf16String to_string() const;
     void serialize_to(Utf16StringBuilder&) const;
 
     void dump(StringBuilder&, int indent_levels = 0) const;
 
 private:
-    MediaQuery() = default;
+    explicit MediaQuery(RustQueryHandle handle)
+        : m_rust_query_handle(move(handle))
+    {
+    }
 
-    // https://www.w3.org/TR/mediaqueries-4/#mq-not
-    bool m_negated { false };
-    MediaType m_media_type { .name = "all"_utf16_fly_string, .known_type = KnownMediaType::All };
-    OwnPtr<BooleanExpression> m_media_condition { nullptr };
+    RustQueryHandle m_rust_query_handle;
 
     // Cached value, updated by evaluate()
     bool m_matches { false };
 };
 
+MatchResult evaluate_media_condition(RustQueryHandle const&, MediaEnvironmentSnapshot const&);
 Utf16String serialize_a_media_query_list(Vector<NonnullRefPtr<MediaQuery>> const&);
-
-Optional<MediaQuery::KnownMediaType> media_type_from_string(Utf16View);
-StringView to_string(MediaQuery::KnownMediaType);
 
 }
 
 namespace AK {
-
-template<>
-struct Formatter<Web::CSS::MediaFeature> : Formatter<StringView> {
-    ErrorOr<void> format(FormatBuilder& builder, Web::CSS::MediaFeature const& media_feature)
-    {
-        return Formatter<StringView>::format(builder, media_feature.to_string().to_utf8());
-    }
-};
 
 template<>
 struct Formatter<Web::CSS::MediaQuery> : Formatter<StringView> {

@@ -4,15 +4,26 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::css_enums::keyword_from_ascii_case_insensitive;
+use crate::css::css_pixels::CssPixels;
 use crate::css::css_tokenizer::{ParserString, ParserTokenKind, TokenizerInput, tokenize_for_parser};
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::parser::component_value::{
     ComponentKind, ComponentValue, consume_a_list_of_component_values, trim_whitespace,
 };
-use crate::css::parser::syntax_parser::{FfiSyntaxParse, FfiSyntaxParseData};
 use crate::css::parser::token_stream::TokenStream;
-use crate::css::parser::value_parser::{equals_ascii_case_insensitive, is_valid_custom_ident};
+use crate::css::parser::value_parser::{
+    FfiValueParsingContext, FfiValueParsingContextKind, NumericRange, ParseContext, equals_ascii_case_insensitive,
+    is_valid_custom_ident, parse_integer_from_stream, parse_length_from_stream, parse_number_from_stream,
+    parse_ratio_value_with_context, parse_resolution_from_stream,
+};
+use crate::css::serialize::{StringUnits, TextSink, serialize_an_identifier, serialize_component_values_to_utf16};
+use crate::css::style_compute::FfiLengthResolutionContext;
+use crate::css::style_value::StyleValueData;
 use std::ffi::c_void;
+use std::sync::Arc;
+
+include!(concat!(env!("OUT_DIR"), "/media_features_generated.rs"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -20,6 +31,7 @@ pub(crate) enum QueryKind {
     Media,
     Size,
     Style,
+    Supports,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +41,93 @@ pub(crate) enum MatchResult {
     False,
     True,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+#[allow(dead_code)] // Constructed by C++ when it builds the media environment snapshot.
+pub enum FfiMediaFeatureValueKind {
+    Absent,
+    Ident,
+    Integer,
+    Length,
+    Ratio,
+    Resolution,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiSupportsFeatureKind {
+    Declaration,
+    Selector,
+    FontTech,
+    FontFormat,
+    AtRule,
+    Env,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiMediaFeatureValue {
+    pub kind: FfiMediaFeatureValueKind,
+    pub keyword: u16,
+    pub value: f64,
+    pub second_value: f64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiMediaEnvironment {
+    pub values: *const FfiMediaFeatureValue,
+    pub value_count: usize,
+    pub length_resolution_context: *const c_void,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiContainerStyleFeatureKind {
+    Boolean,
+    Plain,
+    Range,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiStyleRangeValueKind {
+    Property,
+    Components,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiStyleRangeValue {
+    pub kind: FfiStyleRangeValueKind,
+    pub value: FfiUtf16View,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiContainerStyleFeature {
+    pub kind: FfiContainerStyleFeatureKind,
+    pub values: *const FfiStyleRangeValue,
+    pub value_count: usize,
+    pub first_comparison: u8,
+    pub second_comparison: u8,
+}
+
+type EvaluateContainerStyleFeature = unsafe extern "C" fn(*mut c_void, FfiContainerStyleFeature) -> u8;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiContainerFacts {
+    pub container_available: bool,
+    pub size_available: bool,
+    pub width: f64,
+    pub height: f64,
+    pub inline_axis_horizontal: bool,
+    pub length_resolution_context: *const c_void,
+    pub style_context: *mut c_void,
+    pub evaluate_style_feature: EvaluateContainerStyleFeature,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,12 +171,30 @@ pub(crate) enum QueryFeature {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SupportsFeature {
-    Declaration(Vec<ComponentValue>),
-    Selector(Vec<ComponentValue>),
-    FontTech(ParserString),
-    FontFormat(ParserString),
-    AtRule(ParserString),
-    Env(ParserString),
+    Declaration {
+        components: Vec<ComponentValue>,
+        matches: bool,
+    },
+    Selector {
+        components: Vec<ComponentValue>,
+        matches: bool,
+    },
+    FontTech {
+        name: ParserString,
+        matches: bool,
+    },
+    FontFormat {
+        name: ParserString,
+        matches: bool,
+    },
+    AtRule {
+        name: ParserString,
+        matches: bool,
+    },
+    Env {
+        name: ParserString,
+        matches: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -730,29 +847,49 @@ fn looks_like_supports_declaration(values: &[ComponentValue]) -> bool {
             .all(|value| !matches!(value.kind, ComponentKind::Token(ParserTokenKind::Semicolon)))
 }
 
-fn parse_supports_feature(stream: &mut TokenStream<'_>) -> Option<Expression> {
+fn supports_components_source(components: &[ComponentValue]) -> Vec<u16> {
+    components
+        .iter()
+        .flat_map(|component| component.original_source_text.iter())
+        .collect()
+}
+
+fn parse_supports_feature<E>(stream: &mut TokenStream<'_>, evaluate_feature: &E) -> Option<Expression>
+where
+    E: Fn(FfiSupportsFeatureKind, &[u16]) -> bool,
+{
     let mut transaction = stream.begin_transaction();
     transaction.discard_whitespace();
     let first = transaction.consume_a_token().clone();
     if let Some(values) = parenthesized_values(&first) {
         let values = trim_whitespace(values);
         if looks_like_supports_declaration(values) && contains_only_any_value(values) {
+            let matches = evaluate_feature(FfiSupportsFeatureKind::Declaration, &supports_components_source(values));
             transaction.commit();
             return Some(Expression::InParens(Box::new(Expression::SupportsFeature(
-                SupportsFeature::Declaration(values.to_vec()),
+                SupportsFeature::Declaration {
+                    components: values.to_vec(),
+                    matches,
+                },
             ))));
         }
         return None;
     }
     let (name, values) = first.function()?;
-    let feature = if equals_ascii_case_insensitive(name, b"selector") {
-        SupportsFeature::Selector(values.to_vec())
+    let (kind, name_or_source) = if equals_ascii_case_insensitive(name, b"selector") {
+        (FfiSupportsFeatureKind::Selector, supports_components_source(values))
     } else if equals_ascii_case_insensitive(name, b"font-tech") {
-        SupportsFeature::FontTech(single_ident(values)?)
+        (
+            FfiSupportsFeatureKind::FontTech,
+            single_ident(values)?.as_ref().to_vec(),
+        )
     } else if equals_ascii_case_insensitive(name, b"font-format") {
-        SupportsFeature::FontFormat(single_ident(values)?)
+        (
+            FfiSupportsFeatureKind::FontFormat,
+            single_ident(values)?.as_ref().to_vec(),
+        )
     } else if equals_ascii_case_insensitive(name, b"env") {
-        SupportsFeature::Env(single_ident(values)?)
+        (FfiSupportsFeatureKind::Env, single_ident(values)?.as_ref().to_vec())
     } else if equals_ascii_case_insensitive(name, b"at-rule") {
         let values = trim_whitespace(values);
         let [value] = values else {
@@ -761,27 +898,74 @@ fn parse_supports_feature(stream: &mut TokenStream<'_>) -> Option<Expression> {
         let ComponentKind::Token(ParserTokenKind::AtKeyword(name)) = &value.kind else {
             return None;
         };
-        SupportsFeature::AtRule(name.clone())
+        (FfiSupportsFeatureKind::AtRule, name.as_ref().to_vec())
     } else {
         return None;
+    };
+    let matches = evaluate_feature(kind, &name_or_source);
+    let feature = match kind {
+        FfiSupportsFeatureKind::Selector => SupportsFeature::Selector {
+            components: values.to_vec(),
+            matches,
+        },
+        FfiSupportsFeatureKind::FontTech => SupportsFeature::FontTech {
+            name: ParserString::from(name_or_source.into_boxed_slice()),
+            matches,
+        },
+        FfiSupportsFeatureKind::FontFormat => SupportsFeature::FontFormat {
+            name: ParserString::from(name_or_source.into_boxed_slice()),
+            matches,
+        },
+        FfiSupportsFeatureKind::AtRule => SupportsFeature::AtRule {
+            name: ParserString::from(name_or_source.into_boxed_slice()),
+            matches,
+        },
+        FfiSupportsFeatureKind::Env => SupportsFeature::Env {
+            name: ParserString::from(name_or_source.into_boxed_slice()),
+            matches,
+        },
+        FfiSupportsFeatureKind::Declaration => unreachable!(),
     };
     transaction.commit();
     Some(Expression::SupportsFeature(feature))
 }
 
-pub(crate) fn parse_supports_condition<'a>(source: impl Into<TokenizerInput<'a>>) -> Option<Expression> {
+pub(crate) fn parse_supports_condition<'a, E>(
+    source: impl Into<TokenizerInput<'a>>,
+    evaluate_feature: &E,
+) -> Option<Expression>
+where
+    E: Fn(FfiSupportsFeatureKind, &[u16]) -> bool,
+{
     let values = components_from_source(source)?;
     let mut stream = TokenStream::new(&values);
-    let expression = parse_boolean_expression(&mut stream, MatchResult::False, &parse_supports_feature)?;
+    let expression = parse_boolean_expression(&mut stream, MatchResult::False, &|stream| {
+        parse_supports_feature(stream, evaluate_feature)
+    })?;
     stream.discard_whitespace();
     (!stream.has_next_token()).then_some(expression)
 }
 
-fn parse_supports_declaration_from_source<'a>(source: impl Into<TokenizerInput<'a>>) -> Option<Expression> {
+fn parse_supports_declaration_from_source<'a, E>(
+    source: impl Into<TokenizerInput<'a>>,
+    evaluate_feature: &E,
+) -> Option<Expression>
+where
+    E: Fn(FfiSupportsFeatureKind, &[u16]) -> bool,
+{
     let values = components_from_source(source)?;
     let trimmed = trim_whitespace(&values);
-    (looks_like_supports_declaration(trimmed) && contains_only_any_value(&values))
-        .then_some(Expression::SupportsFeature(SupportsFeature::Declaration(values)))
+    if !looks_like_supports_declaration(trimmed) || !contains_only_any_value(&values) {
+        return None;
+    }
+    let matches = evaluate_feature(
+        FfiSupportsFeatureKind::Declaration,
+        &supports_components_source(&values),
+    );
+    Some(Expression::SupportsFeature(SupportsFeature::Declaration {
+        components: values,
+        matches,
+    }))
 }
 
 fn parse_style_range_value(values: &[ComponentValue]) -> Option<StyleRangeValue> {
@@ -1004,374 +1188,1123 @@ where
     Some(result)
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiQueryValue {
-    pub value_type: u8,
-    pub source_offset: usize,
-    pub source_length: usize,
-    pub name_offset: usize,
-    pub name_length: usize,
+#[derive(Clone, Debug, PartialEq)]
+enum QueryTree {
+    MediaQuery(MediaQuery),
+    Expression { expression: Expression, kind: QueryKind },
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiQueryNode {
-    pub node_type: u8,
-    pub feature_id: u8,
-    pub feature_type: u8,
-    pub match_result: u8,
-    pub first_comparison: u8,
-    pub second_comparison: u8,
-    pub name_offset: usize,
-    pub name_length: usize,
-    pub children_start: usize,
-    pub child_count: usize,
-    pub values_start: usize,
-    pub value_count: usize,
+pub struct FfiQueryHandle {
+    #[allow(dead_code)] // Read by query operations added in subsequent porting stages.
+    tree: QueryTree,
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiMediaQuery {
-    pub negated: bool,
-    pub valid: bool,
-    pub has_media_type: bool,
-    pub has_condition: bool,
-    pub media_type_offset: usize,
-    pub media_type_length: usize,
-    pub condition: usize,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiQueryParseData {
-    pub syntax: FfiSyntaxParseData,
-    pub nodes: *const FfiQueryNode,
-    pub node_count: usize,
-    pub node_indices: *const usize,
-    pub node_index_count: usize,
-    pub query_values: *const FfiQueryValue,
-    pub query_value_count: usize,
-    pub media_queries: *const FfiMediaQuery,
-    pub media_query_count: usize,
-    pub root: usize,
-    pub has_root: bool,
-}
-
-pub struct FfiQueryParse {
-    syntax: FfiSyntaxParse,
-    nodes: Vec<FfiQueryNode>,
-    node_indices: Vec<usize>,
-    query_values: Vec<FfiQueryValue>,
-    media_queries: Vec<FfiMediaQuery>,
-    root: Option<usize>,
-}
-
-impl FfiQueryParse {
-    fn new() -> Self {
-        Self {
-            syntax: FfiSyntaxParse::new(std::ptr::null(), None, false),
-            nodes: Vec::new(),
-            node_indices: Vec::new(),
-            query_values: Vec::new(),
-            media_queries: Vec::new(),
-            root: None,
-        }
+fn push_utf16(sink: &mut TextSink, value: &[u16]) {
+    for &unit in value {
+        sink.push_code_unit(unit);
     }
+}
 
-    fn append_name(&mut self, name: &[u16]) -> (usize, usize) {
-        self.syntax.append_value(name)
-    }
-
-    fn append_query_value(&mut self, value: &StyleRangeValue) -> usize {
-        let (value_type, source_offset, source_length, name_offset, name_length) = match value {
-            StyleRangeValue::Property(name) => {
-                let (name_offset, name_length) = self.append_name(name.as_ref());
-                (1, 0, 0, name_offset, name_length)
-            }
-            StyleRangeValue::Components(components) => {
-                let source = crate::css::serialize::serialize_component_values_to_utf16(
-                    components,
-                    crate::css::parser::component_value::ComponentSerializationMode::Normalized,
-                );
-                let (source_offset, source_length) = self.syntax.append_value(&source);
-                (0, source_offset, source_length, 0, 0)
-            }
-        };
-        let index = self.query_values.len();
-        self.query_values.push(FfiQueryValue {
-            value_type,
-            source_offset,
-            source_length,
-            name_offset,
-            name_length,
-        });
-        index
-    }
-
-    fn append_feature_value(&mut self, value: &QueryFeatureValue) -> usize {
-        let source = crate::css::serialize::serialize_component_values_to_utf16(
-            &value.components,
-            crate::css::parser::component_value::ComponentSerializationMode::PreserveNumericSource,
-        );
-        let (source_offset, source_length) = self.syntax.append_value(&source);
-        let index = self.query_values.len();
-        self.query_values.push(FfiQueryValue {
-            value_type: 0,
-            source_offset,
-            source_length,
-            name_offset: 0,
-            name_length: 0,
-        });
-        index
-    }
-
-    fn append_children(&mut self, children: &[Expression]) -> (usize, usize) {
-        let indices = children
+fn serialize_query_feature_value(sink: &mut TextSink, value: &QueryFeatureValue, id: u8, kind: QueryKind) {
+    let components = trim_whitespace(&value.components);
+    let media_feature_value_types = if kind == QueryKind::Media {
+        MEDIA_FEATURES
+            .get(usize::from(id))
+            .map_or(0, |metadata| metadata.accepted_value_types)
+    } else {
+        0
+    };
+    let is_ratio = media_feature_value_types & MEDIA_FEATURE_VALUE_RATIO != 0 || (kind == QueryKind::Size && id == 0);
+    if is_ratio {
+        let components = components
             .iter()
-            .map(|child| self.append_expression(child))
+            .filter(|component| !component.is_whitespace())
             .collect::<Vec<_>>();
-        let start = self.node_indices.len();
-        self.node_indices.extend(indices);
-        (start, children.len())
+        if let [numerator, slash, denominator] = components.as_slice()
+            && slash.is_delim(b'/')
+        {
+            push_utf16(
+                sink,
+                &serialize_component_values_to_utf16(
+                    std::slice::from_ref(*numerator),
+                    crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+                ),
+            );
+            sink.push_ascii(" / ");
+            push_utf16(
+                sink,
+                &serialize_component_values_to_utf16(
+                    std::slice::from_ref(*denominator),
+                    crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+                ),
+            );
+            return;
+        }
+    }
+    if kind == QueryKind::Media
+        && media_feature_value_types & MEDIA_FEATURE_VALUE_RESOLUTION != 0
+        && let [component] = components
+        && let Some((name, values)) = component.function()
+        && let Some(serialized) = crate::css::calc::serialize_context_free_calculation(name, values, 4)
+    {
+        push_utf16(sink, &serialized);
+        return;
+    }
+    let serialized = serialize_component_values_to_utf16(
+        &value.components,
+        crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+    );
+    push_utf16(sink, &serialized);
+}
+
+fn feature_comparison_text(comparison: FeatureComparison) -> &'static str {
+    match comparison {
+        FeatureComparison::Equal => "=",
+        FeatureComparison::LessThan => "<",
+        FeatureComparison::LessThanOrEqual => "<=",
+        FeatureComparison::GreaterThan => ">",
+        FeatureComparison::GreaterThanOrEqual => ">=",
+    }
+}
+
+fn serialize_query_feature(sink: &mut TextSink, feature: &QueryFeature, kind: QueryKind) {
+    let id = match feature {
+        QueryFeature::Boolean { id } | QueryFeature::Plain { id, .. } | QueryFeature::Range { id, .. } => *id,
+    };
+    let name = match kind {
+        QueryKind::Media => MEDIA_FEATURES[usize::from(id)].name,
+        QueryKind::Size => [
+            "aspect-ratio",
+            "block-size",
+            "height",
+            "inline-size",
+            "orientation",
+            "width",
+        ][usize::from(id)],
+        QueryKind::Supports | QueryKind::Style => unreachable!("this query kind does not use query features"),
+    };
+
+    sink.push_ascii("(");
+    match feature {
+        QueryFeature::Boolean { .. } => sink.push_ascii(name),
+        QueryFeature::Plain { name_type, value, .. } => {
+            match name_type {
+                FeatureNameType::Normal => {}
+                FeatureNameType::Min => sink.push_ascii("min-"),
+                FeatureNameType::Max => sink.push_ascii("max-"),
+            }
+            sink.push_ascii(name);
+            sink.push_ascii(": ");
+            serialize_query_feature_value(sink, value, id, kind);
+        }
+        QueryFeature::Range { left, right, .. } => {
+            if let Some((value, comparison)) = left {
+                serialize_query_feature_value(sink, value, id, kind);
+                sink.push_ascii(" ");
+                sink.push_ascii(feature_comparison_text(*comparison));
+                sink.push_ascii(" ");
+            }
+            sink.push_ascii(name);
+            if let Some((comparison, value)) = right {
+                sink.push_ascii(" ");
+                sink.push_ascii(feature_comparison_text(*comparison));
+                sink.push_ascii(" ");
+                serialize_query_feature_value(sink, value, id, kind);
+            }
+        }
+    }
+    sink.push_ascii(")");
+}
+
+fn serialize_style_property_name(sink: &mut TextSink, name: &[u16]) {
+    if name.starts_with(&[u16::from(b'-'), u16::from(b'-')]) {
+        serialize_an_identifier(sink, &StringUnits::Utf16(name));
+        return;
+    }
+    let lowercase = name
+        .iter()
+        .map(|unit| {
+            if *unit >= u16::from(b'A') && *unit <= u16::from(b'Z') {
+                *unit + u16::from(b'a' - b'A')
+            } else {
+                *unit
+            }
+        })
+        .collect::<Vec<_>>();
+    serialize_an_identifier(sink, &StringUnits::Utf16(&lowercase));
+}
+
+fn serialize_style_range_value(sink: &mut TextSink, value: &StyleRangeValue) {
+    match value {
+        StyleRangeValue::Property(name) => serialize_style_property_name(sink, name),
+        StyleRangeValue::Components(components) => push_utf16(
+            sink,
+            &serialize_component_values_to_utf16(
+                components,
+                crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+            ),
+        ),
+    }
+}
+
+fn serialize_expression(sink: &mut TextSink, expression: &Expression, kind: QueryKind) {
+    match expression {
+        Expression::Not(child) => {
+            sink.push_ascii("not ");
+            serialize_expression(sink, child, kind);
+        }
+        Expression::And(children) | Expression::Or(children) => {
+            let separator = if matches!(expression, Expression::And(_)) {
+                " and "
+            } else {
+                " or "
+            };
+            for (index, child) in children.iter().enumerate() {
+                if index != 0 {
+                    sink.push_ascii(separator);
+                }
+                serialize_expression(sink, child, kind);
+            }
+        }
+        Expression::InParens(child) => {
+            sink.push_ascii("(");
+            serialize_expression(sink, child, kind);
+            sink.push_ascii(")");
+        }
+        Expression::GeneralEnclosed { component, .. } => push_utf16(sink, &component.original_source_text.to_vec()),
+        Expression::GeneralEnclosedValues { components, .. } => {
+            for component in components {
+                push_utf16(sink, &component.original_source_text.to_vec());
+            }
+        }
+        Expression::QueryFeature(feature) => serialize_query_feature(sink, feature, kind),
+        Expression::SupportsFeature(feature) => match feature {
+            SupportsFeature::Declaration { components, .. } => {
+                for component in components {
+                    push_utf16(sink, &component.original_source_text.to_vec());
+                }
+            }
+            SupportsFeature::Selector { components, .. } => {
+                sink.push_ascii("selector(");
+                for component in components {
+                    push_utf16(sink, &component.original_source_text.to_vec());
+                }
+                sink.push_ascii(")");
+            }
+            SupportsFeature::FontTech { name, .. } => {
+                sink.push_ascii("font-tech(");
+                push_utf16(sink, name);
+                sink.push_ascii(")");
+            }
+            SupportsFeature::FontFormat { name, .. } => {
+                sink.push_ascii("font-format(");
+                push_utf16(sink, name);
+                sink.push_ascii(")");
+            }
+            SupportsFeature::AtRule { name, .. } => {
+                sink.push_ascii("at-rule(@");
+                serialize_an_identifier(sink, &StringUnits::Utf16(name));
+                sink.push_ascii(")");
+            }
+            SupportsFeature::Env { name, .. } => {
+                // NB: Preserve the existing C++ serialization until the behavior can be changed separately.
+                sink.push_ascii("font-format(");
+                serialize_an_identifier(sink, &StringUnits::Utf16(name));
+                sink.push_ascii(")");
+            }
+        },
+        Expression::StyleFunction(child) => {
+            sink.push_ascii("style(");
+            serialize_expression(sink, child, QueryKind::Style);
+            sink.push_ascii(")");
+        }
+        Expression::StyleFeature(feature) => match feature {
+            StyleFeature::Boolean(name) => serialize_style_property_name(sink, name),
+            StyleFeature::Plain {
+                name,
+                original_value_source,
+                ..
+            } => {
+                serialize_style_property_name(sink, name);
+                sink.push_ascii(": ");
+                push_utf16(sink, original_value_source);
+            }
+            StyleFeature::Range {
+                left,
+                left_comparison,
+                middle,
+                right,
+            } => {
+                serialize_style_range_value(sink, left);
+                sink.push_ascii(" ");
+                sink.push_ascii(feature_comparison_text(*left_comparison));
+                sink.push_ascii(" ");
+                serialize_style_range_value(sink, middle);
+                if let Some((comparison, right)) = right {
+                    sink.push_ascii(" ");
+                    sink.push_ascii(feature_comparison_text(*comparison));
+                    sink.push_ascii(" ");
+                    serialize_style_range_value(sink, right);
+                }
+            }
+        },
+    }
+}
+
+fn serialize_media_query(query: &MediaQuery) -> Vec<u16> {
+    let mut sink = TextSink::new();
+    if query.negated {
+        sink.push_ascii("not ");
     }
 
-    fn append_expression(&mut self, expression: &Expression) -> usize {
-        let mut node = FfiQueryNode {
-            node_type: 0,
-            feature_id: 0,
-            feature_type: 0,
-            match_result: 0,
-            first_comparison: 0,
-            second_comparison: 0,
-            name_offset: 0,
-            name_length: 0,
-            children_start: 0,
-            child_count: 0,
-            values_start: 0,
-            value_count: 0,
-        };
-        match expression {
-            Expression::Not(child) => {
-                node.node_type = 0;
-                let child = self.append_expression(child);
-                node.children_start = self.node_indices.len();
-                node.child_count = 1;
-                self.node_indices.push(child);
-            }
-            Expression::And(children) => {
-                node.node_type = 1;
-                (node.children_start, node.child_count) = self.append_children(children);
-            }
-            Expression::Or(children) => {
-                node.node_type = 2;
-                (node.children_start, node.child_count) = self.append_children(children);
-            }
-            Expression::InParens(child) => {
-                node.node_type = 3;
-                let child = self.append_expression(child);
-                node.children_start = self.node_indices.len();
-                node.child_count = 1;
-                self.node_indices.push(child);
-            }
-            Expression::GeneralEnclosed { component, result } => {
-                node.node_type = 4;
-                node.match_result = *result as u8;
-                (node.name_offset, node.name_length) = self
-                    .syntax
-                    .append_value(&component.original_source_text.iter().collect::<Vec<_>>());
-            }
-            Expression::GeneralEnclosedValues { components, result } => {
-                node.node_type = 4;
-                node.match_result = *result as u8;
-                let source = components
-                    .iter()
-                    .flat_map(|component| component.original_source_text.iter())
-                    .collect::<Vec<_>>();
-                (node.name_offset, node.name_length) = self.syntax.append_value(&source);
-            }
-            Expression::QueryFeature(feature) => {
-                node.node_type = 5;
-                match feature {
-                    QueryFeature::Boolean { id } => {
-                        node.feature_id = *id;
-                        node.feature_type = 0;
+    let media_type_is_all = query
+        .media_type
+        .as_ref()
+        .is_none_or(|media_type| equals_ascii_case_insensitive(media_type, b"all"));
+    if query.negated || !media_type_is_all || query.condition.is_none() {
+        let media_type = query.media_type.as_deref().unwrap_or(&[]);
+        if equals_ascii_case_insensitive(media_type, b"all") {
+            sink.push_ascii("all");
+        } else if equals_ascii_case_insensitive(media_type, b"print") {
+            sink.push_ascii("print");
+        } else if equals_ascii_case_insensitive(media_type, b"screen") {
+            sink.push_ascii("screen");
+        } else {
+            let lowercase = media_type
+                .iter()
+                .map(|unit| {
+                    if *unit >= u16::from(b'A') && *unit <= u16::from(b'Z') {
+                        *unit + u16::from(b'a' - b'A')
+                    } else {
+                        *unit
                     }
-                    QueryFeature::Plain { id, name_type, value } => {
-                        node.feature_id = *id;
-                        node.feature_type = match name_type {
-                            FeatureNameType::Normal => 1,
-                            FeatureNameType::Min => 2,
-                            FeatureNameType::Max => 3,
-                        };
-                        node.values_start = self.append_feature_value(value);
-                        node.value_count = 1;
-                    }
-                    QueryFeature::Range { id, left, right } => {
-                        node.feature_id = *id;
-                        node.feature_type = 4;
-                        let start = self.query_values.len();
-                        if let Some((value, comparison)) = left {
-                            node.first_comparison = *comparison as u8;
-                            self.append_feature_value(value);
-                        }
-                        if let Some((comparison, value)) = right {
-                            if left.is_some() {
-                                node.second_comparison = *comparison as u8;
-                            } else {
-                                node.first_comparison = *comparison as u8;
-                            }
-                            self.append_feature_value(value);
-                        }
-                        node.values_start = start;
-                        node.value_count = self.query_values.len() - start;
-                        node.match_result = u8::from(left.is_some()) | (u8::from(right.is_some()) << 1);
-                    }
-                }
+                })
+                .collect::<Vec<_>>();
+            serialize_an_identifier(&mut sink, &StringUnits::Utf16(&lowercase));
+        }
+        if query.condition.is_some() {
+            sink.push_ascii(" and ");
+        }
+    }
+
+    if let Some(condition) = &query.condition {
+        serialize_expression(&mut sink, condition, QueryKind::Media);
+    }
+    sink.into_utf16()
+}
+
+#[derive(Debug, PartialEq)]
+enum ResolvedFeatureValue {
+    Ident(u16),
+    Integer(i32),
+    Length(f64),
+    Ratio { numerator: f64, denominator: f64 },
+    Resolution(f64),
+    Unknown,
+}
+
+fn media_value_parse_context(value_context: &FfiValueParsingContext) -> ParseContext {
+    ParseContext {
+        in_quirks_mode: false,
+        is_svg_presentation_attribute: false,
+        is_substituted_value: false,
+        contains_attr_tainted_values: false,
+        value_contexts: value_context,
+        value_context_count: 1,
+        document_url: std::ptr::null(),
+        document_url_length: 0,
+        document_base_url: std::ptr::null(),
+        document_base_url_length: 0,
+        intern_utf16_fly_string: None,
+        normalize_svg_path_data: None,
+        precomputed_svg_paths: std::ptr::null(),
+        precomputed_svg_path_count: 0,
+        font_format_is_supported: None,
+        font_tech_is_supported: None,
+        descriptor_integer_resolution_context: std::ptr::null(),
+        resolve_descriptor_integer: None,
+        random_function_index: std::ptr::null_mut(),
+    }
+}
+
+fn parse_one_value_from_stream(
+    components: &[ComponentValue],
+    parse: impl FnOnce(&mut TokenStream<'_>) -> Option<StyleValueData>,
+) -> Option<StyleValueData> {
+    let mut stream = TokenStream::new(components);
+    let value = parse(&mut stream)?;
+    stream.discard_whitespace();
+    (!stream.has_next_token()).then_some(value)
+}
+
+fn resolve_number(value: &StyleValueData, length_context: Option<&FfiLengthResolutionContext>) -> Option<f64> {
+    match value {
+        StyleValueData::Number { value } => Some(*value),
+        StyleValueData::Calculated { .. } => length_context
+            .and_then(|context| crate::css::calc::resolve_calculated_number_with_context(value, context))
+            .or_else(|| crate::css::calc::resolve_calculated_number_without_context(value)),
+        _ => None,
+    }
+}
+
+fn resolve_parsed_media_feature_value(
+    value: StyleValueData,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> Option<ResolvedFeatureValue> {
+    match &value {
+        StyleValueData::Integer { value } => Some(ResolvedFeatureValue::Integer(*value)),
+        StyleValueData::Length { value, unit } => {
+            let pixels = if let Some(context) = length_context {
+                let result = crate::css::style_compute::absolutize_length(*value, usize::from(*unit), context);
+                result.handled.then_some(result.px)?
+            } else {
+                crate::css::style_compute::absolute_length_to_px(*value, *unit)?
+            };
+            Some(ResolvedFeatureValue::Length(
+                CssPixels::nearest_value_for(pixels).to_double(),
+            ))
+        }
+        StyleValueData::Ratio { numerator, denominator } => Some(ResolvedFeatureValue::Ratio {
+            numerator: resolve_number(numerator.data(), length_context)?,
+            denominator: resolve_number(denominator.data(), length_context)?,
+        }),
+        StyleValueData::Resolution { value, unit } => {
+            let value = crate::css::calc::CalcNumericValue::Resolution {
+                value: *value,
+                unit: *unit,
             }
-            Expression::SupportsFeature(feature) => {
-                node.node_type = match feature {
-                    SupportsFeature::Declaration(_) => 6,
-                    SupportsFeature::Selector(_) => 7,
-                    SupportsFeature::FontTech(_) => 8,
-                    SupportsFeature::FontFormat(_) => 9,
-                    SupportsFeature::AtRule(_) => 10,
-                    SupportsFeature::Env(_) => 11,
-                };
-                match feature {
-                    SupportsFeature::Declaration(components) | SupportsFeature::Selector(components) => {
-                        let source = components
-                            .iter()
-                            .flat_map(|component| component.original_source_text.iter())
-                            .collect::<Vec<_>>();
-                        let (source_offset, source_length) = self.syntax.append_value(&source);
-                        node.values_start = self.query_values.len();
-                        node.value_count = 1;
-                        self.query_values.push(FfiQueryValue {
-                            value_type: 0,
-                            source_offset,
-                            source_length,
-                            name_offset: 0,
-                            name_length: 0,
-                        });
-                    }
-                    SupportsFeature::FontTech(name)
-                    | SupportsFeature::FontFormat(name)
-                    | SupportsFeature::AtRule(name)
-                    | SupportsFeature::Env(name) => {
-                        (node.name_offset, node.name_length) = self.append_name(name.as_ref());
-                    }
-                }
+            .to_canonical_number(crate::css::calc::LengthResolution::default());
+            Some(ResolvedFeatureValue::Resolution(value))
+        }
+        StyleValueData::Calculated { .. } => {
+            if let Some(value) = length_context
+                .and_then(|context| crate::css::calc::resolve_calculated_integer_with_context(&value, context))
+                .or_else(|| crate::css::calc::resolve_calculated_integer_without_context(&value))
+            {
+                return Some(ResolvedFeatureValue::Integer(value));
             }
-            Expression::StyleFunction(child) => {
-                node.node_type = 12;
-                let child = self.append_expression(child);
-                node.children_start = self.node_indices.len();
-                node.child_count = 1;
-                self.node_indices.push(child);
+            if let Some(context) = length_context
+                && let Some(value) = crate::css::calc::resolve_calculated_length_with_context(&value, context)
+            {
+                return Some(ResolvedFeatureValue::Length(
+                    CssPixels::nearest_value_for(value).to_double(),
+                ));
             }
-            Expression::StyleFeature(feature) => match feature {
-                StyleFeature::Boolean(name) => {
-                    node.node_type = 13;
-                    (node.name_offset, node.name_length) = self.append_name(name.as_ref());
-                }
-                StyleFeature::Plain {
-                    name,
-                    value,
-                    original_source,
-                    original_value_source,
-                } => {
-                    node.node_type = 14;
-                    (node.name_offset, node.name_length) = self.append_name(name.as_ref());
-                    node.values_start = self.append_query_value(&StyleRangeValue::Components(value.clone()));
-                    node.value_count = 1;
-                    (node.children_start, node.child_count) = self.append_name(original_source.as_ref());
-                    let (offset, length) = self.append_name(original_value_source.as_ref());
-                    self.query_values[node.values_start].name_offset = offset;
-                    self.query_values[node.values_start].name_length = length;
-                }
-                StyleFeature::Range {
-                    left,
-                    left_comparison,
-                    middle,
-                    right,
-                } => {
-                    node.node_type = 15;
-                    node.first_comparison = *left_comparison as u8;
-                    node.values_start = self.query_values.len();
-                    self.append_query_value(left);
-                    self.append_query_value(middle);
-                    if let Some((comparison, right)) = right {
-                        node.second_comparison = *comparison as u8;
-                        self.append_query_value(right);
-                    }
-                    node.value_count = self.query_values.len() - node.values_start;
-                }
+            length_context
+                .and_then(|context| crate::css::calc::resolve_calculated_resolution_with_context(&value, context))
+                .or_else(|| crate::css::calc::resolve_calculated_resolution_without_context(&value))
+                .map(ResolvedFeatureValue::Resolution)
+        }
+        _ => None,
+    }
+}
+
+fn parse_media_feature_value(
+    id: u8,
+    value: &QueryFeatureValue,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> ResolvedFeatureValue {
+    let Some(metadata) = MEDIA_FEATURES.get(usize::from(id)) else {
+        return ResolvedFeatureValue::Unknown;
+    };
+    let components = trim_whitespace(&value.components);
+    if let [component] = components
+        && let Some(name) = component.ident()
+        && let Some(keyword) = keyword_from_ascii_case_insensitive(name)
+        && metadata.accepted_keywords.contains(&keyword)
+    {
+        return ResolvedFeatureValue::Ident(keyword);
+    }
+
+    let value_context = FfiValueParsingContext {
+        kind: FfiValueParsingContextKind::Special,
+        value: 2, // SpecialContext::MediaCondition
+        secondary_value: 0,
+        name: FfiUtf16View {
+            ascii: std::ptr::null(),
+            utf16: std::ptr::null(),
+            length: 0,
+        },
+    };
+    let context = media_value_parse_context(&value_context);
+    let types = metadata.accepted_value_types;
+    if types & MEDIA_FEATURE_VALUE_BOOLEAN != 0
+        && let Some(value) = parse_one_value_from_stream(components, |stream| {
+            parse_integer_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        })
+        && (matches!(value, StyleValueData::Calculated { .. })
+            || matches!(value, StyleValueData::Integer { value: 0 | 1 }))
+    {
+        return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+    }
+    if types & MEDIA_FEATURE_VALUE_INTEGER != 0
+        && let Some(value) = parse_one_value_from_stream(components, |stream| {
+            parse_integer_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        })
+    {
+        return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+    }
+    if types & MEDIA_FEATURE_VALUE_LENGTH != 0 {
+        if let Some(value) = parse_one_value_from_stream(components, |stream| {
+            parse_length_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        }) {
+            return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+        }
+        if let Some(value @ StyleValueData::Calculated { .. }) = parse_one_value_from_stream(components, |stream| {
+            parse_number_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        }) && resolve_number(&value, length_context) == Some(0.0)
+        {
+            return ResolvedFeatureValue::Length(0.0);
+        }
+    }
+    if types & MEDIA_FEATURE_VALUE_RATIO != 0 {
+        let values = components
+            .iter()
+            .filter(|value| !value.is_whitespace())
+            .collect::<Vec<_>>();
+        if let Some(value) =
+            parse_ratio_value_with_context(&context, crate::css::property_metadata::property_id::CUSTOM, &values)
+        {
+            return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+        }
+    }
+    if types & MEDIA_FEATURE_VALUE_RESOLUTION != 0
+        && let Some(value) = parse_one_value_from_stream(components, |stream| {
+            parse_resolution_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        })
+    {
+        return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+    }
+    ResolvedFeatureValue::Unknown
+}
+
+fn parse_size_feature_value(
+    id: u8,
+    value: &QueryFeatureValue,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> ResolvedFeatureValue {
+    let components = trim_whitespace(&value.components);
+    if id == 4
+        && let [component] = components
+        && let Some(name) = component.ident()
+        && let Some(keyword) = keyword_from_ascii_case_insensitive(name)
+        && matches!(
+            keyword,
+            crate::css::css_enums::keyword::LANDSCAPE | crate::css::css_enums::keyword::PORTRAIT
+        )
+    {
+        return ResolvedFeatureValue::Ident(keyword);
+    }
+
+    let value_context = FfiValueParsingContext {
+        kind: FfiValueParsingContextKind::Special,
+        value: 2, // SpecialContext::MediaCondition
+        secondary_value: 0,
+        name: FfiUtf16View {
+            ascii: std::ptr::null(),
+            utf16: std::ptr::null(),
+            length: 0,
+        },
+    };
+    let context = media_value_parse_context(&value_context);
+    if matches!(id, 1 | 2 | 3 | 5) {
+        if let Some(value) = parse_one_value_from_stream(components, |stream| {
+            parse_length_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        }) {
+            return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+        }
+        if let Some(value @ StyleValueData::Calculated { .. }) = parse_one_value_from_stream(components, |stream| {
+            parse_number_from_stream(
+                &context,
+                crate::css::property_metadata::property_id::CUSTOM,
+                stream,
+                NumericRange::INFINITE,
+            )
+        }) && resolve_number(&value, length_context) == Some(0.0)
+        {
+            return ResolvedFeatureValue::Length(0.0);
+        }
+    }
+    if id == 0 {
+        let values = components
+            .iter()
+            .filter(|value| !value.is_whitespace())
+            .collect::<Vec<_>>();
+        if let Some(value) =
+            parse_ratio_value_with_context(&context, crate::css::property_metadata::property_id::CUSTOM, &values)
+        {
+            return resolve_parsed_media_feature_value(value, length_context).unwrap_or(ResolvedFeatureValue::Unknown);
+        }
+    }
+    ResolvedFeatureValue::Unknown
+}
+
+fn resolved_environment_value(value: &FfiMediaFeatureValue) -> Option<ResolvedFeatureValue> {
+    match value.kind {
+        FfiMediaFeatureValueKind::Absent => None,
+        FfiMediaFeatureValueKind::Ident => Some(ResolvedFeatureValue::Ident(value.keyword)),
+        FfiMediaFeatureValueKind::Integer => Some(ResolvedFeatureValue::Integer(value.value as i32)),
+        FfiMediaFeatureValueKind::Length => Some(ResolvedFeatureValue::Length(value.value)),
+        FfiMediaFeatureValueKind::Ratio => Some(ResolvedFeatureValue::Ratio {
+            numerator: value.value,
+            denominator: value.second_value,
+        }),
+        FfiMediaFeatureValueKind::Resolution => Some(ResolvedFeatureValue::Resolution(value.value)),
+    }
+}
+
+fn compare_feature_values(
+    left: &ResolvedFeatureValue,
+    comparison: FeatureComparison,
+    right: &ResolvedFeatureValue,
+) -> MatchResult {
+    if matches!(left, ResolvedFeatureValue::Unknown) || matches!(right, ResolvedFeatureValue::Unknown) {
+        return MatchResult::Unknown;
+    }
+    let comparison_matches = |ordering: Option<std::cmp::Ordering>| match comparison {
+        FeatureComparison::Equal => ordering == Some(std::cmp::Ordering::Equal),
+        FeatureComparison::LessThan => ordering == Some(std::cmp::Ordering::Less),
+        FeatureComparison::LessThanOrEqual => {
+            matches!(ordering, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+        }
+        FeatureComparison::GreaterThan => ordering == Some(std::cmp::Ordering::Greater),
+        FeatureComparison::GreaterThanOrEqual => {
+            matches!(ordering, Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+        }
+    };
+    let matches = match (left, right) {
+        (ResolvedFeatureValue::Ident(left), ResolvedFeatureValue::Ident(right)) => {
+            comparison == FeatureComparison::Equal && left == right
+        }
+        (ResolvedFeatureValue::Integer(left), ResolvedFeatureValue::Integer(right)) => {
+            comparison_matches(Some(left.cmp(right)))
+        }
+        (ResolvedFeatureValue::Length(left), ResolvedFeatureValue::Length(right))
+        | (ResolvedFeatureValue::Resolution(left), ResolvedFeatureValue::Resolution(right)) => {
+            comparison_matches(left.partial_cmp(right))
+        }
+        (
+            ResolvedFeatureValue::Ratio {
+                numerator: left_numerator,
+                denominator: left_denominator,
             },
+            ResolvedFeatureValue::Ratio {
+                numerator: right_numerator,
+                denominator: right_denominator,
+            },
+        ) => {
+            comparison_matches((left_numerator / left_denominator).partial_cmp(&(right_numerator / right_denominator)))
         }
-        let index = self.nodes.len();
-        self.nodes.push(node);
-        index
-    }
+        _ => false,
+    };
+    if matches { MatchResult::True } else { MatchResult::False }
+}
 
-    fn append_media_query(&mut self, query: &MediaQuery) {
-        let (media_type_offset, media_type_length) = query
-            .media_type
-            .as_ref()
-            .map_or((0, 0), |name| self.append_name(name.as_ref()));
-        let condition = query
-            .condition
-            .as_ref()
-            .map(|condition| self.append_expression(condition));
-        self.media_queries.push(FfiMediaQuery {
-            negated: query.negated,
-            valid: query.valid,
-            has_media_type: query.media_type.is_some(),
-            has_condition: condition.is_some(),
-            media_type_offset,
-            media_type_length,
-            condition: condition.unwrap_or(0),
-        });
-    }
-
-    fn append_container_condition(&mut self, condition: &ContainerCondition) {
-        let (name_offset, name_length) = condition
-            .name
-            .as_ref()
-            .map_or((0, 0), |name| self.append_name(name.as_ref()));
-        let query = condition.query.as_ref().map(|query| self.append_expression(query));
-        self.media_queries.push(FfiMediaQuery {
-            negated: false,
-            valid: true,
-            has_media_type: condition.name.is_some(),
-            has_condition: query.is_some(),
-            media_type_offset: name_offset,
-            media_type_length: name_length,
-            condition: query.unwrap_or(0),
-        });
-    }
-
-    fn data(&self) -> FfiQueryParseData {
-        FfiQueryParseData {
-            syntax: self.syntax.data(),
-            nodes: self.nodes.as_ptr(),
-            node_count: self.nodes.len(),
-            node_indices: self.node_indices.as_ptr(),
-            node_index_count: self.node_indices.len(),
-            query_values: self.query_values.as_ptr(),
-            query_value_count: self.query_values.len(),
-            media_queries: self.media_queries.as_ptr(),
-            media_query_count: self.media_queries.len(),
-            root: self.root.unwrap_or(0),
-            has_root: self.root.is_some(),
+fn evaluate_query_feature(
+    feature: &QueryFeature,
+    environment: &[FfiMediaFeatureValue],
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> MatchResult {
+    let id = match feature {
+        QueryFeature::Boolean { id } | QueryFeature::Plain { id, .. } | QueryFeature::Range { id, .. } => *id,
+    };
+    let Some(queried_value) = environment.get(usize::from(id)).and_then(resolved_environment_value) else {
+        return MatchResult::False;
+    };
+    match feature {
+        QueryFeature::Boolean { .. } => match &queried_value {
+            ResolvedFeatureValue::Integer(value) => {
+                if *value != 0 {
+                    MatchResult::True
+                } else {
+                    MatchResult::False
+                }
+            }
+            ResolvedFeatureValue::Length(value) | ResolvedFeatureValue::Resolution(value) => {
+                if *value != 0.0 {
+                    MatchResult::True
+                } else {
+                    MatchResult::False
+                }
+            }
+            ResolvedFeatureValue::Ratio { numerator, denominator } => {
+                if numerator.is_finite() && *numerator != 0.0 && denominator.is_finite() && *denominator != 0.0 {
+                    MatchResult::True
+                } else {
+                    MatchResult::False
+                }
+            }
+            ResolvedFeatureValue::Ident(keyword) => {
+                if MEDIA_FEATURES[usize::from(id)].false_keywords.contains(keyword) {
+                    MatchResult::False
+                } else {
+                    MatchResult::True
+                }
+            }
+            ResolvedFeatureValue::Unknown => MatchResult::False,
+        },
+        QueryFeature::Plain { name_type, value, .. } => {
+            let value = parse_media_feature_value(id, value, length_context);
+            match name_type {
+                FeatureNameType::Normal => compare_feature_values(&value, FeatureComparison::Equal, &queried_value),
+                FeatureNameType::Min => {
+                    compare_feature_values(&queried_value, FeatureComparison::GreaterThanOrEqual, &value)
+                }
+                FeatureNameType::Max => {
+                    compare_feature_values(&queried_value, FeatureComparison::LessThanOrEqual, &value)
+                }
+            }
+        }
+        QueryFeature::Range { left, right, .. } => {
+            if let Some((value, comparison)) = left {
+                let value = parse_media_feature_value(id, value, length_context);
+                let result = compare_feature_values(&value, *comparison, &queried_value);
+                if result != MatchResult::True {
+                    return result;
+                }
+            }
+            if let Some((comparison, value)) = right {
+                let value = parse_media_feature_value(id, value, length_context);
+                let result = compare_feature_values(&queried_value, *comparison, &value);
+                if result != MatchResult::True {
+                    return result;
+                }
+            }
+            MatchResult::True
         }
     }
+}
+
+fn evaluate_media_expression(
+    expression: &Expression,
+    environment: &[FfiMediaFeatureValue],
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> MatchResult {
+    match expression {
+        Expression::Not(child) => match evaluate_media_expression(child, environment, length_context) {
+            MatchResult::False => MatchResult::True,
+            MatchResult::True => MatchResult::False,
+            MatchResult::Unknown => MatchResult::Unknown,
+        },
+        Expression::And(children) => {
+            let mut result = MatchResult::True;
+            for child in children {
+                match evaluate_media_expression(child, environment, length_context) {
+                    MatchResult::False => return MatchResult::False,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::True => {}
+                }
+            }
+            result
+        }
+        Expression::Or(children) => {
+            let mut result = MatchResult::False;
+            for child in children {
+                match evaluate_media_expression(child, environment, length_context) {
+                    MatchResult::True => return MatchResult::True,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::False => {}
+                }
+            }
+            result
+        }
+        Expression::InParens(child) => evaluate_media_expression(child, environment, length_context),
+        Expression::GeneralEnclosed { result, .. } | Expression::GeneralEnclosedValues { result, .. } => *result,
+        Expression::QueryFeature(feature) => evaluate_query_feature(feature, environment, length_context),
+        _ => MatchResult::Unknown,
+    }
+}
+
+fn evaluate_supports_expression(expression: &Expression) -> MatchResult {
+    match expression {
+        Expression::Not(child) => match evaluate_supports_expression(child) {
+            MatchResult::False => MatchResult::True,
+            MatchResult::True => MatchResult::False,
+            MatchResult::Unknown => MatchResult::Unknown,
+        },
+        Expression::And(children) => {
+            let mut result = MatchResult::True;
+            for child in children {
+                match evaluate_supports_expression(child) {
+                    MatchResult::False => return MatchResult::False,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::True => {}
+                }
+            }
+            result
+        }
+        Expression::Or(children) => {
+            let mut result = MatchResult::False;
+            for child in children {
+                match evaluate_supports_expression(child) {
+                    MatchResult::True => return MatchResult::True,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::False => {}
+                }
+            }
+            result
+        }
+        Expression::InParens(child) => evaluate_supports_expression(child),
+        Expression::GeneralEnclosed { result, .. } | Expression::GeneralEnclosedValues { result, .. } => *result,
+        Expression::SupportsFeature(feature) => {
+            let matches = match feature {
+                SupportsFeature::Declaration { matches, .. }
+                | SupportsFeature::Selector { matches, .. }
+                | SupportsFeature::FontTech { matches, .. }
+                | SupportsFeature::FontFormat { matches, .. }
+                | SupportsFeature::AtRule { matches, .. }
+                | SupportsFeature::Env { matches, .. } => *matches,
+            };
+            if matches { MatchResult::True } else { MatchResult::False }
+        }
+        _ => MatchResult::Unknown,
+    }
+}
+
+pub const CONTAINER_QUERY_REQUIRES_WIDTH: u8 = 1 << 0;
+pub const CONTAINER_QUERY_REQUIRES_HEIGHT: u8 = 1 << 1;
+pub const CONTAINER_QUERY_REQUIRES_INLINE_SIZE: u8 = 1 << 2;
+pub const CONTAINER_QUERY_REQUIRES_BLOCK_SIZE: u8 = 1 << 3;
+pub const CONTAINER_QUERY_REQUIRES_STYLE: u8 = 1 << 4;
+#[allow(dead_code)] // Reserved until scroll-state container query parsing is implemented.
+pub const CONTAINER_QUERY_REQUIRES_SCROLL_STATE: u8 = 1 << 5;
+pub const CONTAINER_QUERY_HAS_UNKNOWN_FEATURE: u8 = 1 << 6;
+
+fn container_requirements(expression: &Expression) -> u8 {
+    match expression {
+        Expression::Not(child) | Expression::InParens(child) | Expression::StyleFunction(child) => {
+            let requirements = container_requirements(child);
+            if matches!(expression, Expression::StyleFunction(_)) {
+                requirements | CONTAINER_QUERY_REQUIRES_STYLE
+            } else {
+                requirements
+            }
+        }
+        Expression::And(children) | Expression::Or(children) => children
+            .iter()
+            .fold(0, |requirements, child| requirements | container_requirements(child)),
+        Expression::GeneralEnclosed { .. } | Expression::GeneralEnclosedValues { .. } => {
+            CONTAINER_QUERY_HAS_UNKNOWN_FEATURE
+        }
+        Expression::QueryFeature(feature) => {
+            let id = match feature {
+                QueryFeature::Boolean { id } | QueryFeature::Plain { id, .. } | QueryFeature::Range { id, .. } => *id,
+            };
+            match id {
+                0 | 4 => CONTAINER_QUERY_REQUIRES_WIDTH | CONTAINER_QUERY_REQUIRES_HEIGHT,
+                1 => CONTAINER_QUERY_REQUIRES_BLOCK_SIZE,
+                2 => CONTAINER_QUERY_REQUIRES_HEIGHT,
+                3 => CONTAINER_QUERY_REQUIRES_INLINE_SIZE,
+                5 => CONTAINER_QUERY_REQUIRES_WIDTH,
+                _ => CONTAINER_QUERY_HAS_UNKNOWN_FEATURE,
+            }
+        }
+        Expression::StyleFeature(_) => CONTAINER_QUERY_REQUIRES_STYLE,
+        _ => CONTAINER_QUERY_HAS_UNKNOWN_FEATURE,
+    }
+}
+
+fn container_size_value(id: u8, facts: &FfiContainerFacts) -> Option<ResolvedFeatureValue> {
+    if !facts.size_available {
+        return None;
+    }
+    Some(match id {
+        0 => ResolvedFeatureValue::Ratio {
+            numerator: facts.width,
+            denominator: facts.height,
+        },
+        1 => ResolvedFeatureValue::Length(if facts.inline_axis_horizontal {
+            facts.height
+        } else {
+            facts.width
+        }),
+        2 => ResolvedFeatureValue::Length(facts.height),
+        3 => ResolvedFeatureValue::Length(if facts.inline_axis_horizontal {
+            facts.width
+        } else {
+            facts.height
+        }),
+        4 => ResolvedFeatureValue::Ident(if facts.height >= facts.width {
+            crate::css::css_enums::keyword::PORTRAIT
+        } else {
+            crate::css::css_enums::keyword::LANDSCAPE
+        }),
+        5 => ResolvedFeatureValue::Length(facts.width),
+        _ => return None,
+    })
+}
+
+fn evaluate_container_size_feature(
+    feature: &QueryFeature,
+    facts: &FfiContainerFacts,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> MatchResult {
+    let id = match feature {
+        QueryFeature::Boolean { id } | QueryFeature::Plain { id, .. } | QueryFeature::Range { id, .. } => *id,
+    };
+    let Some(queried_value) = container_size_value(id, facts) else {
+        return MatchResult::Unknown;
+    };
+    match feature {
+        QueryFeature::Boolean { .. } => match &queried_value {
+            ResolvedFeatureValue::Length(value) => {
+                if *value != 0.0 {
+                    MatchResult::True
+                } else {
+                    MatchResult::False
+                }
+            }
+            ResolvedFeatureValue::Ratio { numerator, denominator } => {
+                if numerator.is_finite() && *numerator != 0.0 && denominator.is_finite() && *denominator != 0.0 {
+                    MatchResult::True
+                } else {
+                    MatchResult::False
+                }
+            }
+            ResolvedFeatureValue::Ident(_) => MatchResult::True,
+            _ => MatchResult::False,
+        },
+        QueryFeature::Plain { name_type, value, .. } => {
+            let value = parse_size_feature_value(id, value, length_context);
+            match name_type {
+                FeatureNameType::Normal => compare_feature_values(&value, FeatureComparison::Equal, &queried_value),
+                FeatureNameType::Min => {
+                    compare_feature_values(&queried_value, FeatureComparison::GreaterThanOrEqual, &value)
+                }
+                FeatureNameType::Max => {
+                    compare_feature_values(&queried_value, FeatureComparison::LessThanOrEqual, &value)
+                }
+            }
+        }
+        QueryFeature::Range { left, right, .. } => {
+            if let Some((value, comparison)) = left {
+                let value = parse_size_feature_value(id, value, length_context);
+                let result = compare_feature_values(&value, *comparison, &queried_value);
+                if result != MatchResult::True {
+                    return result;
+                }
+            }
+            if let Some((comparison, value)) = right {
+                let value = parse_size_feature_value(id, value, length_context);
+                let result = compare_feature_values(&queried_value, *comparison, &value);
+                if result != MatchResult::True {
+                    return result;
+                }
+            }
+            MatchResult::True
+        }
+    }
+}
+
+fn serialize_style_range_value_for_evaluation(value: &StyleRangeValue) -> (FfiStyleRangeValueKind, Vec<u16>) {
+    match value {
+        StyleRangeValue::Property(name) => (FfiStyleRangeValueKind::Property, name.as_ref().to_vec()),
+        StyleRangeValue::Components(components) => (
+            FfiStyleRangeValueKind::Components,
+            serialize_component_values_to_utf16(
+                components,
+                crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+            ),
+        ),
+    }
+}
+
+fn evaluate_container_style_feature(feature: &StyleFeature, facts: &FfiContainerFacts) -> MatchResult {
+    let evaluate = facts.evaluate_style_feature;
+    let (kind, owned_values, first_comparison, second_comparison) = match feature {
+        StyleFeature::Boolean(name) => (
+            FfiContainerStyleFeatureKind::Boolean,
+            vec![(FfiStyleRangeValueKind::Property, name.as_ref().to_vec())],
+            0,
+            0,
+        ),
+        StyleFeature::Plain { name, value, .. } => (
+            FfiContainerStyleFeatureKind::Plain,
+            vec![
+                (FfiStyleRangeValueKind::Property, name.as_ref().to_vec()),
+                (
+                    FfiStyleRangeValueKind::Components,
+                    serialize_component_values_to_utf16(
+                        value,
+                        crate::css::parser::component_value::ComponentSerializationMode::Normalized,
+                    ),
+                ),
+            ],
+            0,
+            0,
+        ),
+        StyleFeature::Range {
+            left,
+            left_comparison,
+            middle,
+            right,
+        } => {
+            let mut values = vec![
+                serialize_style_range_value_for_evaluation(left),
+                serialize_style_range_value_for_evaluation(middle),
+            ];
+            let second_comparison = if let Some((comparison, value)) = right {
+                values.push(serialize_style_range_value_for_evaluation(value));
+                *comparison as u8
+            } else {
+                0
+            };
+            (
+                FfiContainerStyleFeatureKind::Range,
+                values,
+                *left_comparison as u8,
+                second_comparison,
+            )
+        }
+    };
+    let ffi_values = owned_values
+        .iter()
+        .map(|(kind, value)| FfiStyleRangeValue {
+            kind: *kind,
+            value: FfiUtf16View {
+                ascii: std::ptr::null(),
+                utf16: value.as_ptr(),
+                length: value.len(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        evaluate(
+            facts.style_context,
+            FfiContainerStyleFeature {
+                kind,
+                values: ffi_values.as_ptr(),
+                value_count: ffi_values.len(),
+                first_comparison,
+                second_comparison,
+            },
+        )
+    };
+    match result {
+        0 => MatchResult::False,
+        1 => MatchResult::True,
+        _ => MatchResult::Unknown,
+    }
+}
+
+fn evaluate_container_expression(
+    expression: &Expression,
+    facts: &FfiContainerFacts,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> MatchResult {
+    match expression {
+        Expression::Not(child) => match evaluate_container_expression(child, facts, length_context) {
+            MatchResult::False => MatchResult::True,
+            MatchResult::True => MatchResult::False,
+            MatchResult::Unknown => MatchResult::Unknown,
+        },
+        Expression::And(children) => {
+            let mut result = MatchResult::True;
+            for child in children {
+                match evaluate_container_expression(child, facts, length_context) {
+                    MatchResult::False => return MatchResult::False,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::True => {}
+                }
+            }
+            result
+        }
+        Expression::Or(children) => {
+            let mut result = MatchResult::False;
+            for child in children {
+                match evaluate_container_expression(child, facts, length_context) {
+                    MatchResult::True => return MatchResult::True,
+                    MatchResult::Unknown => result = MatchResult::Unknown,
+                    MatchResult::False => {}
+                }
+            }
+            result
+        }
+        Expression::InParens(child) | Expression::StyleFunction(child) => {
+            evaluate_container_expression(child, facts, length_context)
+        }
+        Expression::GeneralEnclosed { result, .. } | Expression::GeneralEnclosedValues { result, .. } => *result,
+        Expression::QueryFeature(feature) => evaluate_container_size_feature(feature, facts, length_context),
+        Expression::StyleFeature(feature) => evaluate_container_style_feature(feature, facts),
+        _ => MatchResult::Unknown,
+    }
+}
+
+fn evaluate_media_query(
+    query: &MediaQuery,
+    environment: &[FfiMediaFeatureValue],
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> MatchResult {
+    let mut result = match query.media_type.as_deref() {
+        None => MatchResult::True,
+        Some(media_type) if equals_ascii_case_insensitive(media_type, b"all") => MatchResult::True,
+        Some(media_type) if equals_ascii_case_insensitive(media_type, b"screen") => MatchResult::True,
+        Some(media_type) if equals_ascii_case_insensitive(media_type, b"print") => MatchResult::False,
+        Some(_) => MatchResult::False,
+    };
+    if result != MatchResult::False
+        && let Some(condition) = &query.condition
+    {
+        result = match (
+            result,
+            evaluate_media_expression(condition, environment, length_context),
+        ) {
+            (MatchResult::False, _) | (_, MatchResult::False) => MatchResult::False,
+            (MatchResult::True, MatchResult::True) => MatchResult::True,
+            _ => MatchResult::Unknown,
+        };
+    }
+    if query.negated {
+        result = match result {
+            MatchResult::False => MatchResult::True,
+            MatchResult::True => MatchResult::False,
+            MatchResult::Unknown => MatchResult::Unknown,
+        };
+    }
+    result
 }
 
 type ResolveQueryFeature = unsafe extern "C" fn(u8, *const u16, usize) -> u16;
 
+type EvaluateSupportsFeature = unsafe extern "C" fn(*mut c_void, FfiSupportsFeatureKind, FfiUtf16View) -> bool;
+
 type VisitSizesAttributeEntry = unsafe extern "C" fn(*mut c_void, *const u16, usize, *const u16, usize);
+
+type VisitQueryHandle = unsafe extern "C" fn(*mut c_void, *const FfiQueryHandle);
+
+type VisitContainerCondition = unsafe extern "C" fn(*mut c_void, *const u16, usize, bool, *const FfiQueryHandle);
+
+type VisitQuerySerialization = unsafe extern "C" fn(*mut c_void, *const u16, usize);
 
 /// Splits a sizes attribute into its top-level condition and source-size value components.
 ///
@@ -1415,26 +2348,56 @@ fn ffi_resolver(callback: ResolveQueryFeature) -> impl Fn(QueryKind, &[u16]) -> 
     }
 }
 
+fn ffi_supports_evaluator(
+    context: *mut c_void,
+    callback: EvaluateSupportsFeature,
+) -> impl Fn(FfiSupportsFeatureKind, &[u16]) -> bool {
+    move |kind, value| {
+        let value = FfiUtf16View {
+            ascii: std::ptr::null(),
+            utf16: value.as_ptr(),
+            length: value.len(),
+        };
+        // SAFETY: The UTF-16 slice remains live for the duration of the callback.
+        unsafe { callback(context, kind, value) }
+    }
+}
+
+/// Parses a media-query list and visits each resulting retained query tree.
+///
 /// # Safety
-/// The source pointers must identify readable storage for the duration of the call.
+/// The source pointers must identify readable storage for the duration of the call. The callback
+/// must be valid and may retain a query handle with `css_query_ref`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_media_query_list(
+#[allow(clippy::arc_with_non_send_sync)]
+pub unsafe extern "C" fn rust_visit_media_query_list(
     source: FfiUtf16View,
     resolve_feature: ResolveQueryFeature,
-) -> *mut FfiQueryParse {
+    context: *mut c_void,
+    visit: VisitQueryHandle,
+) -> bool {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return false;
         };
         let Some(queries) = parse_media_query_list(source, &ffi_resolver(resolve_feature)) else {
-            return std::ptr::null_mut();
+            return false;
         };
-        let mut parse = FfiQueryParse::new();
-        for query in &queries {
-            parse.append_media_query(query);
+        for query in queries {
+            let handle = Arc::new(FfiQueryHandle {
+                tree: QueryTree::MediaQuery(query),
+            });
+            unsafe { visit(context, Arc::as_ptr(&handle)) };
         }
-        Box::into_raw(Box::new(parse))
+        true
     })
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn create_expression_handle(expression: Expression, kind: QueryKind) -> *const FfiQueryHandle {
+    Arc::into_raw(Arc::new(FfiQueryHandle {
+        tree: QueryTree::Expression { expression, kind },
+    }))
 }
 
 /// # Safety
@@ -1443,20 +2406,18 @@ pub unsafe extern "C" fn rust_parse_media_query_list(
 pub unsafe extern "C" fn rust_parse_media_condition(
     source: FfiUtf16View,
     resolve_feature: ResolveQueryFeature,
-) -> *mut FfiQueryParse {
+) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
         let Some(values) = components_from_source(source) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
         let Some(expression) = parse_media_condition(&values, &ffi_resolver(resolve_feature)) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
-        let mut parse = FfiQueryParse::new();
-        parse.root = Some(parse.append_expression(&expression));
-        Box::into_raw(Box::new(parse))
+        create_expression_handle(expression, QueryKind::Media)
     })
 }
 
@@ -1466,51 +2427,56 @@ pub unsafe extern "C" fn rust_parse_media_condition(
 pub unsafe extern "C" fn rust_parse_media_feature(
     source: FfiUtf16View,
     resolve_feature: ResolveQueryFeature,
-) -> *mut FfiQueryParse {
+) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
         let Some(expression) = parse_media_feature_from_source(source, &ffi_resolver(resolve_feature)) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
-        let mut parse = FfiQueryParse::new();
-        parse.root = Some(parse.append_expression(&expression));
-        Box::into_raw(Box::new(parse))
+        create_expression_handle(expression, QueryKind::Media)
     })
 }
 
 /// # Safety
 /// The source pointers must identify readable storage for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_supports_condition(source: FfiUtf16View) -> *mut FfiQueryParse {
+pub unsafe extern "C" fn rust_parse_supports_condition(
+    source: FfiUtf16View,
+    context: *mut c_void,
+    evaluate_feature: EvaluateSupportsFeature,
+) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
-        let Some(expression) = parse_supports_condition(source) else {
-            return std::ptr::null_mut();
+        let Some(expression) = parse_supports_condition(source, &ffi_supports_evaluator(context, evaluate_feature))
+        else {
+            return std::ptr::null();
         };
-        let mut parse = FfiQueryParse::new();
-        parse.root = Some(parse.append_expression(&expression));
-        Box::into_raw(Box::new(parse))
+        create_expression_handle(expression, QueryKind::Supports)
     })
 }
 
 /// # Safety
 /// The source pointers must identify readable storage for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_supports_declaration(source: FfiUtf16View) -> *mut FfiQueryParse {
+pub unsafe extern "C" fn rust_parse_supports_declaration(
+    source: FfiUtf16View,
+    context: *mut c_void,
+    evaluate_feature: EvaluateSupportsFeature,
+) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
-        let Some(expression) = parse_supports_declaration_from_source(source) else {
-            return std::ptr::null_mut();
+        let Some(expression) =
+            parse_supports_declaration_from_source(source, &ffi_supports_evaluator(context, evaluate_feature))
+        else {
+            return std::ptr::null();
         };
-        let mut parse = FfiQueryParse::new();
-        parse.root = Some(parse.append_expression(&expression));
-        Box::into_raw(Box::new(parse))
+        create_expression_handle(expression, QueryKind::Supports)
     })
 }
 
@@ -1520,60 +2486,295 @@ pub unsafe extern "C" fn rust_parse_supports_declaration(source: FfiUtf16View) -
 pub unsafe extern "C" fn rust_parse_style_query(
     source: FfiUtf16View,
     resolve_feature: ResolveQueryFeature,
-) -> *mut FfiQueryParse {
+) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
         let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
         let Some(expression) = parse_style_query_from_source(source, &ffi_resolver(resolve_feature)) else {
-            return std::ptr::null_mut();
+            return std::ptr::null();
         };
-        let mut parse = FfiQueryParse::new();
-        parse.root = Some(parse.append_expression(&expression));
-        Box::into_raw(Box::new(parse))
+        create_expression_handle(expression, QueryKind::Style)
     })
 }
 
-/// # Safety
-/// The source pointers must identify readable storage for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_container_condition_list(
-    source: FfiUtf16View,
-    resolve_feature: ResolveQueryFeature,
-) -> *mut FfiQueryParse {
-    crate::abort_on_panic(|| {
-        let Some(source) = (unsafe { source.units() }) else {
-            return std::ptr::null_mut();
-        };
-        let Some(conditions) = parse_container_condition_list(source, &ffi_resolver(resolve_feature)) else {
-            return std::ptr::null_mut();
-        };
-        let mut parse = FfiQueryParse::new();
-        for condition in &conditions {
-            parse.append_container_condition(condition);
-        }
-        Box::into_raw(Box::new(parse))
-    })
-}
-
-/// Returns borrowed arena slices which remain live until `rust_query_parse_free`.
+/// Parses a container-condition list and visits each condition name and optional retained tree.
 ///
 /// # Safety
-/// `parse` must be a live pointer returned by a query parsing function.
+/// The source pointers must identify readable storage for the duration of the call. The callback
+/// must be valid and may retain a query handle with `css_query_ref`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_query_parse_data(parse: *const FfiQueryParse) -> FfiQueryParseData {
-    crate::abort_on_panic(|| unsafe { &*parse }.data())
+#[allow(clippy::arc_with_non_send_sync)]
+pub unsafe extern "C" fn rust_visit_container_condition_list(
+    source: FfiUtf16View,
+    resolve_feature: ResolveQueryFeature,
+    context: *mut c_void,
+    visit: VisitContainerCondition,
+) -> bool {
+    crate::abort_on_panic(|| {
+        let Some(source) = (unsafe { source.units() }) else {
+            return false;
+        };
+        let Some(conditions) = parse_container_condition_list(source, &ffi_resolver(resolve_feature)) else {
+            return false;
+        };
+        for condition in conditions {
+            let query_handle = condition.query.map(|expression| {
+                Arc::new(FfiQueryHandle {
+                    tree: QueryTree::Expression {
+                        expression,
+                        kind: QueryKind::Size,
+                    },
+                })
+            });
+            let (name, has_name) = condition.name.as_deref().map_or((&[][..], false), |name| (name, true));
+            unsafe {
+                visit(
+                    context,
+                    name.as_ptr(),
+                    name.len(),
+                    has_name,
+                    query_handle.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
+                );
+            };
+        }
+        true
+    })
 }
 
+/// Adds one strong reference to a borrowed query handle.
+///
 /// # Safety
-/// `parse` must be null or a live pointer returned by a query parsing function, and may be freed once.
+/// `handle` must be null or point to a live query handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_query_parse_free(parse: *mut FfiQueryParse) {
+pub unsafe extern "C" fn css_query_ref(handle: *const FfiQueryHandle) -> *const FfiQueryHandle {
     crate::abort_on_panic(|| {
-        if !parse.is_null() {
-            drop(unsafe { Box::from_raw(parse) });
+        if !handle.is_null() {
+            unsafe { Arc::increment_strong_count(handle) };
+        }
+        handle
+    })
+}
+
+/// Releases one strong reference to a query handle.
+///
+/// # Safety
+/// `handle` must be null or own one strong reference to a live query handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_unref(handle: *const FfiQueryHandle) {
+    crate::abort_on_panic(|| {
+        if !handle.is_null() {
+            unsafe { Arc::decrement_strong_count(handle) };
         }
     });
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::arc_with_non_send_sync)]
+pub extern "C" fn css_query_create_not_all() -> *const FfiQueryHandle {
+    crate::abort_on_panic(|| {
+        Arc::into_raw(Arc::new(FfiQueryHandle {
+            tree: QueryTree::MediaQuery(invalid_media_query()),
+        }))
+    })
+}
+
+/// Serializes a retained media query without changing its UTF-16 representation.
+///
+/// # Safety
+/// `handle` must point to a live media-query handle. The callback must be valid and may only
+/// retain a copy of the borrowed UTF-16 slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_serialize_media_query(
+    handle: *const FfiQueryHandle,
+    context: *mut c_void,
+    visit: VisitQuerySerialization,
+) -> bool {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return false;
+        };
+        let QueryTree::MediaQuery(query) = &handle.tree else {
+            return false;
+        };
+        let serialized = serialize_media_query(query);
+        unsafe { visit(context, serialized.as_ptr(), serialized.len()) };
+        true
+    })
+}
+
+/// Evaluates a retained media query against an immutable feature snapshot.
+///
+/// # Safety
+/// `handle` must point to a live media-query handle. The environment slices and optional length
+/// resolution context must remain readable for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_evaluate_media(
+    handle: *const FfiQueryHandle,
+    environment: FfiMediaEnvironment,
+) -> bool {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return false;
+        };
+        let QueryTree::MediaQuery(query) = &handle.tree else {
+            return false;
+        };
+        let values = if environment.value_count == 0 {
+            &[]
+        } else {
+            if environment.values.is_null() {
+                return false;
+            }
+            unsafe { std::slice::from_raw_parts(environment.values, environment.value_count) }
+        };
+        let length_context = unsafe {
+            environment
+                .length_resolution_context
+                .cast::<FfiLengthResolutionContext>()
+                .as_ref()
+        };
+        evaluate_media_query(query, values, length_context) == MatchResult::True
+    })
+}
+
+/// Evaluates a retained standalone media condition against an immutable feature snapshot.
+///
+/// # Safety
+/// `handle` must point to a live expression handle. The environment slices and optional length
+/// resolution context must remain readable for the duration of this call. Returns 3 when the
+/// handle does not contain a media expression, allowing the caller to use another evaluator.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_evaluate_media_condition(
+    handle: *const FfiQueryHandle,
+    environment: FfiMediaEnvironment,
+) -> u8 {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return 3;
+        };
+        let QueryTree::Expression {
+            expression,
+            kind: QueryKind::Media,
+        } = &handle.tree
+        else {
+            return 3;
+        };
+        let values = if environment.value_count == 0 {
+            &[]
+        } else {
+            if environment.values.is_null() {
+                return MatchResult::False as u8;
+            }
+            unsafe { std::slice::from_raw_parts(environment.values, environment.value_count) }
+        };
+        let length_context = unsafe {
+            environment
+                .length_resolution_context
+                .cast::<FfiLengthResolutionContext>()
+                .as_ref()
+        };
+        evaluate_media_expression(expression, values, length_context) as u8
+    })
+}
+
+/// Evaluates a retained supports condition whose feature results were captured while parsing.
+/// Returns 3 when the handle does not contain a supports expression.
+///
+/// # Safety
+/// `handle` must point to a live supports-expression handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_evaluate_supports(handle: *const FfiQueryHandle) -> u8 {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return 3;
+        };
+        let QueryTree::Expression {
+            expression,
+            kind: QueryKind::Supports,
+        } = &handle.tree
+        else {
+            return 3;
+        };
+        evaluate_supports_expression(expression) as u8
+    })
+}
+
+/// Returns the query-container capabilities needed by a retained container condition.
+///
+/// # Safety
+/// `handle` must point to a live container-expression handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_container_requirements(handle: *const FfiQueryHandle) -> u8 {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return CONTAINER_QUERY_HAS_UNKNOWN_FEATURE;
+        };
+        let QueryTree::Expression {
+            expression,
+            kind: QueryKind::Size,
+        } = &handle.tree
+        else {
+            return CONTAINER_QUERY_HAS_UNKNOWN_FEATURE;
+        };
+        container_requirements(expression)
+    })
+}
+
+/// Evaluates a retained container condition against immutable size facts and style callbacks.
+///
+/// # Safety
+/// `handle` must point to a live container-expression handle. All pointers and callbacks in
+/// `facts` must remain valid for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_evaluate_container(handle: *const FfiQueryHandle, facts: FfiContainerFacts) -> u8 {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return MatchResult::Unknown as u8;
+        };
+        let QueryTree::Expression { expression, kind } = &handle.tree else {
+            return MatchResult::Unknown as u8;
+        };
+        if !matches!(kind, QueryKind::Size | QueryKind::Style) {
+            return MatchResult::Unknown as u8;
+        }
+        if !facts.container_available {
+            return MatchResult::Unknown as u8;
+        }
+        let length_context = unsafe {
+            facts
+                .length_resolution_context
+                .cast::<FfiLengthResolutionContext>()
+                .as_ref()
+        };
+        evaluate_container_expression(expression, &facts, length_context) as u8
+    })
+}
+
+/// Serializes a retained query condition without changing its UTF-16 representation.
+///
+/// # Safety
+/// `handle` must point to a live expression handle. The callback must be valid and may only
+/// retain a copy of the borrowed UTF-16 slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn css_query_serialize_condition(
+    handle: *const FfiQueryHandle,
+    context: *mut c_void,
+    visit: VisitQuerySerialization,
+) -> bool {
+    crate::abort_on_panic(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            return false;
+        };
+        let QueryTree::Expression { expression, kind } = &handle.tree else {
+            return false;
+        };
+        let mut sink = TextSink::new();
+        serialize_expression(&mut sink, expression, *kind);
+        let serialized = sink.into_utf16();
+        unsafe { visit(context, serialized.as_ptr(), serialized.len()) };
+        true
+    })
 }
 
 #[cfg(test)]
@@ -1586,6 +2787,7 @@ mod tests {
         }
         let names: &[(&[u8], u8, bool)] = match kind {
             QueryKind::Media => &[(b"width", 1, true), (b"orientation", 2, false)],
+            QueryKind::Supports => &[],
             QueryKind::Size => &[(b"width", 3, true), (b"orientation", 4, false)],
             QueryKind::Style => &[],
         };
@@ -1630,18 +2832,25 @@ mod tests {
 
     #[test]
     fn parses_supports_features() {
+        let supported = |_, _: &[u16]| true;
         assert!(matches!(
-            parse_supports_condition(b"(display: grid) and selector(:has(*))".as_slice()),
+            parse_supports_condition(b"(display: grid) and selector(:has(*))".as_slice(), &supported),
             Some(Expression::And(_))
         ));
         assert!(matches!(
-            parse_supports_condition(b"font-tech(color-COLRv1)".as_slice()),
-            Some(Expression::SupportsFeature(SupportsFeature::FontTech(_)))
+            parse_supports_condition(b"font-tech(color-COLRv1)".as_slice(), &supported),
+            Some(Expression::SupportsFeature(SupportsFeature::FontTech { .. }))
         ));
-        assert!(parse_supports_condition(b"(display: grid) or (color: red) and (width: 1px)".as_slice()).is_none());
-        assert!(parse_supports_condition(b"(--: a)".as_slice()).is_some());
-        assert!(parse_supports_condition(b"(display : grid)".as_slice()).is_some());
-        assert!(parse_supports_declaration_from_source(b"display : grid".as_slice()).is_some());
+        assert!(
+            parse_supports_condition(
+                b"(display: grid) or (color: red) and (width: 1px)".as_slice(),
+                &supported
+            )
+            .is_none()
+        );
+        assert!(parse_supports_condition(b"(--: a)".as_slice(), &supported).is_some());
+        assert!(parse_supports_condition(b"(display : grid)".as_slice(), &supported).is_some());
+        assert!(parse_supports_declaration_from_source(b"display : grid".as_slice(), &supported).is_some());
     }
 
     #[test]
@@ -1679,7 +2888,7 @@ mod tests {
     #[test]
     fn keeps_general_enclosed_forgiving() {
         assert!(matches!(
-            parse_supports_condition(b"future(foo bar)".as_slice()),
+            parse_supports_condition(b"future(foo bar)".as_slice(), &|_, _| false),
             Some(Expression::GeneralEnclosed {
                 result: MatchResult::False,
                 ..
@@ -1692,5 +2901,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn serializes_media_feature_values_from_generated_metadata() {
+        let serialize = |feature_name: &str, source: &[u8]| {
+            let id = MEDIA_FEATURES
+                .iter()
+                .position(|metadata| metadata.name == feature_name)
+                .and_then(|id| u8::try_from(id).ok())
+                .unwrap();
+            let value = QueryFeatureValue {
+                components: components_from_source(source).unwrap(),
+            };
+            let mut sink = TextSink::new();
+            serialize_query_feature_value(&mut sink, &value, id, QueryKind::Media);
+            String::from_utf16(&sink.into_utf16()).unwrap()
+        };
+
+        assert_eq!(serialize("aspect-ratio", b"1/3"), "1 / 3");
+        assert_eq!(serialize("device-aspect-ratio", b"4 / 3"), "4 / 3");
+        assert_eq!(serialize("resolution", b"calc(1x + 2x)"), "calc(3dppx)");
+    }
+
+    #[test]
+    fn container_requirement_bits_cover_every_ffi_capability() {
+        let requirement_for_id = |id| container_requirements(&Expression::QueryFeature(QueryFeature::Boolean { id }));
+        assert_eq!(
+            requirement_for_id(0),
+            CONTAINER_QUERY_REQUIRES_WIDTH | CONTAINER_QUERY_REQUIRES_HEIGHT
+        );
+        assert_eq!(requirement_for_id(1), CONTAINER_QUERY_REQUIRES_BLOCK_SIZE);
+        assert_eq!(requirement_for_id(2), CONTAINER_QUERY_REQUIRES_HEIGHT);
+        assert_eq!(requirement_for_id(3), CONTAINER_QUERY_REQUIRES_INLINE_SIZE);
+        assert_eq!(requirement_for_id(5), CONTAINER_QUERY_REQUIRES_WIDTH);
+        assert_eq!(requirement_for_id(u8::MAX), CONTAINER_QUERY_HAS_UNKNOWN_FEATURE);
+        assert_eq!(CONTAINER_QUERY_REQUIRES_SCROLL_STATE, 1 << 5);
+
+        let style = Expression::StyleFunction(Box::new(Expression::And(Vec::new())));
+        assert_eq!(container_requirements(&style), CONTAINER_QUERY_REQUIRES_STYLE);
+    }
+
+    #[test]
+    fn rejects_non_supports_handles_without_panicking() {
+        let handle = FfiQueryHandle {
+            tree: QueryTree::Expression {
+                expression: Expression::And(Vec::new()),
+                kind: QueryKind::Media,
+            },
+        };
+
+        assert_eq!(unsafe { css_query_evaluate_supports(std::ptr::null()) }, 3);
+        assert_eq!(unsafe { css_query_evaluate_supports(&handle) }, 3);
     }
 }

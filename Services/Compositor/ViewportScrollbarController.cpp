@@ -121,37 +121,42 @@ Optional<size_t> ViewportScrollbarController::hit_test(Web::Compositor::AsyncScr
 
 Optional<ViewportScrollbarController::Drag> ViewportScrollbarController::begin_drag(Web::Compositor::AsyncScrollTree const& async_scroll_tree, Web::Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position)
 {
-    for (size_t i = 0; i < m_scrollbars.size(); ++i) {
-        auto const& scrollbar = m_scrollbars[i];
-        auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot);
-        if (!scroll_offset.has_value())
-            continue;
+    auto scrollbar_index = hit_test(async_scroll_tree, scroll_state_snapshot, position);
+    if (!scrollbar_index.has_value())
+        return {};
 
-        auto expanded = is_expanded(i);
-        auto orientation = orientation_for_scrollbar(scrollbar);
-        auto thumb_rect = translated_thumb_rect(scrollbar, *scroll_offset, expanded);
-        auto primary_position = position.primary_offset_for_orientation(orientation);
-        float thumb_grab_position = 0;
-        if (thumb_rect.to_type<float>().contains(position)) {
-            thumb_grab_position = primary_position - static_cast<float>(thumb_rect.primary_offset_for_orientation(orientation));
-        } else if (scrollbar_hit_rect(scrollbar, *scroll_offset).to_type<float>().contains(position)) {
-            auto gutter_rect = scrollbar_gutter_rect(scrollbar, true);
-            auto thumb_size = static_cast<float>(thumb_rect.primary_size_for_orientation(orientation));
-            auto gutter_start = static_cast<float>(gutter_rect.primary_offset_for_orientation(orientation));
-            auto gutter_size = static_cast<float>(gutter_rect.primary_size_for_orientation(orientation));
-            auto offset_relative_to_gutter = primary_position - gutter_start;
-            thumb_grab_position = max(min(offset_relative_to_gutter, thumb_size / 2), offset_relative_to_gutter - gutter_size + thumb_size);
-        } else {
-            continue;
-        }
+    auto const& scrollbar = m_scrollbars[*scrollbar_index];
+    auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot);
+    VERIFY(scroll_offset.has_value());
 
-        m_captured_scrollbar_index = i;
-        m_hovered_scrollbar_index = i;
-        m_thumb_grab_position = thumb_grab_position;
-        return Drag { i, primary_position, thumb_grab_position };
+    auto orientation = orientation_for_scrollbar(scrollbar);
+
+    // A successful press captures and expands the scrollbar before its drag delta is applied.
+    static constexpr auto expanded = true;
+    auto thumb_rect = translated_thumb_rect(scrollbar, *scroll_offset, expanded);
+    auto thumb_hit_rect = thumb_rect.to_type<float>();
+
+    auto primary_position = position.primary_offset_for_orientation(orientation);
+    auto position_is_along_thumb = orientation == Gfx::Orientation::Vertical
+        ? thumb_hit_rect.contains_vertically(primary_position)
+        : thumb_hit_rect.contains_horizontally(primary_position);
+
+    float thumb_grab_position = 0;
+    if (position_is_along_thumb) {
+        thumb_grab_position = primary_position - static_cast<float>(thumb_rect.primary_offset_for_orientation(orientation));
+    } else {
+        auto gutter_rect = scrollbar_gutter_rect(scrollbar, true);
+        auto thumb_size = static_cast<float>(thumb_rect.primary_size_for_orientation(orientation));
+        auto gutter_start = static_cast<float>(gutter_rect.primary_offset_for_orientation(orientation));
+        auto gutter_size = static_cast<float>(gutter_rect.primary_size_for_orientation(orientation));
+        auto offset_relative_to_gutter = primary_position - gutter_start;
+        thumb_grab_position = max(min(offset_relative_to_gutter, thumb_size / 2), offset_relative_to_gutter - gutter_size + thumb_size);
     }
 
-    return {};
+    m_captured_scrollbar_index = *scrollbar_index;
+    m_hovered_scrollbar_index = *scrollbar_index;
+    m_thumb_grab_position = thumb_grab_position;
+    return Drag { *scrollbar_index, primary_position, thumb_grab_position };
 }
 
 Optional<ViewportScrollbarController::Drag> ViewportScrollbarController::captured_drag(Gfx::FloatPoint position)

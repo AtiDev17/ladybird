@@ -251,7 +251,6 @@ class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BasicShapeStyleValue;
 class BlurFilterStyleValue;
-class BooleanExpression;
 class BorderImageSliceStyleValue;
 class BorderRadiusRectStyleValue;
 class BorderRadiusStyleValue;
@@ -347,7 +346,6 @@ class EasingStyleValue;
 class EdgeStyleValue;
 class EmptyOptionalStyleValue;
 class ExplicitGridTrack;
-class FeatureValue;
 class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
@@ -415,7 +413,6 @@ class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
 class Size;
-class SizeFeature;
 class ScrollbarColorStyleValue;
 class StringStyleValue;
 class StyleComputer;
@@ -427,7 +424,6 @@ class StyleSheetList;
 class StyleValue;
 class StyleValueList;
 class SuperellipseStyleValue;
-class Supports;
 class SVGPaint;
 class TextIndentStyleValue;
 class TextUnderlinePositionStyleValue;
@@ -443,7 +439,6 @@ class URL;
 class URLStyleValue;
 class VisualViewport;
 
-enum class FeatureComparison : u8;
 enum class FontFeatureValueType : u8;
 enum class Keyword : u16;
 enum class LayoutTreeRebuildRoot : u8;
@@ -529,6 +524,12 @@ using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
 }
 
 namespace Web::CSS::Invalidation {
+
+}
+
+namespace Web::CSS::Parser::ValueParserFFI {
+
+struct FfiMediaFeatureValue;
 
 }
 

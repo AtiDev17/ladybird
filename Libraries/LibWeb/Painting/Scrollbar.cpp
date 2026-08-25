@@ -39,12 +39,12 @@ bool Scrollbar::contains(CSSPixelPoint position, ChromeMetrics const& metrics) c
 
 MouseAction Scrollbar::handle_pointer_event(Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position)
 {
-    if (type == UIEvents::EventNames::pointermove) {
+    if (type == UIEvents::EventNames::pointermove || type == UIEvents::EventNames::pointerup) {
         if (!m_thumb_grab_position.has_value())
             return MouseAction::None;
-    } else if (button != UIEvents::MouseButton::Primary) {
-        return MouseAction::None;
     }
+    if (type != UIEvents::EventNames::pointermove && button != UIEvents::MouseButton::Primary)
+        return MouseAction::None;
 
     auto* node = layout_node();
     if (!node) {
@@ -128,11 +128,16 @@ bool Scrollbar::scroll_to_mouse_position(CSSPixelPoint position)
     auto gutter_size = scrollbar_data->gutter_rect.primary_size_for_orientation(orientation);
     auto thumb_size = scrollbar_data->thumb_rect.primary_size_for_orientation(orientation);
 
-    if (gutter_size < thumb_size)
+    if (gutter_size <= thumb_size)
         return true;
 
     if (!m_thumb_grab_position.has_value()) {
-        m_thumb_grab_position = scrollbar_data->thumb_rect.contains(position)
+        auto primary_position = position.primary_offset_for_orientation(orientation);
+        auto position_is_along_thumb = orientation == Orientation::Vertical
+            ? scrollbar_data->thumb_rect.contains_vertically(primary_position)
+            : scrollbar_data->thumb_rect.contains_horizontally(primary_position);
+
+        m_thumb_grab_position = position_is_along_thumb
             ? (position - scrollbar_data->thumb_rect.location()).primary_offset_for_orientation(orientation)
             : max(min(offset_relative_to_gutter, thumb_size / 2), offset_relative_to_gutter - gutter_size + thumb_size);
         if (auto navigable = node->document().navigable())
