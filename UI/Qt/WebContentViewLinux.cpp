@@ -773,11 +773,13 @@ struct WebContentView::VulkanWindowRenderer final : public QVulkanWindowRenderer
 
     virtual void releaseSwapChainResources() override
     {
+        m_view.m_vulkan_window_supports_alpha_blending.clear();
         m_renderer.release_pipeline();
     }
 
     virtual void releaseResources() override
     {
+        m_view.m_vulkan_window_supports_alpha_blending.clear();
         m_renderer.release();
     }
 
@@ -1024,27 +1026,32 @@ void WebContentView::update_vulkan_window_geometry()
 {
     if (m_vulkan_window_container)
         m_vulkan_window_container->setGeometry(rect());
-    update_vulkan_window_input_region();
+    update_vulkan_window_mask();
 }
 
-void WebContentView::update_vulkan_window_input_region()
+void WebContentView::update_vulkan_window_mask()
 {
     if (!m_vulkan_window || !m_vulkan_window_container)
         return;
 
-    // The strips overlaid by hover-expanded vertical tabs are painted transparent, but this native window still captures
-    // the pointer there. Exclude those strips from the input region so clicks fall through to the tab column beneath.
+    // On X11, the native window's bounding shape exposes the strips painted transparent for hover-expanded vertical
+    // tabs. Wayland instead uses the renderer's alpha output and empties the native window's input region separately.
     auto size = m_vulkan_window_container->size();
-    QRegion input_region { QRect { QPoint { 0, 0 }, size } };
+    QRegion window_mask { QRect { QPoint { 0, 0 }, size } };
 
     if (m_vulkan_window_supports_alpha_blending.value_or(false)) {
         if (m_vertical_tab_overlay_left > 0)
-            input_region -= QRect { 0, 0, m_vertical_tab_overlay_left, size.height() };
+            window_mask -= QRect { 0, 0, m_vertical_tab_overlay_left, size.height() };
         if (m_vertical_tab_overlay_right > 0)
-            input_region -= QRect { size.width() - m_vertical_tab_overlay_right, 0, m_vertical_tab_overlay_right, size.height() };
+            window_mask -= QRect { size.width() - m_vertical_tab_overlay_right, 0, m_vertical_tab_overlay_right, size.height() };
     }
 
-    m_vulkan_window->setMask(input_region);
+    // QWindow interprets an empty mask as clearing the mask. Use a non-empty region outside the window to produce an
+    // empty effective bounding shape when the overlay strips cover the entire window.
+    if (window_mask.isEmpty() && !size.isEmpty())
+        window_mask += QRect { size.width(), size.height(), 1, 1 };
+
+    m_vulkan_window->setMask(window_mask);
 }
 
 void WebContentView::update_vulkan_alpha_blending_support()
@@ -1067,15 +1074,24 @@ void WebContentView::update_vulkan_alpha_blending_support()
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities) != VK_SUCCESS)
         return;
 
-    // Our transparent tab-column holes only reach the screen if the surface is blended per-pixel. QVulkanWindow (given
-    // our alpha format) picks a pre/post-multiplied mode when offered (the Wayland case), otherwise INHERIT, which
-    // blends against the window's ARGB visual on X11 while a compositor runs. If only OPAQUE is offered there is no
-    // blending at all, so the feature stays disabled.
-    static constexpr auto blending_modes = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR | VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-    m_vulkan_window_supports_alpha_blending = (capabilities.supportedCompositeAlpha & blending_modes) != 0;
+    // Our transparent tab-column holes only reach the screen if the resolved swapchain format has alpha and the surface
+    // supports per-pixel blending. QVulkanWindow picks a pre/post-multiplied mode when offered. On X11 it may instead
+    // select INHERIT, where the window's ARGB visual and bounding mask provide the native compositing mechanism.
+    auto color_format = m_vulkan_window->colorFormat();
+    bool color_format_has_alpha = color_format == VK_FORMAT_B8G8R8A8_UNORM || color_format == VK_FORMAT_R8G8B8A8_UNORM;
 
-    // The input mask was computed while support was still unknown; refresh it now that any stored insets can apply.
-    update_vulkan_window_input_region();
+    VkCompositeAlphaFlagsKHR blending_modes = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR | VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    if (QGuiApplication::platformName() == "xcb")
+        blending_modes |= VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+
+    m_vulkan_window_supports_alpha_blending = color_format_has_alpha && (capabilities.supportedCompositeAlpha & blending_modes) != 0;
+
+    // Route pointer input through QWidget when it can also display widgets beneath the Vulkan surface. QWidget's
+    // implicit mouse capture then preserves move and release events while the pointer is outside the browser window.
+    m_vulkan_window->setFlag(Qt::WindowTransparentForInput, *m_vulkan_window_supports_alpha_blending);
+
+    // The window mask was computed while support was still unknown; refresh it now that any stored insets can apply.
+    update_vulkan_window_mask();
 }
 
 void WebContentView::set_vulkan_window_cursor(QCursor const& cursor)

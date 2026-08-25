@@ -295,7 +295,6 @@ impl StyleEngine {
         }
         let routing = Rc::get_mut(&mut self.routing).expect("routing program is shared outside a planning epoch");
         routing.add_rule(rule, program, &self.programs);
-        routing.settle_memory(&mut self.memory);
     }
 
     /// The process-global atom for one interned name identity.
@@ -374,8 +373,8 @@ impl StyleEngine {
         let previous_program = self
             .replacement_rule(rule)
             .and_then(|replacement| replacement.version.selector_program);
-        let (program, inserted) = self.programs.add_with_status(selector_program, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        self.selector_programs_need_sweep |= previous_program.is_some();
         self.programs.settle_memory(&mut self.memory);
         if previous_program != Some(program) {
             self.add_routing_rule(rule, program);
@@ -389,8 +388,8 @@ impl StyleEngine {
 
     #[cfg(feature = "style-recording")]
     pub(crate) fn replace_replayed_style_rule_selectors(&mut self, rule: RuleID, selector_program: SelectorProgram) {
-        let (program, inserted) = self.programs.add_with_status(selector_program, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        self.selector_programs_need_sweep = true;
         self.programs.settle_memory(&mut self.memory);
         self.add_routing_rule(rule, program);
         let mut version = self.current_rule_version(rule);
@@ -549,8 +548,8 @@ impl StyleEngine {
         {
             return reusable;
         }
-        let (program, inserted) = self.programs.add_with_status(compiled, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(compiled, &mut self.memory);
+        self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
         program
     }

@@ -758,6 +758,15 @@ impl StyleSheetProgram {
         !self.sheets[sheet.0 as usize].attachments.is_empty()
     }
 
+    pub fn sheets_with_attachment_state(&self) -> impl Iterator<Item = (SheetID, bool)> + '_ {
+        self.sheets.iter().enumerate().map(|(index, sheet)| {
+            (
+                SheetID(u32::try_from(index).expect("sheet identity space exhausted")),
+                !sheet.attachments.is_empty(),
+            )
+        })
+    }
+
     pub fn live_selector_programs(&self) -> impl Iterator<Item = (RuleID, SelectorProgramID)> + '_ {
         self.rules.iter().enumerate().filter_map(|(index, rule)| {
             let version = self.rule_versions[rule.version_slot as usize];
@@ -921,8 +930,20 @@ impl StyleSheetProgram {
     /// Every live style rule of a sheet, in cascade order within that sheet.
     #[must_use]
     pub fn rules_in_sheet(&self, sheet: SheetID) -> Vec<RuleID> {
+        let top_level_rules = &self.sheets[sheet.0 as usize].rules;
+        if top_level_rules
+            .iter()
+            .all(|rule| self.rules[rule.0 as usize].children.is_empty())
+        {
+            return top_level_rules
+                .iter()
+                .copied()
+                .filter(|rule| self.rules[rule.0 as usize].live)
+                .collect();
+        }
+
         let mut rules: Vec<RuleID> = Vec::new();
-        for &top_level in &self.sheets[sheet.0 as usize].rules {
+        for &top_level in top_level_rules {
             self.collect_live_subtree(top_level, &mut rules);
         }
         rules.sort_by(|first, second| {
@@ -1075,7 +1096,9 @@ impl StyleSheetProgram {
         declared: Vec<DeclaredProperty>,
         declarations_are_complete: bool,
     ) {
-        self.invalidate_semantic_declarations();
+        if self.rules[rule.0 as usize].semantic_declaration != SemanticDeclarationID::default() {
+            self.invalidate_semantic_declarations();
+        }
         let entry = &mut self.rules[rule.0 as usize];
         let previous_capacity = (entry.declared_properties.capacity() * size_of::<DeclaredProperty>()) as u64;
         entry.declared_properties = declared;
@@ -1407,6 +1430,7 @@ mod tests {
         let first = program.append_rule(sheet, None, RuleKind::Style);
         let second = program.append_rule(sheet, None, RuleKind::Style);
         let third = program.append_rule(sheet, None, RuleKind::Style);
+        let never_interned = program.append_rule(sheet, None, RuleKind::Style);
         let declared = |value| DeclaredProperty {
             property: 1,
             important: false,
@@ -1424,6 +1448,9 @@ mod tests {
         assert_ne!(first_identity, SemanticDeclarationID::default());
         assert_eq!(first_identity, second_identity);
         assert_ne!(first_identity, third_identity);
+
+        program.set_rule_declared_properties(never_interned, vec![declared(30)], true);
+        assert_eq!(program.ensure_semantic_declaration(first), first_identity);
 
         program.set_rule_declared_properties(second, vec![declared(10)], false);
         assert_eq!(
