@@ -39,6 +39,28 @@ Optional<Selector::PseudoElementSelector> Parser::parse_as_pseudo_element_select
     return Selector::PseudoElementSelector { pseudo_element.release_value(), selector->serialize() };
 }
 
+PageSelectorList Parser::page_selector_list_from_parsed_prelude(ParsedRulePrelude const& prelude)
+{
+    VERIFY(prelude.kind == ParsedRulePreludeKind::PageSelectors);
+    PageSelectorList selectors;
+    Optional<Utf16FlyString> name;
+    Vector<PagePseudoClass> pseudo_classes;
+    for (auto const& item : prelude.items) {
+        auto item_kind = static_cast<ValueParserFFI::FfiPageSelectorItemKind>(item.kind);
+        if (item_kind != ValueParserFFI::FfiPageSelectorItemKind::Name) {
+            VERIFY(item_kind <= ValueParserFFI::FfiPageSelectorItemKind::Blank);
+            pseudo_classes.append(static_cast<PagePseudoClass>(item.kind));
+            continue;
+        }
+        if (name.has_value() || !pseudo_classes.is_empty())
+            selectors.empend(move(name), move(pseudo_classes));
+        name = item.value;
+    }
+    if (name.has_value() || !pseudo_classes.is_empty())
+        selectors.empend(move(name), move(pseudo_classes));
+    return selectors;
+}
+
 Optional<PageSelectorList> Parser::parse_as_page_selector_list()
 {
     auto source = Utf16String::formatted("@page {} {{}}", m_source);
@@ -49,22 +71,7 @@ Optional<PageSelectorList> Parser::parse_as_page_selector_list()
     auto const& prelude = rule->get<AtRule>().parsed_prelude;
     if (prelude.kind != ParsedRulePreludeKind::PageSelectors)
         return {};
-    PageSelectorList selectors;
-    Optional<Utf16FlyString> name;
-    Vector<PagePseudoClass> pseudo_classes;
-    for (auto const& item : prelude.items) {
-        if (item.flags != 0x80) {
-            VERIFY(item.flags <= to_underlying(PagePseudoClass::Blank));
-            pseudo_classes.append(static_cast<PagePseudoClass>(item.flags));
-            continue;
-        }
-        if (name.has_value() || !pseudo_classes.is_empty())
-            selectors.empend(move(name), move(pseudo_classes));
-        name = item.value;
-    }
-    if (name.has_value() || !pseudo_classes.is_empty())
-        selectors.empend(move(name), move(pseudo_classes));
-    return selectors;
+    return page_selector_list_from_parsed_prelude(prelude);
 }
 
 }

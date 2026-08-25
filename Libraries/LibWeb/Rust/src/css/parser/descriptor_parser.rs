@@ -29,7 +29,9 @@ use crate::css::style_value::{RetainedStyleValueData, RetainedUtf16FlyString, St
 use std::ffi::c_void;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub(crate) struct ParsedDescriptor {
+    pub id: u8,
     pub value: Arc<StyleValueData>,
 }
 
@@ -500,7 +502,10 @@ pub(crate) fn parse_descriptor(
     } else {
         parse_with_metadata(&descriptor_context, &metadata, values, source)?
     };
-    Some(ParsedDescriptor { value: Arc::new(value) })
+    Some(ParsedDescriptor {
+        id: metadata.id,
+        value: Arc::new(value),
+    })
 }
 
 /// Parses one descriptor value and returns retained Rust style-value data.
@@ -554,6 +559,7 @@ mod tests {
             is_svg_presentation_attribute: false,
             is_substituted_value: false,
             contains_attr_tainted_values: false,
+            is_ua_style_sheet: false,
             value_contexts: std::ptr::null(),
             value_context_count: 0,
             document_url: std::ptr::null(),

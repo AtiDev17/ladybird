@@ -39,11 +39,8 @@
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/Parser/RustQueryParsing.h>
-#include <LibWeb/CSS/Parser/Syntax.h>
-#include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
-#include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/ValueParserRustFFI.h>
 
@@ -54,103 +51,59 @@ static bool selector_list_contains_pseudo_element(SelectorList const& selectors)
     return any_of(selectors, [](auto const& selector) { return selector->target_pseudo_element().has_value(); });
 }
 
-// A helper that ensures only the last instance of each descriptor is included, while also handling shorthands.
-class DescriptorList {
-public:
-    DescriptorList(AtRuleID at_rule)
-        : m_at_rule(at_rule)
-    {
-    }
-
-    void append(Descriptor&& descriptor)
-    {
-        if (is_shorthand(m_at_rule, descriptor.descriptor_name_and_id)) {
-            for_each_expanded_longhand(m_at_rule, descriptor.descriptor_name_and_id, descriptor.value, [this](auto longhand_id, auto longhand_value) {
-                append_internal(Descriptor { longhand_id, longhand_value.release_nonnull() });
-            });
-            return;
-        }
-
-        append_internal(move(descriptor));
-    }
-
-    Vector<Descriptor> release_descriptors()
-    {
-        return move(m_descriptors);
-    }
-
-private:
-    void append_internal(Descriptor&& descriptor)
-    {
-        if (m_seen_descriptor_ids.contains(descriptor.descriptor_name_and_id)) {
-            m_descriptors.remove_first_matching([&descriptor](Descriptor const& existing) {
-                return existing.descriptor_name_and_id == descriptor.descriptor_name_and_id;
-            });
-        } else {
-            m_seen_descriptor_ids.set(descriptor.descriptor_name_and_id);
-        }
-        m_descriptors.append(move(descriptor));
-    }
-
-    AtRuleID m_at_rule;
-    Vector<Descriptor> m_descriptors;
-    HashTable<DescriptorNameAndID> m_seen_descriptor_ids;
-};
+static Vector<Descriptor> copy_descriptors(ReadonlySpan<Descriptor> descriptors)
+{
+    Vector<Descriptor> copy;
+    copy.ensure_capacity(descriptors.size());
+    for (auto const& descriptor : descriptors)
+        copy.unchecked_append({ descriptor.descriptor_name_and_id, descriptor.value });
+    return copy;
+}
 
 template<typename NestedDeclarationsRule>
 GC::Ptr<CSSRule> Parser::convert_to_rule(Rule const& rule, Nested nested)
 {
     return rule.visit(
         [this, nested](AtRule const& at_rule) -> GC::Ptr<CSSRule> {
-            // https://compat.spec.whatwg.org/#css-at-rules
-            // @-webkit-keyframes must be supported as an alias of @keyframes.
-            if (at_rule.name.equals_ignoring_ascii_case("keyframes"sv) || at_rule.name.equals_ignoring_ascii_case("-webkit-keyframes"sv))
-                return convert_to_keyframes_rule(at_rule);
-
-            if (has_ignored_vendor_prefix(at_rule.name))
+            switch (at_rule.kind) {
+            case ValueParserFFI::FfiRuleKind::Qualified:
+                VERIFY_NOT_REACHED();
+            case ValueParserFFI::FfiRuleKind::Unknown:
+            case ValueParserFFI::FfiRuleKind::FontFeatureValuesRule:
+                break;
+            case ValueParserFFI::FfiRuleKind::IgnoredVendor:
                 return {};
-
-            if (at_rule.name.equals_ignoring_ascii_case("container"sv))
+            case ValueParserFFI::FfiRuleKind::Container:
                 return convert_to_container_rule<NestedDeclarationsRule>(at_rule, nested);
-
-            if (at_rule.name.equals_ignoring_ascii_case("counter-style"sv))
+            case ValueParserFFI::FfiRuleKind::CounterStyle:
                 return convert_to_counter_style_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("font-face"sv))
+            case ValueParserFFI::FfiRuleKind::FontFace:
                 return convert_to_font_face_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("font-feature-values"sv))
+            case ValueParserFFI::FfiRuleKind::FontFeatureValues:
                 return convert_to_font_feature_values_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("function"sv))
+            case ValueParserFFI::FfiRuleKind::Function:
                 return convert_to_function_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("import"sv))
+            case ValueParserFFI::FfiRuleKind::Import:
                 return convert_to_import_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("layer"sv))
+            case ValueParserFFI::FfiRuleKind::Keyframes:
+                return convert_to_keyframes_rule(at_rule);
+            case ValueParserFFI::FfiRuleKind::Layer:
                 return convert_to_layer_rule<NestedDeclarationsRule>(at_rule, nested);
-
-            if (is_margin_rule_name(at_rule.name))
+            case ValueParserFFI::FfiRuleKind::Margin:
                 return convert_to_margin_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("media"sv))
+            case ValueParserFFI::FfiRuleKind::Media:
                 return convert_to_media_rule<NestedDeclarationsRule>(at_rule, nested);
-
-            if (at_rule.name.equals_ignoring_ascii_case("namespace"sv))
+            case ValueParserFFI::FfiRuleKind::Namespace:
                 return convert_to_namespace_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("page"sv))
+            case ValueParserFFI::FfiRuleKind::Page:
                 return convert_to_page_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("property"sv))
+            case ValueParserFFI::FfiRuleKind::Property:
                 return convert_to_property_rule(at_rule);
-
-            if (at_rule.name.equals_ignoring_ascii_case("scope"sv))
+            case ValueParserFFI::FfiRuleKind::Scope:
                 return convert_to_scope_rule<NestedDeclarationsRule>(at_rule, nested);
-
-            if (at_rule.name.equals_ignoring_ascii_case("supports"sv))
+            case ValueParserFFI::FfiRuleKind::Supports:
                 return convert_to_supports_rule<NestedDeclarationsRule>(at_rule, nested);
+            }
 
             // FIXME: More at rules!
             ErrorReporter::the().report(UnknownRuleError { .rule_name = Utf16String::formatted("@{}", at_rule.name) });
@@ -159,6 +112,23 @@ GC::Ptr<CSSRule> Parser::convert_to_rule(Rule const& rule, Nested nested)
         [this, nested](QualifiedRule const& qualified_rule) -> GC::Ptr<CSSRule> {
             return convert_to_style_rule(qualified_rule, nested);
         });
+}
+
+template<typename NestedDeclarationsRule>
+GC::Ref<CSSRuleList> Parser::convert_child_rules(Vector<RuleOrListOfDeclarations> const& children, Nested nested)
+{
+    GC::RootVector<GC::Ref<CSSRule>> child_rules;
+    for (auto const& child : children) {
+        child.visit(
+            [&](Rule const& rule) {
+                if (auto child_rule = convert_to_rule<NestedDeclarationsRule>(rule, nested))
+                    child_rules.append(*child_rule);
+            },
+            [&](Vector<Declaration> const& declarations) {
+                child_rules.append(NestedDeclarationsRule::create(*this, declarations));
+            });
+    }
+    return CSSRuleList::create(child_rules);
 }
 
 static StyleNestingParent parent_rule_for_style_nesting(Vector<RuleContext> rule_context)
@@ -181,10 +151,8 @@ GC::Ptr<CSSStyleRule> Parser::convert_to_style_rule(QualifiedRule const& qualifi
         [[maybe_unused]] auto last = m_rule_context.take_last();
         VERIFY(last == RuleContext::Style);
     };
-    auto maybe_selectors = parse_selector_list_in_rust(qualified_rule.prelude_text, m_declared_namespaces,
-        nested == Nested::Yes, false);
-
-    if (!maybe_selectors.has_value()) {
+    if (!qualified_rule.selectors.has_value()
+        || selector_list_has_undeclared_namespace(*qualified_rule.selectors, m_declared_namespaces)) {
         ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
             .rule_name = "style"_utf16_fly_string,
             .prelude = qualified_rule.prelude_text.to_utf8(),
@@ -193,7 +161,7 @@ GC::Ptr<CSSStyleRule> Parser::convert_to_style_rule(QualifiedRule const& qualifi
         return {};
     }
 
-    if (maybe_selectors.value().is_empty()) {
+    if (qualified_rule.selectors->is_empty()) {
         ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
             .rule_name = "style"_utf16_fly_string,
             .prelude = qualified_rule.prelude_text.to_utf8(),
@@ -202,7 +170,7 @@ GC::Ptr<CSSStyleRule> Parser::convert_to_style_rule(QualifiedRule const& qualifi
         return {};
     }
 
-    SelectorList selectors = maybe_selectors.release_value();
+    SelectorList selectors = *qualified_rule.selectors;
     if (nested == Nested::Yes)
         selectors = adapt_nested_relative_selector_list(selectors, nesting_parent);
 
@@ -240,13 +208,62 @@ GC::Ptr<CSSImportRule> Parser::convert_to_import_rule(AtRule const& rule)
 {
     if (rule.is_block_rule)
         return {};
-    auto prelude = parse_import_prelude(rule);
-    if (!prelude.has_value())
+    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::Import)
         return {};
+
+    VERIFY(!rule.parsed_prelude.items.is_empty());
+    auto const& url_item = rule.parsed_prelude.items.first();
+    auto url_kind = static_cast<ValueParserFFI::FfiImportPreludeItemKind>(url_item.kind);
+    VERIFY(url_kind == ValueParserFFI::FfiImportPreludeItemKind::UrlFunction
+        || url_kind == ValueParserFFI::FfiImportPreludeItemKind::UrlValue);
+    VERIFY(url_item.style_value && url_item.style_value->is_url());
+    auto url = url_item.style_value->as_url().url();
+
+    Optional<Utf16FlyString> layer;
+    bool has_scope = false;
+    Optional<SelectorList> scope_start;
+    Optional<SelectorList> scope_end;
+    Optional<RustQueryHandle> supports;
+    Vector<NonnullRefPtr<MediaQuery>> media_queries;
+    for (auto const& item : rule.parsed_prelude.items.span().slice(1)) {
+        switch (static_cast<ValueParserFFI::FfiImportPreludeItemKind>(item.kind)) {
+        case ValueParserFFI::FfiImportPreludeItemKind::Layer:
+            VERIFY(item.value.has_value());
+            layer = *item.value;
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::Scope:
+            has_scope = true;
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::ScopeStart:
+            VERIFY(item.selectors.has_value());
+            if (selector_list_has_undeclared_namespace(*item.selectors, m_declared_namespaces))
+                return {};
+            scope_start = *item.selectors;
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::ScopeEnd:
+            VERIFY(item.selectors.has_value());
+            if (selector_list_has_undeclared_namespace(*item.selectors, m_declared_namespaces))
+                return {};
+            scope_end = *item.selectors;
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::Supports:
+            VERIFY(item.query.has_value());
+            supports = RustQueryParser::reevaluate_supports_condition(*this, *item.query);
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::Media:
+            VERIFY(item.query.has_value());
+            media_queries.append(MediaQuery::create(*item.query));
+            break;
+        case ValueParserFFI::FfiImportPreludeItemKind::UrlFunction:
+        case ValueParserFFI::FfiImportPreludeItemKind::UrlValue:
+            VERIFY_NOT_REACHED();
+        }
+    }
+
     Optional<CSSImportRule::ImportScope> scope;
-    if (prelude->has_scope)
-        scope = CSSImportRule::ImportScope { move(prelude->scope_start), move(prelude->scope_end) };
-    return CSSImportRule::create(move(prelude->url), const_cast<DOM::Document*>(m_document.ptr()), move(prelude->layer), move(scope), move(prelude->supports), MediaList::create(move(prelude->media_queries)));
+    if (has_scope)
+        scope = CSSImportRule::ImportScope { move(scope_start), move(scope_end) };
+    return CSSImportRule::create(move(url), const_cast<DOM::Document*>(m_document.ptr()), move(layer), move(scope), move(supports), MediaList::create(move(media_queries)));
 }
 
 template<typename NestedDeclarationsRule>
@@ -276,20 +293,7 @@ GC::Ptr<CSSRule> Parser::convert_to_layer_rule(AtRule const& rule, Nested nested
         }
         auto layer_name = rule.parsed_prelude.name.value();
 
-        // Then the rules
-        GC::RootVector<GC::Ref<CSSRule>> child_rules;
-        for (auto const& child : rule.child_rules_and_lists_of_declarations) {
-            child.visit(
-                [&](Rule const& rule) {
-                    if (auto child_rule = convert_to_rule<NestedDeclarationsRule>(rule, nested))
-                        child_rules.append(*child_rule);
-                },
-                [&](Vector<Declaration> const& declarations) {
-                    child_rules.append(NestedDeclarationsRule::create(*this, declarations));
-                });
-        }
-        auto rule_list = CSSRuleList::create(child_rules);
-        return CSSLayerBlockRule::create(layer_name, rule_list);
+        return CSSLayerBlockRule::create(layer_name, convert_child_rules<NestedDeclarationsRule>(rule.child_rules_and_lists_of_declarations, nested));
     }
 
     // CSSLayerStatementRule
@@ -437,19 +441,15 @@ GC::Ptr<CSSMediaRule> Parser::convert_to_media_rule(AtRule const& rule, Nested n
         return nullptr;
     }
 
-    auto media_list = MediaList::create(RustQueryParser::parse_media_query_list(*this, rule.prelude_text));
-    GC::RootVector<GC::Ref<CSSRule>> child_rules;
-    for (auto const& child : rule.child_rules_and_lists_of_declarations) {
-        child.visit(
-            [&](Rule const& rule) {
-                if (auto child_rule = convert_to_rule<NestedDeclarationsRule>(rule, nested))
-                    child_rules.append(*child_rule);
-            },
-            [&](Vector<Declaration> const& declarations) {
-                child_rules.append(NestedDeclarationsRule::create(*this, declarations));
-            });
+    VERIFY(rule.parsed_prelude.kind == ParsedRulePreludeKind::MediaQueries);
+    Vector<NonnullRefPtr<MediaQuery>> media_queries;
+    media_queries.ensure_capacity(rule.parsed_prelude.items.size());
+    for (auto const& item : rule.parsed_prelude.items) {
+        VERIFY(item.query.has_value());
+        media_queries.unchecked_append(MediaQuery::create(*item.query));
     }
-    return CSSMediaRule::create(media_list, CSSRuleList::create(child_rules));
+    auto media_list = MediaList::create(move(media_queries));
+    return CSSMediaRule::create(media_list, convert_child_rules<NestedDeclarationsRule>(rule.child_rules_and_lists_of_declarations, nested));
 }
 
 template<typename NestedDeclarationsRule>
@@ -474,17 +474,9 @@ GC::Ptr<CSSSupportsRule> Parser::convert_to_supports_rule(AtRule const& rule, Ne
         return {};
     }
 
-    if (rule.prelude_text.trim_ascii_whitespace().is_empty()) {
-        ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
-            .rule_name = "@supports"_utf16_fly_string,
-            .prelude = rule.prelude_text.to_utf8(),
-            .description = "Empty prelude."_string,
-        });
-        return {};
-    }
-
-    auto supports = RustQueryParser::parse_supports_condition(*this, rule.prelude_text);
-    if (!supports.has_value()) {
+    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::SupportsCondition
+        || rule.parsed_prelude.items.size() != 1
+        || !rule.parsed_prelude.items.first().query.has_value()) {
         ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
             .rule_name = "@supports"_utf16_fly_string,
             .prelude = rule.prelude_text.to_utf8(),
@@ -492,126 +484,22 @@ GC::Ptr<CSSSupportsRule> Parser::convert_to_supports_rule(AtRule const& rule, Ne
         });
         return {};
     }
+    auto supports = RustQueryParser::reevaluate_supports_condition(*this, *rule.parsed_prelude.items.first().query);
 
-    GC::RootVector<GC::Ref<CSSRule>> child_rules;
-    for (auto const& child : rule.child_rules_and_lists_of_declarations) {
-        child.visit(
-            [&](Rule const& rule) {
-                if (auto child_rule = convert_to_rule<NestedDeclarationsRule>(rule, nested))
-                    child_rules.append(*child_rule);
-            },
-            [&](Vector<Declaration> const& declarations) {
-                child_rules.append(NestedDeclarationsRule::create(*this, declarations));
-            });
-    }
-
-    auto rule_list = CSSRuleList::create(child_rules);
-    return CSSSupportsRule::create(supports.release_value(), rule_list);
+    return CSSSupportsRule::create(move(supports), convert_child_rules<NestedDeclarationsRule>(rule.child_rules_and_lists_of_declarations, nested));
 }
 
 GC::Ptr<CSSPropertyRule> Parser::convert_to_property_rule(AtRule const& rule)
 {
-    m_rule_context.append(RuleContext::AtProperty);
-    ScopeGuard guard = [&] {
-        [[maybe_unused]] auto last = m_rule_context.take_last();
-        VERIFY(last == RuleContext::AtProperty);
-    };
-
-    // https://drafts.css-houdini.org/css-properties-values-api-1/#at-ruledef-property
-    // @property <custom-property-name> {
-    // <declaration-list>
-    // }
-    if (!rule.is_block_rule) {
-        ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
-            .rule_name = "@property"_utf16_fly_string,
-            .prelude = rule.prelude_text.to_utf8(),
-            .description = "Must be a block, not a statement."_string,
-        });
+    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::Property)
         return {};
-    }
-
-    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::Name || !rule.parsed_prelude.name.has_value()) {
-        ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
-            .rule_name = "@property"_utf16_fly_string,
-            .prelude = rule.prelude_text.to_utf8(),
-            .description = "Name must be an ident starting with '--'."_string,
-        });
-        return {};
-    }
-
-    auto name = rule.parsed_prelude.name.value();
-
-    Optional<Utf16FlyString> syntax_maybe;
-    Optional<bool> inherits_maybe;
-    RefPtr<StyleValue const> initial_value_maybe;
-
-    rule.for_each_as_declaration_list([&](auto& declaration) {
-        if (auto descriptor = convert_to_descriptor(AtRuleID::Property, declaration); descriptor.has_value()) {
-            if (descriptor->descriptor_name_and_id.id() == DescriptorID::Syntax) {
-                if (descriptor->value->is_string())
-                    syntax_maybe = descriptor->value->as_string().string_value();
-                return;
-            }
-            if (descriptor->descriptor_name_and_id.id() == DescriptorID::Inherits) {
-                switch (descriptor->value->to_keyword()) {
-                case Keyword::True:
-                    inherits_maybe = true;
-                    break;
-                case Keyword::False:
-                    inherits_maybe = false;
-                    break;
-                default:
-                    break;
-                }
-                return;
-            }
-            if (descriptor->descriptor_name_and_id.id() == DescriptorID::InitialValue) {
-                initial_value_maybe = *descriptor->value;
-                return;
-            }
-        }
-    });
-
-    // @property rules require a syntax and inherits descriptor; if either are missing, the entire rule is invalid and must be ignored.
-    if (!syntax_maybe.has_value() || syntax_maybe->is_empty() || !inherits_maybe.has_value()) {
-        return {};
-    }
-
-    CSS::Parser::ParsingParams parsing_params;
-    if (document())
-        parsing_params = CSS::Parser::ParsingParams { *document() };
-    else
-        parsing_params = CSS::Parser::ParsingParams {};
-
-    auto maybe_syntax = parse_as_syntax(syntax_maybe.value(), LimitSingleComponentIdentToCustomIdent::Yes);
-
-    // If the provided string is not a valid syntax string (if it returns failure when consume
-    // a syntax definition is called on it), the descriptor is invalid and must be ignored.
-    if (!maybe_syntax) {
-        return {};
-    }
-    // The initial-value descriptor is optional only if the syntax is the universal syntax definition,
-    // otherwise the descriptor is required; if it’s missing, the entire rule is invalid and must be ignored.
-    if (!initial_value_maybe && maybe_syntax->type() != CSS::Parser::SyntaxNode::NodeType::Universal) {
-        return {};
-    }
-
-    if (initial_value_maybe) {
-        initial_value_maybe = Web::CSS::Parser::parse_with_a_syntax(parsing_params, initial_value_maybe->is_unresolved() ? initial_value_maybe->as_unresolved().token_source() : initial_value_maybe->to_utf16_string(SerializationMode::ResolvedValueForReparse),
-            *maybe_syntax);
-
-        // Otherwise, if the value of the syntax descriptor is not the universal syntax definition,
-        // the following conditions must be met for the @property rule to be valid:
-        if (maybe_syntax->type() != CSS::Parser::SyntaxNode::NodeType::Universal) {
-            //  - The initial-value descriptor must be present.
-            //  - The initial-value descriptor’s value must parse successfully according to the grammar specified by the syntax definition.
-            //  - The initial-value must be computationally independent.
-            if (!initial_value_maybe || initial_value_maybe->is_guaranteed_invalid() || !initial_value_maybe->is_computationally_independent())
-                return {};
-        }
-    }
-
-    return CSSPropertyRule::create(move(name), syntax_maybe.value(), maybe_syntax.release_nonnull(), inherits_maybe.value(), move(initial_value_maybe));
+    VERIFY(rule.parsed_prelude.name.has_value());
+    VERIFY(rule.parsed_prelude.secondary.has_value());
+    VERIFY(rule.parsed_prelude.syntax.has_value());
+    VERIFY(rule.parsed_prelude.items.size() == 1);
+    auto& item = rule.parsed_prelude.items.first();
+    auto inherits = static_cast<ValueParserFFI::FfiPropertyPreludeItemKind>(item.kind) == ValueParserFFI::FfiPropertyPreludeItemKind::InheritsTrue;
+    return CSSPropertyRule::create(*rule.parsed_prelude.name, *rule.parsed_prelude.secondary, rule.parsed_prelude.syntax.value(), inherits, item.style_value);
 }
 
 // https://drafts.csswg.org/css-cascade-6/#scope-atrule
@@ -631,31 +519,20 @@ GC::Ptr<CSSScopeRule> Parser::convert_to_scope_rule(AtRule const& rule, Nested n
     Optional<SelectorList> start;
     Optional<SelectorList> end;
     for (auto const& item : rule.parsed_prelude.items) {
-        VERIFY(item.value.has_value());
-        bool is_end = item.flags == 1;
-        auto selectors = parse_selector_list_in_rust(*item.value, m_declared_namespaces,
-            is_end || nested == Nested::Yes, false);
-        if (!selectors.has_value() || selectors->is_empty() || selector_list_contains_pseudo_element(*selectors))
+        VERIFY(item.selectors.has_value());
+        bool is_end = static_cast<ValueParserFFI::FfiScopePreludeItemKind>(item.kind) == ValueParserFFI::FfiScopePreludeItemKind::End;
+        auto const& selectors = *item.selectors;
+        if (selectors.is_empty() || selector_list_contains_pseudo_element(selectors)
+            || selector_list_has_undeclared_namespace(selectors, m_declared_namespaces))
             return nullptr;
         if (is_end)
-            end = selectors.release_value();
+            end = selectors;
         else
-            start = selectors.release_value();
+            start = selectors;
     }
     if (nested == Nested::Yes && start.has_value())
         start = adapt_nested_relative_selector_list(*start, nesting_parent);
-    GC::RootVector<GC::Ref<CSSRule>> child_rules;
-    for (auto const& child : rule.child_rules_and_lists_of_declarations) {
-        child.visit(
-            [&](Rule const& child_rule) {
-                if (auto converted_rule = convert_to_rule<NestedDeclarationsRule>(child_rule, Nested::Yes))
-                    child_rules.append(*converted_rule);
-            },
-            [&](Vector<Declaration> const& declarations) {
-                child_rules.append(NestedDeclarationsRule::create(*this, declarations));
-            });
-    }
-    return CSSScopeRule::create(move(start), move(end), CSSRuleList::create(child_rules));
+    return CSSScopeRule::create(move(start), move(end), convert_child_rules<NestedDeclarationsRule>(rule.child_rules_and_lists_of_declarations, Nested::Yes));
 }
 
 // https://drafts.csswg.org/css-conditional-5/#container-rule
@@ -683,8 +560,7 @@ GC::Ptr<CSSContainerRule> Parser::convert_to_container_rule(AtRule const& rule, 
         return nullptr;
     }
 
-    auto rust_conditions = RustQueryParser::parse_container_condition_list(*this, rule.prelude_text);
-    if (!rust_conditions.has_value()) {
+    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::ContainerConditions) {
         ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
             .rule_name = "@container"_utf16_fly_string,
             .prelude = rule.prelude_text.to_utf8(),
@@ -694,24 +570,15 @@ GC::Ptr<CSSContainerRule> Parser::convert_to_container_rule(AtRule const& rule, 
     }
 
     Vector<CSSContainerRule::Condition> conditions;
-    conditions.ensure_capacity(rust_conditions->size());
-    for (auto& condition : *rust_conditions)
-        conditions.unchecked_empend(move(condition.name), move(condition.query));
-
-    GC::RootVector<GC::Ref<CSSRule>> child_rules;
-    for (auto const& child : rule.child_rules_and_lists_of_declarations) {
-        child.visit(
-            [&](Rule const& child_rule) {
-                if (auto converted_rule = convert_to_rule<NestedDeclarationsRule>(child_rule, nested))
-                    child_rules.append(*converted_rule);
-            },
-            [&](Vector<Declaration> const& declarations) {
-                child_rules.append(NestedDeclarationsRule::create(*this, declarations));
-            });
+    conditions.ensure_capacity(rule.parsed_prelude.items.size());
+    for (auto const& item : rule.parsed_prelude.items) {
+        RefPtr<ContainerQuery> query;
+        if (item.query.has_value())
+            query = ContainerQuery::create(*item.query);
+        conditions.unchecked_empend(item.value, move(query));
     }
 
-    auto rule_list = CSSRuleList::create(child_rules);
-    return CSSContainerRule::create(move(conditions), rule_list);
+    return CSSContainerRule::create(move(conditions), convert_child_rules<NestedDeclarationsRule>(rule.child_rules_and_lists_of_declarations, nested));
 }
 
 GC::Ptr<CSSCounterStyleRule> Parser::convert_to_counter_style_rule(AtRule const& rule)
@@ -742,71 +609,16 @@ GC::Ptr<CSSCounterStyleRule> Parser::convert_to_counter_style_rule(AtRule const&
     }
     auto name = rule.parsed_prelude.name.value();
 
-    // https://drafts.csswg.org/css-counter-styles-3/#typedef-counter-style-name
-    // When used here, to define a counter style, it also cannot be any of the non-overridable counter-style names
-    // FIXME: We should allow these in the UA stylesheet in order to initially define them.
-    if (CSSCounterStyleRule::matches_non_overridable_counter_style_name(name) && m_is_ua_style_sheet != IsUAStyleSheet::Yes) {
-        ErrorReporter::the().report(CSS::Parser::InvalidRuleError {
-            .rule_name = "@counter-style"_utf16_fly_string,
-            .prelude = rule.prelude_text.to_utf8(),
-            .description = "Non-overridable counter style name."_string,
+    auto descriptor_value = [&rule](DescriptorID id) -> RefPtr<StyleValue const> {
+        auto descriptor = rule.descriptors.first_matching([id](auto const& descriptor) {
+            return descriptor.descriptor_name_and_id.id() == id;
         });
-        return nullptr;
-    }
-
-    RefPtr<StyleValue const> system;
-    RefPtr<StyleValue const> negative;
-    RefPtr<StyleValue const> prefix;
-    RefPtr<StyleValue const> suffix;
-    RefPtr<StyleValue const> range;
-    RefPtr<StyleValue const> pad;
-    RefPtr<StyleValue const> fallback;
-    RefPtr<StyleValue const> symbols;
-    RefPtr<StyleValue const> additive_symbols;
-    RefPtr<StyleValue const> speak_as;
-
-    rule.for_each_as_declaration_list([&](auto& declaration) {
-        auto const& descriptor = convert_to_descriptor(AtRuleID::CounterStyle, declaration);
         if (!descriptor.has_value())
-            return;
+            return nullptr;
+        return descriptor->value;
+    };
 
-        switch (descriptor->descriptor_name_and_id.id()) {
-        case DescriptorID::System:
-            system = descriptor->value;
-            break;
-        case DescriptorID::Negative:
-            negative = descriptor->value;
-            break;
-        case DescriptorID::Prefix:
-            prefix = descriptor->value;
-            break;
-        case DescriptorID::Suffix:
-            suffix = descriptor->value;
-            break;
-        case DescriptorID::Range:
-            range = descriptor->value;
-            break;
-        case DescriptorID::Pad:
-            pad = descriptor->value;
-            break;
-        case DescriptorID::Fallback:
-            fallback = descriptor->value;
-            break;
-        case DescriptorID::Symbols:
-            symbols = descriptor->value;
-            break;
-        case DescriptorID::AdditiveSymbols:
-            additive_symbols = descriptor->value;
-            break;
-        case DescriptorID::SpeakAs:
-            speak_as = descriptor->value;
-            break;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    });
-
-    return CSSCounterStyleRule::create(move(name), move(system), move(negative), move(prefix), move(suffix), move(range), move(pad), move(fallback), move(symbols), move(additive_symbols), move(speak_as));
+    return CSSCounterStyleRule::create(move(name), descriptor_value(DescriptorID::System), descriptor_value(DescriptorID::Negative), descriptor_value(DescriptorID::Prefix), descriptor_value(DescriptorID::Suffix), descriptor_value(DescriptorID::Range), descriptor_value(DescriptorID::Pad), descriptor_value(DescriptorID::Fallback), descriptor_value(DescriptorID::Symbols), descriptor_value(DescriptorID::AdditiveSymbols), descriptor_value(DescriptorID::SpeakAs));
 }
 
 GC::Ptr<CSSFontFaceRule> Parser::convert_to_font_face_rule(AtRule const& rule)
@@ -836,14 +648,8 @@ GC::Ptr<CSSFontFaceRule> Parser::convert_to_font_face_rule(AtRule const& rule)
         return {};
     }
 
-    DescriptorList descriptors { AtRuleID::FontFace };
-    rule.for_each_as_declaration_list([&](auto& declaration) {
-        if (auto descriptor = convert_to_descriptor(AtRuleID::FontFace, declaration); descriptor.has_value()) {
-            descriptors.append(descriptor.release_value());
-        }
-    });
-
-    return CSSFontFaceRule::create(CSSFontFaceDescriptors::create(descriptors.release_descriptors()));
+    auto font_face_descriptors = CSSFontFaceDescriptors::create(copy_descriptors(rule.descriptors));
+    return CSSFontFaceRule::create(font_face_descriptors);
 }
 
 GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(AtRule const& rule)
@@ -881,35 +687,32 @@ GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(At
             // @ornaments = @ornaments { <declaration-list> }
             // @annotation = @annotation { <declaration-list> }
 
-            GC::Ptr<CSSFontFeatureValuesMap> feature_values_map;
-            size_t max_value_count = 1;
-
-            if (at_rule.name.equals_ignoring_ascii_case("stylistic"sv)) {
-                feature_values_map = font_feature_values_rule->stylistic();
-            } else if (at_rule.name.equals_ignoring_ascii_case("historical-forms"sv)) {
-                feature_values_map = font_feature_values_rule->historical_forms();
-            } else if (at_rule.name.equals_ignoring_ascii_case("styleset"sv)) {
-                feature_values_map = font_feature_values_rule->styleset();
-                max_value_count = NumericLimits<size_t>::max();
-            } else if (at_rule.name.equals_ignoring_ascii_case("character-variant"sv)) {
-                feature_values_map = font_feature_values_rule->character_variant();
-                max_value_count = 2;
-            } else if (at_rule.name.equals_ignoring_ascii_case("swash"sv)) {
-                feature_values_map = font_feature_values_rule->swash();
-            } else if (at_rule.name.equals_ignoring_ascii_case("ornaments"sv)) {
-                feature_values_map = font_feature_values_rule->ornaments();
-            } else if (at_rule.name.equals_ignoring_ascii_case("annotation"sv)) {
-                feature_values_map = font_feature_values_rule->annotation();
-            } else {
-                // NB: Other at-rules are disallowed in this context and should have already been dropped
+            if (at_rule.parsed_prelude.kind != ParsedRulePreludeKind::FontFeatureValuesRule || at_rule.parsed_prelude.items.size() != 1)
+                return;
+            GC::Ref<CSSFontFeatureValuesMap> feature_values_map = [&] {
+                switch (static_cast<ValueParserFFI::FfiFontFeatureValuesRuleKind>(at_rule.parsed_prelude.items.first().kind)) {
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::Annotation:
+                    return font_feature_values_rule->annotation();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::CharacterVariant:
+                    return font_feature_values_rule->character_variant();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::HistoricalForms:
+                    return font_feature_values_rule->historical_forms();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::Ornaments:
+                    return font_feature_values_rule->ornaments();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::Styleset:
+                    return font_feature_values_rule->styleset();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::Stylistic:
+                    return font_feature_values_rule->stylistic();
+                case ValueParserFFI::FfiFontFeatureValuesRuleKind::Swash:
+                    return font_feature_values_rule->swash();
+                }
                 VERIFY_NOT_REACHED();
-            }
+            }();
 
             at_rule.for_each_as_declaration_list([&](Declaration const& declaration) {
-                auto values = parse_font_feature_values(declaration, max_value_count);
-                if (!values.has_value())
+                if (!declaration.font_feature_values.has_value())
                     return;
-                MUST(feature_values_map->set(declaration.name.to_utf16_string(), values.release_value()));
+                MUST(feature_values_map->set(declaration.name.to_utf16_string(), declaration.font_feature_values.value()));
             });
         },
         [&](Declaration const&) {
@@ -938,26 +741,22 @@ GC::Ptr<CSSFunctionRule> Parser::convert_to_function_rule(AtRule const& function
         return nullptr;
     }
 
-    auto prelude = parse_function_prelude(function_rule);
-
-    if (!prelude.has_value())
+    if (function_rule.parsed_prelude.kind != ParsedRulePreludeKind::Function)
         return nullptr;
+    VERIFY(function_rule.parsed_prelude.name.has_value());
+    VERIFY(function_rule.parsed_prelude.syntax.has_value());
 
-    Vector<GC::Ref<CSSRule>> child_rules {};
-
-    // https://drafts.csswg.org/css-mixins-1/#function-body
-    for (auto const& child : function_rule.child_rules_and_lists_of_declarations) {
-        child.visit(
-            [&](Rule const& rule) {
-                if (auto child_rule = convert_to_rule<CSSFunctionDeclarations>(rule, Nested::Yes))
-                    child_rules.append(*child_rule);
-            },
-            [&](Vector<Declaration> const& declarations) {
-                child_rules.append(CSSFunctionDeclarations::create(*this, declarations));
-            });
+    Vector<FunctionParameterInternal> parameters;
+    parameters.ensure_capacity(function_rule.parsed_prelude.items.size());
+    for (auto const& item : function_rule.parsed_prelude.items) {
+        VERIFY(static_cast<ValueParserFFI::FfiFunctionParameterItemKind>(item.kind) == ValueParserFFI::FfiFunctionParameterItemKind::Parameter);
+        VERIFY(item.value.has_value());
+        VERIFY(item.syntax.has_value());
+        parameters.append({ *item.value, item.syntax.value(), item.style_value });
     }
 
-    return CSSFunctionRule::create(CSSRuleList::create(child_rules), move(prelude->name), move(prelude->parameters), move(prelude->return_type));
+    // https://drafts.csswg.org/css-mixins-1/#function-body
+    return CSSFunctionRule::create(convert_child_rules<CSSFunctionDeclarations>(function_rule.child_rules_and_lists_of_declarations, Nested::Yes), *function_rule.parsed_prelude.name, move(parameters), function_rule.parsed_prelude.syntax.value());
 }
 
 GC::Ptr<CSSPageRule> Parser::convert_to_page_rule(AtRule const& page_rule)
@@ -981,24 +780,9 @@ GC::Ptr<CSSPageRule> Parser::convert_to_page_rule(AtRule const& page_rule)
 
     if (page_rule.parsed_prelude.kind != ParsedRulePreludeKind::PageSelectors)
         return nullptr;
-    PageSelectorList page_selectors;
-    Optional<Utf16FlyString> page_name;
-    Vector<PagePseudoClass> pseudo_classes;
-    for (auto const& item : page_rule.parsed_prelude.items) {
-        if (item.flags != 0x80) {
-            VERIFY(item.flags <= to_underlying(PagePseudoClass::Blank));
-            pseudo_classes.append(static_cast<PagePseudoClass>(item.flags));
-            continue;
-        }
-        if (page_name.has_value() || !pseudo_classes.is_empty())
-            page_selectors.empend(move(page_name), move(pseudo_classes));
-        page_name = item.value;
-    }
-    if (page_name.has_value() || !pseudo_classes.is_empty())
-        page_selectors.empend(move(page_name), move(pseudo_classes));
+    auto page_selectors = page_selector_list_from_parsed_prelude(page_rule.parsed_prelude);
 
     GC::RootVector<GC::Ref<CSSRule>> child_rules;
-    DescriptorList descriptors { AtRuleID::Page };
     page_rule.for_each_as_declaration_rule_list(
         [&](auto& at_rule) {
             if (auto converted_rule = convert_to_rule<CSSNestedDeclarations>(at_rule, Nested::No)) {
@@ -1012,14 +796,10 @@ GC::Ptr<CSSPageRule> Parser::convert_to_page_rule(AtRule const& page_rule)
                 }
             }
         },
-        [&](auto& declaration) {
-            if (auto descriptor = convert_to_descriptor(AtRuleID::Page, declaration); descriptor.has_value()) {
-                descriptors.append(descriptor.release_value());
-            }
-        });
+        [](auto&) {});
 
     auto rule_list = CSSRuleList::create(child_rules);
-    return CSSPageRule::create(move(page_selectors), CSSPageDescriptors::create(descriptors.release_descriptors()), rule_list);
+    return CSSPageRule::create(move(page_selectors), CSSPageDescriptors::create(copy_descriptors(page_rule.descriptors)), rule_list);
 }
 
 GC::Ptr<CSSMarginRule> Parser::convert_to_margin_rule(AtRule const& rule)
@@ -1064,16 +844,16 @@ GC::Ptr<CSSMarginRule> Parser::convert_to_margin_rule(AtRule const& rule)
 }
 
 template<typename Descriptors>
-GC::Ref<Descriptors> Parser::convert_to_descriptors(AtRuleID at_rule_id, Vector<Declaration> const& declarations)
+GC::Ref<Descriptors> Parser::convert_to_descriptors(AtRuleID, Vector<Declaration> const& declarations)
 {
-    DescriptorList descriptor_list { at_rule_id };
-
+    Vector<Descriptor> descriptors;
+    descriptors.ensure_capacity(declarations.size());
     for (auto const& declaration : declarations) {
-        if (auto descriptor = convert_to_descriptor(at_rule_id, declaration); descriptor.has_value())
-            descriptor_list.append(descriptor.release_value());
+        if (!declaration.descriptor_name_and_id.has_value() || !declaration.parsed_value)
+            continue;
+        descriptors.unchecked_append({ declaration.descriptor_name_and_id.value(), NonnullRefPtr { *declaration.parsed_value } });
     }
-
-    return Descriptors::create(descriptor_list.release_descriptors());
+    return Descriptors::create(move(descriptors));
 }
 
 template GC::Ref<CSSFunctionDescriptors> Parser::convert_to_descriptors(AtRuleID at_rule_id, Vector<Declaration> const& declarations);
@@ -1092,154 +872,5 @@ template GC::Ptr<CSSRule> Parser::convert_to_layer_rule<CSSNestedDeclarations>(A
 
 template GC::Ptr<CSSSupportsRule> Parser::convert_to_supports_rule<CSSNestedDeclarations>(AtRule const&, Nested);
 template GC::Ptr<CSSSupportsRule> Parser::convert_to_supports_rule<CSSFunctionDeclarations>(AtRule const&, Nested);
-
-Optional<Parser::ImportPrelude> Parser::parse_import_prelude(AtRule const& rule)
-{
-    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::Import)
-        return {};
-    if (rule.parsed_prelude.items.is_empty())
-        return {};
-    auto const& url_item = rule.parsed_prelude.items[0];
-    if (!url_item.value.has_value())
-        return {};
-    Optional<URL> url;
-    if (url_item.flags == 7) {
-        url = URL { MUST(url_item.value->view().to_utf8()) };
-    } else {
-        auto value = parse_primitive_value_from_source(ValueType::Url, *url_item.value);
-        if (value && value->is_url())
-            url = value->as_url().url();
-    }
-    if (!url.has_value())
-        return {};
-    Optional<Utf16FlyString> layer;
-    bool has_scope = false;
-    Optional<SelectorList> scope_start;
-    Optional<SelectorList> scope_end;
-    Optional<RustQueryHandle> supports;
-    Vector<NonnullRefPtr<MediaQuery>> media_queries;
-    auto parse_scope_selector_list = [&](Utf16View source, SelectorType selector_type) -> Optional<SelectorList> {
-        auto selectors = parse_selector_list_in_rust(source, m_declared_namespaces, selector_type == SelectorType::Relative, false);
-        if (!selectors.has_value() || selectors->is_empty())
-            return {};
-        if (selector_list_contains_pseudo_element(*selectors))
-            return {};
-        return selectors;
-    };
-    for (auto const& item : rule.parsed_prelude.items.span().slice(1)) {
-        switch (item.flags) {
-        case 1:
-            if (!item.value.has_value())
-                return {};
-            layer = *item.value;
-            break;
-        case 2:
-            has_scope = true;
-            break;
-        case 3:
-            if (!item.value.has_value())
-                return {};
-            scope_start = parse_scope_selector_list(*item.value, SelectorType::Standalone);
-            if (!scope_start.has_value())
-                return {};
-            break;
-        case 4:
-            if (!item.value.has_value())
-                return {};
-            scope_end = parse_scope_selector_list(*item.value, SelectorType::Relative);
-            if (!scope_end.has_value())
-                return {};
-            break;
-        case 5: {
-            if (!item.value.has_value())
-                return {};
-            supports = RustQueryParser::parse_supports_condition(*this, *item.value);
-            if (!supports.has_value())
-                supports = RustQueryParser::parse_supports_declaration(*this, *item.value);
-            if (!supports.has_value())
-                return {};
-            break;
-        }
-        case 6:
-            if (!item.value.has_value())
-                return {};
-            media_queries = RustQueryParser::parse_media_query_list(*this, *item.value);
-            break;
-        default:
-            return {};
-        }
-    }
-    return ImportPrelude { url.release_value(), move(layer), has_scope, move(scope_start), move(scope_end), move(supports), move(media_queries) };
-}
-
-Optional<Vector<u32>> Parser::parse_font_feature_values(Declaration const& declaration, size_t max_value_count)
-{
-    if (declaration.important == Important::Yes)
-        return {};
-    auto source = declaration.value_text.utf16_view();
-    ValueParserFFI::FfiUtf16View ffi_source {
-        .ascii = source.has_ascii_storage() ? reinterpret_cast<u8 const*>(source.ascii_span().data()) : nullptr,
-        .utf16 = source.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(source.utf16_span().data()),
-        .length = source.length_in_code_units(),
-    };
-    auto count = ValueParserFFI::rust_parse_font_feature_values(ffi_source, max_value_count, nullptr, 0);
-    if (count == NumericLimits<size_t>::max())
-        return {};
-    Vector<u32> values;
-    values.resize(count);
-    if (ValueParserFFI::rust_parse_font_feature_values(ffi_source, max_value_count, values.data(), values.size()) != count)
-        return {};
-    return values;
-}
-
-Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(AtRule const& rule)
-{
-    if (rule.parsed_prelude.kind != ParsedRulePreludeKind::Function || !rule.parsed_prelude.name.has_value())
-        return {};
-    Vector<FunctionParameterInternal> parameters;
-    size_t position = 0;
-    while (position < rule.parsed_prelude.items.size()) {
-        auto const& name_item = rule.parsed_prelude.items[position++];
-        if (name_item.flags != 0 || !name_item.value.has_value())
-            return {};
-        NonnullRefPtr<SyntaxNode> type = UniversalSyntaxNode::create();
-        if (position < rule.parsed_prelude.items.size() && rule.parsed_prelude.items[position].flags == 1) {
-            auto const& type_item = rule.parsed_prelude.items[position++];
-            if (!type_item.value.has_value())
-                return {};
-            auto parsed_type = parse_as_syntax(*type_item.value);
-            if (!parsed_type)
-                return {};
-            type = parsed_type.release_nonnull();
-        }
-        RefPtr<StyleValue const> default_value;
-        if (position < rule.parsed_prelude.items.size() && rule.parsed_prelude.items[position].flags == 2) {
-            auto const& default_item = rule.parsed_prelude.items[position++];
-            if (!default_item.value.has_value())
-                return {};
-            auto parsed_default = parse_css_value_from_source(PropertyID::Custom, *default_item.value);
-            if (parsed_default.is_error())
-                return {};
-            auto unparsed_default = parsed_default.release_value();
-            if (unparsed_default->is_css_wide_keyword() || unparsed_default->as_unresolved().contains_arbitrary_substitution_function()) {
-                default_value = move(unparsed_default);
-            } else {
-                auto parsed = parse_with_a_syntax(unparsed_default->as_unresolved().token_source(), *type);
-                if (parsed->is_guaranteed_invalid())
-                    return {};
-                default_value = move(parsed);
-            }
-        }
-        parameters.append({ *name_item.value, move(type), move(default_value) });
-    }
-    NonnullRefPtr<SyntaxNode> return_type = UniversalSyntaxNode::create();
-    if (rule.parsed_prelude.secondary.has_value()) {
-        auto parsed = parse_as_syntax(*rule.parsed_prelude.secondary);
-        if (!parsed)
-            return {};
-        return_type = parsed.release_nonnull();
-    }
-    return FunctionPrelude { *rule.parsed_prelude.name, move(parameters), move(return_type) };
-}
 
 }

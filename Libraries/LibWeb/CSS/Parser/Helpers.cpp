@@ -12,10 +12,8 @@
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/CSS/CSSRuleList.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/Keyword.h>
 #include <LibWeb/CSS/MediaList.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/Parser/RustTokenizer.h>
 
 namespace Web {
 
@@ -74,9 +72,7 @@ RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const& 
 {
     if (string.is_empty())
         return nullptr;
-    if (!CSS::Parser::RustTokenizer::input_needs_normalization(string))
-        return CSS::Parser::Parser::parse_css_value_from_filtered_source(context, string, property_id);
-    return CSS::Parser::Parser::create(context, string).parse_as_css_value(property_id);
+    return CSS::Parser::Parser::parse_css_value_from_source(context, string, property_id);
 }
 
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const& context, Utf16View string, CSS::ValueType value_type)
@@ -226,26 +222,14 @@ ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_en
     return TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, encoded_string);
 }
 
-// https://drafts.csswg.org/css-values-4/#identifier-value
-bool is_valid_custom_ident(Utf16View ident, ReadonlySpan<Utf16View> const& blacklist)
+bool is_valid_animation_name_custom_ident(Utf16View ident)
 {
-    // The CSS-wide keywords are not valid <custom-ident>s.
-    if (auto keyword = CSS::keyword_from_string(ident); keyword.has_value() && CSS::is_css_wide_keyword(keyword.value()))
-        return false;
+    return CSS::Parser::ValueParserFFI::rust_is_valid_animation_name_custom_ident(CSS::Parser::ffi_utf16_view(ident));
+}
 
-    // The default keyword is reserved and is also not a valid <custom-ident>.
-    if (ident.equals_ignoring_ascii_case("default"sv))
-        return false;
-
-    // Specifications using <custom-ident> must specify clearly what other keywords are excluded from <custom-ident>,
-    // if any—for example by saying that any pre-defined keywords in that property’s value definition are excluded.
-    // Excluded keywords are excluded in all ASCII case permutations.
-    for (auto& value : blacklist) {
-        if (ident.equals_ignoring_ascii_case(value))
-            return false;
-    }
-
-    return true;
+bool has_ignored_vendor_prefix(Utf16View string)
+{
+    return CSS::Parser::ValueParserFFI::rust_has_ignored_vendor_prefix(CSS::Parser::ffi_utf16_view(string));
 }
 
 }

@@ -27,7 +27,6 @@
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/Parser/RustQueryParsing.h>
 #include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
-#include <LibWeb/CSS/Parser/RustTokenizer.h>
 #include <LibWeb/CSS/PropertyName.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/Serialize.h>
@@ -65,16 +64,14 @@ ParsingParams::ParsingParams(DOM::Document const& document, ParsingMode mode)
 {
 }
 
-Parser Parser::create(ParsingParams const& context, StringView input, StringView encoding)
+Parser Parser::create(ParsingParams const& context, StringView input)
 {
-    auto source = RustTokenizer::normalize_input(input, encoding);
-    return Parser { context, move(source) };
+    return Parser { context, Utf16String::from_utf8(input) };
 }
 
 Parser Parser::create(ParsingParams const& context, Utf16View input)
 {
-    auto source = RustTokenizer::normalize_input(input);
-    return Parser { context, move(source) };
+    return Parser { context, Utf16String::from_utf16(input) };
 }
 
 Parser::Parser(ParsingParams const& context, Utf16String source)
@@ -332,203 +329,13 @@ Vector<Descriptor> Parser::parse_as_descriptor_declaration_block(AtRuleID at_rul
             //    specifications, dropping parts that are said to be ignored. If the whole declaration is dropped, let
             //    parsed declaration be null.
             // 2. If parsed declaration is not null, append it to parsed declarations.
-            if (auto parsed_declaration = convert_to_descriptor(at_rule_id, declaration); parsed_declaration.has_value())
-                parsed_declarations.append(parsed_declaration.release_value());
+            if (declaration.descriptor_name_and_id.has_value() && declaration.parsed_value)
+                parsed_declarations.append({ declaration.descriptor_name_and_id.value(), NonnullRefPtr { *declaration.parsed_value } });
         }
     }
 
     // 4. Return parsed declarations.
     return parsed_declarations;
-}
-
-bool Parser::is_valid_in_the_current_context(Declaration const& declaration) const
-{
-    // TODO: Determine if this *particular* declaration is valid here, not just declarations in general.
-
-    // Declarations can't appear at the top level
-    if (m_rule_context.is_empty())
-        return false;
-
-    switch (m_rule_context.last()) {
-    case RuleContext::Unknown:
-        // If the context is an unknown type, we don't accept anything.
-        return false;
-
-    case RuleContext::Style:
-        // Style rules contain property declarations
-        return true;
-
-    case RuleContext::Keyframe: {
-        // https://drafts.csswg.org/css-animations-1/#keyframes
-        // The <declaration-list> inside of <keyframe-block> accepts any CSS property except those defined in this
-        // specification, but does accept the animation-timing-function property and interprets it specially
-        // NB: animation-composition is defined in CSS Animations Level 2, so it is not excluded by this rule.
-        auto property = PropertyNameAndID::from_name(declaration.name);
-        if (!property.has_value())
-            return true;
-        switch (property->id()) {
-        case PropertyID::Animation:
-        case PropertyID::AnimationDelay:
-        case PropertyID::AnimationDirection:
-        case PropertyID::AnimationDuration:
-        case PropertyID::AnimationFillMode:
-        case PropertyID::AnimationIterationCount:
-        case PropertyID::AnimationName:
-        case PropertyID::AnimationPlayState:
-        case PropertyID::AnimationTimeline:
-            return false;
-        default:
-            return true;
-        }
-    }
-
-    case RuleContext::AtContainer:
-    case RuleContext::AtLayer:
-    case RuleContext::AtMedia:
-    case RuleContext::AtSupports:
-        // Grouping rules can contain declarations if they are themselves inside a style or function rule
-        return m_rule_context.contains([](auto const& context) { return context == RuleContext::Style || context == RuleContext::AtFunction; });
-
-    case RuleContext::AtScope:
-        // @scope can contain declarations directly, matching the scoping root with zero specificity.
-        return true;
-
-    case RuleContext::FontFeatureValue:
-        // Each feature value block accepts a list of declarations
-        return true;
-
-    case RuleContext::AtFunction:
-        // @function rules contain descriptor declarations
-        return true;
-
-    case RuleContext::AtCounterStyle:
-    case RuleContext::AtFontFace:
-    case RuleContext::AtFontFeatureValues:
-    case RuleContext::AtPage:
-    case RuleContext::AtProperty:
-    case RuleContext::Margin:
-        // These have descriptor declarations
-        return true;
-
-    case RuleContext::AtKeyframes:
-        // @keyframes can only contain keyframe rules
-        return false;
-
-    case RuleContext::SupportsCondition:
-        // @supports conditions accept all declarations
-        return true;
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-bool Parser::is_valid_in_the_current_context(AtRule const& at_rule) const
-{
-    // All at-rules can appear at the top level, except margin rules
-    if (m_rule_context.is_empty())
-        return !is_margin_rule_name(at_rule.name);
-
-    // Only grouping rules can be nested within style rules
-    if (m_rule_context.contains_slow(RuleContext::Style))
-        return at_rule.name.is_one_of("container"sv, "layer"sv, "media"sv, "scope"sv, "supports"sv);
-
-    if (m_rule_context.contains_slow(RuleContext::AtFunction)) {
-        // https://drafts.csswg.org/css-mixins-1/#function-body
-        // The body of a @function rule accepts conditional group rules
-        return at_rule.name.is_one_of("container"sv, "media"sv, "supports"sv);
-    }
-
-    switch (m_rule_context.last()) {
-    case RuleContext::Unknown:
-        // If the context is an unknown type, we don't accept anything.
-        return false;
-
-    case RuleContext::Style:
-        // Already handled above
-        VERIFY_NOT_REACHED();
-
-    case RuleContext::AtContainer:
-    case RuleContext::AtLayer:
-    case RuleContext::AtMedia:
-    case RuleContext::AtScope:
-    case RuleContext::AtSupports:
-        // Grouping rules can contain anything except @import or @namespace
-        return !at_rule.name.is_one_of("import"sv, "namespace"sv);
-
-    case RuleContext::SupportsCondition:
-        // @supports cannot check for at-rules
-        return false;
-
-    case RuleContext::AtPage:
-        // @page rules can contain margin rules
-        return is_margin_rule_name(at_rule.name);
-
-    case RuleContext::AtCounterStyle:
-    case RuleContext::AtFontFace:
-    case RuleContext::FontFeatureValue:
-    case RuleContext::AtKeyframes:
-    case RuleContext::Keyframe:
-    case RuleContext::AtProperty:
-    case RuleContext::Margin:
-        // These can't contain any at-rules
-        return false;
-    case RuleContext::AtFontFeatureValues:
-        return CSSFontFeatureValuesRule::is_font_feature_value_type_at_keyword(at_rule.name);
-    case RuleContext::AtFunction:
-        // Already handled above
-        VERIFY_NOT_REACHED();
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-bool Parser::is_valid_in_the_current_context(QualifiedRule const&) const
-{
-    // TODO: Different places accept different kinds of qualified rules. How do we tell them apart? Can we?
-
-    // Top level can contain style rules
-    if (m_rule_context.is_empty())
-        return true;
-
-    switch (m_rule_context.last()) {
-    case RuleContext::Unknown:
-        // If the context is an unknown type, we don't accept anything.
-        return false;
-
-    case RuleContext::Style:
-        // Style rules can contain style rules
-        return true;
-
-    case RuleContext::AtContainer:
-    case RuleContext::AtLayer:
-    case RuleContext::AtMedia:
-    case RuleContext::AtScope:
-    case RuleContext::AtSupports:
-        // Grouping rules can contain style rules
-        return true;
-
-    case RuleContext::AtKeyframes:
-        // @keyframes can contain keyframe rules
-        return true;
-
-    case RuleContext::SupportsCondition:
-        // @supports cannot check qualified rules
-        return false;
-
-    case RuleContext::AtCounterStyle:
-    case RuleContext::AtFontFace:
-    case RuleContext::AtFontFeatureValues:
-    case RuleContext::FontFeatureValue:
-    case RuleContext::AtFunction:
-    case RuleContext::AtPage:
-    case RuleContext::AtProperty:
-    case RuleContext::Keyframe:
-    case RuleContext::Margin:
-        // These can't contain qualified rules
-        return false;
-    }
-
-    VERIFY_NOT_REACHED();
 }
 
 void Parser::extract_property(Declaration const& declaration, PropertiesAndCustomProperties& dest)
@@ -609,7 +416,7 @@ RefPtr<StyleValue const> Parser::parse_as_css_value(PropertyID property_id)
     return parsed_value.release_value();
 }
 
-RefPtr<StyleValue const> Parser::parse_css_value_from_filtered_source(ParsingParams const& context, Utf16View source, PropertyID property_id)
+RefPtr<StyleValue const> Parser::parse_css_value_from_source(ParsingParams const& context, Utf16View source, PropertyID property_id)
 {
     Parser parser { context, {} };
     auto parsed_value = parser.parse_css_value_from_source(property_id, source);
@@ -731,19 +538,6 @@ NonnullRefPtr<StyleValue const> Parser::parse_as_sizes_attribute(DOM::Element co
 
     // 4. Return 100vw.
     return LengthStyleValue::create(Length(100, LengthUnit::Vw));
-}
-
-bool Parser::has_ignored_vendor_prefix(Utf16View string)
-{
-    if (!string.starts_with('-'))
-        return false;
-    if (string.starts_with("--"sv))
-        return false;
-    if (string.starts_with("-libweb-"sv))
-        return false;
-    if (string.count("-"sv) == 1)
-        return false;
-    return true;
 }
 
 DOM::Document const* Parser::document() const

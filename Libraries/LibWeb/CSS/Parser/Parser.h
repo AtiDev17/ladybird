@@ -18,6 +18,7 @@
 #include <LibWeb/CSS/MediaQuery.h>
 #include <LibWeb/CSS/PageSelector.h>
 #include <LibWeb/CSS/Parser/RuleContext.h>
+#include <LibWeb/CSS/Parser/RustSyntaxHandle.h>
 #include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
 #include <LibWeb/CSS/Parser/SubstitutionFunctionsPresence.h>
 #include <LibWeb/CSS/Selector.h>
@@ -88,9 +89,9 @@ class Parser {
     AK_MAKE_NONMOVABLE(Parser);
 
 public:
-    static Parser create(ParsingParams const&, StringView input, StringView encoding = "utf-8"sv);
+    static Parser create(ParsingParams const&, StringView input);
     static Parser create(ParsingParams const&, Utf16View input);
-    static RefPtr<StyleValue const> parse_css_value_from_filtered_source(ParsingParams const&, Utf16View, PropertyID);
+    static RefPtr<StyleValue const> parse_css_value_from_source(ParsingParams const&, Utf16View, PropertyID);
 
     GC::RootVector<GC::Ref<CSSRule>> convert_rules(Vector<Rule> const& raw_rules);
     GC::Ref<CSS::CSSStyleSheet> parse_as_css_stylesheet(Optional<::URL::URL> location, GC::Ptr<MediaList> = {});
@@ -135,8 +136,8 @@ public:
 
     [[nodiscard]] NonnullRefPtr<StyleValue const> parse_as_sizes_attribute(DOM::Element const& element, HTML::HTMLImageElement const* img = nullptr);
 
-    NonnullRefPtr<StyleValue const> parse_with_a_syntax(Utf16View input, SyntaxNode const& syntax);
-    NonnullRefPtr<StyleValue const> parse_with_a_syntax(SyntaxNode const& syntax) { return parse_with_a_syntax(m_source, syntax); }
+    NonnullRefPtr<StyleValue const> parse_with_a_syntax(Utf16View input, RustSyntaxHandle const& syntax);
+    NonnullRefPtr<StyleValue const> parse_with_a_syntax(RustSyntaxHandle const& syntax) { return parse_with_a_syntax(m_source, syntax); }
 
     template<typename Descriptors>
     GC::Ref<Descriptors> convert_to_descriptors(AtRuleID, Vector<Declaration> const& declarations);
@@ -158,34 +159,29 @@ private:
         No,
         Yes,
     };
+    enum class ParseContextMode {
+        Syntax,
+        Value,
+        RegisteredSyntax,
+    };
+    // Self-referential: `context.value_contexts` points into this object.
+    struct ParseContextStorage {
+        AK_MAKE_NONCOPYABLE(ParseContextStorage);
+        AK_MAKE_NONMOVABLE(ParseContextStorage);
 
-    enum class SelectorType {
-        Standalone,
-        Relative
-    };
-    struct FunctionPrelude {
-        Utf16FlyString name;
-        Vector<FunctionParameterInternal> parameters;
-        NonnullRefPtr<SyntaxNode> return_type;
-    };
-    struct ImportPrelude {
-        URL url;
-        Optional<Utf16FlyString> layer;
-        bool has_scope { false };
-        Optional<SelectorList> scope_start;
-        Optional<SelectorList> scope_end;
-        Optional<RustQueryHandle> supports;
-        Vector<NonnullRefPtr<MediaQuery>> media_queries;
-    };
-    Optional<ImportPrelude> parse_import_prelude(AtRule const&);
-    Optional<Vector<u32>> parse_font_feature_values(Declaration const&, size_t max_value_count);
-    Optional<FunctionPrelude> parse_function_prelude(AtRule const&);
-    bool is_valid_in_the_current_context(Declaration const&) const;
-    bool is_valid_in_the_current_context(AtRule const&) const;
-    bool is_valid_in_the_current_context(QualifiedRule const&) const;
+    public:
+        ParseContextStorage(Parser&, ParseContextMode, Optional<PropertyID>);
 
+        Vector<ValueParserFFI::FfiValueParsingContext, 1> value_contexts;
+        ValueParserFFI::FfiValueParsingContext single_property_context {};
+        ValueParserFFI::ParseContext context {};
+    };
+
+    static PageSelectorList page_selector_list_from_parsed_prelude(ParsedRulePrelude const&);
     template<typename NestedDeclarationsRule>
     GC::Ptr<CSSRule> convert_to_rule(Rule const&, Nested);
+    template<typename NestedDeclarationsRule>
+    GC::Ref<CSSRuleList> convert_child_rules(Vector<RuleOrListOfDeclarations> const&, Nested);
     GC::Ptr<CSSStyleRule> convert_to_style_rule(QualifiedRule const&, Nested);
     template<typename NestedDeclarationsRule>
     GC::Ptr<CSSContainerRule> convert_to_container_rule(AtRule const&, Nested);
@@ -214,12 +210,9 @@ private:
 
     Optional<StylePropertyAndName> convert_to_style_property(Declaration const&);
 
-    Optional<Descriptor> convert_to_descriptor(AtRuleID, Declaration const&);
-
     ParseErrorOr<NonnullRefPtr<StyleValue const>> parse_css_value_from_source(PropertyID, Utf16View);
     ParseErrorOr<NonnullRefPtr<StyleValue const>> parse_css_value_in_rust(PropertyID, Utf16View source, Optional<PropertyID> direct_property_context = {});
-    static bool has_ignored_vendor_prefix(Utf16View);
-
+    ParseContextStorage make_parse_context(ParseContextMode, Optional<PropertyID> direct_property_context = {});
     void extract_property(Declaration const&, Parser::PropertiesAndCustomProperties&);
 
     DOM::Document const* document() const;
@@ -274,7 +267,8 @@ CSS::CSSRule* parse_css_rule(CSS::Parser::ParsingParams const&, Utf16View, bool 
 RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const&, Utf16View);
 Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const&, Utf16View);
 Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const&, Utf16View);
-ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<StringView> mime_type_charset, ReadonlyBytes encoded_string);
-bool is_valid_custom_ident(Utf16View, ReadonlySpan<Utf16View> const& blacklist);
+WEB_API ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<StringView> mime_type_charset, ReadonlyBytes encoded_string);
+bool is_valid_animation_name_custom_ident(Utf16View);
+bool has_ignored_vendor_prefix(Utf16View);
 
 }

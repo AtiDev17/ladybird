@@ -204,19 +204,15 @@ set(SOURCES
     CSS/NumericType.cpp
     CSS/PageSelector.cpp
     CSS/ParsedFontFace.cpp
-    CSS/Parser/DescriptorParsing.cpp
     CSS/Parser/ErrorReporter.cpp
-    CSS/Parser/FastColorParsing.cpp
     CSS/Parser/Helpers.cpp
     CSS/Parser/Parser.cpp
-    CSS/Parser/RustTokenizer.cpp
     CSS/Parser/RustQueryParsing.cpp
     CSS/Parser/RustValueParsing.cpp
     CSS/Parser/RustSyntaxParsing.cpp
     CSS/Parser/RuleContext.cpp
     CSS/Parser/RuleParsing.cpp
     CSS/Parser/SelectorParsing.cpp
-    CSS/Parser/Syntax.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
     CSS/Ratio.cpp
@@ -1315,7 +1311,7 @@ if(NOT BUILD_SHARED_LIBS)
     # stale Rust objects. Force the C++ FFI bridge files to depend on the
     # Rust archives: when they change, LibWeb re-archives, and POST_BUILD
     # re-merges the fresh Rust objects.
-    set_property(SOURCE CSS/Parser/RustTokenizer.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
+    set_property(SOURCE CSS/Parser/RustSyntaxParsing.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE HTML/Parser/HTMLEncodingDetection.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Layout/LayoutRustBridge.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})
     set_property(SOURCE Layout/TreeBuilder.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libweb_rust_lib})

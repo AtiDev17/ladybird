@@ -6,15 +6,11 @@
 
 #include <AK/ScopeGuard.h>
 #include <AK/Utf16View.h>
-#include <LibWeb/CSS/FontFace.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/RustQueryParsing.h>
 #include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
-#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
-#include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/SVG/AttributeParser.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/ValueParserRustFFI.h>
 
@@ -107,101 +103,11 @@ void QualifiedRule::for_each_as_declaration_list(Utf16FlyString const& rule_name
 
 using namespace ValueParserFFI;
 
-static FfiUtf16View ffi_utf16_view(Utf16View view)
-{
-    return {
-        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
-        .length = view.length_in_code_units(),
-    };
-}
-
-static size_t retain_utf16_fly_string(u16 const* code_units, size_t length)
-{
-    return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length }).to_raw_leaked();
-}
-
-static size_t normalize_svg_path_data(u16 const* code_units, size_t length)
-{
-    auto path = SVG::AttributeParser::parse_path_data(Utf16View { reinterpret_cast<char16_t const*>(code_units), length });
-    if (path.instructions().is_empty())
-        return 0;
-    return Utf16String::from_utf8(path.serialize()).to_raw_leaked();
-}
-
-static bool rust_font_format_is_supported(u16 const* code_units, size_t length)
-{
-    return font_format_is_supported(Utf16View { reinterpret_cast<char16_t const*>(code_units), length });
-}
-
-static bool rust_font_tech_is_supported(u8 tech)
-{
-    return font_tech_is_supported(static_cast<FontTech>(tech));
-}
-
 static u16 resolve_property_id(u16 const* code_units, size_t length)
 {
     auto name = Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length });
     auto property = PropertyNameAndID::from_name(move(name));
     return property.has_value() ? to_underlying(property->id()) : NumericLimits<u16>::max();
-}
-
-static bool resolve_descriptor_integer(void const* document_pointer, void const* value_pointer, i32* result)
-{
-    auto const* document = static_cast<DOM::Document const*>(document_pointer);
-    if (!document || !result)
-        return false;
-    auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
-        static_cast<StyleValueFFI::StyleValueData const*>(value_pointer)));
-    if (value->is_integer()) {
-        *result = value->as_integer().integer();
-        return true;
-    }
-    if (!value->is_calculated())
-        return false;
-    auto absolutized = value->absolutized(ComputationContext { .length_resolution_context = Length::ResolutionContext::for_document(*document) });
-    if (absolutized->is_integer()) {
-        *result = absolutized->as_integer().integer();
-        return true;
-    }
-    if (!absolutized->is_calculated())
-        return false;
-    auto resolved = absolutized->as_calculated().resolve_integer({});
-    if (!resolved.has_value())
-        return false;
-    *result = resolved.value();
-    return true;
-}
-
-struct ParseContextStorage {
-    ValueParserFFI::ParseContext context {};
-};
-
-static ParseContextStorage make_parse_context(bool in_quirks_mode, bool is_svg_presentation_attribute, ReadonlyBytes document_url, ReadonlyBytes document_base_url, DOM::Document const* document, size_t& random_function_index)
-{
-    return {
-        .context = {
-            .in_quirks_mode = in_quirks_mode,
-            .is_svg_presentation_attribute = is_svg_presentation_attribute,
-            .is_substituted_value = false,
-            .contains_attr_tainted_values = false,
-            .value_contexts = nullptr,
-            .value_context_count = 0,
-            .document_url = document_url.data(),
-            .document_url_length = document_url.size(),
-            .document_base_url = document_base_url.data(),
-            .document_base_url_length = document_base_url.size(),
-            .intern_utf16_fly_string = retain_utf16_fly_string,
-            .normalize_svg_path_data = normalize_svg_path_data,
-            .precomputed_svg_paths = nullptr,
-            .precomputed_svg_path_count = 0,
-            .font_format_is_supported = rust_font_format_is_supported,
-            .font_tech_is_supported = rust_font_tech_is_supported,
-            .descriptor_integer_resolution_context = document,
-            .resolve_descriptor_integer = resolve_descriptor_integer,
-            .random_function_index = &random_function_index,
-        },
-    };
 }
 
 static Utf16View utf16_value(FfiSyntaxParseData const& data, size_t offset, size_t length)
@@ -249,16 +155,33 @@ static Declaration declaration(FfiSyntaxParseData const& data, size_t index)
         original_value_text = Utf16String::from_utf16(utf16_value(data, declaration.original_value_offset, declaration.original_value_length));
     auto value_text = Utf16String::from_utf16(utf16_value(data, declaration.value_source_offset, declaration.value_source_length));
     Optional<PropertyID> parsed_property_id;
+    Optional<DescriptorNameAndID> descriptor_name_and_id;
     RefPtr<StyleValue const> parsed_value;
     if (declaration.is_property) {
         if (declaration.property_id != NumericLimits<u16>::max())
             parsed_property_id = static_cast<PropertyID>(declaration.property_id);
+        VERIFY(declaration.descriptor_id == NumericLimits<u8>::max());
+    } else if (declaration.descriptor_id != NumericLimits<u8>::max()) {
+        VERIFY(declaration.descriptor_id <= to_underlying(DescriptorID::Custom));
+        auto descriptor_id = static_cast<DescriptorID>(declaration.descriptor_id);
+        descriptor_name_and_id = descriptor_id == DescriptorID::Custom
+            ? DescriptorNameAndID::from_custom_name(Utf16FlyString::from_utf16(utf16_value(data, declaration.name_offset, declaration.name_length)))
+            : DescriptorNameAndID::from_id(descriptor_id);
     }
     if (declaration.parse_status == FfiParseStatus::Parsed) {
         VERIFY(declaration.parsed_value);
         parsed_value = StyleValue::adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(declaration.parsed_value));
     } else {
         VERIFY(!declaration.parsed_value);
+    }
+    Optional<Vector<u32>> font_feature_values;
+    if (declaration.font_feature_values_start != NumericLimits<size_t>::max()) {
+        VERIFY(declaration.font_feature_values_start <= data.font_feature_value_count);
+        VERIFY(declaration.font_feature_value_count <= data.font_feature_value_count - declaration.font_feature_values_start);
+        font_feature_values = Vector<u32> {};
+        font_feature_values->ensure_capacity(declaration.font_feature_value_count);
+        for (size_t index = 0; index < declaration.font_feature_value_count; ++index)
+            font_feature_values->unchecked_append(data.font_feature_values[declaration.font_feature_values_start + index]);
     }
     return Declaration {
         .name = Utf16FlyString::from_utf16(utf16_value(data, declaration.name_offset, declaration.name_length)),
@@ -268,8 +191,32 @@ static Declaration declaration(FfiSyntaxParseData const& data, size_t index)
         .source_position = source_position(declaration.start_line, declaration.start_column),
         .value_text = move(value_text),
         .parsed_property_id = parsed_property_id,
+        .descriptor_name_and_id = move(descriptor_name_and_id),
         .parsed_value = move(parsed_value),
+        .font_feature_values = move(font_feature_values),
     };
+}
+
+static Vector<Descriptor> descriptors(FfiSyntaxParseData const& data, size_t start, size_t count)
+{
+    VERIFY(start <= data.descriptor_count);
+    VERIFY(count <= data.descriptor_count - start);
+    Vector<Descriptor> result;
+    result.ensure_capacity(count);
+    for (size_t index = 0; index < count; ++index) {
+        auto const& descriptor = data.descriptors[start + index];
+        VERIFY(descriptor.descriptor_id <= to_underlying(DescriptorID::Custom));
+        VERIFY(descriptor.value);
+        auto descriptor_id = static_cast<DescriptorID>(descriptor.descriptor_id);
+        auto name_and_id = descriptor_id == DescriptorID::Custom
+            ? DescriptorNameAndID::from_custom_name(Utf16FlyString::from_utf16(utf16_value(data, descriptor.name_offset, descriptor.name_length)))
+            : DescriptorNameAndID::from_id(descriptor_id);
+        result.unchecked_append({
+            .descriptor_name_and_id = move(name_and_id),
+            .value = StyleValue::adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(descriptor.value)),
+        });
+    }
+    return result;
 }
 
 static Vector<Declaration> declarations(FfiSyntaxParseData const& data, size_t start, size_t count)
@@ -285,7 +232,7 @@ static Vector<Declaration> declarations(FfiSyntaxParseData const& data, size_t s
 
 static ParsedRulePrelude parsed_rule_prelude(FfiSyntaxParseData const& data, FfiSyntaxRule const& rule)
 {
-    VERIFY(rule.parsed_prelude_kind <= to_underlying(ParsedRulePreludeKind::Function));
+    VERIFY(rule.parsed_prelude_kind <= to_underlying(ParsedRulePreludeKind::FontFeatureValuesRule));
     VERIFY(rule.parsed_prelude_items_start <= data.prelude_item_count);
     VERIFY(rule.parsed_prelude_item_count <= data.prelude_item_count - rule.parsed_prelude_items_start);
     auto optional_string = [&](size_t offset, size_t length) -> Optional<Utf16FlyString> {
@@ -297,16 +244,33 @@ static ParsedRulePrelude parsed_rule_prelude(FfiSyntaxParseData const& data, Ffi
     items.ensure_capacity(rule.parsed_prelude_item_count);
     for (size_t index = 0; index < rule.parsed_prelude_item_count; ++index) {
         auto const& item = data.prelude_items[rule.parsed_prelude_items_start + index];
+        Optional<SelectorList> selectors;
+        if (item.selector_list)
+            selectors = selector_list_from_rust(static_cast<SelectorFFI::RustParsedSelectorList*>(item.selector_list));
+        Optional<RustQueryHandle> query;
+        if (item.query)
+            query = RustQueryHandle::retained(static_cast<FfiQueryHandle const*>(item.query));
+        Optional<RustSyntaxHandle> syntax;
+        if (item.syntax)
+            syntax = RustSyntaxHandle { item.syntax };
+        RefPtr<StyleValue const> style_value;
+        if (item.style_value)
+            style_value = StyleValue::adopt_rust_style_value_data(static_cast<StyleValueFFI::StyleValueData const*>(item.style_value));
         items.unchecked_append({
             .value = optional_string(item.value_offset, item.value_length),
+            .selectors = move(selectors),
+            .query = move(query),
+            .syntax = move(syntax),
+            .style_value = move(style_value),
             .number_value = item.number_value,
-            .flags = item.flags,
+            .kind = item.kind,
         });
     }
     return {
         .kind = static_cast<ParsedRulePreludeKind>(rule.parsed_prelude_kind),
         .name = optional_string(rule.parsed_prelude_name_offset, rule.parsed_prelude_name_length),
         .secondary = optional_string(rule.parsed_prelude_secondary_offset, rule.parsed_prelude_secondary_length),
+        .syntax = rule.parsed_prelude_syntax ? Optional<RustSyntaxHandle> { RustSyntaxHandle { rule.parsed_prelude_syntax } } : OptionalNone {},
         .items = move(items),
     };
 }
@@ -341,17 +305,23 @@ static Rule rule(FfiSyntaxParseData const& data, size_t index)
     auto children = items(data, rule.children_start, rule.child_count);
     if (rule.rule_type == 0) {
         return AtRule {
+            .kind = rule.rule_kind,
             .name = Utf16FlyString::from_utf16(utf16_value(data, rule.name_offset, rule.name_length)),
             .prelude_text = move(prelude_text),
             .parsed_prelude = parsed_rule_prelude(data, rule),
+            .descriptors = descriptors(data, rule.descriptors_start, rule.descriptor_count),
             .child_rules_and_lists_of_declarations = move(children),
             .is_block_rule = rule.has_block,
         };
     }
 
     VERIFY(rule.rule_type == 1);
+    Optional<SelectorList> selectors;
+    if (rule.selector_list)
+        selectors = selector_list_from_rust(static_cast<SelectorFFI::RustParsedSelectorList*>(rule.selector_list));
     return QualifiedRule {
         .prelude_text = move(prelude_text),
+        .selectors = move(selectors),
         .parsed_prelude = parsed_rule_prelude(data, rule),
         .declarations = declarations(data, rule.declarations_start, rule.declaration_count),
         .child_rules = move(children),
@@ -361,18 +331,8 @@ static Rule rule(FfiSyntaxParseData const& data, size_t index)
 
 Vector<Rule> RustSyntaxParser::parse_stylesheet(Parser& parser)
 {
-    ReadonlyBytes document_url;
-    ReadonlyBytes document_base_url;
-    if (parser.m_document) {
-        if (!parser.m_serialized_document_url.has_value())
-            parser.m_serialized_document_url = parser.m_document->url().serialize();
-        if (!parser.m_serialized_document_base_url.has_value())
-            parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
-        document_url = parser.m_serialized_document_url->bytes();
-        document_base_url = parser.m_serialized_document_base_url->bytes();
-    }
-    auto context = make_parse_context(parser.in_quirks_mode(), parser.is_parsing_svg_presentation_attribute(), document_url, document_base_url, parser.m_document.ptr(), parser.m_random_function_index);
-    auto* parse = rust_parse_css_stylesheet_syntax(ffi_utf16_view(parser.m_source), &context.context, resolve_property_id);
+    auto context = parser.make_parse_context(Parser::ParseContextMode::Syntax);
+    auto* parse = rust_parse_css_stylesheet_syntax(ffi_utf16_view(parser.m_source), &context.context, resolve_property_id, RustQueryParser::resolve_query_feature);
     VERIFY(parse);
     ScopeGuard free_parse = [&] { rust_css_syntax_parse_free(parse); };
     auto data = rust_css_syntax_parse_data(parse);
@@ -386,19 +346,9 @@ Vector<Rule> RustSyntaxParser::parse_stylesheet(Parser& parser)
 
 Optional<Rule> RustSyntaxParser::parse_rule(Parser& parser, ReadonlySpan<RuleContext> contexts, RuleNesting nested)
 {
-    ReadonlyBytes document_url;
-    ReadonlyBytes document_base_url;
-    if (parser.m_document) {
-        if (!parser.m_serialized_document_url.has_value())
-            parser.m_serialized_document_url = parser.m_document->url().serialize();
-        if (!parser.m_serialized_document_base_url.has_value())
-            parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
-        document_url = parser.m_serialized_document_url->bytes();
-        document_base_url = parser.m_serialized_document_base_url->bytes();
-    }
-    auto context = make_parse_context(parser.in_quirks_mode(), parser.is_parsing_svg_presentation_attribute(), document_url, document_base_url, parser.m_document.ptr(), parser.m_random_function_index);
+    auto context = parser.make_parse_context(Parser::ParseContextMode::Syntax);
     static_assert(sizeof(RuleContext) == sizeof(u8));
-    auto* parse = rust_parse_css_rule_syntax(ffi_utf16_view(parser.m_source), reinterpret_cast<u8 const*>(contexts.data()), contexts.size(), nested == RuleNesting::Yes, &context.context, resolve_property_id);
+    auto* parse = rust_parse_css_rule_syntax(ffi_utf16_view(parser.m_source), reinterpret_cast<u8 const*>(contexts.data()), contexts.size(), nested == RuleNesting::Yes, &context.context, resolve_property_id, RustQueryParser::resolve_query_feature);
     VERIFY(parse);
     ScopeGuard free_parse = [&] { rust_css_syntax_parse_free(parse); };
     auto data = rust_css_syntax_parse_data(parse);
@@ -410,18 +360,8 @@ Optional<Rule> RustSyntaxParser::parse_rule(Parser& parser, ReadonlySpan<RuleCon
 
 ParsedRulePrelude RustSyntaxParser::parse_keyframe_selectors(Parser& parser)
 {
-    ReadonlyBytes document_url;
-    ReadonlyBytes document_base_url;
-    if (parser.m_document) {
-        if (!parser.m_serialized_document_url.has_value())
-            parser.m_serialized_document_url = parser.m_document->url().serialize();
-        if (!parser.m_serialized_document_base_url.has_value())
-            parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
-        document_url = parser.m_serialized_document_url->bytes();
-        document_base_url = parser.m_serialized_document_base_url->bytes();
-    }
-    auto context = make_parse_context(parser.in_quirks_mode(), parser.is_parsing_svg_presentation_attribute(), document_url, document_base_url, parser.m_document.ptr(), parser.m_random_function_index);
-    auto* parse = rust_parse_css_keyframe_selectors_syntax(ffi_utf16_view(parser.m_source), &context.context, resolve_property_id);
+    auto context = parser.make_parse_context(Parser::ParseContextMode::Syntax);
+    auto* parse = rust_parse_css_keyframe_selectors_syntax(ffi_utf16_view(parser.m_source), &context.context, resolve_property_id, RustQueryParser::resolve_query_feature);
     VERIFY(parse);
     ScopeGuard free_parse = [&] { rust_css_syntax_parse_free(parse); };
     auto data = rust_css_syntax_parse_data(parse);
@@ -440,18 +380,8 @@ Vector<RuleOrListOfDeclarations> RustSyntaxParser::parse_block_contents(Parser& 
 Vector<RuleOrListOfDeclarations> RustSyntaxParser::parse_block_contents(Parser& parser, Utf16View source, ReadonlySpan<RuleContext> contexts, PreservePropertySourceText preserve_property_source_text)
 {
     static_assert(sizeof(RuleContext) == sizeof(u8));
-    ReadonlyBytes document_url;
-    ReadonlyBytes document_base_url;
-    if (parser.m_document) {
-        if (!parser.m_serialized_document_url.has_value())
-            parser.m_serialized_document_url = parser.m_document->url().serialize();
-        if (!parser.m_serialized_document_base_url.has_value())
-            parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
-        document_url = parser.m_serialized_document_url->bytes();
-        document_base_url = parser.m_serialized_document_base_url->bytes();
-    }
-    auto context = make_parse_context(parser.in_quirks_mode(), parser.is_parsing_svg_presentation_attribute(), document_url, document_base_url, parser.m_document.ptr(), parser.m_random_function_index);
-    auto* parse = rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(contexts.data()), contexts.size(), &context.context, resolve_property_id, preserve_property_source_text == PreservePropertySourceText::Yes);
+    auto context = parser.make_parse_context(Parser::ParseContextMode::Syntax);
+    auto* parse = rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(contexts.data()), contexts.size(), &context.context, resolve_property_id, RustQueryParser::resolve_query_feature, preserve_property_source_text == PreservePropertySourceText::Yes);
     VERIFY(parse);
     ScopeGuard free_parse = [&] { rust_css_syntax_parse_free(parse); };
     auto data = rust_css_syntax_parse_data(parse);
@@ -472,17 +402,7 @@ Vector<RuleOrListOfDeclarations> RustSyntaxParser::parse_block_contents(Parser& 
 
 RefPtr<StyleValue const> RustSyntaxParser::parse_descriptor(Parser& parser, AtRuleID at_rule_id, DescriptorNameAndID const& descriptor)
 {
-    ReadonlyBytes document_url;
-    ReadonlyBytes document_base_url;
-    if (parser.m_document) {
-        if (!parser.m_serialized_document_url.has_value())
-            parser.m_serialized_document_url = parser.m_document->url().serialize();
-        if (!parser.m_serialized_document_base_url.has_value())
-            parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
-        document_url = parser.m_serialized_document_url->bytes();
-        document_base_url = parser.m_serialized_document_base_url->bytes();
-    }
-    auto context = make_parse_context(parser.in_quirks_mode(), parser.is_parsing_svg_presentation_attribute(), document_url, document_base_url, parser.m_document.ptr(), parser.m_random_function_index);
+    auto context = parser.make_parse_context(Parser::ParseContextMode::Syntax);
     auto* value = rust_parse_css_descriptor(&context.context, to_underlying(at_rule_id), ffi_utf16_view(descriptor.name()), ffi_utf16_view(parser.m_source));
     if (!value)
         return nullptr;

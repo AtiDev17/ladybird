@@ -536,8 +536,7 @@ struct FfiMediaFeatureValue;
 namespace Web::CSS::Parser {
 
 class Parser;
-class RustTokenizer;
-class SyntaxNode;
+class RustSyntaxHandle;
 
 struct AtRule;
 struct Declaration;

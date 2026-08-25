@@ -27,7 +27,7 @@ use crate::css::parser::arbitrary_substitution::{
     substitution_function_presence_bits,
 };
 use crate::css::parser::calc_parser::{CalcParseError, parse_a_calc_function_node};
-use crate::css::parser::color_parser::{is_color_function_name, parse_color_value};
+use crate::css::parser::color_parser::{is_color_function_name, parse_color_value, parse_simple_color};
 use crate::css::parser::component_value::{
     ComponentKind, ComponentValue, consume_a_list_of_component_values, consume_a_small_list_of_component_values,
 };
@@ -154,6 +154,7 @@ pub struct ParseContext {
     pub is_svg_presentation_attribute: bool,
     pub is_substituted_value: bool,
     pub contains_attr_tainted_values: bool,
+    pub is_ua_style_sheet: bool,
     pub value_contexts: *const FfiValueParsingContext,
     pub value_context_count: usize,
     pub document_url: *const u8,
@@ -395,15 +396,25 @@ fn is_css_wide_keyword(keyword: u16) -> bool {
     )
 }
 
-pub(crate) fn is_valid_custom_ident(identifier: &[u16], blacklist: &[&str]) -> bool {
-    if keyword_from_ascii_case_insensitive(identifier).is_some_and(is_css_wide_keyword)
-        || equals_ascii_case_insensitive(identifier, b"default")
+fn is_valid_custom_ident_matching<F>(matches: F, blacklist: &[&str]) -> bool
+where
+    F: Fn(&[u8]) -> bool,
+{
+    if [b"inherit".as_slice(), b"initial", b"unset", b"revert", b"revert-layer"]
+        .iter()
+        .any(|keyword| matches(keyword))
+        || matches(b"default")
     {
         return false;
     }
-    !blacklist
-        .iter()
-        .any(|blocked| equals_ascii_case_insensitive(identifier, blocked.as_bytes()))
+    !blacklist.iter().any(|blocked| matches(blocked.as_bytes()))
+}
+
+pub(crate) fn is_valid_custom_ident(identifier: &[u16], blacklist: &[&str]) -> bool {
+    is_valid_custom_ident_matching(
+        |expected| equals_ascii_case_insensitive(identifier, expected),
+        blacklist,
+    )
 }
 
 pub(crate) fn retain_fly_string(context: &ParseContext, string: &[u16]) -> Option<RetainedUtf16FlyString> {
@@ -5688,54 +5699,6 @@ pub unsafe extern "C" fn rust_collect_arbitrary_substitution_function_presence_f
     })
 }
 
-fn parse_font_feature_values_from_source(source: TokenizerInput<'_>, maximum_value_count: usize) -> Option<Vec<u32>> {
-    let values = component_values_from_source(source).ok()?;
-    let values = values
-        .iter()
-        .filter(|value| !value.is_whitespace())
-        .map(|value| match value.kind {
-            ComponentKind::Token(ParserTokenKind::Number {
-                value,
-                number_type: CssNumberType::Integer | CssNumberType::IntegerWithExplicitSign,
-            }) if value >= 0.0 && value <= f64::from(u32::MAX) => Some(value as u32),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    (!values.is_empty() && values.len() <= maximum_value_count).then_some(values)
-}
-
-/// Parses the non-negative integer list used by font feature value rules.
-///
-/// Returns `usize::MAX` for invalid input. Otherwise returns the value count and
-/// writes it when the provided output has sufficient capacity.
-///
-/// # Safety
-/// The source pointer must be valid for its accompanying length. A non-null
-/// output pointer must be writable for `output_capacity` values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_font_feature_values(
-    source: FfiUtf16View,
-    maximum_value_count: usize,
-    output: *mut u32,
-    output_capacity: usize,
-) -> usize {
-    crate::abort_on_panic(|| {
-        let Some(source) = (unsafe { source.units() }) else {
-            return usize::MAX;
-        };
-        let Some(values) = parse_font_feature_values_from_source(source, maximum_value_count) else {
-            return usize::MAX;
-        };
-        if output_capacity >= values.len() {
-            if output.is_null() {
-                return usize::MAX;
-            }
-            unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), output, values.len()) };
-        }
-        values.len()
-    })
-}
-
 type VisitMarginComponent = unsafe extern "C" fn(*mut c_void, u8, f64, *const u16, usize);
 
 /// Visits the dimension and percentage components accepted by intersection margins.
@@ -5915,6 +5878,60 @@ pub unsafe extern "C" fn rust_parse_entire_css_primitive_from_source(
     })
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct FfiSimpleColor {
+    pub success: bool,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+/// Parses the allocation-free subset used by the canvas color cache.
+///
+/// # Safety
+/// The source view must contain exactly one valid pointer when non-empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_parse_simple_color(source: FfiUtf16View) -> FfiSimpleColor {
+    crate::abort_on_panic(|| {
+        let Some(source) = (unsafe { source.units() }) else {
+            return FfiSimpleColor::default();
+        };
+        let Some([red, green, blue, alpha]) = parse_simple_color(source) else {
+            return FfiSimpleColor::default();
+        };
+        FfiSimpleColor {
+            success: true,
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    })
+}
+
+/// # Safety
+/// The source view must contain exactly one valid pointer when non-empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_is_valid_animation_name_custom_ident(source: FfiUtf16View) -> bool {
+    crate::abort_on_panic(|| {
+        let Some(source) = (unsafe { source.units() }) else {
+            return false;
+        };
+        is_valid_custom_ident_matching(
+            |expected| {
+                source.len() == expected.len()
+                    && expected.iter().enumerate().all(|(index, &expected)| {
+                        u8::try_from(source.code_unit_at(index))
+                            .is_ok_and(|code_unit| code_unit.eq_ignore_ascii_case(&expected))
+                    })
+            },
+            &["none"],
+        )
+    })
+}
+
 /// Parses an entire CSS source as one known keyword, or returns `u16::MAX`.
 ///
 /// # Safety
@@ -5954,27 +5971,13 @@ mod tests {
         result
     }
 
-    #[test]
-    fn parses_font_feature_value_integer_lists() {
-        assert_eq!(
-            parse_font_feature_values_from_source(utf16(" 1 +2 0").as_slice().into(), 3),
-            Some(vec![1, 2, 0])
-        );
-        assert!(parse_font_feature_values_from_source(utf16("1 2").as_slice().into(), 1).is_none());
-        for source in ["", "-1", "1.5", "1 ident"] {
-            assert!(
-                parse_font_feature_values_from_source(utf16(source).as_slice().into(), usize::MAX).is_none(),
-                "{source}"
-            );
-        }
-    }
-
     fn context() -> ParseContext {
         ParseContext {
             in_quirks_mode: false,
             is_svg_presentation_attribute: false,
             is_substituted_value: false,
             contains_attr_tainted_values: false,
+            is_ua_style_sheet: false,
             value_contexts: std::ptr::null(),
             value_context_count: 0,
             document_url: std::ptr::null(),

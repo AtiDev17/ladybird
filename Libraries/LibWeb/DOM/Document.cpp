@@ -8923,7 +8923,7 @@ Optional<CSSPixelRect> Document::current_caret_rect()
             auto result = Layout::RustFFI::layout_arena_text_caret_rect_in_dom_range(
                 layout_node->arena_handle(), text_slots.data(), text_slots.size(), position->offset());
             if (result.has_value)
-                return to_viewport_rect(Painting::from_ffi_css_pixel_rect(result.rect));
+                return to_viewport_rect(result.rect);
         }
     }
 
@@ -9832,25 +9832,21 @@ void Document::sync_custom_property_registrations_to_rust()
         effective_registrations.set(name, &registration);
 
     Vector<Utf16String> names;
-    Vector<Utf16String> syntaxes;
     Vector<Optional<Utf16String>> initial_values;
     Vector<CSS::ComputedValuesFFI::FfiCustomPropertyRegistration> registrations;
     names.ensure_capacity(effective_registrations.size());
-    syntaxes.ensure_capacity(effective_registrations.size());
     initial_values.ensure_capacity(effective_registrations.size());
     registrations.ensure_capacity(effective_registrations.size());
     for (auto const& [name, registration] : effective_registrations) {
         names.unchecked_append(name.to_utf16_string());
-        syntaxes.unchecked_append(registration->syntax->to_string());
         initial_values.unchecked_append(registration->initial_value
                 ? Optional<Utf16String> { registration->initial_value->to_utf16_string(CSS::SerializationMode::ResolvedValueForReparse) }
                 : Optional<Utf16String> {});
         auto const& name_string = names.last();
-        auto const& syntax = syntaxes.last();
         auto const& initial_value = initial_values.last();
         registrations.unchecked_append({
             .name = ffi_utf16_view(name_string),
-            .syntax = ffi_utf16_view(syntax),
+            .syntax = registration->syntax.data(),
             .inherits = registration->inherit,
             .has_initial_value = initial_value.has_value(),
             .initial_value = initial_value.has_value() ? ffi_utf16_view(*initial_value) : CSS::ComputedValuesFFI::FfiUtf16View {},
