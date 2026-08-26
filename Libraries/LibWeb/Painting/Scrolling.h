@@ -13,7 +13,7 @@
 
 namespace Web::Painting {
 
-enum class ScrollDirection {
+enum class ScrollDirection : u8 {
     Horizontal,
     Vertical,
 };
@@ -34,6 +34,7 @@ CSSPixelPoint maximum_scroll_offset(Layout::Node const&);
 CSSPixelPoint clamp_scroll_offset(Layout::Node const&, CSSPixelPoint);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&, CSSPixelRect scrollport);
+CSS::Overflow overflow_value_applied_to_viewport_for_wheel_scrolling(DOM::Document const&, ScrollDirection);
 struct WheelScrollableAxes {
     bool horizontal { false };
     bool vertical { false };

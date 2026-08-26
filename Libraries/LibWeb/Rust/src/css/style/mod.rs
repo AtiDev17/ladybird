@@ -65,6 +65,7 @@ pub mod exact_matcher;
 pub mod fast_hash;
 mod flush;
 mod fnv;
+mod font_resolution;
 pub mod impact;
 pub mod index;
 mod input_routing;
@@ -777,6 +778,9 @@ pub struct StyleEngine {
     exact_covered_scratch: Vec<StyleNodeID>,
     /// Monotonic identity assigned to each non-empty normalized style transaction.
     next_style_transaction_version: StyleTransactionVersion,
+    /// Latest document-wide scalar computation facts, copied at the transaction boundary.
+    document_style_computation_inputs: Option<bridge::FfiDocumentStyleComputationInputs>,
+    font_resolver: Option<font_resolution::FontResolver>,
     layer_topology_version: u64,
     sheet_order_version: u64,
 
@@ -845,9 +849,9 @@ pub struct StyleEngine {
     /// Borrowed FFI result storage for the most recently published style transaction.
     ffi_style_transaction_output: bridge::FfiStyleTransactionOutput,
     ffi_style_transaction_output_memory: MemoryLease,
-    /// Borrowed FFI result storage for a flat-tree descendant query.
-    ffi_flat_tree_descendants: Vec<u32>,
-    ffi_flat_tree_descendants_memory: MemoryLease,
+    /// Borrowed FFI result storage for the most recent style-node query.
+    ffi_style_node_query: Vec<u32>,
+    ffi_style_node_query_memory: MemoryLease,
     /// Borrowed FFI result storage for retained cascade source-slot assignments.
     ffi_retained_cascade_assignments: Vec<FfiSourceSlotAssignment>,
     ffi_retained_cascade_assignments_memory: MemoryLease,

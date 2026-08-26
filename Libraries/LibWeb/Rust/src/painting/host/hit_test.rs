@@ -7,30 +7,22 @@
 use crate::layout::OptionalCssPixelRect;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::OptionalU32;
-use libgfx_rust::WindingRule;
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct FfiHitTestPaintableFacts {
-    pub opacity_is_zero: bool,
-    pub visible_for_hit_testing: bool,
+    pub is_inert: bool,
     pub dom_node_has_parent: bool,
     pub is_editable_or_editing_host: bool,
-    pub has_resizer: bool,
-    pub could_be_scrolled_horizontally: bool,
-    pub could_be_scrolled_vertically: bool,
-    pub svg_path_has_fill: bool,
-    pub svg_path_winding_rule: WindingRule,
     pub svg_mask_content_units_object_bbox: bool,
     pub svg_clip_path_units_object_bbox: bool,
+    pub inside_blocking_wheel_event_handler: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct FfiHitTestTextNodeFacts {
-    pub parent_opacity_is_zero: bool,
-    pub parent_pointer_events_none: bool,
     pub is_inert: bool,
 }
 
@@ -71,6 +63,10 @@ impl FfiHitTestHostCallbacks {
 #[repr(C)]
 pub struct FfiHitTestQueryCallbacks {
     pub context: *mut c_void,
+    pub has_chrome_metrics: bool,
+    pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
+    pub viewport_wheel_overflow_x: u8,
+    pub viewport_wheel_overflow_y: u8,
     pub local_point_for_visual_context: unsafe extern "C" fn(
         *mut c_void,
         usize,
@@ -78,8 +74,6 @@ pub struct FfiHitTestQueryCallbacks {
         bool,
         *mut libgfx_rust::FloatPoint,
     ) -> bool,
-    pub chrome_widget_contains:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, u8, crate::layout::FfiCssPixelPoint) -> bool,
     pub line_in_scope: unsafe extern "C" fn(*mut c_void, usize) -> bool,
     pub sorting_context_group: unsafe extern "C" fn(*mut c_void, usize, *mut usize) -> bool,
     pub plane_depth_key: unsafe extern "C" fn(*mut c_void, usize, crate::layout::FfiCssPixelPoint, *mut i64) -> bool,
@@ -97,15 +91,6 @@ impl FfiHitTestQueryCallbacks {
         let has_local =
             unsafe { (self.local_point_for_visual_context)(self.context, index, point, respect_clip, &raw mut local) };
         has_local.then_some((local.x, local.y))
-    }
-    pub(crate) fn chrome_widget_contains(
-        &self,
-        layout_node_shell: *mut c_void,
-        kind: u8,
-        local_point: crate::css::css_pixels::CssPixelPoint,
-    ) -> bool {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.chrome_widget_contains)(self.context, layout_node_shell, kind, local_point.into()) }
     }
     pub(crate) fn line_in_scope(&self, line_index: usize) -> bool {
         // SAFETY: The C++ host answers synchronously.

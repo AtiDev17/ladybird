@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::{ClipData, EffectsData, PerspectiveData, TransformData, TransformDataRole};
+use super::{ClipData, EffectsData, EffectsFilter, PerspectiveData, TransformData, TransformDataRole};
 use crate::css::computed_value_types::{ComputedClipEdge, ComputedStyleValueHandle};
 use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums;
@@ -48,7 +48,6 @@ pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs
 pub(crate) fn transform_reference_box(
     style: ComputedValuesView<'_>,
     layout_arena: &impl PaintableRowsRead,
-    callbacks: &FfiVisualContextHostCallbacks,
     slot: NodeSlotId,
 ) -> CssPixelRect {
     use css_enums::transform_box::{BORDER_BOX, CONTENT_BOX, FILL_BOX, STROKE_BOX, VIEW_BOX};
@@ -69,9 +68,15 @@ pub(crate) fn transform_reference_box(
     }
     match transform_box {
         CONTENT_BOX | FILL_BOX => paintable_geometry::absolute_rect(layout_arena, slot),
-        VIEW_BOX => callbacks
-            .svg_transform_view_box_rect(layout_arena.shell_if_live(slot))
-            .map(CssPixelRect::from)
+        VIEW_BOX => crate::painting::svg_viewport::nearest_svg_viewport_user_rect(layout_arena, slot)
+            .map(|rect| {
+                CssPixelRect::new(
+                    CssPixels::nearest_value_for(rect.x as f64),
+                    CssPixels::nearest_value_for(rect.y as f64),
+                    CssPixels::nearest_value_for(rect.width as f64),
+                    CssPixels::nearest_value_for(rect.height as f64),
+                )
+            })
             .unwrap_or_else(|| paintable_geometry::absolute_border_box_rect(layout_arena, slot)),
         _ => paintable_geometry::absolute_border_box_rect(layout_arena, slot),
     }
@@ -138,7 +143,7 @@ pub(crate) fn compute_transform(
 
     // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
     // offset properties as follows:
-    let reference_box = transform_reference_box(style, layout_arena, callbacks, node);
+    let reference_box = transform_reference_box(style, layout_arena, node);
     let origin_lp = |handle: &ComputedStyleValueHandle| {
         handle
             .length_percentage()
@@ -201,7 +206,6 @@ pub(crate) fn compute_transform(
 // https://drafts.csswg.org/css-transforms-2/#perspective-matrix
 pub(crate) fn compute_perspective_data(
     layout_arena: &impl PaintableRowsRead,
-    callbacks: &FfiVisualContextHostCallbacks,
     slot: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<PerspectiveData> {
@@ -218,7 +222,7 @@ pub(crate) fn compute_perspective_data(
     // 2. Translate by the computed X and Y values of 'perspective-origin'
     // https://drafts.csswg.org/css-transforms-2/#perspective-origin-property
     // Percentages: refer to the size of the reference box
-    let reference_box = transform_reference_box(style, layout_arena, callbacks, slot);
+    let reference_box = transform_reference_box(style, layout_arena, slot);
     let origin_x = transform_values
         .perspective_origin_x
         .length_percentage()
@@ -507,24 +511,33 @@ pub(crate) fn compute_effects_data(
     layout_arena: &impl PaintableRowsRead,
     callbacks: &FfiVisualContextHostCallbacks,
     slot: NodeSlotId,
+    device_pixels_per_css_pixel: f64,
 ) -> Option<EffectsData> {
     use crate::css::css_enums::mix_blend_mode;
-    let resolved_filter = callbacks.resolve_effects_filter(layout_arena.shell_if_live(slot));
-    layout_arena.paintable_side_data(slot).svg_filter_bounds.set(
-        resolved_filter
-            .svg_filter_bounds
-            .has_value
-            .then_some(resolved_filter.svg_filter_bounds.value),
-    );
-    let filter_raw = resolved_filter.gfx_filter;
-    let filter = if filter_raw.is_null() {
-        None
-    } else {
-        // SAFETY: The host hands over a heap-allocated Gfx::Filter for us to own.
-        Some(std::rc::Rc::new(unsafe { super::FilterHandle::adopt(filter_raw) }))
-    };
     let style = layout_arena.node_style_if_live(slot)?;
     let effects_values = style.effects();
+    let filter = if crate::painting::filter_bytes::contains_url(&effects_values.filter) {
+        let resolved_filter = callbacks.resolve_effects_filter(layout_arena.shell_if_live(slot));
+        layout_arena.paintable_side_data(slot).svg_filter_bounds.set(
+            resolved_filter
+                .svg_filter_bounds
+                .has_value
+                .then_some(resolved_filter.svg_filter_bounds.value),
+        );
+        let filter_raw = resolved_filter.gfx_filter;
+        if filter_raw.is_null() {
+            None
+        } else {
+            // SAFETY: The host hands over a heap-allocated Gfx::Filter for us to own.
+            Some(EffectsFilter::Host(std::rc::Rc::new(unsafe {
+                super::FilterHandle::adopt(filter_raw)
+            })))
+        }
+    } else {
+        layout_arena.paintable_side_data(slot).svg_filter_bounds.set(None);
+        crate::painting::filter_bytes::serialize_non_url_filter(&effects_values.filter, device_pixels_per_css_pixel)
+            .map(|bytes| EffectsFilter::Bytes(std::rc::Rc::new(bytes)))
+    };
     if filter.is_none() && effects_values.opacity == 1.0 && effects_values.mix_blend_mode == mix_blend_mode::NORMAL {
         return None;
     }

@@ -10,6 +10,7 @@
 #include <LibCore/Environment.h>
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/Filter.h>
+#include <LibGfx/FilterImpl.h>
 #include <LibGfx/GradientInterpolation.h>
 #include <LibGfx/Matrix4x4.h>
 #include <LibGfx/Path.h>
@@ -45,6 +46,7 @@
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/Blending.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/Painting/ChromeWidget.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
@@ -58,6 +60,7 @@
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Painting/Scrollbar.h>
+#include <LibWeb/Painting/Scrolling.h>
 #include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/AttributeParser.h>
@@ -68,6 +71,31 @@
 #include <LibWeb/SVG/SVGMaskElement.h>
 
 namespace Web::Painting {
+
+static_assert(sizeof(Layout::RustFFI::ScrollDirection) == sizeof(ScrollDirection));
+static_assert(to_underlying(Layout::RustFFI::ScrollDirection::Horizontal) == to_underlying(ScrollDirection::Horizontal));
+static_assert(to_underlying(Layout::RustFFI::ScrollDirection::Vertical) == to_underlying(ScrollDirection::Vertical));
+
+static_assert(sizeof(Layout::RustFFI::FilterOperationType) == sizeof(Gfx::FilterImpl::OperationType));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Arithmetic) == to_underlying(Gfx::FilterImpl::OperationType::Arithmetic));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Compose) == to_underlying(Gfx::FilterImpl::OperationType::Compose));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Blend) == to_underlying(Gfx::FilterImpl::OperationType::Blend));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Flood) == to_underlying(Gfx::FilterImpl::OperationType::Flood));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::DisplacementMap) == to_underlying(Gfx::FilterImpl::OperationType::DisplacementMap));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::DropShadow) == to_underlying(Gfx::FilterImpl::OperationType::DropShadow));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Blur) == to_underlying(Gfx::FilterImpl::OperationType::Blur));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorFilter) == to_underlying(Gfx::FilterImpl::OperationType::ColorFilter));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorMatrix) == to_underlying(Gfx::FilterImpl::OperationType::ColorMatrix));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorTable) == to_underlying(Gfx::FilterImpl::OperationType::ColorTable));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Saturate) == to_underlying(Gfx::FilterImpl::OperationType::Saturate));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::HueRotate) == to_underlying(Gfx::FilterImpl::OperationType::HueRotate));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Image) == to_underlying(Gfx::FilterImpl::OperationType::Image));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Merge) == to_underlying(Gfx::FilterImpl::OperationType::Merge));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Offset) == to_underlying(Gfx::FilterImpl::OperationType::Offset));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Erode) == to_underlying(Gfx::FilterImpl::OperationType::Erode));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Dilate) == to_underlying(Gfx::FilterImpl::OperationType::Dilate));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Turbulence) == to_underlying(Gfx::FilterImpl::OperationType::Turbulence));
+static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorSpaceConversion) == to_underlying(Gfx::FilterImpl::OperationType::ColorSpaceConversion));
 
 static_assert(sizeof(RustFFI::IntPoint) == sizeof(Gfx::IntPoint));
 static_assert(alignof(RustFFI::IntPoint) == alignof(Gfx::IntPoint));
@@ -286,6 +314,15 @@ VERIFY_SHARED_FFI_TYPE(Gfx::ScalingMode);
 VERIFY_SHARED_FFI_TYPE(Gfx::InterpolationColorSpace);
 VERIFY_SHARED_FFI_TYPE(TransformDataRole);
 VERIFY_SHARED_FFI_TYPE(MaskLayerOrigin);
+VERIFY_SHARED_FFI_TYPE(ChromeMetrics);
+static_assert(sizeof(ChromeMetrics) == 7 * sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, scroll_thumb_min_length) == 0);
+static_assert(offsetof(ChromeMetrics, scroll_thumb_padding_thin) == sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, scroll_thumb_thickness_thin) == 2 * sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, scroll_thumb_thickness) == 3 * sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, scroll_gutter_thickness) == 4 * sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, resize_gripper_size) == 5 * sizeof(CSSPixels));
+static_assert(offsetof(ChromeMetrics, resize_gripper_padding) == 6 * sizeof(CSSPixels));
 VERIFY_SHARED_FFI_TYPE(Optional<CSSPixels>);
 VERIFY_SHARED_FFI_TYPE(Optional<CSSPixelRect>);
 VERIFY_SHARED_FFI_TYPE(Optional<Gfx::IntRect>);
@@ -343,6 +380,8 @@ static VisualContextData visual_context_data_from_export(Layout::RustFFI::FfiVis
         EffectsData effects { .opacity = node.opacity, .blend_mode = node.blend_mode, .gfx_filter = {} };
         if (node.filter)
             effects.gfx_filter = *static_cast<Gfx::Filter const*>(node.filter);
+        else if (node.filter_bytes_length)
+            effects.gfx_filter = Gfx::deserialize_filter({ node.filter_bytes, node.filter_bytes_length }, [](u64) -> Gfx::DecodedImageFrame { VERIFY_NOT_REACHED(); });
         return effects;
     }
     case Layout::RustFFI::FfiVisualContextNodeKind::ScrollCompensation:
@@ -437,14 +476,6 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
         },
         .scroll_offset = [](void*, void* layout_node_shell) -> CSSPixelPoint {
             return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell));
-        },
-        .svg_transform_view_box_rect = [](void*, void* layout_node_shell, CSSPixelRect* out) -> bool {
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            auto const* viewport_paintable = nearest_svg_viewport_of(layout_node);
-            if (!viewport_paintable)
-                return false;
-            *out = svg_viewport_user_rect(*viewport_paintable).to_type<CSSPixels>();
-            return true;
         },
         .svg_additional_element_transform = [](void*, void* layout_node_shell, Gfx::AffineTransform* out) -> bool {
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
@@ -717,22 +748,10 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
         .paintable_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiHitTestPaintableFacts {
             auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
             Layout::RustFFI::FfiHitTestPaintableFacts facts {};
-            facts.opacity_is_zero = layout_node.opacity() == 0;
-            facts.visible_for_hit_testing = visible_for_hit_testing(layout_node);
             auto dom_node = layout_node.dom_node();
+            facts.is_inert = dom_node && dom_node->is_inert();
             facts.dom_node_has_parent = dom_node && dom_node->parent();
             facts.is_editable_or_editing_host = dom_node && dom_node->is_editable_or_editing_host();
-            facts.has_resizer = has_resizer(layout_node);
-            auto wheel_scrollable_axes = Painting::wheel_scrollable_axes(layout_node);
-            facts.could_be_scrolled_horizontally = wheel_scrollable_axes.horizontal;
-            facts.could_be_scrolled_vertically = wheel_scrollable_axes.vertical;
-            if (is_svg_path_paintable(layout_node)) {
-                auto const& graphics_element = as<SVG::SVGGraphicsElement>(*dom_node);
-                facts.svg_path_has_fill = graphics_element.fill_color().has_value();
-                facts.svg_path_winding_rule = graphics_element.fill_rule().value_or(SVG::FillRule::Nonzero) == SVG::FillRule::Evenodd
-                    ? Gfx::WindingRule::EvenOdd
-                    : Gfx::WindingRule::Nonzero;
-            }
             if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(dom_node); graphics_element && graphics_element->unsafe_layout_node()) {
                 for (auto child = graphics_element->unsafe_layout_node()->first_child(); child; child = child->next_sibling()) {
                     if (child->kind() == Layout::RustFFI::NodeKind::SVGMaskBox)
@@ -741,15 +760,13 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
                         facts.svg_clip_path_units_object_bbox = as<SVG::SVGClipPathElement>(*child->dom_node()).clip_path_units() == SVG::ClipPathUnits::ObjectBoundingBox;
                 }
             }
+            facts.inside_blocking_wheel_event_handler = dom_node && dom_node->inside_blocking_wheel_event_handler();
             return facts;
         },
         .text_node_facts = [](void*, void* node_shell) -> Layout::RustFFI::FfiHitTestTextNodeFacts {
             auto const& text_node = *static_cast<Layout::TextNode const*>(node_shell);
-            auto const& style_source = *text_node.parent();
             auto const* dom_text = text_node.dom_text();
             return {
-                .parent_opacity_is_zero = style_source.opacity() == 0,
-                .parent_pointer_events_none = style_source.pointer_events() == CSS::PointerEvents::None,
                 .is_inert = dom_text && dom_text->is_inert(),
             };
         },
@@ -825,73 +842,6 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 facts.snaps_scroll_position_horizontally = snap_axes.x;
                 facts.snaps_scroll_position_vertically = snap_axes.y;
             }
-            facts.inside_blocking_wheel_event_handler = dom_node && dom_node->inside_blocking_wheel_event_handler();
-            facts.records_viewport_scrollbars = is_viewport_paintable(layout_node)
-                && layout_node.document().page().async_scrolling_enabled()
-                && should_paint_viewport_scrollbars()
-                && layout_node.scrollbar_width() != CSS::ScrollbarWidth::None;
-            if (facts.records_viewport_scrollbars) {
-                auto scrollbar_colors = scrollbar_colors_for_paint(layout_node);
-                auto const& metrics = layout_node.document().page().chrome_metrics();
-                size_t index = 0;
-                for (auto direction : { ScrollDirection::Vertical, ScrollDirection::Horizontal }) {
-                    auto& out = facts.viewport_scrollbars[index++];
-                    auto scrollbar_data = compute_scrollbar_data(layout_node, direction, metrics, nullptr, ScrollbarSizing::Regular);
-                    if (!scrollbar_data.has_value())
-                        continue;
-                    auto expanded_scrollbar_data = compute_scrollbar_data(layout_node, direction, metrics, nullptr, ScrollbarSizing::Enlarged);
-                    VERIFY(expanded_scrollbar_data.has_value());
-                    out.present = true;
-                    out.gutter_rect = scrollbar_data->gutter_rect;
-                    out.thumb_rect = scrollbar_data->thumb_rect;
-                    out.expanded_gutter_rect = expanded_scrollbar_data->gutter_rect;
-                    out.expanded_thumb_rect = expanded_scrollbar_data->thumb_rect;
-                    out.scroll_size = scrollbar_data->thumb_travel_to_scroll_ratio.to_double();
-                    out.expanded_scroll_size = expanded_scrollbar_data->thumb_travel_to_scroll_ratio.to_double();
-                    out.thumb_color = scrollbar_colors.thumb_color;
-                    out.track_color = scrollbar_colors.track_color;
-                }
-            }
-            return facts;
-        },
-        .overlay_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiOverlayFacts {
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            auto const& document = layout_node.document();
-            auto const& metrics = document.page().chrome_metrics();
-            Layout::RustFFI::FfiOverlayFacts facts {};
-            facts.paints_scrollbars = ((should_paint_viewport_scrollbars() && !document.page().async_scrolling_enabled()) || !is_viewport_paintable(layout_node))
-                && layout_node.scrollbar_width() != CSS::ScrollbarWidth::None;
-            if (facts.paints_scrollbars) {
-                auto scrollbar_colors = scrollbar_colors_for_paint(layout_node);
-                facts.thumb_color = scrollbar_colors.thumb_color;
-                facts.track_color = scrollbar_colors.track_color;
-                size_t index = 0;
-                for (auto direction : { ScrollDirection::Vertical, ScrollDirection::Horizontal }) {
-                    auto& out = facts.scrollbars[index++];
-                    auto scrollbar = document.chrome_widget_registry().scrollbar(committed_row_slot(layout_node), direction);
-                    auto scrollbar_data = compute_scrollbar_data(layout_node, direction, metrics, nullptr,
-                        scrollbar && scrollbar->is_enlarged() ? ScrollbarSizing::Enlarged : ScrollbarSizing::Regular);
-                    if (!scrollbar_data.has_value())
-                        continue;
-                    out.present = true;
-                    out.gutter_rect = scrollbar_data->gutter_rect;
-                    out.thumb_rect = scrollbar_data->thumb_rect;
-                    out.track_rect = scrollbar_data->track_rect;
-                    out.thumb_travel_to_scroll_ratio = scrollbar_data->thumb_travel_to_scroll_ratio.to_double();
-                }
-            }
-            if (auto resizer_rect = absolute_resizer_rect(layout_node, metrics); resizer_rect.has_value()) {
-                facts.resizer_rect = *resizer_rect;
-                facts.resize_gripper_padding = metrics.resize_gripper_padding;
-            }
-            if (is_viewport_paintable(layout_node)) {
-                if (auto navigable = document.navigable()) {
-                    if (auto handler = navigable->event_handler().middle_button_scroll_handler(); handler.has_value()) {
-                        facts.middle_button_scroll_active = true;
-                        facts.middle_button_scroll_origin = handler->origin();
-                    }
-                }
-            }
             return facts;
         },
         .outline_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiOutlineFacts {
@@ -937,10 +887,6 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 }
             }
             return facts;
-        },
-        .root_background_source = [](void* context_pointer) -> Layout::RustFFI::FfiRootBackgroundSource {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            return rust_root_background_source(context.document);
         },
         .text_control_selection = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiTextControlSelection {
             Layout::RustFFI::FfiTextControlSelection result {};
@@ -1210,22 +1156,16 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto display_list = DisplayList::create_from_command_bytes(visual_context_tree, move(command_bytes));
             return context.resource_storage.add_display_list(move(display_list), visual_context_tree).value();
         },
-        .svg_host_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiSvgHostFacts {
+        .svg_image_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiSvgImageFacts {
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
             auto const* row = committed_row(layout_node);
             VERIFY(row);
-            Layout::RustFFI::FfiSvgHostFacts facts {};
-            if (is_svg_path_paintable(layout_node)) {
-                facts.percentage_basis = as<SVG::SVGGraphicsElement>(*layout_node.dom_node()).viewport_percentage_basis();
-                if (auto const* viewport_paintable = nearest_svg_viewport_of(layout_node))
-                    facts.viewport = svg_viewport_user_rect(*viewport_paintable);
-            }
-            if (row->kind == Layout::RustFFI::PaintableKind::SVGImagePaintable) {
-                auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
-                facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
-                if (auto natural_size = image_provider.intrinsic_size(); natural_size.has_value())
-                    facts.natural_size = natural_size->to_type<float>();
-            }
+            VERIFY(row->kind == Layout::RustFFI::PaintableKind::SVGImagePaintable);
+            Layout::RustFFI::FfiSvgImageFacts facts {};
+            auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
+            facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
+            if (auto natural_size = image_provider.intrinsic_size(); natural_size.has_value())
+                facts.natural_size = natural_size->to_type<float>();
             return facts;
         },
         .svg_paint_style = [](void* context_pointer, void* layout_node_shell, bool is_stroke, Layout::RustFFI::FfiSvgPaintContext const* ffi_paint_context, void* sink) -> Layout::RustFFI::FfiSvgPaintStyle {
@@ -1391,6 +1331,18 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
     inputs.is_recording_async_scrolling_metadata = true;
     inputs.document_id = document.unique_id().value();
     inputs.has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport;
+    inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Horizontal)));
+    inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Vertical)));
+    inputs.chrome_metrics = document.page().chrome_metrics();
+    inputs.root_background_source = rust_root_background_source(document);
+    inputs.paint_viewport_scrollbars = should_paint_viewport_scrollbars();
+    inputs.async_scrolling_enabled = document.page().async_scrolling_enabled();
+    if (auto navigable = document.navigable()) {
+        if (auto handler = navigable->event_handler().middle_button_scroll_handler(); handler.has_value()) {
+            inputs.middle_button_scroll_active = true;
+            inputs.middle_button_scroll_origin = handler->origin();
+        }
+    }
     inputs.paint_command_cache_read_write = cache_mode == PaintCommandCacheMode::ReadWrite;
     inputs.display_list_id = placeholder_display_list.id();
     {

@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/CSS/ComputedValues.h>
@@ -105,51 +104,6 @@ struct StyleEngineTransaction {
     Optional<StyleEngine::PublishedTransactionVersion> published_version;
     bool prefers_broad_matching_batch { false };
 };
-
-static Vector<u64> style_inheritance_path(DOM::Element const& element)
-{
-    Vector<u64> path;
-    for (Optional<DOM::AbstractElement> ancestor = DOM::AbstractElement { element }; ancestor.has_value();) {
-        auto parent = ancestor->element_to_inherit_style_from();
-        u64 branch = 0;
-        if (parent.has_value()) {
-            // Shadow-tree children are traversed before the host's light-tree children. Assigned
-            // slottables follow the slot's own fallback subtree.
-            if (ancestor->element().assigned_slot_internal() == GC::Ptr<DOM::Element> { parent->element() })
-                branch = 2;
-            else if (parent->element().shadow_root() && !ancestor->element().parent_node()->is_shadow_root())
-                branch = 1;
-        }
-        path.append((branch << 32) | ancestor->element().style_node_id().value());
-        ancestor = parent;
-    }
-    return path;
-}
-
-static void sort_style_engine_reactions_for_direct_application(StyleComputer& style_computer, Vector<StyleEngine::PublishedStyleDelta>& reactions)
-{
-    // Apply each inheritance branch contiguously in preorder. Besides making every parent ready
-    // before its descendants, this lets a parent's derived reaction merge into an unconsumed child
-    // reaction in the same batch.
-    HashMap<u32, Vector<u64>> style_inheritance_paths;
-    for (auto const& reaction : reactions) {
-        auto element = style_computer.element_for_style_node(reaction.style_node);
-        VERIFY(element);
-        style_inheritance_paths.set(reaction.style_node, style_inheritance_path(*element));
-    }
-    quick_sort(reactions, [&](auto const& first, auto const& second) {
-        auto const& first_path = style_inheritance_paths.get(first.style_node).value();
-        auto const& second_path = style_inheritance_paths.get(second.style_node).value();
-        auto common_length = min(first_path.size(), second_path.size());
-        for (size_t offset = 1; offset <= common_length; ++offset) {
-            auto first_node = first_path[first_path.size() - offset];
-            auto second_node = second_path[second_path.size() - offset];
-            if (first_node != second_node)
-                return first_node < second_node;
-        }
-        return first_path.size() < second_path.size();
-    });
-}
 
 static StyleEngineTransaction take_style_engine_transaction(DOM::Document& document)
 {
@@ -288,13 +242,9 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             VERIFY(reaction.damage == StyleEngineFFI::FfiStyleDeltaDamage::Full);
         }
 
-        bool was_unstyled = false;
-        bool was_display_none = false;
-        {
-            auto previous_style = element->computed_style();
-            was_unstyled = !previous_style;
-            was_display_none = previous_style && previous_style->display().is_none();
-        }
+        auto previous_style_state = document.style_computer().style_engine().style_record_state(element->style_record_identity());
+        bool const was_unstyled = !previous_style_state.present;
+        bool const was_display_none = previous_style_state.display_none;
         bool const needs_regular_style_recompute = reaction.reaction & (StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle | StyleEngine::RecomputeDescendantStyles | StyleEngine::AncestorBecameVisible);
         bool const needs_custom_property_recompute = reaction.reaction & StyleEngine::InheritedCustomProperties;
         bool const needs_inherited_style_recompute = reaction.reaction & StyleEngine::InheritedStyle;
@@ -373,9 +323,9 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
         apply_element_style_invalidation_after_style_change(*element, invalidation);
         transaction_invalidation |= invalidation;
 
-        auto current_style = element->computed_style();
-        VERIFY(current_style);
-        if (current_style->display().is_none()) {
+        auto current_style_state = document.style_computer().style_engine().style_record_state(element->style_record_identity());
+        VERIFY(current_style_state.present);
+        if (current_style_state.display_none) {
             if (was_unstyled) {
                 record_direct_child_style_engine_reactions(*element, reaction_batch, StyleEngine::RecomputeStyle);
                 if (auto shadow_root = element->shadow_root())
@@ -403,7 +353,7 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
         if ((reaction.reaction & StyleEngine::RecomputeDescendantStyles) || invalidation.recompute_descendant_styles)
             common_child_reaction |= StyleEngine::RecomputeDescendantStyles;
         if (ancestor_became_visible
-            || (was_display_none && !current_style->in_display_none_subtree()))
+            || (was_display_none && !current_style_state.in_display_none_subtree))
             common_child_reaction |= StyleEngine::AncestorBecameVisible;
 
         auto light_tree_child_reaction = common_child_reaction;
@@ -448,6 +398,11 @@ static void update_style(DOM::Document& document)
     // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
     if (document.created_for_appropriate_template_contents())
         return;
+
+    document.style_computer().begin_style_record_view_epoch();
+    ScopeGuard end_style_record_view_epoch = [&] {
+        document.style_computer().end_style_record_view_epoch();
+    };
 
     document.synchronize_dirty_style_attributes();
 
@@ -631,7 +586,10 @@ static void update_style(DOM::Document& document)
         }
         style_engine_reactions.clear();
         if (!applicable_style_engine_reactions.is_empty()) {
-            sort_style_engine_reactions_for_direct_application(document.style_computer(), applicable_style_engine_reactions);
+            // Apply each inheritance branch contiguously in preorder. Besides making every parent
+            // ready before its descendants, this lets a parent's derived reaction merge into an
+            // unconsumed child reaction in the same batch.
+            document.style_computer().style_engine().sort_style_deltas_for_direct_application(applicable_style_engine_reactions);
             auto& counters = document.style_invalidation_counters();
             if (published_reaction_count > 0) {
                 ++counters.style_engine_reaction_batch_runs;
@@ -754,6 +712,11 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
         if (inheritance_chain_has_style)
             return true;
     }
+
+    document.style_computer().begin_style_record_view_epoch();
+    ScopeGuard end_style_record_view_epoch = [&] {
+        document.style_computer().end_style_record_view_epoch();
+    };
 
     StyleValueFFI::rust_style_ffi_complete_style_update_begin();
     ScopeGuard leave_complete_style_update = finish_complete_style_update;

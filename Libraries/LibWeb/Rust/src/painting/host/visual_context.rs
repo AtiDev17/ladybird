@@ -43,8 +43,6 @@ pub struct FfiVisualContextHostCallbacks {
     pub context: *mut c_void,
     pub tree_inputs: unsafe extern "C" fn(*mut c_void) -> FfiVisualContextTreeInputs,
     pub scroll_offset: unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::FfiCssPixelPoint,
-    pub svg_transform_view_box_rect:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut crate::layout::FfiCssPixelRect) -> bool,
     pub svg_additional_element_transform:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut libgfx_rust::AffineTransform) -> bool,
     pub root_background_source: unsafe extern "C" fn(*mut c_void) -> FfiRootBackgroundSource,
@@ -62,15 +60,6 @@ impl FfiVisualContextHostCallbacks {
     pub(crate) fn scroll_offset(&self, layout_node_shell: *mut c_void) -> crate::layout::FfiCssPixelPoint {
         // SAFETY: The C++ host answers synchronously from a live layout node shell.
         unsafe { (self.scroll_offset)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn svg_transform_view_box_rect(
-        &self,
-        layout_node_shell: *mut c_void,
-    ) -> Option<crate::layout::FfiCssPixelRect> {
-        let mut rect = crate::layout::FfiCssPixelRect::default();
-        // SAFETY: The C++ host writes the rect synchronously when it returns true.
-        let has_rect = unsafe { (self.svg_transform_view_box_rect)(self.context, layout_node_shell, &raw mut rect) };
-        has_rect.then_some(rect)
     }
     pub(crate) fn svg_additional_element_transform(
         &self,
@@ -134,6 +123,8 @@ pub struct FfiVisualContextNodeExport {
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
     pub filter: *mut c_void,
+    pub filter_bytes: *const u8,
+    pub filter_bytes_length: usize,
     pub path: *mut c_void,
     pub winding_rule: WindingRule,
     pub mask_kind: MaskKind,

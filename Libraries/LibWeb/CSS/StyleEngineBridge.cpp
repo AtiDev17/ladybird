@@ -25,6 +25,45 @@ static void ladybird_utf16_fly_string_unref_raw(size_t raw)
     Utf16FlyString::unref_raw(static_cast<FlatPtr>(raw));
 }
 
+static StyleEngineFFI::FfiResolvedFont resolve_font(void* context, StyleEngineFFI::FfiFontResolutionRequest request)
+{
+    auto& style_computer = *static_cast<StyleComputer*>(context);
+    auto& font_computer = style_computer.document().font_computer();
+    auto font_family = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
+        static_cast<StyleValueFFI::StyleValueData const*>(request.font_family)));
+    auto font_list = font_computer.compute_font_for_style_values(
+        *font_family,
+        CSSPixels::from_raw(request.font_size_raw),
+        request.font_slope,
+        request.font_weight,
+        Percentage(request.font_width),
+        static_cast<FontOpticalSizing>(request.font_optical_sizing),
+        {},
+        {});
+    font_computer.pin_font_list_for_style_record(font_list);
+    auto const& first_available_font = font_list->font_for_code_point(' ');
+    auto const metrics = first_available_font.pixel_metrics();
+    auto* handle = &font_list.leak_ref();
+    return {
+        .handle = handle,
+        .first_available_font = &first_available_font,
+        .font_cascade_list = handle,
+        .ascent = metrics.ascent,
+        .descent = metrics.descent,
+        .x_height = metrics.x_height,
+    };
+}
+
+static void retain_resolved_font(void const* handle)
+{
+    static_cast<Gfx::FontCascadeList const*>(handle)->ref();
+}
+
+static void release_resolved_font(void const* handle)
+{
+    static_cast<Gfx::FontCascadeList const*>(handle)->unref();
+}
+
 static_assert(!IsMoveConstructible<StyleEngine>);
 static_assert(!IsMoveAssignable<StyleEngine>);
 
@@ -44,6 +83,14 @@ StyleEngine::StyleEngine(DeviceClass device_class, StyleComputer* style_computer
     , m_style_computer(style_computer)
 {
     StyleEngineFFI::style_engine_install_raw_atom_callbacks(ladybird_utf16_fly_string_ref_raw, ladybird_utf16_fly_string_unref_raw);
+    if (m_style_computer) {
+        StyleEngineFFI::style_engine_install_font_resolver(
+            m_impl,
+            m_style_computer.ptr(),
+            resolve_font,
+            retain_resolved_font,
+            release_resolved_font);
+    }
 }
 
 StyleEngine::~StyleEngine()
@@ -201,6 +248,11 @@ StyleEngine::StyleRecordDelta StyleEngine::assign_shared_style_record(StyleNodeI
 void const* StyleEngine::style_record_payloads(StyleRecordID style_record) const
 {
     return StyleEngineFFI::style_engine_style_record_payloads(m_impl, style_record.value());
+}
+
+StyleEngine::StyleRecordState StyleEngine::style_record_state(StyleRecordID style_record) const
+{
+    return StyleEngineFFI::style_engine_style_record_state(m_impl, style_record.value());
 }
 
 StyleEngine::StyleRecordView StyleEngine::style_record_view(StyleRecordID style_record) const
@@ -456,6 +508,17 @@ void StyleEngine::record_flat_tree_descendant_style_input_changes(StyleNodeID st
     StyleEngineFFI::style_engine_discard_flat_tree_descendants(m_impl);
 }
 
+Vector<StyleNodeID> StyleEngine::viewport_dependent_style_nodes()
+{
+    auto view = StyleEngineFFI::style_engine_viewport_dependent_nodes(m_impl);
+    Vector<StyleNodeID> nodes;
+    nodes.ensure_capacity(view.count);
+    for (auto node : ReadonlySpan<u32> { view.nodes, view.count })
+        nodes.unchecked_append(StyleNodeID { node });
+    StyleEngineFFI::style_engine_discard_viewport_dependent_nodes(m_impl);
+    return nodes;
+}
+
 void StyleEngine::consume_recorded_element_style_input_change(StyleNodeID style_node)
 {
     auto existing = m_element_style_input_indices.find(style_node);
@@ -569,7 +632,26 @@ void StyleEngine::discard_style_transaction_outputs()
 StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(StyleNodeID root)
 {
     submit_recorded_input();
-    auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value());
+    StyleEngineFFI::FfiDocumentStyleComputationInputs computation_inputs {};
+    if (m_style_computer) {
+        auto const viewport_rect = m_style_computer->viewport_rect_for_style_environment();
+        auto const& root_font_metrics = m_style_computer->root_element_font_metrics();
+        computation_inputs = {
+            .viewport_width = viewport_rect.width().to_double(),
+            .viewport_height = viewport_rect.height().to_double(),
+            .root_font_size = root_font_metrics.font_size.to_double(),
+            .root_font_x_height = root_font_metrics.x_height.to_double(),
+            .root_font_cap_height = root_font_metrics.cap_height.to_double(),
+            .root_font_zero_advance = root_font_metrics.zero_advance.to_double(),
+            .root_line_height = root_font_metrics.line_height.to_double(),
+            .root_font_metrics_depend_on_viewport_metrics = m_style_computer->root_element_font_metrics_depend_on_viewport_metrics(),
+            .initial_font_size_raw = InitialValues::font_size().raw_value(),
+            .default_font_size_raw = StyleComputer::default_user_font_size().raw_value(),
+            .device_pixels_per_css_pixel = m_style_computer->document().page().client().device_pixels_per_css_pixel(),
+            .font_environment_generation = m_style_computer->document().font_computer().environment_generation(),
+        };
+    }
+    auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value(), computation_inputs);
     if (view.reclaimed_style_atom_count != 0) {
         HashTable<StyleAtomID> reclaimed_atoms;
         reclaimed_atoms.ensure_capacity(view.reclaimed_style_atom_count);
@@ -600,6 +682,11 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
         .reactions = { view.answers, view.count },
         .is_scoped = view.scoped,
     };
+}
+
+void StyleEngine::sort_style_deltas_for_direct_application(Span<PublishedStyleDelta> deltas) const
+{
+    StyleEngineFFI::style_engine_sort_style_deltas_for_direct_application(m_impl, deltas.data(), deltas.size());
 }
 
 bool StyleEngine::has_pending_transaction() const
@@ -718,6 +805,34 @@ Optional<bool> StyleEngine::selector_query_matches_without_document_root(void co
     if (result == NumericLimits<u8>::max())
         return {};
     return result != 0;
+}
+
+bool StyleEngine::selector_query_all(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, Vector<StyleNodeID>& matches)
+{
+    matches.resize(16);
+    auto read = [&] {
+        return StyleEngineFFI::style_engine_selector_query_all(
+            m_impl,
+            query,
+            root.value(),
+            include_root,
+            scope_root.value(),
+            shadow_root.value(),
+            has_document_root,
+            reinterpret_cast<u32*>(matches.data()),
+            matches.size());
+    };
+    auto count = read();
+    if (count == NumericLimits<size_t>::max())
+        return false;
+    if (count > matches.size()) {
+        matches.resize(count);
+        count = read();
+        if (count == NumericLimits<size_t>::max() || count > matches.size())
+            return false;
+    }
+    matches.shrink(count);
+    return true;
 }
 
 bool StyleEngine::counter(size_t index, StringView& out_name, u64& out_value) const

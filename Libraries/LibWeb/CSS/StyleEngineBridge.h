@@ -85,6 +85,7 @@ public:
         StyleRecordID new_style_record;
     };
     using StyleRecordView = StyleEngineFFI::FfiStyleRecordView;
+    using StyleRecordState = StyleEngineFFI::FfiStyleRecordState;
     using ExactCascadePublication = StyleEngineFFI::FfiExactCascadePublication;
     // The returned assignments borrow Rust storage until the next mutable engine call or an
     // explicit discard. Consume them synchronously before asking the engine anything else.
@@ -99,6 +100,7 @@ public:
     // The borrowed payload array is stable while a base record exists or an animation-overlay
     // generation remains assigned or pinned.
     [[nodiscard]] void const* style_record_payloads(StyleRecordID style_record) const;
+    [[nodiscard]] StyleRecordState style_record_state(StyleRecordID style_record) const;
     [[nodiscard]] StyleRecordView style_record_view(StyleRecordID style_record) const;
     // Remove the retained input identities for one pseudo-element kind and return its removal.
     [[nodiscard]] StyleRecordDelta remove_computed_pseudo(StyleNodeID node, u8 pseudo_kind);
@@ -184,6 +186,7 @@ public:
     };
     void record_element_style_input_change(StyleNodeID style_node, u8 reaction = PublishedStyle | RecomputeStyle, u8 inherited_style_groups = 0);
     void record_flat_tree_descendant_style_input_changes(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups = 0);
+    [[nodiscard]] Vector<StyleNodeID> viewport_dependent_style_nodes();
     void consume_recorded_element_style_input_change(StyleNodeID style_node);
     [[nodiscard]] bool has_recorded_element_style_input_change(StyleNodeID style_node) const;
     void record_benchmark_marker(Utf16View);
@@ -224,6 +227,7 @@ public:
     //     explicit discard. Consume them synchronously before asking the engine anything else.
     bool take_diagnostic_style_transaction(StyleNodeID root, Function<void(ReadonlySpan<StyleNodeID>)>&&);
     PublishedStyleTransaction take_style_transaction(StyleNodeID root);
+    void sort_style_deltas_for_direct_application(Span<PublishedStyleDelta>) const;
     void discard_style_transaction_outputs();
 
     using RuleMatch = StyleEngineFFI::FfiRuleMatch;
@@ -245,6 +249,7 @@ public:
     void prepare_selector_query();
     Optional<bool> selector_query_matches(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root);
     Optional<bool> selector_query_matches_without_document_root(void const* query, StyleNodeID node, StyleNodeID scope_root, StyleNodeID shadow_root);
+    bool selector_query_all(void* query, StyleNodeID root, bool include_root, StyleNodeID scope_root, StyleNodeID shadow_root, bool has_document_root, Vector<StyleNodeID>& matches);
 
     // Enumerates the engine's counters. Returns false once index is past the last counter.
     bool counter(size_t index, StringView& out_name, u64& out_value) const;

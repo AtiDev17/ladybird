@@ -1377,6 +1377,7 @@ public:
 
     ListStyleType list_style_type(StyleScope const& style_scope) const { return m_inherited.list->list_style_type_value(style_scope); }
     bool list_style_type_depends_on_counter_style_environment() const { return m_inherited.list->list_style_type_depends_on_counter_style_environment(); }
+    bool list_style_type_uses_non_overridable_counter_style() const { return m_inherited.list->list_style_type_uses_non_overridable_counter_style(); }
 
     RefPtr<AbstractImageStyleValue const> mask_image() const { return m_noninherited.mask_data->mask_image_value(); }
     Optional<MaskReference> mask() const { return m_noninherited.mask_data->mask_value(); }
@@ -1436,7 +1437,11 @@ private:
     friend class ComputedStyleRecordView;
     enum class BorrowedStyleRecord { Yes };
     ComputedValues();
+
+public:
     explicit ComputedValues(BorrowedStyleRecord);
+
+private:
     void borrow_style_record_payloads(ReadonlySpan<void const*>);
 
     RefPtr<StyleValue const> style_value_from_handle(PropertyID, RustStyleValueHandle const&) const;
@@ -1506,6 +1511,7 @@ public:
 
         ListStyleType list_style_type_value(StyleScope const&) const;
         bool list_style_type_depends_on_counter_style_environment() const;
+        bool list_style_type_uses_non_overridable_counter_style() const;
         RefPtr<AbstractImageStyleValue const> list_style_image_value() const;
         QuotesData quotes_value() const;
 
@@ -2078,7 +2084,7 @@ private:
     AK::FixedBitmap<number_of_longhand_properties> m_property_important { false };
     AK::FixedBitmap<number_of_longhand_properties> m_property_inherited { false };
     HashMap<PropertyID, NonnullRefPtr<StyleValue const>> m_inheritance_dependent_specified_values;
-    mutable HashMap<PropertyID, NonnullRefPtr<StyleValue const>> m_style_value_cache;
+    mutable OwnPtr<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>> m_style_value_cache;
     RefPtr<StyleValue const> m_raw_cascaded_font_size;
     StyleValueFFI::StyleValueData const* m_borrowed_raw_cascaded_font_size { nullptr };
     ReadonlySpan<StyleEngineFFI::FfiInheritanceDependentValue const> m_borrowed_inheritance_dependent_values;
@@ -2106,7 +2112,7 @@ class WEB_API ComputedStyleRecordView {
 
 public:
     ComputedStyleRecordView() = default;
-    ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordView const&, StyleComputer const&, StyleRecordID);
+    ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordView const&, StyleComputer const&, StyleRecordID, bool owns_style_record_pin);
     ~ComputedStyleRecordView();
 
     void retain_across_style_record_publication();
@@ -2125,11 +2131,12 @@ public:
     }
 
 private:
-    ComputedValues m_base_values { ComputedValues::BorrowedStyleRecord::Yes };
+    Optional<ComputedValues> m_base_values;
     ComputedValues m_values { ComputedValues::BorrowedStyleRecord::Yes };
     RefPtr<ComputedValues const> m_retained_values;
     GC::Ptr<StyleComputer const> m_style_computer;
     StyleRecordID m_style_record_identity;
+    bool m_owns_style_record_pin { false };
     bool m_present { false };
 };
 

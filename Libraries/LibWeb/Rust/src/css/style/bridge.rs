@@ -41,6 +41,7 @@ use super::compiler::ScopeChain;
 use super::index::FeatureValue;
 use super::index::LocalFeatureKey;
 use super::index::StyleAtomID;
+use super::matching::{SelectorQueryCache, SelectorQueryContext};
 use super::memory::DeviceClass;
 #[cfg(feature = "style-recording")]
 use super::memory::MEMORY_CATEGORIES;
@@ -132,6 +133,47 @@ pub struct FfiStyleTransactionView {
     pub reclaimed_style_atom_count: usize,
     pub scoped: bool,
     pub style_atoms_swept: bool,
+}
+
+/// Document-wide scalar computation inputs captured at a style transaction boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FfiDocumentStyleComputationInputs {
+    pub viewport_width: f64,
+    pub viewport_height: f64,
+    pub root_font_size: f64,
+    pub root_font_x_height: f64,
+    pub root_font_cap_height: f64,
+    pub root_font_zero_advance: f64,
+    pub root_line_height: f64,
+    pub root_font_metrics_depend_on_viewport_metrics: bool,
+    pub initial_font_size_raw: i32,
+    pub default_font_size_raw: i32,
+    pub device_pixels_per_css_pixel: f64,
+    pub font_environment_generation: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiFontResolutionRequest {
+    pub font_family: *const c_void,
+    pub font_size_raw: i32,
+    pub font_slope: i32,
+    pub font_weight: f64,
+    pub font_width: f64,
+    pub font_optical_sizing: u8,
+    pub font_environment_generation: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FfiResolvedFont {
+    pub handle: *const c_void,
+    pub first_available_font: *const c_void,
+    pub font_cascade_list: *const c_void,
+    pub ascent: f32,
+    pub descent: f32,
+    pub x_height: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -241,6 +283,15 @@ pub struct FfiMemoryPressureSnapshot {
     pub category_bytes: [u64; MEMORY_CATEGORY_COUNT],
 }
 
+/// Small by-value state probes for one final style record.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FfiStyleRecordState {
+    pub present: bool,
+    pub display_none: bool,
+    pub in_display_none_subtree: bool,
+}
+
 /// A synchronous borrowed view of one final style record.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -270,8 +321,19 @@ pub struct FfiStyleRecordView {
 
 struct SelectorQuery {
     program: SelectorProgram,
+    cache: SelectorQueryCache,
     _atoms: PinnedAtoms,
     _memory: MemoryLease,
+}
+
+impl SelectorQuery {
+    #[must_use]
+    fn capacity_bytes(&self) -> u64 {
+        self.program
+            .capacity_bytes()
+            .saturating_add(self.cache.capacity_bytes())
+            .saturating_add(std::mem::size_of::<Self>() as u64)
+    }
 }
 
 impl FfiStyleRecordView {
@@ -690,20 +752,20 @@ impl StyleEngine {
         self.ffi_retained_cascade_assignments_memory.shrink_to(0);
     }
 
-    fn install_ffi_flat_tree_descendants(&mut self, descendants: Vec<u32>) -> FfiStyleNodeSlice {
-        let bytes = (descendants.capacity() * size_of::<u32>()) as u64;
-        self.ffi_flat_tree_descendants = descendants;
-        self.ffi_flat_tree_descendants_memory
+    fn install_ffi_style_node_query(&mut self, nodes: Vec<u32>) -> FfiStyleNodeSlice {
+        let bytes = (nodes.capacity() * size_of::<u32>()) as u64;
+        self.ffi_style_node_query = nodes;
+        self.ffi_style_node_query_memory
             .resize_required_to(&mut self.memory, bytes);
         FfiStyleNodeSlice {
-            nodes: self.ffi_flat_tree_descendants.as_ptr(),
-            count: self.ffi_flat_tree_descendants.len(),
+            nodes: self.ffi_style_node_query.as_ptr(),
+            count: self.ffi_style_node_query.len(),
         }
     }
 
-    fn clear_ffi_flat_tree_descendants(&mut self) {
-        self.ffi_flat_tree_descendants = Vec::new();
-        self.ffi_flat_tree_descendants_memory.shrink_to(0);
+    fn clear_ffi_style_node_query(&mut self) {
+        self.ffi_style_node_query = Vec::new();
+        self.ffi_style_node_query_memory.shrink_to(0);
     }
 
     fn install_ffi_style_transaction_output(&mut self, output: FfiStyleTransactionOutput) {
@@ -909,6 +971,27 @@ pub extern "C" fn style_engine_install_raw_atom_callbacks(
     super::atoms::install_raw_atom_callbacks(retain, release);
 }
 
+/// Installs the document's synchronous platform font resolver once.
+///
+/// # Safety
+/// The context and callbacks must remain valid until the engine is destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_install_font_resolver(
+    engine: *mut c_void,
+    context: *mut c_void,
+    resolve: unsafe extern "C" fn(*mut c_void, FfiFontResolutionRequest) -> FfiResolvedFont,
+    retain: unsafe extern "C" fn(*const c_void),
+    release: unsafe extern "C" fn(*const c_void),
+) {
+    abort_on_panic(|| {
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        assert!(engine.font_resolver.is_none(), "font resolver is installed once");
+        engine.font_resolver = Some(super::font_resolution::FontResolver::new(
+            context, resolve, retain, release,
+        ));
+    });
+}
+
 /// Creates a replay engine whose atom keys are opaque capture tokens rather than live fly strings.
 pub fn style_engine_create_for_replay(device_class: FfiDeviceClass) -> *mut c_void {
     abort_on_panic(|| Box::into_raw(Box::new(StyleEngine::new_for_replay(device_class.decode()))).cast())
@@ -982,7 +1065,7 @@ pub unsafe extern "C" fn style_engine_allocate_style_nodes(engine: *mut c_void, 
 pub unsafe extern "C" fn style_engine_flat_tree_descendants(engine: *mut c_void, root: u32) -> FfiStyleNodeSlice {
     abort_on_panic(|| {
         let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-        engine.clear_ffi_flat_tree_descendants();
+        engine.clear_ffi_style_node_query();
         let Some(root) = StyleNodeID::from_raw(root) else {
             return FfiStyleNodeSlice::default();
         };
@@ -994,7 +1077,7 @@ pub unsafe extern "C" fn style_engine_flat_tree_descendants(engine: *mut c_void,
             payload.write_u32(root.raw());
             payload.write_u32_slice(&descendants);
         });
-        engine.install_ffi_flat_tree_descendants(descendants)
+        engine.install_ffi_style_node_query(descendants)
     })
 }
 
@@ -1006,9 +1089,37 @@ pub unsafe extern "C" fn style_engine_flat_tree_descendants(engine: *mut c_void,
 pub unsafe extern "C" fn style_engine_discard_flat_tree_descendants(engine: *mut c_void) {
     abort_on_panic(|| {
         let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-        engine.clear_ffi_flat_tree_descendants();
+        engine.clear_ffi_style_node_query();
     });
 }
+
+/// Returns the owner nodes whose element or pseudo style depends on viewport metrics.
+///
+/// # Safety
+/// `engine` must be live. The returned slice remains valid until the next mutable engine call or an
+/// explicit discard.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_viewport_dependent_nodes(engine: *mut c_void) -> FfiStyleNodeSlice {
+    abort_on_panic(|| {
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        engine.clear_ffi_style_node_query();
+        let nodes = engine.computed_group_sets.viewport_dependent_nodes();
+        engine.install_ffi_style_node_query(nodes)
+    })
+}
+
+/// Discards the borrowed viewport-dependent node slice.
+///
+/// # Safety
+/// `engine` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_discard_viewport_dependent_nodes(engine: *mut c_void) {
+    abort_on_panic(|| {
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        engine.clear_ffi_style_node_query();
+    });
+}
+
 /// Applies one flat style input transaction.
 ///
 /// # Safety
@@ -1467,6 +1578,7 @@ pub unsafe extern "C" fn style_engine_compile_selector_query(
         memory.resize_required_to(&mut engine.memory, bytes);
         Box::into_raw(Box::new(SelectorQuery {
             program,
+            cache: SelectorQueryCache::default(),
             _atoms: atoms,
             _memory: memory,
         }))
@@ -1514,6 +1626,60 @@ pub unsafe extern "C" fn style_engine_selector_query_matches_without_document_ro
     shadow_root: u32,
 ) -> u8 {
     unsafe { selector_query_matches_impl(engine, query, node, scope_root, shadow_root, false) }
+}
+
+/// Matches a selector query against one resident subtree in one operation.
+///
+/// Returns the required result capacity without writing when `capacity` is too small, and
+/// `usize::MAX` when resident facts do not cover the query.
+///
+/// # Safety
+/// `engine` and `query` must be live and belong to the same document. `matches` must point at
+/// `capacity` writable node identities when `capacity` is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_selector_query_all(
+    engine: *mut c_void,
+    query: *mut c_void,
+    root: u32,
+    include_root: bool,
+    scope_root: u32,
+    shadow_root: u32,
+    has_document_root: bool,
+    matches: *mut u32,
+    capacity: usize,
+) -> usize {
+    abort_on_panic(|| {
+        let Some(root) = StyleNodeID::from_raw(root) else {
+            return usize::MAX;
+        };
+        if query.is_null() || (capacity != 0 && matches.is_null()) {
+            return usize::MAX;
+        }
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        let query = unsafe { &mut *query.cast::<SelectorQuery>() };
+        let result = engine.selector_query_all(
+            &query.program,
+            &mut query.cache,
+            SelectorQueryContext {
+                root,
+                include_root,
+                scope_root: StyleNodeID::from_raw(scope_root),
+                shadow_root: StyleNodeID::from_raw(shadow_root),
+                has_document_root,
+            },
+        );
+        let query_bytes = query.capacity_bytes();
+        query._memory.resize_required_to(&mut engine.memory, query_bytes);
+        let Ok(result) = result else {
+            return usize::MAX;
+        };
+        if result.len() <= capacity {
+            for (index, node) in result.iter().enumerate() {
+                unsafe { matches.add(index).write(node.raw()) };
+            }
+        }
+        result.len()
+    })
 }
 
 unsafe fn selector_query_matches_impl(
@@ -2286,6 +2452,29 @@ pub unsafe extern "C" fn style_engine_style_record_payloads(engine: *const c_voi
     })
 }
 
+/// Returns the small state probes used while applying and reusing style records.
+///
+/// # Safety
+/// `engine` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_style_record_state(
+    engine: *const c_void,
+    style_record: u64,
+) -> FfiStyleRecordState {
+    abort_on_panic(|| {
+        let engine = unsafe { &*engine.cast::<StyleEngine>() };
+        let Some(view) = engine.style_record_view(style_record) else {
+            return FfiStyleRecordState::default();
+        };
+        let box_values = unsafe { &*view.payloads[22].cast::<crate::css::computed_values::BoxValues>() };
+        FfiStyleRecordState {
+            present: true,
+            display_none: box_values.display == crate::css::display::FfiDisplay::none(),
+            in_display_none_subtree: view.dependency_flags & 4 != 0,
+        }
+    })
+}
+
 /// Returns a synchronous borrowed view of a base or live animation-overlay record.
 ///
 /// # Safety
@@ -2523,12 +2712,14 @@ pub unsafe extern "C" fn style_engine_intern_atom(engine: *mut c_void, raw: usiz
 pub unsafe extern "C" fn style_engine_take_style_transaction(
     engine: *mut c_void,
     root: u32,
+    computation_inputs: FfiDocumentStyleComputationInputs,
 ) -> FfiStyleTransactionView {
     abort_on_panic(|| {
         let Some(root) = StyleNodeID::from_raw(root) else {
             return FfiStyleTransactionView::default();
         };
         let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        engine.document_style_computation_inputs = Some(computation_inputs);
         engine.clear_ffi_style_transaction_output();
         let mut output = FfiStyleTransactionOutput::default();
         output.scoped = engine.take_style_transaction(root, |transaction_version, program_version, answers| {
@@ -2571,6 +2762,31 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
             style_atoms_swept: output.style_atoms_swept,
         }
     })
+}
+
+/// Orders a completed reaction batch for direct application in C++.
+///
+/// # Safety
+/// `engine` must be live, and `deltas` must name `count` writable entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_sort_style_deltas_for_direct_application(
+    engine: *const c_void,
+    deltas: *mut FfiStyleDelta,
+    count: usize,
+) {
+    abort_on_panic(|| {
+        if count == 0 {
+            return;
+        }
+        assert!(!deltas.is_null(), "a non-empty delta span must have storage");
+        let engine = unsafe { &*engine.cast::<StyleEngine>() };
+        let deltas = unsafe { std::slice::from_raw_parts_mut(deltas, count) };
+        deltas.sort_unstable_by(|first, second| {
+            let first = StyleNodeID::from_raw(first.style_node).expect("a style delta must name an element");
+            let second = StyleNodeID::from_raw(second.style_node).expect("a style delta must name an element");
+            engine.tree.compare_style_reaction_order(first, second)
+        });
+    });
 }
 
 /// Installs the authoritative release order recorded for the next replay transaction.

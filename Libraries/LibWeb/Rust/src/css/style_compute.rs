@@ -1289,6 +1289,7 @@ pub(crate) struct ExternalValueDependencies {
     pub container_relative_length_unit_mask: u8,
     pub has_unfixed_random_sharing: bool,
     pub needs_document_base_url: bool,
+    pub may_need_style_sheet_resource_context: bool,
     pub inheritance_dependent: bool,
 }
 
@@ -1361,6 +1362,7 @@ pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalVal
                 url, resource_context, ..
             } => {
                 dependencies.needs_document_base_url |= !url.as_bytes().is_empty() && !resource_context.has_base_url;
+                dependencies.may_need_style_sheet_resource_context |= !url.as_bytes().is_empty();
             }
             StyleValueData::Calculated { rust_calculation, .. } => {
                 collect_calculation(rust_calculation.node(), dependencies);
@@ -3173,19 +3175,7 @@ fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &FfiC
 }
 
 fn requires_cpp_store_side_effect(entry: &FfiComputedStoreEntry, has_animated_inheritance_parent: bool) -> bool {
-    use crate::css::property_metadata::property_id as prop;
-    entry.has_style_sheet_context
-        || entry.inherited && has_animated_inheritance_parent
-        || matches!(
-            entry.property_id,
-            prop::COLOR_SCHEME
-                | prop::FONT_FAMILY
-                | prop::FONT_SIZE
-                | prop::FONT_STYLE
-                | prop::FONT_VARIATION_SETTINGS
-                | prop::FONT_WEIGHT
-                | prop::FONT_WIDTH
-        )
+    entry.has_style_sheet_context || entry.inherited && has_animated_inheritance_parent
 }
 
 fn publish_longhand_store_batch(
@@ -4404,6 +4394,10 @@ pub unsafe extern "C" fn rust_drive_property_computation(
         let longhand_table = unsafe { &mut *longhand_table };
         longhand_table.finish_drive_inheritance_dependent_values();
         longhand_table.merge_driver_flags(&important_words, &inherited_words, &evaluated_words);
+        longhand_table.merge_dependency_flags(
+            results.depends_on_viewport_metrics,
+            results.font_metrics_depend_on_viewport_metrics,
+        );
         if phase != LONGHAND_DRIVE_PHASE_REMAINING {
             return publish_longhand_store_batch(cpp_store_side_effects, pending_effective_color_scheme);
         }

@@ -357,12 +357,16 @@ ValidityState element_validity_state(DOM::Element const& target)
     if (!form_element && !is<HTML::HTMLFieldSetElement>(target))
         return ValidityState::NotApplicable;
 
+    if (form_element)
+        return form_element->has_invalid_associated_element() ? ValidityState::Invalid : ValidityState::Valid;
+
     bool has_invalid_elements = false;
     target.for_each_in_subtree([&](auto& node) {
-        auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(&node);
-        if (!form_associated_element)
+        auto const* element = as_if<DOM::Element>(node);
+        if (!element)
             return TraversalDecision::Continue;
-        if (form_element && form_associated_element->form() != form_element)
+        auto const* form_associated_element = as_form_associated_element(*element);
+        if (!form_associated_element)
             return TraversalDecision::Continue;
         if (form_associated_element->is_candidate_for_constraint_validation() && !form_associated_element->satisfies_its_constraints()) {
             has_invalid_elements = true;

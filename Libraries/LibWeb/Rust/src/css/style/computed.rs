@@ -674,6 +674,7 @@ pub struct ComputedGroupSets {
     pseudo_assignment_nested_memory: MemoryLease,
     style_records_interned_since_reclamation: usize,
     next_reclamation_after: usize,
+    style_record_view_epoch_depth: u32,
 }
 
 impl Default for ComputedGroupSets {
@@ -705,11 +706,27 @@ impl Default for ComputedGroupSets {
             pseudo_assignment_nested_memory: MemoryLease::new(MemoryCategory::ComputedPseudoAssignment),
             style_records_interned_since_reclamation: 0,
             next_reclamation_after: 1024,
+            style_record_view_epoch_depth: 0,
         }
     }
 }
 
 impl ComputedGroupSets {
+    pub(crate) fn begin_style_record_view_epoch(&mut self) {
+        self.style_record_view_epoch_depth = self
+            .style_record_view_epoch_depth
+            .checked_add(1)
+            .expect("style-record view epoch depth overflow");
+    }
+
+    pub(crate) fn end_style_record_view_epoch(&mut self) {
+        assert!(
+            self.style_record_view_epoch_depth > 0,
+            "style-record view epoch underflow"
+        );
+        self.style_record_view_epoch_depth -= 1;
+    }
+
     fn group_identity(&self, index: usize, payload: *const c_void) -> ComputedGroupID {
         let key = (index, payload as usize);
         self.groups
@@ -791,6 +808,29 @@ impl ComputedGroupSets {
         let index = node.element_index()? as usize;
         let style_record = *self.style_record_column.get(index)?.as_ref()?;
         Some(self.final_style_record(style_record, self.columns.animation_overlay_slot(index)))
+    }
+
+    pub(super) fn viewport_dependent_nodes(&self) -> Vec<u32> {
+        let depends_on_viewport = |fixed_metadata: ComputedFixedMetadataID| {
+            self.computed_fixed_metadata.get(fixed_metadata).dependency_flags & 1 != 0
+        };
+        let mut nodes = Vec::new();
+        for index in 1..self.columns.flags.len() {
+            if self.columns.fixed_metadata(index).is_some_and(depends_on_viewport) {
+                nodes.push(u32::try_from(index).expect("computed style node identity exceeds u32"));
+            }
+        }
+        for (&node, rows) in &self.pseudo_rows_by_node {
+            if rows.iter().any(|row| {
+                row.assignment
+                    .is_some_and(|assignment| depends_on_viewport(assignment.fixed_metadata))
+            }) {
+                nodes.push(node.raw());
+            }
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 
     fn intern_group_set(&mut self, groups: &[ComputedGroupID]) -> (ComputedGroupSetID, bool) {
@@ -984,17 +1024,37 @@ impl ComputedGroupSets {
         identity
     }
 
-    /// Replace a fully inheriting element's static inherited groups with its flat-tree parent's
-    /// groups and publish the resulting base style record without rebuilding computed values.
-    pub(super) fn replace_static_inherited_groups(
+    /// Replace a fully inheriting element's engine-resolvable inherited groups with its flat-tree
+    /// parent's groups and publish the resulting base style record without rebuilding computed values.
+    pub(super) fn replace_engine_resolvable_inherited_groups(
         &mut self,
         node: StyleNodeID,
         parent: StyleNodeID,
         inherited_style_groups: u8,
     ) -> Option<(FinalStyleRecordID, FinalStyleRecordID)> {
         const STATIC_INHERITED_GROUPS: u8 = (1 << 0) | (1 << 1) | (1 << 3);
+        const INHERITED_UI_GROUP: u8 = 1 << 2;
+        const INHERITED_TEXT_GROUP: u8 = 1 << 4;
+        const ENGINE_RESOLVABLE_INHERITED_GROUPS: u8 =
+            STATIC_INHERITED_GROUPS | INHERITED_UI_GROUP | INHERITED_TEXT_GROUP;
         const INHERITED_GROUP_COUNT: usize = 7;
-        if inherited_style_groups == 0 || inherited_style_groups & !STATIC_INHERITED_GROUPS != 0 {
+        const INHERITED_GROUP_MASK: u32 = (1 << INHERITED_GROUP_COUNT) - 1;
+        if inherited_style_groups == 0 || inherited_style_groups & !ENGINE_RESOLVABLE_INHERITED_GROUPS != 0 {
+            return None;
+        }
+        let target = ComputedStyleTarget::new(node, u8::MAX);
+        if inherited_style_groups & INHERITED_TEXT_GROUP != 0
+            && self
+                .current_color_dependency_mask(target)
+                .is_none_or(|dependencies| dependencies & !INHERITED_GROUP_MASK != 0)
+        {
+            return None;
+        }
+        if inherited_style_groups & INHERITED_UI_GROUP != 0
+            && self
+                .color_scheme_dependency_mask(target)
+                .is_none_or(|dependencies| dependencies & !INHERITED_GROUP_MASK != 0)
+        {
             return None;
         }
         let index = node.element_index()? as usize;
@@ -1272,7 +1332,8 @@ impl ComputedGroupSets {
         };
         let longhand_table = unsafe { longhand_table.as_ref() };
         let inherited_group_swap_eligible = dependency_flags & INHERITED_GROUP_SWAP_ELIGIBLE != 0;
-        let dependency_flags = dependency_flags & COMPUTED_VALUE_DEPENDENCY_FLAGS;
+        let dependency_flags = (dependency_flags & COMPUTED_VALUE_DEPENDENCY_FLAGS)
+            | longhand_table.map_or(0, ComputedLonghandTable::dependency_flags);
         assert!(inherited_group_count <= payloads.len());
         let previous_group_set = target.and_then(|target| {
             let ComputedStyleTarget { node, pseudo_kind } = target;
@@ -1440,8 +1501,21 @@ impl ComputedGroupSets {
             .iter()
             .copied()
             .zip(reconstruction_metadata.inheritance_dependent_values.iter().copied())
+            .map(|(property, value)| (property, value, 1u8))
             .collect();
-        inheritance_dependent_values.sort_unstable_by_key(|&(property, _)| property);
+        if let Some(longhand_table) = longhand_table {
+            inheritance_dependent_values.extend(
+                longhand_table
+                    .inheritance_dependent_values()
+                    .map(|(property, value)| (property, value, 0u8)),
+            );
+        }
+        inheritance_dependent_values.sort_unstable_by_key(|&(property, _, source_rank)| (property, source_rank));
+        inheritance_dependent_values.dedup_by_key(|(property, _, _)| *property);
+        let inheritance_dependent_values: Vec<_> = inheritance_dependent_values
+            .into_iter()
+            .map(|(property, value, _)| (property, value))
+            .collect();
         let reconstruction_hash = reconstruction_metadata_hash(
             reconstruction_metadata.property_importance,
             reconstruction_metadata.property_inheritance,
@@ -2411,6 +2485,9 @@ impl ComputedGroupSets {
     }
 
     pub(super) fn reclaim_unreachable_if_needed(&mut self) -> Option<ComputedGroupRetention> {
+        if self.style_record_view_epoch_depth != 0 {
+            return None;
+        }
         if self.style_records_interned_since_reclamation < self.next_reclamation_after {
             return None;
         }
@@ -2795,6 +2872,29 @@ mod tests {
                 raw_cascaded_font_size: std::ptr::null(),
             },
         }
+    }
+
+    #[test]
+    fn viewport_dependent_nodes_include_elements_and_pseudo_owners_once() {
+        let mut sets = ComputedGroupSets::default();
+        let independent = ComputedStyleTarget::new(StyleNodeID::element(1), u8::MAX);
+        let viewport_dependent = ComputedStyleTarget::new(StyleNodeID::element(2), u8::MAX);
+        let font_dependent_pseudo = ComputedStyleTarget::new(StyleNodeID::element(3), 1);
+        let viewport_dependent_pseudo = ComputedStyleTarget::new(StyleNodeID::element(2), 2);
+        let viewport_dependent_pseudo_only = ComputedStyleTarget::new(StyleNodeID::element(4), 1);
+        sets.publish(Some(independent), &[], 0, 0, metadata(0, 0, 0, &[], &[]));
+        sets.publish(Some(viewport_dependent), &[], 0, 0, metadata(0, 1, 0, &[], &[]));
+        sets.publish(Some(font_dependent_pseudo), &[], 0, 0, metadata(0, 2, 0, &[], &[]));
+        sets.publish(Some(viewport_dependent_pseudo), &[], 0, 0, metadata(0, 1, 0, &[], &[]));
+        sets.publish(
+            Some(viewport_dependent_pseudo_only),
+            &[],
+            0,
+            0,
+            metadata(0, 1, 0, &[], &[]),
+        );
+
+        assert_eq!(sets.viewport_dependent_nodes(), vec![2, 4]);
     }
 
     #[test]

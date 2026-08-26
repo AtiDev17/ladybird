@@ -18,6 +18,7 @@ use super::tree::PseudoElementKind;
 use super::tree::PseudoElementTarget;
 use super::*;
 use crate::css::property_metadata::property_id;
+use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 
 #[test]
 fn sparse_program_staging_freezes_before_until_release() {
@@ -520,6 +521,52 @@ fn published_match_answer(node: u32, cascade_input: Option<u32>, match_count: us
         cascade_winners_are_complete: true,
         observed: false,
     }
+}
+
+#[test]
+fn retained_winners_construct_a_source_free_cascade_store() {
+    let (mut engine, nodes) = linear_document();
+    let target = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: 1 });
+    let value_id = unsafe { engine.intern_specified_value(value.pointer()) };
+    engine.set_rule_declared_properties_with_values(rule, &[(property_id::BACKGROUND_COLOR, true, value_id)], true);
+    commit_test_setup(&mut engine);
+    let matches = vec![concrete_rule_match(&engine, nodes[1], rule, 0, None)];
+    engine.matches_for_cascade(matches, false, Some(nodes[1]));
+    engine.published_match_answers.push(
+        published_match_answer(nodes[1].raw(), None, 1),
+        &mut engine.memory,
+        &mut engine.counters,
+    );
+    engine.published_match_answers.sort();
+
+    let store = engine
+        .engine_constructed_cascade_store(computed::ComputedStyleTarget::new(nodes[1], u8::MAX))
+        .unwrap();
+    let (stored, important, _, has_style_sheet_context, _) =
+        store.winning_declaration(property_id::BACKGROUND_COLOR).unwrap();
+    assert_eq!(stored, value.pointer().cast());
+    assert!(important);
+    assert!(!has_style_sheet_context);
+}
+
+#[test]
+fn retained_stores_reject_every_logically_mapped_property() {
+    let (_, nodes) = linear_document();
+    let target = computed::ComputedStyleTarget::new(nodes[1], u8::MAX);
+    let mut mapped_property_count = 0;
+
+    for property in crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+        ..=crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID
+    {
+        if crate::css::property_metadata::property_is_in_logical_group(property) {
+            mapped_property_count += 1;
+            assert!(!StyleEngine::retained_store_supports_property(target, property));
+        }
+    }
+
+    assert!(mapped_property_count > 0);
 }
 
 #[test]
@@ -8763,7 +8810,17 @@ fn replay_ffi_reclaims_the_non_empty_recorded_atom_set() {
         bridge::style_engine_set_replay_reclaimed_style_atoms(engine_pointer, recorded.as_ptr(), recorded.len());
     }
 
-    let output = unsafe { bridge::style_engine_take_style_transaction(engine_pointer, nodes[0].raw()) };
+    let computation_inputs = bridge::FfiDocumentStyleComputationInputs {
+        viewport_width: 800.0,
+        viewport_height: 600.0,
+        root_font_size: 16.0,
+        device_pixels_per_css_pixel: 2.0,
+        ..Default::default()
+    };
+    let output =
+        unsafe { bridge::style_engine_take_style_transaction(engine_pointer, nodes[0].raw(), computation_inputs) };
+
+    assert_eq!(engine.document_style_computation_inputs, Some(computation_inputs));
 
     assert!(output.style_atoms_swept);
     assert_eq!(output.reclaimed_style_atom_count, 1);

@@ -409,9 +409,12 @@ ComputedStyleRecordView StyleComputer::computed_style_record_view(StyleRecordID 
     auto view = m_style_engine.style_record_view(style_record_identity);
     if (!view.present)
         return {};
-    pin_style_record(style_record_identity);
-    ++m_computed_style_record_view_pin_count;
-    return ComputedStyleRecordView { view, *this, style_record_identity };
+    bool owns_style_record_pin = m_style_record_view_epoch_depth == 0 || view.animation_overlay_identity != 0;
+    if (owns_style_record_pin) {
+        pin_style_record(style_record_identity);
+        ++m_computed_style_record_view_pin_count;
+    }
+    return ComputedStyleRecordView { view, *this, style_record_identity, owns_style_record_pin };
 }
 
 StyleComputer::StyleRecordStatus StyleComputer::style_record_status(StyleRecordID style_record_identity) const
@@ -444,6 +447,19 @@ void StyleComputer::unpin_style_record(StyleRecordID style_record_identity) cons
 {
     VERIFY(style_record_identity);
     const_cast<StyleComputer&>(*this).m_style_engine.unpin_style_record(style_record_identity);
+}
+
+void StyleComputer::begin_style_record_view_epoch() const
+{
+    if (m_style_record_view_epoch_depth++ == 0)
+        const_cast<StyleComputer&>(*this).m_style_engine.begin_style_record_view_epoch();
+}
+
+void StyleComputer::end_style_record_view_epoch() const
+{
+    VERIFY(m_style_record_view_epoch_depth > 0);
+    if (--m_style_record_view_epoch_depth == 0)
+        const_cast<StyleComputer&>(*this).m_style_engine.end_style_record_view_epoch();
 }
 
 void StyleComputer::register_style_node(StyleNodeID style_node_id, DOM::Element& element)
@@ -3299,12 +3315,19 @@ void StyleComputer::compute_property_values(ComputedStyleWorkingSet& style, Opti
 ComputationContext StyleComputer::make_computation_context_for_property(PropertyID property_id, ComputedStyleWorkingSet const& style, Optional<DOM::AbstractElement> abstract_element) const
 {
     auto subject_inline_axis_is_horizontal = [&]() {
+        auto writing_mode = [&](DOM::AbstractElement const& candidate) -> Optional<WritingMode> {
+            auto record = m_style_engine.style_record_view(candidate.style_record_identity());
+            if (!record.present)
+                return {};
+            auto const* inherited_box = static_cast<ComputedValuesFFI::InheritedBoxValues const*>(record.payloads[to_underlying(StyleGroupIndex::InheritedBoxValues)]);
+            return static_cast<WritingMode>(inherited_box->writing_mode);
+        };
         if (!abstract_element.has_value())
             return true;
-        if (auto computed_values = abstract_element->computed_style(); computed_values)
-            return computed_values->writing_mode() == WritingMode::HorizontalTb;
+        if (auto mode = writing_mode(*abstract_element); mode.has_value())
+            return *mode == WritingMode::HorizontalTb;
         if (auto inheritance_parent = abstract_element->element_to_inherit_style_from(); inheritance_parent.has_value() && inheritance_parent->has_style())
-            return inheritance_parent->computed_style()->writing_mode() == WritingMode::HorizontalTb;
+            return writing_mode(*inheritance_parent).value_or(WritingMode::HorizontalTb) == WritingMode::HorizontalTb;
         return true;
     }();
 
@@ -3554,9 +3577,9 @@ static ComputedValuesFFI::FfiBoxTypeTransformationInput make_box_type_transforma
         .is_br_element = !abstract_element.pseudo_element().has_value() && is<HTML::HTMLBRElement>(element),
         .is_document_element = element.is_document_element(),
         .is_mathml_element = element.namespace_uri() == Namespace::MathML,
-        .is_mathml_mtable = element.tag_name().equals_ignoring_ascii_case("mtable"sv),
-        .is_mathml_mtr = element.tag_name().equals_ignoring_ascii_case("mtr"sv),
-        .is_mathml_mtd = element.tag_name().equals_ignoring_ascii_case("mtd"sv),
+        .is_mathml_mtable = local_name.equals_ignoring_ascii_case("mtable"sv),
+        .is_mathml_mtr = local_name.equals_ignoring_ascii_case("mtr"sv),
+        .is_mathml_mtd = local_name.equals_ignoring_ascii_case("mtd"sv),
         .has_parent_display = has_parent_display,
         .parent_display = has_parent_display ? to_ffi_display(*parent_display) : ComputedValuesFFI::FfiDisplay {},
         .is_wbr_element = should_adjust_element && is_html_element && local_name == HTML::TagNames::wbr,
@@ -3923,9 +3946,7 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
     for (size_t index = 0; index < payloads.size(); ++index)
         payloads[index] = payload_source.style_group_payload(static_cast<StyleGroupIndex>(index));
     auto custom_property_environment = abstract_element.has_value() ? abstract_element->custom_property_data() : nullptr;
-    u8 dependency_flags = (base.depends_on_viewport_metrics() ? to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics) : 0)
-        | (base.font_metrics_depend_on_viewport_metrics() ? to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics) : 0)
-        | (base.in_display_none_subtree() ? to_underlying(StyleRecordDependencyFlag::InDisplayNoneSubtree) : 0);
+    u8 dependency_flags = base.in_display_none_subtree() ? to_underlying(StyleRecordDependencyFlag::InDisplayNoneSubtree) : 0;
     if (abstract_element.has_value() && !abstract_element->pseudo_element().has_value()) {
         auto& element = abstract_element->element();
         bool const inherited_group_swap_eligible = element.style_input_record()
@@ -3941,9 +3962,12 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
             dependency_flags |= inherited_group_swap_eligible_flag;
     }
     u64 counter_style_environment_identity = 0;
+    bool const is_pseudo = abstract_element.has_value() && abstract_element->pseudo_element().has_value();
+    bool const list_style_type_depends_on_counter_style_environment = base.list_style_type_depends_on_counter_style_environment()
+        && (is_pseudo || !base.list_style_type_uses_non_overridable_counter_style());
     if (abstract_element.has_value()
         && (computed_content_depends_on_counter_style_environment(base.computed_content())
-            || base.list_style_type_depends_on_counter_style_environment()))
+            || list_style_type_depends_on_counter_style_environment))
         counter_style_environment_identity = abstract_element->style_scope().counter_style_environment_identity();
     auto animated_properties = style_node_id != 0 ? values.animated_properties() : nullptr;
     u64 animation_overlay_identity = animated_properties ? animated_properties->identity() : 0;
@@ -3952,21 +3976,13 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
         for (size_t index = 0; index < animation_overlay_payloads.size(); ++index)
             animation_overlay_payloads[index] = values.style_group_payload(static_cast<StyleGroupIndex>(index));
     }
-    // A drive-built style borrows its recorded inheritance-dependent values from its table's
-    // span, while a builder-copied style carries them as owned wrappers; publish both, with the
-    // borrowed span winning like the snapshot's merge order.
+    // Builder-copied styles can carry inheritance-dependent values as owned wrappers. Rust
+    // publication merges these with the table's borrowed entries, with table entries winning.
     Vector<u16> inheritance_dependent_properties;
     Vector<void const*> inheritance_dependent_values;
-    auto borrowed_inheritance_dependent = base.borrowed_inheritance_dependent_values();
-    inheritance_dependent_properties.ensure_capacity(base.inheritance_dependent_specified_values().size() + borrowed_inheritance_dependent.size());
-    inheritance_dependent_values.ensure_capacity(base.inheritance_dependent_specified_values().size() + borrowed_inheritance_dependent.size());
-    for (auto const& entry : borrowed_inheritance_dependent) {
-        inheritance_dependent_properties.unchecked_append(entry.property);
-        inheritance_dependent_values.unchecked_append(entry.value);
-    }
+    inheritance_dependent_properties.ensure_capacity(base.inheritance_dependent_specified_values().size());
+    inheritance_dependent_values.ensure_capacity(base.inheritance_dependent_specified_values().size());
     for (auto const& [property_id, value] : base.inheritance_dependent_specified_values()) {
-        if (inheritance_dependent_properties.contains_slow(to_underlying(property_id)))
-            continue;
         inheritance_dependent_properties.unchecked_append(to_underlying(property_id));
         inheritance_dependent_values.unchecked_append(value->rust_style_value_data());
     }
@@ -4824,8 +4840,9 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     auto last_style_still_stands = [&]() -> bool {
         if (!sharing || !sharing->is_candidate || !new_style_input_record)
             return false;
-        auto existing = abstract_element.computed_style();
-        if (!existing || existing->animated_properties() || existing->has_animated_values())
+        if (!previous_style_record.present
+            || previous_style_record.animated_properties
+            || previous_style_record.animation_overlay_identity != 0)
             return false;
         // What the record does not name is everything that reaches the element some other way: a
         // font finishing loading, the viewport moving, or a registration arriving. An environment
@@ -5017,8 +5034,10 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     auto materialize_style_record_view = [&](StyleEngine::StyleRecordView const& view, StyleRecordID identity) -> OwnPtr<ComputedStyleRecordView> {
         if (!view.present)
             return {};
-        pin_style_record(identity);
-        return make<ComputedStyleRecordView>(view, *this, identity);
+        bool owns_style_record_pin = m_style_record_view_epoch_depth == 0 || view.animation_overlay_identity != 0;
+        if (owns_style_record_pin)
+            pin_style_record(identity);
+        return make<ComputedStyleRecordView>(view, *this, identity, owns_style_record_pin);
     };
     inheritance_parent_style = materialize_style_record_view(inheritance_parent_style_record, inheritance_parent_style_record_identity);
     inheritance_parent_values = inheritance_parent_style ? &**inheritance_parent_style : nullptr;
