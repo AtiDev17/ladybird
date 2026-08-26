@@ -17,6 +17,7 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/Scrolling.h>
 
@@ -272,19 +273,67 @@ ScrollHandled scroll_by(Layout::Node& node, double delta_x, double delta_y)
     return set_scroll_offset_from_user_input(node, scroll_offset(node).translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)));
 }
 
+static Optional<CompositorScrollNodeKind> scroll_node_kind_for(Layout::Node const& node)
+{
+    if (node.is_viewport())
+        return CompositorScrollNodeKind::Viewport;
+    if (node.generated_for_pseudo_element().has_value())
+        return CompositorScrollNodeKind::PseudoElement;
+    if (node.dom_node() && is<DOM::Element>(*node.dom_node()))
+        return CompositorScrollNodeKind::Element;
+    return {};
+}
+
+static UniqueNodeID scrollable_node_id_for(Layout::Node const& node)
+{
+    if (node.is_viewport())
+        return node.document().unique_id();
+    if (node.generated_for_pseudo_element().has_value())
+        return node.pseudo_element_generator()->unique_id();
+    return node.dom_node()->unique_id();
+}
+
+static u8 pseudo_element_type_for(Layout::Node const& node)
+{
+    auto pseudo_element = node.generated_for_pseudo_element();
+    if (!pseudo_element.has_value())
+        return 0;
+    return static_cast<u8>(to_underlying(*pseudo_element));
+}
+
+Optional<Compositor::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const& node)
+{
+    auto scroll_node_kind = scroll_node_kind_for(node);
+    if (!scroll_node_kind.has_value())
+        return {};
+
+    return Compositor::AsyncScrollNodeStableID {
+        .node_id = scrollable_node_id_for(node),
+        .kind = Compositor::async_scroll_node_kind_for(*scroll_node_kind),
+        .pseudo_element_type = pseudo_element_type_for(node),
+    };
+}
+
 ScrollHandled set_scroll_offset_from_user_input(Layout::Node& node, CSSPixelPoint offset)
 {
     if (!has_committed_box(node))
         return ScrollHandled::No;
 
-    auto scroll_handled = set_scroll_offset(node, offset);
     auto navigable = node.document().navigable();
+    auto stable_node_id = async_scroll_node_stable_id(node);
+
+    auto scroll_offset_before_scroll = scroll_offset(node);
+
+    if (navigable && stable_node_id.has_value())
+        navigable->abort_in_flight_smooth_scrolls_taken_over_by_user_input(*stable_node_id, scroll_offset_before_scroll);
+
+    auto scroll_handled = set_scroll_offset(node, offset);
     if (!navigable)
         return scroll_handled;
 
     if (scroll_handled == ScrollHandled::Yes) {
         if (auto event_target = scroll_event_target(node))
-            navigable->queue_scrollend_event_after_user_scroll(*event_target);
+            navigable->queue_scrollend_event_after_user_scroll(*event_target, stable_node_id, scroll_offset_before_scroll);
     } else {
         // User input keeps the scroll gesture in progress even when it does not move the scrolling box.
         navigable->defer_user_scroll_settlement();

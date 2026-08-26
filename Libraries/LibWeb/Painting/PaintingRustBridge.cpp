@@ -56,6 +56,7 @@
 #include <LibWeb/Painting/PaintingRustFFI.h>
 #include <LibWeb/Painting/ResizeHandle.h>
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
+#include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/Platform/FontPlugin.h>
@@ -527,6 +528,23 @@ bool rust_update_accumulated_visual_context_values(DOM::Document& document, Layo
     return Layout::RustFFI::layout_arena_update_visual_context_values(layout_arena_handle(document), paintable_slot, visual_context_host_callbacks(document));
 }
 
+Optional<TransformData> rust_compute_css_transform(Layout::Node const& box, double pixel_ratio)
+{
+    auto& document = const_cast<DOM::Document&>(box.document());
+    float matrix_values[16];
+    float origin_values[2];
+    if (!Layout::RustFFI::layout_arena_compute_css_transform(box.arena_handle(), committed_row_slot(box), visual_context_host_callbacks(document), pixel_ratio, matrix_values, origin_values))
+        return {};
+    return TransformData {
+        Gfx::FloatMatrix4x4(
+            matrix_values[0], matrix_values[1], matrix_values[2], matrix_values[3],
+            matrix_values[4], matrix_values[5], matrix_values[6], matrix_values[7],
+            matrix_values[8], matrix_values[9], matrix_values[10], matrix_values[11],
+            matrix_values[12], matrix_values[13], matrix_values[14], matrix_values[15]),
+        { origin_values[0], origin_values[1] },
+    };
+}
+
 Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const& box)
 {
     return Layout::RustFFI::layout_arena_physical_overflow_directions(box.arena_handle(), committed_row_slot(box));
@@ -802,6 +820,11 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 facts.scrollable_node_id = dom_node->unique_id().value();
             }
             facts.pseudo_element_type = layout_node.generated_for_pseudo_element().has_value() ? static_cast<u8>(to_underlying(*layout_node.generated_for_pseudo_element())) : 0;
+            if (facts.scroll_node_kind != Layout::RustFFI::FfiScrollNodeKind::None) {
+                auto snap_axes = snap_axes_of_scroll_container(layout_node);
+                facts.snaps_scroll_position_horizontally = snap_axes.x;
+                facts.snaps_scroll_position_vertically = snap_axes.y;
+            }
             facts.inside_blocking_wheel_event_handler = dom_node && dom_node->inside_blocking_wheel_event_handler();
             facts.records_viewport_scrollbars = is_viewport_paintable(layout_node)
                 && layout_node.document().page().async_scrolling_enabled()
