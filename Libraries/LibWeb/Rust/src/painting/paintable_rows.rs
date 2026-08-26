@@ -155,6 +155,17 @@ where
         generation != 0 && generation == id.generation()
     }
 
+    pub(crate) fn clear_cached_overflow_data(&self, id: NodeSlotId) {
+        if !self.paintable_row_is_populated(id) {
+            return;
+        }
+        let index = id.slot_index() as usize;
+        let chunk = &self.arena.paintable_rows.chunks[index / PAINTABLE_SLOTS_PER_CHUNK];
+        let data = (&raw const chunk.slots[index % PAINTABLE_SLOTS_PER_CHUNK]).cast_mut();
+        // SAFETY: paintable_row_is_populated established that the chunk and slot exist.
+        unsafe { (&raw mut (*data).overflow_valid_across_recommits).write(false) };
+    }
+
     pub(crate) fn inline_pieces_root(&self, inline_paintable: NodeSlotId) -> Option<NodeSlotId> {
         if !self.paintable_row_is_populated(inline_paintable) {
             return None;
@@ -673,6 +684,28 @@ impl LayoutNodeArena {
 
     pub(crate) fn invalidate_paint_cache(&self, id: NodeSlotId) {
         self.paintable_rows().invalidate_paint_cache(id);
+    }
+
+    pub(crate) fn transfer_fragments_to_replacement_node(
+        &self,
+        containing_block: NodeSlotId,
+        old_node: NodeSlotId,
+        new_node: NodeSlotId,
+    ) {
+        if !self.paintable_row_is_populated(containing_block) {
+            return;
+        }
+        let mut side = self.paintable_side_data_mut(containing_block);
+        for fragment in &mut side.fragments {
+            if fragment.layout_node == old_node {
+                fragment.layout_node = new_node;
+            }
+        }
+        for piece in &mut side.inline_box_pieces {
+            if piece.node == old_node {
+                piece.node = new_node;
+            }
+        }
     }
 
     pub(crate) fn mark_descendant_subtree_caches_dirty_from_layout_node(&self, node: NodeSlotId) {

@@ -9,6 +9,7 @@
 
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
@@ -209,14 +210,6 @@ public:
         return false;
     }
 
-    void append_child(NonnullRefPtr<Node>);
-    void prepend_child(NonnullRefPtr<Node>);
-    void insert_before(NonnullRefPtr<Node>, Node* before);
-    void insert_before(NonnullRefPtr<Node> node, Node& before) { insert_before(move(node), &before); }
-    void remove_child(Node&);
-    void replace_child(NonnullRefPtr<Node> new_child, Node& old_child);
-    void remove();
-
     bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
@@ -233,12 +226,11 @@ public:
 
     void bump_fragment_cache_epoch();
 
-    // Any invalidation or restructuring below a node must reach every ancestor's epoch: cached
-    // runs capture subtree structure, and unlike intrinsic-size invalidation there is no
-    // absolutely-positioned or SVG boundary — those descendants' fragments live in ancestor
-    // run trees. Layout tree restructuring in particular never funnels through
-    // set_needs_layout_update (a full pass lays out everything), so the tree mutation
-    // primitives call this on the parent of every structural change.
+    // Any invalidation below a node must reach every ancestor's epoch: cached runs capture
+    // subtree structure, and unlike intrinsic-size invalidation there is no absolutely-positioned
+    // or SVG boundary — those descendants' fragments live in ancestor run trees. The arena runs
+    // the same walk for every structural change; this serves content changes that never
+    // restructure the tree.
     void bump_fragment_cache_epoch_of_self_and_ancestors();
 
     // Set when a style change altered geometry-determining properties of this node itself, so
@@ -430,6 +422,11 @@ public:
         WeakPtr<NodeWithStyle> m_owner;
         NonnullRefPtr<CSS::ImageStyleValue const> m_image;
     };
+
+    ImageObserver const* background_image_observer(size_t layer_index) const;
+    ImageObserver const* mask_image_observer(size_t layer_index) const;
+    ImageObserver const* cursor_image_observer(size_t cursor_index) const;
+    ImageObserver const* border_image_source_observer() const { return m_image_observers.border_image_source.ptr(); }
 
     NonnullRefPtr<CSS::ComputedValues const> copy_computed_values() const;
     CSS::ComputedStyleRecordView computed_style_record_view() const;
@@ -750,7 +747,14 @@ private:
     // unpins their records before this root is cleared. Every document destruction path goes
     // through that teardown.
     GC::Root<DOM::Document> m_style_record_owner;
-    Vector<NonnullOwnPtr<ImageObserver>> m_image_observers;
+    struct ImageObserverSlots {
+        Vector<OwnPtr<ImageObserver>> background_layers;
+        Vector<OwnPtr<ImageObserver>> mask_layers;
+        Vector<OwnPtr<ImageObserver>> cursors;
+        OwnPtr<ImageObserver> border_image_source;
+        OwnPtr<ImageObserver> list_style_image;
+    };
+    ImageObserverSlots m_image_observers;
     Vector<RefPtr<CSS::CursorStyleValue const>> m_cursor_style_values;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_background_layers;
     mutable Optional<Vector<CSS::BackgroundLayerData>> m_mask_layers;

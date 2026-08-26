@@ -313,35 +313,6 @@ pub unsafe extern "C" fn layout_arena_paintable_cleared_from_node(arena: *mut c_
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paintable_transfer_fragments_to_replacement_node(
-    arena: *mut c_void,
-    containing_block: NodeSlotId,
-    old_node: NodeSlotId,
-    new_node: NodeSlotId,
-) {
-    abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle(arena) };
-        if !arena.paintable_row_is_populated(containing_block) {
-            return;
-        }
-        let mut side = arena.paintable_side_data_mut(containing_block);
-        for fragment in &mut side.fragments {
-            if fragment.layout_node == old_node {
-                fragment.layout_node = new_node;
-            }
-        }
-        for piece in &mut side.inline_box_pieces {
-            if piece.node == old_node {
-                piece.node = new_node;
-            }
-        }
-    });
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_paintable_event_dispatch_node_shell(
     arena: *mut c_void,
     slot: NodeSlotId,
@@ -481,11 +452,8 @@ pub unsafe extern "C" fn layout_arena_paintable_clear_overflow_data(arena: *mut 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_paintable_clear_cached_overflow_data(arena: *mut c_void, slot: NodeSlotId) {
     abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle_mut(arena) };
-        let mut paintable_rows = arena.paintable_rows_mut();
-        if paintable_rows.paintable_row_is_populated(slot) {
-            paintable_rows.paintable_data_mut(slot).overflow_valid_across_recommits = false;
-        }
+        let arena = unsafe { arena_from_handle(arena) };
+        arena.paintable_rows().clear_cached_overflow_data(slot);
     });
 }
 

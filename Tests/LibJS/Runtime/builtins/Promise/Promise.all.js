@@ -55,6 +55,144 @@ describe("normal behavior", () => {
         expect(rejectionReason).toBe("foo");
         expect(wasResolved).toBeFalse();
     });
+
+    test("invokes an overridden then method", () => {
+        const promise = Promise.resolve(42);
+        const originalThen = promise.then;
+        let callCount = 0;
+        let resolvedValues = null;
+
+        promise.then = function (...args) {
+            ++callCount;
+            return originalThen.apply(this, args);
+        };
+
+        Promise.all([promise]).then(values => {
+            resolvedValues = values;
+        });
+
+        runQueuedPromiseJobs();
+        expect(callCount).toBe(1);
+        expect(resolvedValues).toEqual([42]);
+    });
+
+    test("invokes a then getter that returns the original method", () => {
+        const promise = Promise.resolve(42);
+        const originalThen = promise.then;
+        let callCount = 0;
+        let resolvedValues = null;
+
+        Object.defineProperty(promise, "then", {
+            configurable: true,
+            get() {
+                ++callCount;
+                return originalThen;
+            },
+        });
+
+        Promise.all([promise]).then(values => {
+            resolvedValues = values;
+        });
+
+        runQueuedPromiseJobs();
+        expect(callCount).toBe(1);
+        expect(resolvedValues).toEqual([42]);
+    });
+
+    test("observes the promise constructor when invoking then", () => {
+        const promise = Promise.resolve(42);
+        let constructorCallCount = 0;
+
+        Object.defineProperty(promise, "constructor", {
+            configurable: true,
+            get() {
+                ++constructorCallCount;
+                return Promise;
+            },
+        });
+
+        Promise.all([promise]);
+        expect(constructorCallCount).toBe(2);
+        runQueuedPromiseJobs();
+        expect(constructorCallCount).toBe(2);
+    });
+
+    test("resolves the result array through an inherited then getter", () => {
+        const originalThen = Object.getOwnPropertyDescriptor(Array.prototype, "then");
+        const marker = {};
+        let thenCallCount = 0;
+        let resolvedValues = null;
+
+        Object.defineProperty(Array.prototype, "then", {
+            configurable: true,
+            get() {
+                if (this.length === 1 && this[0] === marker) ++thenCallCount;
+                return undefined;
+            },
+        });
+
+        try {
+            Promise.all([Promise.resolve(marker)]).then(values => {
+                resolvedValues = values;
+            });
+
+            runQueuedPromiseJobs();
+        } finally {
+            if (originalThen) Object.defineProperty(Array.prototype, "then", originalThen);
+            else delete Array.prototype.then;
+        }
+
+        expect(thenCallCount).toBe(1);
+        expect(resolvedValues).toEqual([marker]);
+    });
+
+    test("observes Symbol.species when invoking then", () => {
+        const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+        let speciesCallCount = 0;
+
+        Object.defineProperty(Promise, Symbol.species, {
+            configurable: true,
+            get() {
+                ++speciesCallCount;
+                return Promise;
+            },
+        });
+
+        try {
+            Promise.all([Promise.resolve(42)]);
+            expect(speciesCallCount).toBe(1);
+            runQueuedPromiseJobs();
+            expect(speciesCallCount).toBe(1);
+        } finally {
+            Object.defineProperty(Promise, Symbol.species, originalSpecies);
+        }
+    });
+
+    test("constructs a custom Symbol.species promise when invoking then", () => {
+        const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+        let constructionCount = 0;
+
+        class SpeciesPromise extends Promise {
+            constructor(executor) {
+                super(executor);
+                ++constructionCount;
+            }
+        }
+
+        Object.defineProperty(Promise, Symbol.species, {
+            configurable: true,
+            value: SpeciesPromise,
+        });
+
+        try {
+            Promise.all([Promise.resolve(42)]);
+            expect(constructionCount).toBe(1);
+            runQueuedPromiseJobs();
+            expect(constructionCount).toBe(1);
+        } finally {
+            Object.defineProperty(Promise, Symbol.species, originalSpecies);
+        }
+    });
 });
 
 describe("exceptional behavior", () => {
