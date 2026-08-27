@@ -684,10 +684,23 @@ pub struct SelectorProgram {
     language_ranges: Vec<(u32, u32)>,
     /// Immutable dispatch analysis, retained so rebuilding scope dispatches never walks the IR.
     dispatch_metadata: CachedDispatchMetadata,
+    /// Per selector node: the dispatch-bloom bits a node evaluated against that compound must
+    /// carry — or zero, when nothing certain is required. A combinator walk consults this before
+    /// trying the compound, so an ancestor that cannot possibly match costs one AND rather than
+    /// an evaluation. Only always-resident key kinds contribute (id, class, attribute name, tag
+    /// name); everything else stays out — rather than risking a bit facts never set.
+    relation_target_blooms: Box<[u64]>,
     can_leave_scope: bool,
 }
 
 impl SelectorProgram {
+    /// Whether any operator here tests a sibling position. Only those queries can reuse sibling
+    /// geometry across candidates — and attaching a workspace to the rest would cache answers no
+    /// later candidate asks for.
+    pub(super) fn has_positional_test(&self) -> bool {
+        self.nodes.iter().any(|node| matches!(node, SelectorOp::NthPosition(_)))
+    }
+
     pub(super) fn collect_atoms(&self, atoms: &mut HashSet<StyleAtomID>) -> u64 {
         let mut visited = 0_u64;
         let mut insert = |atom: StyleAtomID| {
@@ -744,6 +757,13 @@ impl SelectorProgram {
     #[must_use]
     pub fn node(&self, id: SelectorNodeID) -> SelectorOp {
         self.nodes[id.0 as usize]
+    }
+
+    /// The dispatch-bloom bits a node evaluated against the compound at `id` must carry. Zero —
+    /// including for a program built without dispatch metadata — means no cheap requirement.
+    #[must_use]
+    fn relation_target_bloom(&self, id: SelectorNodeID) -> u64 {
+        self.relation_target_blooms.get(id.0 as usize).copied().unwrap_or(0)
     }
 
     #[must_use]
@@ -1075,6 +1095,36 @@ impl SelectorProgramBuilder {
 
 impl SelectorProgram {
     fn cache_dispatch_metadata(&mut self) {
+        let mut relation_target_blooms = vec![0_u64; self.nodes.len()];
+        for (id, target_bloom) in relation_target_blooms.iter_mut().enumerate() {
+            let node = SelectorNodeID(u32::try_from(id).unwrap_or(u32::MAX));
+            // Only a feature op standing directly in the compound is a test of the node itself.
+            // Anything deeper (a negation, a disjunction branch, a relative query's witness) may
+            // hold elsewhere, or not at all. And only the always-resident key kinds contribute —
+            // so a bit facts never set can't reject a node that matches.
+            let single = [node];
+            let operands = match self.node(node) {
+                SelectorOp::And { first, count } => self.operands(first, count),
+                _ => &single,
+            };
+            let mut bloom = 0_u64;
+            for &operand in operands {
+                if let SelectorOp::Feature(test) = self.node(operand) {
+                    let key = dispatch_key_for_feature(test);
+                    if matches!(
+                        key,
+                        DispatchKey::Id(_)
+                            | DispatchKey::Class(_)
+                            | DispatchKey::AttributeName(_)
+                            | DispatchKey::TagName(_)
+                    ) {
+                        bloom |= dispatch_bloom_bit(key);
+                    }
+                }
+            }
+            *target_bloom = bloom;
+        }
+        self.relation_target_blooms = relation_target_blooms.into_boxed_slice();
         self.dispatch_metadata.0 = (0..self.entries.len())
             .map(|entry| {
                 let selector_entry = &self.entries[entry];
@@ -4718,6 +4768,11 @@ pub struct MatchEvaluationWorkspace {
     relations_by_evaluation_side: [MatchRelationCache; 3],
     sibling_geometry_by_tree_side: [RefCell<SiblingSequenceGeometry>; 2],
     type_positions_by_evaluation_side: [RefCell<SiblingPositionColumn>; 3],
+    /// Whether final an+b answers are memoized at all. Style recalc runs many programs over one
+    /// node — so the same test repeats, and the memo hits. A selector query is one program asking
+    /// each node once: no ask ever repeats, so the memo would only ever be written — and a map
+    /// insert per positional test is the single-most-expensive part of answering one.
+    positional_answer_memo_suppressed: bool,
     /// Canonical plain an+b answers shared across independently compiled selector programs.
     positional_answers_by_evaluation_side: [RefCell<PositionalAnswers>; 3],
 }
@@ -4933,7 +4988,19 @@ impl MatchEvaluationWorkspace {
             .1
     }
 
+    /// A workspace for the candidates of one selector query: sibling geometry is shared, final
+    /// answers are not memoized.
+    pub(super) fn for_selector_query() -> Self {
+        Self {
+            positional_answer_memo_suppressed: true,
+            ..Self::default()
+        }
+    }
+
     fn positional_answer(&self, position: NthPosition, node: StyleNodeID, side: MatchEvaluationSide) -> Option<bool> {
+        if self.positional_answer_memo_suppressed {
+            return None;
+        }
         self.positional_answers_by_evaluation_side[side as usize]
             .borrow()
             .get(position, node)
@@ -4946,6 +5013,9 @@ impl MatchEvaluationWorkspace {
         side: MatchEvaluationSide,
         answer: bool,
     ) {
+        if self.positional_answer_memo_suppressed {
+            return;
+        }
         self.positional_answers_by_evaluation_side[side as usize]
             .borrow_mut()
             .insert(position, node, answer);
@@ -5391,6 +5461,24 @@ impl<'a> MatchEvaluator<'a> {
         }
     }
 
+    /// Whether the dispatch bloom leaves `node` any chance of matching the compound at `inner`.
+    /// A row facts cannot answer for yet is never prejudged.
+    #[inline]
+    fn relation_target_may_match(&self, program: &SelectorProgram, inner: SelectorNodeID, node: StyleNodeID) -> bool {
+        let required = program.relation_target_bloom(inner);
+        if required == 0 {
+            return true;
+        }
+        // The shadow scope root matches featurelessly — so its facts prove nothing about it.
+        if Some(node) == self.scope_shadow_root {
+            return true;
+        }
+        match self.row_of(node) {
+            Ok(row) => row.facts.dispatch_bloom_of(row.row, false) & required == required,
+            Err(_) => true,
+        }
+    }
+
     #[inline]
     fn matches_relation_target(
         &self,
@@ -5687,7 +5775,9 @@ impl<'a> MatchEvaluator<'a> {
                 let mut ancestor = self.parent_of(node);
                 while let Some(current) = ancestor {
                     counters.bump(Counter::CombinatorSteps);
-                    if self.matches_relation_target(program, inner, current, counters)? {
+                    if self.relation_target_may_match(program, inner, current)
+                        && self.matches_relation_target(program, inner, current, counters)?
+                    {
                         return Ok(true);
                     }
                     ancestor = self.parent_of(current);

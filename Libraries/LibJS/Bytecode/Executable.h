@@ -393,6 +393,7 @@ public:
         size_t start_offset;
         size_t end_offset;
         size_t handler_offset;
+        bool catches_exception { false };
     };
 
     Vector<ExceptionHandlers> exception_handlers;
@@ -400,6 +401,16 @@ public:
     Vector<SourceMapEntry> source_map;
 
     Vector<Utf16FlyString> local_variable_names;
+    Vector<Utf16FlyString> argument_variable_names;
+    struct LocalVariableScopeRange {
+        Position start;
+        Position end;
+    };
+    struct LocalVariableMetadata {
+        bool is_mutable { true };
+        Optional<LocalVariableScopeRange> scope_range;
+    };
+    Vector<LocalVariableMetadata> local_variable_metadata;
     u32 local_index_base { 0 };
     u32 argument_index_base { 0 };
 
@@ -427,6 +438,7 @@ public:
     void remove_debugger_breakpoint(BreakpointID breakpoint_id);
     void clear_debugger_breakpoints();
     [[nodiscard]] bool has_debugger_breakpoint_at(u32 bytecode_offset) const;
+    [[nodiscard]] ReadonlySpan<BreakpointID> debugger_breakpoints_at(u32 bytecode_offset) const;
     [[nodiscard]] bool has_debugger_breakpoint(BreakpointID breakpoint_id) const;
 
     void dump() const;

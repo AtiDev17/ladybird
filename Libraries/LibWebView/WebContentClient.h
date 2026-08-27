@@ -49,6 +49,7 @@
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
+#include <LibWebView/Debugger.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/PrivateBrowsing.h>
 #include <WebContent/WebContentClientEndpoint.h>
@@ -131,6 +132,7 @@ private:
     StorageJar* storage_jar_for_page(u64 page_id, Web::StorageAPI::StorageEndpointType);
     void cancel_navigation_transactions();
     bool continue_navigation_population_in_selected_process(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
+    void report_unexpected_debugger_response();
 
     virtual void die() override;
 
@@ -186,6 +188,13 @@ private:
     virtual void did_list_devtools_sources(u64 page_id, u64 request_id, Vector<Web::HTML::ScriptRegistry::Description> sources) override;
     virtual void did_get_devtools_source(u64 page_id, Web::HTML::ScriptRegistry::Identifier source_id, Optional<Web::HTML::ScriptRegistry::Content> source) override;
     virtual void did_add_devtools_source(u64 page_id, Web::HTML::ScriptRegistry::Description source) override;
+    virtual void did_pause_debugger(u64 page_id, DebuggerPause) override;
+    virtual void did_resume_debugger(u64 page_id) override;
+    virtual void did_complete_debugger_breakpoint_operation(u64 page_id, u64 request_id, Optional<String> error) override;
+    virtual void did_get_debugger_environments(u64 page_id, u64 request_id, Optional<String> error, Vector<DebuggerEnvironment>) override;
+    virtual void did_evaluate_javascript_in_debugger_frame(u64 page_id, u64 request_id, Optional<String> error, DebuggerEvaluationResult) override;
+    virtual void did_get_debugger_object_properties(u64 page_id, u64 request_id, Optional<String> error, DebuggerObjectProperties) override;
+    virtual void did_get_debugger_source_positions(u64 page_id, u64 request_id, Vector<DebuggerSourcePosition> positions) override;
     virtual void did_resolve_dom_node_url(u64 page_id, u64 request_id, String resolved_url) override;
     virtual void did_take_screenshot(u64 page_id, Gfx::ShareableBitmap screenshot) override;
     virtual void did_get_internal_page_info(u64 page_id, PageInfoType, Optional<Core::AnonymousBuffer>) override;
