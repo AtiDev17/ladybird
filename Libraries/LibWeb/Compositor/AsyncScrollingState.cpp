@@ -20,7 +20,7 @@ SnapContainerHandling snap_container_handling_for(WheelDeltaPrecision wheel_delt
     return SnapContainerHandling::ScrollOnCompositor;
 }
 
-static AsyncScrollNodeID scroll_node_id_for(UniqueNodeID document_id, Painting::VisualContextIndex scroll_node_index)
+static AsyncScrollNodeID scroll_node_id_for(UniqueNodeID document_id, Painting::SpatialNodeIndex scroll_node_index)
 {
     return { .document_id = document_id, .scroll_node_index = scroll_node_index };
 }
@@ -50,8 +50,8 @@ static AsyncScrollNodeStableID stable_scroll_node_id_for(UniqueNodeID scrollable
 AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayList const& display_list)
 {
     AsyncScrollingState async_scrolling_state;
-    Vector<Painting::VisualContextIndex> parent_scroll_node_indices;
-    Vector<Painting::VisualContextIndex> wheel_hit_test_target_scroll_node_indices;
+    Vector<Painting::SpatialNodeIndex> parent_scroll_node_indices;
+    Vector<Painting::SpatialNodeIndex> wheel_hit_test_target_scroll_node_indices;
     Vector<UniqueNodeID> wheel_hit_test_target_document_ids;
 
     if (auto const& metadata = display_list.async_scrolling_metadata(); metadata.has_value()) {
@@ -64,7 +64,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
     display_list.for_each_command_header([&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
         auto append_wheel_hit_test_target = [&](auto const& command, Gfx::CornerRadii corner_radii) {
             async_scrolling_state.wheel_hit_test_targets.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
                 .corner_radii = corner_radii,
                 .target_node_id = {},
@@ -78,27 +78,8 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
             auto command = Painting::read_display_list_command_payload<Painting::CompositorBlockingWheelEventRegion>(payload);
             async_scrolling_state.has_blocking_wheel_event_listeners = true;
             async_scrolling_state.blocking_wheel_event_regions.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
-            });
-            break;
-        }
-        case Painting::DisplayListCommandType::CompositorStickyArea: {
-            auto command = Painting::read_display_list_command_payload<Painting::CompositorStickyArea>(payload);
-            async_scrolling_state.sticky_areas.append({
-                .document_id = command.document_id,
-                .scroll_node_index = command.scroll_node_index,
-                .parent_scroll_node_index = command.parent_scroll_node_index,
-                .nearest_scrolling_ancestor_index = command.nearest_scrolling_ancestor_index,
-                .position_relative_to_scroll_ancestor = command.position_relative_to_scroll_ancestor,
-                .border_box_size = command.border_box_size,
-                .scrollport_size = command.scrollport_size,
-                .containing_block_region = command.containing_block_region,
-                .needs_parent_offset_adjustment = command.needs_parent_offset_adjustment,
-                .inset_top = command.inset_top,
-                .inset_right = command.inset_right,
-                .inset_bottom = command.inset_bottom,
-                .inset_left = command.inset_left,
             });
             break;
         }
@@ -133,7 +114,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Painting::DisplayLis
         case Painting::DisplayListCommandType::CompositorMainThreadWheelEventRegion: {
             auto command = Painting::read_display_list_command_payload<Painting::CompositorMainThreadWheelEventRegion>(payload);
             async_scrolling_state.main_thread_wheel_event_regions.append({
-                .visual_context_index = header.context_index,
+                .context = header.context,
                 .rect = command.rect,
             });
             break;
@@ -219,7 +200,7 @@ bool blocks_wheel_event_at_position(AsyncScrollingState const& async_scrolling_s
 
     VERIFY(display_list->compatible_visual_context_tree_version() == visual_context_tree->version());
     for (auto const& region : async_scrolling_state.blocking_wheel_event_regions) {
-        auto position_in_context = visual_context_tree->transform_point_for_hit_test(region.visual_context_index, position, scroll_state_snapshot);
+        auto position_in_context = visual_context_tree->transform_point_for_hit_test(region.context, position, scroll_state_snapshot);
         if (position_in_context.has_value() && region.rect.contains(*position_in_context))
             return true;
     }

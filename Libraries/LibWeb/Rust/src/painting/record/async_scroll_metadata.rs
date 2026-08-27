@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::chrome_geometry::{
@@ -16,7 +15,6 @@ use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
 use crate::painting::record::PaintRecorder;
 use crate::painting::style_queries;
-use crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT;
 use libgfx_rust::{FloatPoint, FloatRect, FloatSize, IntRect};
 
 fn css_point_to_device_point(point: CssPixelPoint, device_pixels_per_css_pixel: f64) -> FloatPoint {
@@ -46,10 +44,6 @@ fn css_rect_to_device_rect(rect: CssPixelRect, device_pixels_per_css_pixel: f64)
     }
 }
 
-fn css_inset_to_device_inset(inset: Option<CssPixels>, device_pixels_per_css_pixel: f64) -> OptionalF32 {
-    OptionalF32::from(inset.map(|inset| inset.to_float() * device_pixels_per_css_pixel as f32))
-}
-
 impl PaintRecorder<'_> {
     fn could_be_scrolled_by_wheel_event(&mut self, paintable: NodeSlotId) -> bool {
         let facts = self.hit_test_facts(paintable);
@@ -70,9 +64,9 @@ impl PaintRecorder<'_> {
         None
     }
 
-    fn wheel_hit_test_target_scroll_node_index_for(&mut self, paintable: NodeSlotId) -> usize {
+    fn wheel_hit_test_target_scroll_node_index_for(&mut self, paintable: NodeSlotId) -> SpatialNodeIndex {
         let mut paintables_to_cache: Vec<NodeSlotId> = Vec::new();
-        let mut target = 0usize;
+        let mut target = VISUAL_VIEWPORT_NODE_INDEX;
         let mut current = paintable;
         loop {
             if let Some(cached) = self.wheel_hit_test_target_cache.get(&current) {
@@ -82,7 +76,7 @@ impl PaintRecorder<'_> {
 
             paintables_to_cache.push(current);
             let own = self.data(current).own_scroll_node_index;
-            if own != 0 && self.could_be_scrolled_by_wheel_event(current) {
+            if own != VISUAL_VIEWPORT_NODE_INDEX && self.could_be_scrolled_by_wheel_event(current) {
                 target = own;
                 break;
             }
@@ -95,10 +89,10 @@ impl PaintRecorder<'_> {
                 && style_queries::is_fixed_position(self.layout_arena, block)
             {
                 let block_own = self.data(block).own_scroll_node_index;
-                if block_own != 0 && self.could_be_scrolled_by_wheel_event(block) {
+                if block_own != VISUAL_VIEWPORT_NODE_INDEX && self.could_be_scrolled_by_wheel_event(block) {
                     target = block_own;
                 }
-                if target != 0 {
+                if target != VISUAL_VIEWPORT_NODE_INDEX {
                     break;
                 }
                 containing_block = None;
@@ -152,7 +146,7 @@ impl PaintRecorder<'_> {
             self.recorder.compositor_wheel_hit_test_target_with_corner_radii(
                 CompositorWheelHitTestTargetWithCornerRadii {
                     document_id,
-                    target_scroll_node_index: VisualContextIndex(target_scroll_node_index),
+                    target_scroll_node_index,
                     rect,
                     corner_radii,
                 },
@@ -162,7 +156,7 @@ impl PaintRecorder<'_> {
         self.recorder
             .compositor_wheel_hit_test_target(CompositorWheelHitTestTarget {
                 document_id,
-                target_scroll_node_index: VisualContextIndex(target_scroll_node_index),
+                target_scroll_node_index,
                 rect,
             });
     }
@@ -211,7 +205,7 @@ impl PaintRecorder<'_> {
         };
         let parent_scroll_node_index = match self.nearest_scrollable_ancestor(paintable) {
             Some(ancestor) => self.data(ancestor).own_scroll_node_index,
-            None => 0,
+            None => VISUAL_VIEWPORT_NODE_INDEX,
         };
         let is_viewport = self.data(paintable).kind == PaintableKind::ViewportPaintable;
         let scrollport_rect = if is_viewport {
@@ -233,8 +227,8 @@ impl PaintRecorder<'_> {
         self.recorder.compositor_scroll_node(CompositorScrollNode {
             document_id: UniqueNodeId(self.inputs.document_id),
             scrollable_node_id: UniqueNodeId(facts.scrollable_node_id),
-            scroll_node_index: VisualContextIndex(self.data(paintable).own_scroll_node_index),
-            parent_scroll_node_index: VisualContextIndex(parent_scroll_node_index),
+            scroll_node_index: self.data(paintable).own_scroll_node_index,
+            parent_scroll_node_index,
             scrollport_rect,
             min_scroll_offset: css_point_to_device_point(minimum_scroll_offset(self.layout_arena, paintable), scale),
             max_scroll_offset: css_point_to_device_point(maximum_scroll_offset(self.layout_arena, paintable), scale),
@@ -261,7 +255,7 @@ impl PaintRecorder<'_> {
         let scale = self.inputs.device_pixels_per_css_pixel;
         let min_scroll_offset = css_point_to_device_point(minimum_scroll_offset(self.layout_arena, paintable), scale);
         let max_scroll_offset = css_point_to_device_point(maximum_scroll_offset(self.layout_arena, paintable), scale);
-        let scroll_node_index = VisualContextIndex(self.data(paintable).own_scroll_node_index);
+        let scroll_node_index = self.data(paintable).own_scroll_node_index;
         let (thumb_color, track_color) = scrollbar_colors_for_paint(
             self.layout_arena,
             paintable,
@@ -315,51 +309,11 @@ impl PaintRecorder<'_> {
 
         if facts.is_nested_navigable_container {
             self.record_main_thread_wheel_event_region(paintable);
-        } else if self.data(paintable).own_scroll_node_index != 0 && self.could_be_scrolled_by_wheel_event(paintable) {
+        } else if self.data(paintable).own_scroll_node_index != VISUAL_VIEWPORT_NODE_INDEX
+            && self.could_be_scrolled_by_wheel_event(paintable)
+        {
             self.record_scroll_node(paintable, &facts);
         }
         self.record_viewport_scrollbar_state(paintable);
-
-        let sticky_node_index = self.data(paintable).enclosing_scroll_node_index;
-        if style_queries::is_sticky_position(self.layout_arena, paintable) && sticky_node_index != 0 {
-            let Some(tree) = &self.paint_state.visual_context.tree else {
-                return;
-            };
-            let scroll_state = &self.paint_state.visual_context.scroll_state;
-            let sticky_slot = tree.scroll_state_slot_for_node(sticky_node_index);
-            if sticky_slot == NO_SCROLL_STATE_SLOT {
-                return;
-            }
-            let state = scroll_state.state_at_slot(sticky_slot);
-            if state.is_sticky
-                && let Some(constraints) = &state.sticky_constraints
-            {
-                let scale = self.inputs.device_pixels_per_css_pixel;
-                let insets = constraints.insets;
-                let inset =
-                    |value: CssPixels, present: bool| css_inset_to_device_inset(present.then_some(value), scale);
-                let area = CompositorStickyArea {
-                    document_id: UniqueNodeId(self.inputs.document_id),
-                    scroll_node_index: VisualContextIndex(sticky_node_index),
-                    parent_scroll_node_index: VisualContextIndex(scroll_state.node_index_for_slot(state.parent_slot)),
-                    nearest_scrolling_ancestor_index: VisualContextIndex(
-                        scroll_state.node_index_for_slot(scroll_state.nearest_scrolling_ancestor_slot(sticky_slot)),
-                    ),
-                    position_relative_to_scroll_ancestor: css_point_to_device_point(
-                        constraints.position_relative_to_scroll_ancestor,
-                        scale,
-                    ),
-                    border_box_size: css_size_to_device_size(constraints.border_box_size, scale),
-                    scrollport_size: css_size_to_device_size(constraints.scrollport_size, scale),
-                    containing_block_region: css_rect_to_device_rect(constraints.containing_block_region, scale),
-                    needs_parent_offset_adjustment: constraints.needs_parent_offset_adjustment,
-                    inset_top: inset(insets.top, insets.has_top),
-                    inset_right: inset(insets.right, insets.has_right),
-                    inset_bottom: inset(insets.bottom, insets.has_bottom),
-                    inset_left: inset(insets.left, insets.has_left),
-                };
-                self.recorder.compositor_sticky_area(area);
-            }
-        }
     }
 }

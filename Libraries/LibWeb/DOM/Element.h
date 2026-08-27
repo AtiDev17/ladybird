@@ -751,7 +751,9 @@ public:
     bool matches_local_link_pseudo_class() const;
     bool matches_focus_within_pseudo_class() const;
 
-    void invalidate_list_item_counters_for_list_owner();
+    void schedule_list_item_renumber_for_list_owner();
+    bool list_item_renumber_affects_rendered_content() const;
+    bool after_pseudo_element_style_depends_on_list_item_counter() const;
 
     bool captured_in_a_view_transition() const;
     void set_captured_in_a_view_transition(bool);
@@ -875,7 +877,7 @@ private:
     void apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS::RequiredInvalidationAfterStyleChange const&);
     void replace_style_record(CSS::StyleRecordID);
-    void set_in_display_none_subtree_on_descendant_styles();
+    void clear_computed_styles_from_display_none_descendants();
 
     WebIDL::ExceptionOr<GC::Ptr<Node>> insert_adjacent(Utf16View where, GC::Ref<Node> node);
 

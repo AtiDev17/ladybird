@@ -1006,13 +1006,23 @@ pub unsafe extern "C" fn layout_arena_clear_scroll_state(arena: *mut c_void) {
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_refresh_sticky_constraints(arena: *mut c_void) {
+pub unsafe extern "C" fn layout_arena_refresh_sticky_constraints(
+    arena: *mut c_void,
+    callbacks: FfiVisualContextHostCallbacks,
+) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintable_rows = arena.paintable_rows();
         let mut paint_state = arena.paint_state().borrow_mut();
         let state = &mut paint_state.visual_context;
-        crate::painting::visual_context::refresh::refresh_sticky_constraints(&paintable_rows, &mut state.scroll_state);
+        if let Some(tree) = state.tree.as_mut() {
+            crate::painting::visual_context::refresh::refresh_sticky_constraints(
+                &paintable_rows,
+                &state.scroll_state,
+                tree,
+                callbacks.tree_inputs().device_pixels_per_css_pixel,
+            );
+        }
         state.needs_to_refresh_scroll_state = true;
     });
 }
@@ -1309,11 +1319,23 @@ pub unsafe extern "C" fn layout_arena_paint_push_overlay_glyph(sink: *mut c_void
 ///
 /// `tree` must be the pointer handed to the callback, used synchronously.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_node_count(tree: *const c_void) -> usize {
+pub unsafe extern "C" fn layout_arena_visual_context_tree_spatial_node_count(tree: *const c_void) -> usize {
     abort_on_panic(|| {
         // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
         let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        tree.nodes.len()
+        tree.spatial_nodes.len()
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be the pointer handed to the callback, used synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_tree_frame_node_count(tree: *const c_void) -> usize {
+    abort_on_panic(|| {
+        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
+        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
+        tree.frame_nodes.len()
     })
 }
 
@@ -1329,19 +1351,67 @@ pub unsafe extern "C" fn layout_arena_visual_context_tree_root_is_visual_viewpor
     })
 }
 
+fn export_visual_context_nodes<Node>(
+    nodes: &[Node],
+    begin: usize,
+    out: *mut crate::painting::host::FfiVisualContextNodeExport,
+    capacity: usize,
+    export: fn(&Node) -> crate::painting::host::FfiVisualContextNodeExport,
+) {
+    let nodes = &nodes[begin..begin + capacity];
+    // SAFETY: The caller provides writable storage for `capacity` exports.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
+    for (out, node) in out.iter_mut().zip(nodes) {
+        *out = export(node);
+    }
+}
+
 /// # Safety
 ///
-/// `tree` must be the pointer handed to the callback, used synchronously; `index` in range.
+/// `tree` must be the pointer handed to the callback, used synchronously; `out` must have room
+/// for `capacity` exports, and `begin..begin + capacity` must lie within the spatial nodes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_node(
+pub unsafe extern "C" fn layout_arena_visual_context_tree_export_spatial_nodes(
     tree: *const c_void,
-    index: usize,
-) -> crate::painting::host::FfiVisualContextNodeExport {
+    begin: usize,
+    out: *mut crate::painting::host::FfiVisualContextNodeExport,
+    capacity: usize,
+) {
     abort_on_panic(|| {
         // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
         let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        crate::painting::visual_context::export_node(&tree.nodes[index])
-    })
+        export_visual_context_nodes(
+            &tree.spatial_nodes,
+            begin,
+            out,
+            capacity,
+            crate::painting::visual_context::export_spatial_node,
+        );
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be the pointer handed to the callback, used synchronously; `out` must have room
+/// for `capacity` exports, and `begin..begin + capacity` must lie within the frame nodes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_tree_export_frame_nodes(
+    tree: *const c_void,
+    begin: usize,
+    out: *mut crate::painting::host::FfiVisualContextNodeExport,
+    capacity: usize,
+) {
+    abort_on_panic(|| {
+        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
+        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
+        export_visual_context_nodes(
+            &tree.frame_nodes,
+            begin,
+            out,
+            capacity,
+            crate::painting::visual_context::export_frame_node,
+        );
+    });
 }
 
 /// # Safety
@@ -2353,27 +2423,6 @@ pub unsafe extern "C" fn layout_arena_scroll_state_snapshot(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_cumulative_scroll_offset_for_node(
-    arena: *mut c_void,
-    scroll_node_index: usize,
-) -> FfiCssPixelPoint {
-    abort_on_panic(|| {
-        let arena = unsafe { arena_from_handle(arena) };
-        let paint_state = arena.paint_state().borrow();
-        let state = &paint_state.visual_context;
-        let offset = state.tree.as_ref().map_or_else(Default::default, |tree| {
-            state
-                .scroll_state
-                .cumulative_offset(tree.scroll_state_slot_for_node(scroll_node_index))
-        });
-        offset.into()
-    })
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_hit_test_item_count(arena: *mut c_void) -> usize {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
@@ -2418,7 +2467,7 @@ pub unsafe extern "C" fn layout_arena_export_hit_test_items(
                 caret_offset: item.caret_offset,
                 rect: rect(item.rect),
                 caret_rect: rect(item.caret_rect),
-                visual_context_index: item.visual_context_index,
+                context: item.context,
             };
         }
     });
@@ -2509,20 +2558,20 @@ pub unsafe extern "C" fn layout_arena_display_list_mask_registration_count(arena
 pub unsafe extern "C" fn layout_arena_display_list_mask_registration(
     arena: *mut c_void,
     index: usize,
-    out_context_index: *mut usize,
+    out_frame: *mut crate::painting::display_list::commands::FrameNodeIndex,
     out_display_list_id: *mut u64,
 ) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paint_state = arena.paint_state().borrow();
-        let (context_index, id) = paint_state
+        let (frame, id) = paint_state
             .last_recording
             .as_ref()
             .expect("no recording")
             .mask_display_lists[index];
         // SAFETY: the caller passes valid out pointers.
         unsafe {
-            *out_context_index = context_index;
+            *out_frame = frame;
             *out_display_list_id = id.0;
         }
     });
@@ -2584,7 +2633,7 @@ pub unsafe extern "C" fn layout_arena_hit_test_caret_line(
             let line = &list.caret_lines[line_index];
             crate::painting::host::FfiCaretLineExport {
                 rect: line.rect.into(),
-                visual_context_index: line.visual_context_index,
+                context: line.context,
                 first_caret_item_index: line.first_caret_item_index,
                 last_caret_item_index: line.last_caret_item_index,
             }

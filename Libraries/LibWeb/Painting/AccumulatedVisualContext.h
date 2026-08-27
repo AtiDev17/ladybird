@@ -29,13 +29,26 @@ namespace Web::Painting {
 
 class ScrollStateSnapshot;
 
-// The node's own VisualContextIndex keys the scroll offset snapshot; the paintable that owns the
-// node and its sticky constraints live in the ScrollState entry addressed by state_slot, stamped
-// at registration. The slot is process-local bookkeeping: it stays off the wire and takes no part
-// in tree compatibility or damage comparisons.
-struct ScrollData {
-    bool is_sticky { false };
-    ScrollStateSlot state_slot { NO_SCROLL_STATE_SLOT };
+// The node's own SpatialNodeIndex keys its entry in the scroll offset snapshot.
+struct ScrollData { };
+
+// A sticky box's shift, derived by resolve_sticky_offsets() from the scroller's snapshot entry and
+// the parent sticky chain. Both references follow the containing block chain, which continues
+// through fixed-position ancestors, so they need not be spatial ancestors of the node.
+struct StickyData {
+    SpatialNodeIndex scroller;
+    Optional<SpatialNodeIndex> parent_sticky;
+    Gfx::FloatPoint position_relative_to_scroller;
+    Gfx::FloatSize border_box_size;
+    Gfx::FloatSize scrollport_size;
+    Gfx::FloatRect containing_block_region;
+    bool needs_parent_offset_adjustment { false };
+    Optional<float> inset_top;
+    Optional<float> inset_right;
+    Optional<float> inset_bottom;
+    Optional<float> inset_left;
+
+    bool operator==(StickyData const&) const = default;
 };
 
 struct ClipData {
@@ -62,7 +75,7 @@ enum class TransformDataRole : u8 {
 struct TransformData {
     Gfx::FloatMatrix4x4 matrix;
     Gfx::FloatPoint origin;
-    Optional<VisualContextIndex> sorting_context_root_index {};
+    Optional<SpatialNodeIndex> sorting_context_root_index {};
     bool flattens_inherited_transform { false };
     TransformDataRole role { TransformDataRole::CssTransform };
     bool synthetic_plane { false };
@@ -76,7 +89,7 @@ struct PerspectiveData {
 };
 
 struct BackfaceVisibilityData {
-    VisualContextIndex plane_root_index;
+    SpatialNodeIndex plane_root_index;
     bool flattens_inherited_transform { false };
 };
 
@@ -106,16 +119,10 @@ struct MaskData {
     MaskLayerOrigin origin { MaskLayerOrigin::CssMaskLayers };
 };
 
-// Translates by another scroll node's negated offset during display list replay, keeping fixed
-// backgrounds stationary relative to the viewport regardless of scroll position.
-struct ScrollCompensation {
-    VisualContextIndex scroll_node_index;
-};
-
 // One scroll node's contribution to the default scroll shift of an anchor-positioned box, masked to the axes in which
 // the box compensates for scroll. Nodes that move the box but not its default anchor contribute negated.
 struct AnchorScrollShift {
-    VisualContextIndex scroll_node_index;
+    SpatialNodeIndex scroll_node_index;
     bool negate { false };
     bool compensate_horizontal_scroll { true };
     bool compensate_vertical_scroll { true };
@@ -123,35 +130,45 @@ struct AnchorScrollShift {
     Gfx::FloatPoint masked_offset(ScrollStateSnapshot const&) const;
 };
 
-using VisualContextData = Variant<ScrollData, ClipData, TransformData, PerspectiveData, BackfaceVisibilityData, ClipPathData, EffectsData, ScrollCompensation, AnchorScrollShift, MaskData>;
+using SpatialData = Variant<ScrollData, StickyData, TransformData, PerspectiveData, BackfaceVisibilityData, AnchorScrollShift>;
+using FrameData = Variant<ClipData, ClipPathData, EffectsData, MaskData>;
 
 CSSPixelRect apply_css_transform_to_rect(Layout::Node const&, CSSPixelRect const&);
 
-struct AccumulatedVisualContextNode {
-    VisualContextData data;
-    VisualContextIndex parent_index {};
-    size_t depth { 0 };
+struct SpatialNode {
+    SpatialData data;
+    SpatialNodeIndex parent {};
+};
+
+// A frame's geometry is expressed in the space of the spatial node it records. That node and
+// the spatial node of every context applying the frame lie on one root path: the frame's node
+// is an ancestor-or-self of the context's, except for a fixed-background context, which is
+// rooted above the scroll nodes its frames record in and so has them hanging below its node.
+struct FrameNode {
+    FrameData data;
+    FrameNodeIndex parent { NO_FRAME_NODE };
+    SpatialNodeIndex spatial {};
     bool has_empty_effective_clip { false };
 };
 
-// Marks a visual context node whose content belongs to no 3D rendering context.
-static constexpr VisualContextIndex NO_SORTING_CONTEXT { NumericLimits<size_t>::max() };
+// Marks a spatial node whose content belongs to no 3D rendering context.
+static constexpr SpatialNodeIndex NO_SORTING_CONTEXT { NumericLimits<u32>::max() };
 
 // The plane and 3D rendering context that an established context's own plane renders into.
 struct SortingContextLink {
-    VisualContextIndex parent_context;
-    VisualContextIndex parent_leaf;
+    SpatialNodeIndex parent_context;
+    SpatialNodeIndex parent_leaf;
 };
 
-// Per-node 3D rendering context membership: the plane each node's content renders into and the context that
+// Per-spatial-node 3D rendering context membership: the plane each node's content renders into and the context that
 // sorts that plane. A tree without 3D rendering contexts resolves to empty per-node vectors.
 struct SortingContexts {
-    HashMap<size_t, SortingContextLink> links;
-    Vector<VisualContextIndex> leaf_by_node;
-    Vector<VisualContextIndex> context_by_node;
+    HashMap<u32, SortingContextLink> links;
+    Vector<SpatialNodeIndex> leaf_by_node;
+    Vector<SpatialNodeIndex> context_by_node;
 
     bool is_empty() const { return leaf_by_node.is_empty(); }
-    VisualContextIndex outermost_context_of(VisualContextIndex) const;
+    SpatialNodeIndex outermost_context_of(SpatialNodeIndex) const;
 };
 
 class AccumulatedVisualContextTree {
@@ -184,40 +201,44 @@ public:
 
     u64 version() const { return m_version; }
 
-    WEB_API VisualContextIndex append(VisualContextData data, VisualContextIndex parent_index);
+    WEB_API SpatialNodeIndex append_spatial(SpatialData, SpatialNodeIndex parent);
+    WEB_API FrameNodeIndex append_frame(FrameData, FrameNodeIndex parent, SpatialNodeIndex spatial);
     WEB_API void set_visual_viewport_transform(TransformData);
     WEB_API bool is_compatible_with(AccumulatedVisualContextTree const&) const;
     WEB_API void reuse_version_from(AccumulatedVisualContextTree const&);
 
-    AccumulatedVisualContextNode const& node_at(VisualContextIndex index) const { return m_nodes[index.value()]; }
-    AccumulatedVisualContextNode& node_at(VisualContextIndex index) { return m_nodes[index.value()]; }
-    ReadonlySpan<AccumulatedVisualContextNode> nodes() const { return m_nodes.span(); }
+    SpatialNode const& spatial_node_at(SpatialNodeIndex index) const { return m_spatial_nodes[index.value()]; }
+    SpatialNode& spatial_node_at(SpatialNodeIndex index) { return m_spatial_nodes[index.value()]; }
+    FrameNode const& frame_node_at(FrameNodeIndex index) const { return m_frame_nodes[index.value()]; }
+    FrameNode& frame_node_at(FrameNodeIndex index) { return m_frame_nodes[index.value()]; }
+    ReadonlySpan<SpatialNode> spatial_nodes() const { return m_spatial_nodes.span(); }
+    ReadonlySpan<FrameNode> frame_nodes() const { return m_frame_nodes.span(); }
     bool root_is_visual_viewport() const { return m_root_is_visual_viewport; }
 
     SortingContexts resolve_sorting_contexts() const;
-    Optional<float> plane_depth_at_point_for_hit_test(VisualContextIndex plane_node_index, Gfx::FloatPoint, ScrollStateSnapshot const&) const;
-    Optional<Gfx::FloatPoint> transform_point_for_hit_test(VisualContextIndex, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
-    Gfx::FloatPoint inverse_transform_point(VisualContextIndex, Gfx::FloatPoint) const;
-    Gfx::FloatRect transform_rect_to_viewport(VisualContextIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;
-    Gfx::FloatMatrix4x4 accumulated_matrix(VisualContextIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
-    Gfx::FloatSize accumulated_2d_scale(VisualContextIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
-    void dump(VisualContextIndex, StringBuilder&) const;
+    Optional<float> plane_depth_at_point_for_hit_test(SpatialNodeIndex plane_node_index, Gfx::FloatPoint, ScrollStateSnapshot const&) const;
+    Optional<Gfx::FloatPoint> transform_point_for_hit_test(ContextRef, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
+    Gfx::FloatPoint inverse_transform_point(SpatialNodeIndex, Gfx::FloatPoint) const;
+    Gfx::FloatRect transform_rect_to_viewport(SpatialNodeIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;
+    // Sum of the snapshot entries along the scroll-parent chain from the given scroll-like node.
+    Gfx::FloatPoint cumulative_scroll_chain_offset(SpatialNodeIndex, ScrollStateSnapshot const&) const;
+    Gfx::FloatMatrix4x4 accumulated_matrix(SpatialNodeIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
+    Gfx::FloatSize accumulated_2d_scale(SpatialNodeIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
+    void dump_spatial_node(SpatialNodeIndex, StringBuilder&) const;
+    void dump_frame_node(FrameNodeIndex, StringBuilder&) const;
 
-    bool has_empty_effective_clip(VisualContextIndex i) const { return m_nodes[i.value()].has_empty_effective_clip; }
+    bool has_empty_effective_clip(FrameNodeIndex index) const { return index != NO_FRAME_NODE && m_frame_nodes[index.value()].has_empty_effective_clip; }
 
 private:
-    AccumulatedVisualContextTree(u64 version, Vector<AccumulatedVisualContextNode>&& nodes, bool root_is_visual_viewport)
-        : m_version(version)
-        , m_nodes(move(nodes))
-        , m_root_is_visual_viewport(root_is_visual_viewport)
-    {
-    }
+    AccumulatedVisualContextTree(u64 version, TransformData root_transform, bool root_is_visual_viewport);
+    AccumulatedVisualContextTree(u64 version, Vector<SpatialNode>&& spatial_nodes, Vector<FrameNode>&& frame_nodes, bool root_is_visual_viewport);
 
-    Vector<size_t, 8> build_ancestor_chain(VisualContextIndex index) const;
-    bool chain_contains_3d_transform(VisualContextIndex index) const;
+    Vector<SpatialNodeIndex, 8> build_ancestor_chain(SpatialNodeIndex index) const;
+    bool chain_contains_3d_transform(SpatialNodeIndex index) const;
 
     u64 m_version { 0 };
-    Vector<AccumulatedVisualContextNode> m_nodes;
+    Vector<SpatialNode> m_spatial_nodes;
+    Vector<FrameNode> m_frame_nodes;
     bool m_root_is_visual_viewport { true };
 
     template<typename T>
@@ -225,6 +246,9 @@ private:
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
+
+// Fills the snapshot entries of the tree's sticky nodes from the scroll containers' entries.
+WEB_API void resolve_sticky_offsets(AccumulatedVisualContextTree const&, ScrollStateSnapshot&);
 
 }
 
@@ -234,6 +258,11 @@ template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::ScrollData const&);
 template<>
 WEB_API ErrorOr<Web::Painting::ScrollData> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::StickyData const&);
+template<>
+WEB_API ErrorOr<Web::Painting::StickyData> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::ClipData const&);
@@ -271,19 +300,24 @@ template<>
 WEB_API ErrorOr<Web::Painting::MaskData> decode(Decoder&);
 
 template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::ScrollCompensation const&);
-template<>
-WEB_API ErrorOr<Web::Painting::ScrollCompensation> decode(Decoder&);
-
-template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::AnchorScrollShift const&);
 template<>
 WEB_API ErrorOr<Web::Painting::AnchorScrollShift> decode(Decoder&);
 
 template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::AccumulatedVisualContextNode const&);
+WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::SpatialNode const&);
 template<>
-WEB_API ErrorOr<Web::Painting::AccumulatedVisualContextNode> decode(Decoder&);
+WEB_API ErrorOr<Web::Painting::SpatialNode> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::FrameNode const&);
+template<>
+WEB_API ErrorOr<Web::Painting::FrameNode> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::ContextRef const&);
+template<>
+WEB_API ErrorOr<Web::Painting::ContextRef> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::Painting::AccumulatedVisualContextTree const&);

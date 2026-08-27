@@ -29,7 +29,7 @@ using AsyncScrollOperationID = u64;
 // Stable identifier for a scroll node in a document; the node index alone is not unique across nested documents.
 struct AsyncScrollNodeID {
     UniqueNodeID document_id;
-    Painting::VisualContextIndex scroll_node_index;
+    Painting::SpatialNodeIndex scroll_node_index;
 
     bool operator==(AsyncScrollNodeID const&) const = default;
 };
@@ -72,32 +72,14 @@ struct AsyncScrollNode {
     bool snaps_scroll_position_vertically { false };
 };
 
-// Sticky elements are represented as scroll nodes whose offset is derived from ancestor scroll offsets. Keep only
-// the precomputed geometry needed to replay that calculation on the compositor thread after an async scroll mutation.
-struct AsyncStickyArea {
-    UniqueNodeID document_id;
-    Painting::VisualContextIndex scroll_node_index;
-    Painting::VisualContextIndex parent_scroll_node_index;
-    Painting::VisualContextIndex nearest_scrolling_ancestor_index;
-    Gfx::FloatPoint position_relative_to_scroll_ancestor;
-    Gfx::FloatSize border_box_size;
-    Gfx::FloatSize scrollport_size;
-    Gfx::FloatRect containing_block_region;
-    bool needs_parent_offset_adjustment { false };
-    Optional<float> inset_top;
-    Optional<float> inset_right;
-    Optional<float> inset_bottom;
-    Optional<float> inset_left;
-};
-
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
 struct BlockingWheelEventRegion {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
 };
 
 struct WheelHitTestTarget {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
     Optional<AsyncScrollNodeID> target_node_id;
@@ -105,13 +87,13 @@ struct WheelHitTestTarget {
 
 // A region that must always use main-thread wheel routing even without a blocking listener, such as a nested navigable.
 struct MainThreadWheelEventRegion {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
 };
 
 struct ViewportScrollbar {
     AsyncScrollNodeID scroll_node_id;
-    Painting::VisualContextIndex scroll_node_index;
+    Painting::SpatialNodeIndex scroll_node_index;
     Gfx::IntRect gutter_rect;
     Gfx::IntRect thumb_rect;
     Gfx::IntRect expanded_gutter_rect;
@@ -127,7 +109,6 @@ struct ViewportScrollbar {
 
 struct AsyncScrollingState {
     Vector<AsyncScrollNode> scroll_nodes;
-    Vector<AsyncStickyArea> sticky_areas;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
     Vector<ViewportScrollbar> viewport_scrollbars;

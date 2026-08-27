@@ -8,9 +8,11 @@ use super::*;
 
 use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
+use crate::painting::display_list::commands::OptionalF32;
 use crate::painting::visual_context::{MaskLayerOrigin, TransformDataRole};
 use libgfx_rust::{
-    CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, IntRect, MaskKind, WindingRule,
+    CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, MaskKind,
+    WindingRule,
 };
 use std::ffi::c_void;
 
@@ -104,16 +106,17 @@ pub enum FfiVisualContextNodeKind {
     BackfaceVisibility,
     ClipPath,
     Effects,
-    ScrollCompensation,
     AnchorScrollShift,
     Mask,
+    Sticky,
 }
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiVisualContextNodeExport {
     pub kind: FfiVisualContextNodeKind,
-    pub parent_index: usize,
+    pub parent: u32,
+    pub spatial: u32,
     pub matrix: FloatMatrix4x4,
     pub origin: FloatPoint,
     pub flattens_inherited_transform: bool,
@@ -131,9 +134,17 @@ pub struct FfiVisualContextNodeExport {
     pub winding_rule: WindingRule,
     pub mask_kind: MaskKind,
     pub mask_origin: MaskLayerOrigin,
-    pub index_value: usize,
-    pub is_sticky: bool,
-    pub state_slot: usize,
+    pub index_value: u32,
+    pub sticky_parent_sticky_index: u32,
+    pub sticky_position_relative_to_scroller: FloatPoint,
+    pub sticky_border_box_size: FloatSize,
+    pub sticky_scrollport_size: FloatSize,
+    pub sticky_containing_block_region: FloatRect,
+    pub sticky_needs_parent_offset_adjustment: bool,
+    pub sticky_inset_top: OptionalF32,
+    pub sticky_inset_right: OptionalF32,
+    pub sticky_inset_bottom: OptionalF32,
+    pub sticky_inset_left: OptionalF32,
     pub negate: bool,
     pub compensate_horizontal_scroll: bool,
     pub compensate_vertical_scroll: bool,

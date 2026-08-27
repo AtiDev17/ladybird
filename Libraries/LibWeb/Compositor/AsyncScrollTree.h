@@ -28,21 +28,21 @@ struct WheelHitTestResult {
 
 struct CachedWheelHitTestTarget {
     Optional<AsyncScrollNodeID> target_node_id;
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
     Gfx::FloatRect viewport_rect;
 };
 
 struct CachedMainThreadWheelEventTarget {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::FloatRect viewport_rect;
 };
 
 // Viewport-space cache of regions containing non-passive wheel listeners.
 struct CachedBlockingWheelEventTarget {
-    Painting::VisualContextIndex visual_context_index;
+    Painting::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::FloatRect viewport_rect;
 };
@@ -61,8 +61,8 @@ public:
     Optional<AsyncScrollNodeID> scroll_node_id_for_stable_id(AsyncScrollNodeStableID) const;
     WheelHitTestResult hit_test_scroll_node_for_wheel(Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling) const;
     bool scroll_node_is_viewport(AsyncScrollNodeID) const;
-    Vector<AsyncScrollOffset> apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Painting::ScrollStateSnapshot&);
-    Optional<Gfx::FloatPoint> set_scroll_offset(AsyncScrollNodeID, Gfx::FloatPoint, Painting::ScrollStateSnapshot&);
+    Vector<AsyncScrollOffset> apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Painting::AccumulatedVisualContextTree const&, Painting::ScrollStateSnapshot&);
+    Optional<Gfx::FloatPoint> set_scroll_offset(AsyncScrollNodeID, Gfx::FloatPoint, Painting::AccumulatedVisualContextTree const&, Painting::ScrollStateSnapshot&);
 
 private:
     static Gfx::FloatPoint clamp_scroll_offset_to_node(AsyncScrollNode const&, Gfx::FloatPoint);
@@ -73,14 +73,10 @@ private:
     AsyncScrollNode const* scroll_node_for_id(AsyncScrollNodeID) const;
     WheelHitTestResult hit_test_result_for_scroll_node(AsyncScrollNodeID, Gfx::FloatPoint delta) const;
     AsyncScrollNode const* scroll_node_for_stable_id(AsyncScrollNodeStableID) const;
-    AsyncStickyArea const* sticky_area_for_scroll_node_index(Painting::VisualContextIndex) const;
     Optional<AsyncScrollNodeID> scrollable_ancestor_for_node(AsyncScrollNodeID, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint delta) const;
-    Gfx::FloatPoint cumulative_device_sticky_offset_for_node(Painting::VisualContextIndex, Painting::ScrollStateSnapshot const&) const;
     Gfx::FloatPoint apply_scroll_delta_to_node(AsyncScrollNode const&, Gfx::FloatPoint delta, Painting::ScrollStateSnapshot&);
-    void update_sticky_offsets(Painting::ScrollStateSnapshot&) const;
 
     Vector<AsyncScrollNode> m_scroll_nodes;
-    Vector<AsyncStickyArea> m_sticky_areas;
     Vector<WheelHitTestTarget> m_wheel_hit_test_regions;
     Vector<MainThreadWheelEventRegion> m_main_thread_wheel_event_regions;
     Vector<CachedWheelHitTestTarget> m_cached_wheel_hit_test_targets;
