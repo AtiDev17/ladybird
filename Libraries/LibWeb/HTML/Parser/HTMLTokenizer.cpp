@@ -6,29 +6,18 @@
  */
 
 #include <AK/Debug.h>
-#include <AK/NeverDestroyed.h>
 #include <AK/Vector.h>
-#include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/Parser/HTMLToken.h>
 #include <LibWeb/HTML/Parser/HTMLTokenizer.h>
-#include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HTMLTokenizerRustFFI.h>
 
 namespace Web::HTML {
 
-static Vector<u32> code_points_from_utf16_view(Utf16View input)
-{
-    Vector<u32> code_points;
-    code_points.ensure_capacity(input.length_in_code_units());
-    for (auto code_point : input)
-        code_points.append(is_unicode_surrogate(code_point) ? AK::UnicodeUtils::REPLACEMENT_CODE_POINT : code_point);
-    return code_points;
-}
-
 static RustFfiTokenizerHandle* create_tokenizer_from_utf16(Utf16View input)
 {
-    auto code_points = code_points_from_utf16_view(input);
-    return rust_html_tokenizer_create(code_points.data(), code_points.size());
+    if (input.has_ascii_storage())
+        return rust_html_tokenizer_create_from_ascii(reinterpret_cast<u8 const*>(input.ascii_span().data()), input.length_in_code_units());
+    return rust_html_tokenizer_create_from_utf16(reinterpret_cast<u16 const*>(input.utf16_span().data()), input.length_in_code_units());
 }
 
 static Utf16FlyString utf16_fly_string_from_ffi(u16 const* ptr, size_t len)
@@ -43,46 +32,6 @@ static Utf16String utf16_string_from_ffi(u16 const* ptr, size_t len)
     if (!ptr || len == 0)
         return {};
     return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(ptr), len });
-}
-
-static Vector<Utf16FlyString> build_interned_tag_name_table()
-{
-    Vector<Utf16FlyString> table;
-    // Slot 0 is unused (id 0 means "not interned"); store an empty Utf16FlyString there.
-    table.append(Utf16FlyString {});
-#define __ENUMERATE_HTML_TAG(name, tag) table.append(TagNames::name);
-    ENUMERATE_HTML_TAGS
-#undef __ENUMERATE_HTML_TAG
-    VERIFY(table.size() == rust_html_tokenizer_interned_tag_name_count() + 1);
-    return table;
-}
-
-static Vector<Utf16FlyString> build_interned_attr_name_table()
-{
-    Vector<Utf16FlyString> table;
-    // Slot 0 is unused (id 0 means "not interned"); store an empty Utf16FlyString there.
-    table.append(Utf16FlyString {});
-#define __ENUMERATE_HTML_ATTRIBUTE(name, attribute) table.append(AttributeNames::name);
-    ENUMERATE_HTML_ATTRIBUTES
-#undef __ENUMERATE_HTML_ATTRIBUTE
-    VERIFY(table.size() == rust_html_tokenizer_interned_attr_name_count() + 1);
-    return table;
-}
-
-static Utf16FlyString const& interned_rust_tag_name(uint16_t id)
-{
-    static NeverDestroyed<Vector<Utf16FlyString>> table { build_interned_tag_name_table() };
-    if (id == 0 || id >= table->size())
-        return (*table)[0];
-    return (*table)[id];
-}
-
-static Utf16FlyString const& interned_rust_attr_name(uint16_t id)
-{
-    static NeverDestroyed<Vector<Utf16FlyString>> table { build_interned_attr_name_table() };
-    if (id == 0 || id >= table->size())
-        return (*table)[0];
-    return (*table)[id];
 }
 
 HTMLTokenizer::HTMLTokenizer()
@@ -153,19 +102,13 @@ Optional<HTMLToken> HTMLTokenizer::next_token(StopAtInsertionPoint stop_at_inser
         break;
     case HTMLToken::Type::StartTag:
     case HTMLToken::Type::EndTag: {
-        if (ffi.tag_name_id != 0)
-            token.set_tag_name(interned_rust_tag_name(ffi.tag_name_id));
-        else
-            token.set_tag_name(utf16_fly_string_from_ffi(ffi.tag_name_ptr, ffi.tag_name_len));
+        token.set_tag_name(Utf16FlyString::from_raw(ffi.tag_name));
 
         token.set_self_closing(ffi.self_closing);
         for (size_t i = 0; i < ffi.attributes_len; ++i) {
             auto const& ffi_attribute = ffi.attributes_ptr[i];
             HTMLToken::Attribute attribute;
-            if (ffi_attribute.name_id != 0)
-                attribute.local_name = interned_rust_attr_name(ffi_attribute.name_id);
-            else
-                attribute.local_name = utf16_fly_string_from_ffi(ffi_attribute.name_ptr, ffi_attribute.name_len);
+            attribute.local_name = Utf16FlyString::from_raw(ffi_attribute.name);
             attribute.value = utf16_string_from_ffi(ffi_attribute.value_ptr, ffi_attribute.value_len);
             attribute.name_start_position = { ffi_attribute.name_start_line, ffi_attribute.name_start_column };
             attribute.name_end_position = { ffi_attribute.name_end_line, ffi_attribute.name_end_column };
@@ -225,8 +168,11 @@ void HTMLTokenizer::append_to_input_stream(Utf16View input)
     if (input.is_empty())
         return;
 
-    auto code_points = code_points_from_utf16_view(input);
-    rust_html_tokenizer_append_input(m_tokenizer, code_points.data(), code_points.size());
+    if (input.has_ascii_storage()) {
+        rust_html_tokenizer_append_ascii_input(m_tokenizer, reinterpret_cast<u8 const*>(input.ascii_span().data()), input.length_in_code_units());
+        return;
+    }
+    rust_html_tokenizer_append_utf16_input(m_tokenizer, reinterpret_cast<u16 const*>(input.utf16_span().data()), input.length_in_code_units());
 }
 
 void HTMLTokenizer::close_input_stream()
@@ -237,8 +183,11 @@ void HTMLTokenizer::close_input_stream()
 
 void HTMLTokenizer::insert_input_at_insertion_point(Utf16View input)
 {
-    auto code_points = code_points_from_utf16_view(input);
-    rust_html_tokenizer_insert_input(m_tokenizer, code_points.data(), code_points.size());
+    if (input.has_ascii_storage()) {
+        rust_html_tokenizer_insert_ascii_input(m_tokenizer, reinterpret_cast<u8 const*>(input.ascii_span().data()), input.length_in_code_units());
+        return;
+    }
+    rust_html_tokenizer_insert_utf16_input(m_tokenizer, reinterpret_cast<u16 const*>(input.utf16_span().data()), input.length_in_code_units());
 }
 
 void HTMLTokenizer::insert_eof()

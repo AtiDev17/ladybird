@@ -334,11 +334,12 @@ public:
     u32 indexed_array_like_size() const { return m_indexed_array_like_size; }
     bool set_indexed_array_like_size(size_t new_size);
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
+    void indexed_append(ReadonlySpan<Value> values);
     ValueAndAttributes indexed_take_first();
     ValueAndAttributes indexed_take_last();
     size_t indexed_real_size() const;
     Vector<u32> indexed_indices() const;
-    void set_indexed_property_elements(Vector<Value>&& values);
+    void set_indexed_property_elements(ReadonlySpan<Value> values);
     IndexedStorageKind indexed_storage_kind() const { return m_indexed_storage_kind; }
 
     template<typename Callback>

@@ -575,6 +575,46 @@ ThrowCompletionOr<void> Object::copy_data_properties(VM& vm, Value source, HashT
     // 2. Let from be ! ToObject(source).
     auto from = MUST(source.to_object(vm));
 
+    // OPTIMIZATION: An empty ordinary object can reuse the shape of a compatible ordinary source
+    //               and copy its property storage directly. This is equivalent to defining each
+    //               property because all source properties already have the default attributes.
+    if (from.ptr() != this
+        && excluded_keys.is_empty()
+        && excluded_values.is_empty()
+        && &shape() == vm.current_realm()->intrinsics().new_object_shape().ptr()
+        && indexed_storage_kind() == IndexedStorageKind::None
+        && extensible()
+        && eligible_for_own_property_enumeration_fast_path()
+        && !has_intrinsic_accessors()
+        && !may_interfere_with_indexed_property_access()
+        && !requires_slow_add_own_property()
+        && from->indexed_storage_kind() == IndexedStorageKind::None
+        && from->eligible_for_own_property_enumeration_fast_path()
+        && !from->has_intrinsic_accessors()
+        && !from->may_interfere_with_indexed_property_access()
+        && !from->requires_slow_add_own_property()
+        && !from->shape().is_dictionary()
+        && !from->shape().is_prototype_shape()
+        && &from->shape().realm() == vm.current_realm()
+        && from->shape().prototype() == shape().prototype()) {
+        bool has_only_default_data_properties = true;
+        from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+            if (metadata.attributes != default_attributes || from->get_direct(metadata.offset).is_accessor()) {
+                has_only_default_data_properties = false;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+
+        if (has_only_default_data_properties) {
+            unsafe_set_shape(from->shape());
+            from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+                put_direct(metadata.offset, from->get_direct(metadata.offset));
+            });
+            return {};
+        }
+    }
+
     // OPTIMIZATION: For ordinary objects we can iterate the shape directly and read values by storage
     //               offset, avoiding repeated property lookups through DescriptorArray::find.
     if (from->eligible_for_own_property_enumeration_fast_path()
@@ -2154,6 +2194,26 @@ void Object::indexed_append(Value value, PropertyAttributes attributes)
     indexed_put(m_indexed_array_like_size, value, attributes);
 }
 
+void Object::indexed_append(ReadonlySpan<Value> values)
+{
+    VERIFY(m_indexed_storage_kind <= IndexedStorageKind::Packed);
+    VERIFY(values.size() <= NumericLimits<u32>::max() - m_indexed_array_like_size);
+
+    if (values.is_empty())
+        return;
+
+    auto old_size = m_indexed_array_like_size;
+    auto values_size = static_cast<u32>(values.size());
+    auto new_size = old_size + values_size;
+    ensure_indexed_elements(new_size);
+
+    for (u32 i = 0; i < values_size; ++i)
+        m_indexed_elements[old_size + i] = values[i];
+
+    m_indexed_storage_kind = IndexedStorageKind::Packed;
+    m_indexed_array_like_size = new_size;
+}
+
 ValueAndAttributes Object::indexed_take_first()
 {
     if (m_indexed_storage_kind == IndexedStorageKind::Dictionary) {
@@ -2256,7 +2316,7 @@ Vector<u32> Object::indexed_indices() const
     VERIFY_NOT_REACHED();
 }
 
-void Object::set_indexed_property_elements(Vector<Value>&& values)
+void Object::set_indexed_property_elements(ReadonlySpan<Value> values)
 {
     free_indexed_elements();
 

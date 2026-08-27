@@ -649,9 +649,11 @@ set(SOURCES
     HTML/NavigationCurrentEntryChangeEvent.cpp
     HTML/NavigationDestination.cpp
     HTML/NavigationHistoryEntry.cpp
+    HTML/NavigationPopulationRequest.cpp
     HTML/NavigationSourceSnapshot.cpp
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
+    HTML/NavigationParamsDescriptor.cpp
     HTML/NavigationTransition.cpp
     HTML/Navigator.cpp
     HTML/NavigatorBeacon.cpp

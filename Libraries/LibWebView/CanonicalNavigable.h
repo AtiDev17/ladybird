@@ -16,15 +16,20 @@
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
+#include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
+#include <LibRequests/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/CrossProcessId.h>
+#include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
+#include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/NavigationLoader.h>
 
 namespace WebView {
 
@@ -37,14 +42,39 @@ public:
     };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#ongoing-navigation
+    // A navigation transaction, live from its admission until its target document is activated or the
+    // navigation is canceled or superseded.
     struct OngoingNavigation {
+        enum class Phase : u8 {
+            Started,
+            AwaitingUnloadCheck,
+            Populating,
+            AwaitingResponseBody,
+        };
+
         Optional<URL::URL> url {};
+        Optional<URL::URL> current_url {};
+        Optional<Web::NavigationTarget> target {};
         Optional<Utf16String> navigation_id {};
+        Optional<Web::HTML::NavigationStartRequest> start_request {};
+        u64 sequence_number { 0 };
         bool has_started { false };
-        bool uses_replacement_process { false };
-        bool is_uncommitted { false };
-        HostLocality target_locality { HostLocality::Local };
-        Optional<u64> remote_page_id {};
+        Phase phase { Phase::Started };
+        OwnPtr<NavigationLoader> loader {};
+        WeakPtr<WebContentClient> population_worker_client {};
+        u64 population_worker_page_id { 0 };
+        WeakPtr<WebContentClient> host_client {};
+        u64 host_page_id { 0 };
+    };
+
+    // The active document's load, tracked from the document's activation until WebContent reports that
+    // the load finished, failed, or was canceled. Kept apart from the ongoing navigation because the two
+    // overlap: a newer navigation can be admitted, and a traversal can run, while the active document's
+    // load is still in progress. A navigable has an active document from birth, so this always exists;
+    // the navigation id is empty when no UI-recorded navigation produced the document (the initial
+    // about:blank, or a document populated by a traversal).
+    struct ActiveDocumentLoad {
+        Optional<Utf16String> navigation_id {};
     };
 
     CanonicalNavigable(Web::HTML::CrossProcessId id, Optional<Web::HTML::CrossProcessId> parent_id, RefPtr<WebContentClient> reporting_client, u64 reporting_page_id);
@@ -102,15 +132,43 @@ public:
     bool current_session_history_entry_is(Web::HTML::SessionHistoryEntryDescriptor const&) const;
     bool active_document_is(Web::HTML::SessionHistoryEntryDescriptor const&) const;
 
-    void did_commit_navigation(Web::HTML::ReplicatedNavigableState);
+    // AD-HOC: A synchronous same-document entry is script-addressable in WebContent before its queued spec
+    // finalization runs. Keep its canonical staging state on the corresponding tree node until that queue position.
+    struct PendingSameDocumentSessionHistoryEntry {
+        Web::HTML::CrossProcessId operation_id;
+        Web::HTML::SameDocumentNavigationEntry entry;
+    };
+
+    void stage_same_document_session_history_entry(Web::HTML::CrossProcessId operation_id, Web::HTML::SameDocumentNavigationEntry);
+    Optional<Web::HTML::SameDocumentNavigationEntry> take_pending_same_document_session_history_entry(Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryIdentity const&);
+    bool update_pending_same_document_session_history_entry(Web::HTML::SessionHistoryEntryIdentity const&, Function<void(Web::HTML::SameDocumentNavigationEntry&)> const&);
+    bool has_pending_same_document_session_history_entry(Web::HTML::SessionHistoryEntryIdentity const&) const;
+    void remove_pending_same_document_session_history_entries(Web::HTML::CrossProcessId operation_id);
+    Vector<PendingSameDocumentSessionHistoryEntry> take_pending_same_document_session_history_entries();
+    void append_pending_same_document_session_history_entries(Vector<PendingSameDocumentSessionHistoryEntry>);
+    Vector<PendingSameDocumentSessionHistoryEntry> const& pending_same_document_session_history_entries() const { return m_pending_same_document_session_history_entries; }
+
+    void did_commit_navigation(Web::HTML::ReplicatedNavigableState, Optional<Utf16String> const& navigation_id);
 
     Optional<OngoingNavigation>& ongoing_navigation() { return m_ongoing_navigation; }
     Optional<OngoingNavigation> const& ongoing_navigation() const { return m_ongoing_navigation; }
     OngoingNavigation& ensure_ongoing_navigation();
-    void clear_ongoing_navigation() { m_ongoing_navigation.clear(); }
-    bool has_uncommitted_navigation() const { return m_ongoing_navigation.has_value() && m_ongoing_navigation->is_uncommitted; }
-    bool has_matching_ongoing_navigation(URL::URL const&, HostLocality) const;
+    void set_ongoing_navigation(OngoingNavigation);
+    void clear_ongoing_navigation();
+    void set_navigation_population_worker(WebContentClient&, u64 page_id);
+    bool navigation_population_matches(WebContentClient const&, u64 page_id, Utf16String const& navigation_id) const;
+    void did_finish_navigation_params_creation();
+    void set_navigation_host(WebContentClient&, u64 page_id);
+    bool navigation_host_matches(WebContentClient const&, u64 page_id) const;
+    bool navigation_owner_matches(WebContentClient const&, u64 page_id) const;
+    bool navigation_transaction_matches(Utf16String const&, WebContentClient const&, u64 page_id) const;
+    bool cancel_navigation_transaction_for_client(WebContentClient&);
+    void did_finish_navigation_transaction(Optional<Utf16String> const&, Web::HTML::HistoryStepResult);
+    bool has_uncommitted_navigation() const { return m_ongoing_navigation.has_value(); }
     bool matches_ongoing_navigation(Optional<Utf16String> const& navigation_id) const;
+
+    ActiveDocumentLoad const& active_document_load() const { return m_active_document_load; }
+    void clear_active_document_load() { m_active_document_load = {}; }
 
 private:
     Web::HTML::CrossProcessId m_id;
@@ -123,7 +181,9 @@ private:
     Optional<Web::HTML::ReplicatedNavigableState> m_replicated_state;
     Optional<Web::HTML::SessionHistoryEntryIdentity> m_current_session_history_entry_identity;
     Optional<Web::HTML::SessionHistoryEntryIdentity> m_active_session_history_entry_identity;
+    Vector<PendingSameDocumentSessionHistoryEntry> m_pending_same_document_session_history_entries;
     Optional<OngoingNavigation> m_ongoing_navigation;
+    ActiveDocumentLoad m_active_document_load;
     Optional<Web::DevicePixelRect> m_viewport_rect;
     double m_device_pixel_ratio { 1 };
 

@@ -268,6 +268,11 @@ impl Utf16String {
 impl Utf16FlyString {
     /// Creates a string through AK's authoritative UTF-8 fly-string table.
     pub fn from_utf8(string: &str) -> Self {
+        if let Some(raw) = utf16_short_string_raw(string) {
+            // SAFETY: Short strings own no allocation or reference count.
+            return Self(unsafe { OwnedUtf16String::from_raw(raw) });
+        }
+
         // SAFETY: The string's storage remains alive for the duration of the call.
         let raw = unsafe { ladybird_utf16_fly_string_from_utf8(string.as_ptr(), string.len()) };
         // SAFETY: The constructor transfers one ownership reference.
@@ -281,6 +286,32 @@ impl Utf16FlyString {
         // SAFETY: The constructor transfers one ownership reference.
         unsafe { Self::from_raw_owned(raw) }
     }
+}
+
+/// Returns AK's one-word representation for a short ASCII string.
+pub const fn utf16_short_string_raw(string: &str) -> Option<usize> {
+    let bytes = string.as_bytes();
+    if bytes.len() >= size_of::<usize>() {
+        return None;
+    }
+
+    let mut raw = (bytes.len() << SHORT_STRING_BYTE_COUNT_SHIFT) | SHORT_STRING_FLAG;
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii() {
+            return None;
+        }
+        #[cfg(target_endian = "little")]
+        {
+            raw |= (bytes[index] as usize) << ((index + 1) * 8);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            raw |= (bytes[index] as usize) << ((size_of::<usize>() - index - 1) * 8);
+        }
+        index += 1;
+    }
+    Some(raw)
 }
 
 impl PartialEq for Utf16String {

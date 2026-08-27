@@ -22,21 +22,28 @@ namespace Web {
 
 struct FinalizeCrossDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
-    HTML::CrossProcessId pending_document_state_id;
+    HTML::PendingSessionHistoryEntryDescriptor history_entry;
+    Optional<Utf16String> navigation_id;
     HTML::HistoryHandlingBehavior history_handling;
     HTML::UserNavigationInvolvement user_involvement;
 };
 
-struct CrossDocumentNavigationFinalization {
-    HTML::PendingSessionHistoryEntryDescriptor history_entry;
+struct CrossDocumentNavigationFinalizationHostState {
+    bool pending_document_is_in_auxiliary_browsing_context_with_opener { false };
+    Optional<URL::Origin> pending_document_origin;
+    Optional<URL::Origin> active_document_origin;
+};
+
+struct ReconstructedChildNavigation {
+    HTML::SessionHistoryEntryDescriptor target_entry;
+    Utf16String navigation_id;
 };
 
 using HistoryOperationReadyResult = Variant<
     Empty,
     HTML::HistoryStepResult,
     HTML::CrossProcessId,
-    HTML::SameDocumentNavigationEntry,
-    CrossDocumentNavigationFinalization>;
+    CrossDocumentNavigationFinalizationHostState>;
 
 struct ReloadHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
@@ -100,10 +107,6 @@ struct CloseTopLevelTraversableHistoryOperationParameters {
     HTML::CrossProcessId traversable_id;
 };
 
-struct ResetSessionHistoryForTestingOperationParameters {
-    HTML::CrossProcessId traversable_id;
-};
-
 struct FlushSessionHistoryTraversalQueueOperationParameters {
     HTML::CrossProcessId traversable_id;
 };
@@ -119,7 +122,6 @@ using HistoryOperationParameters = Variant<
     NavigableDestructionHistoryOperationParameters,
     FinalizeSameDocumentNavigationHistoryOperationParameters,
     CloseTopLevelTraversableHistoryOperationParameters,
-    ResetSessionHistoryForTestingOperationParameters,
     FlushSessionHistoryTraversalQueueOperationParameters>;
 
 }
@@ -132,9 +134,14 @@ template<>
 WEB_API ErrorOr<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters> decode(Decoder&);
 
 template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::CrossDocumentNavigationFinalization const&);
+WEB_API ErrorOr<void> encode(Encoder&, Web::CrossDocumentNavigationFinalizationHostState const&);
 template<>
-WEB_API ErrorOr<Web::CrossDocumentNavigationFinalization> decode(Decoder&);
+WEB_API ErrorOr<Web::CrossDocumentNavigationFinalizationHostState> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::ReconstructedChildNavigation const&);
+template<>
+WEB_API ErrorOr<Web::ReconstructedChildNavigation> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::ReloadHistoryOperationParameters const&);
@@ -185,11 +192,6 @@ template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::CloseTopLevelTraversableHistoryOperationParameters const&);
 template<>
 WEB_API ErrorOr<Web::CloseTopLevelTraversableHistoryOperationParameters> decode(Decoder&);
-
-template<>
-WEB_API ErrorOr<void> encode(Encoder&, Web::ResetSessionHistoryForTestingOperationParameters const&);
-template<>
-WEB_API ErrorOr<Web::ResetSessionHistoryForTestingOperationParameters> decode(Decoder&);
 
 template<>
 WEB_API ErrorOr<void> encode(Encoder&, Web::FlushSessionHistoryTraversalQueueOperationParameters const&);
