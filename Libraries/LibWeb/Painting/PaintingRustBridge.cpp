@@ -290,6 +290,9 @@ static_assert(sizeof(MaskLayerOrigin) == sizeof(u8));
 static_assert(to_underlying(MaskLayerOrigin::CssMaskLayers) == 0);
 static_assert(to_underlying(MaskLayerOrigin::SvgMask) == 1);
 static_assert(to_underlying(MaskLayerOrigin::SvgClip) == 2);
+static_assert(sizeof(ClipMode) == sizeof(u8));
+static_assert(to_underlying(ClipMode::Intersect) == 0);
+static_assert(to_underlying(ClipMode::Difference) == 1);
 
 #define VERIFY_SHARED_FFI_TYPE(type) static_assert(IsTriviallyCopyable<type>)
 VERIFY_SHARED_FFI_TYPE(CSSPixels);
@@ -315,6 +318,7 @@ VERIFY_SHARED_FFI_TYPE(Gfx::ScalingMode);
 VERIFY_SHARED_FFI_TYPE(Gfx::InterpolationColorSpace);
 VERIFY_SHARED_FFI_TYPE(TransformDataRole);
 VERIFY_SHARED_FFI_TYPE(MaskLayerOrigin);
+VERIFY_SHARED_FFI_TYPE(ClipMode);
 VERIFY_SHARED_FFI_TYPE(ChromeMetrics);
 static_assert(sizeof(ChromeMetrics) == 7 * sizeof(CSSPixels));
 static_assert(offsetof(ChromeMetrics, scroll_thumb_min_length) == 0);
@@ -402,7 +406,7 @@ static FrameData frame_data_from_export(Layout::RustFFI::FfiVisualContextNodeExp
     auto rect = [&] { return node.rect.to_type<DevicePixels>(); };
     switch (node.kind) {
     case Layout::RustFFI::FfiVisualContextNodeKind::Clip:
-        return ClipData { rect(), node.corner_radii };
+        return ClipData { .rect = node.clip_rect, .corner_radii = node.corner_radii, .mode = node.clip_mode };
     case Layout::RustFFI::FfiVisualContextNodeKind::ClipPath:
         return ClipPathData { .path = *static_cast<Gfx::Path const*>(node.path), .bounding_rect = rect(), .fill_rule = node.winding_rule };
     case Layout::RustFFI::FfiVisualContextNodeKind::Effects: {
@@ -451,6 +455,8 @@ static AccumulatedVisualContextTree materialize_rust_visual_context_tree(void co
         visual_context_tree.append_spatial(spatial_data_from_export(spatial_nodes[index]), SpatialNodeIndex { spatial_nodes[index].parent });
     for (auto const& node : frame_nodes)
         visual_context_tree.append_frame(frame_data_from_export(node), FrameNodeIndex { node.parent }, SpatialNodeIndex { node.spatial });
+    if (auto root_isolation_frame = Layout::RustFFI::layout_arena_visual_context_tree_root_isolation_frame(tree); root_isolation_frame != NO_FRAME_NODE.value())
+        visual_context_tree.set_root_isolation_frame(FrameNodeIndex { root_isolation_frame });
     return visual_context_tree;
 }
 
@@ -1114,9 +1120,9 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
             auto const* row = committed_row(layout_node);
             VERIFY(row);
-            auto kind = row->kind;
+            auto kind = layout_node.kind();
             Layout::RustFFI::FfiReplacedPaintFacts facts {};
-            if (kind == Layout::RustFFI::PaintableKind::ImagePaintable) {
+            if (kind == Layout::RustFFI::NodeKind::ImageBox) {
                 auto const& image_provider = static_cast<Layout::Box const&>(layout_node).image_provider();
                 facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
                 facts.natural_width = image_provider.intrinsic_width();
@@ -1128,7 +1134,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 }
                 if (selection_state(layout_node) != SelectionState::None)
                     facts.selection_background_color = selection_style(layout_node).background_color;
-            } else if (kind == Layout::RustFFI::PaintableKind::CanvasPaintable) {
+            } else if (kind == Layout::RustFFI::NodeKind::CanvasBox) {
                 auto& canvas_element = as<HTML::HTMLCanvasElement>(*layout_node.dom_node());
                 if (auto content_size = canvas_element.canvas_surface_content_size(); content_size.has_value()) {
                     facts.has_canvas_content = true;
@@ -1137,7 +1143,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                     facts.canvas_id = canvas_element.canvas_id().value().value();
                     facts.canvas_content_generation = canvas_element.content_generation();
                 }
-            } else if (kind == Layout::RustFFI::PaintableKind::VideoPaintable) {
+            } else if (kind == Layout::RustFFI::NodeKind::VideoBox) {
                 auto const& video_element = as<HTML::HTMLVideoElement>(*layout_node.dom_node());
                 switch (video_element.current_representation()) {
                 case HTML::HTMLVideoElement::Representation::FirstVideoFrame:
@@ -1185,7 +1191,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                         facts.composited_context_id = context_id->value();
                     }
                 }
-            } else if (kind == Layout::RustFFI::PaintableKind::CheckBoxPaintable || kind == Layout::RustFFI::PaintableKind::RadioButtonPaintable) {
+            } else if (kind == Layout::RustFFI::NodeKind::CheckBox || kind == Layout::RustFFI::NodeKind::RadioButton) {
                 auto const& input = as<HTML::HTMLInputElement const>(*layout_node.dom_node());
                 facts.enabled = input.enabled();
                 facts.checked = input.checked();
@@ -1205,9 +1211,9 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             VERIFY(row);
             Layout::RustFFI::FfiImagePaintFacts facts {};
             GC::Ptr<HTML::DecodedImageData> decoded_image_data;
-            if (row->kind == Layout::RustFFI::PaintableKind::ImagePaintable)
+            if (layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox)
                 decoded_image_data = static_cast<Layout::Box const&>(layout_node).image_provider().decoded_image_data();
-            else if (row->kind == Layout::RustFFI::PaintableKind::SVGImagePaintable) {
+            else if (layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox) {
                 auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
                 decoded_image_data = image_provider.decoded_image_data();
             }
@@ -1252,7 +1258,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
             auto const* row = committed_row(layout_node);
             VERIFY(row);
-            VERIFY(row->kind == Layout::RustFFI::PaintableKind::SVGImagePaintable);
+            VERIFY(layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox);
             Layout::RustFFI::FfiSvgImageFacts facts {};
             auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
             facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
@@ -1341,7 +1347,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
                 auto border_rect = absolute_border_box_rect(layout_node);
                 Utf16StringBuilder builder;
-                builder.appendff("{}", debug_description(layout_node));
+                builder.appendff("{}", layout_node.debug_description());
                 builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
                 text = builder.to_string();
             } else if (utf16_fly_string_raw) {

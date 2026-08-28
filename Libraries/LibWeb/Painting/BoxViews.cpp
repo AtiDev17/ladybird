@@ -321,107 +321,56 @@ CSS::StyleRecordID style_record_identity(Layout::Node const& node)
     return as<Layout::NodeWithStyle>(node).style_record_identity();
 }
 
-static StringView class_name_for_kind(Layout::RustFFI::PaintableKind kind)
-{
-    switch (kind) {
-    case Layout::RustFFI::PaintableKind::None:
-    case Layout::RustFFI::PaintableKind::Paintable:
-        return "Paintable"sv;
-    case Layout::RustFFI::PaintableKind::PaintableWithLines:
-        return "PaintableWithLines"sv;
-    case Layout::RustFFI::PaintableKind::InlinePaintable:
-        return "InlinePaintable"sv;
-    case Layout::RustFFI::PaintableKind::ViewportPaintable:
-        return "ViewportPaintable"sv;
-    case Layout::RustFFI::PaintableKind::ImagePaintable:
-        return "ImagePaintable"sv;
-    case Layout::RustFFI::PaintableKind::CanvasPaintable:
-        return "CanvasPaintable"sv;
-    case Layout::RustFFI::PaintableKind::VideoPaintable:
-        return "VideoPaintable"sv;
-    case Layout::RustFFI::PaintableKind::CheckBoxPaintable:
-        return "CheckBoxPaintable"sv;
-    case Layout::RustFFI::PaintableKind::RadioButtonPaintable:
-        return "RadioButtonPaintable"sv;
-    case Layout::RustFFI::PaintableKind::FieldSetPaintable:
-        return "FieldSetPaintable"sv;
-    case Layout::RustFFI::PaintableKind::NavigableContainerViewportPaintable:
-        return "NavigableContainerViewportPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGSVGPaintable:
-        return "SVGSVGPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGPathPaintable:
-        return "SVGPathPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGGraphicsPaintable:
-        return "SVGGraphicsPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGImagePaintable:
-        return "SVGImagePaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGMaskPaintable:
-        return "SVGMaskPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGClipPaintable:
-        return "SVGClipPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGPatternPaintable:
-        return "SVGPatternPaintable"sv;
-    case Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable:
-        return "SVGForeignObjectPaintable"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-StringView class_name(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    return row ? class_name_for_kind(row->kind) : StringView {};
-}
-
-String debug_description(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    if (!row)
-        return {};
-    return MUST(String::formatted("{}({})", class_name_for_kind(row->kind), node.debug_description()));
-}
-
 bool is_navigable_container_viewport_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::NavigableContainerViewportPaintable;
+    return has_committed_box(node) && node.kind() == Layout::RustFFI::NodeKind::NavigableContainerViewport;
 }
 
 bool is_viewport_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::ViewportPaintable;
+    return has_committed_box(node) && node.kind() == Layout::RustFFI::NodeKind::Viewport;
 }
 
 bool is_paintable_with_lines(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    if (!row)
+    if (!has_committed_box(node))
         return false;
-    auto kind = row->kind;
-    return kind == Layout::RustFFI::PaintableKind::PaintableWithLines
-        || kind == Layout::RustFFI::PaintableKind::ViewportPaintable
-        || kind == Layout::RustFFI::PaintableKind::SVGForeignObjectPaintable;
+    switch (node.kind()) {
+    case Layout::RustFFI::NodeKind::Viewport:
+    case Layout::RustFFI::NodeKind::BlockContainer:
+    case Layout::RustFFI::NodeKind::LegendBox:
+    case Layout::RustFFI::NodeKind::TableWrapper:
+    case Layout::RustFFI::NodeKind::TextAreaBox:
+    case Layout::RustFFI::NodeKind::TextInputBox:
+    case Layout::RustFFI::NodeKind::RangeInputBox:
+    case Layout::RustFFI::NodeKind::ListItemMarkerBox:
+    case Layout::RustFFI::NodeKind::SVGForeignObjectBox:
+        return true;
+    case Layout::RustFFI::NodeKind::ListItemBox:
+        return !node.is_fragmented_inline();
+    default:
+        return false;
+    }
 }
 
 bool is_inline_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::InlinePaintable;
+    return has_committed_box(node) && node.is_fragmented_inline();
 }
 
 bool is_svg_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    if (!row)
+    if (!has_committed_box(node))
         return false;
-    switch (row->kind) {
-    case Layout::RustFFI::PaintableKind::SVGGraphicsPaintable:
-    case Layout::RustFFI::PaintableKind::SVGPathPaintable:
-    case Layout::RustFFI::PaintableKind::SVGImagePaintable:
-    case Layout::RustFFI::PaintableKind::SVGMaskPaintable:
-    case Layout::RustFFI::PaintableKind::SVGClipPaintable:
-    case Layout::RustFFI::PaintableKind::SVGPatternPaintable:
+    switch (node.kind()) {
+    case Layout::RustFFI::NodeKind::SVGGraphicsBox:
+    case Layout::RustFFI::NodeKind::SVGGeometryBox:
+    case Layout::RustFFI::NodeKind::SVGTextBox:
+    case Layout::RustFFI::NodeKind::SVGTextPathBox:
+    case Layout::RustFFI::NodeKind::SVGImageBox:
+    case Layout::RustFFI::NodeKind::SVGMaskBox:
+    case Layout::RustFFI::NodeKind::SVGClipBox:
+    case Layout::RustFFI::NodeKind::SVGPatternBox:
         return true;
     default:
         return false;
@@ -430,14 +379,21 @@ bool is_svg_paintable(Layout::Node const& node)
 
 bool is_svg_svg_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::SVGSVGPaintable;
+    return has_committed_box(node) && node.kind() == Layout::RustFFI::NodeKind::SVGSVGBox;
 }
 
 bool is_svg_path_paintable(Layout::Node const& node)
 {
-    auto const* row = committed_row(node);
-    return row && row->kind == Layout::RustFFI::PaintableKind::SVGPathPaintable;
+    if (!has_committed_box(node))
+        return false;
+    switch (node.kind()) {
+    case Layout::RustFFI::NodeKind::SVGGeometryBox:
+    case Layout::RustFFI::NodeKind::SVGTextBox:
+    case Layout::RustFFI::NodeKind::SVGTextPathBox:
+        return true;
+    default:
+        return false;
+    }
 }
 
 Optional<int> effective_z_index(Layout::Node const& node)
@@ -529,7 +485,7 @@ CSSPixelPoint box_type_agnostic_position(Layout::Node const& node)
     auto const* row = committed_row(node);
     if (!row)
         return {};
-    if (row->kind == Layout::RustFFI::PaintableKind::InlinePaintable) {
+    if (is_inline_paintable(node)) {
         auto result = Layout::RustFFI::layout_arena_inline_paintable_first_piece_position(node.arena_handle(), committed_row_slot(node));
         if (result.has_value)
             return { result.x, result.y };
@@ -593,7 +549,7 @@ Layout::Node const* nearest_self_painting_inline_box(Layout::Node const& node)
 {
     for (auto const* ancestor = node.nearest_fragmented_inline_ancestor(); ancestor; ancestor = ancestor->nearest_fragmented_inline_ancestor()) {
         auto const* row = committed_row(*ancestor);
-        if (row && row->kind == Layout::RustFFI::PaintableKind::InlinePaintable
+        if (row && is_inline_paintable(*ancestor)
             && (row->stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT || is_positioned(*ancestor)))
             return ancestor;
     }

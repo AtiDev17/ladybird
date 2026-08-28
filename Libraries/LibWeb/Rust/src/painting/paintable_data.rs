@@ -12,77 +12,6 @@ use std::cell::Cell;
 
 pub const NO_STACKING_CONTEXT: u32 = u32::MAX;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(u8)]
-pub enum PaintableKind {
-    #[default]
-    None = 0,
-    Paintable,
-    PaintableWithLines,
-    InlinePaintable,
-    ViewportPaintable,
-    ImagePaintable,
-    CanvasPaintable,
-    VideoPaintable,
-    CheckBoxPaintable,
-    RadioButtonPaintable,
-    FieldSetPaintable,
-    NavigableContainerViewportPaintable,
-    SVGSVGPaintable,
-    SVGPathPaintable,
-    SVGGraphicsPaintable,
-    SVGImagePaintable,
-    SVGMaskPaintable,
-    SVGClipPaintable,
-    SVGPatternPaintable,
-    SVGForeignObjectPaintable,
-}
-
-impl PaintableKind {
-    pub const fn class_name(self) -> &'static str {
-        match self {
-            Self::None => "(none)",
-            Self::Paintable => "Paintable",
-            Self::PaintableWithLines => "PaintableWithLines",
-            Self::InlinePaintable => "InlinePaintable",
-            Self::ViewportPaintable => "ViewportPaintable",
-            Self::ImagePaintable => "ImagePaintable",
-            Self::CanvasPaintable => "CanvasPaintable",
-            Self::VideoPaintable => "VideoPaintable",
-            Self::CheckBoxPaintable => "CheckBoxPaintable",
-            Self::RadioButtonPaintable => "RadioButtonPaintable",
-            Self::FieldSetPaintable => "FieldSetPaintable",
-            Self::NavigableContainerViewportPaintable => "NavigableContainerViewportPaintable",
-            Self::SVGSVGPaintable => "SVGSVGPaintable",
-            Self::SVGPathPaintable => "SVGPathPaintable",
-            Self::SVGGraphicsPaintable => "SVGGraphicsPaintable",
-            Self::SVGImagePaintable => "SVGImagePaintable",
-            Self::SVGMaskPaintable => "SVGMaskPaintable",
-            Self::SVGClipPaintable => "SVGClipPaintable",
-            Self::SVGPatternPaintable => "SVGPatternPaintable",
-            Self::SVGForeignObjectPaintable => "SVGForeignObjectPaintable",
-        }
-    }
-
-    pub const fn has_lines(self) -> bool {
-        matches!(
-            self,
-            Self::PaintableWithLines | Self::ViewportPaintable | Self::SVGForeignObjectPaintable
-        )
-    }
-
-    pub const fn foreground_is_never_cached(self) -> bool {
-        matches!(self, Self::NavigableContainerViewportPaintable)
-    }
-
-    pub const fn forms_unconnected_subtree(self) -> bool {
-        matches!(
-            self,
-            Self::SVGMaskPaintable | Self::SVGClipPaintable | Self::SVGPatternPaintable
-        )
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum PaintableFlag {
@@ -124,7 +53,6 @@ pub struct FfiOverflowData {
 #[repr(C)]
 pub struct PaintableData {
     pub containing_block: NodeSlotId,
-    pub kind: PaintableKind,
     pub selection_state: u8,
     pub slot_generation: u8,
     pub flags: u32,
@@ -161,7 +89,6 @@ impl Default for PaintableData {
     fn default() -> Self {
         Self {
             containing_block: NodeSlotId::INVALID,
-            kind: PaintableKind::None,
             selection_state: 0,
             slot_generation: 0,
             flags: 0,
@@ -192,6 +119,10 @@ impl Default for PaintableData {
 }
 
 impl PaintableData {
+    pub fn local_frame_range(&self) -> (u32, u32) {
+        (self.frame_nodes_begin, self.frame_nodes_end)
+    }
+
     pub fn has_flag(&self, flag: PaintableFlag) -> bool {
         self.flags & flag as u32 != 0
     }
@@ -269,6 +200,22 @@ pub struct InlineBoxPieceRecord {
     pub accumulated_vertical_shift: CssPixels,
     pub present_edges: u8,
     pub is_geometry_only_placeholder: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BorderEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl BorderEdge {
+    pub const ALL: [BorderEdge; 4] = [BorderEdge::Top, BorderEdge::Right, BorderEdge::Bottom, BorderEdge::Left];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 pub const PIECE_EDGE_TOP: u8 = 1 << 0;

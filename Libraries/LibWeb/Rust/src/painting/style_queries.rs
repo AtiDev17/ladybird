@@ -59,6 +59,14 @@ pub(crate) fn is_abstract_image(value: &StyleValueData) -> bool {
     )
 }
 
+pub(crate) fn has_css_borders(style: ComputedValuesView<'_>) -> bool {
+    let zero = CssPixels::from_raw(0);
+    style.border_top_width() != zero
+        || style.border_right_width() != zero
+        || style.border_bottom_width() != zero
+        || style.border_left_width() != zero
+}
+
 pub(crate) fn background_layers_have_image(style: ComputedValuesView<'_>) -> bool {
     let Some(value) = handle_value(&style.background().background_image) else {
         return false;
@@ -415,6 +423,11 @@ fn participates_in_a_3d_rendering_context(arena: &LayoutNodeArena, node: NodeSlo
 #[derive(Clone, Copy)]
 pub(crate) struct OutlineData {
     pub color: u32,
+    pub geometry: OutlineGeometry,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OutlineGeometry {
     pub line_style: u8,
     pub width: CssPixels,
 }
@@ -435,7 +448,21 @@ fn outline_style_to_line_style(style: u8) -> u8 {
     }
 }
 
-// Returns OptionalNone if there is no outline to paint.
+pub(crate) fn outline_geometry(style: ComputedValuesView<'_>) -> Option<OutlineGeometry> {
+    let misc = style.misc_reset();
+    let (line_style, width) = if misc.outline_style == outline_style::AUTO {
+        // `auto` lets us do whatever we want for the outline. 2px of the accent
+        // colour seems reasonable.
+        (line_style::SOLID, CssPixels::from_integer(2))
+    } else {
+        (outline_style_to_line_style(misc.outline_style), misc.outline_width)
+    };
+    if line_style == line_style::NONE || width.raw_value() == 0 {
+        return None;
+    }
+    Some(OutlineGeometry { line_style, width })
+}
+
 pub(crate) fn outline_data(
     arena: &LayoutNodeArena,
     node: NodeSlotId,
@@ -443,26 +470,20 @@ pub(crate) fn outline_data(
     auto_outline_color: u32,
 ) -> Option<OutlineData> {
     let style = arena.node_style_if_live(node)?;
-    let misc = style.misc_reset();
-    if misc.outline_style == outline_style::AUTO && !window_is_focused {
+    let is_auto = style.misc_reset().outline_style == outline_style::AUTO;
+    if is_auto && !window_is_focused {
         return None;
     }
-    let (color, resolved_line_style, width) = if misc.outline_style == outline_style::AUTO {
-        // `auto` lets us do whatever we want for the outline. 2px of the accent
-        // colour seems reasonable.
-        (auto_outline_color, line_style::SOLID, CssPixels::from_integer(2))
+    let geometry = outline_geometry(style)?;
+    let color = if is_auto {
+        auto_outline_color
     } else {
-        let resolved = outline_style_to_line_style(misc.outline_style);
-        (misc.outline_color, resolved, misc.outline_width)
+        style.misc_reset().outline_color
     };
-    if color >> 24 == 0 || resolved_line_style == line_style::NONE || width.raw_value() == 0 {
+    if color >> 24 == 0 {
         return None;
     }
-    Some(OutlineData {
-        color,
-        line_style: resolved_line_style,
-        width,
-    })
+    Some(OutlineData { color, geometry })
 }
 
 pub(crate) fn outline_offset(arena: &LayoutNodeArena, node: NodeSlotId) -> CssPixels {

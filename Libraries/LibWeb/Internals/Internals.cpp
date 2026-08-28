@@ -69,6 +69,7 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
@@ -887,19 +888,6 @@ Utf16String Internals::dump_layout_tree(GC::Ref<DOM::Node> node)
     return dump_string_to_utf16(builder.to_string_without_validation());
 }
 
-Utf16String Internals::dump_paintable_tree(GC::Ref<DOM::Node> node)
-{
-    node->document().update_layout(DOM::UpdateLayoutReason::Debugging);
-
-    auto* layout_node = node->layout_node();
-    if (!layout_node || !Painting::has_committed_box(*layout_node))
-        return "(no paintable)"_utf16;
-
-    StringBuilder builder;
-    Web::dump_paint_tree(builder, *layout_node);
-    return dump_string_to_utf16(builder.to_string_without_validation());
-}
-
 Utf16String Internals::dump_stacking_context_tree()
 {
     return window().associated_document().dump_stacking_context_tree();
@@ -1149,6 +1137,11 @@ void Internals::set_geolocation_emulated_position(double latitude, double longit
         .latitude = latitude,
         .longitude = longitude,
     });
+}
+
+u64 Internals::parser_non_append_insertions()
+{
+    return HTML::parser_non_append_insertions();
 }
 
 bool Internals::media_element_is_fetching(HTML::HTMLMediaElement& element)

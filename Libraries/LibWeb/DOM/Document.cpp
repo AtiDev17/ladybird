@@ -9801,24 +9801,16 @@ Utf16String Document::dump_display_list()
     HashMap<Painting::FrameNodeIndex, Layout::Node const*> frame_node_owners;
     spatial_node_owners.set(Painting::VISUAL_VIEWPORT_NODE_INDEX, m_layout_root.ptr());
     spatial_node_owners.set(Painting::own_scroll_node_index(*m_layout_root), m_layout_root.ptr());
-    auto viewport_slot = Painting::committed_row_slot(*m_layout_root);
-    auto* arena = m_layout_root->arena_handle();
-    auto entry_count = Layout::RustFFI::layout_arena_paint_tree_dump_entry_count(arena, viewport_slot);
-    Vector<Layout::RustFFI::FfiPaintTreeDumpEntry> entries;
-    entries.resize(entry_count);
-    Layout::RustFFI::layout_arena_export_paint_tree_dump_entries(arena, viewport_slot, entries.data(), entries.size());
-    for (auto const& entry : entries) {
-        if (!entry.layout_node_shell)
-            continue;
-        auto& layout_node = *static_cast<Layout::Node*>(entry.layout_node_shell);
+    m_layout_root->for_each_in_inclusive_subtree([&](Layout::Node const& layout_node) {
         auto const* row = Painting::committed_row(layout_node);
         if (!row)
-            continue;
+            return TraversalDecision::Continue;
         for (auto spatial = row->spatial_nodes_begin; spatial < row->spatial_nodes_end; ++spatial)
             spatial_node_owners.set(Painting::SpatialNodeIndex { spatial }, &layout_node);
         for (auto frame = row->frame_nodes_begin; frame < row->frame_nodes_end; ++frame)
             frame_node_owners.set(Painting::FrameNodeIndex { frame }, &layout_node);
-    }
+        return TraversalDecision::Continue;
+    });
 
     StringBuilder builder;
     builder.append("AccumulatedVisualContext Tree:\n"sv);
@@ -9851,7 +9843,7 @@ Utf16String Document::dump_display_list()
 
     auto append_owner = [&](auto const& owners, auto node_index) {
         if (auto it = owners.find(node_index); it != owners.end())
-            builder.appendff(" ({})", Painting::debug_description(*it->value));
+            builder.appendff(" ({})", it->value->debug_description());
         builder.append('\n');
     };
 
@@ -9885,14 +9877,8 @@ Utf16String Document::dump_display_list()
 
     Function<void(Painting::DisplayList const&, int)> dump_commands =
         [&](Painting::DisplayList const& list, int base_indent) {
-            int indent = base_indent;
             list.for_each_command_header([&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-                auto nesting_change = Painting::display_list_command_nesting_level_change(header.command_type);
-
-                if (nesting_change < 0)
-                    indent = max(base_indent, indent + nesting_change);
-
-                builder.append_repeated(' ', indent * 2);
+                builder.append_repeated(' ', base_indent * 2);
                 Optional<Painting::DisplayListResourceId> nested_display_list_id;
                 Painting::visit_display_list_command(header.command_type, payload, [&]<typename Command>(Command const& command) {
                     builder.appendff("{}@{}", command.command_name, header.context);
@@ -9900,15 +9886,14 @@ Utf16String Document::dump_display_list()
                     if constexpr (IsSame<Command, Painting::PaintNestedDisplayList>)
                         nested_display_list_id = command.display_list_id;
                 });
+                if (header.clips_to_bounding_rect)
+                    builder.appendff(" clip_to_bounds={}", header.bounding_rect);
                 builder.append('\n');
 
                 if (nested_display_list_id.has_value()) {
                     auto& nested_display_list = resource_storage.display_list(*nested_display_list_id);
-                    dump_commands(nested_display_list, indent + 1);
+                    dump_commands(nested_display_list, base_indent + 1);
                 }
-
-                if (nesting_change > 0)
-                    indent += nesting_change;
             });
 
             auto mask_frames = list.mask_display_lists().keys();

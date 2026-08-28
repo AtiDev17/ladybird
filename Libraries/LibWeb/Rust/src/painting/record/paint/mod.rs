@@ -22,57 +22,63 @@ pub mod table_borders;
 pub mod text;
 pub mod text_decoration;
 
-use crate::layout::node_data::NodeSlotId;
-use crate::painting::paintable_data::PaintableKind;
+use crate::layout::node_data::{NodeKind, NodeSlotId};
+use crate::painting::node_painting;
 use crate::painting::record::{PaintPhase, PaintRecorder};
 
 pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, phase: PaintPhase) {
-    let kind = recorder.data(paintable).kind;
-    match kind {
-        PaintableKind::PaintableWithLines
-        | PaintableKind::ViewportPaintable
-        | PaintableKind::SVGForeignObjectPaintable => {
-            if kind == PaintableKind::SVGForeignObjectPaintable && !recorder.is_visible(paintable) {
-                return;
-            }
-            paint_base(recorder, paintable, phase);
-            if phase == PaintPhase::Foreground {
-                // visibility: hidden on this block does not hide descendants that set visibility:
-                // visible again, so fragments (and the caret between their glyphs) are filtered by
-                // their own node's visibility instead.
-                text::paint_fragments_foreground(recorder, paintable, None);
-                text::paint_cursor(recorder, paintable, None);
-            }
+    let Some(kind) = recorder.layout_arena.node_kind_if_live(paintable) else {
+        return;
+    };
+    if node_painting::is_inline(recorder.layout_arena, paintable) {
+        inline_box::paint(recorder, paintable, phase);
+        return;
+    }
+    if node_painting::has_lines(recorder.layout_arena, paintable) {
+        if kind == NodeKind::SVGForeignObjectBox && !recorder.is_visible(paintable) {
+            return;
         }
-        PaintableKind::Paintable => paint_base(recorder, paintable, phase),
-        PaintableKind::InlinePaintable => inline_box::paint(recorder, paintable, phase),
-        PaintableKind::ImagePaintable
-        | PaintableKind::CanvasPaintable
-        | PaintableKind::VideoPaintable
-        | PaintableKind::CheckBoxPaintable
-        | PaintableKind::RadioButtonPaintable
-        | PaintableKind::NavigableContainerViewportPaintable => {
+        paint_base(recorder, paintable, phase);
+        if phase == PaintPhase::Foreground {
+            // visibility: hidden on this block does not hide descendants that set visibility:
+            // visible again, so fragments (and the caret between their glyphs) are filtered by
+            // their own node's visibility instead.
+            text::paint_fragments_foreground(recorder, paintable, None);
+            text::paint_cursor(recorder, paintable, None);
+        }
+        return;
+    }
+    match kind {
+        NodeKind::Box | NodeKind::ReplacedBox | NodeKind::AudioBox | NodeKind::SVGBox => {
+            paint_base(recorder, paintable, phase);
+        }
+        NodeKind::ImageBox
+        | NodeKind::CanvasBox
+        | NodeKind::VideoBox
+        | NodeKind::CheckBox
+        | NodeKind::RadioButton
+        | NodeKind::NavigableContainerViewport => {
             if !recorder.is_visible(paintable) {
                 return;
             }
             paint_base(recorder, paintable, phase);
             if phase == PaintPhase::Foreground {
                 match kind {
-                    PaintableKind::ImagePaintable => replaced::paint_image_foreground(recorder, paintable),
-                    PaintableKind::CanvasPaintable => replaced::paint_canvas_foreground(recorder, paintable),
-                    PaintableKind::VideoPaintable => replaced::paint_video_foreground(recorder, paintable),
-                    PaintableKind::NavigableContainerViewportPaintable => {
+                    NodeKind::ImageBox => replaced::paint_image_foreground(recorder, paintable),
+                    NodeKind::CanvasBox => replaced::paint_canvas_foreground(recorder, paintable),
+                    NodeKind::VideoBox => replaced::paint_video_foreground(recorder, paintable),
+                    NodeKind::NavigableContainerViewport => {
                         replaced::paint_navigable_container_foreground(recorder, paintable);
                     }
-                    PaintableKind::CheckBoxPaintable => form_controls::paint_check_box_foreground(recorder, paintable),
-                    PaintableKind::RadioButtonPaintable => {
+                    NodeKind::CheckBox => form_controls::paint_check_box_foreground(recorder, paintable),
+                    NodeKind::RadioButton => {
                         form_controls::paint_radio_button_foreground(recorder, paintable);
                     }
                     _ => unreachable!(),
                 }
             }
         }
-        PaintableKind::FieldSetPaintable => {
+        NodeKind::FieldSetBox => {
             if !recorder.is_visible(paintable) {
                 return;
             }
@@ -82,52 +88,33 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, pha
             }
             fieldset::paint_border(recorder, paintable);
         }
-        PaintableKind::SVGSVGPaintable
-        | PaintableKind::SVGGraphicsPaintable
-        | PaintableKind::SVGMaskPaintable
-        | PaintableKind::SVGClipPaintable
-        | PaintableKind::SVGPatternPaintable => paint_base(recorder, paintable, phase),
-        PaintableKind::SVGPathPaintable => svg::paint_path(recorder, paintable, phase),
-        PaintableKind::SVGImagePaintable => svg::paint_image_element(recorder, paintable, phase),
-        PaintableKind::None => {}
-    }
-}
-
-pub(crate) fn border_radii_shrunk_for_borders(
-    recorder: &mut PaintRecorder<'_>,
-    paintable: NodeSlotId,
-) -> crate::painting::border_radii::BorderRadii {
-    let mut radii = recorder.border_radii(paintable);
-    let layout_node = paintable;
-    if let Some(style) = recorder.layout_arena.node_style_if_live(layout_node) {
-        radii.shrink(
-            style.border_top_width(),
-            style.border_right_width(),
-            style.border_bottom_width(),
-            style.border_left_width(),
-        );
-    }
-    radii
-}
-
-pub(crate) fn begin_corner_clip(
-    recorder: &mut PaintRecorder<'_>,
-    rect: libgfx_rust::IntRect,
-    radii: &crate::painting::border_radii::BorderRadii,
-    corner_clip: libgfx_rust::CornerClip,
-) -> bool {
-    let corner_radii = radii.corners_unconditionally(&recorder.converter);
-    if !corner_radii.has_any_radius() {
-        return false;
-    }
-    recorder.recorder.save();
-    recorder.recorder.add_rounded_rect_clip(corner_radii, rect, corner_clip);
-    true
-}
-
-pub(crate) fn end_corner_clip(recorder: &mut PaintRecorder<'_>, applied: bool) {
-    if applied {
-        recorder.recorder.restore();
+        NodeKind::SVGSVGBox
+        | NodeKind::SVGGraphicsBox
+        | NodeKind::SVGMaskBox
+        | NodeKind::SVGClipBox
+        | NodeKind::SVGPatternBox => paint_base(recorder, paintable, phase),
+        NodeKind::SVGGeometryBox | NodeKind::SVGTextBox | NodeKind::SVGTextPathBox => {
+            svg::paint_path(recorder, paintable, phase);
+        }
+        NodeKind::SVGImageBox => svg::paint_image_element(recorder, paintable, phase),
+        NodeKind::Unset
+        | NodeKind::BreakNode
+        | NodeKind::GeneratedTextNode
+        | NodeKind::Node
+        | NodeKind::NodeWithStyle
+        | NodeKind::TextNode
+        | NodeKind::TextSliceNode => {}
+        NodeKind::Viewport
+        | NodeKind::BlockContainer
+        | NodeKind::LegendBox
+        | NodeKind::TableWrapper
+        | NodeKind::TextAreaBox
+        | NodeKind::TextInputBox
+        | NodeKind::RangeInputBox
+        | NodeKind::ListItemMarkerBox
+        | NodeKind::SVGForeignObjectBox
+        | NodeKind::ListItemBox
+        | NodeKind::InlineNode => unreachable!("line and inline paintables are handled before kind dispatch"),
     }
 }
 
@@ -156,7 +143,14 @@ pub(crate) fn paint_base_with(
         let padding_box_rect =
             crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.layout_arena, paintable);
         let border_radii = recorder.border_radii(paintable);
-        shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
+        shadow::paint_box_shadow(
+            recorder,
+            paintable,
+            crate::painting::visual_context::PieceKey::Box,
+            border_box_rect,
+            padding_box_rect,
+            border_radii,
+        );
     }
     if phase == PaintPhase::Border
         && !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(
@@ -194,12 +188,6 @@ pub(crate) fn paint_backdrop_filter(
                 paintable,
             ));
     let border_radii = recorder.border_radii(paintable);
-    let corner_clip = begin_corner_clip(
-        recorder,
-        backdrop_region,
-        &border_radii,
-        libgfx_rust::CornerClip::Outside,
-    );
     let filter_bytes = recorder.layout_arena.node_style_if_live(paintable).and_then(|style| {
         let backdrop_filter = &style.effects().backdrop_filter;
         if crate::painting::filter_bytes::contains_url(backdrop_filter) {
@@ -219,5 +207,4 @@ pub(crate) fn paint_backdrop_filter(
             .recorder
             .apply_backdrop_filter(backdrop_region, corner_radii, &filter_bytes);
     }
-    end_corner_clip(recorder, corner_clip);
 }

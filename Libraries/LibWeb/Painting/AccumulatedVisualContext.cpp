@@ -27,9 +27,12 @@
 
 namespace Web::Painting {
 
-bool ClipData::contains(DevicePixelPoint point) const
+bool ClipData::contains(Gfx::FloatPoint point) const
 {
-    return corner_radii.contains(point.to_type<int>(), rect.to_type<int>());
+    auto integral_rect = rect.to_type<int>();
+    if (integral_rect.to_type<float>() == rect)
+        return corner_radii.contains(point.to_type<int>(), integral_rect);
+    return corner_radii.contains(point, rect);
 }
 
 static Atomic<u64> s_next_accumulated_visual_context_tree_version { 1 };
@@ -115,8 +118,8 @@ FrameNodeIndex AccumulatedVisualContextTree::append_frame(FrameData data, FrameN
         empty_clip = m_frame_nodes[parent.value()].has_empty_effective_clip;
     }
     if (!empty_clip) {
-        if (data.has<ClipData>())
-            empty_clip = data.get<ClipData>().rect.is_empty();
+        if (auto const* clip = data.get_pointer<ClipData>())
+            empty_clip = clip->mode == ClipMode::Intersect && clip->rect.is_empty();
         else if (data.has<ClipPathData>())
             empty_clip = data.get<ClipPathData>().path.bounding_box().is_empty();
         else if (data.has<MaskData>())
@@ -138,6 +141,8 @@ void AccumulatedVisualContextTree::set_visual_viewport_transform(TransformData t
 bool AccumulatedVisualContextTree::is_compatible_with(AccumulatedVisualContextTree const& other) const
 {
     if (m_spatial_nodes.size() != other.m_spatial_nodes.size() || m_frame_nodes.size() != other.m_frame_nodes.size())
+        return false;
+    if (m_root_isolation_frame != other.m_root_isolation_frame)
         return false;
 
     for (size_t i = 0; i < m_spatial_nodes.size(); ++i) {
@@ -376,7 +381,8 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
                     return true;
                 // NOTE: The clip rect is in absolute device-pixel coordinates. After inverse-transforming, `point`
                 //       is also in device-pixel coordinates, so we compare them directly.
-                return clip.contains(point.to_type<int>().to_type<DevicePixels>());
+                bool inside = clip.contains(point);
+                return clip.mode == ClipMode::Intersect ? inside : !inside;
             },
             [&](ClipPathData const& clip_path) {
                 if (clip_behavior == ClipBehavior::Ignore)
@@ -758,10 +764,23 @@ void AccumulatedVisualContextTree::dump_frame_node(FrameNodeIndex index, StringB
                 auto const& corner_radii = clip.corner_radii;
                 builder.appendff(" radii=({},{},{},{})", corner_radii.top_left.horizontal_radius, corner_radii.top_right.horizontal_radius, corner_radii.bottom_right.horizontal_radius, corner_radii.bottom_left.horizontal_radius);
             }
+            if (clip.mode == ClipMode::Difference)
+                builder.append(" mode=difference"sv);
         },
         [&](ClipPathData const& clip_path) {
             auto const& rect = clip_path.bounding_rect;
-            builder.appendff("clip_path=[bounds: {},{} {}x{}, path: {}]", rect.x(), rect.y(), rect.width(), rect.height(), clip_path.path.to_svg_string());
+            auto svg_path = clip_path.path.to_svg_string();
+            bool const has_curves_with_host_dependent_control_points = svg_path.contains('Q') || svg_path.contains('C');
+            if (has_curves_with_host_dependent_control_points) {
+                size_t command_count = 0;
+                for (auto code_point : svg_path.code_points()) {
+                    if (code_point == 'M' || code_point == 'L' || code_point == 'Q' || code_point == 'C' || code_point == 'Z')
+                        ++command_count;
+                }
+                builder.appendff("clip_path=[bounds: {},{} {}x{}, curved path: {} commands]", rect.x(), rect.y(), rect.width(), rect.height(), command_count);
+            } else {
+                builder.appendff("clip_path=[bounds: {},{} {}x{}, path: {}]", rect.x(), rect.y(), rect.width(), rect.height(), svg_path);
+            }
         },
         [&](EffectsData const& effects) {
             builder.append("effects=["sv);
@@ -873,6 +892,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::ClipData const& data)
 {
     TRY(encoder.encode(data.rect));
     TRY(encoder.encode(data.corner_radii));
+    TRY(encoder.encode(data.mode));
     return {};
 }
 
@@ -880,8 +900,9 @@ template<>
 ErrorOr<Web::Painting::ClipData> decode(Decoder& decoder)
 {
     return Web::Painting::ClipData {
-        TRY(decoder.decode<Web::DevicePixelRect>()),
-        TRY(decoder.decode<Gfx::CornerRadii>()),
+        .rect = TRY(decoder.decode<Gfx::FloatRect>()),
+        .corner_radii = TRY(decoder.decode<Gfx::CornerRadii>()),
+        .mode = TRY(decoder.decode<Web::Painting::ClipMode>()),
     };
 }
 
@@ -1084,6 +1105,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::AccumulatedVisualContextTr
     TRY(encoder.encode(tree.m_spatial_nodes));
     TRY(encoder.encode(tree.m_frame_nodes));
     TRY(encoder.encode(tree.m_root_is_visual_viewport));
+    TRY(encoder.encode(tree.m_root_isolation_frame));
     return {};
 }
 
@@ -1095,6 +1117,7 @@ ErrorOr<Web::Painting::AccumulatedVisualContextTree> decode(Decoder& decoder)
     auto spatial_nodes = TRY(decoder.decode<Vector<SpatialNode>>());
     auto frame_nodes = TRY(decoder.decode<Vector<FrameNode>>());
     auto root_is_visual_viewport = TRY(decoder.decode<bool>());
+    auto root_isolation_frame = TRY(decoder.decode<Optional<FrameNodeIndex>>());
     if (spatial_nodes.is_empty())
         return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree missing visual viewport node");
     if (!spatial_nodes[VISUAL_VIEWPORT_NODE_INDEX.value()].data.has<TransformData>())
@@ -1126,7 +1149,12 @@ ErrorOr<Web::Painting::AccumulatedVisualContextTree> decode(Decoder& decoder)
         if (frame_nodes[i].spatial.value() >= spatial_count)
             return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree frame node spatial index out of range");
     }
-    return AccumulatedVisualContextTree { version, move(spatial_nodes), move(frame_nodes), root_is_visual_viewport };
+    if (root_isolation_frame.has_value() && (root_isolation_frame->value() >= frame_nodes.size() || !frame_nodes[root_isolation_frame->value()].data.has<EffectsData>()))
+        return Error::from_string_literal("IPC decode: AccumulatedVisualContextTree root isolation frame is not an effects frame");
+    AccumulatedVisualContextTree tree { version, move(spatial_nodes), move(frame_nodes), root_is_visual_viewport };
+    if (root_isolation_frame.has_value())
+        tree.set_root_isolation_frame(*root_isolation_frame);
+    return tree;
 }
 
 }

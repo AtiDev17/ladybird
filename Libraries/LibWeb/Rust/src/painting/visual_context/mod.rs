@@ -6,12 +6,14 @@
 
 pub mod basic_shapes;
 pub mod build;
+pub mod local_frames;
 pub mod nested;
 pub mod node_values;
 pub mod refresh;
 pub mod scroll_state;
 
 use crate::painting::display_list::commands::OptionalF32;
+use crate::painting::paintable_data::BorderEdge;
 use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, MaskKind,
     WindingRule,
@@ -80,9 +82,17 @@ pub struct BackfaceVisibilityData {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClipMode {
+    Intersect,
+    Difference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipData {
-    pub rect: IntRect,
+    pub rect: FloatRect,
     pub corner_radii: CornerRadii,
+    pub mode: ClipMode,
 }
 
 pub struct ClipPathData {
@@ -102,6 +112,24 @@ pub struct EffectsData {
 pub enum EffectsFilter {
     Bytes(std::rc::Rc<Vec<u8>>),
     Host(std::rc::Rc<FilterHandle>),
+}
+
+impl FrameData {
+    pub fn layer_blending_with(blend_mode: CompositingAndBlendingOperator) -> Self {
+        FrameData::Effects(EffectsData {
+            opacity: 1.0,
+            blend_mode,
+            filter: None,
+        })
+    }
+
+    pub fn rect_clip(rect: FloatRect) -> Self {
+        FrameData::Clip(ClipData {
+            rect,
+            corner_radii: CornerRadii::default(),
+            mode: ClipMode::Intersect,
+        })
+    }
 }
 
 impl EffectsData {
@@ -228,7 +256,7 @@ impl FrameData {
 
     fn is_empty_clip(&self) -> bool {
         match self {
-            Self::Clip(clip) => clip.rect.is_empty(),
+            Self::Clip(clip) => clip.mode == ClipMode::Intersect && clip.rect.is_empty(),
             Self::ClipPath(clip_path) => clip_path.path_bounds_are_empty,
             Self::Mask(mask) => mask.rect.is_empty(),
             Self::Effects(_) => false,
@@ -241,11 +269,71 @@ pub struct SpatialNode {
     pub parent: SpatialNodeIndex,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PieceKey {
+    Box,
+    Piece(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FrameRole {
+    Structural,
+    RootIsolation,
+    ContentCornerClip,
+    ContentClip,
+    OuterShadowClip {
+        piece: PieceKey,
+    },
+    FieldsetBackgroundClip,
+    FieldsetTopBorderBand,
+    LegendCutout,
+    BackgroundIsolation {
+        piece: PieceKey,
+    },
+    BackgroundLayerCornerClip {
+        piece: PieceKey,
+        layer: u16,
+        isolated: bool,
+    },
+    BackgroundLayerClip {
+        piece: PieceKey,
+        layer: u16,
+        isolated: bool,
+    },
+    BackgroundLayerBlend {
+        piece: PieceKey,
+        layer: u16,
+        isolated: bool,
+    },
+    // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
+    BackgroundTextClip {
+        piece: PieceKey,
+    },
+    BackgroundTextContentLayer {
+        piece: PieceKey,
+    },
+    BackgroundTextMask {
+        piece: PieceKey,
+    },
+    PatternedEdge {
+        owner: PatternedEdgeOwner,
+        piece: PieceKey,
+        edge: BorderEdge,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PatternedEdgeOwner {
+    Border,
+    Outline,
+}
+
 pub struct FrameNode {
     pub data: FrameData,
     pub parent: FrameNodeIndex,
     pub spatial: SpatialNodeIndex,
     pub has_empty_effective_clip: bool,
+    pub role: FrameRole,
 }
 
 #[derive(Default)]
@@ -274,6 +362,7 @@ pub struct VisualContextTree {
     pub spatial_nodes: Vec<SpatialNode>,
     pub frame_nodes: Vec<FrameNode>,
     pub root_is_visual_viewport: bool,
+    pub root_isolation_frame: Option<FrameNodeIndex>,
     pub version: u64,
     pub reused_previous_version: bool,
 }
@@ -295,6 +384,7 @@ impl VisualContextTree {
             }],
             frame_nodes: Vec::new(),
             root_is_visual_viewport,
+            root_isolation_frame: None,
             version: 0,
             reused_previous_version: false,
         }
@@ -326,6 +416,16 @@ impl VisualContextTree {
         parent: FrameNodeIndex,
         spatial: SpatialNodeIndex,
     ) -> FrameNodeIndex {
+        self.append_frame_with_role(data, parent, spatial, FrameRole::Structural)
+    }
+
+    pub fn append_frame_with_role(
+        &mut self,
+        data: FrameData,
+        parent: FrameNodeIndex,
+        spatial: SpatialNodeIndex,
+        role: FrameRole,
+    ) -> FrameNodeIndex {
         assert!((spatial.0 as usize) < self.spatial_nodes.len());
         let inherited_empty_clip = if parent.is_none() {
             false
@@ -339,6 +439,7 @@ impl VisualContextTree {
             data,
             parent,
             spatial,
+            role,
         });
         FrameNodeIndex((self.frame_nodes.len() - 1) as u32)
     }
@@ -365,6 +466,9 @@ impl VisualContextTree {
 
     pub fn is_compatible_with(&self, other: &Self) -> bool {
         if self.spatial_nodes.len() != other.spatial_nodes.len() || self.frame_nodes.len() != other.frame_nodes.len() {
+            return false;
+        }
+        if self.root_isolation_frame != other.root_isolation_frame {
             return false;
         }
         let spatial_compatible = self
@@ -419,6 +523,8 @@ fn empty_export(
         synthetic_plane: false,
         rect: IntRect::default(),
         corner_radii: CornerRadii::default(),
+        clip_rect: FloatRect::default(),
+        clip_mode: ClipMode::Intersect,
         opacity: 1.0,
         blend_mode: CompositingAndBlendingOperator::Normal,
         filter: std::ptr::null_mut(),
@@ -498,8 +604,9 @@ pub fn export_frame_node(node: &FrameNode) -> crate::painting::host::FfiVisualCo
     out.spatial = node.spatial.0;
     match &node.data {
         FrameData::Clip(clip) => {
-            out.rect = clip.rect;
+            out.clip_rect = clip.rect;
             out.corner_radii = clip.corner_radii;
+            out.clip_mode = clip.mode;
         }
         FrameData::ClipPath(clip_path) => {
             out.path = clip_path.path.as_raw();

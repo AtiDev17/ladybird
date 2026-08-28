@@ -59,20 +59,12 @@ Vector<DisplayListCommandRun> compute_display_list_command_runs(ReadonlyBytes co
         auto& run = runs.last();
         run.size += record_size;
         offset += record_size;
-        auto nesting_level_change = display_list_command_nesting_level_change(header.command_type);
-        if (header.is_clip && run.nesting_delta == 0)
-            run.has_unconfined_clip = true;
-        run.nesting_delta += nesting_level_change;
-        run.min_relative_nesting = min(run.min_relative_nesting, run.nesting_delta);
-        if (display_list_command_is_compositor_metadata(header.command_type)) {
+        if (display_list_command_is_compositor_metadata(header.command_type))
             run.has_compositor_metadata = true;
-        } else if (nesting_level_change == 0 && !header.is_clip) {
-            if (header.has_bounding_rect)
-                run.ink_bounds.unite(header.bounding_rect);
-            else
-                run.has_unbounded_draw = true;
-        }
-        run.is_self_contained = run.nesting_delta == 0 && run.min_relative_nesting == 0 && !run.has_unconfined_clip;
+        else if (header.has_bounding_rect)
+            run.ink_bounds.unite(header.bounding_rect);
+        else
+            run.has_unbounded_draw = true;
     });
     return runs;
 }
@@ -211,7 +203,7 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
             });
     }
 
-    // The palette entry the canvas matrix currently equals, if known; every Restore resets the
+    // The palette entry the canvas matrix currently equals, if known; popping a frame resets the
     // matrix to its save point, so unwinding applied frames invalidates it. Recorded streams
     // contain no matrix-mutating commands, so playing commands never invalidates the cache.
     Optional<SpatialNodeIndex> current_ctm_space;
@@ -246,29 +238,13 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
             if (mask) {
                 --applied_mask_frame_count;
                 ensure_ctm_space(frame_node.spatial);
-                play_command(ApplyEffects {
-                                 .opacity = 1.0f,
-                                 .compositing_and_blending_operator = Gfx::CompositingAndBlendingOperator::DestinationIn,
-                                 .has_filter = false,
-                                 .filter_data = {},
-                                 .has_mask_kind = mask->kind == Gfx::MaskKind::Luminance,
-                                 .mask_kind = mask->kind,
-                             },
-                    nullptr);
+                Optional<DisplayListResourceId> mask_content;
                 if (auto display_list_id = display_list.mask_display_list_id(frame_index);
-                    display_list_id.has_value() && resource_storage().has_display_list(*display_list_id)) {
-                    auto mask_rect = mask->rect.to_type<int>();
-                    play_command(PaintNestedDisplayList {
-                        .display_list_id = *display_list_id,
-                        .rect = mask_rect.to_type<float>(),
-                        .list_size = mask_rect.size(),
-                    });
-                }
-                play_command(Restore {}); // DstIn layer
-                play_command(Restore {}); // content layer
-                play_command(Restore {}); // clip save
+                    display_list_id.has_value() && resource_storage().has_display_list(*display_list_id))
+                    mask_content = *display_list_id;
+                pop_mask(*mask, mask_content);
             } else {
-                play_command(Restore {});
+                pop();
             }
             current_ctm_space = {};
         }
@@ -295,8 +271,7 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
         for (size_t i = common_prefix_length; i < target_frames.size(); ++i) {
             auto frame_index = target_frames[i];
             auto const& frame_node = visual_context_tree.frame_node_at(frame_index);
-            auto const* effects = frame_node.data.get_pointer<EffectsData>();
-            bool pushes_layer = effects || frame_node.data.has<MaskData>();
+            bool pushes_layer = frame_node.data.has<EffectsData>() || frame_node.data.has<MaskData>();
             if (pushes_layer && bounding_rect.has_value()) {
                 bool culled_by_layer_frame = bounding_rect->is_empty();
                 if (!culled_by_layer_frame) {
@@ -311,42 +286,15 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
                     return SwitchResult::CulledByEffect;
                 }
             }
-            if (effects) {
-                ensure_ctm_space(frame_node.spatial);
-                play_command(ApplyEffects {
-                                 .opacity = effects->opacity,
-                                 .compositing_and_blending_operator = effects->blend_mode,
-                                 .has_filter = effects->gfx_filter.has_value(),
-                                 .filter_data = {},
-                                 .has_mask_kind = false,
-                                 .mask_kind = {},
-                             },
-                    effects->gfx_filter.has_value() ? &effects->gfx_filter.value() : nullptr);
-            } else {
-                play_command(Save {});
-                ensure_ctm_space(frame_node.spatial);
-                frame_node.data.visit(
-                    [&](ClipData const& clip) {
-                        if (clip.corner_radii.has_any_radius()) {
-                            play_command(AddRoundedRectClip {
-                                .corner_radii = clip.corner_radii,
-                                .border_rect = clip.rect.to_type<int>(),
-                                .corner_clip = Gfx::CornerClip::Outside,
-                            });
-                        } else {
-                            play_command(AddClipRect { .rect = clip.rect.to_type<int>().to_type<float>() });
-                        }
-                    },
-                    [&](ClipPathData const& clip_path) {
-                        add_clip_path(clip_path.path, clip_path.fill_rule, true);
-                    },
-                    [&](MaskData const& mask) {
-                        play_command(AddClipRect { .rect = mask.rect.to_type<int>().to_type<float>() });
-                        play_command(SaveLayer {});
-                        ++applied_mask_frame_count;
-                    },
-                    [&](EffectsData const&) { VERIFY_NOT_REACHED(); });
-            }
+            ensure_ctm_space(frame_node.spatial);
+            frame_node.data.visit(
+                [&](ClipData const& clip) { push_clip(clip); },
+                [&](ClipPathData const& clip_path) { push_clip_path(clip_path.path, clip_path.fill_rule); },
+                [&](EffectsData const& effects) { push_layer(effects); },
+                [&](MaskData const& mask) {
+                    push_mask(mask);
+                    ++applied_mask_frame_count;
+                });
             applied_frames.append(frame_index);
         }
 
@@ -362,19 +310,12 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
             ? Optional<Gfx::IntRect>(header.bounding_rect)
             : Optional<Gfx::IntRect> {};
 
-        if (bounding_rect.has_value() && (bounding_rect->is_empty() || would_be_fully_clipped_by_painter(*bounding_rect))) {
-            // Any clip that's located outside of the visible region is equivalent to a simple clip-rect,
-            // so replace it with one to avoid doing unnecessary work.
-            if (header.is_clip) {
-                if (header.command_type == DisplayListCommandType::AddClipRect)
-                    play_command(read_display_list_command_payload<AddClipRect>(payload));
-                else
-                    play_command(AddClipRect { bounding_rect.release_value().to_type<float>() });
-            }
+        if (bounding_rect.has_value() && (bounding_rect->is_empty() || would_be_fully_clipped_by_painter(*bounding_rect)))
             return;
-        }
 
         TemporaryChange current_command_payload_change { m_current_command_payload, payload };
+        if (header.clips_to_bounding_rect)
+            push_clip(ClipData { .rect = header.bounding_rect.to_type<float>(), .corner_radii = {} });
         auto dispatch_command = [&]<DisplayListCommand Command>(auto&& callback) {
             auto command = read_display_list_command_payload<Command>(payload);
             if constexpr (IsSame<Command, PaintScrollBar>) {
@@ -397,17 +338,18 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
             ENUMERATE_DISPLAY_LIST_COMMANDS(DISPATCH_DISPLAY_LIST_COMMAND)
 #undef DISPATCH_DISPLAY_LIST_COMMAND
         }
+        if (header.clips_to_bounding_rect)
+            pop();
     };
 
-    // A run enters its context once. Only a self-contained run with known ink bounds may be
-    // skipped as a whole, and only such a run offers its bounds to the layer-frame cull; any
-    // other run gets none, so an open Save or a clip that outlives the run is never dropped.
-    // Skipping a run with nothing to draw before entering its context spares the frame pushes.
+    // A run enters its context once. Only a run whose ink bounds are known may be skipped as a
+    // whole, and only such a run offers its bounds to the layer-frame cull. Skipping a run with
+    // nothing to draw before entering its context spares the frame pushes.
     auto execute_run = [&](DisplayListCommandRun const& run) {
         if (backface_culled[run.context.spatial.value()])
             return;
         Optional<Gfx::IntRect> skippable_ink_bounds;
-        if (run.is_self_contained && !run.has_unbounded_draw)
+        if (!run.has_unbounded_draw)
             skippable_ink_bounds = run.ink_bounds;
         if (skippable_ink_bounds.has_value() && skippable_ink_bounds->is_empty())
             return;
@@ -423,6 +365,8 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
         for (auto const& run : command_runs)
             execute_run(run);
     } else {
+        auto root_isolation_frame = visual_context_tree.root_isolation_frame();
+        size_t const plane_clip_base_length = root_isolation_frame.has_value() ? 1 : 0;
         for (auto const& step : build_depth_sorted_replay_plan(command_runs, visual_context_tree, transform_palette, draw_space, backface_culled)) {
             step.visit(
                 [&](ReadonlySpan<DisplayListCommandRun> runs) {
@@ -430,20 +374,20 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStat
                         execute_run(run);
                 },
                 [&](PushPlaneClip const& clip) {
-                    restore_to_length(0);
-                    play_command(Save {});
-                    set_matrix(Gfx::FloatMatrix4x4::identity());
-                    current_ctm_space = {};
+                    if (root_isolation_frame.has_value())
+                        switch_to_context(ContextRef { visual_context_tree.frame_node_at(*root_isolation_frame).spatial, *root_isolation_frame });
+                    restore_to_length(plane_clip_base_length);
                     Gfx::Path path;
                     path.move_to({ clip.vertices[0].x(), clip.vertices[0].y() });
                     for (size_t i = 1; i < clip.vertices.size(); ++i)
                         path.line_to({ clip.vertices[i].x(), clip.vertices[i].y() });
                     path.close();
-                    add_clip_path(path, Gfx::WindingRule::Nonzero, false);
+                    push_device_space_plane_clip(path);
+                    current_ctm_space = {};
                 },
                 [&](PopPlaneClip const&) {
-                    restore_to_length(0);
-                    play_command(Restore {});
+                    restore_to_length(plane_clip_base_length);
+                    pop();
                     current_ctm_space = {};
                 });
         }
