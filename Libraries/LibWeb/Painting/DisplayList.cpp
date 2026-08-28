@@ -5,7 +5,7 @@
  */
 
 #include <AK/Atomic.h>
-#include <AK/NumericLimits.h>
+#include <AK/Debug.h>
 #include <AK/TemporaryChange.h>
 #include <LibGfx/PaintingSurface.h>
 #include <LibGfx/Path.h>
@@ -24,51 +24,74 @@ DisplayList::DisplayList(u64 compatible_visual_context_tree_version)
 {
 }
 
-DisplayList::DisplayList(u64 compatible_visual_context_tree_version, u64 id, ByteBuffer&& command_bytes, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata> async_scrolling_metadata, HashMap<FrameNodeIndex, DisplayListResourceId>&& mask_display_lists)
+DisplayList::DisplayList(u64 compatible_visual_context_tree_version, u64 id, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata> async_scrolling_metadata, HashMap<FrameNodeIndex, DisplayListResourceId>&& mask_display_lists)
     : m_compatible_visual_context_tree_version(compatible_visual_context_tree_version)
     , m_id(id)
     , m_command_bytes(move(command_bytes))
+    , m_command_runs(move(command_runs))
     , m_surface_clear_color(surface_clear_color)
     , m_async_scrolling_metadata(move(async_scrolling_metadata))
     , m_mask_display_lists(move(mask_display_lists))
 {
 }
 
-bool DisplayList::append_bytes(
-    DisplayListCommandType type,
-    ReadonlyBytes payload,
-    ReadonlyBytes inline_data,
-    AccumulatedVisualContextTree const& visual_context_tree,
-    ContextRef context,
-    Optional<Gfx::IntRect> bounding_rect,
-    bool is_clip)
+NonnullRefPtr<DisplayList> DisplayList::create_from_command_bytes(AccumulatedVisualContextTree const& visual_context_tree, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs)
 {
-    VERIFY(visual_context_tree.version() == m_compatible_visual_context_tree_version);
-    if (visual_context_tree.has_empty_effective_clip(context.frame))
-        return false;
-    VERIFY(m_command_bytes.size() % DisplayList::command_alignment == 0);
-    VERIFY(payload.size() <= NumericLimits<u32>::max());
-    VERIFY(inline_data.size() <= NumericLimits<u32>::max() - payload.size());
-    auto payload_size = payload.size() + inline_data.size();
-    auto record_size = sizeof(DisplayListCommandHeader) + payload_size;
-    constexpr auto command_alignment = DisplayList::command_alignment;
-    auto trailing_padding = align_up_to(record_size, command_alignment) - record_size;
-    VERIFY(trailing_padding <= NumericLimits<u32>::max() - payload_size);
-    DisplayListCommandHeader header {
-        .command_type = type,
-        .has_bounding_rect = bounding_rect.has_value(),
-        .is_clip = is_clip,
-        .payload_size = static_cast<u32>(payload_size + trailing_padding),
-        .context = context,
-        .bounding_rect = bounding_rect.value_or({}),
-    };
-    auto header_bytes = display_list_object_bytes(header);
-    m_command_bytes.append(header_bytes.data(), header_bytes.size());
-    m_command_bytes.append(payload.data(), payload.size());
-    if (!inline_data.is_empty())
-        m_command_bytes.append(inline_data.data(), inline_data.size());
-    m_command_bytes.resize(m_command_bytes.size() + trailing_padding, ByteBuffer::ZeroFillNewElements::Yes);
-    return true;
+    MUST(validate_display_list_command_runs(command_bytes, command_runs));
+    auto display_list = create(visual_context_tree);
+    display_list->m_command_bytes = move(command_bytes);
+    display_list->m_command_runs = move(command_runs);
+    return display_list;
+}
+
+Vector<DisplayListCommandRun> compute_display_list_command_runs(ReadonlyBytes command_bytes)
+{
+    Vector<DisplayListCommandRun> runs;
+    u32 offset = 0;
+    DisplayList::for_each_command_header(command_bytes, [&](DisplayListCommandHeader const& header, ReadonlyBytes) {
+        auto record_size = static_cast<u32>(sizeof(DisplayListCommandHeader) + header.payload_size);
+        if (runs.is_empty() || runs.last().context != header.context) {
+            DisplayListCommandRun new_run {};
+            new_run.offset = offset;
+            new_run.context = header.context;
+            runs.append(new_run);
+        }
+        auto& run = runs.last();
+        run.size += record_size;
+        offset += record_size;
+        auto nesting_level_change = display_list_command_nesting_level_change(header.command_type);
+        if (header.is_clip && run.nesting_delta == 0)
+            run.has_unconfined_clip = true;
+        run.nesting_delta += nesting_level_change;
+        run.min_relative_nesting = min(run.min_relative_nesting, run.nesting_delta);
+        if (display_list_command_is_compositor_metadata(header.command_type)) {
+            run.has_compositor_metadata = true;
+        } else if (nesting_level_change == 0 && !header.is_clip) {
+            if (header.has_bounding_rect)
+                run.ink_bounds.unite(header.bounding_rect);
+            else
+                run.has_unbounded_draw = true;
+        }
+        run.is_self_contained = run.nesting_delta == 0 && run.min_relative_nesting == 0 && !run.has_unconfined_clip;
+    });
+    return runs;
+}
+
+ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun> runs)
+{
+    size_t next_offset = 0;
+    for (auto const& run : runs) {
+        if (run.offset != next_offset || run.size == 0 || run.size % DisplayList::command_alignment != 0)
+            return Error::from_string_literal("Display list command runs do not cover the command bytes");
+        next_offset += run.size;
+    }
+    if (next_offset != command_bytes.size())
+        return Error::from_string_literal("Display list command runs do not cover the command bytes");
+    if constexpr (DISPLAY_LIST_RUNS_DEBUG) {
+        if (runs != compute_display_list_command_runs(command_bytes).span())
+            return Error::from_string_literal("Display list command runs disagree with the command bytes");
+    }
+    return {};
 }
 
 void DisplayListPlayer::execute(
@@ -107,30 +130,22 @@ void DisplayListPlayer::execute_display_list_into_surface(DisplayList const& dis
 void DisplayListPlayer::execute_nested_display_list(
     DisplayList const& display_list,
     AccumulatedVisualContextTree const& visual_context_tree,
-    ScrollStateSnapshot const& scroll_state_snapshot,
-    ReadonlyBytes command_bytes)
+    ScrollStateSnapshot const& scroll_state_snapshot)
 {
     VERIFY(display_list.compatible_visual_context_tree_version() == visual_context_tree.version());
     TemporaryChange display_list_change { m_active_display_list, &display_list };
     TemporaryChange visual_context_tree_change { m_active_visual_context_tree, &visual_context_tree };
     VERIFY(m_resource_storage);
-    execute_impl(display_list, scroll_state_snapshot, command_bytes);
+    execute_impl(display_list, scroll_state_snapshot);
 }
 
 void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStateSnapshot const& scroll_state)
-{
-    execute_impl(display_list, scroll_state, display_list.command_bytes());
-}
-
-void DisplayListPlayer::execute_impl(
-    DisplayList const& display_list,
-    ScrollStateSnapshot const& scroll_state,
-    ReadonlyBytes commands)
 {
     auto const& visual_context_tree = active_visual_context_tree();
     VERIFY(display_list.compatible_visual_context_tree_version() == visual_context_tree.version());
 
     VERIFY(m_surface);
+    auto command_runs = display_list.command_runs();
 
     // Cumulative to-root matrices for every spatial node, resolved against the live scroll offsets
     // and folded onto the canvas matrix at replay entry, so any node's space can be entered
@@ -343,18 +358,9 @@ void DisplayListPlayer::execute_impl(
         if (display_list_command_is_compositor_metadata(header.command_type))
             return;
 
-        auto context = header.context;
-        if (backface_culled[context.spatial.value()])
-            return;
-
         auto bounding_rect = header.has_bounding_rect
             ? Optional<Gfx::IntRect>(header.bounding_rect)
             : Optional<Gfx::IntRect> {};
-
-        if (switch_to_context(context, bounding_rect) == SwitchResult::CulledByEffect)
-            return;
-
-        ensure_ctm_space(context.spatial);
 
         if (bounding_rect.has_value() && (bounding_rect->is_empty() || would_be_fully_clipped_by_painter(*bounding_rect))) {
             // Any clip that's located outside of the visible region is equivalent to a simple clip-rect,
@@ -393,13 +399,35 @@ void DisplayListPlayer::execute_impl(
         }
     };
 
+    // A run enters its context once. Only a self-contained run with known ink bounds may be
+    // skipped as a whole, and only such a run offers its bounds to the layer-frame cull; any
+    // other run gets none, so an open Save or a clip that outlives the run is never dropped.
+    // Skipping a run with nothing to draw before entering its context spares the frame pushes.
+    auto execute_run = [&](DisplayListCommandRun const& run) {
+        if (backface_culled[run.context.spatial.value()])
+            return;
+        Optional<Gfx::IntRect> skippable_ink_bounds;
+        if (run.is_self_contained && !run.has_unbounded_draw)
+            skippable_ink_bounds = run.ink_bounds;
+        if (skippable_ink_bounds.has_value() && skippable_ink_bounds->is_empty())
+            return;
+        if (switch_to_context(run.context, skippable_ink_bounds) == SwitchResult::CulledByEffect)
+            return;
+        ensure_ctm_space(run.context.spatial);
+        if (skippable_ink_bounds.has_value() && would_be_fully_clipped_by_painter(*skippable_ink_bounds))
+            return;
+        DisplayList::for_each_command_header(display_list.command_bytes_of_run(run), execute_command);
+    };
+
     if (!tree_has_sorting_contexts) {
-        DisplayList::for_each_command_header(commands, execute_command);
+        for (auto const& run : command_runs)
+            execute_run(run);
     } else {
-        for (auto const& step : build_depth_sorted_replay_plan(commands, visual_context_tree, transform_palette, draw_space, backface_culled)) {
+        for (auto const& step : build_depth_sorted_replay_plan(command_runs, visual_context_tree, transform_palette, draw_space, backface_culled)) {
             step.visit(
-                [&](DisplayListCommandRange const& range) {
-                    DisplayList::for_each_command_header(commands.slice(range.offset, range.size), execute_command);
+                [&](ReadonlySpan<DisplayListCommandRun> runs) {
+                    for (auto const& run : runs)
+                        execute_run(run);
                 },
                 [&](PushPlaneClip const& clip) {
                     restore_to_length(0);
@@ -463,6 +491,11 @@ ErrorOr<void> encode(Encoder& encoder, Web::Painting::DisplayList const& display
     TRY(encoder.encode(display_list.m_surface_clear_color));
     TRY(encoder.encode(display_list.m_async_scrolling_metadata));
     TRY(encoder.encode(display_list.m_mask_display_lists));
+    // Trivially copyable records, so they travel as raw bytes like the command tape does.
+    auto const& command_runs = display_list.m_command_runs;
+    TRY(encoder.encode_size(command_runs.size()));
+    if (!command_runs.is_empty())
+        TRY(encoder.append(reinterpret_cast<u8 const*>(command_runs.data()), command_runs.size() * sizeof(Web::Painting::DisplayListCommandRun)));
     return {};
 }
 
@@ -481,7 +514,13 @@ ErrorOr<NonnullRefPtr<Web::Painting::DisplayList>> decode(Decoder& decoder)
     auto surface_clear_color = TRY(decoder.decode<Optional<Gfx::Color>>());
     auto async_scrolling_metadata = TRY(decoder.decode<Optional<Web::Painting::DisplayList::AsyncScrollingMetadata>>());
     auto mask_display_lists = TRY(decoder.decode<HashMap<Web::Painting::FrameNodeIndex, Web::Painting::DisplayListResourceId>>());
-    return adopt_ref(*new Web::Painting::DisplayList(compatible_visual_context_tree_version, id, move(command_bytes), surface_clear_color, move(async_scrolling_metadata), move(mask_display_lists)));
+    auto command_run_count = TRY(decoder.decode_size());
+    Vector<Web::Painting::DisplayListCommandRun> command_runs;
+    TRY(command_runs.try_resize(command_run_count));
+    if (!command_runs.is_empty())
+        TRY(decoder.decode_into(Bytes { reinterpret_cast<u8*>(command_runs.data()), command_runs.size() * sizeof(Web::Painting::DisplayListCommandRun) }));
+    TRY(Web::Painting::validate_display_list_command_runs(command_bytes, command_runs));
+    return adopt_ref(*new Web::Painting::DisplayList(compatible_visual_context_tree_version, id, move(command_bytes), move(command_runs), surface_clear_color, move(async_scrolling_metadata), move(mask_display_lists)));
 }
 
 }

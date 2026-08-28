@@ -56,9 +56,8 @@ protected:
         return { reinterpret_cast<T const*>(bytes.data()), bytes.size() / sizeof(T) };
     }
     void execute_impl(DisplayList const&, ScrollStateSnapshot const& scroll_state);
-    void execute_impl(DisplayList const&, ScrollStateSnapshot const& scroll_state, ReadonlyBytes command_bytes);
     void execute_display_list_into_surface(DisplayList const&, AccumulatedVisualContextTree const&, Gfx::PaintingSurface&);
-    void execute_nested_display_list(DisplayList const&, AccumulatedVisualContextTree const&, ScrollStateSnapshot const&, ReadonlyBytes command_bytes);
+    void execute_nested_display_list(DisplayList const&, AccumulatedVisualContextTree const&, ScrollStateSnapshot const&);
 
 private:
 #define DECLARE_PLAY_COMMAND(command_type, player_method) \
@@ -104,30 +103,14 @@ public:
         return adopt_ref(*new DisplayList(visual_context_tree.version()));
     }
 
-    static NonnullRefPtr<DisplayList> create_from_command_bytes(AccumulatedVisualContextTree const& visual_context_tree, ByteBuffer&& command_bytes)
-    {
-        auto display_list = create(visual_context_tree);
-        display_list->m_command_bytes = move(command_bytes);
-        return display_list;
-    }
-
-    template<DisplayListCommand Command>
-    bool append(Command const& command, AccumulatedVisualContextTree const& visual_context_tree, ContextRef context, ReadonlyBytes inline_data = {})
-    {
-        return append_bytes(
-            Command::command_type,
-            display_list_object_bytes(command),
-            inline_data,
-            visual_context_tree,
-            context,
-            command_bounding_rectangle(command),
-            command_is_clip(command));
-    }
+    static WEB_API NonnullRefPtr<DisplayList> create_from_command_bytes(AccumulatedVisualContextTree const&, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs);
 
     u64 compatible_visual_context_tree_version() const { return m_compatible_visual_context_tree_version; }
     u64 id() const { return m_id; }
 
     ReadonlyBytes command_bytes() const { return m_command_bytes.span(); }
+    ReadonlySpan<DisplayListCommandRun> command_runs() const { return m_command_runs.span(); }
+    ReadonlyBytes command_bytes_of_run(DisplayListCommandRun const& run) const { return command_bytes().slice(run.offset, run.size); }
     void set_surface_clear_color(Gfx::Color color) { m_surface_clear_color = color; }
     Optional<Gfx::Color> surface_clear_color() const { return m_surface_clear_color; }
     void set_async_scrolling_metadata(AsyncScrollingMetadata metadata) { m_async_scrolling_metadata = metadata; }
@@ -161,36 +144,12 @@ public:
 
 private:
     explicit DisplayList(u64 compatible_visual_context_tree_version);
-    DisplayList(u64 compatible_visual_context_tree_version, u64 id, ByteBuffer&& command_bytes, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>, HashMap<FrameNodeIndex, DisplayListResourceId>&& mask_display_lists);
-
-    static Optional<Gfx::IntRect> command_bounding_rectangle(auto const& command)
-    {
-        if constexpr (requires { command.bounding_rect(); })
-            return command.bounding_rect();
-        else
-            return {};
-    }
-
-    static bool command_is_clip(auto const& command)
-    {
-        if constexpr (requires { command.is_clip(); })
-            return command.is_clip();
-        else
-            return false;
-    }
-
-    bool append_bytes(
-        DisplayListCommandType,
-        ReadonlyBytes payload,
-        ReadonlyBytes inline_data,
-        AccumulatedVisualContextTree const&,
-        ContextRef,
-        Optional<Gfx::IntRect> bounding_rect,
-        bool is_clip);
+    DisplayList(u64 compatible_visual_context_tree_version, u64 id, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata>, HashMap<FrameNodeIndex, DisplayListResourceId>&& mask_display_lists);
 
     u64 m_compatible_visual_context_tree_version { 0 };
     u64 m_id { 0 };
     ByteBuffer m_command_bytes;
+    Vector<DisplayListCommandRun> m_command_runs;
     Optional<Gfx::Color> m_surface_clear_color;
     Optional<AsyncScrollingMetadata> m_async_scrolling_metadata;
     HashMap<FrameNodeIndex, DisplayListResourceId> m_mask_display_lists;
@@ -200,6 +159,13 @@ private:
     template<typename T>
     friend ErrorOr<T> IPC::decode(IPC::Decoder&);
 };
+
+// The run table the Rust builder records while it writes the tape, derived from the tape alone;
+// tests build tapes by hand and debug builds check that both agree.
+WEB_API Vector<DisplayListCommandRun> compute_display_list_command_runs(ReadonlyBytes command_bytes);
+// Runs must start at offset zero, follow each other without gaps, stay aligned, end at the tape's
+// end, and under DISPLAY_LIST_RUNS_DEBUG match the table recomputed from the tape.
+WEB_API ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun>);
 
 }
 
