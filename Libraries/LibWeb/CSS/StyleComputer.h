@@ -165,26 +165,16 @@ public:
     // see, which decides whether its answer can be offered to another element.
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, ComputedValues const* previous_values = nullptr, u32 computed_group_mask = ComputedValues::all_style_groups, u64 const* computed_properties_to_evaluate = nullptr, ComputedValues const* inheritance_parent_values = nullptr, bool stop_after_longhand_drive = false) const;
 
-    void compute_property_values(ComputedStyleWorkingSet&, Optional<DOM::AbstractElement>) const;
-    void apply_post_compute_adjustments(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
     void process_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element) const;
 
     NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedStyleWorkingSet const*, AbstractOrHypotheticalElement const&, Utf16FlyString const& name) const;
     NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(AbstractOrHypotheticalElement, PropertyNameAndID const&, UnresolvedStyleValue const&) const;
     ComputationContext fallback_computation_context_for_custom_property(AbstractOrHypotheticalElement const&) const;
 
-    static NonnullRefPtr<StyleValue const> compute_value_of_property(PropertyID, NonnullRefPtr<StyleValue const> const& specified_value, Function<NonnullRefPtr<StyleValue const>(PropertyID)> const& get_property_specified_value, ComputationContext const&, double device_pixels_per_css_pixel);
-    static NonnullRefPtr<StyleValue const> compute_animation_name(NonnullRefPtr<StyleValue const> const& absolutized_value);
-    static NonnullRefPtr<StyleValue const> compute_border_or_outline_width(NonnullRefPtr<StyleValue const> const& absolutized_value, double device_pixels_per_css_pixel);
-    static NonnullRefPtr<StyleValue const> compute_corner_shape(NonnullRefPtr<StyleValue const> const& absolutized_value);
-    static NonnullRefPtr<StyleValue const> compute_font_feature_tag_value_list(NonnullRefPtr<StyleValue const> const& absolutized_value);
-    static NonnullRefPtr<StyleValue const> compute_math_depth(NonnullRefPtr<StyleValue const> const& absolutized_value, Optional<DOM::AbstractElement> const& inheritance_parent);
     static NonnullRefPtr<StyleValue const> compute_font_size(NonnullRefPtr<StyleValue const> const& absolutized_value, int computed_math_depth, Optional<DOM::AbstractElement> const& inheritance_parent, CSSPixels initial_font_size = InitialValues::font_size());
     static NonnullRefPtr<StyleValue const> compute_font_style(NonnullRefPtr<StyleValue const> const& absolutized_value);
     static NonnullRefPtr<StyleValue const> compute_font_weight(NonnullRefPtr<StyleValue const> const& absolutized_value, Optional<DOM::AbstractElement> const& inheritance_parent);
     static NonnullRefPtr<StyleValue const> compute_font_width(NonnullRefPtr<StyleValue const> const& absolutized_value);
-    static NonnullRefPtr<StyleValue const> compute_line_height(NonnullRefPtr<StyleValue const> const& absolutized_value, CSSPixels computed_font_size);
-    static NonnullRefPtr<StyleValue const> compute_transform_origin(NonnullRefPtr<StyleValue const> const& absolutized_value);
 
     [[nodiscard]] NonnullRefPtr<ComputedValues const> build_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const* previous_base = nullptr, u32 groups_to_apply = ComputedValues::all_style_groups) const;
     // The animation-frame variant: keep the previous style's base and rebuild only the groups the
@@ -303,9 +293,7 @@ private:
     void collect_animation_effects_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
     void compute_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
     Vector<GC::Ref<Animations::KeyframeEffect>> start_needed_transitions(ComputedValues const& old_style, ComputedStyleWorkingSet& new_style, DOM::AbstractElement) const;
-    void resolve_effective_overflow_values(ComputedStyleWorkingSet&) const;
-    void adjust_element_style_if_needed(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
-    void adjust_animated_element_style_if_needed(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
+    void finalize_style(ComputedStyleWorkingSet&, DOM::AbstractElement, ComputedValuesFFI::FfiStyleFinalizationMode) const;
 
     [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
 
@@ -353,6 +341,7 @@ public:
 
 private:
     [[nodiscard]] Length::FontMetrics calculate_root_element_font_metrics(ComputedStyleWorkingSet const&) const;
+    NonnullRefPtr<StyleValue const> finalize_custom_property_value(ComputedStyleWorkingSet const*, AbstractOrHypotheticalElement const&, Utf16FlyString const&, NonnullRefPtr<StyleValue const>) const;
 
     GC::Ref<DOM::Document> m_document;
 
@@ -469,21 +458,6 @@ private:
     mutable u64 m_parsed_substitution_registration_generation { 0 };
     [[nodiscard]] u64 parsed_substitution_cache_bytes() const;
     void settle_parsed_substitution_cache() const;
-
-    // While one element's own custom properties resolve in dependency order, the values already final for it. A
-    // nested var() naming one reads the finished answer instead of resolving the value again. Members of a reference
-    // cycle are never in here while their cycle resolves, so the substitution guards remain the only thing that
-    // decides what a cycle is.
-    struct ActiveCustomPropertyResolution {
-        DOM::AbstractElement element;
-        HashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> finalized;
-
-        void visit_edges(GC::Cell::Visitor& visitor) const
-        {
-            element.visit(visitor);
-        }
-    };
-    mutable Optional<ActiveCustomPropertyResolution> m_active_custom_property_resolution;
 
     // The cascade input a match signature names, expanded once and answered from for every other
     // element the traversal proves has the same one. Keyed by the signature and what is being

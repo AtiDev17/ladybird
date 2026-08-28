@@ -237,6 +237,20 @@ fn scan_custom_property_references(
     all_references_visible
 }
 
+pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(Vec<Vec<u16>>, bool)> {
+    let StyleValueData::Unresolved { components, .. } = value else {
+        return None;
+    };
+    let mut references = Vec::new();
+    unsafe extern "C" fn collect(context: *mut c_void, name: *const u16, name_length: usize) {
+        let references = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
+        references.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
+    }
+    let all_references_visible =
+        scan_custom_property_references(components.as_slice(), (&raw mut references).cast(), collect);
+    Some((references, all_references_visible))
+}
+
 /// Visits the Typed OM reification of an unresolved style value. Event 0 appends a text segment,
 /// event 1 begins a variable reference, and event 2 ends its optional fallback.
 ///
@@ -2728,12 +2742,7 @@ impl StyleValueData {
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
             }
-            Self::Image {
-                url,
-                url_type,
-                url_modifiers: _,
-                ..
-            } => {
+            Self::Image { url, url_type, .. } => {
                 hasher.write(url.as_bytes());
                 hasher.write_u8(*url_type);
             }
@@ -4393,7 +4402,7 @@ mod substitution_clone_tests {
     fn shorthand_clone_preserves_repeated_child_aliases() {
         let child = Arc::new(StyleValueData::Keyword { keyword: 1 });
         let properties = [1, 2];
-        let children = [Arc::into_raw(child.clone()), Arc::into_raw(child.clone())];
+        let children = [Arc::into_raw(child.clone()), Arc::into_raw(child)];
         let shorthand = unsafe {
             rust_style_value_create_shorthand(
                 3,

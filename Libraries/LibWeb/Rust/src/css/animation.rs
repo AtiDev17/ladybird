@@ -428,6 +428,7 @@ pub struct FfiAnimationKeyframeValue {
 #[repr(C)]
 pub struct FfiAnimationValueInput {
     pub property_id: u16,
+    pub result_of_transition: bool,
     pub underlying: *const StyleValueData,
     pub initial: *const StyleValueData,
     pub current_key: f64,
@@ -450,8 +451,7 @@ pub struct FfiComputedAnimationBatch {
     pub context: FfiAnimationContext,
     pub values: *const FfiAnimationValueInput,
     pub value_count: usize,
-    pub results: *mut FfiAnimatedProperty,
-    pub result_capacity: usize,
+    pub overlay: *mut std::ffi::c_void,
 }
 
 #[repr(C)]
@@ -466,10 +466,32 @@ pub struct FfiAnimatedProperty {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiAnimationStyleSheetResourceContext {
+    pub base_url: *const u8,
+    pub base_url_length: usize,
+    pub has_value: bool,
+    pub origin_clean: bool,
+}
+
+impl FfiAnimationStyleSheetResourceContext {
+    #[cfg(test)]
+    const fn empty() -> Self {
+        Self {
+            base_url: std::ptr::null(),
+            base_url_length: 0,
+            has_value: false,
+            origin_clean: false,
+        }
+    }
+}
+
+#[repr(C)]
 pub struct FfiAnimationDeclaration {
     pub keyframe_index: usize,
     pub property_id: u16,
     pub value: *const StyleValueData,
+    pub style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
     pub use_initial: bool,
     pub is_transition: bool,
 }
@@ -480,6 +502,7 @@ struct AnimationPropertyConflictCandidate {
     source_property_id: u16,
     source_longhand_id: u16,
     value: RetainedStyleValueData,
+    style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
     use_initial: bool,
     suppressed_by_important: bool,
 }
@@ -589,13 +612,26 @@ pub struct FfiResolvedAnimationProperty {
     pub source_longhand_id: u16,
     pub value: *const StyleValueData,
     pub value_source: FfiAnimationSpecifiedValueSource,
+    pub style_sheet_resource_context: FfiAnimationStyleSheetResourceContext,
 }
 
 #[repr(C)]
 pub struct FfiResolvedAnimationProperties {
     pub properties: *const FfiResolvedAnimationProperty,
     pub count: usize,
+    pub uses_tree_counting_function: bool,
+    pub container_relative_length_unit_mask: u8,
+    pub needs_document_base_url: bool,
+    pub unfixed_random_sharings: *const FfiAnimationUnfixedRandomSharing,
+    pub unfixed_random_sharing_count: usize,
     pub storage: *mut std::ffi::c_void,
+}
+
+#[repr(C)]
+pub struct FfiAnimationUnfixedRandomSharing {
+    pub source: *const StyleValueData,
+    pub name: usize,
+    pub element_shared: bool,
 }
 
 fn resolve_animation_declarations(
@@ -627,6 +663,7 @@ fn resolve_animation_declarations(
                             data.cast(),
                         ))
                     },
+                    style_sheet_resource_context: declaration.style_sheet_resource_context,
                     use_initial: declaration.use_initial,
                     // OPTIMIZATION: Values resulting from animations other than CSS transitions
                     // are overridden by important properties, so there is no need to compute or
@@ -654,19 +691,70 @@ fn resolve_animation_declarations(
                 source_longhand_id: candidate.source_longhand_id,
                 value: candidate.value.pointer(),
                 value_source,
+                style_sheet_resource_context: candidate.style_sheet_resource_context,
             });
             retained_values.push(candidate.value);
         }
     }
+    let mut uses_tree_counting_function = false;
+    let mut container_relative_length_unit_mask = 0;
+    let mut needs_document_base_url = false;
+    let mut random_sharing_sources = Vec::new();
+    for property in &properties {
+        if property.value_source != FfiAnimationSpecifiedValueSource::Value {
+            continue;
+        }
+        let value = unsafe { &*property.value };
+        if matches!(
+            value,
+            StyleValueData::Unresolved { .. } | StyleValueData::PendingSubstitution { .. }
+        ) {
+            continue;
+        }
+        let dependencies = crate::css::style_compute::external_value_dependencies(value);
+        uses_tree_counting_function |= dependencies.uses_tree_counting_function;
+        container_relative_length_unit_mask |= dependencies.container_relative_length_unit_mask;
+        needs_document_base_url |= dependencies.needs_document_base_url;
+        if dependencies.has_unfixed_random_sharing {
+            crate::css::style_compute::collect_unfixed_random_sharings_in_value(value, &mut random_sharing_sources);
+        }
+    }
+    let unfixed_random_sharings = random_sharing_sources
+        .into_iter()
+        .map(|source| {
+            let StyleValueData::RandomValueSharing {
+                has_name,
+                name,
+                element_shared,
+                ..
+            } = (unsafe { &*source })
+            else {
+                unreachable!();
+            };
+            FfiAnimationUnfixedRandomSharing {
+                source,
+                name: if *has_name { name.raw() } else { 0 },
+                element_shared: *element_shared,
+            }
+        })
+        .collect();
     ResolvedAnimationDeclarations {
         properties,
         _retained_values: retained_values,
+        uses_tree_counting_function,
+        container_relative_length_unit_mask,
+        needs_document_base_url,
+        unfixed_random_sharings,
     }
 }
 
 struct ResolvedAnimationDeclarations {
     properties: Vec<FfiResolvedAnimationProperty>,
     _retained_values: Vec<RetainedStyleValueData>,
+    uses_tree_counting_function: bool,
+    container_relative_length_unit_mask: u8,
+    needs_document_base_url: bool,
+    unfixed_random_sharings: Vec<FfiAnimationUnfixedRandomSharing>,
 }
 
 #[repr(u8)]
@@ -6820,6 +6908,11 @@ pub unsafe extern "C" fn rust_resolve_animation_declarations(
             return FfiResolvedAnimationProperties {
                 properties: std::ptr::null(),
                 count: 0,
+                uses_tree_counting_function: false,
+                container_relative_length_unit_mask: 0,
+                needs_document_base_url: false,
+                unfixed_random_sharings: std::ptr::null(),
+                unfixed_random_sharing_count: 0,
                 storage: std::ptr::null_mut(),
             };
         }
@@ -6829,6 +6922,11 @@ pub unsafe extern "C" fn rust_resolve_animation_declarations(
         FfiResolvedAnimationProperties {
             properties,
             count,
+            uses_tree_counting_function: resolved.uses_tree_counting_function,
+            container_relative_length_unit_mask: resolved.container_relative_length_unit_mask,
+            needs_document_base_url: resolved.needs_document_base_url,
+            unfixed_random_sharings: resolved.unfixed_random_sharings.as_ptr(),
+            unfixed_random_sharing_count: resolved.unfixed_random_sharings.len(),
             storage: Box::into_raw(resolved).cast(),
         }
     })
@@ -6844,11 +6942,11 @@ pub unsafe extern "C" fn rust_resolved_animation_properties_destroy(storage: *mu
 }
 
 /// Evaluate and compose every prepared animation interval without consulting C++ or the DOM.
-/// Results are written into caller-owned storage, transferring every non-null result value.
+/// Applied results are stored directly in the Rust-owned animated overlay.
 ///
 /// # Safety
 /// `computed` must point to a live batch whose input style values remain live for the call. Its
-/// result storage must have room for every input value, and C++ must adopt every non-null result.
+/// `overlay` must point at a live, uniquely owned animated overlay.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
     crate::abort_on_panic(|| {
@@ -6858,25 +6956,40 @@ pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAn
             return 0;
         }
         let inputs = unsafe { std::slice::from_raw_parts(computed.values, computed.value_count) };
-        assert!(computed.result_capacity >= inputs.len());
-        assert!(!computed.results.is_null());
+        let overlay = unsafe { &mut *computed.overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() };
 
         // https://www.w3.org/TR/web-animations-1/#effect-stacks
         // NB: Inputs arrive in composite order. Keep each result as the underlying value for the
         //     next effect affecting the same property.
         let mut previous_values = Vec::<(u16, *const StyleValueData)>::new();
-        for (index, input) in inputs.iter().enumerate() {
+        for input in inputs {
             let previous_value = previous_values
                 .iter()
                 .rev()
                 .find(|(property_id, _)| *property_id == input.property_id)
                 .map(|(_, value)| unsafe { &**value });
             let result = evaluate_animation_value(&computed.context, input, previous_value);
-            if result.apply && !result.value.is_null() {
-                previous_values.push((input.property_id, result.value));
+            if !result.apply {
+                assert!(result.value.is_null());
+                continue;
             }
-            unsafe { computed.results.add(index).write(result) };
+            if !result.value.is_null() {
+                previous_values.push((input.property_id, result.value));
+                let value = unsafe { RetainedStyleValueData::from_retained_pointer(result.value) };
+                overlay.set_owned(input.property_id, value, false, input.result_of_transition);
+            } else {
+                let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {
+                    keyword: crate::css::css_enums::keyword::HIDDEN,
+                });
+                overlay.set_owned(
+                    crate::css::property_metadata::property_id::VISIBILITY,
+                    value,
+                    false,
+                    input.result_of_transition,
+                );
+            }
         }
+        overlay.refresh_ffi_entries();
         inputs.len()
     })
 }
@@ -6937,6 +7050,7 @@ mod tests {
                 source_property_id: property_id::BORDER,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
             },
@@ -6946,6 +7060,7 @@ mod tests {
                 source_property_id: property_id::BORDER_TOP,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
             },
@@ -6955,6 +7070,7 @@ mod tests {
                 source_property_id: property_id::BORDER_TOP_COLOR,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: false,
                 suppressed_by_important: false,
             },
@@ -6964,6 +7080,7 @@ mod tests {
                 source_property_id: property_id::BORDER_TOP_COLOR,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: true,
                 suppressed_by_important: false,
             },
@@ -6973,6 +7090,7 @@ mod tests {
                 source_property_id: property_id::BORDER,
                 source_longhand_id: property_id::BORDER_TOP_COLOR,
                 value: value(),
+                style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
                 use_initial: true,
                 suppressed_by_important: false,
             },
@@ -7025,6 +7143,7 @@ mod tests {
             keyframe_index: 0,
             property_id: crate::css::property_metadata::property_id::BORDER,
             value: &raw const *pending,
+            style_sheet_resource_context: FfiAnimationStyleSheetResourceContext::empty(),
             use_initial: false,
             is_transition: false,
         };
@@ -7179,6 +7298,7 @@ mod tests {
         ];
         let input = FfiAnimationValueInput {
             property_id: crate::css::property_metadata::property_id::FLEX_GROW,
+            result_of_transition: false,
             underlying: &raw const underlying,
             initial: &raw const underlying,
             current_key: 75.0,
@@ -7229,6 +7349,7 @@ mod tests {
             ];
             let input = FfiAnimationValueInput {
                 property_id: crate::css::property_metadata::property_id::FLEX_GROW,
+                result_of_transition: false,
                 underlying: Arc::as_ptr(&underlying),
                 initial: Arc::as_ptr(&initial),
                 current_key: 50.0,

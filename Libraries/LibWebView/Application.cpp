@@ -685,6 +685,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_web_content_options.expose_experimental_interfaces = ExposeExperimentalInterfaces::Yes;
         m_web_content_options.expose_internals_object = ExposeInternalsObject::Yes;
         m_web_content_options.force_cpu_painting = ForceCPUPainting::Yes;
+
+        // Test results must not depend on the content blocking the developer running the tests happens to have
+        // configured for normal browsing, and compiling those lists into every renderer is not cheap.
+        m_browser_options.content_blocker_list_paths.clear();
     }
 
     if (m_web_content_options.file_scheme_urls_have_tuple_origins == FileSchemeUrlsHaveTupleOrigins::Yes)
@@ -824,7 +828,8 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
         initial_document_state_id = cross_process_id_allocator.allocate();
 
     auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, *root_navigable_id));
-    client->async_initialize(initial_page_id, *root_navigable_id, cross_process_id_allocator, *initial_document_state_id);
+    auto system_visibility_state = view.has_value() ? view->traversable().system_visibility_state() : Web::HTML::VisibilityState::Hidden;
+    client->async_initialize(initial_page_id, *root_navigable_id, cross_process_id_allocator, *initial_document_state_id, system_visibility_state);
     if (view.has_value())
         client->assign_view({}, *view);
 
