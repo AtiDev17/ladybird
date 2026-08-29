@@ -21,9 +21,9 @@ use std::hash::Hasher;
 
 use crate::abort_on_panic;
 use crate::css::ffi_support::FfiUtf16View;
+use crate::css::parser::query_parser::FfiMediaEnvironment;
 use crate::css::parser::value_parser::{
-    FfiPrecomputedSvgPath, FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, ParseOutcome,
-    parse_css_value_from_source, svg_path_strings_from_source,
+    FfiValueParsingContext, FfiValueParsingContextKind, ParseContext, ParseOutcome, parse_css_value_from_source,
 };
 use crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID;
 use crate::css::style_compute::expand_shorthands_with;
@@ -637,11 +637,6 @@ struct ResolvedStyleValue {
     has_style_sheet_context: bool,
 }
 
-struct PrecomputedSvgPath {
-    source: Vec<u16>,
-    normalized: Option<Vec<u16>>,
-}
-
 struct CallbackFreeParseInput {
     in_quirks_mode: bool,
     is_svg_presentation_attribute: bool,
@@ -651,7 +646,6 @@ struct CallbackFreeParseInput {
     document_base_url: Vec<u8>,
     property_id: u16,
     source: Vec<u16>,
-    svg_paths: Vec<PrecomputedSvgPath>,
 }
 
 struct CallbackFreeParseOutcome {
@@ -666,26 +660,6 @@ fn parse_substituted_without_callbacks(
     source: Vec<u16>,
     contains_attr_tainted_values: bool,
 ) -> CallbackFreeParseOutcome {
-    let svg_paths = svg_path_strings_from_source(&source)
-        .into_iter()
-        .map(|path| {
-            let normalized = base_context.normalize_svg_path_data.and_then(|normalize| {
-                let raw = unsafe { normalize(path.as_ptr(), path.len()) };
-                if raw == 0 {
-                    return None;
-                }
-                let normalized = unsafe { RetainedUtf16FlyString::from_leaked_raw(raw) };
-                Some(match unsafe { ak::utf16_string_units(normalized.raw_word()) } {
-                    ak::Utf16StringUnits::Ascii(bytes) => bytes.iter().copied().map(u16::from).collect(),
-                    ak::Utf16StringUnits::Utf16(units) => units.to_vec(),
-                })
-            });
-            PrecomputedSvgPath {
-                source: path,
-                normalized,
-            }
-        })
-        .collect();
     let input = CallbackFreeParseInput {
         in_quirks_mode: base_context.in_quirks_mode,
         is_svg_presentation_attribute: base_context.is_svg_presentation_attribute,
@@ -701,19 +675,8 @@ fn parse_substituted_without_callbacks(
         .to_vec(),
         property_id,
         source,
-        svg_paths,
     };
     crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionCallbackFreeParse);
-    let ffi_svg_paths: Vec<_> = input
-        .svg_paths
-        .iter()
-        .map(|path| FfiPrecomputedSvgPath {
-            source: path.source.as_ptr(),
-            source_length: path.source.len(),
-            normalized: path.normalized.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
-            normalized_length: path.normalized.as_ref().map_or(0, Vec::len),
-        })
-        .collect();
     let mut random_function_index = 0;
     let value_context = FfiValueParsingContext {
         kind: FfiValueParsingContextKind::Property,
@@ -729,18 +692,15 @@ fn parse_substituted_without_callbacks(
         is_ua_style_sheet: input.is_ua_style_sheet,
         value_contexts: &raw const value_context,
         value_context_count: 1,
+        declared_namespaces: std::ptr::null(),
+        declared_namespace_count: 0,
         document_url: input.document_url.as_ptr(),
         document_url_length: input.document_url.len(),
         document_base_url: input.document_base_url.as_ptr(),
         document_base_url_length: input.document_base_url.len(),
         intern_utf16_fly_string: None,
         normalize_svg_path_data: None,
-        precomputed_svg_paths: ffi_svg_paths.as_ptr(),
-        precomputed_svg_path_count: ffi_svg_paths.len(),
-        font_format_is_supported: None,
-        font_tech_is_supported: None,
-        descriptor_integer_resolution_context: std::ptr::null(),
-        resolve_descriptor_integer: None,
+        length_resolution_context: std::ptr::null(),
         random_function_index: &raw mut random_function_index,
     };
     let outcome = match parse_css_value_from_source(&context, input.property_id, &input.source) {
@@ -987,6 +947,8 @@ pub struct FfiCascadedCustomProperties {
 #[derive(Clone, Copy)]
 pub struct FfiCascadeResolutionContext {
     pub parse_context: *const c_void,
+    pub media_environment: *const c_void,
+    pub load_media_environment: Option<unsafe extern "C" fn(*mut c_void) -> *const c_void>,
     pub custom_property_store: *const c_void,
     pub inheritance_custom_property_store: *const c_void,
     pub custom_property_registry: *const c_void,
@@ -999,7 +961,7 @@ pub struct FfiCascadeResolutionContext {
     pub custom_function_scope_identity: usize,
     pub callback_context: *mut c_void,
     pub resolve_custom_function: Option<unsafe extern "C" fn(usize, FfiUtf16View) -> usize>,
-    pub evaluate_condition: Option<unsafe extern "C" fn(*mut c_void, u8, FfiUtf16View) -> u8>,
+    pub evaluate_style_query: Option<unsafe extern "C" fn(*mut c_void, FfiUtf16View) -> u8>,
     pub note_substitution: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
     pub lookup_cached_substitution: Option<unsafe extern "C" fn(*mut c_void, u32, u16) -> *const c_void>,
     pub cache_parsed_substitution: Option<unsafe extern "C" fn(*mut c_void, u32, u16, *const c_void)>,
@@ -1234,17 +1196,25 @@ fn resolve_cascade_value(
 ) -> ResolvedStyleValue {
     let native_resolution = match resolution_environment {
         Some(resolution_environment) => unsafe {
+            let parse_context = resolution_context.parse_context.cast::<ParseContext>().as_ref();
+            let media_environment = resolution_context
+                .media_environment
+                .cast::<FfiMediaEnvironment>()
+                .as_ref();
             crate::css::custom_properties::resolve_vars(
                 resolution_context.custom_property_store,
                 resolution_context.inheritance_custom_property_store,
                 resolution_context.custom_property_registry,
+                parse_context,
+                media_environment,
+                resolution_context.load_media_environment,
                 resolution_context.root_custom_property_name,
                 unresolved_data,
                 resolution_environment,
                 resolution_context.attribute_names_are_ascii_case_insensitive,
                 resolution_context.resolve_custom_function,
                 resolution_context.callback_context,
-                resolution_context.evaluate_condition,
+                resolution_context.evaluate_style_query,
                 final_custom_properties,
             )
         },

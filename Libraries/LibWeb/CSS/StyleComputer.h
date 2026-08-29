@@ -21,6 +21,7 @@
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/MediaQuery.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleGroupPayloadPins.h>
@@ -104,6 +105,9 @@ public:
     // Style sharing has a self-validating key and survives ordinary transaction boundaries.
     void prepare_for_style_engine_transaction() const;
 
+    void begin_style_update() const;
+    void end_style_update() const;
+
     // Forget every style one element computed on another's behalf. See m_style_sharing_cache.
     void drop_style_sharing_cache() const;
 
@@ -149,6 +153,7 @@ public:
     // each. What that buys is not the bytes: an environment resolves once, and a child naming its
     // parent's environment by identity is told the truth when two parents agree.
     [[nodiscard]] NonnullRefPtr<CustomPropertyData const> intern_custom_property_data(NonnullRefPtr<CustomPropertyData const>) const;
+    [[nodiscard]] RefPtr<CustomPropertyData const> custom_property_environment_for_own_declarations(OrderedHashMap<Utf16FlyString, StyleProperty>, RefPtr<CustomPropertyData const> parent) const;
     void sweep_custom_property_environments() const;
 
     // Whether the collection refreshes a previously published style outside the drive; a refresh
@@ -194,6 +199,8 @@ private:
     virtual void visit_edges(Visitor&) override;
 
     [[nodiscard]] StyleEngine::StyleRecordDelta record_computed_style_inputs(Optional<DOM::AbstractElement>, ComputedValues const&, StyleNodeID style_node_id) const;
+    [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* cached_media_environment_for_style_update() const;
+    [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* ensure_media_environment_for_style_update() const;
 
     enum class ComputeStyleMode {
         Normal,
@@ -260,6 +267,7 @@ public:
         // then does the key name that environment, which is an object the element's own ancestors
         // mint afresh whenever any of them recomputes.
         bool cascade_reads_custom_properties { false };
+        bool cascade_font_family_is_monospace { true };
         RefPtr<CustomPropertyData const> pinned_parent_custom_property_data;
         // The style groups whose values the computation read from the inherited style's
         // non-inherited half, which the key does not name.
@@ -352,6 +360,9 @@ private:
     mutable Optional<ComputationContext> m_cached_font_computation_context;
     mutable Optional<ComputationContext> m_cached_line_height_computation_context;
     mutable Optional<ComputationContext> m_cached_generic_computation_context;
+    mutable u64 m_style_update_depth { 0 };
+    mutable Optional<MediaEnvironmentSnapshot> m_style_update_media_environment;
+    mutable Optional<Parser::ValueParserFFI::FfiMediaEnvironment> m_style_update_ffi_media_environment;
     // The style most recently built, kept as a payload donor: a run of elements computing the same
     // style shares group payloads through it, which no parent or previous-style adoption can do.
     mutable RefPtr<ComputedValues const> m_last_built_computed_values;
@@ -374,6 +385,7 @@ private:
         Vector<u64> style_input_declaration_words;
         Vector<NonnullRefPtr<StyleValue const>> pinned_style_input_values;
         bool cascade_declares_custom_properties { false };
+        Optional<Vector<Utf16FlyString>> declared_custom_property_names;
         Vector<Utf16FlyString> custom_property_references;
         bool style_uses_var_css_function { false };
         bool style_uses_inherit_css_function { false };
@@ -416,6 +428,8 @@ private:
         Vector<u64> key;
         RefPtr<CustomPropertyData const> parent;
         RefPtr<CustomPropertyData const> result;
+        Optional<Vector<Utf16FlyString>> declared_names;
+        Vector<Utf16FlyString> inherited_references;
     };
     mutable HashMap<u64, Vector<CascadedCustomPropertyEnvironment>> m_cascaded_custom_property_environments;
 
@@ -429,6 +443,7 @@ private:
         NonnullRefPtr<StyleValue const> value;
         Vector<Utf16FlyString> references;
         bool all_references_visible { true };
+        bool contains_css_wide_keyword { false };
     };
     CustomPropertyReferenceScan const& custom_property_reference_scan(NonnullRefPtr<StyleValue const> const&) const;
     mutable HashMap<void const*, CustomPropertyReferenceScan> m_custom_property_reference_scans;

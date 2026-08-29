@@ -24,6 +24,7 @@
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/Supports.h>
 #include <LibWeb/CSS/URL.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
@@ -164,7 +165,7 @@ private:
         Value,
         RegisteredSyntax,
     };
-    // Self-referential: `context.value_contexts` points into this object.
+    // Self-referential: `context` points into this object's storage.
     struct ParseContextStorage {
         AK_MAKE_NONCOPYABLE(ParseContextStorage);
         AK_MAKE_NONMOVABLE(ParseContextStorage);
@@ -174,10 +175,11 @@ private:
 
         Vector<ValueParserFFI::FfiValueParsingContext, 1> value_contexts;
         ValueParserFFI::FfiValueParsingContext single_property_context {};
+        Vector<ValueParserFFI::FfiUtf16View> declared_namespaces;
+        Optional<ComputedValuesFFI::FfiLengthResolutionContext> length_resolution_context;
         ValueParserFFI::ParseContext context {};
     };
 
-    static PageSelectorList page_selector_list_from_parsed_prelude(ParsedRulePrelude const&);
     template<typename NestedDeclarationsRule>
     GC::Ptr<CSSRule> convert_to_rule(Rule const&, Nested);
     template<typename NestedDeclarationsRule>
@@ -207,8 +209,6 @@ private:
     GC::Ptr<CSSSupportsRule> convert_to_supports_rule(AtRule const&, Nested);
     template<typename NestedDeclarationsRule>
     GC::Ptr<CSSScopeRule> convert_to_scope_rule(AtRule const&, Nested);
-
-    Optional<StylePropertyAndName> convert_to_style_property(Declaration const&);
 
     ParseErrorOr<NonnullRefPtr<StyleValue const>> parse_css_value_from_source(PropertyID, Utf16View);
     ParseErrorOr<NonnullRefPtr<StyleValue const>> parse_css_value_in_rust(PropertyID, Utf16View source, Optional<PropertyID> direct_property_context = {});
@@ -269,6 +269,5 @@ Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::Parsi
 Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const&, Utf16View);
 WEB_API ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<StringView> mime_type_charset, ReadonlyBytes encoded_string);
 bool is_valid_animation_name_custom_ident(Utf16View);
-bool has_ignored_vendor_prefix(Utf16View);
 
 }

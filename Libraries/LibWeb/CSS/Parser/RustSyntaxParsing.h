@@ -14,6 +14,7 @@
 #include <AK/Vector.h>
 #include <LibWeb/CSS/Descriptor.h>
 #include <LibWeb/CSS/DescriptorNameAndID.h>
+#include <LibWeb/CSS/PageSelector.h>
 #include <LibWeb/CSS/Parser/RuleContext.h>
 #include <LibWeb/CSS/Parser/RustSyntaxHandle.h>
 #include <LibWeb/CSS/RustQueryHandle.h>
@@ -34,6 +35,8 @@ inline ValueParserFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
         .length = view.length_in_code_units(),
     };
 }
+
+PageSelectorList page_selector_list_from_rust(ValueParserFFI::FfiPageSelectorListData const&);
 
 using Rule = Variant<AtRule, QualifiedRule>;
 using RuleOrListOfDeclarations = Variant<Rule, Vector<Declaration, 0>>;
@@ -79,42 +82,41 @@ struct ParsedRulePrelude {
     Optional<Utf16FlyString> secondary;
     Optional<RustSyntaxHandle> syntax;
     Vector<ParsedRulePreludeItem> items;
+    PageSelectorList page_selectors;
 };
 
 struct AtRule {
     ValueParserFFI::FfiRuleKind kind;
     Utf16FlyString name;
-    Utf16String prelude_text;
     ParsedRulePrelude parsed_prelude;
     Vector<Descriptor> descriptors;
     Vector<RuleOrListOfDeclarations> child_rules_and_lists_of_declarations;
     bool is_block_rule { false };
 
-    void for_each(AtRuleVisitor&& visit_at_rule, QualifiedRuleVisitor&& visit_qualified_rule, DeclarationVisitor&& visit_declaration) const;
     void for_each_as_declaration_list(DeclarationVisitor&& visit) const;
     void for_each_as_qualified_rule_list(QualifiedRuleVisitor&& visit) const;
     void for_each_as_declaration_rule_list(AtRuleVisitor&& visit_at_rule, DeclarationVisitor&& visit_declaration) const;
 };
 
 struct QualifiedRule {
-    Utf16String prelude_text;
+    ValueParserFFI::FfiRuleKind kind;
     Optional<SelectorList> selectors;
     ParsedRulePrelude parsed_prelude;
     Vector<Declaration> declarations;
     Vector<RuleOrListOfDeclarations> child_rules;
     Optional<SourcePosition> source_position = {};
 
-    void for_each_as_declaration_list(Utf16FlyString const& rule_name, DeclarationVisitor&& visit) const;
+    void for_each_as_declaration_list(DeclarationVisitor&& visit) const;
 };
 
 struct Declaration {
-    Utf16FlyString name;
+    Optional<Utf16FlyString> name;
     Important important = Important::No;
-    Optional<Utf16String> original_value_text = {};
-    Optional<Utf16String> original_full_text = {};
     Optional<SourcePosition> source_position = {};
-    Utf16String value_text;
+    Optional<Utf16String> value_text;
     Optional<PropertyID> parsed_property_id;
+    Optional<StylePropertyAndName> property;
+    ValueParserFFI::FfiDeclarationRejection rejection { ValueParserFFI::FfiDeclarationRejection::None };
     Optional<DescriptorNameAndID> descriptor_name_and_id;
     RefPtr<StyleValue const> parsed_value;
     Optional<Vector<u32>> font_feature_values;

@@ -325,9 +325,7 @@ The definitions here are like a simplified version of the `Properties.json` defi
 
 The generated code provides:
 - A `MediaFeatureID` enum, listing each media-feature
-- `Optional<MediaFeatureID> media_feature_id_from_string(StringView)` to convert a string to a `MediaFeatureID`
 - `StringView string_from_media_feature_id(MediaFeatureID)` to convert a `MediaFeatureID` back to a string
-- `bool media_feature_type_is_range(MediaFeatureID)` returns whether the media feature is a `range` type, as opposed to a `discrete` type
 - `bool media_feature_accepts_type(MediaFeatureID, QueryValueType)` returns whether the media feature will accept values of this type
 - `bool media_feature_accepts_keyword(MediaFeatureID, Keyword)` returns whether the media feature accepts this keyword
 - `bool media_feature_keyword_is_falsey(MediaFeatureID, Keyword)` returns whether the given keyword is considered false when the media-feature is evaluated in a boolean context. (Like `@media (foo)`)
@@ -393,7 +391,6 @@ Each entry has 3 properties, all taken from the spec:
 
 The generated code provides:
 - An `EnvironmentVariable` enum listing the environment variables
-- `Optional<EnvironmentVariable> environment_variable_from_string(StringView)` to parse a string as an `EnvironmentVariable`
 - `StringView to_string(EnvironmentVariable)` to convert the `EnvironmentVariable` back to a string
 - `ValueType environment_variable_type(EnvironmentVariable)` to get the variable's value type
 - `u32 environment_variable_dimension_count(EnvironmentVariable)` to get its dimension count

@@ -62,10 +62,16 @@ define_ffi_ops! {
     TransitionDecisionEntry => "transitionDecisionEntries",
     SubstitutionCallbackFreeParse => "substitutionCallbackFreeParses",
     SubstitutionCallbackParseRequest => "substitutionCallbackParseRequests",
+    SizesAttributeParseEntry => "sizesAttributeParseEntries",
     // Ownership callbacks: Rust -> C++.
     StringRetainReleaseCallback => "stringRetainReleaseCallbacks",
     AnimatedPropertiesRetainReleaseCallback => "animatedPropertiesRetainReleaseCallbacks",
     SubstitutionOracleCallback => "substitutionOracleCallbacks",
+    // CSS parser callbacks: Rust -> C++.
+    InternUtf16FlyStringCallback => "internUtf16FlyStringCallbacks",
+    NormalizeSvgPathDataCallback => "normalizeSvgPathDataCallbacks",
+    EvaluateConditionCallback => "evaluateConditionCallbacks",
+    MediaEnvironmentCallback => "mediaEnvironmentCallbacks",
 }
 
 static COUNTERS: [AtomicU64; FFI_OP_COUNT] = [const { AtomicU64::new(0) }; FFI_OP_COUNT];

@@ -75,7 +75,7 @@ fn any_simple(selector: &CompiledSelector, predicate: &impl Fn(&SimpleSelector) 
         .any(|compound| compound.simple_selectors.iter().any(predicate))
 }
 
-fn contains_unknown_webkit(selector: &CompiledSelector) -> bool {
+pub(crate) fn contains_unknown_webkit(selector: &CompiledSelector) -> bool {
     any_simple(selector, &|simple| match simple {
         SimpleSelector::PseudoElement(pseudo_element) => {
             pseudo_element.pseudo_element == PseudoElementType::UnknownWebKit
@@ -102,33 +102,6 @@ fn contains_named_namespace(selector: &CompiledSelector) -> bool {
             .any(|selector| contains_named_namespace(selector)),
         SimpleSelector::PseudoElement(pseudo_element) => match &pseudo_element.value {
             PseudoElementValue::CompoundSelector(selector) => contains_named_namespace(selector),
-            _ => false,
-        },
-        _ => false,
-    })
-}
-
-fn has_undeclared_namespace(selector: &CompiledSelector, declared_namespaces: &[usize]) -> bool {
-    any_simple(selector, &|simple| match simple {
-        SimpleSelector::Universal(name) | SimpleSelector::TagName(name) => {
-            name.namespace_type == super::selector::NamespaceType::Named
-                && !name
-                    .interned_namespace_identity()
-                    .is_some_and(|namespace| declared_namespaces.contains(&namespace))
-        }
-        SimpleSelector::Attribute(attribute) => {
-            attribute.qualified_name.namespace_type == super::selector::NamespaceType::Named
-                && !attribute
-                    .qualified_name
-                    .interned_namespace_identity()
-                    .is_some_and(|namespace| declared_namespaces.contains(&namespace))
-        }
-        SimpleSelector::PseudoClass(pseudo_class) => pseudo_class
-            .argument_selector_list
-            .iter()
-            .any(|selector| has_undeclared_namespace(selector, declared_namespaces)),
-        SimpleSelector::PseudoElement(pseudo_element) => match &pseudo_element.value {
-            PseudoElementValue::CompoundSelector(selector) => has_undeclared_namespace(selector, declared_namespaces),
             _ => false,
         },
         _ => false,
@@ -287,46 +260,11 @@ pub unsafe extern "C" fn rust_selector_contains_pseudo_class(selector: *const Ru
 /// # Safety
 /// `selector` must point to a live `RustSelector`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_contains_unknown_webkit(selector: *const RustSelector) -> bool {
-    unsafe {
-        crate::abort_on_panic(|| {
-            assert!(!selector.is_null());
-            contains_unknown_webkit((*selector).compiled())
-        })
-    }
-}
-
-/// # Safety
-/// `selector` must point to a live `RustSelector`.
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_selector_contains_named_namespace(selector: *const RustSelector) -> bool {
     unsafe {
         crate::abort_on_panic(|| {
             assert!(!selector.is_null());
             contains_named_namespace((*selector).compiled())
-        })
-    }
-}
-
-/// # Safety
-/// `selector` must point to a live `RustSelector`. `declared_namespaces` must address
-/// `declared_namespace_count` interned string identities, or be null when the count is zero.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_has_undeclared_namespace(
-    selector: *const RustSelector,
-    declared_namespaces: *const usize,
-    declared_namespace_count: usize,
-) -> bool {
-    unsafe {
-        crate::abort_on_panic(|| {
-            assert!(!selector.is_null());
-            let declared_namespaces = if declared_namespace_count == 0 {
-                &[]
-            } else {
-                assert!(!declared_namespaces.is_null());
-                std::slice::from_raw_parts(declared_namespaces, declared_namespace_count)
-            };
-            has_undeclared_namespace((*selector).compiled(), declared_namespaces)
         })
     }
 }
@@ -516,18 +454,15 @@ pub unsafe extern "C" fn rust_selector_absolutize(
 
 #[cfg(test)]
 mod tests {
-    use super::super::css_tokenizer::tokenize_for_parser;
+    use super::super::css_tokenizer::{TokenizerInput, tokenize_for_parser};
     use super::super::parser::component_value::consume_a_list_of_component_values;
     use super::super::selector::SelectorList;
     use super::super::selector_parser::{SelectorType, parse_selector_list_from_component_values};
-    use super::{contains_named_namespace, has_undeclared_namespace};
+    use super::contains_named_namespace;
 
-    /// Parses the way the syntax parser does: from component values, with namespace
-    /// declarations unknown, so prefix validity is decided later by
-    /// `has_undeclared_namespace` against the rule's tree scope.
-    fn parse_without_namespace_context(source: &str) -> SelectorList {
+    fn parse_with_namespace_context(source: &str) -> SelectorList {
         let values = consume_a_list_of_component_values(tokenize_for_parser(source.as_bytes())).unwrap();
-        parse_selector_list_from_component_values(&values, SelectorType::Standalone)
+        parse_selector_list_from_component_values(&values, &[TokenizerInput::Ascii(b"foo")], SelectorType::Standalone)
             .unwrap()
             .selectors()
             .clone()
@@ -535,22 +470,19 @@ mod tests {
 
     #[test]
     fn named_namespace_inside_pseudo_element_compound_selector_is_seen() {
-        let selectors = parse_without_namespace_context("::slotted(foo|div)");
+        let selectors = parse_with_namespace_context("::slotted(foo|div)");
         assert!(selectors.iter().all(|selector| contains_named_namespace(selector)));
-        assert!(selectors.iter().all(|selector| has_undeclared_namespace(selector, &[])));
     }
 
     #[test]
     fn named_namespace_inside_pseudo_class_argument_is_seen() {
-        let selectors = parse_without_namespace_context(":is(foo|div)");
+        let selectors = parse_with_namespace_context(":is(foo|div)");
         assert!(selectors.iter().all(|selector| contains_named_namespace(selector)));
-        assert!(selectors.iter().all(|selector| has_undeclared_namespace(selector, &[])));
     }
 
     #[test]
     fn pseudo_element_compound_selector_without_namespace_is_clean() {
-        let selectors = parse_without_namespace_context("::slotted(div.a)");
+        let selectors = parse_with_namespace_context("::slotted(div.a)");
         assert!(!selectors.iter().any(|selector| contains_named_namespace(selector)));
-        assert!(!selectors.iter().any(|selector| has_undeclared_namespace(selector, &[])));
     }
 }

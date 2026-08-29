@@ -60,6 +60,7 @@ fn retained_optional(value: Option<StyleValueData>) -> RetainedStyleValueData {
 
 fn retain_fly_string(context: &ParseContext, string: &[u16]) -> Option<RetainedUtf16FlyString> {
     let callback = context.intern_utf16_fly_string?;
+    crate::css::ffi_stats::bump_cpp_callback(crate::css::ffi_stats::FfiOp::InternUtf16FlyStringCallback);
     let raw = unsafe { callback(string.as_ptr(), string.len()) };
     Some(unsafe { RetainedUtf16FlyString::from_leaked_raw(raw) })
 }
@@ -1114,18 +1115,15 @@ mod tests {
             is_ua_style_sheet: false,
             value_contexts: std::ptr::null(),
             value_context_count: 0,
+            declared_namespaces: std::ptr::null(),
+            declared_namespace_count: 0,
             document_url: std::ptr::null(),
             document_url_length: 0,
             document_base_url: std::ptr::null(),
             document_base_url_length: 0,
             intern_utf16_fly_string: Some(discard_interned_string),
             normalize_svg_path_data: None,
-            precomputed_svg_paths: std::ptr::null(),
-            precomputed_svg_path_count: 0,
-            font_format_is_supported: None,
-            font_tech_is_supported: None,
-            descriptor_integer_resolution_context: std::ptr::null(),
-            resolve_descriptor_integer: None,
+            length_resolution_context: std::ptr::null(),
             random_function_index: std::ptr::null_mut(),
         }
     }

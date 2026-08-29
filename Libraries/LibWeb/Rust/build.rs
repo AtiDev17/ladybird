@@ -74,6 +74,7 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
          pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\n\
          pub(crate) struct MediaFeatureMetadata {\n\
              pub name: &'static str,\n\
+             pub allows_range: bool,\n\
              pub accepted_value_types: u8,\n\
              pub accepted_keywords: &'static [u16],\n\
              pub false_keywords: &'static [u16],\n\
@@ -81,6 +82,11 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
          pub(crate) const MEDIA_FEATURES: &[MediaFeatureMetadata] = &[\n",
     );
     for (name, feature) in features {
+        let allows_range = match feature["type"].as_str() {
+            Some("discrete") => false,
+            Some("range") => true,
+            _ => return Err(format!("unknown media feature type for {name}").into()),
+        };
         let values = feature["values"]
             .as_array()
             .ok_or("media feature values is not an array")?;
@@ -126,7 +132,7 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             .join(", ");
         writeln!(
             output,
-            "    MediaFeatureMetadata {{ name: \"{name}\", accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
+            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
         )?;
     }
     output.push_str("];\n");
@@ -1499,6 +1505,20 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         .chain(&noninherited_longhands)
         .map(String::as_str)
         .collect();
+    // The C++ property-name generator accepts legacy aliases but maps them to
+    // their canonical IDs instead of assigning separate IDs.
+    let mut property_name_lookup: Vec<(&str, u16)> = properties
+        .iter()
+        .map(|(name, value)| {
+            let object = value.as_object().unwrap();
+            let target = object
+                .get("legacy-alias-for")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(name);
+            (name.as_str(), ids[target])
+        })
+        .collect();
+    property_name_lookup.sort_unstable_by(|left, right| left.0.cmp(right.0));
     fn expanded_longhands(
         name: &str,
         properties: &serde_json::Map<String, serde_json::Value>,
@@ -1701,6 +1721,11 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static PROPERTY_NAMES: [&str; {}] = {:?};\n",
         property_names.len(),
         property_names
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_NAME_LOOKUP: [(&str, u16); {}] = {:?};\n",
+        property_name_lookup.len(),
+        property_name_lookup
     ));
     output.push_str(&format!(
         "pub(crate) static PROPERTY_IDL_NAMES: [&str; {}] = {:?};\n",
@@ -2524,8 +2549,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiValueParsingContextKind".to_string(),
         "FfiUtf16View".to_string(),
         "FfiQueryHandle".to_string(),
-        "EvaluateSupportsFeature".to_string(),
-        "FfiSupportsFeatureKind".to_string(),
         "EvaluateContainerStyleFeature".to_string(),
         "FfiContainerFacts".to_string(),
         "FfiContainerStyleFeature".to_string(),

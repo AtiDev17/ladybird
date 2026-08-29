@@ -6,14 +6,12 @@
 
 #include <AK/GenericShorthands.h>
 #include <AK/StringBuilder.h>
-#include <LibWeb/CSS/FontFace.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/Parser/RustSyntaxHandle.h>
 #include <LibWeb/CSS/Parser/SyntaxParsing.h>
-#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleComputeFFI.h>
 #include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
-#include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/SVG/AttributeParser.h>
 #include <LibWeb/StyleValueRustFFI.h>
@@ -26,49 +24,15 @@ static size_t retain_utf16_fly_string(u16 const* code_units, size_t length)
     return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length }).to_raw_leaked();
 }
 
-static size_t normalize_svg_path_data(u16 const* code_units, size_t length)
+static size_t normalize_svg_path_data(u16 const* code_units, size_t length, bool allow_error_recovery)
 {
-    auto path = SVG::AttributeParser::parse_path_data(Utf16View { reinterpret_cast<char16_t const*>(code_units), length });
-    if (path.instructions().is_empty())
+    auto input = Utf16View { reinterpret_cast<char16_t const*>(code_units), length };
+    auto path = allow_error_recovery
+        ? Optional<SVG::Path> { SVG::AttributeParser::parse_path_data(input) }
+        : SVG::AttributeParser::parse_path_data_without_error_recovery(input);
+    if (!path.has_value() || path->instructions().is_empty())
         return 0;
-    return Utf16String::from_utf8(path.serialize()).to_raw_leaked();
-}
-
-static bool rust_font_format_is_supported(u16 const* code_units, size_t length)
-{
-    return font_format_is_supported(Utf16View { reinterpret_cast<char16_t const*>(code_units), length });
-}
-
-static bool rust_font_tech_is_supported(u8 tech)
-{
-    return font_tech_is_supported(static_cast<FontTech>(tech));
-}
-
-static bool resolve_descriptor_integer(void const* document_pointer, void const* value_pointer, i32* result)
-{
-    auto const* document = static_cast<DOM::Document const*>(document_pointer);
-    if (!document || !result)
-        return false;
-    auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(
-        static_cast<StyleValueFFI::StyleValueData const*>(value_pointer)));
-    if (value->is_integer()) {
-        *result = value->as_integer().integer();
-        return true;
-    }
-    if (!value->is_calculated())
-        return false;
-    auto absolutized = value->absolutized(ComputationContext { .length_resolution_context = Length::ResolutionContext::for_document(*document) });
-    if (absolutized->is_integer()) {
-        *result = absolutized->as_integer().integer();
-        return true;
-    }
-    if (!absolutized->is_calculated())
-        return false;
-    auto resolved = absolutized->as_calculated().resolve_integer({});
-    if (!resolved.has_value())
-        return false;
-    *result = resolved.value();
-    return true;
+    return Utf16String::from_utf8(path->serialize()).to_raw_leaked();
 }
 
 Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMode mode, Optional<PropertyID> direct_property_context)
@@ -114,6 +78,12 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
         }
     }
 
+    if (mode == ParseContextMode::Syntax) {
+        declared_namespaces.ensure_capacity(parser.m_declared_namespaces.size());
+        for (auto const& namespace_ : parser.m_declared_namespaces)
+            declared_namespaces.unchecked_append(ffi_utf16_view(namespace_));
+    }
+
     ReadonlyBytes document_url;
     ReadonlyBytes document_base_url;
     if (parser.m_document) {
@@ -123,10 +93,14 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
             parser.m_serialized_document_base_url = parser.m_document->base_url().serialize();
         document_url = parser.m_serialized_document_url->bytes();
         document_base_url = parser.m_serialized_document_base_url->bytes();
+        if (mode == ParseContextMode::Syntax) {
+            length_resolution_context = to_ffi_length_resolution_context_with_container_bases(
+                Length::ResolutionContext::for_document(*parser.m_document), all_container_relative_length_units_mask);
+            length_resolution_context->resolved_viewport_relative_length = nullptr;
+        }
     }
 
     bool provide_value_callbacks = mode != ParseContextMode::RegisteredSyntax;
-    bool provide_descriptor_resolution = mode == ParseContextMode::Syntax;
     context = {
         .in_quirks_mode = parser.in_quirks_mode(),
         .is_svg_presentation_attribute = parser.is_parsing_svg_presentation_attribute(),
@@ -135,18 +109,15 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
         .is_ua_style_sheet = mode == ParseContextMode::Syntax && parser.m_is_ua_style_sheet == IsUAStyleSheet::Yes,
         .value_contexts = context.value_contexts,
         .value_context_count = context.value_context_count,
+        .declared_namespaces = declared_namespaces.data(),
+        .declared_namespace_count = declared_namespaces.size(),
         .document_url = document_url.data(),
         .document_url_length = document_url.size(),
         .document_base_url = document_base_url.data(),
         .document_base_url_length = document_base_url.size(),
         .intern_utf16_fly_string = retain_utf16_fly_string,
         .normalize_svg_path_data = provide_value_callbacks ? normalize_svg_path_data : nullptr,
-        .precomputed_svg_paths = nullptr,
-        .precomputed_svg_path_count = 0,
-        .font_format_is_supported = provide_value_callbacks ? rust_font_format_is_supported : nullptr,
-        .font_tech_is_supported = provide_value_callbacks ? rust_font_tech_is_supported : nullptr,
-        .descriptor_integer_resolution_context = provide_descriptor_resolution ? parser.m_document.ptr() : nullptr,
-        .resolve_descriptor_integer = provide_descriptor_resolution ? resolve_descriptor_integer : nullptr,
+        .length_resolution_context = length_resolution_context.has_value() ? &*length_resolution_context : nullptr,
         .random_function_index = &parser.m_random_function_index,
     };
 }

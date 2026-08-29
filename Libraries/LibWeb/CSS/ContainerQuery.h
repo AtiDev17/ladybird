@@ -19,15 +19,6 @@ class RustQueryParser;
 
 }
 
-enum class SizeFeatureID : u8 {
-    AspectRatio,
-    BlockSize,
-    Height,
-    InlineSize,
-    Orientation,
-    Width,
-};
-
 struct ContainerQueryFeatureRequirements {
     bool requires_width_container : 1 { false };
     bool requires_height_container : 1 { false };
@@ -69,8 +60,6 @@ private:
     ContainerQueryFeatureRequirements m_feature_requirements;
 };
 
-Optional<SizeFeatureID> size_feature_id_from_string(Utf16View);
-bool size_feature_type_is_range(SizeFeatureID);
 bool container_name_matches(DOM::Element const&, Optional<Utf16FlyString> const& container_name);
 MatchResult evaluate_style_query(RustQueryHandle const&, AbstractOrHypotheticalElement);
 void prepare_for_style_query_evaluation();

@@ -70,11 +70,6 @@ bool Selector::contains_pseudo_class(PseudoClass pseudo_class) const
     return SelectorFFI::rust_selector_contains_pseudo_class(m_rust_selector, to_underlying(pseudo_class));
 }
 
-bool Selector::contains_unknown_webkit_pseudo_element() const
-{
-    return SelectorFFI::rust_selector_contains_unknown_webkit(m_rust_selector);
-}
-
 bool Selector::contains_named_namespace() const
 {
     return SelectorFFI::rust_selector_contains_named_namespace(m_rust_selector);
@@ -147,19 +142,6 @@ SelectorList selector_list_from_rust(SelectorFFI::RustParsedSelectorList* parsed
     for (size_t index = 0; index < selector_count; ++index)
         selectors.append(Selector::create(SelectorFFI::rust_parsed_selector_list_selector(parsed, index)));
     return selectors;
-}
-
-bool selector_list_has_undeclared_namespace(SelectorList const& selectors, HashTable<Utf16FlyString> const& namespaces)
-{
-    Vector<uintptr_t> namespace_identities;
-    namespace_identities.ensure_capacity(namespaces.size());
-    for (auto const& namespace_ : namespaces)
-        namespace_identities.unchecked_append(namespace_.raw_identity());
-
-    return any_of(selectors, [&](auto const& selector) {
-        return SelectorFFI::rust_selector_has_undeclared_namespace(
-            &selector->rust_selector(), namespace_identities.data(), namespace_identities.size());
-    });
 }
 
 static Vector<SelectorFFI::StringView> namespace_prefixes_mapping_to_default(CSSStyleSheet const& style_sheet, Vector<Vector<u16>>& storage)
