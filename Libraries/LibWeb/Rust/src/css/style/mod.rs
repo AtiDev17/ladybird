@@ -86,6 +86,7 @@ mod publication;
 pub mod record_replay;
 mod routing;
 mod sorted_merge;
+mod style_invalidation;
 #[cfg(not(feature = "style-recording"))]
 pub mod record_replay {
     include!(concat!(env!("OUT_DIR"), "/style_engine_event_kind_stub_generated.rs"));
@@ -107,6 +108,7 @@ pub mod record_replay {
         pub fn write_bool(&mut self, _value: bool) {}
         pub fn write_bytes(&mut self, _value: &[u8]) {}
         pub fn write_length(&mut self, _value: usize) {}
+        pub fn write_i32(&mut self, _value: i32) {}
         pub fn write_u8(&mut self, _value: u8) {}
         pub fn write_u16(&mut self, _value: u16) {}
         pub fn write_u16_slice(&mut self, _value: &[u16]) {}
@@ -821,13 +823,15 @@ pub struct StyleEngine {
     /// computed half of the eventual base style record; custom properties and metadata remain
     /// separate inputs until that record is complete.
     computed_group_sets: ComputedGroupSets,
+    pending_style_computation_selections: HashMap<computed::ComputedStyleTarget, StyleComputationSelection>,
     computed_group_set_memory: MemoryLease,
     custom_property_environment_memory: MemoryLease,
     computed_fixed_metadata_memory: MemoryLease,
-    computed_reconstruction_metadata_memory: MemoryLease,
+    computed_longhand_table_memory: MemoryLease,
     style_record_memory: MemoryLease,
     animation_overlay_memory: MemoryLease,
     computed_pseudo_assignment_memory: MemoryLease,
+    style_invalidation_cache: HashMap<(u64, u64, bool, bool), u32>,
 
     /// One identity per distinct match-answer factor, retained exact factor, or cascade input.
     /// The catalog lives with the document rather than with a traversal, because a per-element ask -
@@ -956,6 +960,12 @@ pub struct StyleEngine {
     fold_id_and_class_name_case: bool,
     #[cfg(test)]
     diagnostic_plan_capture: Option<DiagnosticPlanCapture>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StyleComputationSelection {
+    pub computed_property_words: [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT],
+    pub computed_property_closure_is_exact: bool,
 }
 
 #[cfg(test)]

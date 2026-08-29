@@ -13,14 +13,13 @@
 //! not hold, like the animated overlay), resolves the color and opacity
 //! sidecars natively, and runs the existing group builders, so the sharing
 //! rules - adopt the parent's payload on equality, fall back to the immortal
-//! default payload - are exactly the ones the marshalled calls used. A group
-//! whose values the core cannot map stays null in the output and is reported
-//! in the returned mask for the C++ population path.
+//! default payload - are exactly the ones the marshalled calls used.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 
 use crate::abort_on_panic;
+use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::calc::{resolve_calculated_flex_without_context, resolve_calculated_integer_without_context};
 use crate::css::color_resolution::{
     ColorResolutionInput, FfiColorResolutionInput, PREFERRED_COLOR_SCHEME_DARK, Rgba, accent_color,
@@ -31,21 +30,22 @@ use crate::css::computed_value_types::{
     AnchorValues, AnimationValues, BackgroundValues, BorderValues, ComputedClipEdge, ComputedColorOrAuto,
     ComputedCursor, ComputedFilter, ComputedFilterOperation, ComputedGridArea, ComputedGridPlacement,
     ComputedGridPlacementKind, ComputedGridTrackBreadth, ComputedGridTrackEntry, ComputedGridTrackEntryKind,
-    ComputedGridTrackList, ComputedLengthBox, ComputedOverflowClipMargin, ComputedOverflowClipMarginSide,
-    ComputedPositionTryFallback, ComputedResolvedTransform, ComputedScrollbarColor, ComputedShadow, ComputedSize,
-    ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint, ComputedTextIndent,
-    ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ContentValues, EffectsValues, FontValues,
-    GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextValues, InheritedUIValues,
-    MaskValues, MiscResetValues, RetainedComputedCursorList, RetainedComputedFilterOperationList,
+    ComputedGridTrackList, ComputedLengthBox, ComputedLengthPercentageOrAuto, ComputedOverflowClipMargin,
+    ComputedOverflowClipMarginSide, ComputedPositionTryFallback, ComputedResolvedTransform, ComputedScrollbarColor,
+    ComputedShadow, ComputedSize, ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint,
+    ComputedTextIndent, ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ContentValues, EffectsValues,
+    FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextValues,
+    InheritedUIValues, MaskValues, MiscResetValues, RetainedComputedCursorList, RetainedComputedFilterOperationList,
     RetainedComputedResolvedTransformList, RetainedComputedShadowList, RetainedComputedSvgDashList,
     RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList, RetainedPositionAreaList,
-    RetainedPositionTryFallbackList, TransformValues,
+    RetainedPositionTryFallbackList, SVGResetValues, TransformValues,
 };
 use crate::css::computed_values::{
     FfiGroupValueEntry, GROUP_FIELD_COLOR, GROUP_FIELD_COLOR_OR_KEYWORD, GROUP_FIELD_RESOLVED_F32,
-    GROUP_FIELD_RESOLVED_F64, GROUP_FIELD_RESOLVED_U8, registered_group_field_descriptors, rust_build_alignment_group,
-    rust_build_grid_group, rust_build_inherited_box_group, rust_build_inherited_table_group, rust_build_sizing_group,
-    rust_build_style_group, rust_build_surround_group, rust_build_svg_reset_group, rust_build_text_reset_group,
+    GROUP_FIELD_RESOLVED_F64, GROUP_FIELD_RESOLVED_U8, build_svg_reset_group_payload,
+    registered_group_field_descriptors, rust_build_alignment_group, rust_build_grid_group,
+    rust_build_inherited_box_group, rust_build_inherited_table_group, rust_build_sizing_group, rust_build_style_group,
+    rust_build_surround_group, rust_build_text_reset_group,
 };
 use crate::css::css_enums::keyword;
 use crate::css::css_pixels::CssPixels;
@@ -85,8 +85,7 @@ mod group_index {
 
 /// The pre-resolved inputs one table-driven group build needs from C++: the
 /// color resolution context (whose current color is the element's own
-/// resolved color), the used color-scheme, and the sparse effective-value
-/// overrides.
+/// resolved color), the used color-scheme, and platform font data.
 #[repr(C)]
 pub struct FfiTableGroupBuildInputs {
     /// A marshalled StyleValueFFI::FfiColorResolutionInput whose current
@@ -95,12 +94,7 @@ pub struct FfiTableGroupBuildInputs {
     pub color_input: *const c_void,
     /// The used color-scheme code (PreferredColorScheme underlying value).
     pub used_color_scheme: u8,
-    /// Longhands whose effective computed value differs from the table slot -
-    /// the animated overlay and partial-drive specified-value preferences -
-    /// as parallel property-id and value-data spans.
-    pub override_properties: *const u16,
-    pub override_values: *const *const c_void,
-    pub override_count: usize,
+    pub animated_overlay: *const AnimatedOverlay,
     /// The raw bits of the C++ Display value before the box type
     /// transformation, a C++-side member the table does not hold.
     pub box_display_before_transformation_raw: u32,
@@ -131,8 +125,7 @@ pub struct FfiFontGroupBuildInputs {
 /// values `ComputedStyleWorkingSet::property()` returns during a group build.
 struct EffectiveValues<'a> {
     table: &'a ComputedLonghandTable,
-    override_properties: &'a [u16],
-    override_values: &'a [*const c_void],
+    animated_overlay: Option<&'a AnimatedOverlay>,
 }
 
 const MAX_GROUP_FIELD_COUNT: usize = 40;
@@ -171,13 +164,9 @@ impl std::ops::Deref for GroupValueEntries {
 
 impl EffectiveValues<'_> {
     fn pointer(&self, property_id: u16) -> *const c_void {
-        if let Some(index) = self.override_properties.iter().position(|id| *id == property_id) {
-            return self.override_values[index];
-        }
-        match self.table.get(property_id) {
-            Some(value) => value.pointer().cast(),
-            None => std::ptr::null(),
-        }
+        self.table
+            .effective_value(self.animated_overlay, property_id, true)
+            .value
     }
 
     fn value(&self, property_id: u16) -> Option<&StyleValueData> {
@@ -357,37 +346,41 @@ unsafe fn build_svg_reset_group(
     input: &ColorResolutionInput,
     parent_payload: *const c_void,
 ) -> *const c_void {
-    let color = |property: u16| Some(packed_color(to_color(values.value(property)?, input)?));
-    let opacity = |property: u16| resolved_wrapped_number(values.value(property)?);
-    let (Some(stop_color), Some(stop_opacity), Some(flood_color), Some(flood_opacity)) = (
-        color(property_id::STOP_COLOR),
-        opacity(property_id::STOP_OPACITY),
-        color(property_id::FLOOD_COLOR),
-        opacity(property_id::FLOOD_OPACITY),
-    ) else {
-        return std::ptr::null();
-    };
-    // SAFETY: Every pointer names live value data from the table and the
-    // caller warrants the parent payload.
-    unsafe {
-        rust_build_svg_reset_group(
-            group_index::SVG_RESET,
-            values.pointer(property_id::CX),
-            values.pointer(property_id::CY),
-            values.pointer(property_id::D),
-            values.pointer(property_id::R),
-            values.pointer(property_id::RX),
-            values.pointer(property_id::RY),
-            values.pointer(property_id::X),
-            values.pointer(property_id::Y),
-            stop_color,
-            stop_opacity as f32,
-            flood_color,
-            flood_opacity as f32,
-            values.pointer(property_id::VECTOR_EFFECT),
-            parent_payload,
+    let color = |property: u16| {
+        packed_color(
+            to_color(
+                values.value(property).expect("the table holds the computed color"),
+                input,
+            )
+            .expect("a computed SVG reset color resolves in the Rust color context"),
         )
-    }
+    };
+    let opacity = |property: u16| {
+        resolved_wrapped_number(values.value(property).expect("the table holds the computed opacity"))
+            .expect("a computed SVG reset opacity resolves")
+    };
+    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
+    let built = SVGResetValues {
+        cx: retained(property_id::CX),
+        cy: retained(property_id::CY),
+        d: retained(property_id::D),
+        r: retained(property_id::R),
+        rx: ComputedLengthPercentageOrAuto::from_data(values.pointer(property_id::RX)),
+        ry: ComputedLengthPercentageOrAuto::from_data(values.pointer(property_id::RY)),
+        x: retained(property_id::X),
+        y: retained(property_id::Y),
+        stop_color: color(property_id::STOP_COLOR),
+        stop_opacity: opacity(property_id::STOP_OPACITY) as f32,
+        flood_color: color(property_id::FLOOD_COLOR),
+        flood_opacity: opacity(property_id::FLOOD_OPACITY) as f32,
+        vector_effect: required_keyword_code(
+            values,
+            property_id::VECTOR_EFFECT,
+            crate::css::css_enums::keyword_to_vector_effect,
+        ),
+    };
+    // SAFETY: The caller warrants the parent payload.
+    unsafe { build_svg_reset_group_payload(group_index::SVG_RESET, built, parent_payload) }
 }
 
 /// The name table, name-index spans, track entries and named areas one grid
@@ -942,7 +935,10 @@ fn matrix_rotation(axis: [f32; 3], angle: f32) -> [f32; 16] {
 /// The TransformationStyleValue::to_matrix port for computed values, which
 /// never carry reference-box percentages here: the translate family's
 /// percentage-bearing values lower into per-axis slots instead.
-fn transformation_to_matrix(function: u8, values: &[crate::css::style_value::RetainedStyleValueData]) -> [f32; 16] {
+pub(crate) fn transformation_to_matrix(
+    function: u8,
+    values: &[crate::css::style_value::RetainedStyleValueData],
+) -> [f32; 16] {
     use crate::css::serialize::transform_function as functions;
 
     let parameters = crate::css::serialize::TRANSFORM_FUNCTION_PARAMETER_TYPES[function as usize];
@@ -3232,9 +3228,47 @@ unsafe fn build_animation_group(
     }
 }
 
+/// Rebuilds one non-inherited group whose specified values read the newly
+/// inherited `color`. These groups need no DOM, layout, or font input.
+pub(crate) unsafe fn rebuild_group_for_inherited_current_color(
+    table: &ComputedLonghandTable,
+    group: usize,
+    parent_payload: *const c_void,
+    current_color: u32,
+    used_color_scheme: u8,
+) -> Option<*const c_void> {
+    let values = EffectiveValues {
+        table,
+        animated_overlay: None,
+    };
+    let input = ColorResolutionInput {
+        scheme: Some(used_color_scheme),
+        current_color: Some(Rgba {
+            r: (current_color >> 16) as u8,
+            g: (current_color >> 8) as u8,
+            b: current_color as u8,
+            a: (current_color >> 24) as u8,
+        }),
+        current_color_value: values.value(property_id::COLOR),
+        length: None,
+        channels: None,
+    };
+    let payload = unsafe {
+        match group {
+            group_index::SVG_RESET => build_svg_reset_group(&values, &input, parent_payload),
+            group_index::EFFECTS => build_effects_group(&values, &input, used_color_scheme, parent_payload),
+            group_index::TEXT_RESET => build_text_reset_group(&values, &input, parent_payload),
+            group_index::BACKGROUND => build_background_group(&values, &input, used_color_scheme, parent_payload),
+            group_index::BORDER => build_border_group(&values, &input, used_color_scheme, parent_payload),
+            group_index::MISC_RESET => build_misc_reset_group(&values, &input, used_color_scheme, parent_payload),
+            _ => return None,
+        }
+    };
+    (!payload.is_null()).then_some(payload)
+}
+
 /// Builds every applied group's payload from the longhand table, writing one
-/// payload (or null) per group into `out_payloads` and returning the mask of
-/// applied groups whose payload the C++ population path must build instead.
+/// payload per applied group into `out_payloads`.
 /// Non-null payloads carry one reference for the caller, with the marshalled
 /// builders' sharing rules.
 ///
@@ -3242,8 +3276,7 @@ unsafe fn build_animation_group(
 /// `table` must be a valid frozen table holding the style's computed values;
 /// `parent_payloads` and `out_payloads` must each hold `group_count` entries,
 /// with each parent entry a valid payload of its group or null; `inputs` must
-/// be valid with its pointers live across the call, and its override values
-/// must point at live style value data.
+/// be valid with its pointers live across the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_build_group_payloads_from_table(
     table: *const ComputedLonghandTable,
@@ -3252,7 +3285,7 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
     inputs: *const FfiTableGroupBuildInputs,
     out_payloads: *mut *const c_void,
     group_count: usize,
-) -> u32 {
+) {
     abort_on_panic(|| {
         assert_eq!(
             group_count,
@@ -3265,17 +3298,13 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
         let out = unsafe { std::slice::from_raw_parts_mut(out_payloads, group_count) };
         let values = EffectiveValues {
             table,
-            override_properties: unsafe {
-                std::slice::from_raw_parts(inputs.override_properties, inputs.override_count)
-            },
-            override_values: unsafe { std::slice::from_raw_parts(inputs.override_values, inputs.override_count) },
+            animated_overlay: unsafe { inputs.animated_overlay.as_ref() },
         };
         let color_input = unsafe { &*inputs.color_input.cast::<FfiColorResolutionInput>() };
         let channels = relative_color_context_from_ffi(color_input);
         // SAFETY: The caller keeps the input's pointers live across the call.
         let input = unsafe { resolution_input_from_ffi(color_input, &channels) };
 
-        let mut needs_cpp_mask = 0u32;
         for group in 0..group_count {
             out[group] = std::ptr::null();
             if (groups_to_apply >> group) & 1 == 0 {
@@ -3369,11 +3398,8 @@ pub unsafe extern "C" fn rust_build_group_payloads_from_table(
                     _ => build_generic_group(group, &values, &input, inputs.used_color_scheme, parent_payload),
                 }
             };
+            assert!(!payload.is_null(), "computed group build returned null");
             out[group] = payload;
-            if payload.is_null() {
-                needs_cpp_mask |= 1 << group;
-            }
         }
-        needs_cpp_mask
-    })
+    });
 }

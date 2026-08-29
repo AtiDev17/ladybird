@@ -24,6 +24,13 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/StyleEngineRustFFI.h>
 
+namespace Web::CSS::StyleValueFFI {
+
+struct FfiTransitionAction;
+struct FfiTransitionInput;
+
+}
+
 namespace Web::CSS {
 
 class StyleComputer;
@@ -85,7 +92,6 @@ public:
         StyleRecordID new_style_record;
     };
     using StyleRecordView = StyleEngineFFI::FfiStyleRecordView;
-    using StyleRecordState = StyleEngineFFI::FfiStyleRecordState;
     using ExactCascadePublication = StyleEngineFFI::FfiExactCascadePublication;
     // The returned assignments borrow Rust storage until the next mutable engine call or an
     // explicit discard. Consume them synchronously before asking the engine anything else.
@@ -95,13 +101,15 @@ public:
     // Publish the immutable input identities of an element or pseudo-element's base style and
     // return its previous and current StyleRecordID assignments. A zero node interns an unassigned
     // record for a style target which is not registered in the engine.
-    [[nodiscard]] StyleRecordDelta publish_computed_groups(StyleNodeID node, u8 pseudo_kind, ReadonlySpan<void const*> payloads, size_t inherited_group_count, u64 custom_property_environment, u64 pseudo_element_styles, u8 dependency_flags, u64 counter_style_environment_identity, u64 animation_overlay_identity, void const* animated_properties, ReadonlySpan<void const*> animation_overlay_payloads, ReadonlyBytes property_importance, ReadonlyBytes property_inheritance, ReadonlySpan<u16> inheritance_dependent_properties, ReadonlySpan<void const*> inheritance_dependent_values, void const* raw_cascaded_font_size, void const* computed_longhand_table);
+    [[nodiscard]] StyleRecordDelta publish_computed_groups(StyleNodeID node, u8 pseudo_kind, ReadonlySpan<void const*> payloads, size_t inherited_group_count, u64 custom_property_environment, bool inherited_group_swap_candidate, u64 counter_style_environment_identity, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> animation_overlay_payloads, void const* computed_longhand_table);
     [[nodiscard]] StyleRecordDelta assign_shared_style_record(StyleNodeID node, u8 pseudo_kind, StyleRecordID style_record, bool inherited_group_swap_eligible);
     // The borrowed payload array is stable while a base record exists or an animation-overlay
     // generation remains assigned or pinned.
     [[nodiscard]] void const* style_record_payloads(StyleRecordID style_record) const;
-    [[nodiscard]] StyleRecordState style_record_state(StyleRecordID style_record) const;
+    [[nodiscard]] u8 style_record_dependency_flags(StyleRecordID style_record) const;
+    [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout) const;
     [[nodiscard]] StyleRecordView style_record_view(StyleRecordID style_record) const;
+    void decide_transitions(StyleRecordID before_style_record, void const* after_longhand_table, void const* after_animated_overlay, StyleValueFFI::FfiTransitionInput&, StyleValueFFI::FfiTransitionAction*) const;
     // Remove the retained input identities for one pseudo-element kind and return its removal.
     [[nodiscard]] StyleRecordDelta remove_computed_pseudo(StyleNodeID node, u8 pseudo_kind);
     // The `@namespace` declarations in scope for a rule's selectors. A prefix means whatever its
@@ -254,6 +262,8 @@ public:
 
     // Enumerates the engine's counters. Returns false once index is past the last counter.
     bool counter(size_t index, StringView& out_name, u64& out_value) const;
+
+    [[nodiscard]] void const* rust_handle() const { return m_impl; }
 
 private:
     using InputTransaction = StyleEngineFFI::FfiStyleInputTransaction;

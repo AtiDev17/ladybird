@@ -350,6 +350,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 EventKind::StyleDeltaBatch => {
                     let (engine_index, engine) = read_engine_indexed(&mut event.payload, &live_engines)?;
                     let root = event.payload.read_u32()?;
+                    let computation_inputs = bridge::FfiDocumentStyleComputationInputs {
+                        viewport_width: f64::from_bits(event.payload.read_u64()?),
+                        viewport_height: f64::from_bits(event.payload.read_u64()?),
+                        root_font_size: f64::from_bits(event.payload.read_u64()?),
+                        root_font_x_height: f64::from_bits(event.payload.read_u64()?),
+                        root_font_cap_height: f64::from_bits(event.payload.read_u64()?),
+                        root_font_zero_advance: f64::from_bits(event.payload.read_u64()?),
+                        root_line_height: f64::from_bits(event.payload.read_u64()?),
+                        root_font_metrics_depend_on_viewport_metrics: event.payload.read_bool()?,
+                        initial_font_size_raw: event.payload.read_i32()?,
+                        default_font_size_raw: event.payload.read_i32()?,
+                        device_pixels_per_css_pixel: f64::from_bits(event.payload.read_u64()?),
+                        font_environment_generation: event.payload.read_u64()?,
+                    };
                     let output_bytes = event.payload.read_bytes()?;
                     let expected_digest = event.payload.read_u64()?;
                     let expected = read_style_transaction_outputs(PayloadReader::new(output_bytes))?;
@@ -380,7 +394,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let start = Instant::now();
-                    let actual_view = unsafe { bridge::style_engine_take_style_transaction(engine, root) };
+                    let actual_view =
+                        unsafe { bridge::style_engine_take_style_transaction(engine, root, computation_inputs) };
                     let actual_reclaimed_atoms = if actual_view.reclaimed_style_atom_count == 0 {
                         Vec::new()
                     } else {
@@ -816,7 +831,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let dependency_flags = event.payload.read_u8()?;
                     let counter_style_environment_identity = event.payload.read_u64()?;
                     let animation_overlay_identity = event.payload.read_u64()?;
-                    let animated_properties = replay_pointer(event.payload.read_u64()?);
+                    let animated_overlay = match event.payload.read_u64()? {
+                        0 => std::ptr::null_mut(),
+                        _ => libweb_rust::css::animated_overlay::rust_animated_overlay_create(),
+                    };
                     let overlay_count = event.payload.read_length()?;
                     animation_overlay_payloads.clear();
                     animation_overlay_payloads.reserve(overlay_count);
@@ -890,6 +908,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         old_style_record: event.payload.read_u64()?,
                         new_style_record: event.payload.read_u64()?,
                     };
+                    let publication_longhand_table = if longhand_table.is_null() {
+                        if !inheritance_dependent_values.is_empty() {
+                            return Err("inheritance-dependent values require a computed longhand table".into());
+                        }
+                        std::ptr::null_mut()
+                    } else {
+                        let table = libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_create();
+                        unsafe {
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_copy_from(
+                                table,
+                                longhand_table,
+                            );
+                            for (&property, &value) in inheritance_dependent_properties
+                                .iter()
+                                .zip(&inheritance_dependent_values)
+                            {
+                                libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_add_inheritance_dependent_value(
+                                    table,
+                                    property,
+                                    value,
+                                );
+                            }
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_load_flag_bitmaps(
+                                table,
+                                property_importance.as_ptr(),
+                                property_importance.len(),
+                                property_inheritance.as_ptr(),
+                                property_inheritance.len(),
+                            );
+                            let metadata =
+                                &mut *libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_metadata(
+                                    table,
+                                );
+                            metadata.pseudo_element_styles = pseudo_element_styles;
+                            metadata.dependency_flags = dependency_flags & 3;
+                            metadata.in_display_none_subtree = dependency_flags & (1 << 2) != 0;
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_set_raw_cascaded_font_size(
+                                table,
+                                raw_cascaded_font_size,
+                            );
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_freeze(table);
+                        }
+                        table
+                    };
                     let actual = unsafe {
                         bridge::style_engine_publish_computed_groups(
                             engine,
@@ -899,24 +961,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             computed_group_payloads.len(),
                             inherited_group_count,
                             custom_property_environment,
-                            pseudo_element_styles,
-                            dependency_flags,
+                            dependency_flags & (1 << 3) != 0,
                             counter_style_environment_identity,
                             animation_overlay_identity,
-                            animated_properties,
+                            animated_overlay.cast(),
                             animation_overlay_payloads.as_ptr(),
                             animation_overlay_payloads.len(),
-                            property_importance.as_ptr(),
-                            property_importance.len(),
-                            property_inheritance.as_ptr(),
-                            property_inheritance.len(),
-                            inheritance_dependent_properties.as_ptr(),
-                            inheritance_dependent_values.as_ptr(),
-                            inheritance_dependent_properties.len(),
-                            raw_cascaded_font_size,
-                            longhand_table.cast_const().cast(),
+                            publication_longhand_table.cast_const().cast(),
                         )
                     };
+                    if !publication_longhand_table.is_null() {
+                        unsafe {
+                            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_release(
+                                publication_longhand_table,
+                            );
+                        }
+                    }
+                    if !animated_overlay.is_null() {
+                        unsafe {
+                            libweb_rust::css::animated_overlay::rust_animated_overlay_free(animated_overlay);
+                        }
+                    }
                     if actual != expected {
                         return Err(format!(
                             "computed style publication diverged at event {event_count} after {last_benchmark_marker:?} in {active_phase:?} for node {node}: expected {expected:?}, got {actual:?}"
@@ -2077,13 +2142,6 @@ fn read_exact_cascade_publication(
 ) -> Result<FfiExactCascadePublication, Box<dyn std::error::Error>> {
     Ok(FfiExactCascadePublication {
         computed_group_mask: payload.read_u32()?,
-        computed_property_word_0: payload.read_u64()?,
-        computed_property_word_1: payload.read_u64()?,
-        computed_property_word_2: payload.read_u64()?,
-        computed_property_word_3: payload.read_u64()?,
-        computed_property_word_4: payload.read_u64()?,
-        computed_property_word_5: payload.read_u64()?,
-        computed_property_closure_is_exact: payload.read_bool()?,
         unchanged: payload.read_bool()?,
     })
 }
@@ -2181,7 +2239,7 @@ struct RecordedStyleRecordView<'a> {
     property_inheritance: &'a [u8],
     inheritance_dependent_values: EncodedInheritanceDependentValues<'a>,
     raw_cascaded_font_size: u64,
-    animated_properties: u64,
+    animated_overlay_present: bool,
     pseudo_element_styles: u64,
     counter_style_environment_identity: u64,
     animation_overlay_identity: u64,
@@ -2206,7 +2264,7 @@ fn read_style_record_view<'a>(
         property_inheritance,
         inheritance_dependent_values,
         raw_cascaded_font_size: payload.read_u64()?,
-        animated_properties: payload.read_u64()?,
+        animated_overlay_present: payload.read_u64()? != 0,
         pseudo_element_styles: payload.read_u64()?,
         counter_style_environment_identity: payload.read_u64()?,
         animation_overlay_identity: payload.read_u64()?,
@@ -2219,12 +2277,17 @@ fn style_record_view_matches(
     expected: &RecordedStyleRecordView,
     actual: bridge::FfiStyleRecordView,
 ) -> Result<bool, std::num::TryFromIntError> {
+    let (actual_longhand_values, actual_longhand_value_count) = style_record_longhand_values(actual);
+    let (actual_property_importance, actual_property_inheritance, actual_property_flag_count) =
+        style_record_property_flags(actual);
+    let (actual_inheritance_dependent_values, actual_inheritance_dependent_value_count) =
+        style_record_inheritance_dependent_values(actual);
     if actual.payload_count != expected.payloads.len()
         || actual.payload_count != expected.base_payloads.len()
-        || actual.property_importance_count != expected.property_importance.len()
-        || actual.property_inheritance_count != expected.property_inheritance.len()
-        || actual.inheritance_dependent_value_count != expected.inheritance_dependent_values.len()
-        || actual.longhand_value_count != expected.longhand_values.len()
+        || actual_property_flag_count != expected.property_importance.len()
+        || actual_property_flag_count != expected.property_inheritance.len()
+        || actual_inheritance_dependent_value_count != expected.inheritance_dependent_values.len()
+        || actual_longhand_value_count != expected.longhand_values.len()
     {
         return Ok(false);
     }
@@ -2248,8 +2311,8 @@ fn style_record_view_matches(
     } else {
         unsafe {
             std::slice::from_raw_parts(
-                actual.inheritance_dependent_values,
-                actual.inheritance_dependent_value_count,
+                actual_inheritance_dependent_values,
+                actual_inheritance_dependent_value_count,
             )
         }
         .iter()
@@ -2262,12 +2325,12 @@ fn style_record_view_matches(
     };
     Ok(pointers_match(actual.payloads, expected.payloads)?
         && pointers_match(actual.base_payloads, expected.base_payloads)?
-        && pointers_match(actual.longhand_values, expected.longhand_values)?
-        && bytes_match(actual.property_importance, &expected.property_importance)
-        && bytes_match(actual.property_inheritance, &expected.property_inheritance)
+        && pointers_match(actual_longhand_values, expected.longhand_values)?
+        && bytes_match(actual_property_importance, &expected.property_importance)
+        && bytes_match(actual_property_inheritance, &expected.property_inheritance)
         && inheritance_dependent_values_match
-        && pointer_value(actual.raw_cascaded_font_size)? == expected.raw_cascaded_font_size
-        && pointer_value(actual.animated_properties)? == expected.animated_properties
+        && pointer_value(style_record_raw_cascaded_font_size(actual))? == expected.raw_cascaded_font_size
+        && !actual.animated_overlay.is_null() == expected.animated_overlay_present
         && actual.pseudo_element_styles == expected.pseudo_element_styles
         && actual.counter_style_environment_identity == expected.counter_style_environment_identity
         && actual.animation_overlay_identity == expected.animation_overlay_identity
@@ -2277,6 +2340,10 @@ fn style_record_view_matches(
 fn semantic_style_record_view(
     view: bridge::FfiStyleRecordView,
 ) -> Result<OwnedSemanticStyleRecordView, Box<dyn std::error::Error>> {
+    let (longhand_values, longhand_value_count) = style_record_longhand_values(view);
+    let (property_importance, property_inheritance, property_flag_count) = style_record_property_flags(view);
+    let (inheritance_dependent_values, inheritance_dependent_value_count) =
+        style_record_inheritance_dependent_values(view);
     let pointers = |pointer: *const *const c_void, count: usize| -> Result<Vec<u64>, Box<dyn std::error::Error>> {
         if count == 0 {
             return Ok(Vec::new());
@@ -2291,10 +2358,10 @@ fn semantic_style_record_view(
         0 => Vec::new(),
         _ => unsafe { std::slice::from_raw_parts(pointer, count) }.to_vec(),
     };
-    let inheritance_dependent_values = match view.inheritance_dependent_value_count {
+    let inheritance_dependent_values = match inheritance_dependent_value_count {
         0 => Vec::new(),
         count => {
-            let entries = unsafe { std::slice::from_raw_parts(view.inheritance_dependent_values, count) };
+            let entries = unsafe { std::slice::from_raw_parts(inheritance_dependent_values, count) };
             let mut values = Vec::with_capacity(count);
             for entry in entries {
                 values.push((entry.property, pointer_value(entry.value)?));
@@ -2305,17 +2372,81 @@ fn semantic_style_record_view(
     Ok(OwnedSemanticStyleRecordView {
         payloads: pointers(view.payloads, view.payload_count)?,
         base_payloads: pointers(view.base_payloads, view.payload_count)?,
-        longhand_values: pointers(view.longhand_values, view.longhand_value_count)?,
-        property_importance: bytes(view.property_importance, view.property_importance_count),
-        property_inheritance: bytes(view.property_inheritance, view.property_inheritance_count),
+        longhand_values: pointers(longhand_values, longhand_value_count)?,
+        property_importance: bytes(property_importance, property_flag_count),
+        property_inheritance: bytes(property_inheritance, property_flag_count),
         inheritance_dependent_values,
-        raw_cascaded_font_size: pointer_value(view.raw_cascaded_font_size)?,
-        animated_properties: pointer_value(view.animated_properties)?,
+        raw_cascaded_font_size: pointer_value(style_record_raw_cascaded_font_size(view))?,
+        animated_overlay_present: !view.animated_overlay.is_null(),
         pseudo_element_styles: view.pseudo_element_styles,
         counter_style_environment_identity: view.counter_style_environment_identity,
         animation_overlay_identity: view.animation_overlay_identity,
         dependency_flags: view.dependency_flags,
     })
+}
+
+fn style_record_property_flags(view: bridge::FfiStyleRecordView) -> (*const u8, *const u8, usize) {
+    if view.longhand_table.is_null() {
+        return (std::ptr::null(), std::ptr::null(), 0);
+    }
+    let longhand_count = (libweb_rust::css::property_metadata::LAST_LONGHAND_PROPERTY_ID
+        - libweb_rust::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+        + 1) as usize;
+    let count = longhand_count.div_ceil(8);
+    unsafe {
+        (
+            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_importance_bits(
+                view.longhand_table.cast(),
+            ),
+            libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_inheritance_bits(
+                view.longhand_table.cast(),
+            ),
+            count,
+        )
+    }
+}
+
+fn style_record_inheritance_dependent_values(
+    view: bridge::FfiStyleRecordView,
+) -> (
+    *const libweb_rust::css::computed_longhand_table::FfiTableInheritanceDependentValue,
+    usize,
+) {
+    if view.longhand_table.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    let mut count = 0;
+    let values = unsafe {
+        libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_inheritance_dependent_values(
+            view.longhand_table.cast(),
+            &raw mut count,
+        )
+    };
+    (values, count)
+}
+
+fn style_record_raw_cascaded_font_size(view: bridge::FfiStyleRecordView) -> *const c_void {
+    if view.longhand_table.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_raw_cascaded_font_size(
+            view.longhand_table.cast(),
+        )
+    }
+}
+
+fn style_record_longhand_values(view: bridge::FfiStyleRecordView) -> (*const *const c_void, usize) {
+    if view.longhand_table.is_null() {
+        return (std::ptr::null(), 0);
+    }
+    let count = (libweb_rust::css::property_metadata::LAST_LONGHAND_PROPERTY_ID
+        - libweb_rust::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+        + 1) as usize;
+    let values = unsafe {
+        libweb_rust::css::computed_longhand_table::rust_computed_longhand_table_values(view.longhand_table.cast())
+    };
+    (values, count)
 }
 
 struct OwnedSemanticStyleRecordView {
@@ -2326,7 +2457,7 @@ struct OwnedSemanticStyleRecordView {
     property_inheritance: Vec<u8>,
     inheritance_dependent_values: Vec<(u16, u64)>,
     raw_cascaded_font_size: u64,
-    animated_properties: u64,
+    animated_overlay_present: bool,
     pseudo_element_styles: u64,
     counter_style_environment_identity: u64,
     animation_overlay_identity: u64,
@@ -2344,7 +2475,7 @@ impl std::fmt::Debug for OwnedSemanticStyleRecordView {
             .field("property_inheritance", &self.property_inheritance)
             .field("inheritance_dependent_values", &self.inheritance_dependent_values)
             .field("raw_cascaded_font_size", &self.raw_cascaded_font_size)
-            .field("animated_properties", &self.animated_properties)
+            .field("animated_overlay_present", &self.animated_overlay_present)
             .field("pseudo_element_styles", &self.pseudo_element_styles)
             .field(
                 "counter_style_environment_identity",
@@ -2454,12 +2585,6 @@ unsafe extern "C" fn ladybird_rust_realloc(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn ladybird_animated_properties_ref(_values: *const c_void) {}
-
-#[unsafe(no_mangle)]
-extern "C" fn ladybird_animated_properties_unref(_values: *const c_void) {}
-
-#[unsafe(no_mangle)]
 extern "C" fn ladybird_string_unref(_raw: usize) {}
 #[unsafe(no_mangle)]
 extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
@@ -2472,19 +2597,12 @@ mod tests {
     fn presence_degraded_publications_compare_every_non_mask_field() {
         let expected = FfiExactCascadePublication {
             computed_group_mask: 1,
-            computed_property_word_0: 2,
-            computed_property_word_1: 3,
-            computed_property_word_2: 4,
-            computed_property_word_3: 5,
-            computed_property_word_4: 6,
-            computed_property_word_5: 7,
-            computed_property_closure_is_exact: true,
             unchanged: false,
         };
         let mut actual = expected;
         actual.computed_group_mask = 8;
         assert!(exact_cascade_publications_match(expected, actual, false));
-        actual.computed_property_word_3 = 9;
+        actual.unchanged = true;
         assert!(!exact_cascade_publications_match(expected, actual, false));
     }
 

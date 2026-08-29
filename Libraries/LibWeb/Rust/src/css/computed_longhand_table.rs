@@ -28,17 +28,18 @@ use std::sync::Arc;
 use crate::abort_on_panic;
 use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::animated_overlay::overlay_wins;
-use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID};
-use crate::css::style_value::RetainedStyleValueData;
+use crate::css::property_metadata::{
+    FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, property_id, property_is_inherited,
+};
 use crate::css::style_value::retained_value_depends_on_current_color;
+use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
 
 pub(crate) const LONGHAND_COUNT: usize = (LAST_LONGHAND_PROPERTY_ID - FIRST_LONGHAND_PROPERTY_ID + 1) as usize;
 
 pub(crate) const LONGHAND_BITMAP_BYTES: usize = LONGHAND_COUNT.div_ceil(8);
 
 /// One sparse inheritance-dependent specified value, exposed to C++ as the
-/// borrowed span behind a style's inheritance-dependent value view. Layout
-/// matches `FfiInheritanceDependentValue` in the style-engine bridge.
+/// borrowed span behind a style's inheritance-dependent value view.
 #[repr(C)]
 pub struct FfiTableInheritanceDependentValue {
     pub property: u16,
@@ -102,18 +103,30 @@ pub struct ComputedLonghandTable {
     evaluated_bits: [u8; LONGHAND_BITMAP_BYTES],
     /// The recorded inheritance-dependent specified values, sparse.
     inheritance_dependent: Vec<(u16, RetainedStyleValueData)>,
+    /// The winning cascaded font-size retained for monospace recascades.
+    raw_cascaded_font_size: Option<RetainedStyleValueData>,
     /// The borrowed view over `inheritance_dependent` handed to C++.
     inheritance_dependent_view: Vec<FfiTableInheritanceDependentValue>,
     /// Viewport dependency flags accumulated by the longhand drive.
-    dependency_flags: u8,
+    metadata: FfiComputedStyleMetadata,
     /// Values before automatic post-compute adjustments, retained only while
     /// animation processing may need to restore them.
     post_compute_restore_values: Option<Box<PostComputeRestoreValues>>,
     frozen: bool,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiComputedStyleMetadata {
+    pub display_before_box_type_transformation: u32,
+    pub pseudo_element_styles: u64,
+    pub effective_color_scheme: i16,
+    pub dependency_flags: u8,
+    pub in_display_none_subtree: bool,
+}
+
 impl ComputedLonghandTable {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| None),
             value_view: [std::ptr::null(); LONGHAND_COUNT],
@@ -123,7 +136,14 @@ impl ComputedLonghandTable {
             evaluated_bits: [0; LONGHAND_BITMAP_BYTES],
             inheritance_dependent: Vec::new(),
             inheritance_dependent_view: Vec::new(),
-            dependency_flags: 0,
+            raw_cascaded_font_size: None,
+            metadata: FfiComputedStyleMetadata {
+                display_before_box_type_transformation: 0,
+                pseudo_element_styles: 0,
+                effective_color_scheme: -1,
+                dependency_flags: 0,
+                in_display_none_subtree: false,
+            },
             post_compute_restore_values: None,
             frozen: false,
         }
@@ -199,18 +219,62 @@ impl ComputedLonghandTable {
         depends_on_viewport_metrics: bool,
         font_metrics_depend_on_viewport_metrics: bool,
     ) {
-        self.dependency_flags |=
+        self.metadata.dependency_flags |=
             u8::from(depends_on_viewport_metrics) | (u8::from(font_metrics_depend_on_viewport_metrics) << 1);
     }
 
     pub(crate) fn dependency_flags(&self) -> u8 {
-        self.dependency_flags
+        self.metadata.dependency_flags
+    }
+
+    pub(crate) fn publication_dependency_flags(&self) -> u8 {
+        self.metadata.dependency_flags | (u8::from(self.metadata.in_display_none_subtree) << 2)
+    }
+
+    pub(crate) fn pseudo_element_styles(&self) -> u64 {
+        self.metadata.pseudo_element_styles
+    }
+
+    pub(crate) fn set_effective_color_scheme(&mut self, color_scheme: i16) {
+        self.metadata.effective_color_scheme = color_scheme;
+    }
+
+    pub(crate) fn set_display_before_box_type_transformation(&mut self, display: u32) {
+        self.metadata.display_before_box_type_transformation = display;
+    }
+
+    pub(crate) fn set_in_display_none_subtree(&mut self, in_display_none_subtree: bool) {
+        self.metadata.in_display_none_subtree = in_display_none_subtree;
+    }
+
+    pub(crate) fn display_before_box_type_transformation(&self) -> u32 {
+        self.metadata.display_before_box_type_transformation
     }
 
     pub(crate) fn inheritance_dependent_values(&self) -> impl Iterator<Item = (u16, *const c_void)> + '_ {
         self.inheritance_dependent
             .iter()
             .map(|(property, value)| (*property, value.pointer().cast()))
+    }
+
+    pub(crate) fn retained_inheritance_dependent_values(&self) -> impl Iterator<Item = (u16, &RetainedStyleValueData)> {
+        self.inheritance_dependent
+            .iter()
+            .map(|(property, value)| (*property, value))
+    }
+
+    pub(crate) fn raw_cascaded_font_size(&self) -> *const c_void {
+        self.raw_cascaded_font_size
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.pointer().cast())
+    }
+
+    pub(crate) fn set_raw_cascaded_font_size(&mut self, value: Option<RetainedStyleValueData>) {
+        assert!(
+            !self.frozen,
+            "the computed longhand table is immutable once its style is created"
+        );
+        self.raw_cascaded_font_size = value;
     }
 
     fn copy_from(&mut self, source: &ComputedLonghandTable) {
@@ -224,8 +288,9 @@ impl ComputedLonghandTable {
         self.important_bits = source.important_bits;
         self.inherited_bits = source.inherited_bits;
         self.evaluated_bits = source.evaluated_bits;
-        self.dependency_flags = source.dependency_flags;
+        self.metadata = source.metadata;
         self.inheritance_dependent.clone_from(&source.inheritance_dependent);
+        self.raw_cascaded_font_size.clone_from(&source.raw_cascaded_font_size);
         self.rebuild_inheritance_dependent_view();
         self.post_compute_restore_values = None;
     }
@@ -235,6 +300,89 @@ impl ComputedLonghandTable {
         table.copy_from(source);
         table.clear_seeded_state();
         table
+    }
+
+    pub(crate) fn copied_for_partial_drive(source: &ComputedLonghandTable) -> Self {
+        let mut table = Self::copied_for_drive(source);
+        table.inheritance_dependent.clone_from(&source.inheritance_dependent);
+        table.rebuild_inheritance_dependent_view();
+        table.set_in_display_none_subtree(false);
+        table
+    }
+
+    pub(crate) fn with_inherited_values_from(&self, inherited_source: &ComputedLonghandTable) -> Self {
+        self.with_inherited_values_and_flags_from(inherited_source, &self.important_bits, &self.inherited_bits)
+    }
+
+    pub(crate) fn with_inherited_values_and_flags_from(
+        &self,
+        inherited_source: &ComputedLonghandTable,
+        importance: &[u8],
+        inheritance: &[u8],
+    ) -> Self {
+        assert!(self.frozen);
+        assert!(inherited_source.frozen);
+        let mut table = Self::new();
+        table.copy_from(self);
+        for property_id in FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID {
+            if !property_is_inherited(property_id) {
+                continue;
+            }
+            let index = Self::slot_index(property_id);
+            let Some(value) = inherited_source.slots[index].clone() else {
+                continue;
+            };
+            table.set(property_id, value, -1);
+        }
+        table.metadata.effective_color_scheme = inherited_source.metadata.effective_color_scheme;
+        let inherited_color = inherited_source
+            .get(property_id::COLOR)
+            .map(RetainedStyleValueData::data);
+        let color_input = crate::css::color_resolution::ColorResolutionInput {
+            scheme: u8::try_from(inherited_source.metadata.effective_color_scheme).ok(),
+            current_color: inherited_color.and_then(|color| {
+                crate::css::color_resolution::to_color(
+                    color,
+                    &crate::css::color_resolution::ColorResolutionInput {
+                        scheme: u8::try_from(inherited_source.metadata.effective_color_scheme).ok(),
+                        current_color: None,
+                        current_color_value: None,
+                        length: None,
+                        channels: None,
+                    },
+                )
+            }),
+            current_color_value: inherited_color,
+            length: None,
+            channels: None,
+        };
+        for index in 0..table.inheritance_dependent.len() {
+            let (property_id, depends_on_current_color) = {
+                let (property_id, value) = &table.inheritance_dependent[index];
+                (*property_id, retained_value_depends_on_current_color(value))
+            };
+            if !property_is_inherited(property_id) && depends_on_current_color {
+                let value = table.inheritance_dependent[index].1.clone();
+                let slot = Self::slot_index(property_id);
+                let resolved = crate::css::color_resolution::to_color(value.data(), &color_input).map(|color| unsafe {
+                    RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(
+                        crate::css::color_resolution::resolved_srgb_style_value(color),
+                    )))
+                });
+                let is_resolved = resolved.is_some();
+                let replacement = resolved.unwrap_or(value);
+                table.value_view[slot] = replacement.pointer().cast();
+                table.slots[slot] = Some(replacement);
+                set_bitmap_bit(&mut table.evaluated_bits, slot, is_resolved);
+            }
+        }
+        table.load_flag_bitmaps(importance, inheritance);
+        table.frozen = true;
+        table
+    }
+
+    pub(crate) fn into_raw_shared(self) -> *const Self {
+        Arc::into_raw(Arc::new(self))
     }
 
     fn copy_from_values(&mut self, values: &[*const c_void]) {
@@ -253,9 +401,10 @@ impl ComputedLonghandTable {
         self.important_bits = [0; LONGHAND_BITMAP_BYTES];
         self.inherited_bits = [0; LONGHAND_BITMAP_BYTES];
         self.evaluated_bits = [0; LONGHAND_BITMAP_BYTES];
-        self.dependency_flags = 0;
+        self.metadata.dependency_flags = 0;
         self.inheritance_dependent.clear();
         self.inheritance_dependent_view.clear();
+        self.raw_cascaded_font_size = None;
         self.post_compute_restore_values = None;
     }
 
@@ -345,8 +494,72 @@ impl ComputedLonghandTable {
         bitmap_bit(&self.important_bits, Self::slot_index(property_id))
     }
 
-    fn is_inherited(&self, property_id: u16) -> bool {
+    pub(crate) fn is_inherited(&self, property_id: u16) -> bool {
         bitmap_bit(&self.inherited_bits, Self::slot_index(property_id))
+    }
+
+    pub(crate) fn importance_bits(&self) -> &[u8] {
+        &self.important_bits
+    }
+
+    pub(crate) fn publication_sidecars(&self) -> (&[u8; LONGHAND_BITMAP_BYTES], u32, i16) {
+        (
+            &self.evaluated_bits,
+            self.metadata.display_before_box_type_transformation,
+            self.metadata.effective_color_scheme,
+        )
+    }
+
+    pub(crate) fn inheritance_bits(&self) -> &[u8] {
+        &self.inherited_bits
+    }
+
+    pub(crate) fn load_flag_bitmaps(&mut self, importance: &[u8], inheritance: &[u8]) {
+        assert!(!self.frozen);
+        assert_eq!(importance.len(), LONGHAND_BITMAP_BYTES);
+        assert_eq!(inheritance.len(), LONGHAND_BITMAP_BYTES);
+        self.important_bits.copy_from_slice(importance);
+        self.inherited_bits.copy_from_slice(inheritance);
+    }
+
+    pub(crate) fn property_inheritance_is_standard(&self) -> bool {
+        (FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID)
+            .all(|property_id| self.is_inherited(property_id) == property_is_inherited(property_id))
+    }
+
+    pub(crate) fn publication_equals(&self, other: &Self) -> bool {
+        let values_equal = |first: *const c_void, second: *const c_void| {
+            first == second
+                || (!first.is_null()
+                    && !second.is_null()
+                    && unsafe { crate::css::style_value::rust_style_value_equals(first.cast(), second.cast()) })
+        };
+        self.value_view
+            .iter()
+            .zip(&other.value_view)
+            .all(|(&first, &second)| values_equal(first, second))
+            && self.important_bits == other.important_bits
+            && self.inherited_bits == other.inherited_bits
+            && self.publication_sidecars() == other.publication_sidecars()
+            && self.publication_dependency_flags() == other.publication_dependency_flags()
+            && self.pseudo_element_styles() == other.pseudo_element_styles()
+            && values_equal(self.raw_cascaded_font_size(), other.raw_cascaded_font_size())
+            && self.inheritance_dependent.len() == other.inheritance_dependent.len()
+            && self.inheritance_dependent.iter().all(|(property, value)| {
+                other
+                    .inheritance_dependent
+                    .iter()
+                    .find(|(other_property, _)| other_property == property)
+                    .is_some_and(|(_, other_value)| values_equal(value.pointer().cast(), other_value.pointer().cast()))
+            })
+    }
+
+    pub(crate) fn display_is_list_item(&self) -> bool {
+        let Some(StyleValueData::Display { raw }) = self.get(property_id::DISPLAY).map(RetainedStyleValueData::data)
+        else {
+            return false;
+        };
+        crate::css::display::FfiDisplay::from_raw(*raw).is_list_item()
     }
 
     fn is_evaluated(&self, property_id: u16) -> bool {
@@ -385,50 +598,6 @@ impl ComputedLonghandTable {
             value: self.value_view[Self::slot_index(property_id)],
             source: EFFECTIVE_LONGHAND_SOURCE_TABLE,
         }
-    }
-
-    /// The sparse set of longhands whose effective value differs from the
-    /// stored table value: the animated overlay under the overlay read rule
-    /// first (the consumer's override scan takes the first match, like the
-    /// effective-value query prefers the overlay), then the unevaluated
-    /// longhands' currentcolor-dependent specified values.
-    fn collect_effective_overrides(
-        &self,
-        overlay: Option<&AnimatedOverlay>,
-        out_properties: &mut [u16],
-        out_values: &mut [*const c_void],
-    ) -> usize {
-        let mut count = 0;
-        if let Some(overlay) = overlay {
-            for entry in overlay.entries() {
-                if !overlay_wins(entry, self.is_important(entry.property)) {
-                    continue;
-                }
-                let value = entry.value.pointer().cast();
-                if value == self.value_view[Self::slot_index(entry.property)] {
-                    continue;
-                }
-                out_properties[count] = entry.property;
-                out_values[count] = value;
-                count += 1;
-            }
-        }
-        for (property, value) in &self.inheritance_dependent {
-            if self.is_evaluated(*property) || !retained_value_depends_on_current_color(value) {
-                continue;
-            }
-            if out_properties[..count].contains(property) {
-                continue;
-            }
-            let value = value.pointer().cast();
-            if value == self.value_view[Self::slot_index(*property)] {
-                continue;
-            }
-            out_properties[count] = *property;
-            out_values[count] = value;
-            count += 1;
-        }
-        count
     }
 
     pub(crate) fn set_post_compute_restore_values(&mut self, values: [(u16, RetainedStyleValueData); 7]) {
@@ -471,7 +640,7 @@ impl ComputedLonghandTable {
         restored
     }
 
-    fn freeze(&mut self) {
+    pub(crate) fn freeze(&mut self) {
         self.post_compute_restore_values = None;
         self.frozen = true;
     }
@@ -527,6 +696,24 @@ pub unsafe extern "C" fn rust_computed_longhand_table_retain(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_computed_longhand_table_release(table: *mut ComputedLonghandTable) {
     abort_on_panic(|| unsafe { Arc::decrement_strong_count(table.cast_const()) });
+}
+
+/// Creates a frozen copy of `table` with every inherited longhand value taken
+/// from `inherited_source`.
+///
+/// # Safety
+/// Both pointers must name live, frozen tables.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_computed_longhand_table_create_with_inherited_values(
+    table: *const ComputedLonghandTable,
+    inherited_source: *const ComputedLonghandTable,
+) -> *mut ComputedLonghandTable {
+    abort_on_panic(|| {
+        Arc::into_raw(Arc::new(
+            unsafe { &*table }.with_inherited_values_from(unsafe { &*inherited_source }),
+        ))
+        .cast_mut()
+    })
 }
 
 /// Stores one computed longhand, retaining `data`. `source_slot` is the
@@ -603,6 +790,18 @@ pub unsafe extern "C" fn rust_computed_longhand_table_values(
     })
 }
 
+/// Whether two frozen tables have equal values and publication metadata.
+///
+/// # Safety
+/// Both pointers must name live, frozen tables.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_computed_longhand_tables_equal_for_publication(
+    first: *const ComputedLonghandTable,
+    second: *const ComputedLonghandTable,
+) -> bool {
+    abort_on_panic(|| unsafe { &*first }.publication_equals(unsafe { &*second }))
+}
+
 /// Makes the table immutable; every later store aborts. Only a frozen table
 /// may be shared through `rust_computed_longhand_table_retain`.
 ///
@@ -627,6 +826,35 @@ pub unsafe extern "C" fn rust_computed_longhand_table_get(
         Some(value) => value.pointer().cast(),
         None => std::ptr::null(),
     })
+}
+
+/// Returns the retained raw cascaded font-size data, or null when none won.
+///
+/// # Safety
+/// `table` must be a valid table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_computed_longhand_table_raw_cascaded_font_size(
+    table: *const ComputedLonghandTable,
+) -> *const c_void {
+    abort_on_panic(|| unsafe { &*table }.raw_cascaded_font_size())
+}
+
+/// Replaces the retained raw cascaded font-size data.
+///
+/// # Safety
+/// `table` must be a valid, unfrozen, uniquely owned table. `data` must be
+/// null or point at live `StyleValueData`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_computed_longhand_table_set_raw_cascaded_font_size(
+    table: *mut ComputedLonghandTable,
+    data: *const c_void,
+) {
+    abort_on_panic(|| {
+        let value = (!data.is_null()).then(|| unsafe {
+            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(data.cast()))
+        });
+        unsafe { &mut *table }.set_raw_cascaded_font_size(value);
+    });
 }
 
 /// Returns the longhand's recorded cascade source slot, or -1 when its value
@@ -729,19 +957,11 @@ pub unsafe extern "C" fn rust_computed_longhand_table_load_flag_bitmaps(
     inheritance_count: usize,
 ) {
     abort_on_panic(|| {
-        assert_eq!(importance_count, LONGHAND_BITMAP_BYTES);
-        assert_eq!(inheritance_count, LONGHAND_BITMAP_BYTES);
         let table = unsafe { &mut *table };
-        assert!(
-            !table.frozen,
-            "the computed longhand table is immutable once its style is created"
+        table.load_flag_bitmaps(
+            unsafe { std::slice::from_raw_parts(importance, importance_count) },
+            unsafe { std::slice::from_raw_parts(inheritance, inheritance_count) },
         );
-        table
-            .important_bits
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(importance, importance_count) });
-        table
-            .inherited_bits
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(inheritance, inheritance_count) });
     });
 }
 
@@ -786,21 +1006,16 @@ pub unsafe extern "C" fn rust_computed_longhand_table_remove_inheritance_depende
     abort_on_panic(|| unsafe { &mut *table }.remove_inheritance_dependent_value(property_id));
 }
 
-/// Records dependency bits produced outside the native longhand drive.
+/// Returns the non-longhand computation state stored alongside the table.
 ///
 /// # Safety
-/// `table` must be a valid, unfrozen, uniquely owned table.
+/// `table` must be a valid, uniquely owned table when the returned view is
+/// mutated. The view remains valid for the lifetime of the table.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_set_dependency_flag(table: *mut ComputedLonghandTable, flag: u8) {
-    abort_on_panic(|| {
-        let table = unsafe { &mut *table };
-        assert!(
-            !table.frozen,
-            "the computed longhand table is immutable once its style is created"
-        );
-        assert!(flag < 2, "only viewport dependency flags belong to the longhand table");
-        table.dependency_flags |= 1 << flag;
-    });
+pub unsafe extern "C" fn rust_computed_longhand_table_metadata(
+    table: *mut ComputedLonghandTable,
+) -> *mut FfiComputedStyleMetadata {
+    abort_on_panic(|| &raw mut unsafe { &mut *table }.metadata)
 }
 
 /// The recorded inheritance-dependent specified values as a borrowed span.
@@ -836,45 +1051,6 @@ pub unsafe extern "C" fn rust_computed_longhand_table_effective_value(
     with_animations: bool,
 ) -> FfiEffectiveLonghandValue {
     abort_on_panic(|| unsafe { &*table }.effective_value(unsafe { overlay.as_ref() }, property_id, with_animations))
-}
-
-/// An upper bound on how many overrides
-/// `rust_computed_longhand_table_collect_effective_overrides` can produce.
-///
-/// # Safety
-/// `table` must be a valid table and `overlay` null or a valid overlay.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_effective_override_capacity(
-    table: *const ComputedLonghandTable,
-    overlay: *const AnimatedOverlay,
-) -> usize {
-    abort_on_panic(|| {
-        let overlay_entries = unsafe { overlay.as_ref() }.map_or(0, |overlay| overlay.entries().len());
-        overlay_entries + unsafe { &*table }.inheritance_dependent.len()
-    })
-}
-
-/// Collects the sparse set of longhands whose effective value differs from
-/// the stored table value, exactly what the effective-value query returns.
-/// Returns how many entries were written.
-///
-/// # Safety
-/// `table` must be a valid table, `overlay` null or a valid overlay, and the
-/// output spans must have at least `capacity` writable entries, `capacity`
-/// itself at least the reported override capacity.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_computed_longhand_table_collect_effective_overrides(
-    table: *const ComputedLonghandTable,
-    overlay: *const AnimatedOverlay,
-    out_properties: *mut u16,
-    out_values: *mut *const c_void,
-    capacity: usize,
-) -> usize {
-    abort_on_panic(|| {
-        let out_properties = unsafe { std::slice::from_raw_parts_mut(out_properties, capacity) };
-        let out_values = unsafe { std::slice::from_raw_parts_mut(out_values, capacity) };
-        unsafe { &*table }.collect_effective_overrides(unsafe { overlay.as_ref() }, out_properties, out_values)
-    })
 }
 
 #[cfg(test)]

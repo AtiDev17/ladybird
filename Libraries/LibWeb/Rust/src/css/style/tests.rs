@@ -673,16 +673,9 @@ fn publish_current_cascade_as_computed(engine: &mut StyleEngine, node: StyleNode
             dependency_flags: 0,
             counter_style_environment_identity: 0,
             animation_overlay_identity: 0,
-            animated_properties: std::ptr::null(),
+            animated_overlay: std::ptr::null(),
             animation_overlay_payloads: &[],
             longhand_table: std::ptr::null(),
-            reconstruction: computed::ComputedReconstructionMetadataInput {
-                property_importance: &[],
-                property_inheritance: &[],
-                inheritance_dependent_properties: &[],
-                inheritance_dependent_values: &[],
-                raw_cascaded_font_size: std::ptr::null(),
-            },
         },
     );
     assert_eq!(

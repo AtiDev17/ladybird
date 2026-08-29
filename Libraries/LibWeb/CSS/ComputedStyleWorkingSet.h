@@ -15,7 +15,6 @@
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/Forward.h>
-#include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -30,12 +29,6 @@ namespace Web::CSS {
 class AnimatedProperties;
 class CSSStyleSheet;
 class StyleComputer;
-
-}
-
-namespace Web::CSS::StyleEngineFFI {
-
-struct FfiInheritanceDependentValue;
 
 }
 
@@ -70,6 +63,7 @@ public:
     };
 
     static NonnullRefPtr<ComputedStyleWorkingSet> create();
+    static NonnullRefPtr<ComputedStyleWorkingSet> create_with_longhand_table(ComputedValuesFFI::ComputedLonghandTable*);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedStyleWorkingSet const&);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedValues const&);
     ~ComputedStyleWorkingSet();
@@ -88,33 +82,24 @@ public:
     void set_depends_on_viewport_metrics();
     void set_font_metrics_depend_on_viewport_metrics();
     void set_in_display_none_subtree();
-    void clear_in_display_none_subtree();
 
     void set_property(PropertyID, NonnullRefPtr<StyleValue const> value, Inherited = Inherited::No, Important = Important::No);
     // The wrapper-carrying store funnel: dual-writes the Rust table and the wrapper cache.
     // `style_sheet_source_slot` is the winning declaration's cascade source slot when its
-    // value carries style sheet context, and -1 otherwise; only the longhand drive's batch
-    // executor passes one.
+    // value carries style sheet context, and -1 otherwise.
     void set_property_without_modifying_flags(PropertyID, NonnullRefPtr<StyleValue const> value, i64 style_sheet_source_slot = -1);
-    // The wrapper-free store the longhand drive uses for values it already holds as Rust
-    // data: writes the table and invalidates the cached wrapper; property() mints one on
-    // demand. `style_sheet` is the sheet whose rule supplied the winning declaration, kept
-    // for stamping sheet context onto the wrapper the mint produces.
-    void set_property_data_from_drive(PropertyID, void const* value_data, i64 style_sheet_source_slot, GC::Ptr<CSSStyleSheet> style_sheet);
     // Invalidates C++ sidecars after the Rust driver stores a value directly in the table.
-    void did_store_property_data_from_drive(PropertyID, GC::Ptr<CSSStyleSheet> style_sheet);
+    void did_store_property_data_from_drive(PropertyID);
+    void set_style_sheet_for_source_slot(u32, GC::Ptr<CSSStyleSheet>);
     void cache_property_wrapper_from_drive(PropertyID, NonnullRefPtr<StyleValue const>);
     void set_display_before_box_type_transformation(Display);
 
-    bool has_effective_color_scheme() const { return m_effective_color_scheme.has_value(); }
-    void set_effective_color_scheme(PreferredColorScheme color_scheme) { m_effective_color_scheme = color_scheme; }
-    void clear_effective_color_scheme() { m_effective_color_scheme.clear(); }
+    bool has_effective_color_scheme() const { return metadata().effective_color_scheme >= 0; }
+    void set_effective_color_scheme(PreferredColorScheme color_scheme) { metadata().effective_color_scheme = to_underlying(color_scheme); }
+    void clear_effective_color_scheme() { metadata().effective_color_scheme = -1; }
 
     void add_inheritance_dependent_specified_value(PropertyID, NonnullRefPtr<StyleValue const> value);
     void remove_inheritance_dependent_specified_value(PropertyID);
-
-    RefPtr<StyleValue const> raw_cascaded_font_size() const { return m_raw_cascaded_font_size; }
-    void set_raw_cascaded_font_size(NonnullRefPtr<StyleValue const> value) { m_raw_cascaded_font_size = move(value); }
 
     RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
     bool has_animated_property(PropertyID property_id) const;
@@ -124,14 +109,15 @@ public:
     bool is_property_inherited(PropertyID property_id) const;
     bool is_animated_property_inherited(PropertyID property_id) const;
     bool is_animated_property_result_of_transition(PropertyID property_id) const;
-    bool depends_on_viewport_metrics() const { return m_depends_on_viewport_metrics; }
-    bool font_metrics_depend_on_viewport_metrics() const { return m_font_metrics_depend_on_viewport_metrics; }
+    bool depends_on_viewport_metrics() const { return metadata().dependency_flags & 1; }
+    bool font_metrics_depend_on_viewport_metrics() const { return metadata().dependency_flags & 2; }
     // Whether the element this style was computed for has computed display none, or is a descendant of one that does.
-    bool in_display_none_subtree() const { return m_in_display_none_subtree; }
+    bool in_display_none_subtree() const { return metadata().in_display_none_subtree; }
     bool has_pseudo_element_style(PseudoElement) const;
     void set_animated_property(Badge<StyleComputer>, PropertyID, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition, Inherited = Inherited::No);
     ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_mutation(Badge<StyleComputer>);
     ComputedValuesFFI::AnimatedOverlay* prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>, CreateAnimatedOverlay);
+    ComputedValuesFFI::AnimatedOverlay const* animated_overlay(Badge<StyleComputer>) const;
     void finish_animated_overlay_rust_mutation(Badge<StyleComputer>);
     void did_apply_style_finalization_from_rust(u16 invalidated_longhands);
     void clear_animated_properties(Badge<StyleComputer>);
@@ -170,9 +156,6 @@ public:
     CSS::EmptyCells empty_cells() const;
     Direction direction() const;
     WritingMode writing_mode() const;
-    Vector<AnimationProperties> animations(DOM::AbstractElement const&) const;
-    Vector<TransitionProperties> transitions() const;
-
     Display display_before_box_type_transformation() const;
 
     float stop_opacity() const;
@@ -195,7 +178,7 @@ public:
 
     // The recorded inheritance-dependent specified values, borrowed from the drive's table;
     // the span stays valid while the table does.
-    ReadonlySpan<StyleEngineFFI::FfiInheritanceDependentValue const> inheritance_dependent_value_span() const;
+    ReadonlySpan<ComputedValuesFFI::FfiTableInheritanceDependentValue const> inheritance_dependent_value_span() const;
 
     // Whole-bitmap views over the table's importance and inheritance flags, in FixedBitmap
     // byte layout; valid while the table is.
@@ -207,12 +190,6 @@ public:
     ComputedValuesFFI::ComputedLonghandTable* mutable_computed_longhand_table() { return m_computed_longhand_table; }
     ComputedValuesFFI::ComputedLonghandTable const* computed_longhand_table() const { return m_computed_longhand_table; }
 
-    // The sparse set of longhands whose effective value differs from the table's stored value:
-    // the animated overlay and the unevaluated longhands' currentcolor-dependent specified-value
-    // preference. Exactly what property() returns, without minting a wrapper per longhand to
-    // find out.
-    void collect_effective_longhand_overrides(Vector<u16>& properties, Vector<void const*>& values) const;
-
 private:
     // The sparse per-longhand mint cache over the effective values: an entry holds the
     // wrapper a store funnel carried or the one property() minted on demand, and is replaced
@@ -222,20 +199,21 @@ private:
     // once, preserving wrapper identity for values with side effects (image loads).
     struct WrapperMintCache final : public RefCounted<WrapperMintCache> {
         HashMap<PropertyID, NonnullRefPtr<StyleValue const>> wrappers;
-        // The style sheet whose rule supplied a longhand's winning declaration, for longhands
-        // whose stored value carries style sheet context and awaits an on-demand wrapper mint.
-        // Held weakly, like the cascade's own declaration sources; the wrappers themselves
-        // only extract state from the sheet, so a collected sheet degrades to no stamping.
-        HashMap<PropertyID, GC::Weak<CSSStyleSheet>> style_sheet_sources;
+        // Style sheets are indexed by the source slots stored in the Rust longhand table.
+        // Held weakly, like the cascade's own declaration sources.
+        Vector<GC::Weak<CSSStyleSheet>> style_sheet_source_slots;
     };
 
     ComputedStyleWorkingSet();
+    explicit ComputedStyleWorkingSet(ComputedValuesFFI::ComputedLonghandTable*);
     // The without-animations copy: shares the frozen table and the mint cache.
     struct ShareFrozenTable { };
     ComputedStyleWorkingSet(ShareFrozenTable, ComputedStyleWorkingSet const&);
 
     AnimatedProperties const& animated_properties() const;
     AnimatedProperties& mutable_animated_properties();
+    ComputedValuesFFI::FfiComputedStyleMetadata& metadata() { return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table); }
+    ComputedValuesFFI::FfiComputedStyleMetadata const& metadata() const { return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table); }
     void set_animated_property_internal(PropertyID, NonnullRefPtr<StyleValue const>, AnimatedPropertyResultOfTransition, Inherited);
     void clear_computed_font_list_cache()
     {
@@ -250,15 +228,6 @@ private:
     NonnullRefPtr<WrapperMintCache> m_mint_cache;
     RefPtr<AnimatedProperties> m_animated_properties;
 
-    Display m_display_before_box_type_transformation { InitialValues::display() };
-    u64 m_pseudo_element_styles { 0 };
-    Optional<PreferredColorScheme> m_effective_color_scheme;
-    RefPtr<StyleValue const> m_raw_cascaded_font_size;
-
-    bool m_depends_on_viewport_metrics { false };
-    bool m_font_metrics_depend_on_viewport_metrics { false };
-    bool m_in_display_none_subtree { false };
-
     mutable RefPtr<Gfx::FontCascadeList const> m_cached_computed_font_list;
     mutable RefPtr<Gfx::Font const> m_cached_first_available_computed_font;
 };
@@ -267,6 +236,7 @@ class AnimatedProperties final : public RefCounted<AnimatedProperties> {
 public:
     AnimatedProperties();
     AnimatedProperties(AnimatedProperties const&);
+    explicit AnimatedProperties(ComputedValuesFFI::AnimatedOverlay const*);
     ~AnimatedProperties();
 
     u64 identity() const { return m_identity; }

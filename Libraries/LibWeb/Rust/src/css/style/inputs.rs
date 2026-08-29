@@ -76,13 +76,15 @@ impl StyleEngine {
             specified_values: SpecifiedValues::new(),
             winner_groups: WinnerGroups::new(),
             computed_group_sets: ComputedGroupSets::default(),
+            pending_style_computation_selections: HashMap::default(),
             computed_group_set_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
             custom_property_environment_memory: MemoryLease::new(MemoryCategory::CustomPropertyEnvironment),
             computed_fixed_metadata_memory: MemoryLease::new(MemoryCategory::ComputedFixedMetadata),
-            computed_reconstruction_metadata_memory: MemoryLease::new(MemoryCategory::ComputedReconstructionMetadata),
+            computed_longhand_table_memory: MemoryLease::new(MemoryCategory::ComputedLonghandTable),
             style_record_memory: MemoryLease::new(MemoryCategory::StyleRecord),
             animation_overlay_memory: MemoryLease::new(MemoryCategory::AnimationOverlayRecord),
             computed_pseudo_assignment_memory: MemoryLease::new(MemoryCategory::ComputedPseudoAssignment),
+            style_invalidation_cache: HashMap::default(),
             html_element_namespace: StyleAtomID::NONE,
             match_answers: MatchAnswerCatalog::default(),
             selector_truth_sets: SelectorTruthSetCatalog::default(),
@@ -1326,6 +1328,8 @@ impl StyleEngine {
             self.winner_groups.remove(node);
             let live_animation_overlays_before = self.computed_group_sets.live_animation_overlay_records();
             self.computed_group_sets.remove(node);
+            self.pending_style_computation_selections
+                .retain(|target, _| target.node() != node);
             let live_animation_overlays_after = self.computed_group_sets.live_animation_overlay_records();
             self.settle_computed_memory();
             self.counters.add(

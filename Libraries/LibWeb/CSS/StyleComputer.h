@@ -14,6 +14,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
+#include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
@@ -51,12 +52,6 @@ public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
     static void for_each_property_expanding_shorthands(PropertyID, StyleValue const&, Function<void(PropertyID, StyleValue const&)> const& set_longhand_property);
-    static NonnullRefPtr<StyleValue const> get_non_animated_inherit_value(PropertyID, DOM::AbstractElement);
-    struct AnimatedInheritValue {
-        NonnullRefPtr<StyleValue const> value;
-        AnimatedPropertyResultOfTransition is_result_of_transition;
-    };
-    static Optional<AnimatedInheritValue> get_animated_inherit_value(PropertyID, DOM::AbstractElement);
 
     static Optional<Utf16String> user_agent_style_sheet_source(Utf16View name);
 
@@ -94,7 +89,7 @@ public:
     static CSSPixels default_user_font_size();
     static void ensure_style_metadata_tables_installed();
     static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
-    [[nodiscard]] RefPtr<StyleValue const> recascade_font_size_if_needed(DOM::AbstractElement, CascadedProperties&, bool& depends_on_viewport_metrics) const;
+    [[nodiscard]] RefPtr<StyleValue const> recascade_font_size_if_needed(DOM::AbstractElement, bool has_monospace_font_family, bool& depends_on_viewport_metrics) const;
 
     void set_viewport_rect(Badge<DOM::Document>, CSSPixelRect const& viewport_rect) { m_viewport_rect = viewport_rect; }
     [[nodiscard]] CSSPixelRect const& viewport_rect_for_style_environment() const { return m_viewport_rect; }
@@ -115,8 +110,6 @@ public:
         RequiredInvalidationAfterStyleChange invalidation;
         bool any_computed_value_changed { false };
     };
-    [[nodiscard]] Optional<ComputedStyleInvalidation> cached_computed_style_invalidation(StyleEngine::StyleRecordDelta const&, bool element_folds_transform_into_layout) const;
-    void cache_computed_style_invalidation(StyleEngine::StyleRecordDelta const&, bool element_folds_transform_into_layout, ComputedStyleInvalidation) const;
 
     // Publish a computed style built outside the ordinary cascade path, such as an inherited-group
     // swap, so StyleEngine's final node-to-style relation remains authoritative.
@@ -128,19 +121,7 @@ public:
     // authoritative shared record rather than layout-owned complete computed values.
     [[nodiscard]] StyleRecordID intern_anonymous_layout_style(ComputedValues const&) const;
 
-    // Replace a fully inheriting element's inherited groups without re-running its cascade or
-    // driving every longhand. The result is shared by every element making the same transition.
-    [[nodiscard]] RefPtr<ComputedValues const> inherited_style_group_swap(DOM::Element&, ComputedValues const& old_values, ComputedValues const& new_parent_values) const;
-
     [[nodiscard]] ComputedStyleRecordView computed_style_record_view(StyleRecordID) const;
-
-    // Presence and display:none-subtree placement of a style record, read without materializing a full style record view.
-    struct StyleRecordStatus {
-        bool present { false };
-        bool in_display_none_subtree { false };
-    };
-    [[nodiscard]] StyleRecordStatus style_record_status(StyleRecordID) const;
-
     [[nodiscard]] void const* style_record_payloads(StyleRecordID) const;
     void pin_style_record(StyleRecordID) const;
     void unpin_style_record(StyleRecordID) const;
@@ -168,9 +149,9 @@ public:
     // `explicitly_inherited_non_inherited_style_groups` reports the style groups whose values the
     // computation read from the half of the style it inherits from that a child normally cannot
     // see, which decides whether its answer can be offered to another element.
-    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, ComputedValues const* previous_values = nullptr, u32 computed_group_mask = ComputedValues::all_style_groups, u64 const* computed_properties_to_evaluate = nullptr, ComputedValues const* inheritance_parent_values = nullptr, bool stop_after_longhand_drive = false) const;
+    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, StyleRecordID previous_style_record = {}, u32 initial_computed_group_mask = ComputedValues::all_style_groups, bool use_retained_style_computation_selection = false, bool stop_after_longhand_drive = false, u32* selected_computed_group_mask = nullptr, bool* cascade_font_family_is_monospace = nullptr) const;
 
-    void process_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element) const;
+    void process_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element, ReadonlySpan<AnimationProperties> animation_definitions) const;
 
     NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedStyleWorkingSet const*, AbstractOrHypotheticalElement const&, Utf16FlyString const& name) const;
     NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(AbstractOrHypotheticalElement, PropertyNameAndID const&, UnresolvedStyleValue const&) const;
@@ -282,8 +263,6 @@ public:
         // The exact cascade winner delta's conservative computed dependency closure. Present only
         // when a preceding base style is available to supply every group outside the closure.
         Optional<u32> computed_groups_to_rebuild;
-        Optional<Array<u64, (number_of_longhand_properties + 63) / 64>> computed_properties_to_evaluate;
-        bool computed_property_closure_is_exact { false };
         u8 inherited_style_groups { 0 };
     };
 
@@ -299,8 +278,7 @@ private:
     [[nodiscard]] RefPtr<ComputedStyleWorkingSet> compute_style_impl(DOM::AbstractElement, ComputeStyleMode, Optional<bool&> did_change_custom_properties, StyleScope const&, IncludeInlineStyle, StyleEngineMatchResult* = nullptr, StyleSharingCandidate* = nullptr) const;
     [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, CascadeInput const&, IncludeInlineStyle, StyleSharingCandidate* sharing = nullptr, Vector<StyleProperty> const* precomputed_presentational_hints = nullptr) const;
     void collect_animation_effects_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
-    void compute_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
-    Vector<GC::Ref<Animations::KeyframeEffect>> start_needed_transitions(ComputedValues const& old_style, ComputedStyleWorkingSet& new_style, DOM::AbstractElement) const;
+    Vector<GC::Ref<Animations::KeyframeEffect>> start_needed_transitions(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
     void finalize_style(ComputedStyleWorkingSet&, DOM::AbstractElement, ComputedValuesFFI::FfiStyleFinalizationMode) const;
 
     [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
@@ -398,21 +376,6 @@ private:
     mutable HashMap<u64, Vector<StyleSharingEntry>> m_style_sharing_cache;
     mutable size_t m_style_sharing_cache_entry_count { 0 };
     mutable u64 m_style_sharing_transaction_generation { 0 };
-    // The computed-property consequence of one semantic style transition. Element-dependent
-    // observer consequences are added separately and are never cached by style-record identity.
-    struct ComputedStyleInvalidationCacheEntry {
-        StyleRecordID old_style_record;
-        StyleRecordID new_style_record;
-        bool element_folds_transform_into_layout { false };
-        ComputedStyleInvalidation result;
-    };
-    mutable HashMap<u32, Vector<ComputedStyleInvalidationCacheEntry>> m_computed_style_invalidation_cache;
-    struct InheritedStyleGroupSwapEntry {
-        StyleRecordID old_style_record;
-        Array<void const*, ComputedValues::inherited_style_group_count> new_parent_groups;
-        NonnullRefPtr<ComputedValues const> result;
-    };
-    mutable Vector<InheritedStyleGroupSwapEntry> m_inherited_style_group_swaps;
     mutable bool m_materializing_for_targeted_style_update { false };
     // The word buffer one element's record gives up, reused by the next element's.
     mutable OwnPtr<StyleInputRecord> m_style_input_record_scratch;
@@ -491,11 +454,6 @@ private:
         GC::Ptr<DOM::Element> element;
         Optional<PseudoElement> pseudo_element;
         PropertyID property_id;
-        // The transition consumer reads only this property's animated before-change value and
-        // whether its specified value was currentColor. Pin those derived values for the
-        // stabilization epoch instead of retaining another complete computed-style projection.
-        RefPtr<StyleValue const> before_change_value;
-        bool before_change_value_originates_from_current_color { false };
         GC::Ptr<CSSTransition> committed_transition;
         GC::Ptr<CSSTransition> proposed_transition;
         ProvisionalTransitionAction action { ProvisionalTransitionAction::None };

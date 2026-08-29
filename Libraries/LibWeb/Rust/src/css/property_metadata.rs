@@ -18,6 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/property_metadata_generated.rs"));
 
 pub(crate) const NUMBER_OF_LONGHAND_PROPERTIES: usize =
     (LAST_LONGHAND_PROPERTY_ID - FIRST_LONGHAND_PROPERTY_ID + 1) as usize;
+pub(crate) const LONGHAND_WORD_COUNT: usize = NUMBER_OF_LONGHAND_PROPERTIES.div_ceil(64);
 
 pub(crate) fn property_name(property_id: u16) -> &'static str {
     if property_id == 0 {
@@ -137,6 +138,29 @@ pub fn property_may_affect_layout_geometry(property_id: u16) -> bool {
     PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY[longhand_index(property_id)]
 }
 
+pub(crate) fn property_affects_layout(property_id: u16) -> bool {
+    PROPERTY_AFFECTS_LAYOUT[longhand_index(property_id)]
+}
+
+pub(crate) fn property_affects_stacking_context(property_id: u16) -> bool {
+    PROPERTY_AFFECTS_STACKING_CONTEXT[longhand_index(property_id)]
+}
+
+pub(crate) fn property_affects_scrollable_overflow(property_id: u16) -> bool {
+    PROPERTY_AFFECTS_SCROLLABLE_OVERFLOW[longhand_index(property_id)]
+}
+
+pub(crate) fn property_affects_accumulated_visual_contexts(property_id: u16) -> bool {
+    PROPERTY_AFFECTS_ACCUMULATED_VISUAL_CONTEXTS[longhand_index(property_id)]
+}
+
+pub(crate) fn property_style_group_index(property_id: u16) -> Option<u8> {
+    match PROPERTY_STYLE_GROUP_INDICES[longhand_index(property_id)] {
+        u8::MAX => None,
+        index => Some(index),
+    }
+}
+
 pub(crate) fn property_initial_value(property_id: u16) -> &'static str {
     PROPERTY_INITIAL_VALUES[longhand_index(property_id)]
 }
@@ -250,8 +274,20 @@ fn property_is_logical_alias_including_shorthands(property_id: u16) -> bool {
     PROPERTY_IS_LOGICAL_ALIAS[property_index(property_id)]
 }
 
+pub(crate) fn longhand_is_logical_alias(property_id: u16) -> bool {
+    debug_assert!((FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property_id));
+    property_is_logical_alias_including_shorthands(property_id)
+}
+
 pub(crate) fn property_is_in_logical_group(property_id: u16) -> bool {
-    PROPERTY_IS_LOGICAL_GROUP_MEMBER[property_index(property_id)]
+    property_logical_group(property_id).is_some()
+}
+
+pub(crate) fn property_logical_group(property_id: u16) -> Option<u8> {
+    match PROPERTY_LOGICAL_GROUPS[property_index(property_id)] {
+        0 => None,
+        group => Some(group),
+    }
 }
 
 /// Returns whether `a` wins a keyframe declaration conflict with `b`.

@@ -129,6 +129,12 @@ pub(crate) struct OwnedCollapsedTableBorders {
     pub(crate) vertical_edges: Vec<CollapsedBorderEdge>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableParticipantPreparation {
+    CreateUsedValues,
+    TrackPercentageDependenciesOnly,
+}
+
 fn grid_line_offsets(sizes: impl ExactSizeIterator<Item = CssPixels>) -> Vec<CssPixels> {
     let mut offsets = Vec::with_capacity(sizes.len() + 1);
     let mut offset = CssPixels::default();
@@ -646,6 +652,20 @@ pub(crate) struct TableGrid {
     pub(crate) occupancy: HashSet<(usize, usize)>,
 }
 
+pub(crate) struct TableInlineLayout {
+    table_box: Node,
+    table_constraints: ContainingBlockConstraints,
+    cells: Vec<TableCell>,
+    columns: Vec<Column>,
+    rows: Vec<Row>,
+}
+
+impl TableInlineLayout {
+    pub(crate) fn table_box(&self) -> Node {
+        self.table_box
+    }
+}
+
 fn matching_children<T: TableTree>(tree: &T, parent: Node, predicate: impl Fn(FfiDisplay) -> bool) -> Vec<Node> {
     let mut result = Vec::new();
     let mut child = tree.first_child(parent);
@@ -918,6 +938,52 @@ impl TableFormattingContext {
         }
     }
 
+    pub(super) fn take_inline_layout(&mut self) -> TableInlineLayout {
+        TableInlineLayout {
+            table_box: self.table_box,
+            table_constraints: self.table_constraints,
+            cells: std::mem::take(&mut self.cells),
+            columns: std::mem::take(&mut self.columns),
+            rows: std::mem::take(&mut self.rows),
+        }
+    }
+
+    fn reuse_inline_layout(&mut self, input: LayoutInput, layout: TableInlineLayout) -> bool {
+        if layout.table_box != self.table_box || layout.table_constraints != input.containing_block_constraints {
+            return false;
+        }
+
+        self.available_space = input.available_space;
+        self.table_constraints = input.containing_block_constraints;
+        self.participant_constraints = ContainingBlockConstraints {
+            percentage_basis_inline_size: self.table_constraints.percentage_basis_inline_size,
+            percentage_basis_block_size: if self.style(self.table_box).height().is_auto() {
+                None
+            } else {
+                self.table_constraints.percentage_basis_block_size
+            },
+            quirks_mode_percentage_basis_block_size: self.table_constraints.quirks_mode_percentage_basis_block_size,
+        };
+        self.cells = layout.cells;
+        self.columns = layout.columns;
+        self.rows = layout.rows;
+
+        // The wrapper sizing pass deliberately omits intrinsic row measurement. Reusing its
+        // inline result is only sufficient when the committing pass would omit it as well.
+        if !self.can_skip_row_intrinsic_measurement() {
+            return false;
+        }
+
+        self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
+        self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
+        self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
+        self.needs_fixed_mode_row_measurement = false;
+        self.prepare_table_participants(TableParticipantPreparation::CreateUsedValues);
+        self.border_conflict_resolution();
+        self.compute_table_inline_size();
+        true
+    }
+
     fn sizing(&self) -> sizing_context::SizingContext {
         sizing_context::SizingContext::new(self.purpose, self.records.clone(), self.callbacks)
     }
@@ -1167,17 +1233,18 @@ impl TableFormattingContext {
 
     // Participants resolve percentages against the table's input basis inside this context, so
     // their dependency is charged here rather than through child runs.
-    fn seed_table_participant_used_values(&mut self) {
-        let participants: Vec<Node> = self
-            .matching_children(self.table_box, |display| display.is_table_row_group_kind())
+    fn prepare_table_participants(&mut self, preparation: TableParticipantPreparation) {
+        let row_groups = self.matching_children(self.table_box, |display| display.is_table_row_group_kind());
+        let participants = row_groups
             .into_iter()
             .chain(self.rows.iter().map(|row| row.box_))
-            .chain(self.cells.iter().map(|cell| cell.box_))
-            .collect();
+            .chain(self.cells.iter().map(|cell| cell.box_));
         let sizing = self.sizing();
         let table_record = self.used_values(self.table_box);
         for participant in participants {
-            self.create_used_values(participant, self.participant_constraints);
+            if preparation == TableParticipantPreparation::CreateUsedValues {
+                self.create_used_values(participant, self.participant_constraints);
+            }
             if sizing.own_style_depends_on_percentage_block_size(participant) {
                 table_record
                     .has_descendant_that_depends_on_percentage_block_size
@@ -1263,9 +1330,9 @@ impl TableFormattingContext {
             let padding_block_end = style.padding_bottom().to_px(block_basis);
             let padding_inline_start = style.padding_left().to_px(inline_basis);
             let padding_inline_end = style.padding_right().to_px(inline_basis);
-            let used = self.used_values(cell.box_);
             // Implement the collapsing border model https://www.w3.org/TR/CSS22/tables.html#collapsing-borders.
             let (border_block_start, border_block_end, border_inline_start, border_inline_end) = if collapsed {
+                let used = self.used_values(cell.box_);
                 (
                     used.border_top_collapsed(true),
                     used.border_bottom_collapsed(true),
@@ -2005,7 +2072,15 @@ impl TableFormattingContext {
             },
             quirks_mode_percentage_basis_block_size: self.table_constraints.quirks_mode_percentage_basis_block_size,
         };
-        self.seed_table_participant_used_values();
+        let participant_preparation =
+            if skip_row_measurement && self.style(self.table_box).border_collapse() == BORDER_COLLAPSE_SEPARATE {
+                // OPTIMIZATION: Wrapper inline sizing measures cell contents in isolated measurement runs and does not
+                //               otherwise read participant UsedValues in the separated-borders model.
+                TableParticipantPreparation::TrackPercentageDependenciesOnly
+            } else {
+                TableParticipantPreparation::CreateUsedValues
+            };
+        self.prepare_table_participants(participant_preparation);
         self.border_conflict_resolution();
 
         let mut include_rows = !skip_row_measurement;
@@ -2066,7 +2141,7 @@ impl TableFormattingContext {
         {
             ChildLayoutOutcome::Created(result) => result.baselines,
             ChildLayoutOutcome::ReenterCurrent => {
-                self.run(run, layout_input);
+                self.run(run, layout_input, None);
                 self.used_values(cell.box_).content_baselines_from_cells()
             }
             ChildLayoutOutcome::Skipped => self.used_values(cell.box_).content_baselines_from_cells(),
@@ -2656,14 +2731,21 @@ impl TableFormattingContext {
         }
     }
 
-    pub(super) fn run(&mut self, run: &FormattingContextRun, input: LayoutInput) {
+    pub(super) fn run(
+        &mut self,
+        run: &FormattingContextRun,
+        input: LayoutInput,
+        inline_layout: Option<TableInlineLayout>,
+    ) {
         self.available_space = input.available_space;
         self.min_border_box_block_size_from_flex_item = input.sizing.forced_min_border_box_block_size;
         self.table_box_content_block_offset_in_wrapper = input
             .sizing
             .table_box_content_block_offset_in_wrapper
             .unwrap_or_default();
-        self.run_until_inline_size_calculation(input, false);
+        if inline_layout.is_none_or(|layout| !self.reuse_inline_layout(input, layout)) {
+            self.run_until_inline_size_calculation(input, false);
+        }
         if matches!(
             self.available_space.inline_size,
             AvailableSize::MinContent | AvailableSize::MaxContent

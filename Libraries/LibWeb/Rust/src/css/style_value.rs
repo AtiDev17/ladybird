@@ -428,6 +428,18 @@ fn replay_style_value_dependency_flags(value: *const StyleValueData) -> Option<u
     }
 }
 
+/// # Safety
+/// `value` must be null, a registered replay token, or point to a live `StyleValueData`.
+pub(crate) unsafe fn style_value_content_hash(value: *const StyleValueData) -> u64 {
+    if value.is_null() {
+        return 0;
+    }
+    if replay_style_value_dependency_flags(value).is_some() {
+        return value as usize as u64;
+    }
+    unsafe { &*value }.content_hash()
+}
+
 /// A strong reference to immutable Rust-owned style value data.
 #[repr(C)]
 pub struct RetainedStyleValueData {
@@ -4301,108 +4313,6 @@ pub unsafe extern "C" fn rust_style_value_equals(first: *const StyleValueData, s
     })
 }
 
-/// Diffs two finalized longhand tables after applying each style's animation overlay.
-///
-/// `first_properties` and `second_properties` map each output bit to the physical
-/// longhand read from the corresponding style. This keeps logical-property mapping
-/// in the C++ metadata layer while the value walk and equality checks stay in Rust.
-///
-/// # Safety
-/// The value arrays, property arrays, importance bitmaps and output bitmap must be
-/// valid for their supplied lengths. Every non-null value must point at live
-/// `StyleValueData`, and each overlay must be null or point at a live overlay.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_diff_effective_longhands(
-    first_values: *const *const std::ffi::c_void,
-    second_values: *const *const std::ffi::c_void,
-    first_properties: *const u16,
-    second_properties: *const u16,
-    property_count: usize,
-    first_overlay: *const std::ffi::c_void,
-    second_overlay: *const std::ffi::c_void,
-    first_importance: *const u8,
-    second_importance: *const u8,
-    importance_byte_count: usize,
-    changed_properties: *mut u8,
-    changed_property_byte_count: usize,
-) -> bool {
-    abort_on_panic(|| {
-        use crate::css::animated_overlay::overlay_wins;
-        use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID};
-
-        if property_count == 0
-            || first_values.is_null()
-            || second_values.is_null()
-            || first_properties.is_null()
-            || second_properties.is_null()
-            || first_importance.is_null()
-            || second_importance.is_null()
-            || changed_properties.is_null()
-            || importance_byte_count < property_count.div_ceil(8)
-            || changed_property_byte_count < property_count.div_ceil(8)
-        {
-            return false;
-        }
-
-        let first_values = unsafe { std::slice::from_raw_parts(first_values, property_count) };
-        let second_values = unsafe { std::slice::from_raw_parts(second_values, property_count) };
-        let first_properties = unsafe { std::slice::from_raw_parts(first_properties, property_count) };
-        let second_properties = unsafe { std::slice::from_raw_parts(second_properties, property_count) };
-        let first_importance = unsafe { std::slice::from_raw_parts(first_importance, importance_byte_count) };
-        let second_importance = unsafe { std::slice::from_raw_parts(second_importance, importance_byte_count) };
-        let changed_properties =
-            unsafe { std::slice::from_raw_parts_mut(changed_properties, changed_property_byte_count) };
-        changed_properties.fill(0);
-
-        let first_overlay = unsafe {
-            first_overlay
-                .cast::<crate::css::animated_overlay::AnimatedOverlay>()
-                .as_ref()
-        };
-        let second_overlay = unsafe {
-            second_overlay
-                .cast::<crate::css::animated_overlay::AnimatedOverlay>()
-                .as_ref()
-        };
-        let effective_value = |values: &[*const std::ffi::c_void],
-                               overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
-                               importance: &[u8],
-                               property: u16|
-         -> Option<*const StyleValueData> {
-            if !(FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property) {
-                return None;
-            }
-            let index = usize::from(property - FIRST_LONGHAND_PROPERTY_ID);
-            let important = importance[index / 8] & (1 << (index % 8)) != 0;
-            if let Some(entry) = overlay.and_then(|overlay| overlay.get(property))
-                && overlay_wins(entry, important)
-            {
-                return Some(entry.value.pointer());
-            }
-            Some(values[index].cast())
-        };
-
-        for index in 0..property_count {
-            let Some(first) = effective_value(first_values, first_overlay, first_importance, first_properties[index])
-            else {
-                return false;
-            };
-            let Some(second) = effective_value(
-                second_values,
-                second_overlay,
-                second_importance,
-                second_properties[index],
-            ) else {
-                return false;
-            };
-            if first != second && !unsafe { rust_style_value_equals(first, second) } {
-                changed_properties[index / 8] |= 1 << (index % 8);
-            }
-        }
-        true
-    })
-}
-
 /// Retains one reference to a shared style value allocation.
 ///
 /// # Safety
@@ -4480,16 +4390,15 @@ mod replay_tests {
 }
 
 /// Whether a value's computed color depends on the element's used currentcolor: the
-/// currentcolor keyword itself, or a color function, color-mix(), contrast-color() or
-/// light-dark() whose nested colors do.
+/// currentcolor keyword itself, a color function whose nested colors do, or an Effects
+/// list whose shadow or filter colors do.
 pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     let retained_data_depends =
-        |retained: &RetainedStyleValueData| -> bool { value_depends_on_current_color(retained.data()) };
+        |retained: &RetainedStyleValueData| retained.optional_data().is_some_and(value_depends_on_current_color);
+    let list_depends = |values: &RetainedStyleValueDataList| values.as_slice().iter().any(retained_data_depends);
     match value {
         StyleValueData::Keyword { keyword } => *keyword == crate::css::style_compute::keyword::CURRENTCOLOR,
-        StyleValueData::ColorFunction { origin_color, .. } => {
-            origin_color.optional_data().is_some_and(value_depends_on_current_color)
-        }
+        StyleValueData::ColorFunction { origin_color, .. } => retained_data_depends(origin_color),
         StyleValueData::ColorMix {
             first_color,
             second_color,
@@ -4497,6 +4406,9 @@ pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
         } => retained_data_depends(first_color) || retained_data_depends(second_color),
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
+        StyleValueData::Shadow { color, .. } => retained_data_depends(color),
+        StyleValueData::Filter { value, .. } => retained_data_depends(value),
+        StyleValueData::ValueList { values, .. } => list_depends(values),
         _ => false,
     }
 }
