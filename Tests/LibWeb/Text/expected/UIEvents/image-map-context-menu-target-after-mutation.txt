@@ -1,0 +1,5 @@
+removed: page target=DIV#behind-removed
+removed-over-link: link target=A#behind-link
+moved: page target=DIV#behind-moved
+hidden: page target=DIV#behind-hidden
+restyled: image target=IMG#img-restyled
