@@ -565,28 +565,15 @@ void CompositorState::resume_presentation_after_becoming_visible(Web::Compositor
             vsync_scheduler_for_display(display_id_for_context(context)).schedule(display_refresh_rate_for_context(context));
     }
 
-    auto frame_rect_to_present = root_context.pending_present_frame_viewport_rect();
-    if (!frame_rect_to_present.has_value())
-        frame_rect_to_present = root_context.current_frame_rect_to_present();
-    if (frame_rect_to_present.has_value())
+    if (auto frame_rect_to_present = root_context.frame_rect_to_repaint(); frame_rect_to_present.has_value())
         schedule_present_frame(root_context_id, root_context, *frame_rect_to_present);
 }
 
-void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)
 {
     auto* context = context_if_present(context_id);
     VERIFY(context);
-    if (context->should_defer_main_thread_present_for_async_scroll()) {
-        dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread deferred present while async scroll is pending");
-        // NB: The in-flight compositor frame may have been rasterized before the
-        //     main thread installed its new display list. Preserve the present as
-        //     a full repaint so that it uses both the new list and the latest
-        //     compositor scroll state once presentation is unblocked.
-        schedule_present_frame(context_id, *context, viewport_rect);
-        return;
-    }
-    damage_rect.intersect({ {}, viewport_rect.size() });
-    schedule_present_frame(context_id, *context, ContextState::PendingFrame { viewport_rect, damage_rect });
+    schedule_present_frame(context_id, *context, ContextState::PendingFrame { viewport_rect, {} });
 }
 
 void CompositorState::present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, ContextState::PendingFrame pending_frame)
@@ -596,7 +583,7 @@ void CompositorState::present_frame(Web::Compositor::CompositorContextId context
     if (!prepared_frame.has_value())
         return;
 
-    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, pending_frame.damage_rect, prepared_frame->bitmap_id);
+    m_pending_async_presents.append(context_id, pending_frame.viewport_rect, prepared_frame->damage_rect, prepared_frame->bitmap_id);
     auto* pending_present = &m_pending_async_presents.last();
 
     auto& event_loop = Core::EventLoop::current();
@@ -618,10 +605,7 @@ void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextI
 
 void CompositorState::schedule_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context, Gfx::IntRect viewport_rect)
 {
-    schedule_present_frame(context_id, context, ContextState::PendingFrame {
-                                                    .viewport_rect = viewport_rect,
-                                                    .damage_rect = { {}, viewport_rect.size() },
-                                                });
+    schedule_present_frame(context_id, context, ContextState::PendingFrame::repainting_everything(viewport_rect));
 }
 
 void CompositorState::schedule_pending_present_frame(Web::Compositor::CompositorContextId context_id, ContextState& context)
@@ -694,10 +678,7 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id)
             continue;
 
         if (auto animation_frame = context.advance_smooth_scroll_animations(now); animation_frame.has_value())
-            context.queue_present_frame({
-                .viewport_rect = *animation_frame,
-                .damage_rect = { {}, animation_frame->size() },
-            });
+            context.queue_present_frame(ContextState::PendingFrame::repainting_changes(*animation_frame));
 
         auto pending_present_frame = context.take_pending_present_frame_if_unblocked();
         if (!pending_present_frame.has_value()) {
@@ -707,7 +688,7 @@ void CompositorState::present_pending_frames_on_vsync(Optional<u64> display_id)
             continue;
         }
         if (context.has_active_smooth_scroll_animations())
-            schedule_present_frame(context_id, context, pending_present_frame->viewport_rect);
+            schedule_present_frame(context_id, context, ContextState::PendingFrame::repainting_changes(pending_present_frame->viewport_rect));
         present_frame(context_id, context, *pending_present_frame);
     }
 }
@@ -924,10 +905,7 @@ void CompositorState::shrink_backing_stores_after_resize(Web::Compositor::Compos
 
 void CompositorState::present_current_frame(Web::Compositor::CompositorContextId context_id, ContextState& context)
 {
-    // A queued frame already captures the newest viewport rect and will pick up
-    // the updated resource when the outstanding bitmap is acknowledged.
-    auto frame_to_present = context.current_frame_rect_to_present();
-    if (frame_to_present.has_value())
+    if (auto frame_to_present = context.frame_rect_to_repaint(); frame_to_present.has_value())
         schedule_present_frame(context_id, context, *frame_to_present);
 }
 

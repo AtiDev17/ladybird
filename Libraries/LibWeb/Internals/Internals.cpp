@@ -1663,6 +1663,7 @@ Utf16String Internals::async_scrolling_state_wheel_target_at(double x, double y,
     scroll_tree.rebuild_wheel_hit_test_targets(snapshot->display_list, &snapshot->visual_context_tree, snapshot->document->scroll_state_snapshot());
 
     auto target = scroll_tree.hit_test_scroll_node_for_wheel(
+        snapshot->visual_context_tree,
         { static_cast<float>(x), static_cast<float>(y) },
         { static_cast<float>(delta_x), static_cast<float>(delta_y) },
         Compositor::snap_container_handling_for(wheel_delta_precision_from(precise), scroll_gesture_phase_from(phase)));
@@ -1745,6 +1746,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
 {
     auto& realm = HTML::relevant_realm(window());
     auto const& counters = style_invalidation_counters();
+    auto& document = window().associated_document();
     auto object = JS::Object::create(realm, nullptr);
     object->define_direct_property("styleEnvironmentVersion"_utf16_fly_string, JS::Value(window().associated_document().style_environment_version()), JS::default_attributes);
     object->define_direct_property("styleEngineReactionBatchRuns"_utf16_fly_string, JS::Value(counters.style_engine_reaction_batch_runs), JS::default_attributes);
@@ -1765,6 +1767,7 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("elementInheritedStyleGroupSwaps"_utf16_fly_string, JS::Value(counters.element_inherited_style_group_swaps), JS::default_attributes);
     object->define_direct_property("animatedStyleReconstructionFallbacks"_utf16_fly_string, JS::Value(counters.animated_style_reconstruction_fallbacks), JS::default_attributes);
     object->define_direct_property("animatedStyleOverlayBuilds"_utf16_fly_string, JS::Value(counters.animated_style_overlay_builds), JS::default_attributes);
+    object->define_direct_property("associatedAnimations"_utf16_fly_string, JS::Value(document.associated_animation_count()), JS::default_attributes);
     object->define_direct_property("animatedStyleFullBuilds"_utf16_fly_string, JS::Value(counters.animated_style_full_builds), JS::default_attributes);
     object->define_direct_property("baseStylePartialBuilds"_utf16_fly_string, JS::Value(counters.base_style_partial_builds), JS::default_attributes);
     object->define_direct_property("baseStyleFullBuilds"_utf16_fly_string, JS::Value(counters.base_style_full_builds), JS::default_attributes);
