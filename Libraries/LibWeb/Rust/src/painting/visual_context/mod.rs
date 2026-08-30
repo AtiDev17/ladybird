@@ -12,45 +12,19 @@ pub mod node_values;
 pub mod refresh;
 pub mod scroll_state;
 
+use std::collections::HashMap;
+
 use crate::painting::display_list::commands::OptionalF32;
 use crate::painting::paintable_data::BorderEdge;
 use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, MaskKind,
-    WindingRule,
+    WindingRule, translation_matrix,
 };
 use scroll_state::{NO_SCROLL_STATE_SLOT, ScrollStateSlot};
-use std::ffi::c_void;
 
 pub use crate::painting::display_list::commands::{
     ContextRef, FrameNodeIndex, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX,
 };
-
-pub struct FilterHandle {
-    raw: *mut c_void,
-}
-
-unsafe extern "C" {
-    fn ladybird_gfx_filter_destroy(filter: *mut c_void);
-}
-
-impl FilterHandle {
-    /// # Safety
-    ///
-    /// `raw` must be a heap-allocated `Gfx::Filter` owned by nobody else.
-    pub unsafe fn adopt(raw: *mut c_void) -> Self {
-        Self { raw }
-    }
-    pub fn as_raw(&self) -> *mut c_void {
-        self.raw
-    }
-}
-
-impl Drop for FilterHandle {
-    fn drop(&mut self) {
-        // SAFETY: adopt() took sole ownership of the filter.
-        unsafe { ladybird_gfx_filter_destroy(self.raw) };
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -67,6 +41,14 @@ pub struct TransformData {
     pub flattens_inherited_transform: bool,
     pub role: TransformDataRole,
     pub synthetic_plane: bool,
+}
+
+impl TransformData {
+    pub fn matrix_including_origin(&self) -> FloatMatrix4x4 {
+        translation_matrix(self.origin.x, self.origin.y, 0.0)
+            .multiplied(self.matrix)
+            .multiplied(translation_matrix(-self.origin.x, -self.origin.y, 0.0))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,19 +81,12 @@ pub struct ClipPathData {
     pub path: std::rc::Rc<libgfx_rust::path::OwnedPath>,
     pub bounding_rect: IntRect,
     pub fill_rule: WindingRule,
-    pub path_bounds_are_empty: bool,
 }
 
 pub struct EffectsData {
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
-    pub filter: Option<EffectsFilter>,
-}
-
-#[derive(Clone)]
-pub enum EffectsFilter {
-    Bytes(std::rc::Rc<Vec<u8>>),
-    Host(std::rc::Rc<FilterHandle>),
+    pub filter: Option<std::rc::Rc<Vec<u8>>>,
 }
 
 impl FrameData {
@@ -209,6 +184,41 @@ pub struct AnchorScrollShift {
     pub compensate_vertical_scroll: bool,
 }
 
+impl AnchorScrollShift {
+    pub fn masked_offset(&self, scroll_offsets: &[FloatPoint]) -> FloatPoint {
+        let mut offset = device_offset_for_index(scroll_offsets, self.scroll_node_index);
+        if !self.compensate_horizontal_scroll {
+            offset.x = 0.0;
+        }
+        if !self.compensate_vertical_scroll {
+            offset.y = 0.0;
+        }
+        if self.negate {
+            FloatPoint {
+                x: -offset.x,
+                y: -offset.y,
+            }
+        } else {
+            offset
+        }
+    }
+}
+
+pub fn device_offset_for_index(scroll_offsets: &[FloatPoint], index: SpatialNodeIndex) -> FloatPoint {
+    scroll_offsets.get(index.0 as usize).copied().unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncludeVisualViewportTransform {
+    No,
+    Yes,
+}
+
+struct LocalSpatialMatrix {
+    matrix: FloatMatrix4x4,
+    flattens_inherited_transform: bool,
+}
+
 pub enum SpatialData {
     Scroll(ScrollData),
     Sticky(StickyData),
@@ -251,15 +261,6 @@ impl FrameData {
             Self::ClipPath(_) => FfiVisualContextNodeKind::ClipPath,
             Self::Effects(_) => FfiVisualContextNodeKind::Effects,
             Self::Mask(_) => FfiVisualContextNodeKind::Mask,
-        }
-    }
-
-    fn is_empty_clip(&self) -> bool {
-        match self {
-            Self::Clip(clip) => clip.mode == ClipMode::Intersect && clip.rect.is_empty(),
-            Self::ClipPath(clip_path) => clip_path.path_bounds_are_empty,
-            Self::Mask(mask) => mask.rect.is_empty(),
-            Self::Effects(_) => false,
         }
     }
 }
@@ -332,8 +333,101 @@ pub struct FrameNode {
     pub data: FrameData,
     pub parent: FrameNodeIndex,
     pub spatial: SpatialNodeIndex,
-    pub has_empty_effective_clip: bool,
     pub role: FrameRole,
+}
+
+// Marks a spatial node whose content belongs to no 3D rendering context.
+pub const NO_SORTING_CONTEXT: SpatialNodeIndex = SpatialNodeIndex(u32::MAX);
+
+// The plane and 3D rendering context that an established context's own plane renders into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortingContextLink {
+    pub parent_context: SpatialNodeIndex,
+    pub parent_leaf: SpatialNodeIndex,
+}
+
+// Per-spatial-node 3D rendering context membership: the plane each node's content renders into and the context that
+// sorts that plane. A tree without 3D rendering contexts resolves to empty per-node vectors.
+#[derive(Default)]
+pub struct SortingContexts {
+    pub links: HashMap<u32, SortingContextLink>,
+    pub leaf_by_node: Vec<SpatialNodeIndex>,
+    pub context_by_node: Vec<SpatialNodeIndex>,
+}
+
+impl SortingContexts {
+    pub fn is_empty(&self) -> bool {
+        self.leaf_by_node.is_empty()
+    }
+
+    pub fn outermost_context_of(&self, mut context: SpatialNodeIndex) -> SpatialNodeIndex {
+        loop {
+            let Some(link) = self.links.get(&context.0) else {
+                return context;
+            };
+            if link.parent_context == NO_SORTING_CONTEXT {
+                return context;
+            }
+            context = link.parent_context;
+        }
+    }
+}
+
+pub fn resolve_sorting_contexts_over_nodes(
+    node_count: usize,
+    parent_and_sorting_context_root_of_node: impl Fn(usize) -> (SpatialNodeIndex, Option<SpatialNodeIndex>),
+) -> SortingContexts {
+    let mut is_sorting_context_root = vec![false; node_count];
+    let mut has_sorting_context_roots = false;
+    for index in 0..node_count {
+        let (_, sorting_context_root) = parent_and_sorting_context_root_of_node(index);
+        if let Some(root) = sorting_context_root {
+            is_sorting_context_root[root.0 as usize] = true;
+            has_sorting_context_roots = true;
+        }
+    }
+    if !has_sorting_context_roots {
+        return SortingContexts::default();
+    }
+
+    // Roots always precede their contexts' nodes, so a single forward walk resolves every node.
+    let mut contexts = SortingContexts {
+        links: HashMap::new(),
+        leaf_by_node: Vec::with_capacity(node_count),
+        context_by_node: Vec::with_capacity(node_count),
+    };
+    for (index, is_sorting_context_root) in is_sorting_context_root.iter().copied().enumerate() {
+        let spatial_index = SpatialNodeIndex(index as u32);
+        let (parent, sorting_context_root) = parent_and_sorting_context_root_of_node(index);
+        let inherited_leaf = if index == 0 {
+            NO_SORTING_CONTEXT
+        } else {
+            contexts.leaf_by_node[parent.0 as usize]
+        };
+        let inherited_context = if index == 0 {
+            NO_SORTING_CONTEXT
+        } else {
+            contexts.context_by_node[parent.0 as usize]
+        };
+        if let Some(root) = sorting_context_root {
+            contexts.leaf_by_node.push(spatial_index);
+            contexts.context_by_node.push(root);
+        } else if is_sorting_context_root {
+            contexts.links.insert(
+                spatial_index.0,
+                SortingContextLink {
+                    parent_context: inherited_context,
+                    parent_leaf: inherited_leaf,
+                },
+            );
+            contexts.leaf_by_node.push(spatial_index);
+            contexts.context_by_node.push(spatial_index);
+        } else {
+            contexts.leaf_by_node.push(inherited_leaf);
+            contexts.context_by_node.push(inherited_context);
+        }
+    }
+    contexts
 }
 
 #[derive(Default)]
@@ -427,15 +521,11 @@ impl VisualContextTree {
         role: FrameRole,
     ) -> FrameNodeIndex {
         assert!((spatial.0 as usize) < self.spatial_nodes.len());
-        let inherited_empty_clip = if parent.is_none() {
-            false
-        } else {
+        if !parent.is_none() {
             let parent_node = &self.frame_nodes[parent.0 as usize];
             debug_assert!(self.spatial_is_ancestor_or_self(parent_node.spatial, spatial));
-            parent_node.has_empty_effective_clip
-        };
+        }
         self.frame_nodes.push(FrameNode {
-            has_empty_effective_clip: inherited_empty_clip || data.is_empty_clip(),
             data,
             parent,
             spatial,
@@ -484,9 +574,114 @@ impl VisualContextTree {
                 .all(|(node, other_node)| {
                     node.parent == other_node.parent
                         && node.spatial == other_node.spatial
-                        && node.has_empty_effective_clip == other_node.has_empty_effective_clip
                         && node.data.kind() == other_node.data.kind()
                 })
+    }
+
+    fn ancestor_chain(&self, index: SpatialNodeIndex) -> Vec<SpatialNodeIndex> {
+        assert!((index.0 as usize) < self.spatial_nodes.len());
+        let mut chain = Vec::with_capacity(8);
+        let mut current = index;
+        loop {
+            chain.push(current);
+            if current == VISUAL_VIEWPORT_NODE_INDEX {
+                break;
+            }
+            current = self.spatial_nodes[current.0 as usize].parent;
+        }
+        chain
+    }
+
+    fn local_spatial_matrix(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> LocalSpatialMatrix {
+        let translation = |offset: FloatPoint| LocalSpatialMatrix {
+            matrix: translation_matrix(offset.x, offset.y, 0.0),
+            flattens_inherited_transform: false,
+        };
+        match &self.spatial_nodes[index.0 as usize].data {
+            SpatialData::Transform(transform) => LocalSpatialMatrix {
+                matrix: transform.matrix_including_origin(),
+                flattens_inherited_transform: transform.flattens_inherited_transform,
+            },
+            SpatialData::Perspective(perspective) => LocalSpatialMatrix {
+                matrix: perspective.matrix,
+                flattens_inherited_transform: perspective.flattens_inherited_transform,
+            },
+            SpatialData::Scroll(_) | SpatialData::Sticky(_) => {
+                translation(device_offset_for_index(scroll_offsets, index))
+            }
+            SpatialData::AnchorScrollShift(shift) => translation(shift.masked_offset(scroll_offsets)),
+            SpatialData::BackfaceVisibility(backface) => LocalSpatialMatrix {
+                matrix: FloatMatrix4x4::identity(),
+                flattens_inherited_transform: backface.flattens_inherited_transform,
+            },
+        }
+    }
+
+    pub fn accumulated_matrix(
+        &self,
+        index: SpatialNodeIndex,
+        scroll_offsets: &[FloatPoint],
+        include_visual_viewport_transform: IncludeVisualViewportTransform,
+    ) -> FloatMatrix4x4 {
+        let chain = self.ancestor_chain(index);
+        let mut matrix = FloatMatrix4x4::identity();
+        for node_index in chain.into_iter().rev() {
+            if node_index == VISUAL_VIEWPORT_NODE_INDEX
+                && self.root_is_visual_viewport
+                && include_visual_viewport_transform == IncludeVisualViewportTransform::No
+            {
+                continue;
+            }
+            let local = self.local_spatial_matrix(node_index, scroll_offsets);
+            let inherited = if local.flattens_inherited_transform {
+                matrix.flattened()
+            } else {
+                matrix
+            };
+            matrix = inherited.multiplied(local.matrix);
+        }
+        matrix
+    }
+
+    pub fn accumulated_2d_scale(
+        &self,
+        index: SpatialNodeIndex,
+        scroll_offsets: &[FloatPoint],
+        include_visual_viewport_transform: IncludeVisualViewportTransform,
+    ) -> FloatSize {
+        let affine = self
+            .accumulated_matrix(index, scroll_offsets, include_visual_viewport_transform)
+            .extract_2d_affine();
+        FloatSize {
+            width: affine.x_scale(),
+            height: affine.y_scale(),
+        }
+    }
+
+    pub fn plane_depth_at_point_for_hit_test(
+        &self,
+        plane_node_index: SpatialNodeIndex,
+        screen_point: FloatPoint,
+        scroll_offsets: &[FloatPoint],
+    ) -> Option<f32> {
+        let inverse = self
+            .accumulated_matrix(plane_node_index, scroll_offsets, IncludeVisualViewportTransform::Yes)
+            .inverse()?;
+        let matrix = &inverse.elements;
+        let depth = -(screen_point.x * matrix[2][0] + screen_point.y * matrix[2][1] + matrix[2][3]) / matrix[2][2];
+        depth.is_finite().then_some(depth)
+    }
+
+    pub fn resolve_sorting_contexts(&self) -> SortingContexts {
+        resolve_sorting_contexts_over_nodes(self.spatial_nodes.len(), |index| {
+            let node = &self.spatial_nodes[index];
+            let sorting_context_root = if let SpatialData::Transform(transform) = &node.data {
+                transform.sorting_context_root_index
+            } else {
+                None
+            };
+            (node.parent, sorting_context_root)
+        })
     }
 
     pub fn scroll_state_slot_for_node(&self, index: SpatialNodeIndex) -> ScrollStateSlot {
@@ -498,13 +693,6 @@ impl VisualContextTree {
             SpatialData::Sticky(sticky) => sticky.state_slot,
             _ => panic!("spatial node {} is not a scroll-like node", index.0),
         }
-    }
-
-    pub fn empty_effective_clips_by_frame(&self) -> Vec<bool> {
-        self.frame_nodes
-            .iter()
-            .map(|node| node.has_empty_effective_clip)
-            .collect()
     }
 }
 
@@ -527,7 +715,6 @@ fn empty_export(
         clip_mode: ClipMode::Intersect,
         opacity: 1.0,
         blend_mode: CompositingAndBlendingOperator::Normal,
-        filter: std::ptr::null_mut(),
         filter_bytes: std::ptr::null(),
         filter_bytes_length: 0,
         path: std::ptr::null_mut(),
@@ -616,14 +803,9 @@ pub fn export_frame_node(node: &FrameNode) -> crate::painting::host::FfiVisualCo
         FrameData::Effects(effects) => {
             out.opacity = effects.opacity;
             out.blend_mode = effects.blend_mode;
-            if let Some(filter) = &effects.filter {
-                match filter {
-                    EffectsFilter::Bytes(bytes) => {
-                        out.filter_bytes = bytes.as_ptr();
-                        out.filter_bytes_length = bytes.len();
-                    }
-                    EffectsFilter::Host(filter) => out.filter = filter.as_raw(),
-                }
+            if let Some(bytes) = &effects.filter {
+                out.filter_bytes = bytes.as_ptr();
+                out.filter_bytes_length = bytes.len();
             }
         }
         FrameData::Mask(mask) => {
@@ -633,4 +815,344 @@ pub fn export_frame_node(node: &FrameNode) -> crate::painting::host::FfiVisualCo
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libgfx_rust::translation_matrix;
+
+    fn transform(translation: f32) -> TransformData {
+        TransformData {
+            matrix: translation_matrix(translation, translation, 0.0),
+            origin: FloatPoint {
+                x: translation,
+                y: translation,
+            },
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+        }
+    }
+
+    fn tree() -> VisualContextTree {
+        VisualContextTree::create(transform(0.0))
+    }
+
+    fn effects() -> FrameData {
+        FrameData::Effects(EffectsData {
+            opacity: 1.0,
+            blend_mode: CompositingAndBlendingOperator::Normal,
+            filter: None,
+        })
+    }
+
+    fn mask(rect: IntRect) -> FrameData {
+        FrameData::Mask(MaskData {
+            rect,
+            kind: MaskKind::Alpha,
+            origin: MaskLayerOrigin::CssMaskLayers,
+        })
+    }
+
+    fn clip(rect: FloatRect, mode: ClipMode) -> FrameData {
+        FrameData::Clip(ClipData {
+            rect,
+            corner_radii: CornerRadii::default(),
+            mode,
+        })
+    }
+
+    fn sorting_transform(root: SpatialNodeIndex) -> TransformData {
+        TransformData {
+            sorting_context_root_index: Some(root),
+            ..transform(0.0)
+        }
+    }
+
+    #[test]
+    fn trees_with_the_same_structure_are_compatible() {
+        let mut tree = VisualContextTree::create(transform(1.0));
+        tree.append_spatial(SpatialData::Transform(transform(2.0)), VISUAL_VIEWPORT_NODE_INDEX);
+
+        let mut updated_tree = VisualContextTree::create(transform(3.0));
+        updated_tree.append_spatial(SpatialData::Transform(transform(4.0)), VISUAL_VIEWPORT_NODE_INDEX);
+
+        assert!(updated_tree.is_compatible_with(&tree));
+    }
+
+    #[test]
+    fn compatibility_requires_the_same_shape() {
+        let mut reference = tree();
+        reference.append_spatial(SpatialData::Transform(transform(1.0)), VISUAL_VIEWPORT_NODE_INDEX);
+
+        let shorter_tree = tree();
+        assert!(!shorter_tree.is_compatible_with(&reference));
+
+        let mut different_type_tree = tree();
+        different_type_tree.append_spatial(
+            SpatialData::Perspective(PerspectiveData {
+                matrix: FloatMatrix4x4::identity(),
+                flattens_inherited_transform: false,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert!(!different_type_tree.is_compatible_with(&reference));
+
+        let mut frame_tree = tree();
+        frame_tree.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(!frame_tree.is_compatible_with(&reference));
+
+        let mut mask_tree = tree();
+        mask_tree.append_frame(
+            mask(IntRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }),
+            FrameNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert!(!mask_tree.is_compatible_with(&frame_tree));
+
+        let mut different_parent_tree = tree();
+        let parent =
+            different_parent_tree.append_spatial(SpatialData::Transform(transform(1.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        different_parent_tree.append_spatial(SpatialData::Transform(transform(2.0)), parent);
+
+        let mut same_node_count_tree = tree();
+        same_node_count_tree.append_spatial(SpatialData::Transform(transform(1.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        same_node_count_tree.append_spatial(SpatialData::Transform(transform(2.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(!different_parent_tree.is_compatible_with(&same_node_count_tree));
+
+        let mut frame_under_root_tree = tree();
+        let frame_under_root_spatial =
+            frame_under_root_tree.append_spatial(SpatialData::Transform(transform(1.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        frame_under_root_tree.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+
+        let mut frame_under_transform_tree = tree();
+        let frame_under_transform_spatial = frame_under_transform_tree
+            .append_spatial(SpatialData::Transform(transform(1.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        frame_under_transform_tree.append_frame(effects(), FrameNodeIndex::NONE, frame_under_transform_spatial);
+
+        assert_eq!(frame_under_root_spatial, frame_under_transform_spatial);
+        assert!(!frame_under_root_tree.is_compatible_with(&frame_under_transform_tree));
+    }
+
+    #[test]
+    fn compatibility_requires_the_same_root_isolation_frame() {
+        let mut isolated = tree();
+        let isolation_frame = isolated.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        isolated.root_isolation_frame = Some(isolation_frame);
+
+        let mut not_isolated = tree();
+        not_isolated.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(!isolated.is_compatible_with(&not_isolated));
+
+        let mut also_isolated = tree();
+        let also_isolation_frame =
+            also_isolated.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        also_isolated.root_isolation_frame = Some(also_isolation_frame);
+        assert!(isolated.is_compatible_with(&also_isolated));
+    }
+
+    fn scaled(scale: f32) -> TransformData {
+        TransformData {
+            matrix: libgfx_rust::scale_matrix(scale, scale, 1.0),
+            ..transform(0.0)
+        }
+    }
+
+    #[test]
+    fn accumulated_matrix_composes_the_root_path_and_may_leave_out_the_visual_viewport() {
+        let mut tree = VisualContextTree::create(scaled(2.0));
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: NO_SCROLL_STATE_SLOT,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let child = tree.append_spatial(SpatialData::Transform(scaled(3.0)), scroll);
+        let scroll_offsets = [FloatPoint::default(), FloatPoint { x: -10.0, y: -20.0 }];
+
+        let without_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::No);
+        assert_eq!(
+            without_viewport,
+            translation_matrix(-10.0, -20.0, 0.0).multiplied(libgfx_rust::scale_matrix(3.0, 3.0, 1.0))
+        );
+        let with_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::Yes);
+        assert_eq!(
+            with_viewport,
+            libgfx_rust::scale_matrix(2.0, 2.0, 1.0).multiplied(without_viewport)
+        );
+
+        assert_eq!(
+            tree.accumulated_2d_scale(child, &scroll_offsets, IncludeVisualViewportTransform::No),
+            FloatSize {
+                width: 3.0,
+                height: 3.0
+            }
+        );
+        assert_eq!(
+            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::Yes),
+            FloatSize {
+                width: 6.0,
+                height: 6.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_content_root_is_always_included() {
+        let mut tree = VisualContextTree::create_with_content_root(scaled(2.0));
+        let child = tree.append_spatial(SpatialData::Transform(scaled(3.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        assert_eq!(
+            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::No),
+            FloatSize {
+                width: 6.0,
+                height: 6.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_transform_origin_does_not_change_the_accumulated_scale() {
+        let mut tree = VisualContextTree::create(transform(0.0));
+        let child = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                origin: FloatPoint { x: 50.0, y: 50.0 },
+                ..scaled(2.0)
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let matrix = tree.accumulated_matrix(child, &[], IncludeVisualViewportTransform::No);
+        assert_eq!(matrix.map_vector4([50.0, 50.0, 0.0, 1.0]), [50.0, 50.0, 0.0, 1.0]);
+        assert_eq!(matrix.map_vector4([0.0, 0.0, 0.0, 1.0]), [-50.0, -50.0, 0.0, 1.0]);
+        assert_eq!(
+            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::No),
+            FloatSize {
+                width: 2.0,
+                height: 2.0
+            }
+        );
+    }
+    #[test]
+    fn a_tree_without_sorting_context_roots_resolves_to_empty_contexts() {
+        assert!(tree().resolve_sorting_contexts().is_empty());
+    }
+
+    #[test]
+    fn sorting_context_membership_is_resolved_for_participants_descendants_and_outsiders() {
+        let mut tree = tree();
+        let context_root = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let participating_transform =
+            tree.append_spatial(SpatialData::Transform(sorting_transform(context_root)), context_root);
+        let plain_descendant = tree.append_spatial(SpatialData::Transform(transform(0.0)), participating_transform);
+        let outside_context = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+
+        let contexts = tree.resolve_sorting_contexts();
+        assert!(!contexts.is_empty());
+        assert_eq!(contexts.leaf_by_node[context_root.0 as usize], context_root);
+        assert_eq!(contexts.context_by_node[context_root.0 as usize], context_root);
+        assert_eq!(
+            contexts.leaf_by_node[participating_transform.0 as usize],
+            participating_transform
+        );
+        assert_eq!(
+            contexts.context_by_node[participating_transform.0 as usize],
+            context_root
+        );
+        assert_eq!(
+            contexts.leaf_by_node[plain_descendant.0 as usize],
+            participating_transform
+        );
+        assert_eq!(contexts.context_by_node[plain_descendant.0 as usize], context_root);
+        assert_eq!(contexts.leaf_by_node[outside_context.0 as usize], NO_SORTING_CONTEXT);
+        assert_eq!(contexts.context_by_node[outside_context.0 as usize], NO_SORTING_CONTEXT);
+    }
+
+    #[test]
+    fn nested_sorting_contexts_link_to_the_inherited_context_and_leaf() {
+        let mut tree = tree();
+        let outer_context = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let outer_leaf = tree.append_spatial(SpatialData::Transform(sorting_transform(outer_context)), outer_context);
+        let inner_context = tree.append_spatial(SpatialData::Transform(transform(0.0)), outer_leaf);
+        tree.append_spatial(SpatialData::Transform(sorting_transform(inner_context)), inner_context);
+
+        let contexts = tree.resolve_sorting_contexts();
+        assert_eq!(
+            contexts.links.get(&inner_context.0),
+            Some(&SortingContextLink {
+                parent_context: outer_context,
+                parent_leaf: outer_leaf,
+            })
+        );
+        assert_eq!(contexts.outermost_context_of(inner_context), outer_context);
+    }
+
+    #[test]
+    fn an_untransformed_plane_has_zero_depth() {
+        let tree = tree();
+        assert_eq!(
+            tree.plane_depth_at_point_for_hit_test(VISUAL_VIEWPORT_NODE_INDEX, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn a_plane_translated_in_z_has_the_translated_depth() {
+        let mut tree = tree();
+        let plane = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                matrix: translation_matrix(0.0, 0.0, 75.0),
+                ..transform(0.0)
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert_eq!(
+            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            Some(75.0)
+        );
+    }
+
+    #[test]
+    fn a_perspective_chain_projects_the_plane_depth() {
+        let mut tree = tree();
+        let perspective = tree.append_spatial(
+            SpatialData::Perspective(PerspectiveData {
+                matrix: libgfx_rust::perspective_matrix(1000.0),
+                flattens_inherited_transform: false,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let plane = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                matrix: translation_matrix(0.0, 0.0, 100.0),
+                ..transform(0.0)
+            }),
+            perspective,
+        );
+        let depth = tree
+            .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[])
+            .unwrap();
+        assert!((depth - 1000.0 / 9.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn a_singular_accumulated_matrix_has_no_plane_depth() {
+        let mut tree = tree();
+        let plane = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                matrix: libgfx_rust::scale_matrix(0.0, 1.0, 1.0),
+                ..transform(0.0)
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert_eq!(
+            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            None
+        );
+    }
 }

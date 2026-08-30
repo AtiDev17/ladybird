@@ -7,8 +7,6 @@
 #pragma once
 
 #include <AK/DistinctNumeric.h>
-#include <AK/HashMap.h>
-#include <AK/NumericLimits.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibGfx/CompositingAndBlendingOperator.h>
@@ -133,8 +131,6 @@ struct AnchorScrollShift {
 using SpatialData = Variant<ScrollData, StickyData, TransformData, PerspectiveData, BackfaceVisibilityData, AnchorScrollShift>;
 using FrameData = Variant<ClipData, ClipPathData, EffectsData, MaskData>;
 
-CSSPixelRect apply_css_transform_to_rect(Layout::Node const&, CSSPixelRect const&);
-
 struct SpatialNode {
     SpatialData data;
     SpatialNodeIndex parent {};
@@ -148,27 +144,7 @@ struct FrameNode {
     FrameData data;
     FrameNodeIndex parent { NO_FRAME_NODE };
     SpatialNodeIndex spatial {};
-    bool has_empty_effective_clip { false };
-};
-
-// Marks a spatial node whose content belongs to no 3D rendering context.
-static constexpr SpatialNodeIndex NO_SORTING_CONTEXT { NumericLimits<u32>::max() };
-
-// The plane and 3D rendering context that an established context's own plane renders into.
-struct SortingContextLink {
-    SpatialNodeIndex parent_context;
-    SpatialNodeIndex parent_leaf;
-};
-
-// Per-spatial-node 3D rendering context membership: the plane each node's content renders into and the context that
-// sorts that plane. A tree without 3D rendering contexts resolves to empty per-node vectors.
-struct SortingContexts {
-    HashMap<u32, SortingContextLink> links;
-    Vector<SpatialNodeIndex> leaf_by_node;
-    Vector<SpatialNodeIndex> context_by_node;
-
-    bool is_empty() const { return leaf_by_node.is_empty(); }
-    SpatialNodeIndex outermost_context_of(SpatialNodeIndex) const;
+    bool clips_everything { false };
 };
 
 class AccumulatedVisualContextTree {
@@ -204,13 +180,12 @@ public:
     WEB_API SpatialNodeIndex append_spatial(SpatialData, SpatialNodeIndex parent);
     WEB_API FrameNodeIndex append_frame(FrameData, FrameNodeIndex parent, SpatialNodeIndex spatial);
     WEB_API void set_visual_viewport_transform(TransformData);
-    WEB_API bool is_compatible_with(AccumulatedVisualContextTree const&) const;
     WEB_API void reuse_version_from(AccumulatedVisualContextTree const&);
 
     SpatialNode const& spatial_node_at(SpatialNodeIndex index) const { return m_spatial_nodes[index.value()]; }
     SpatialNode& spatial_node_at(SpatialNodeIndex index) { return m_spatial_nodes[index.value()]; }
     FrameNode const& frame_node_at(FrameNodeIndex index) const { return m_frame_nodes[index.value()]; }
-    FrameNode& frame_node_at(FrameNodeIndex index) { return m_frame_nodes[index.value()]; }
+    WEB_API void set_frame_data(FrameNodeIndex, FrameData);
     ReadonlySpan<SpatialNode> spatial_nodes() const { return m_spatial_nodes.span(); }
     ReadonlySpan<FrameNode> frame_nodes() const { return m_frame_nodes.span(); }
     bool root_is_visual_viewport() const { return m_root_is_visual_viewport; }
@@ -221,8 +196,6 @@ public:
         m_root_isolation_frame = frame;
     }
 
-    SortingContexts resolve_sorting_contexts() const;
-    Optional<float> plane_depth_at_point_for_hit_test(SpatialNodeIndex plane_node_index, Gfx::FloatPoint, ScrollStateSnapshot const&) const;
     WEB_API Optional<Gfx::FloatPoint> transform_point_for_hit_test(ContextRef, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
     Gfx::FloatPoint inverse_transform_point(SpatialNodeIndex, Gfx::FloatPoint) const;
     Gfx::FloatRect transform_rect_to_viewport(SpatialNodeIndex, Gfx::FloatRect const&, ScrollStateSnapshot const&, IncludeVisualViewportTransform = IncludeVisualViewportTransform::Yes) const;
@@ -233,7 +206,7 @@ public:
     void dump_spatial_node(SpatialNodeIndex, StringBuilder&) const;
     void dump_frame_node(FrameNodeIndex, StringBuilder&) const;
 
-    bool has_empty_effective_clip(FrameNodeIndex index) const { return index != NO_FRAME_NODE && m_frame_nodes[index.value()].has_empty_effective_clip; }
+    WEB_API Vector<bool> frames_with_empty_effective_clip() const;
 
 private:
     AccumulatedVisualContextTree(u64 version, TransformData root_transform, bool root_is_visual_viewport);
