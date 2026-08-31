@@ -10,6 +10,7 @@ use super::{
     SpatialNodeIndex, StickyData, TransformData, TransformDataRole, VISUAL_VIEWPORT_NODE_INDEX, VisualContextTree,
     scroll_state::NO_SCROLL_STATE_SLOT,
 };
+use crate::layout::node_data::NodeSlotId;
 use libgfx_rust::path::OwnedPath;
 use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, CornerRadius, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize,
@@ -26,11 +27,13 @@ const SPATIAL_KIND_TRANSFORM: u8 = 2;
 const SPATIAL_KIND_PERSPECTIVE: u8 = 3;
 const SPATIAL_KIND_BACKFACE_VISIBILITY: u8 = 4;
 const SPATIAL_KIND_ANCHOR_SCROLL_SHIFT: u8 = 5;
+const SPATIAL_KIND_DEAD: u8 = 6;
 
 const FRAME_KIND_CLIP: u8 = 0;
 const FRAME_KIND_CLIP_PATH: u8 = 1;
 const FRAME_KIND_EFFECTS: u8 = 2;
 const FRAME_KIND_MASK: u8 = 3;
+const FRAME_KIND_DEAD: u8 = 4;
 
 const MINIMUM_SERIALIZED_SPATIAL_NODE_SIZE: usize = 5;
 const MINIMUM_SERIALIZED_FRAME_NODE_SIZE: usize = 9;
@@ -288,6 +291,7 @@ fn write_spatial_data(writer: &mut TreeByteWriter, data: &SpatialData) {
             writer.bool(transform.flattens_inherited_transform);
             writer.u8(transform.role as u8);
             writer.bool(transform.synthetic_plane);
+            writer.bool(transform.establishes_sorting_context);
         }
         SpatialData::Perspective(perspective) => {
             writer.u8(SPATIAL_KIND_PERSPECTIVE);
@@ -306,6 +310,7 @@ fn write_spatial_data(writer: &mut TreeByteWriter, data: &SpatialData) {
             writer.bool(shift.compensate_horizontal_scroll);
             writer.bool(shift.compensate_vertical_scroll);
         }
+        SpatialData::Dead => writer.u8(SPATIAL_KIND_DEAD),
     }
 }
 
@@ -313,21 +318,29 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
     Some(match reader.u8()? {
         SPATIAL_KIND_SCROLL => SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
+            owner_paintable: NodeSlotId::INVALID,
+            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         }),
-        SPATIAL_KIND_STICKY => SpatialData::Sticky(StickyData {
-            scroller: reader.spatial_index()?,
-            parent_sticky: reader.optional_spatial_index()?,
-            position_relative_to_scroller: reader.point()?,
-            border_box_size: reader.size()?,
-            scrollport_size: reader.size()?,
-            containing_block_region: reader.float_rect()?,
-            needs_parent_offset_adjustment: reader.bool()?,
-            inset_top: reader.optional_f32()?,
-            inset_right: reader.optional_f32()?,
-            inset_bottom: reader.optional_f32()?,
-            inset_left: reader.optional_f32()?,
-            state_slot: NO_SCROLL_STATE_SLOT,
-        }),
+        SPATIAL_KIND_STICKY => {
+            let scroller = reader.spatial_index()?;
+            let parent_sticky = reader.optional_spatial_index()?;
+            SpatialData::Sticky(StickyData {
+                scroller,
+                parent_sticky,
+                position_relative_to_scroller: reader.point()?,
+                border_box_size: reader.size()?,
+                scrollport_size: reader.size()?,
+                containing_block_region: reader.float_rect()?,
+                needs_parent_offset_adjustment: reader.bool()?,
+                inset_top: reader.optional_f32()?,
+                inset_right: reader.optional_f32()?,
+                inset_bottom: reader.optional_f32()?,
+                inset_left: reader.optional_f32()?,
+                state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: parent_sticky.unwrap_or(scroller),
+            })
+        }
         SPATIAL_KIND_TRANSFORM => SpatialData::Transform(TransformData {
             matrix: reader.matrix()?,
             origin: reader.point()?,
@@ -335,6 +348,7 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
             flattens_inherited_transform: reader.bool()?,
             role: reader.transform_role()?,
             synthetic_plane: reader.bool()?,
+            establishes_sorting_context: reader.bool()?,
         }),
         SPATIAL_KIND_PERSPECTIVE => SpatialData::Perspective(PerspectiveData {
             matrix: reader.matrix()?,
@@ -350,6 +364,7 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
             compensate_horizontal_scroll: reader.bool()?,
             compensate_vertical_scroll: reader.bool()?,
         }),
+        SPATIAL_KIND_DEAD => SpatialData::Dead,
         _ => return None,
     })
 }
@@ -381,6 +396,7 @@ fn write_frame_data(writer: &mut TreeByteWriter, data: &FrameData) {
             writer.i32(mask.kind as i32);
             writer.u8(mask.origin as u8);
         }
+        FrameData::Dead => writer.u8(FRAME_KIND_DEAD),
     }
 }
 
@@ -417,6 +433,7 @@ fn read_frame_data(reader: &mut TreeByteReader<'_>) -> Option<FrameData> {
             kind: reader.mask_kind()?,
             origin: reader.mask_layer_origin()?,
         }),
+        FRAME_KIND_DEAD => FrameData::Dead,
         _ => return None,
     })
 }
@@ -431,31 +448,59 @@ fn spatial_node_has_ancestor(nodes: &[SpatialNode], mut node: usize, ancestor: S
     false
 }
 
-fn spatial_node_references_are_consistent(nodes: &[SpatialNode], index: usize) -> bool {
-    let node = &nodes[index];
-    if node.parent.0 as usize >= index.max(1) {
-        return false;
-    }
-    match &node.data {
-        SpatialData::Transform(transform) => transform
-            .sorting_context_root_index
-            .is_none_or(|root| (root.0 as usize) < index),
-        // The hit-test walk looks the plane root up on the marker's root path, so a preceding node
-        // on another branch must be rejected here rather than fail that lookup.
-        SpatialData::BackfaceVisibility(backface) => spatial_node_has_ancestor(nodes, index, backface.plane_root_index),
-        SpatialData::Sticky(sticky) => {
-            // resolve_sticky_offsets() reads the referenced nodes by kind, so a hostile tree must not
-            // get past this point with references of the wrong kind or order.
-            let scroller_is_valid = (sticky.scroller.0 as usize) < index
-                && (sticky.scroller == VISUAL_VIEWPORT_NODE_INDEX
-                    || matches!(nodes[sticky.scroller.0 as usize].data, SpatialData::Scroll(_)));
-            let parent_sticky_is_valid = sticky.parent_sticky.is_none_or(|parent| {
-                (parent.0 as usize) < index && matches!(nodes[parent.0 as usize].data, SpatialData::Sticky(_))
-            });
-            scroller_is_valid && parent_sticky_is_valid
+impl VisualContextTree {
+    fn decoded_references_are_consistent(&self) -> bool {
+        let spatial_nodes = &self.spatial_nodes;
+        let root = &spatial_nodes[VISUAL_VIEWPORT_NODE_INDEX.0 as usize];
+        if root.parent != VISUAL_VIEWPORT_NODE_INDEX || !matches!(root.data, SpatialData::Transform(_)) {
+            return false;
         }
-        SpatialData::AnchorScrollShift(shift) => (shift.scroll_node_index.0 as usize) < index,
-        SpatialData::Scroll(_) | SpatialData::Perspective(_) => true,
+        let spatial_order = self.spatial_dependency_order_with_back_edges();
+        if !spatial_order.back_edges.is_empty() || !spatial_order.dangling_references.is_empty() {
+            return false;
+        }
+        for (index, node) in spatial_nodes.iter().enumerate() {
+            match &node.data {
+                // The hit-test walk looks the plane root up on the marker's root path, so a node on
+                // another branch must be rejected here rather than fail that lookup.
+                SpatialData::BackfaceVisibility(backface) => {
+                    if !spatial_node_has_ancestor(spatial_nodes, index, backface.plane_root_index) {
+                        return false;
+                    }
+                }
+                // resolve_sticky_offsets() reads the referenced nodes by kind, so a hostile tree must not
+                // get past this point with references of the wrong kind.
+                SpatialData::Sticky(sticky) => {
+                    let scroller_is_valid = sticky.scroller == VISUAL_VIEWPORT_NODE_INDEX
+                        || matches!(spatial_nodes[sticky.scroller.0 as usize].data, SpatialData::Scroll(_));
+                    let parent_sticky_is_valid = sticky
+                        .parent_sticky
+                        .is_none_or(|parent| matches!(spatial_nodes[parent.0 as usize].data, SpatialData::Sticky(_)));
+                    if !scroller_is_valid || !parent_sticky_is_valid {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for node in &self.frame_nodes {
+            let spatial_is_out_of_range = node.spatial.0 as usize >= spatial_nodes.len();
+            let live_frame_in_a_tombstone = node.data.is_live() && !self.spatial_is_live(node.spatial);
+            if spatial_is_out_of_range || live_frame_in_a_tombstone {
+                return false;
+            }
+        }
+        let frame_order = self.frame_dependency_order_with_back_edges();
+        if !frame_order.back_edges.is_empty() || !frame_order.dangling_references.is_empty() {
+            return false;
+        }
+        if let Some(root_isolation_frame) = self.root_isolation_frame {
+            let index = root_isolation_frame.0 as usize;
+            if index >= self.frame_nodes.len() || !matches!(self.frame_nodes[index].data, FrameData::Effects(_)) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -464,7 +509,7 @@ impl VisualContextTree {
         let mut writer = TreeByteWriter::default();
         writer.u32(SERIALIZED_TREE_MAGIC);
         writer.u32(SERIALIZED_TREE_FORMAT);
-        writer.u64(self.version);
+        writer.u64(self.structural_epoch);
         writer.bool(self.root_is_visual_viewport);
         writer.frame_index(self.root_isolation_frame.unwrap_or(FrameNodeIndex::NONE));
         writer.u32(self.spatial_nodes.len() as u32);
@@ -486,7 +531,7 @@ impl VisualContextTree {
         if reader.u32()? != SERIALIZED_TREE_MAGIC || reader.u32()? != SERIALIZED_TREE_FORMAT {
             return None;
         }
-        let version = reader.u64()?;
+        let structural_epoch = reader.u64()?;
         let root_is_visual_viewport = reader.bool()?;
         let root_isolation_frame = reader.frame_index()?;
         let spatial_count = reader.u32()? as usize;
@@ -499,51 +544,40 @@ impl VisualContextTree {
         }
 
         let mut spatial_nodes = Vec::with_capacity(spatial_count);
-        for index in 0..spatial_count {
+        for _ in 0..spatial_count {
             let parent = reader.spatial_index()?;
             let data = read_spatial_data(&mut reader)?;
             spatial_nodes.push(SpatialNode { data, parent });
-            if !spatial_node_references_are_consistent(&spatial_nodes, index) {
-                return None;
-            }
-        }
-        if !matches!(spatial_nodes[0].data, SpatialData::Transform(_)) {
-            return None;
         }
 
         let mut frame_nodes = Vec::with_capacity(frame_count);
-        for index in 0..frame_count {
+        for _ in 0..frame_count {
             let parent = reader.frame_index()?;
             let spatial = reader.spatial_index()?;
             let data = read_frame_data(&mut reader)?;
-            if (!parent.is_none() && parent.0 as usize >= index) || spatial.0 as usize >= spatial_count {
-                return None;
-            }
             frame_nodes.push(FrameNode::new(data, parent, spatial, FrameRole::Structural));
         }
-
-        let root_isolation_frame = if root_isolation_frame.is_none() {
-            None
-        } else {
-            let index = root_isolation_frame.0 as usize;
-            if index >= frame_nodes.len() || !matches!(frame_nodes[index].data, FrameData::Effects(_)) {
-                return None;
-            }
-            Some(root_isolation_frame)
-        };
 
         if reader.remaining() != 0 {
             return None;
         }
 
-        Some(Self {
+        let live_spatial_node_count = spatial_nodes.iter().filter(|node| node.data.is_live()).count() as u32;
+        let live_frame_node_count = frame_nodes.iter().filter(|node| node.data.is_live()).count() as u32;
+        let tree = Self {
             spatial_nodes,
             frame_nodes,
             root_is_visual_viewport,
-            root_isolation_frame,
-            version,
-            reused_previous_version: false,
-        })
+            root_isolation_frame: (!root_isolation_frame.is_none()).then_some(root_isolation_frame),
+            structural_epoch,
+            live_spatial_node_count,
+            live_frame_node_count,
+            free_spatial_slots: Vec::new(),
+            free_frame_slots: Vec::new(),
+            quarantined_spatial_slots: Vec::new(),
+            quarantined_frame_slots: Vec::new(),
+        };
+        tree.decoded_references_are_consistent().then_some(tree)
     }
 }
 
@@ -560,15 +594,18 @@ mod tests {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         }
     }
 
     fn tree_with_every_node_kind() -> VisualContextTree {
         let mut tree = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
-        tree.version = 42;
+        tree.structural_epoch = 42;
         let scroll_node = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -578,6 +615,7 @@ mod tests {
                 flattens_inherited_transform: true,
                 role: TransformDataRole::SvgViewportTransform,
                 synthetic_plane: true,
+                establishes_sorting_context: false,
                 ..transform(translation_matrix(3.0, 4.0, 5.0))
             }),
             scroll_node,
@@ -602,6 +640,8 @@ mod tests {
                 inset_bottom: Some(2.5),
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: scroll_node,
             }),
             scroll_node,
         );
@@ -625,6 +665,8 @@ mod tests {
                 inset_bottom: None,
                 inset_left: Some(3.0),
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: scroll_node,
             }),
             outer_sticky,
         );
@@ -724,6 +766,8 @@ mod tests {
             (SpatialData::Sticky(a), SpatialData::Sticky(b)) => {
                 StickyData {
                     state_slot: NO_SCROLL_STATE_SLOT,
+                    owner_paintable: b.owner_paintable,
+                    registry_parent_node: b.registry_parent_node,
                     ..*a
                 } == *b
             }
@@ -731,6 +775,7 @@ mod tests {
             (SpatialData::Perspective(a), SpatialData::Perspective(b)) => a == b,
             (SpatialData::BackfaceVisibility(a), SpatialData::BackfaceVisibility(b)) => a == b,
             (SpatialData::AnchorScrollShift(a), SpatialData::AnchorScrollShift(b)) => a == b,
+            (SpatialData::Dead, SpatialData::Dead) => true,
             _ => false,
         }
     }
@@ -745,16 +790,19 @@ mod tests {
                 a.opacity == b.opacity && a.blend_mode == b.blend_mode && a.filter == b.filter
             }
             (FrameData::Mask(a), FrameData::Mask(b)) => a == b,
+            (FrameData::Dead, FrameData::Dead) => true,
             _ => false,
         }
     }
 
     fn assert_trees_match(a: &VisualContextTree, b: &VisualContextTree) {
-        assert_eq!(a.version, b.version);
+        assert_eq!(a.structural_epoch, b.structural_epoch);
         assert_eq!(a.root_is_visual_viewport, b.root_is_visual_viewport);
         assert_eq!(a.root_isolation_frame, b.root_isolation_frame);
         assert_eq!(a.spatial_nodes.len(), b.spatial_nodes.len());
         assert_eq!(a.frame_nodes.len(), b.frame_nodes.len());
+        assert_eq!(a.live_spatial_node_count, b.live_spatial_node_count);
+        assert_eq!(a.live_frame_node_count, b.live_frame_node_count);
         for (node, other) in a.spatial_nodes.iter().zip(&b.spatial_nodes) {
             assert_eq!(node.parent, other.parent);
             assert!(spatial_data_matches(&node.data, &other.data));
@@ -782,9 +830,130 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_with_tombstones_round_trips_and_keeps_its_live_counts() {
+        let mut tree = tree_with_every_node_kind();
+        let scroll_node = SpatialNodeIndex(1);
+        let stale_transform = tree.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            scroll_node,
+        );
+        let stale_frame = tree.append_frame(
+            FrameData::Effects(EffectsData {
+                opacity: 0.5,
+                blend_mode: CompositingAndBlendingOperator::Normal,
+                filter: None,
+            }),
+            FrameNodeIndex::NONE,
+            scroll_node,
+        );
+        assert!(tree.tombstone_spatial_slot(stale_transform));
+        assert!(tree.tombstone_frame_slot(stale_frame));
+        let bytes = tree.to_bytes();
+        let decoded = VisualContextTree::from_bytes(&bytes).expect("a serialized tree decodes");
+        assert_trees_match(&tree, &decoded);
+        assert!(!decoded.spatial_is_live(stale_transform));
+        assert!(!decoded.frame_is_live(stale_frame));
+        assert_eq!(decoded.dead_node_count(), 2);
+        assert_eq!(decoded.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn a_live_node_referencing_a_tombstone_is_rejected() {
+        let tree_with_tombstoned_target = |make_referencing_data: &dyn Fn(SpatialNodeIndex) -> SpatialData| {
+            let mut tree = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+            let target = tree.append_spatial(
+                SpatialData::Scroll(ScrollData {
+                    state_slot: NO_SCROLL_STATE_SLOT,
+                    owner_paintable: NodeSlotId::INVALID,
+                    registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
+                }),
+                VISUAL_VIEWPORT_NODE_INDEX,
+            );
+            tree.append_spatial(make_referencing_data(target), VISUAL_VIEWPORT_NODE_INDEX);
+            assert!(tree.tombstone_spatial_slot(target));
+            tree
+        };
+        let plane_root = tree_with_tombstoned_target(&|target| {
+            SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+                plane_root_index: target,
+                flattens_inherited_transform: false,
+            })
+        });
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root)).is_none());
+        let sorting_root = tree_with_tombstoned_target(&|target| {
+            SpatialData::Transform(TransformData {
+                sorting_context_root_index: Some(target),
+                ..transform(FloatMatrix4x4::identity())
+            })
+        });
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root)).is_none());
+        let anchor = tree_with_tombstoned_target(&|target| {
+            SpatialData::AnchorScrollShift(AnchorScrollShift {
+                scroll_node_index: target,
+                negate: false,
+                compensate_horizontal_scroll: true,
+                compensate_vertical_scroll: true,
+            })
+        });
+        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor)).is_none());
+        let scroller = tree_with_tombstoned_target(&|target| {
+            SpatialData::Sticky(StickyData::unconstrained(
+                target,
+                None,
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                target,
+            ))
+        });
+        assert!(VisualContextTree::from_bytes(&encode_tree(&scroller)).is_none());
+    }
+
+    #[test]
+    fn a_live_node_under_a_tombstone_is_rejected() {
+        let mut child_under_tombstone = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+        let parent = child_under_tombstone.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        child_under_tombstone.append_spatial(SpatialData::Transform(transform(FloatMatrix4x4::identity())), parent);
+        assert!(child_under_tombstone.tombstone_spatial_slot(parent));
+        assert!(VisualContextTree::from_bytes(&encode_tree(&child_under_tombstone)).is_none());
+
+        let effects = || {
+            FrameData::Effects(EffectsData {
+                opacity: 1.0,
+                blend_mode: CompositingAndBlendingOperator::Normal,
+                filter: None,
+            })
+        };
+        let mut frame_under_tombstone = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+        let parent_frame =
+            frame_under_tombstone.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        frame_under_tombstone.append_frame(effects(), parent_frame, VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(frame_under_tombstone.tombstone_frame_slot(parent_frame));
+        assert!(VisualContextTree::from_bytes(&encode_tree(&frame_under_tombstone)).is_none());
+
+        let mut frame_in_tombstone = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+        let spatial = frame_in_tombstone.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        frame_in_tombstone.append_frame(effects(), FrameNodeIndex::NONE, spatial);
+        assert!(frame_in_tombstone.tombstone_spatial_slot(spatial));
+        assert!(VisualContextTree::from_bytes(&encode_tree(&frame_in_tombstone)).is_none());
+
+        let mut tombstoned_isolation_frame = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+        let isolation_frame =
+            tombstoned_isolation_frame.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(tombstoned_isolation_frame.tombstone_frame_slot(isolation_frame));
+        tombstoned_isolation_frame.root_isolation_frame = Some(isolation_frame);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&tombstoned_isolation_frame)).is_none());
+    }
+
+    #[test]
     fn a_content_root_tree_round_trips() {
         let mut tree = VisualContextTree::create_with_content_root(transform(translation_matrix(-8.0, -9.0, 0.0)));
-        tree.version = 7;
+        tree.structural_epoch = 7;
         let decoded = VisualContextTree::from_bytes(&tree.to_bytes()).expect("a serialized tree decodes");
         assert_trees_match(&tree, &decoded);
     }
@@ -827,6 +996,8 @@ mod tests {
         tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -835,6 +1006,8 @@ mod tests {
                 SpatialNodeIndex(1),
                 None,
                 NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                SpatialNodeIndex(1),
             )),
             SpatialNodeIndex(1),
         );
@@ -860,27 +1033,92 @@ mod tests {
     }
 
     #[test]
-    fn references_to_nodes_that_do_not_precede_the_node_are_rejected() {
-        let mut spatial_parent_after_node = hostile_tree();
-        spatial_parent_after_node.spatial_nodes[1].parent = SpatialNodeIndex(2);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&spatial_parent_after_node)).is_none());
+    fn references_to_nodes_stored_after_the_node_are_accepted() {
+        let mut child_stored_below_its_parent = hostile_tree();
+        child_stored_below_its_parent.spatial_nodes[1].parent = SpatialNodeIndex(2);
+        child_stored_below_its_parent.spatial_nodes[2] = SpatialNode {
+            data: SpatialData::Transform(transform(translation_matrix(5.0, 5.0, 0.0))),
+            parent: VISUAL_VIEWPORT_NODE_INDEX,
+        };
+        child_stored_below_its_parent.frame_nodes[0].parent = FrameNodeIndex(1);
+        child_stored_below_its_parent.frame_nodes[1].parent = FrameNodeIndex::NONE;
+        let decoded = VisualContextTree::from_bytes(&encode_tree(&child_stored_below_its_parent))
+            .expect("acyclic forward references decode");
+        assert_eq!(decoded.spatial_dependency_order(), vec![0, 2, 1]);
+        assert_eq!(decoded.frame_dependency_order(), vec![1, 0]);
+        assert_eq!(
+            decoded.transform_rect_to_viewport(
+                SpatialNodeIndex(1),
+                FloatRect::new(0.0, 0.0, 10.0, 10.0),
+                &[],
+                super::super::IncludeVisualViewportTransform::Yes
+            ),
+            FloatRect::new(5.0, 5.0, 10.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn reference_cycles_self_references_and_wrong_kinds_are_rejected() {
+        let mut parent_cycle = hostile_tree();
+        parent_cycle.spatial_nodes[1].parent = SpatialNodeIndex(2);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_cycle)).is_none());
+
+        let mut self_parented = hostile_tree();
+        self_parented.spatial_nodes[1].parent = SpatialNodeIndex(1);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&self_parented)).is_none());
 
         let mut root_with_a_parent = hostile_tree();
         root_with_a_parent.spatial_nodes[0].parent = SpatialNodeIndex(1);
         assert!(VisualContextTree::from_bytes(&encode_tree(&root_with_a_parent)).is_none());
 
+        let mut sticky_parent_cycle = hostile_tree();
+        sticky_parent_cycle.spatial_nodes[1] = SpatialNode {
+            data: SpatialData::Sticky(StickyData::unconstrained(
+                VISUAL_VIEWPORT_NODE_INDEX,
+                Some(SpatialNodeIndex(2)),
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                VISUAL_VIEWPORT_NODE_INDEX,
+            )),
+            parent: VISUAL_VIEWPORT_NODE_INDEX,
+        };
+        sticky_parent_cycle.spatial_nodes[2] = SpatialNode {
+            data: SpatialData::Sticky(StickyData::unconstrained(
+                VISUAL_VIEWPORT_NODE_INDEX,
+                Some(SpatialNodeIndex(1)),
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                VISUAL_VIEWPORT_NODE_INDEX,
+            )),
+            parent: VISUAL_VIEWPORT_NODE_INDEX,
+        };
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_cycle)).is_none());
+
+        let mut parent_out_of_range = hostile_tree();
+        parent_out_of_range.spatial_nodes[1].parent = SpatialNodeIndex(7);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_out_of_range)).is_none());
+
+        let mut plane_root_out_of_range = hostile_tree();
+        plane_root_out_of_range.spatial_nodes[1].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+            plane_root_index: SpatialNodeIndex(9),
+            flattens_inherited_transform: false,
+        });
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_out_of_range)).is_none());
+
         let mut root_is_not_a_transform = hostile_tree();
         root_is_not_a_transform.spatial_nodes[0].data = SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
+            owner_paintable: NodeSlotId::INVALID,
+            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         });
         assert!(VisualContextTree::from_bytes(&encode_tree(&root_is_not_a_transform)).is_none());
 
-        let mut sorting_root_after_node = hostile_tree();
-        sorting_root_after_node.spatial_nodes[0].data = SpatialData::Transform(TransformData {
+        let mut sorting_root_cycle = hostile_tree();
+        sorting_root_cycle.spatial_nodes[0].data = SpatialData::Transform(TransformData {
             sorting_context_root_index: Some(SpatialNodeIndex(1)),
             ..transform(FloatMatrix4x4::identity())
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root_after_node)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root_cycle)).is_none());
 
         let mut sticky_scroller_is_not_a_scroll_node = hostile_tree();
         sticky_scroller_is_not_a_scroll_node.spatial_nodes[1].data = SpatialData::Perspective(PerspectiveData {
@@ -894,15 +1132,17 @@ mod tests {
             SpatialNodeIndex(1),
             Some(SpatialNodeIndex(1)),
             NO_SCROLL_STATE_SLOT,
+            NodeSlotId::INVALID,
+            SpatialNodeIndex(1),
         ));
         assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_is_not_sticky)).is_none());
 
-        let mut plane_root_after_node = hostile_tree();
-        plane_root_after_node.spatial_nodes[1].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+        let mut plane_root_cycle = hostile_tree();
+        plane_root_cycle.spatial_nodes[1].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
             plane_root_index: SpatialNodeIndex(2),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_after_node)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_cycle)).is_none());
 
         let mut plane_root_on_another_branch = hostile_tree();
         plane_root_on_another_branch.spatial_nodes[2].parent = VISUAL_VIEWPORT_NODE_INDEX;
@@ -919,21 +1159,25 @@ mod tests {
         });
         assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_on_the_root_path)).is_some());
 
-        let mut anchor_node_after_node = hostile_tree();
-        anchor_node_after_node.spatial_nodes[1].data = SpatialData::AnchorScrollShift(AnchorScrollShift {
+        let mut anchor_node_names_itself = hostile_tree();
+        anchor_node_names_itself.spatial_nodes[1].data = SpatialData::AnchorScrollShift(AnchorScrollShift {
             scroll_node_index: SpatialNodeIndex(1),
             negate: false,
             compensate_horizontal_scroll: true,
             compensate_vertical_scroll: true,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor_node_after_node)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor_node_names_itself)).is_none());
     }
 
     #[test]
-    fn frame_references_out_of_order_or_range_are_rejected() {
-        let mut frame_parent_after_frame = hostile_tree();
-        frame_parent_after_frame.frame_nodes[0].parent = FrameNodeIndex(1);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&frame_parent_after_frame)).is_none());
+    fn frame_reference_cycles_and_ranges_are_rejected() {
+        let mut frame_parent_cycle = hostile_tree();
+        frame_parent_cycle.frame_nodes[0].parent = FrameNodeIndex(1);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&frame_parent_cycle)).is_none());
+
+        let mut frame_parent_out_of_range = hostile_tree();
+        frame_parent_out_of_range.frame_nodes[1].parent = FrameNodeIndex(4);
+        assert!(VisualContextTree::from_bytes(&encode_tree(&frame_parent_out_of_range)).is_none());
 
         let mut frame_spatial_out_of_range = hostile_tree();
         frame_spatial_out_of_range.frame_nodes[1].spatial = SpatialNodeIndex(3);

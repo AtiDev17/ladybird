@@ -11,18 +11,23 @@ use crate::painting::display_list::commands::ContextRef;
 use crate::painting::node_painting;
 use crate::painting::paintable_data::*;
 use crate::painting::record::cache::PaintCache;
+use crate::painting::visual_context::dirty::{
+    RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason,
+};
+use crate::painting::visual_context::{
+    BoxVisualContextNodeHandles, EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES, PaintableVisualContextRecord,
+};
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VisualContextAssignmentSnapshot {
     pub slot_generation: u32,
     pub has_accumulated_visual_context: bool,
     pub accumulated_visual_context: ContextRef,
     pub accumulated_visual_context_for_descendants: ContextRef,
-    pub spatial_nodes: (u32, u32),
-    pub frame_nodes: (u32, u32),
+    pub node_handles: BoxVisualContextNodeHandles,
 }
 
 pub(crate) const PAINTABLE_SLOTS_PER_CHUNK: usize = 64;
@@ -77,6 +82,7 @@ pub(crate) struct PaintableRowStore {
     chunks: Vec<Box<PaintableRowChunk>>,
     side_data: RefCell<Vec<PaintableSideData>>,
     paint_caches: RefCell<Vec<PaintCache>>,
+    visual_context_records: RefCell<Vec<Option<PaintableVisualContextRecord>>>,
     absolute_rect_memo: RefCell<Vec<Option<(NodeSlotId, u64, crate::css::css_pixels::CssPixelRect)>>>,
     absolute_rect_memo_epoch: Cell<u64>,
     committed_fragment_links: RefCell<Vec<CommittedFragmentLinkSlot>>,
@@ -187,6 +193,7 @@ where
     }
 
     pub(crate) fn visual_context_assignments(&self) -> Vec<VisualContextAssignmentSnapshot> {
+        let records = self.arena.paintable_rows.visual_context_records.borrow();
         (0..self.arena.paintable_row_count())
             .map(|index| {
                 let chunk = &self.arena.paintable_rows.chunks[index / PAINTABLE_SLOTS_PER_CHUNK];
@@ -196,8 +203,11 @@ where
                     has_accumulated_visual_context: data.has_accumulated_visual_context,
                     accumulated_visual_context: data.accumulated_visual_context,
                     accumulated_visual_context_for_descendants: data.accumulated_visual_context_for_descendants,
-                    spatial_nodes: (data.spatial_nodes_begin, data.spatial_nodes_end),
-                    frame_nodes: (data.frame_nodes_begin, data.frame_nodes_end),
+                    node_handles: records[index]
+                        .as_ref()
+                        .map_or_else(BoxVisualContextNodeHandles::default, |record| {
+                            record.node_handles.clone()
+                        }),
                 }
             })
             .collect()
@@ -605,6 +615,7 @@ impl LayoutNodeArena {
         let mut side_data = store.side_data.borrow_mut();
         let mut paint_caches = store.paint_caches.borrow_mut();
         let mut absolute_rect_memo = store.absolute_rect_memo.borrow_mut();
+        let mut visual_context_records = store.visual_context_records.borrow_mut();
         while side_data.len() <= index {
             if side_data.len().is_multiple_of(PAINTABLE_SLOTS_PER_CHUNK) {
                 chunks.push(new_chunk());
@@ -612,6 +623,7 @@ impl LayoutNodeArena {
             side_data.push(PaintableSideData::default());
             paint_caches.push(PaintCache::default());
             absolute_rect_memo.push(None);
+            visual_context_records.push(None);
         }
 
         chunks[index / PAINTABLE_SLOTS_PER_CHUNK].slots[index % PAINTABLE_SLOTS_PER_CHUNK] = PaintableData {
@@ -621,6 +633,7 @@ impl LayoutNodeArena {
         side_data[index] = PaintableSideData::default();
         paint_caches[index].clear();
         absolute_rect_memo[index] = None;
+        visual_context_records[index] = None;
     }
 
     fn reset_paintable_row(&mut self, mark_caches_dirty_along_paint_chain: bool, reset: PaintableRowReset) {
@@ -629,6 +642,25 @@ impl LayoutNodeArena {
             self.paintable_rows()
                 .mark_descendant_subtree_caches_dirty_along_paint_chain(id);
         }
+        if let Some(record) = self.take_paintable_visual_context_record(id) {
+            let former_paint_parent =
+                crate::painting::paint_order::paint_parent(&self.paintable_rows(), id).unwrap_or(NodeSlotId::INVALID);
+            self.paint_state()
+                .borrow_mut()
+                .visual_context
+                .dirty_boxes
+                .note_removed(RemovedBoxBlocks {
+                    slot: id,
+                    node_handles: record.node_handles,
+                    former_paint_parent,
+                });
+        } else {
+            self.paint_state()
+                .borrow_mut()
+                .visual_context
+                .dirty_boxes
+                .forget_box(id);
+        }
         self.clear_absolute_rect_memo();
         let store = &mut self.paintable_rows;
         let index = id.slot_index() as usize;
@@ -636,6 +668,84 @@ impl LayoutNodeArena {
             PaintableData::default();
         store.side_data.borrow_mut()[index] = PaintableSideData::default();
         store.paint_caches.borrow()[index].clear();
+        store.visual_context_records.borrow_mut()[index] = None;
+    }
+
+    pub(crate) fn paintable_visual_context_record(
+        &self,
+        id: NodeSlotId,
+    ) -> Option<Ref<'_, PaintableVisualContextRecord>> {
+        if !self.paintable_row_is_populated(id) {
+            return None;
+        }
+        Ref::filter_map(self.paintable_rows.visual_context_records.borrow(), |records| {
+            records.get(id.slot_index() as usize).and_then(Option::as_ref)
+        })
+        .ok()
+    }
+
+    pub(crate) fn cloned_paintable_visual_context_record(
+        &self,
+        id: NodeSlotId,
+    ) -> Option<PaintableVisualContextRecord> {
+        self.paintable_visual_context_record(id).map(|record| record.clone())
+    }
+
+    pub(crate) fn take_paintable_visual_context_record(&self, id: NodeSlotId) -> Option<PaintableVisualContextRecord> {
+        if !self.paintable_row_is_populated(id) {
+            return None;
+        }
+        self.paintable_rows
+            .visual_context_records
+            .borrow_mut()
+            .get_mut(id.slot_index() as usize)
+            .and_then(Option::take)
+    }
+
+    pub(crate) fn set_paintable_visual_context_record(&self, id: NodeSlotId, record: PaintableVisualContextRecord) {
+        debug_assert!(self.paintable_row_is_populated(id));
+        self.paintable_rows.visual_context_records.borrow_mut()[id.slot_index() as usize] = Some(record);
+    }
+
+    pub(crate) fn with_paintable_visual_context_node_handles<R>(
+        &self,
+        id: NodeSlotId,
+        read: impl FnOnce(&BoxVisualContextNodeHandles) -> R,
+    ) -> R {
+        match self.paintable_visual_context_record(id) {
+            Some(record) => read(&record.node_handles),
+            None => read(&EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES),
+        }
+    }
+
+    pub(crate) fn mark_paintable_subtree_may_own_geometry_dependent_nodes(&self, id: NodeSlotId) -> Option<bool> {
+        if !self.paintable_row_is_populated(id) {
+            return None;
+        }
+        let mut records = self.paintable_rows.visual_context_records.borrow_mut();
+        let record = records.get_mut(id.slot_index() as usize)?.as_mut()?;
+        let was_flagged = record.subtree_may_own_geometry_dependent_nodes;
+        record.subtree_may_own_geometry_dependent_nodes = true;
+        Some(was_flagged)
+    }
+
+    pub(crate) fn note_visual_context_box_dirty(&self, id: NodeSlotId, kind: VisualContextBoxDirtyKind) {
+        let pending_box_limit = self
+            .paintable_row_count()
+            .max(crate::painting::visual_context::dirty::MINIMUM_PENDING_DIRTY_BOX_LIMIT);
+        self.paint_state()
+            .borrow_mut()
+            .visual_context
+            .dirty_boxes
+            .note_box(id, kind, pending_box_limit);
+    }
+
+    pub(crate) fn request_full_visual_context_rebuild(&self, reason: VisualContextGlobalRebuildReason) {
+        self.paint_state()
+            .borrow_mut()
+            .visual_context
+            .dirty_boxes
+            .request_full_rebuild(reason);
     }
 
     pub(crate) fn prepare_paintable_row_freed_reset(&self, layout_slot_index: u32) -> Option<PaintableRowReset> {

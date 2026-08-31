@@ -853,6 +853,120 @@ pub unsafe extern "C" fn layout_arena_physical_overflow_directions(
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_note_box_dirty(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    kind: crate::painting::host::FfiVisualContextBoxDirtyKind,
+) {
+    abort_on_panic(|| {
+        use crate::painting::host::FfiVisualContextBoxDirtyKind;
+        use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
+        let arena = unsafe { arena_from_handle(arena) };
+        if !arena.paintable_row_is_populated(slot) {
+            return;
+        }
+        let kind = match kind {
+            FfiVisualContextBoxDirtyKind::StyleValueChange => VisualContextBoxDirtyKind::StyleValueChange,
+            FfiVisualContextBoxDirtyKind::StyleStructuralChange => VisualContextBoxDirtyKind::StyleStructuralChange,
+            FfiVisualContextBoxDirtyKind::ScrollableOverflowFlipped => {
+                VisualContextBoxDirtyKind::ScrollableOverflowFlipped
+            }
+        };
+        arena.note_visual_context_box_dirty(slot, kind);
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_request_full_rebuild(
+    arena: *mut c_void,
+    reason: crate::painting::host::FfiVisualContextGlobalRebuildReason,
+) {
+    abort_on_panic(|| {
+        use crate::painting::host::FfiVisualContextGlobalRebuildReason;
+        use crate::painting::visual_context::dirty::VisualContextGlobalRebuildReason;
+        let arena = unsafe { arena_from_handle(arena) };
+        let reason = match reason {
+            FfiVisualContextGlobalRebuildReason::FirstBuild => VisualContextGlobalRebuildReason::FirstBuild,
+            FfiVisualContextGlobalRebuildReason::DocumentWideStructuralChange => {
+                VisualContextGlobalRebuildReason::DocumentWideStructuralChange
+            }
+            FfiVisualContextGlobalRebuildReason::FilterResourcesChanged => {
+                VisualContextGlobalRebuildReason::FilterResourcesChanged
+            }
+            FfiVisualContextGlobalRebuildReason::ForcedForTesting => VisualContextGlobalRebuildReason::ForcedForTesting,
+            FfiVisualContextGlobalRebuildReason::CanonicalDumpRequested => {
+                VisualContextGlobalRebuildReason::CanonicalDumpRequested
+            }
+        };
+        arena.request_full_visual_context_rebuild(reason);
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_pending_dirty_box_count(arena: *mut c_void) -> usize {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paint_state = arena.paint_state().borrow();
+        paint_state.visual_context.dirty_boxes.boxes.len()
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_visual_context_node_count(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    list: crate::painting::host::FfiVisualContextBoxNodeList,
+) -> usize {
+    abort_on_panic(|| {
+        use crate::painting::host::FfiVisualContextBoxNodeList;
+        let arena = unsafe { arena_from_handle(arena) };
+        arena.with_paintable_visual_context_node_handles(slot, |handles| match list {
+            FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.len(),
+            FfiVisualContextBoxNodeList::FrameNodes => handles.frame_handles().count(),
+        })
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread; `out`
+/// must have room for `capacity` indices.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paintable_visual_context_copy_node_indices(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    list: crate::painting::host::FfiVisualContextBoxNodeList,
+    out: *mut u32,
+    capacity: usize,
+) {
+    abort_on_panic(|| {
+        use crate::painting::host::FfiVisualContextBoxNodeList;
+        let arena = unsafe { arena_from_handle(arena) };
+        arena.with_paintable_visual_context_node_handles(slot, |handles| {
+            let indices: Vec<u32> = match list {
+                FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.iter().map(|index| index.0).collect(),
+                FfiVisualContextBoxNodeList::FrameNodes => handles.frame_handles().map(|index| index.0).collect(),
+            };
+            assert!(indices.len() <= capacity);
+            // SAFETY: the caller warrants `capacity` writable indices behind `out`.
+            unsafe { std::ptr::copy_nonoverlapping(indices.as_ptr(), out, indices.len()) };
+        });
+    });
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_build_stacking_context_tree(arena: *mut c_void, root: NodeSlotId) {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle_mut(arena) };
@@ -870,67 +984,202 @@ pub unsafe extern "C" fn layout_arena_build_stacking_context_tree(arena: *mut c_
 
 use crate::painting::host::FfiVisualContextHostCallbacks;
 
+fn full_visual_context_build(
+    arena: *mut c_void,
+    viewport: NodeSlotId,
+    callbacks: &FfiVisualContextHostCallbacks,
+    state: &mut crate::painting::visual_context::VisualContextState,
+    force_incompatible_rebuild: bool,
+) -> crate::painting::host::FfiVisualContextUpdateOutcome {
+    let (mut tree, scroll_state, paintables_with_mask_nodes, previous_assignments, assignments) = {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintable_rows = arena.paintable_rows();
+        let previous_assignments = paintable_rows.visual_context_assignments();
+        let (tree, scroll_state, paintables_with_mask_nodes, assignments) =
+            crate::painting::visual_context::build::build_visual_context_tree(&paintable_rows, callbacks, viewport);
+        (
+            tree,
+            scroll_state,
+            paintables_with_mask_nodes,
+            previous_assignments,
+            assignments,
+        )
+    };
+    let arena = unsafe { arena_from_handle_mut(arena) };
+    let assignments_changed = {
+        let mut paintable_rows = arena.paintable_rows_mut();
+        for assignment in assignments {
+            assignment.apply(&mut paintable_rows);
+        }
+        previous_assignments != paintable_rows.visual_context_assignments()
+    };
+    state.build_count += 1;
+    let is_compatible = !force_incompatible_rebuild
+        && state
+            .tree
+            .as_deref()
+            .is_some_and(|previous| tree.is_compatible_with(previous));
+    if is_compatible {
+        tree.structural_epoch = state.structural_epoch();
+    } else {
+        arena.mark_all_paint_caches_dirty();
+    }
+    let structural_epoch = tree.structural_epoch;
+    state.tree = Some(Rc::new(tree));
+    state.paintables_with_mask_nodes = paintables_with_mask_nodes;
+    state.scroll_state = scroll_state;
+    state.scroll_state_snapshot.clear();
+    state.needs_to_refresh_scroll_state = true;
+    state.dirty_boxes.clear();
+    state.quarantined_slots_are_releasable = false;
+    if assignments_changed {
+        arena.mark_all_descendant_subtree_caches_dirty();
+    }
+    crate::painting::host::FfiVisualContextUpdateOutcome {
+        performed_full_build: true,
+        structural_epoch_changed: !is_compatible,
+        requires_display_list_recording: !is_compatible,
+        structural_epoch,
+    }
+}
+
+fn paintables_with_mask_nodes_in_paint_order(
+    arena: &crate::layout::LayoutNodeArena,
+    viewport: NodeSlotId,
+) -> Vec<NodeSlotId> {
+    let paintable_rows = arena.paintable_rows();
+    let mut owners = Vec::new();
+    crate::painting::paint_order::for_each_in_paint_subtree(&paintable_rows, viewport, |slot| {
+        if arena
+            .paintable_visual_context_record(slot)
+            .is_some_and(|record| record.has_mask_nodes)
+        {
+            owners.push(slot);
+        }
+    });
+    owners
+}
+
 /// # Safety
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_assign_accumulated_visual_contexts(
+pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
     arena: *mut c_void,
     viewport: NodeSlotId,
     callbacks: FfiVisualContextHostCallbacks,
-    force_incompatible_rebuild: bool,
-) -> bool {
+    force_full_rebuild: bool,
+) -> crate::painting::host::FfiVisualContextUpdateOutcome {
     abort_on_panic(|| {
-        let (mut tree, scroll_state, paintables_with_mask_nodes, previous_assignments, assignments) = {
-            let arena = unsafe { arena_from_handle(arena) };
-            let paintable_rows = arena.paintable_rows();
-            if !paintable_rows.paintable_row_is_populated(viewport) {
-                return false;
+        use crate::painting::visual_context::dirty::{VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason};
+        use crate::painting::visual_context::incremental::{
+            IncrementalUpdateResult, update_visual_context_tree_incrementally,
+        };
+        let arena_ref = unsafe { arena_from_handle(arena) };
+        if !arena_ref.paintable_row_is_populated(viewport) {
+            return crate::painting::host::FfiVisualContextUpdateOutcome::default();
+        }
+        let inputs = callbacks.tree_inputs();
+        let root_background_source = callbacks.root_background_source();
+        let mut state = std::mem::take(&mut arena_ref.paint_state().borrow_mut().visual_context);
+        state.release_quarantined_slots_while_no_handle_is_retained();
+
+        let mut reason = state.dirty_boxes.global_reason;
+        if state.tree.is_none() {
+            reason = reason.max(VisualContextGlobalRebuildReason::FirstBuild);
+        }
+        if force_full_rebuild {
+            reason = reason.max(VisualContextGlobalRebuildReason::ForcedForTesting);
+        }
+        if state.last_tree_inputs.is_some_and(|last| {
+            last.device_pixels_per_css_pixel != inputs.device_pixels_per_css_pixel
+                || last.viewport_wheel_overflow_x != inputs.viewport_wheel_overflow_x
+                || last.viewport_wheel_overflow_y != inputs.viewport_wheel_overflow_y
+        }) {
+            reason = reason.max(VisualContextGlobalRebuildReason::TreeInputsChanged);
+        }
+        if inputs.may_have_default_scroll_shift_anchor {
+            reason = reason.max(VisualContextGlobalRebuildReason::AnchorsRegistered);
+        }
+        if state.tree.as_deref().is_some_and(|tree| tree.should_compact()) {
+            reason = reason.max(VisualContextGlobalRebuildReason::Compaction);
+        }
+        if let Some(last_source) = state.last_root_background_source
+            && (last_source.use_body_background_properties != root_background_source.use_body_background_properties
+                || last_source.body_layout_node != root_background_source.body_layout_node)
+        {
+            for body in [last_source.body_layout_node, root_background_source.body_layout_node] {
+                if arena_ref.paintable_row_is_populated(body) {
+                    let pending_box_limit = arena_ref
+                        .paintable_row_count()
+                        .max(crate::painting::visual_context::dirty::MINIMUM_PENDING_DIRTY_BOX_LIMIT);
+                    state.dirty_boxes.note_box(
+                        body,
+                        VisualContextBoxDirtyKind::StyleStructuralChange,
+                        pending_box_limit,
+                    );
+                    if let Some(html) = crate::painting::paint_order::paint_parent(&arena_ref.paintable_rows(), body) {
+                        state.dirty_boxes.note_box(
+                            html,
+                            VisualContextBoxDirtyKind::StyleStructuralChange,
+                            pending_box_limit,
+                        );
+                    }
+                }
             }
-            let previous_assignments = paintable_rows.visual_context_assignments();
-            let (tree, scroll_state, paintables_with_mask_nodes, assignments) =
-                crate::painting::visual_context::build::build_visual_context_tree(
+        }
+
+        if reason == VisualContextGlobalRebuildReason::None {
+            let result = {
+                let paintable_rows = arena_ref.paintable_rows();
+                update_visual_context_tree_incrementally(
                     &paintable_rows,
                     &callbacks,
                     viewport,
-                );
-            (
-                tree,
-                scroll_state,
-                paintables_with_mask_nodes,
-                previous_assignments,
-                assignments,
-            )
-        };
-        let arena = unsafe { arena_from_handle_mut(arena) };
-        let assignments_changed = {
-            let mut paintable_rows = arena.paintable_rows_mut();
-            for assignment in assignments {
-                assignment.apply(&mut paintable_rows);
+                    inputs,
+                    root_background_source,
+                    &mut state,
+                )
+            };
+            match result {
+                IncrementalUpdateResult::Applied(outcome) => {
+                    let arena_mut = unsafe { arena_from_handle_mut(arena) };
+                    {
+                        let mut paintable_rows = arena_mut.paintable_rows_mut();
+                        for assignment in outcome.assignments {
+                            assignment.apply(&mut paintable_rows);
+                        }
+                    }
+                    if outcome.mask_node_owners_changed {
+                        state.paintables_with_mask_nodes =
+                            paintables_with_mask_nodes_in_paint_order(arena_mut, viewport);
+                    }
+                    let structural_epoch_changed = outcome.delta.structural_epoch_changed;
+                    let requires_display_list_recording = outcome.delta.requires_display_list_recording;
+                    state.dirty_boxes.clear();
+                    state.incremental_update_count += 1;
+                    state.last_tree_inputs = Some(inputs);
+                    state.last_root_background_source = Some(root_background_source);
+                    let structural_epoch = state.structural_epoch();
+                    arena_mut.paint_state().borrow_mut().visual_context = state;
+                    return crate::painting::host::FfiVisualContextUpdateOutcome {
+                        performed_full_build: false,
+                        structural_epoch_changed,
+                        requires_display_list_recording,
+                        structural_epoch,
+                    };
+                }
+                IncrementalUpdateResult::NeedsFullBuild(fallback_reason) => reason = fallback_reason,
             }
-            previous_assignments != paintable_rows.visual_context_assignments()
-        };
-        let mut paint_state = arena.paint_state().borrow_mut();
-        let state = &mut paint_state.visual_context;
-        state.build_count += 1;
-        let is_compatible = !force_incompatible_rebuild
-            && state
-                .tree
-                .as_deref()
-                .is_some_and(|previous| tree.is_compatible_with(previous));
-        tree.reused_previous_version = is_compatible;
-        if is_compatible {
-            tree.version = state.tree_version();
         }
-        state.tree = Some(Rc::new(tree));
-        state.paintables_with_mask_nodes = paintables_with_mask_nodes;
-        state.scroll_state = scroll_state;
-        state.scroll_state_snapshot.clear();
-        state.needs_to_refresh_scroll_state = true;
-        if assignments_changed {
-            arena.mark_all_descendant_subtree_caches_dirty();
-        }
-        is_compatible
+
+        state.last_full_build_reason = reason;
+        let outcome = full_visual_context_build(arena, viewport, &callbacks, &mut state, force_full_rebuild);
+        state.last_tree_inputs = Some(inputs);
+        state.last_root_background_source = Some(root_background_source);
+        let arena_ref = unsafe { arena_from_handle(arena) };
+        arena_ref.paint_state().borrow_mut().visual_context = state;
+        outcome
     })
 }
 
@@ -967,46 +1216,6 @@ pub unsafe extern "C" fn layout_arena_compute_css_transform(
             out_origin.add(1).write(transform.origin.y);
         }
         true
-    })
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_update_visual_context_values(
-    arena: *mut c_void,
-    paintable: NodeSlotId,
-    callbacks: FfiVisualContextHostCallbacks,
-) -> bool {
-    abort_on_panic(|| {
-        let pixel_ratio = callbacks.tree_inputs().device_pixels_per_css_pixel;
-        let (compatible, has_non_invertible_css_transform) = {
-            let arena = unsafe { arena_from_handle(arena) };
-            let paintable_rows = arena.paintable_rows();
-            if !paintable_rows.paintable_row_is_populated(paintable) {
-                return false;
-            }
-            let mut paint_state = arena.paint_state().borrow_mut();
-            let Some(tree) = paint_state.visual_context.tree.as_mut() else {
-                return false;
-            };
-            crate::painting::visual_context::build::update_visual_context_values(
-                &paintable_rows,
-                &callbacks,
-                Rc::make_mut(tree),
-                paintable,
-                pixel_ratio,
-            )
-        };
-        if let Some(value) = has_non_invertible_css_transform {
-            let arena = unsafe { arena_from_handle_mut(arena) };
-            arena.paintable_rows_mut().paintable_data_mut(paintable).set_flag(
-                crate::painting::paintable_data::PaintableFlag::HasNonInvertibleCssTransform,
-                value,
-            );
-        }
-        compatible
     })
 }
 
@@ -1131,6 +1340,16 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
 ) -> u64 {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
+        {
+            let mut paint_state = arena.paint_state().borrow_mut();
+            if paint_state.recorded_wheel_event_listener_state_generation
+                != Some(inputs.wheel_event_listener_state_generation)
+            {
+                arena.mark_all_descendant_subtree_caches_dirty();
+                paint_state.recorded_wheel_event_listener_state_generation =
+                    Some(inputs.wheel_event_listener_state_generation);
+            }
+        }
         let mut output = {
             let paint_state = arena.paint_state().borrow();
             if !arena.paintable_row_is_populated(viewport) || paint_state.stacking_context_tree.is_none() {
@@ -1157,19 +1376,11 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
         let mut paint_state = arena.paint_state().borrow_mut();
         paint_state.hit_test_list_generation += 1;
         debug_assert_eq!(output.hit_test_list.generation, paint_state.hit_test_list_generation);
-        if paint_state
-            .hit_test_item_cache_source
-            .as_ref()
-            .is_some_and(|source| source.visual_context_tree_version != output.compatible_visual_context_tree_version)
-        {
-            paint_state.hit_test_item_cache_source = None;
-        }
         let list = std::mem::take(&mut output.hit_test_list);
         if inputs.paint_command_cache_read_write {
             paint_state.hit_test_item_cache_source = Some(std::rc::Rc::new(
                 crate::painting::record::cache::HitTestItemCacheSource {
                     id: list.generation,
-                    visual_context_tree_version: output.compatible_visual_context_tree_version,
                     items: list.items.clone(),
                 },
             ));
@@ -1180,6 +1391,7 @@ pub unsafe extern "C" fn layout_arena_record_display_list(
             paint_state.paint_command_cache_source = Some(output.clone());
             // Read-only recordings commit nothing and must not age dirty stamps out.
             arena.note_paint_record_completed_with_cache_writes();
+            paint_state.visual_context.quarantined_slots_are_releasable = true;
         }
         paint_state.last_recording = Some(output);
         list_generation_of(&paint_state)
@@ -1286,6 +1498,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         });
         let mut recorder = DisplayListRecorder::new();
         let dest_rect = inputs.dest_rect;
@@ -2246,11 +2459,11 @@ pub unsafe extern "C" fn layout_arena_has_visual_context_tree(arena: *mut c_void
 ///
 /// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_version(arena: *mut c_void) -> u64 {
+pub unsafe extern "C" fn layout_arena_visual_context_tree_structural_epoch(arena: *mut c_void) -> u64 {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paint_state = arena.paint_state().borrow();
-        paint_state.visual_context.tree_version()
+        paint_state.visual_context.structural_epoch()
     })
 }
 
@@ -2285,8 +2498,8 @@ pub unsafe extern "C" fn visual_context_tree_release(tree: *const c_void) {
 ///
 /// `tree` must be a live retained tree handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_version(tree: *const c_void) -> u64 {
-    abort_on_panic(|| unsafe { tree_from_handle(tree) }.version)
+pub unsafe extern "C" fn visual_context_tree_structural_epoch(tree: *const c_void) -> u64 {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.structural_epoch)
 }
 
 /// # Safety
@@ -2335,6 +2548,47 @@ pub unsafe extern "C" fn visual_context_tree_spatial_node_count(tree: *const c_v
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_frame_node_count(tree: *const c_void) -> usize {
     abort_on_panic(|| unsafe { tree_from_handle(tree) }.frame_nodes.len())
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_live_spatial_node_count(tree: *const c_void) -> usize {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.live_spatial_node_count as usize)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_live_frame_node_count(tree: *const c_void) -> usize {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.live_frame_node_count as usize)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `command_runs` must address `command_run_count`
+/// runs and `mask_frames` `mask_frame_count` frame indices for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn display_list_references_only_live_visual_context_nodes(
+    tree: *const c_void,
+    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
+    command_run_count: usize,
+    mask_frames: *const FrameNodeIndex,
+    mask_frame_count: usize,
+) -> bool {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the slices address the stated number of values.
+        let (command_runs, mask_frames) = unsafe {
+            (
+                ffi_slice(command_runs, command_run_count),
+                ffi_slice(mask_frames, mask_frame_count),
+            )
+        };
+        tree.display_list_references_only_live_nodes(command_runs, mask_frames)
+    })
 }
 
 /// # Safety
@@ -2506,7 +2760,7 @@ pub unsafe extern "C" fn visual_context_tree_visual_viewport_transform(
 /// # Safety
 ///
 /// `tree` must be a live retained tree handle. Returns a retained handle to a copy of the tree whose
-/// visual viewport node carries the given transform; the copy keeps the version.
+/// visual viewport node carries the given transform; the copy keeps the structural epoch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_with_visual_viewport_transform(
     tree: *const c_void,
@@ -2523,7 +2777,7 @@ pub unsafe extern "C" fn visual_context_tree_with_visual_viewport_transform(
 ///
 /// `tree` must be a live retained tree handle; `frame_opacities` must address `frame_opacity_count`
 /// samples and `spatial_matrices` `spatial_matrix_count` samples. Returns a retained handle to a copy
-/// of the tree carrying the sampled values; the copy keeps the version.
+/// of the tree carrying the sampled values; the copy keeps the structural epoch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
     tree: *const c_void,
@@ -2703,6 +2957,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_create() -> *mut c_voi
                 flattens_inherited_transform: false,
                 role: crate::painting::visual_context::TransformDataRole::CssTransform,
                 synthetic_plane: false,
+                establishes_sorting_context: false,
             },
         );
         Box::into_raw(Box::new(tree)).cast()
@@ -2737,6 +2992,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_transform(
                 flattens_inherited_transform: false,
                 role: crate::painting::visual_context::TransformDataRole::CssTransform,
                 synthetic_plane: false,
+                establishes_sorting_context: false,
             }),
             SpatialNodeIndex(parent),
         )
@@ -2754,6 +3010,8 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_scroll(builder:
         tree.append_spatial(
             crate::painting::visual_context::SpatialData::Scroll(crate::painting::visual_context::ScrollData {
                 state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: SpatialNodeIndex(parent),
             }),
             SpatialNodeIndex(parent),
         )
@@ -2790,6 +3048,12 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
                 inset_bottom: inset(constraints.inset_bottom),
                 inset_left: inset(constraints.inset_left),
                 state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: if constraints.has_parent_sticky {
+                    SpatialNodeIndex(constraints.parent_sticky)
+                } else {
+                    SpatialNodeIndex(constraints.scroller)
+                },
             }),
             SpatialNodeIndex(parent),
         )
@@ -2885,12 +3149,15 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_effects_frame(
 /// # Safety
 ///
 /// `builder` must be a live handle from `visual_context_tree_test_builder_create`. Gives the tree
-/// the version another tree carries, so a test can stage a compatible tree-only update.
+/// the structural epoch another tree carries, so a test can stage a compatible tree-only update.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_test_builder_set_version(builder: *mut c_void, version: u64) {
+pub unsafe extern "C" fn visual_context_tree_test_builder_set_structural_epoch(
+    builder: *mut c_void,
+    structural_epoch: u64,
+) {
     abort_on_panic(|| {
         let tree = unsafe { test_builder_tree(builder) };
-        tree.version = version;
+        tree.structural_epoch = structural_epoch;
     });
 }
 

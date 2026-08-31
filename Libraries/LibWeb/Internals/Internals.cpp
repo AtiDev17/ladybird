@@ -152,10 +152,52 @@ void Internals::force_incompatible_visual_context_tree_rebuild()
     if (!document.has_committed_viewport_box())
         return;
     document.paint_state().set_force_incompatible_visual_context_tree_rebuild_for_testing();
-    document.set_needs_accumulated_visual_contexts_update(true);
+    document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::ForcedForTesting);
+}
+
+u64 Internals::accumulated_visual_context_incremental_update_count()
+{
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box())
+        return 0;
+    return document.paint_state().accumulated_visual_context_tree_incremental_update_count();
+}
+
+u64 Internals::visual_context_pending_dirty_box_count()
+{
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box())
+        return 0;
+    return Layout::RustFFI::layout_arena_visual_context_pending_dirty_box_count(document.layout_node_arena().handle());
 }
 
 u64 Internals::visual_context_tree_node_count()
+{
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
+        return 0;
+    auto visual_context_tree = document.paint_state().visual_context_tree(document);
+    return visual_context_tree.live_spatial_node_count() + visual_context_tree.live_frame_node_count();
+}
+
+u64 Internals::visual_context_tree_dead_node_count()
+{
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
+        return 0;
+    auto visual_context_tree = document.paint_state().visual_context_tree(document);
+    return (visual_context_tree.spatial_node_count() - visual_context_tree.live_spatial_node_count()) + (visual_context_tree.frame_node_count() - visual_context_tree.live_frame_node_count());
+}
+
+u64 Internals::visual_context_tree_structural_epoch()
+{
+    auto& document = window().associated_document();
+    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
+        return 0;
+    return document.paint_state().visual_context_tree(document).structural_epoch();
+}
+
+u64 Internals::visual_context_tree_node_capacity()
 {
     auto& document = window().associated_document();
     if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree())
@@ -174,13 +216,13 @@ void Internals::send_mismatched_visual_context_tree_update_to_compositor()
         return;
     auto& document_paint_state = document.paint_state();
 
-    // Force a fresh, incompatible rebuild — so the tree is minted with a new version that the Compositor's installed
+    // Force a fresh, incompatible rebuild — so the tree is minted with a new structural epoch that the Compositor's installed
     // display list was never recorded against.
     document_paint_state.set_force_incompatible_visual_context_tree_rebuild_for_testing();
-    document.set_needs_accumulated_visual_contexts_update(true);
+    document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::ForcedForTesting);
     document.update_paint_and_hit_testing_properties_if_needed();
 
-    // Send a bare visual-context-tree update carrying that new version *without* re-recording the display list —
+    // Send a bare visual-context-tree update carrying that new structural epoch *without* re-recording the display list —
     // deliberately reproducing the peer inconsistency behind issue #10368.
     navigable->compositor_context().update_visual_context_tree(document_paint_state.visual_context_tree(document), {});
 }

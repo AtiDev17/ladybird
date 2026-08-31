@@ -277,6 +277,10 @@ impl DisplayListRecorder {
         self.builder.byte_size()
     }
 
+    pub fn bytes(&self) -> &[u8] {
+        self.builder.bytes()
+    }
+
     pub fn accumulated_visual_context(&self) -> ContextRef {
         self.context
     }
@@ -295,8 +299,6 @@ impl DisplayListRecorder {
         source: &[u8],
         range: CommandRange,
         recorded_context: ContextRef,
-        recorded_local_frame_range: (u32, u32),
-        current_local_frame_range: (u32, u32),
     ) -> CommandRange {
         let offset = self.builder.append_command_range(
             source,
@@ -304,8 +306,6 @@ impl DisplayListRecorder {
             Some(ContextRewrite {
                 recorded_context,
                 current_context: self.context,
-                recorded_local_frame_range,
-                current_local_frame_range,
             }),
         );
         CommandRange {

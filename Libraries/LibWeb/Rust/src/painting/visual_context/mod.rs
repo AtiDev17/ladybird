@@ -5,20 +5,27 @@
  */
 
 pub mod basic_shapes;
+pub mod box_build;
 pub mod build;
+pub mod delta;
+pub mod dirty;
 pub mod dump;
+pub mod incremental;
 pub mod local_frames;
 pub mod nested;
 pub mod node_values;
 pub mod queries;
+pub mod reconcile;
 pub mod refresh;
 pub mod scroll_state;
 pub mod serialize;
+pub mod shape;
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::paintable_data::BorderEdge;
 use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect,
@@ -46,6 +53,7 @@ pub struct TransformData {
     pub flattens_inherited_transform: bool,
     pub role: TransformDataRole,
     pub synthetic_plane: bool,
+    pub establishes_sorting_context: bool,
 }
 
 impl TransformData {
@@ -131,6 +139,8 @@ pub struct MaskData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScrollData {
     pub state_slot: ScrollStateSlot,
+    pub owner_paintable: NodeSlotId,
+    pub registry_parent_node: SpatialNodeIndex,
 }
 
 // A sticky box's shift is derived when the scroll state snapshot is resolved, from the scroller's
@@ -151,6 +161,8 @@ pub struct StickyData {
     pub inset_bottom: Option<f32>,
     pub inset_left: Option<f32>,
     pub state_slot: ScrollStateSlot,
+    pub owner_paintable: NodeSlotId,
+    pub registry_parent_node: SpatialNodeIndex,
 }
 
 impl StickyData {
@@ -158,6 +170,8 @@ impl StickyData {
         scroller: SpatialNodeIndex,
         parent_sticky: Option<SpatialNodeIndex>,
         state_slot: ScrollStateSlot,
+        owner_paintable: NodeSlotId,
+        registry_parent_node: SpatialNodeIndex,
     ) -> Self {
         Self {
             scroller,
@@ -172,6 +186,8 @@ impl StickyData {
             inset_bottom: None,
             inset_left: None,
             state_slot,
+            owner_paintable,
+            registry_parent_node,
         }
     }
 }
@@ -227,6 +243,7 @@ pub enum SpatialData {
     Perspective(PerspectiveData),
     BackfaceVisibility(BackfaceVisibilityData),
     AnchorScrollShift(AnchorScrollShift),
+    Dead,
 }
 
 #[derive(Clone)]
@@ -235,6 +252,7 @@ pub enum FrameData {
     ClipPath(ClipPathData),
     Effects(EffectsData),
     Mask(MaskData),
+    Dead,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +267,7 @@ enum VisualContextNodeKind {
     ClipPath,
     Effects,
     Mask,
+    Dead,
 }
 
 impl SpatialData {
@@ -260,7 +279,12 @@ impl SpatialData {
             Self::Perspective(_) => VisualContextNodeKind::Perspective,
             Self::BackfaceVisibility(_) => VisualContextNodeKind::BackfaceVisibility,
             Self::AnchorScrollShift(_) => VisualContextNodeKind::AnchorScrollShift,
+            Self::Dead => VisualContextNodeKind::Dead,
         }
+    }
+
+    pub fn is_live(&self) -> bool {
+        !matches!(self, Self::Dead)
     }
 
     pub fn is_scroll_like(&self) -> bool {
@@ -276,7 +300,7 @@ impl FrameData {
                 let [_, _, width, height] = clip_path.path.bounding_box();
                 width <= 0.0 || height <= 0.0
             }
-            Self::Effects(_) => false,
+            Self::Effects(_) | Self::Dead => false,
             Self::Mask(mask) => mask.rect.is_empty(),
         }
     }
@@ -287,7 +311,12 @@ impl FrameData {
             Self::ClipPath(_) => VisualContextNodeKind::ClipPath,
             Self::Effects(_) => VisualContextNodeKind::Effects,
             Self::Mask(_) => VisualContextNodeKind::Mask,
+            Self::Dead => VisualContextNodeKind::Dead,
         }
+    }
+
+    pub fn is_live(&self) -> bool {
+        !matches!(self, Self::Dead)
     }
 }
 
@@ -417,12 +446,13 @@ impl SortingContexts {
 
 pub fn resolve_sorting_contexts_over_nodes(
     node_count: usize,
+    nodes_in_dependency_order: &[u32],
     parent_and_sorting_context_root_of_node: impl Fn(usize) -> (SpatialNodeIndex, Option<SpatialNodeIndex>),
 ) -> SortingContexts {
     let mut is_sorting_context_root = vec![false; node_count];
     let mut has_sorting_context_roots = false;
-    for index in 0..node_count {
-        let (_, sorting_context_root) = parent_and_sorting_context_root_of_node(index);
+    for &index in nodes_in_dependency_order {
+        let (_, sorting_context_root) = parent_and_sorting_context_root_of_node(index as usize);
         if let Some(root) = sorting_context_root {
             is_sorting_context_root[root.0 as usize] = true;
             has_sorting_context_roots = true;
@@ -432,14 +462,16 @@ pub fn resolve_sorting_contexts_over_nodes(
         return SortingContexts::default();
     }
 
-    // Roots always precede their contexts' nodes, so a single forward walk resolves every node.
+    // The dependency order lists a node after its parent and its sorting context root, so a single
+    // walk along it resolves every node from entries already written.
     let mut contexts = SortingContexts {
         links: HashMap::new(),
-        leaf_by_node: Vec::with_capacity(node_count),
-        context_by_node: Vec::with_capacity(node_count),
+        leaf_by_node: vec![NO_SORTING_CONTEXT; node_count],
+        context_by_node: vec![NO_SORTING_CONTEXT; node_count],
     };
-    for (index, is_sorting_context_root) in is_sorting_context_root.iter().copied().enumerate() {
-        let spatial_index = SpatialNodeIndex(index as u32);
+    for &index in nodes_in_dependency_order {
+        let spatial_index = SpatialNodeIndex(index);
+        let index = index as usize;
         let (parent, sorting_context_root) = parent_and_sorting_context_root_of_node(index);
         let inherited_leaf = if index == 0 {
             NO_SORTING_CONTEXT
@@ -452,9 +484,9 @@ pub fn resolve_sorting_contexts_over_nodes(
             contexts.context_by_node[parent.0 as usize]
         };
         if let Some(root) = sorting_context_root {
-            contexts.leaf_by_node.push(spatial_index);
-            contexts.context_by_node.push(root);
-        } else if is_sorting_context_root {
+            contexts.leaf_by_node[index] = spatial_index;
+            contexts.context_by_node[index] = root;
+        } else if is_sorting_context_root[index] {
             contexts.links.insert(
                 spatial_index.0,
                 SortingContextLink {
@@ -462,20 +494,57 @@ pub fn resolve_sorting_contexts_over_nodes(
                     parent_leaf: inherited_leaf,
                 },
             );
-            contexts.leaf_by_node.push(spatial_index);
-            contexts.context_by_node.push(spatial_index);
+            contexts.leaf_by_node[index] = spatial_index;
+            contexts.context_by_node[index] = spatial_index;
         } else {
-            contexts.leaf_by_node.push(inherited_leaf);
-            contexts.context_by_node.push(inherited_context);
+            contexts.leaf_by_node[index] = inherited_leaf;
+            contexts.context_by_node[index] = inherited_context;
         }
     }
     contexts
 }
 
-static NEXT_TREE_VERSION: AtomicU64 = AtomicU64::new(1);
+static NEXT_STRUCTURAL_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-pub fn allocate_tree_version() -> u64 {
-    NEXT_TREE_VERSION.fetch_add(1, Ordering::Relaxed)
+pub fn allocate_structural_epoch() -> u64 {
+    NEXT_STRUCTURAL_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn resolve_leaf_to_context_matrices(
+    contexts: &SortingContexts,
+    parent_by_node: &[SpatialNodeIndex],
+    local_matrix_by_node: &[FloatMatrix4x4],
+    flattens_inherited_transform_by_node: &[bool],
+) -> Vec<FloatMatrix4x4> {
+    if contexts.is_empty() {
+        return Vec::new();
+    }
+    let mut matrices = Vec::with_capacity(local_matrix_by_node.len());
+    for (index, local_matrix) in local_matrix_by_node.iter().enumerate() {
+        let context = contexts.context_by_node[index];
+        if context.0 as usize == index || index == 0 {
+            matrices.push(FloatMatrix4x4::identity());
+            continue;
+        }
+        let parent = parent_by_node[index].0 as usize;
+        if parent == context.0 as usize {
+            matrices.push(*local_matrix);
+            continue;
+        }
+        let mut base = matrices[parent];
+        if flattens_inherited_transform_by_node[index] {
+            base = base.flattened();
+        }
+        if context != NO_SORTING_CONTEXT && contexts.context_by_node[parent] != context {
+            let root_matrix = matrices[context.0 as usize];
+            base = root_matrix
+                .inverse()
+                .unwrap_or(FloatMatrix4x4::identity())
+                .multiplied(base);
+        }
+        matrices.push(base.multiplied(*local_matrix));
+    }
+    matrices
 }
 
 #[derive(Default)]
@@ -486,11 +555,27 @@ pub struct VisualContextState {
     pub scroll_state_snapshot: Vec<FloatPoint>,
     pub needs_to_refresh_scroll_state: bool,
     pub build_count: u64,
+    pub dirty_boxes: dirty::VisualContextDirtySet,
+    pub incremental_update_count: u64,
+    pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
+    pub last_root_background_source: Option<crate::painting::host::FfiRootBackgroundSource>,
+    pub last_full_build_reason: dirty::VisualContextGlobalRebuildReason,
+    pub quarantined_slots_are_releasable: bool,
 }
 
 impl VisualContextState {
-    pub fn tree_version(&self) -> u64 {
-        self.tree.as_ref().map_or(0, |tree| tree.version)
+    pub fn structural_epoch(&self) -> u64 {
+        self.tree.as_ref().map_or(0, |tree| tree.structural_epoch)
+    }
+
+    pub fn release_quarantined_slots_while_no_handle_is_retained(&mut self) {
+        if !self.quarantined_slots_are_releasable {
+            return;
+        }
+        self.quarantined_slots_are_releasable = false;
+        if let Some(tree) = self.tree.as_mut() {
+            Rc::make_mut(tree).release_quarantined_slots_after_recording();
+        }
     }
 }
 
@@ -500,8 +585,113 @@ pub struct VisualContextTree {
     pub frame_nodes: Vec<FrameNode>,
     pub root_is_visual_viewport: bool,
     pub root_isolation_frame: Option<FrameNodeIndex>,
-    pub version: u64,
-    pub reused_previous_version: bool,
+    pub structural_epoch: u64,
+    pub live_spatial_node_count: u32,
+    pub live_frame_node_count: u32,
+    free_spatial_slots: Vec<SpatialNodeIndex>,
+    free_frame_slots: Vec<FrameNodeIndex>,
+    quarantined_spatial_slots: Vec<SpatialNodeIndex>,
+    quarantined_frame_slots: Vec<FrameNodeIndex>,
+}
+
+const COMPACTION_DEAD_NODE_THRESHOLD: usize = 512;
+
+pub(crate) struct NodeDependencyOrder {
+    pub order: Vec<u32>,
+    pub back_edges: Vec<(u32, u32)>,
+    pub dangling_references: Vec<(u32, u32)>,
+}
+
+fn for_each_spatial_node_reference(
+    index: SpatialNodeIndex,
+    node: &SpatialNode,
+    mut visit: impl FnMut(SpatialNodeIndex),
+) {
+    if index != VISUAL_VIEWPORT_NODE_INDEX {
+        visit(node.parent);
+    }
+    match &node.data {
+        SpatialData::Scroll(scroll) => visit(scroll.registry_parent_node),
+        SpatialData::Sticky(sticky) => {
+            visit(sticky.scroller);
+            if let Some(parent_sticky) = sticky.parent_sticky {
+                visit(parent_sticky);
+            }
+            visit(sticky.registry_parent_node);
+        }
+        SpatialData::Transform(transform) => {
+            if let Some(root) = transform.sorting_context_root_index {
+                visit(root);
+            }
+        }
+        SpatialData::BackfaceVisibility(backface) => visit(backface.plane_root_index),
+        SpatialData::AnchorScrollShift(shift) => visit(shift.scroll_node_index),
+        SpatialData::Perspective(_) | SpatialData::Dead => {}
+    }
+}
+
+fn dependency_order(
+    node_count: usize,
+    is_live: impl Fn(usize) -> bool,
+    collect_references: impl Fn(usize, &mut Vec<usize>),
+) -> NodeDependencyOrder {
+    const UNVISITED: u8 = 0;
+    const ON_STACK: u8 = 1;
+    const DONE: u8 = 2;
+    struct PendingNode {
+        node: usize,
+        references_begin: usize,
+        references_end: usize,
+        next_reference: usize,
+    }
+    let mut marks = vec![UNVISITED; node_count];
+    let mut order = Vec::with_capacity(node_count);
+    let mut back_edges = Vec::new();
+    let mut dangling_references = Vec::new();
+    let mut references: Vec<usize> = Vec::new();
+    let mut stack: Vec<PendingNode> = Vec::new();
+    let push = |node: usize, references: &mut Vec<usize>, stack: &mut Vec<PendingNode>, marks: &mut Vec<u8>| {
+        marks[node] = ON_STACK;
+        let references_begin = references.len();
+        collect_references(node, references);
+        stack.push(PendingNode {
+            node,
+            references_begin,
+            references_end: references.len(),
+            next_reference: references_begin,
+        });
+    };
+    for root in 0..node_count {
+        if marks[root] != UNVISITED || !is_live(root) {
+            continue;
+        }
+        push(root, &mut references, &mut stack, &mut marks);
+        while let Some(pending) = stack.last_mut() {
+            if pending.next_reference == pending.references_end {
+                marks[pending.node] = DONE;
+                order.push(pending.node as u32);
+                references.truncate(pending.references_begin);
+                stack.pop();
+                continue;
+            }
+            let referenced = references[pending.next_reference];
+            pending.next_reference += 1;
+            if referenced >= node_count || !is_live(referenced) {
+                dangling_references.push((pending.node as u32, referenced as u32));
+                continue;
+            }
+            match marks[referenced] {
+                ON_STACK => back_edges.push((pending.node as u32, referenced as u32)),
+                UNVISITED => push(referenced, &mut references, &mut stack, &mut marks),
+                _ => {}
+            }
+        }
+    }
+    NodeDependencyOrder {
+        order,
+        back_edges,
+        dangling_references,
+    }
 }
 
 impl VisualContextTree {
@@ -521,6 +711,7 @@ impl VisualContextTree {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         })
     }
 
@@ -533,14 +724,150 @@ impl VisualContextTree {
             frame_nodes: Vec::new(),
             root_is_visual_viewport,
             root_isolation_frame: None,
-            version: allocate_tree_version(),
-            reused_previous_version: false,
+            structural_epoch: allocate_structural_epoch(),
+            live_spatial_node_count: 1,
+            live_frame_node_count: 0,
+            free_spatial_slots: Vec::new(),
+            free_frame_slots: Vec::new(),
+            quarantined_spatial_slots: Vec::new(),
+            quarantined_frame_slots: Vec::new(),
         }
     }
 
+    pub fn spatial_is_live(&self, index: SpatialNodeIndex) -> bool {
+        self.spatial_nodes
+            .get(index.0 as usize)
+            .is_some_and(|node| node.data.is_live())
+    }
+
+    pub fn frame_is_live(&self, index: FrameNodeIndex) -> bool {
+        self.frame_nodes
+            .get(index.0 as usize)
+            .is_some_and(|node| node.data.is_live())
+    }
+
+    pub fn dead_node_count(&self) -> usize {
+        self.spatial_nodes.len() + self.frame_nodes.len()
+            - self.live_spatial_node_count as usize
+            - self.live_frame_node_count as usize
+    }
+
+    pub fn should_compact(&self) -> bool {
+        let live = self.live_spatial_node_count as usize + self.live_frame_node_count as usize;
+        self.dead_node_count() > live.max(COMPACTION_DEAD_NODE_THRESHOLD)
+    }
+
+    pub fn allocate_spatial_slot(&mut self) -> (SpatialNodeIndex, bool) {
+        if let Some(index) = self.free_spatial_slots.pop() {
+            debug_assert!(!self.spatial_nodes[index.0 as usize].data.is_live());
+            return (index, true);
+        }
+        self.spatial_nodes.push(SpatialNode {
+            data: SpatialData::Dead,
+            parent: VISUAL_VIEWPORT_NODE_INDEX,
+        });
+        (SpatialNodeIndex((self.spatial_nodes.len() - 1) as u32), false)
+    }
+
+    pub fn allocate_frame_slot(&mut self) -> (FrameNodeIndex, bool) {
+        if let Some(index) = self.free_frame_slots.pop() {
+            debug_assert!(!self.frame_nodes[index.0 as usize].data.is_live());
+            return (index, true);
+        }
+        self.frame_nodes.push(FrameNode::new(
+            FrameData::Dead,
+            FrameNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+            FrameRole::Structural,
+        ));
+        (FrameNodeIndex((self.frame_nodes.len() - 1) as u32), false)
+    }
+
+    pub fn tombstone_spatial_slot(&mut self, index: SpatialNodeIndex) -> bool {
+        assert_ne!(
+            index, VISUAL_VIEWPORT_NODE_INDEX,
+            "the visual viewport node is never tombstoned"
+        );
+        let node = &mut self.spatial_nodes[index.0 as usize];
+        if !node.data.is_live() {
+            return false;
+        }
+        node.data = SpatialData::Dead;
+        self.live_spatial_node_count -= 1;
+        self.quarantined_spatial_slots.push(index);
+        true
+    }
+
+    pub fn tombstone_frame_slot(&mut self, index: FrameNodeIndex) -> bool {
+        assert_ne!(
+            Some(index),
+            self.root_isolation_frame,
+            "the root isolation frame is never tombstoned"
+        );
+        let node = &mut self.frame_nodes[index.0 as usize];
+        if !node.data.is_live() {
+            return false;
+        }
+        node.data = FrameData::Dead;
+        node.role = FrameRole::Structural;
+        node.clips_everything = false;
+        self.live_frame_node_count -= 1;
+        self.quarantined_frame_slots.push(index);
+        true
+    }
+
+    pub fn replace_spatial_node(&mut self, index: SpatialNodeIndex, node: SpatialNode) -> bool {
+        debug_assert!(node.data.is_live(), "slots are retired through tombstone_spatial_slot");
+        let slot = &mut self.spatial_nodes[index.0 as usize];
+        let was_live = slot.data.is_live();
+        *slot = node;
+        if !was_live {
+            self.live_spatial_node_count += 1;
+        }
+        was_live
+    }
+
+    pub fn replace_frame_node(&mut self, index: FrameNodeIndex, node: FrameNode) -> bool {
+        debug_assert!(node.data.is_live(), "slots are retired through tombstone_frame_slot");
+        let slot = &mut self.frame_nodes[index.0 as usize];
+        let was_live = slot.data.is_live();
+        *slot = node;
+        if !was_live {
+            self.live_frame_node_count += 1;
+        }
+        was_live
+    }
+
+    pub fn release_quarantined_slots_after_recording(&mut self) {
+        self.free_spatial_slots.append(&mut self.quarantined_spatial_slots);
+        self.free_frame_slots.append(&mut self.quarantined_frame_slots);
+        self.debug_assert_slot_accounting();
+    }
+
+    pub fn free_slot_count(&self) -> usize {
+        self.free_spatial_slots.len() + self.free_frame_slots.len()
+    }
+
+    pub fn quarantined_slot_count(&self) -> usize {
+        self.quarantined_spatial_slots.len() + self.quarantined_frame_slots.len()
+    }
+
+    pub(crate) fn debug_assert_slot_accounting(&self) {
+        debug_assert_eq!(
+            self.dead_node_count(),
+            self.free_slot_count() + self.quarantined_slot_count(),
+            "every dead slot is either free or quarantined"
+        );
+    }
+
     pub fn append_spatial(&mut self, data: SpatialData, parent: SpatialNodeIndex) -> SpatialNodeIndex {
-        assert!((parent.0 as usize) < self.spatial_nodes.len());
+        assert!(
+            self.spatial_is_live(parent),
+            "a spatial node's parent must be a live node"
+        );
+        assert!(data.is_live(), "appended spatial nodes are live");
         self.spatial_nodes.push(SpatialNode { data, parent });
+        self.live_spatial_node_count += 1;
         SpatialNodeIndex((self.spatial_nodes.len() - 1) as u32)
     }
 
@@ -574,12 +901,18 @@ impl VisualContextTree {
         spatial: SpatialNodeIndex,
         role: FrameRole,
     ) -> FrameNodeIndex {
-        assert!((spatial.0 as usize) < self.spatial_nodes.len());
+        assert!(
+            self.spatial_is_live(spatial),
+            "a frame node's spatial node must be a live node"
+        );
+        assert!(data.is_live(), "appended frame nodes are live");
         if !parent.is_none() {
+            assert!(self.frame_is_live(parent), "a frame node's parent must be a live node");
             let parent_node = &self.frame_nodes[parent.0 as usize];
             debug_assert!(self.spatial_is_ancestor_or_self(parent_node.spatial, spatial));
         }
         self.frame_nodes.push(FrameNode::new(data, parent, spatial, role));
+        self.live_frame_node_count += 1;
         FrameNodeIndex((self.frame_nodes.len() - 1) as u32)
     }
 
@@ -672,6 +1005,10 @@ impl VisualContextTree {
                 matrix: FloatMatrix4x4::identity(),
                 flattens_inherited_transform: backface.flattens_inherited_transform,
             },
+            SpatialData::Dead => LocalSpatialMatrix {
+                matrix: FloatMatrix4x4::identity(),
+                flattens_inherited_transform: false,
+            },
         }
     }
 
@@ -730,8 +1067,59 @@ impl VisualContextTree {
         depth.is_finite().then_some(depth)
     }
 
+    pub(crate) fn spatial_dependency_order_with_back_edges(&self) -> NodeDependencyOrder {
+        dependency_order(
+            self.spatial_nodes.len(),
+            |index| self.spatial_nodes[index].data.is_live(),
+            |index, references| {
+                for_each_spatial_node_reference(
+                    SpatialNodeIndex(index as u32),
+                    &self.spatial_nodes[index],
+                    |referenced| {
+                        references.push(referenced.0 as usize);
+                    },
+                );
+            },
+        )
+    }
+
+    pub(crate) fn frame_dependency_order_with_back_edges(&self) -> NodeDependencyOrder {
+        dependency_order(
+            self.frame_nodes.len(),
+            |index| self.frame_nodes[index].data.is_live(),
+            |index, references| {
+                let parent = self.frame_nodes[index].parent;
+                if !parent.is_none() {
+                    references.push(parent.0 as usize);
+                }
+            },
+        )
+    }
+
+    pub fn spatial_dependency_order(&self) -> Vec<u32> {
+        let dependency_order = self.spatial_dependency_order_with_back_edges();
+        debug_assert!(
+            dependency_order.back_edges.is_empty() && dependency_order.dangling_references.is_empty(),
+            "spatial node references form a cycle or dangle: {:?} {:?}",
+            dependency_order.back_edges,
+            dependency_order.dangling_references
+        );
+        dependency_order.order
+    }
+
+    pub fn frame_dependency_order(&self) -> Vec<u32> {
+        let dependency_order = self.frame_dependency_order_with_back_edges();
+        debug_assert!(
+            dependency_order.back_edges.is_empty() && dependency_order.dangling_references.is_empty(),
+            "frame node parents form a cycle or dangle: {:?} {:?}",
+            dependency_order.back_edges,
+            dependency_order.dangling_references
+        );
+        dependency_order.order
+    }
+
     pub fn resolve_sorting_contexts(&self) -> SortingContexts {
-        resolve_sorting_contexts_over_nodes(self.spatial_nodes.len(), |index| {
+        resolve_sorting_contexts_over_nodes(self.spatial_nodes.len(), &self.spatial_dependency_order(), |index| {
             let node = &self.spatial_nodes[index];
             let sorting_context_root = if let SpatialData::Transform(transform) = &node.data {
                 transform.sorting_context_root_index
@@ -754,9 +1142,135 @@ impl VisualContextTree {
     }
 }
 
+pub trait VisualContextNodeSink {
+    fn append_spatial_node(&mut self, data: SpatialData, parent: SpatialNodeIndex) -> SpatialNodeIndex;
+    fn append_frame_node(
+        &mut self,
+        data: FrameData,
+        parent: FrameNodeIndex,
+        spatial: SpatialNodeIndex,
+        role: FrameRole,
+    ) -> FrameNodeIndex;
+    fn spatial_node_at(&self, index: SpatialNodeIndex) -> &SpatialNode;
+    fn next_spatial_node_index(&self) -> SpatialNodeIndex;
+    fn next_frame_node_index(&self) -> FrameNodeIndex;
+
+    fn append_spatial_node_under(&mut self, context: ContextRef, data: SpatialData) -> ContextRef {
+        ContextRef {
+            spatial: self.append_spatial_node(data, context.spatial),
+            ..context
+        }
+    }
+
+    fn append_frame_node_under(&mut self, context: ContextRef, data: FrameData) -> ContextRef {
+        ContextRef {
+            frame: self.append_frame_node(data, context.frame, context.spatial, FrameRole::Structural),
+            ..context
+        }
+    }
+}
+
+impl VisualContextNodeSink for VisualContextTree {
+    fn append_spatial_node(&mut self, data: SpatialData, parent: SpatialNodeIndex) -> SpatialNodeIndex {
+        self.append_spatial(data, parent)
+    }
+
+    fn append_frame_node(
+        &mut self,
+        data: FrameData,
+        parent: FrameNodeIndex,
+        spatial: SpatialNodeIndex,
+        role: FrameRole,
+    ) -> FrameNodeIndex {
+        self.append_frame_with_role(data, parent, spatial, role)
+    }
+
+    fn spatial_node_at(&self, index: SpatialNodeIndex) -> &SpatialNode {
+        &self.spatial_nodes[index.0 as usize]
+    }
+
+    fn next_spatial_node_index(&self) -> SpatialNodeIndex {
+        SpatialNodeIndex(self.spatial_nodes.len() as u32)
+    }
+
+    fn next_frame_node_index(&self) -> FrameNodeIndex {
+        FrameNodeIndex(self.frame_nodes.len() as u32)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BoxVisualContextNodeHandles {
+    pub spatial: Vec<SpatialNodeIndex>,
+    pub chain_frames: Vec<FrameNodeIndex>,
+    pub local_frames: Vec<FrameNodeIndex>,
+    pub descendant_frames: Vec<FrameNodeIndex>,
+}
+
+pub static EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES: BoxVisualContextNodeHandles = BoxVisualContextNodeHandles {
+    spatial: Vec::new(),
+    chain_frames: Vec::new(),
+    local_frames: Vec::new(),
+    descendant_frames: Vec::new(),
+};
+
+impl BoxVisualContextNodeHandles {
+    pub fn frame_handles(&self) -> impl Iterator<Item = FrameNodeIndex> + '_ {
+        self.chain_frames
+            .iter()
+            .chain(&self.local_frames)
+            .chain(&self.descendant_frames)
+            .copied()
+    }
+
+    pub fn contains_frame(&self, frame: FrameNodeIndex) -> bool {
+        self.frame_handles().any(|handle| handle == frame)
+    }
+
+    pub fn local_frame_handles(&self) -> &[FrameNodeIndex] {
+        &self.local_frames
+    }
+}
+
+// Nearest ancestor scroll node resolved along the containing block chain, drilled down alongside
+// the visual context indices. A fixed-position ancestor decouples its subtree from all outer
+// scrollers, but sticky boxes must still reference a scrollport through fixed-position ancestors
+// for their sticky offset computation, so both resolutions are carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NearestScrollNodeIndices {
+    pub stopping_at_fixed_position_ancestors: SpatialNodeIndex,
+    pub continuing_through_fixed_position_ancestors: SpatialNodeIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescendantVisualContexts {
+    pub normal: ContextRef,
+    pub absolute_position: ContextRef,
+    pub fixed_position: ContextRef,
+    pub normal_nearest_scroll_nodes: NearestScrollNodeIndices,
+    pub absolute_position_nearest_scroll_nodes: NearestScrollNodeIndices,
+    pub fixed_position_nearest_scroll_nodes: NearestScrollNodeIndices,
+    pub normal_plane_root: SpatialNodeIndex,
+    pub absolute_position_plane_root: SpatialNodeIndex,
+    pub fixed_position_plane_root: SpatialNodeIndex,
+    pub flattens_inherited_transform: bool,
+    pub sorting_context_root: Option<SpatialNodeIndex>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaintableVisualContextRecord {
+    pub inherited_input: DescendantVisualContexts,
+    pub output_for_descendants: DescendantVisualContexts,
+    pub node_handles: BoxVisualContextNodeHandles,
+    pub has_mask_nodes: bool,
+    pub may_be_root_element: bool,
+    pub owns_geometry_dependent_nodes: bool,
+    pub subtree_may_own_geometry_dependent_nodes: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::node_data::NodeSlotId;
     use libgfx_rust::translation_matrix;
 
     fn transform(translation: f32) -> TransformData {
@@ -770,6 +1284,7 @@ mod tests {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         }
     }
 
@@ -908,6 +1423,8 @@ mod tests {
         let scroll = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -975,6 +1492,274 @@ mod tests {
             }
         );
     }
+
+    fn viewport_scroll() -> SpatialData {
+        SpatialData::Scroll(ScrollData {
+            state_slot: NO_SCROLL_STATE_SLOT,
+            owner_paintable: NodeSlotId::INVALID,
+            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
+        })
+    }
+
+    #[test]
+    fn spatial_dependency_order_puts_every_reference_before_its_referrer() {
+        let mut tree = tree();
+        let scroll = tree.append_spatial(viewport_scroll(), VISUAL_VIEWPORT_NODE_INDEX);
+        let child = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let parent = tree.append_spatial(SpatialData::Transform(transform(0.0)), scroll);
+        tree.spatial_nodes[child.0 as usize].parent = parent;
+        let sticky = tree.append_spatial(
+            SpatialData::Sticky(StickyData::unconstrained(
+                scroll,
+                None,
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                scroll,
+            )),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let order = tree.spatial_dependency_order();
+        let position = |index: SpatialNodeIndex| order.iter().position(|entry| *entry == index.0).unwrap();
+        assert_eq!(order.len(), 5);
+        assert!(position(parent) < position(child));
+        assert!(position(scroll) < position(parent));
+        assert!(position(scroll) < position(sticky));
+        assert_eq!(order[0], VISUAL_VIEWPORT_NODE_INDEX.0);
+    }
+
+    #[test]
+    fn frame_dependency_order_follows_parents_only() {
+        let mut tree = tree();
+        let root_isolation_frame = tree.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        let child = tree.append_frame(effects(), root_isolation_frame, VISUAL_VIEWPORT_NODE_INDEX);
+        let parent = tree.append_frame(effects(), root_isolation_frame, VISUAL_VIEWPORT_NODE_INDEX);
+        tree.frame_nodes[child.0 as usize].parent = parent;
+        assert_eq!(
+            tree.frame_dependency_order(),
+            vec![root_isolation_frame.0, parent.0, child.0]
+        );
+    }
+
+    #[test]
+    fn a_reference_cycle_and_a_self_reference_are_reported_as_back_edges() {
+        let mut tree = tree();
+        let first = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let second = tree.append_spatial(SpatialData::Transform(transform(0.0)), first);
+        tree.spatial_nodes[first.0 as usize].parent = second;
+        let order = tree.spatial_dependency_order_with_back_edges();
+        assert_eq!(order.back_edges, vec![(second.0, first.0)]);
+        assert!(order.dangling_references.is_empty());
+        assert_eq!(order.order.len(), 3);
+
+        let mut self_referencing = self::tree();
+        let anchored = self_referencing.append_spatial(
+            SpatialData::AnchorScrollShift(AnchorScrollShift {
+                scroll_node_index: SpatialNodeIndex(1),
+                negate: false,
+                compensate_horizontal_scroll: true,
+                compensate_vertical_scroll: true,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let order = self_referencing.spatial_dependency_order_with_back_edges();
+        assert_eq!(order.back_edges, vec![(anchored.0, anchored.0)]);
+    }
+
+    #[test]
+    fn a_reference_out_of_range_is_reported_as_dangling() {
+        let mut tree = tree();
+        let marker = tree.append_spatial(
+            SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+                plane_root_index: SpatialNodeIndex(9),
+                flattens_inherited_transform: false,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let order = tree.spatial_dependency_order_with_back_edges();
+        assert_eq!(order.dangling_references, vec![(marker.0, 9)]);
+        assert!(order.back_edges.is_empty());
+    }
+
+    #[test]
+    fn sorting_contexts_resolve_the_same_for_a_child_stored_below_its_parent() {
+        let mut in_order = tree();
+        let context_root = in_order.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let participant =
+            in_order.append_spatial(SpatialData::Transform(sorting_transform(context_root)), context_root);
+        let descendant = in_order.append_spatial(SpatialData::Transform(transform(0.0)), participant);
+
+        let mut permuted = tree();
+        let permuted_descendant =
+            permuted.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let permuted_participant =
+            permuted.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let permuted_context_root =
+            permuted.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        permuted.spatial_nodes[permuted_participant.0 as usize] = SpatialNode {
+            data: SpatialData::Transform(sorting_transform(permuted_context_root)),
+            parent: permuted_context_root,
+        };
+        permuted.spatial_nodes[permuted_descendant.0 as usize].parent = permuted_participant;
+
+        let expected = in_order.resolve_sorting_contexts();
+        let contexts = permuted.resolve_sorting_contexts();
+        let pairs = [
+            (context_root, permuted_context_root),
+            (participant, permuted_participant),
+            (descendant, permuted_descendant),
+        ];
+        let map = |index: SpatialNodeIndex| {
+            pairs
+                .iter()
+                .find(|(original, _)| *original == index)
+                .map_or(index, |(_, mapped)| *mapped)
+        };
+        for (original, mapped) in pairs {
+            assert_eq!(
+                contexts.leaf_by_node[mapped.0 as usize],
+                map(expected.leaf_by_node[original.0 as usize])
+            );
+            assert_eq!(
+                contexts.context_by_node[mapped.0 as usize],
+                map(expected.context_by_node[original.0 as usize])
+            );
+        }
+        assert_eq!(
+            contexts.outermost_context_of(permuted_context_root),
+            permuted_context_root
+        );
+    }
+
+    #[test]
+    fn tombstones_keep_their_links_and_leave_the_live_counts() {
+        let mut tree = tree();
+        let transform = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let empty_clip = tree.append_frame(
+            clip(FloatRect::new(0.0, 0.0, 0.0, 0.0), ClipMode::Intersect),
+            FrameNodeIndex::NONE,
+            transform,
+        );
+        assert_eq!(tree.live_spatial_node_count, 2);
+        assert_eq!(tree.live_frame_node_count, 1);
+        assert!(tree.frame_nodes[empty_clip.0 as usize].clips_everything);
+        assert!(tree.tombstone_frame_slot(empty_clip));
+        assert!(tree.tombstone_spatial_slot(transform));
+        assert!(!tree.tombstone_spatial_slot(transform));
+        assert!(!tree.spatial_is_live(transform));
+        assert!(!tree.frame_is_live(empty_clip));
+        assert_eq!(
+            tree.spatial_nodes[transform.0 as usize].parent,
+            VISUAL_VIEWPORT_NODE_INDEX
+        );
+        assert!(!tree.frame_nodes[empty_clip.0 as usize].clips_everything);
+        assert_eq!(tree.live_spatial_node_count, 1);
+        assert_eq!(tree.live_frame_node_count, 0);
+        assert_eq!(tree.dead_node_count(), 2);
+        assert!(!tree.should_compact());
+        assert!(tree.is_compatible_with(&tree.clone()));
+    }
+
+    #[test]
+    fn tombstoned_slots_stay_quarantined_until_a_recording_completes() {
+        let mut tree = tree();
+        let tombstoned = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(tree.tombstone_spatial_slot(tombstoned));
+        assert_eq!(tree.quarantined_slot_count(), 1);
+        assert_eq!(tree.free_slot_count(), 0);
+        let (fresh, reused) = tree.allocate_spatial_slot();
+        assert!(!reused);
+        assert_eq!(fresh, SpatialNodeIndex(2));
+        assert!(!tree.replace_spatial_node(
+            fresh,
+            SpatialNode {
+                data: SpatialData::Transform(transform(0.0)),
+                parent: VISUAL_VIEWPORT_NODE_INDEX,
+            },
+        ));
+        tree.release_quarantined_slots_after_recording();
+        assert_eq!(tree.quarantined_slot_count(), 0);
+        assert_eq!(tree.free_slot_count(), 1);
+        let (recycled, reused) = tree.allocate_spatial_slot();
+        assert!(reused);
+        assert_eq!(recycled, tombstoned);
+    }
+
+    #[test]
+    fn released_slots_are_reused_before_the_arrays_grow() {
+        let mut tree = tree();
+        let first = tree.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        let second = tree.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        assert!(tree.tombstone_frame_slot(first));
+        assert!(tree.tombstone_frame_slot(second));
+        tree.release_quarantined_slots_after_recording();
+        let frame_count = tree.frame_nodes.len();
+        assert_eq!(tree.allocate_frame_slot(), (second, true));
+        assert_eq!(tree.allocate_frame_slot(), (first, true));
+        assert_eq!(tree.frame_nodes.len(), frame_count);
+        assert_eq!(tree.allocate_frame_slot(), (FrameNodeIndex(frame_count as u32), false));
+    }
+
+    #[test]
+    fn dead_node_count_counts_free_and_quarantined_slots() {
+        let mut tree = tree();
+        let transform_node = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let clip_frame = tree.append_frame(
+            clip(FloatRect::new(0.0, 0.0, 1.0, 1.0), ClipMode::Intersect),
+            FrameNodeIndex::NONE,
+            transform_node,
+        );
+        assert!(tree.tombstone_frame_slot(clip_frame));
+        tree.release_quarantined_slots_after_recording();
+        assert!(tree.tombstone_spatial_slot(transform_node));
+        assert_eq!(tree.dead_node_count(), 2);
+        assert_eq!(tree.free_slot_count(), 1);
+        assert_eq!(tree.quarantined_slot_count(), 1);
+        let (slot, reused) = tree.allocate_frame_slot();
+        assert!(reused);
+        assert!(!tree.replace_frame_node(
+            slot,
+            FrameNode::new(
+                effects(),
+                FrameNodeIndex::NONE,
+                VISUAL_VIEWPORT_NODE_INDEX,
+                FrameRole::Structural
+            )
+        ));
+        assert_eq!(tree.dead_node_count(), 1);
+        tree.debug_assert_slot_accounting();
+    }
+
+    #[test]
+    fn dependency_orders_leave_tombstones_out() {
+        let mut tree = tree();
+        let stale = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let other = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let frame = tree.append_frame(effects(), FrameNodeIndex::NONE, other);
+        assert!(tree.tombstone_spatial_slot(stale));
+        assert!(tree.tombstone_frame_slot(frame));
+        let order = tree.spatial_dependency_order_with_back_edges();
+        assert_eq!(order.order, vec![VISUAL_VIEWPORT_NODE_INDEX.0, other.0]);
+        assert!(order.back_edges.is_empty());
+        assert!(order.dangling_references.is_empty());
+        assert!(tree.frame_dependency_order().is_empty());
+    }
+
+    #[test]
+    fn a_live_node_referencing_a_tombstone_dangles() {
+        let mut tree = tree();
+        let plane_root = tree.append_spatial(SpatialData::Transform(transform(0.0)), VISUAL_VIEWPORT_NODE_INDEX);
+        let marker = tree.append_spatial(
+            SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+                plane_root_index: plane_root,
+                flattens_inherited_transform: false,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert!(tree.tombstone_spatial_slot(plane_root));
+        let order = tree.spatial_dependency_order_with_back_edges();
+        assert_eq!(order.dangling_references, vec![(marker.0, plane_root.0)]);
+    }
+
     #[test]
     fn a_tree_without_sorting_context_roots_resolves_to_empty_contexts() {
         assert!(tree().resolve_sorting_contexts().is_empty());
@@ -1091,5 +1876,43 @@ mod tests {
             tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
             None
         );
+    }
+
+    fn resolve_matrices(parents: &[u32], roots: &[Option<u32>], locals: &[FloatMatrix4x4]) -> Vec<FloatMatrix4x4> {
+        let dependency_order: Vec<u32> = (0..parents.len() as u32).collect();
+        let contexts = resolve_sorting_contexts_over_nodes(parents.len(), &dependency_order, |index| {
+            (SpatialNodeIndex(parents[index]), roots[index].map(SpatialNodeIndex))
+        });
+        let parent_by_node: Vec<SpatialNodeIndex> = parents.iter().map(|parent| SpatialNodeIndex(*parent)).collect();
+        resolve_leaf_to_context_matrices(&contexts, &parent_by_node, locals, &vec![false; parents.len()])
+    }
+
+    #[test]
+    fn leaf_to_context_matrices_compose_from_the_context_root() {
+        let locals = [
+            FloatMatrix4x4::identity(),
+            translation_matrix(1.0, 0.0, 0.0),
+            translation_matrix(0.0, 2.0, 0.0),
+            translation_matrix(0.0, 0.0, 3.0),
+        ];
+        let matrices = resolve_matrices(&[0, 0, 1, 2], &[None, None, Some(1), None], &locals);
+        assert_eq!(matrices[1], FloatMatrix4x4::identity());
+        assert_eq!(matrices[2], locals[2]);
+        assert_eq!(matrices[3], locals[2].multiplied(locals[3]));
+    }
+
+    #[test]
+    fn leaf_to_context_matrices_rebase_through_a_nested_context_root() {
+        let locals = [
+            FloatMatrix4x4::identity(),
+            translation_matrix(1.0, 0.0, 0.0),
+            translation_matrix(0.0, 2.0, 0.0),
+            translation_matrix(0.0, 0.0, 3.0),
+            translation_matrix(4.0, 0.0, 0.0),
+        ];
+        let matrices = resolve_matrices(&[0, 0, 1, 2, 3], &[None, None, Some(1), None, Some(2)], &locals);
+        assert_eq!(matrices[2], locals[2]);
+        assert_eq!(matrices[3], locals[2].multiplied(locals[3]));
+        assert_eq!(matrices[4], locals[3].multiplied(locals[4]));
     }
 }

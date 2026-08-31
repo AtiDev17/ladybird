@@ -47,10 +47,10 @@ AccumulatedVisualContextTree DocumentPaintState::visual_context_tree(DOM::Docume
     return visual_context_tree_without_update(document);
 }
 
-u64 DocumentPaintState::visual_context_tree_version(DOM::Document const& document) const
+u64 DocumentPaintState::visual_context_tree_structural_epoch(DOM::Document const& document) const
 {
     ensure_visual_context_tree(document);
-    return Layout::RustFFI::layout_arena_visual_context_tree_version(m_layout_node_arena->handle());
+    return Layout::RustFFI::layout_arena_visual_context_tree_structural_epoch(m_layout_node_arena->handle());
 }
 
 BlockingWheelEventRegionState DocumentPaintState::collect_root_blocking_wheel_event_regions(DOM::Document& document)
@@ -112,35 +112,29 @@ void DocumentPaintState::clear_scroll_state(DOM::Document& document)
     mirror_rust_clear_scroll_state(document);
 }
 
-void DocumentPaintState::assign_accumulated_visual_contexts(DOM::Document& document)
+void DocumentPaintState::update_accumulated_visual_contexts(DOM::Document& document)
 {
-    clear_scroll_state(document);
-    ++m_accumulated_visual_context_tree_build_count;
-    auto forced_incompatible_rebuild = m_force_incompatible_visual_context_tree_rebuild_for_testing;
+    auto force_full_rebuild = m_force_incompatible_visual_context_tree_rebuild_for_testing;
     m_force_incompatible_visual_context_tree_rebuild_for_testing = false;
-    auto is_compatible = rust_assign_accumulated_visual_contexts(document, forced_incompatible_rebuild);
-    if (!is_compatible)
+    auto result = rust_update_accumulated_visual_contexts(document, force_full_rebuild);
+    if (result.performed_full_build) {
+        m_scroll_state_snapshot = {};
+        ++m_accumulated_visual_context_tree_build_count;
+    } else {
+        ++m_accumulated_visual_context_tree_incremental_update_count;
+    }
+    set_needs_to_refresh_scroll_state(document, true);
+    if (result.requires_display_list_recording)
         document.set_needs_to_record_display_list();
-    m_visual_context_tree_visual_animations = nullptr;
+    if (result.performed_full_build || result.structural_epoch_changed)
+        m_visual_context_tree_visual_animations = nullptr;
     m_visual_context_tree_needs_compositor_update = true;
-}
-
-bool DocumentPaintState::update_accumulated_visual_context_values(DOM::Document& document, Layout::RustFFI::NodeSlotId paintable_slot)
-{
-    if (!has_visual_context_tree())
-        return false;
-    if (m_force_incompatible_visual_context_tree_rebuild_for_testing)
-        return false;
-    if (!rust_update_accumulated_visual_context_values(document, paintable_slot))
-        return false;
-    m_visual_context_tree_needs_compositor_update = true;
-    return true;
 }
 
 void DocumentPaintState::update_visual_viewport_accumulated_visual_context(DOM::Document& document)
 {
     if (!has_visual_context_tree()) {
-        assign_accumulated_visual_contexts(document);
+        update_accumulated_visual_contexts(document);
         return;
     }
     rust_update_visual_viewport_transform(document);
@@ -163,7 +157,11 @@ void DocumentPaintState::set_visual_animations(DOM::Document& document, Vector<C
         }
     }
     m_visual_animations = animations;
-    m_visual_context_tree_visual_animations = animations.is_empty() ? nullptr : adopt_ref(*new VisualAnimationList(move(animations)));
+    if (animations.is_empty()) {
+        m_visual_context_tree_visual_animations = nullptr;
+    } else {
+        m_visual_context_tree_visual_animations = adopt_ref(*new VisualAnimationList(move(animations)));
+    }
     m_visual_context_tree_needs_compositor_update = true;
     if (animation_parameters_changed)
         ++document.style_invalidation_counters().compositor_visual_animation_updates;

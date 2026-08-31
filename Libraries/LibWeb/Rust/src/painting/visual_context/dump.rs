@@ -123,6 +123,7 @@ impl VisualContextTree {
                     if shift.compensate_vertical_scroll { "" } else { ", no-y" }
                 );
             }
+            SpatialData::Dead => text.push_str("tombstone"),
         }
         text
     }
@@ -211,6 +212,7 @@ impl VisualContextTree {
                     origin
                 );
             }
+            FrameData::Dead => text.push_str("tombstone"),
         }
         text
     }
@@ -310,6 +312,7 @@ impl VisualContextTree {
 
 #[cfg(test)]
 mod node_dump_tests {
+    use crate::layout::node_data::NodeSlotId;
     use crate::painting::visual_context::{
         AnchorScrollShift, BackfaceVisibilityData, ClipData, ClipMode, EffectsData, FrameData, FrameNodeIndex,
         MaskData, MaskLayerOrigin, PerspectiveData, ScrollData, SpatialData, StickyData, TransformData,
@@ -328,6 +331,7 @@ mod node_dump_tests {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         })
     }
 
@@ -349,6 +353,7 @@ mod node_dump_tests {
                 flattens_inherited_transform: false,
                 role: TransformDataRole::CssTransform,
                 synthetic_plane: false,
+                establishes_sorting_context: false,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -360,17 +365,26 @@ mod node_dump_tests {
                 flattens_inherited_transform: false,
                 role: TransformDataRole::SvgViewportTransform,
                 synthetic_plane: false,
+                establishes_sorting_context: false,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         let scroll_node = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         let outer_sticky = tree.append_spatial(
-            SpatialData::Sticky(StickyData::unconstrained(scroll_node, None, NO_SCROLL_STATE_SLOT)),
+            SpatialData::Sticky(StickyData::unconstrained(
+                scroll_node,
+                None,
+                NO_SCROLL_STATE_SLOT,
+                NodeSlotId::INVALID,
+                scroll_node,
+            )),
             scroll_node,
         );
         let inner_sticky = tree.append_spatial(
@@ -393,6 +407,8 @@ mod node_dump_tests {
                 inset_bottom: Some(1.5),
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: scroll_node,
             }),
             outer_sticky,
         );
@@ -520,6 +536,7 @@ mod node_dump_tests {
 
 #[cfg(test)]
 mod section_dump_tests {
+    use crate::layout::node_data::NodeSlotId;
     use crate::painting::display_list::commands::{
         ContextRef, DisplayListCommandRun, FrameNodeIndex, SpatialNodeIndex,
     };
@@ -549,16 +566,21 @@ mod section_dump_tests {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         });
         let scroll_node = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         let unreachable_node = tree.append_spatial(
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );

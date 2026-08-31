@@ -36,7 +36,7 @@ use std::rc::Rc;
 #[derive(Default)]
 pub struct RecordingOutput {
     pub id: u64,
-    pub compatible_visual_context_tree_version: u64,
+    pub recorded_structural_epoch: u64,
     // A default-constructed output's 0.0 never matches a real recording scale.
     pub recorded_device_pixels_per_css_pixel: f64,
     pub hit_test_list: HitTestList,
@@ -360,12 +360,15 @@ impl<'a> PaintRecorder<'a> {
         let Some(tree) = self.paint_state.visual_context.tree.as_deref() else {
             return HashMap::new();
         };
-        let (begin, end) = self.data(paintable).local_frame_range();
-        (begin..end)
-            .map(FrameNodeIndex)
-            .map(|frame| (tree.frame_nodes[frame.0 as usize].role, frame))
-            .filter(|(role, _)| *role != FrameRole::Structural)
-            .collect()
+        self.layout_arena
+            .with_paintable_visual_context_node_handles(paintable, |handles| {
+                handles
+                    .local_frame_handles()
+                    .iter()
+                    .map(|frame| (tree.frame_nodes[frame.0 as usize].role, *frame))
+                    .filter(|(role, _)| *role != FrameRole::Structural)
+                    .collect()
+            })
     }
 
     pub(crate) fn local_context(&self, paintable: NodeSlotId, role: FrameRole) -> Option<ContextRef> {

@@ -79,9 +79,9 @@ void AccumulatedVisualContextTree::release_rust_handle()
     m_rust_tree = nullptr;
 }
 
-u64 AccumulatedVisualContextTree::version() const
+u64 AccumulatedVisualContextTree::structural_epoch() const
 {
-    return Layout::RustFFI::visual_context_tree_version(m_rust_tree);
+    return Layout::RustFFI::visual_context_tree_structural_epoch(m_rust_tree);
 }
 
 ByteBuffer AccumulatedVisualContextTree::serialize_to_bytes() const
@@ -103,6 +103,16 @@ size_t AccumulatedVisualContextTree::frame_node_count() const
     return Layout::RustFFI::visual_context_tree_frame_node_count(m_rust_tree);
 }
 
+size_t AccumulatedVisualContextTree::live_spatial_node_count() const
+{
+    return Layout::RustFFI::visual_context_tree_live_spatial_node_count(m_rust_tree);
+}
+
+size_t AccumulatedVisualContextTree::live_frame_node_count() const
+{
+    return Layout::RustFFI::visual_context_tree_live_frame_node_count(m_rust_tree);
+}
+
 TransformWithOrigin AccumulatedVisualContextTree::visual_viewport_transform() const
 {
     return Layout::RustFFI::visual_context_tree_visual_viewport_transform(m_rust_tree);
@@ -117,7 +127,11 @@ AccumulatedVisualContextTree AccumulatedVisualContextTree::with_visual_viewport_
 
 void AccumulatedVisualContextTree::set_visual_animations(Vector<Compositor::VisualAnimation> animations)
 {
-    m_visual_animations = animations.is_empty() ? nullptr : adopt_ref(*new VisualAnimationList(move(animations)));
+    if (animations.is_empty()) {
+        m_visual_animations = nullptr;
+    } else {
+        m_visual_animations = adopt_ref(*new VisualAnimationList(move(animations)));
+    }
 }
 
 AccumulatedVisualContextTree AccumulatedVisualContextTree::with_visual_animation_samples(i64 monotonic_time_ns) const

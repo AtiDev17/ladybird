@@ -544,7 +544,7 @@ public:
     Painting::DocumentPaintState& paint_state();
     Painting::DocumentPaintState const& paint_state() const;
     Painting::AccumulatedVisualContextTree visual_context_tree() const;
-    u64 visual_context_tree_version() const;
+    u64 visual_context_tree_structural_epoch() const;
     Painting::ScrollStateSnapshot const& scroll_state_snapshot() const;
 
     GC::Ref<NodeList> get_elements_by_name(Utf16View);
@@ -1176,10 +1176,15 @@ public:
     LayoutTreeBuildStats const& layout_tree_build_stats() const { return m_layout_tree_build_stats; }
     void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
 
+    enum class AccumulatedVisualContextUpdateScope : u8 {
+        Values,
+        Structure,
+    };
     void set_needs_accumulated_visual_contexts_update(bool);
+    void schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason);
     bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
-    void schedule_accumulated_visual_context_value_update(Element&);
-    void schedule_accumulated_visual_context_value_update(Layout::Node const&);
+    void schedule_accumulated_visual_context_update(Element&, AccumulatedVisualContextUpdateScope);
+    void schedule_accumulated_visual_context_update(Layout::Node const&, AccumulatedVisualContextUpdateScope);
     void schedule_scrollable_overflow_recalculation(Element&);
     void schedule_scrollable_overflow_recalculation(Layout::Node const&);
 
@@ -1900,7 +1905,6 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
-    Vector<Layout::RustFFI::NodeSlotId> m_boxes_needing_visual_context_value_update;
 
     bool m_needs_full_scrollable_overflow_recalculation { false };
     Vector<Layout::RustFFI::NodeSlotId> m_boxes_needing_scrollable_overflow_recalculation;

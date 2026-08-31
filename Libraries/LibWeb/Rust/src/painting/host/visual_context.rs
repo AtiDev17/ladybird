@@ -20,6 +20,40 @@ pub struct FfiSvgMaskFacts {
     pub clip_area: OptionalCssPixelRect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiVisualContextBoxDirtyKind {
+    StyleValueChange,
+    StyleStructuralChange,
+    ScrollableOverflowFlipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiVisualContextGlobalRebuildReason {
+    FirstBuild,
+    DocumentWideStructuralChange,
+    FilterResourcesChanged,
+    ForcedForTesting,
+    CanonicalDumpRequested,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiVisualContextBoxNodeList {
+    SpatialNodes,
+    FrameNodes,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FfiVisualContextUpdateOutcome {
+    pub performed_full_build: bool,
+    pub structural_epoch_changed: bool,
+    pub requires_display_list_recording: bool,
+    pub structural_epoch: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiVisualContextTreeInputs {

@@ -3001,23 +3001,8 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     // NB: Called during paint property resolution.
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
-        m_boxes_needing_visual_context_value_update.clear_with_capacity();
         if (has_committed_viewport_box())
-            paint_state().assign_accumulated_visual_contexts(*this);
-    } else if (!m_boxes_needing_visual_context_value_update.is_empty()) {
-        auto boxes = move(m_boxes_needing_visual_context_value_update);
-        if (has_committed_viewport_box()) {
-            for (auto const& paintable_slot : boxes) {
-                auto* layout_node = Painting::layout_node_for_committed_slot(layout_node_arena(), paintable_slot);
-                if (!layout_node)
-                    continue;
-                if (!paint_state().update_accumulated_visual_context_values(*this, paintable_slot)) {
-                    // Structure changed after all; rebuild the whole tree.
-                    paint_state().assign_accumulated_visual_contexts(*this);
-                    break;
-                }
-            }
-        }
+            paint_state().update_accumulated_visual_contexts(*this);
     }
 
     // Scroll nodes are (re)created by the visual context tree build above, so scroll offsets and
@@ -7260,9 +7245,9 @@ Painting::AccumulatedVisualContextTree Document::visual_context_tree() const
     return paint_state().visual_context_tree(*this);
 }
 
-u64 Document::visual_context_tree_version() const
+u64 Document::visual_context_tree_structural_epoch() const
 {
-    return paint_state().visual_context_tree_version(*this);
+    return paint_state().visual_context_tree_structural_epoch(*this);
 }
 
 Painting::ScrollStateSnapshot const& Document::scroll_state_snapshot() const
@@ -7832,6 +7817,19 @@ static bool keyframe_effect_only_translates_horizontally(Animations::KeyframeEff
     return transform_keyframes_only_translate_horizontally(keyframes);
 }
 
+static Vector<u32> owned_visual_context_node_indices(Layout::Node const& layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList list)
+{
+    Vector<u32> indices;
+    if (!Painting::has_committed_box(layout_node))
+        return indices;
+    auto* arena = layout_node.arena_handle();
+    auto slot = Painting::committed_row_slot(layout_node);
+    indices.resize(Layout::RustFFI::layout_arena_paintable_visual_context_node_count(arena, slot, list));
+    if (!indices.is_empty())
+        Layout::RustFFI::layout_arena_paintable_visual_context_copy_node_indices(arena, slot, list, indices.data(), indices.size());
+    return indices;
+}
+
 static Optional<Compositor::VisualAnimation> build_compositor_animation(Animations::KeyframeEffect& effect, Painting::AccumulatedVisualContextTree const& visual_context_tree, Compositor::VisualAnimation::TargetKind target_kind, Optional<bool>& only_translates_horizontally)
 {
     auto animation = effect.associated_animation();
@@ -7979,12 +7977,12 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     auto build_animation_for_target = [&](Compositor::VisualAnimation::TargetKind target_kind) -> Optional<Compositor::VisualAnimation> {
         Vector<u32> visual_context_node_indices;
         if (target_kind == Compositor::VisualAnimation::TargetKind::Opacity) {
-            for (auto index = row->frame_nodes_begin; index < row->frame_nodes_end; ++index) {
+            for (auto index : owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes)) {
                 if (visual_context_tree.frame_is_effects(Painting::FrameNodeIndex { index }))
                     visual_context_node_indices.append(index);
             }
         } else {
-            for (auto index = row->spatial_nodes_begin; index < row->spatial_nodes_end; ++index) {
+            for (auto index : owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes)) {
                 if (visual_context_tree.spatial_node_is_css_transform(Painting::SpatialNodeIndex { index }))
                     visual_context_node_indices.append(index);
             }
@@ -10325,34 +10323,49 @@ void Document::set_needs_accumulated_visual_contexts_update(bool value)
         set_needs_repaint(InvalidateDisplayList::No);
 }
 
-void Document::schedule_accumulated_visual_context_value_update(Layout::Node const& layout_node)
+void Document::schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason reason)
 {
-    // NB: A full rebuild is already pending and will refresh all node values anyway.
-    if (m_needs_accumulated_visual_contexts_update)
-        return;
-
-    // NB: Cap the queue in case it's never consumed (e.g. forced style updates in a document that never paints).
-    static constexpr size_t max_pending_visual_context_value_updates = 1024;
-    if (m_boxes_needing_visual_context_value_update.size() >= max_pending_visual_context_value_updates) {
-        m_boxes_needing_visual_context_value_update.clear();
-        set_needs_accumulated_visual_contexts_update(true);
-        return;
-    }
-
-    if (Painting::has_committed_box(layout_node)) {
-        m_boxes_needing_visual_context_value_update.append(Painting::committed_row_slot(layout_node));
-        set_needs_repaint(InvalidateDisplayList::No);
-    }
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_visual_context_request_full_rebuild(m_layout_node_arena->handle(), reason);
+    set_needs_accumulated_visual_contexts_update(true);
 }
 
-void Document::schedule_accumulated_visual_context_value_update(Element& element)
+void Document::schedule_accumulated_visual_context_update(Layout::Node const& layout_node, AccumulatedVisualContextUpdateScope scope)
+{
+    if (!Painting::has_committed_box(layout_node))
+        return;
+    auto slot = Painting::committed_row_slot(layout_node);
+    Layout::RustFFI::layout_arena_visual_context_note_box_dirty(
+        layout_node_arena().handle(),
+        slot,
+        scope == AccumulatedVisualContextUpdateScope::Values
+            ? Layout::RustFFI::FfiVisualContextBoxDirtyKind::StyleValueChange
+            : Layout::RustFFI::FfiVisualContextBoxDirtyKind::StyleStructuralChange);
+
+    set_needs_accumulated_visual_contexts_update(true);
+}
+
+void Document::schedule_accumulated_visual_context_update(Element& element, AccumulatedVisualContextUpdateScope scope)
 {
     if (auto* layout_node = element.unsafe_layout_node())
-        schedule_accumulated_visual_context_value_update(*layout_node);
+        schedule_accumulated_visual_context_update(*layout_node, scope);
     element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
         if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
-            schedule_accumulated_visual_context_value_update(*pseudo_element_layout_node);
+            schedule_accumulated_visual_context_update(*pseudo_element_layout_node, scope);
     });
+
+    // https://drafts.csswg.org/css-backgrounds/#root-background
+    // The root and body boxes paint each other's propagated background layers, so a structural
+    // change on either has to reach both.
+    if (scope != AccumulatedVisualContextUpdateScope::Structure)
+        return;
+    if (element.is_document_element()) {
+        if (auto* body = this->body(); body && body->unsafe_layout_node())
+            schedule_accumulated_visual_context_update(*body->unsafe_layout_node(), scope);
+    } else if (&element == body()) {
+        if (auto* document_element = this->document_element(); document_element && document_element->unsafe_layout_node())
+            schedule_accumulated_visual_context_update(*document_element->unsafe_layout_node(), scope);
+    }
 }
 
 void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& layout_node)
@@ -10501,7 +10514,7 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     auto display_list = Painting::record_rust_display_list(*this, *placeholder_display_list, resource_storage, cache_mode, config, overlay_inputs);
     if (!display_list)
         return nullptr;
-    m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.version(), layout_node_arena(), *m_chrome_widget_registry);
+    m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
     if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite) {
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
@@ -10540,7 +10553,7 @@ Painting::HitTestDisplayList const* Document::ensure_hit_test_display_list()
         (void)record_display_list(paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
-    if (!m_hit_test_display_list || !m_hit_test_display_list->is_current() || m_hit_test_display_list->visual_context_tree_version() != visual_context_tree_version())
+    if (!m_hit_test_display_list || !m_hit_test_display_list->is_current() || m_hit_test_display_list->visual_context_tree_structural_epoch() != visual_context_tree_structural_epoch())
         rebuild_hit_test_display_list();
 
     return m_hit_test_display_list.ptr();
@@ -10995,6 +11008,9 @@ Utf16String Document::dump_display_list()
     if (!has_committed_viewport_box())
         return "No paintable"_utf16;
 
+    if (paint_state().has_visual_context_tree())
+        schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::CanonicalDumpRequested);
+
     auto& resource_storage = navigable()->display_list_resource_storage();
     auto display_list = record_display_list(HTML::PaintConfig {}, resource_storage, Painting::PaintCommandCacheMode::ReadOnly);
     if (!display_list)
@@ -11007,12 +11023,9 @@ Utf16String Document::dump_display_list()
     spatial_node_owners.set(Painting::VISUAL_VIEWPORT_NODE_INDEX, m_layout_root.ptr());
     spatial_node_owners.set(Painting::own_scroll_node_index(*m_layout_root), m_layout_root.ptr());
     m_layout_root->for_each_in_inclusive_subtree([&](Layout::Node const& layout_node) {
-        auto const* row = Painting::committed_row(layout_node);
-        if (!row)
-            return TraversalDecision::Continue;
-        for (auto spatial = row->spatial_nodes_begin; spatial < row->spatial_nodes_end; ++spatial)
+        for (auto spatial : owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes))
             spatial_node_owners.set(Painting::SpatialNodeIndex { spatial }, &layout_node);
-        for (auto frame = row->frame_nodes_begin; frame < row->frame_nodes_end; ++frame)
+        for (auto frame : owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes))
             frame_node_owners.set(Painting::FrameNodeIndex { frame }, &layout_node);
         return TraversalDecision::Continue;
     });

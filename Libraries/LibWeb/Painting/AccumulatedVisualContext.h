@@ -65,7 +65,7 @@ public:
     WEB_API AccumulatedVisualContextTree& operator=(AccumulatedVisualContextTree&&);
     WEB_API ~AccumulatedVisualContextTree();
 
-    WEB_API u64 version() const;
+    WEB_API u64 structural_epoch() const;
     WEB_API ByteBuffer serialize_to_bytes() const;
     void const* rust_handle() const { return m_rust_tree; }
 
@@ -76,6 +76,8 @@ public:
 
     WEB_API size_t spatial_node_count() const;
     WEB_API size_t frame_node_count() const;
+    WEB_API size_t live_spatial_node_count() const;
+    WEB_API size_t live_frame_node_count() const;
     WEB_API TransformWithOrigin visual_viewport_transform() const;
     WEB_API AccumulatedVisualContextTree with_visual_viewport_transform(TransformWithOrigin const&) const;
     WEB_API AccumulatedVisualContextTree with_visual_animation_samples(i64 monotonic_time_ns) const;

@@ -9,7 +9,8 @@ use crate::painting::display_list::commands::{
 };
 use crate::painting::display_list::depth_sorted_plan::{DepthSortedReplayStepKind, build_depth_sorted_replay_plan};
 use crate::painting::visual_context::{
-    FrameData, SpatialData, VisualContextTree, device_offset_for_index, should_cull_back_face,
+    FrameData, SpatialData, VisualContextTree, device_offset_for_index, resolve_leaf_to_context_matrices,
+    should_cull_back_face,
 };
 use libgfx_rust::path::OwnedPath;
 use libgfx_rust::{FloatMatrix4x4, FloatPoint, FloatVector3, IntRect, WindingRule, translation_matrix};
@@ -38,8 +39,10 @@ pub trait ReplayPainter {
 #[derive(Default)]
 struct ReplayPaletteStorage {
     to_root_matrices: Vec<FloatMatrix4x4>,
+    local_matrices: Vec<FloatMatrix4x4>,
     draw_spaces: Vec<SpatialNodeIndex>,
     backface_culled: Vec<bool>,
+    flattens_inherited_transform: Vec<bool>,
 }
 
 // Steady-state replays reuse the previous frame's capacity. Taking the storage out of the slot
@@ -63,8 +66,10 @@ fn take_replay_scratch_storage() -> ReplayScratchStorage {
 
 fn return_replay_scratch_storage(mut storage: ReplayScratchStorage) {
     storage.palette.to_root_matrices.clear();
+    storage.palette.local_matrices.clear();
     storage.palette.draw_spaces.clear();
     storage.palette.backface_culled.clear();
+    storage.palette.flattens_inherited_transform.clear();
     storage.frame_has_empty_effective_clip.clear();
     storage.applied_frames.clear();
     storage.target_frames.clear();
@@ -134,20 +139,33 @@ fn replay_mask_of(mask: &crate::painting::visual_context::MaskData) -> ReplayMas
     }
 }
 
-impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
-    fn build_transform_palette(&mut self, scroll_offsets: &[FloatPoint]) {
-        let tree = self.tree;
-        let spatial_nodes = &tree.spatial_nodes;
-        let palette = &mut self.palette;
-        palette.to_root_matrices.reserve(spatial_nodes.len());
-        palette.draw_spaces.reserve(spatial_nodes.len());
-        palette.backface_culled.reserve(spatial_nodes.len());
-        let replay_base_matrix = self.replay_base_matrix;
-        for (i, node) in spatial_nodes.iter().enumerate() {
-            let parent = node.parent.0 as usize;
-            let append_spatial = |palette: &mut ReplayPaletteStorage,
-                                  local_matrix: FloatMatrix4x4,
-                                  flattens_inherited_transform: bool| {
+fn fill_replay_palette_in_dependency_order(
+    tree: &VisualContextTree,
+    scroll_offsets: &[FloatPoint],
+    replay_base_matrix: FloatMatrix4x4,
+    palette: &mut ReplayPaletteStorage,
+) {
+    let spatial_nodes = &tree.spatial_nodes;
+    palette.to_root_matrices.clear();
+    palette.to_root_matrices.resize(spatial_nodes.len(), replay_base_matrix);
+    palette.local_matrices.clear();
+    palette
+        .local_matrices
+        .resize(spatial_nodes.len(), FloatMatrix4x4::identity());
+    palette.draw_spaces.clear();
+    palette
+        .draw_spaces
+        .extend((0..spatial_nodes.len()).map(|index| SpatialNodeIndex(index as u32)));
+    palette.backface_culled.clear();
+    palette.backface_culled.resize(spatial_nodes.len(), false);
+    palette.flattens_inherited_transform.clear();
+    palette.flattens_inherited_transform.resize(spatial_nodes.len(), false);
+    for index in tree.spatial_dependency_order() {
+        let i = index as usize;
+        let node = &spatial_nodes[i];
+        let parent = node.parent.0 as usize;
+        let write_spatial =
+            |palette: &mut ReplayPaletteStorage, local_matrix: FloatMatrix4x4, flattens_inherited_transform: bool| {
                 let parent_matrix = if i == 0 {
                     replay_base_matrix
                 } else {
@@ -158,63 +176,68 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
                 } else {
                     parent_matrix
                 };
-                palette.to_root_matrices.push(inherited.multiplied(local_matrix));
-                palette.draw_spaces.push(SpatialNodeIndex(i as u32));
-                palette
-                    .backface_culled
-                    .push(if i == 0 { false } else { palette.backface_culled[parent] });
+                palette.to_root_matrices[i] = inherited.multiplied(local_matrix);
+                palette.local_matrices[i] = local_matrix;
+                palette.flattens_inherited_transform[i] = flattens_inherited_transform;
+                palette.draw_spaces[i] = SpatialNodeIndex(index);
+                palette.backface_culled[i] = if i == 0 { false } else { palette.backface_culled[parent] };
             };
-            let append_spatial_translation = |palette: &mut ReplayPaletteStorage, offset: FloatPoint| {
-                // Whole device pixels, so scrolled content never lands on subpixel positions.
-                append_spatial(
+        let write_spatial_translation = |palette: &mut ReplayPaletteStorage, offset: FloatPoint| {
+            // Whole device pixels, so scrolled content never lands on subpixel positions.
+            write_spatial(
+                palette,
+                translation_matrix(offset.x as i32 as f32, offset.y as i32 as f32, 0.0),
+                false,
+            );
+        };
+        match &node.data {
+            SpatialData::Transform(transform) => {
+                write_spatial(
                     palette,
-                    translation_matrix(offset.x as i32 as f32, offset.y as i32 as f32, 0.0),
-                    false,
+                    transform.matrix_including_origin(),
+                    transform.flattens_inherited_transform,
                 );
-            };
-            match &node.data {
-                SpatialData::Transform(transform) => {
-                    append_spatial(
-                        palette,
-                        transform.matrix_including_origin(),
-                        transform.flattens_inherited_transform,
-                    );
-                }
-                SpatialData::Perspective(perspective) => {
-                    append_spatial(palette, perspective.matrix, perspective.flattens_inherited_transform);
-                }
-                SpatialData::BackfaceVisibility(backface) => {
-                    let parent_matrix = palette.to_root_matrices[parent];
-                    palette.to_root_matrices.push(if backface.flattens_inherited_transform {
-                        parent_matrix.flattened()
-                    } else {
-                        parent_matrix
-                    });
-                    palette.draw_spaces.push(palette.draw_spaces[parent]);
-                    let mut culled = palette.backface_culled[parent];
-                    if !culled {
-                        let plane_root_matrix = palette.to_root_matrices[backface.plane_root_index.0 as usize];
-                        culled = should_cull_back_face(
-                            *palette
-                                .to_root_matrices
-                                .last()
-                                .expect("the marker's own entry was just appended"),
-                            plane_root_matrix,
-                        );
-                    }
-                    palette.backface_culled.push(culled);
-                }
-                SpatialData::Scroll(_) | SpatialData::Sticky(_) => {
-                    append_spatial_translation(
-                        palette,
-                        device_offset_for_index(scroll_offsets, SpatialNodeIndex(i as u32)),
-                    );
-                }
-                SpatialData::AnchorScrollShift(shift) => {
-                    append_spatial_translation(palette, shift.masked_offset(scroll_offsets));
+                if transform.sorting_context_root_index.is_some() || transform.establishes_sorting_context {
+                    palette.backface_culled[i] = false;
                 }
             }
+            SpatialData::Perspective(perspective) => {
+                write_spatial(palette, perspective.matrix, perspective.flattens_inherited_transform);
+            }
+            SpatialData::BackfaceVisibility(backface) => {
+                let parent_matrix = palette.to_root_matrices[parent];
+                palette.to_root_matrices[i] = if backface.flattens_inherited_transform {
+                    parent_matrix.flattened()
+                } else {
+                    parent_matrix
+                };
+                palette.local_matrices[i] = FloatMatrix4x4::identity();
+                palette.flattens_inherited_transform[i] = backface.flattens_inherited_transform;
+                palette.draw_spaces[i] = palette.draw_spaces[parent];
+                let mut culled = palette.backface_culled[parent];
+                if !culled {
+                    let plane_root_matrix = palette.to_root_matrices[backface.plane_root_index.0 as usize];
+                    culled = should_cull_back_face(palette.to_root_matrices[i], plane_root_matrix);
+                }
+                palette.backface_culled[i] = culled;
+            }
+            SpatialData::Scroll(_) | SpatialData::Sticky(_) => {
+                write_spatial_translation(
+                    palette,
+                    device_offset_for_index(scroll_offsets, SpatialNodeIndex(index)),
+                );
+            }
+            SpatialData::AnchorScrollShift(shift) => {
+                write_spatial_translation(palette, shift.masked_offset(scroll_offsets));
+            }
+            SpatialData::Dead => {}
         }
+    }
+}
+
+impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
+    fn build_transform_palette(&mut self, scroll_offsets: &[FloatPoint]) {
+        fill_replay_palette_in_dependency_order(self.tree, scroll_offsets, self.replay_base_matrix, &mut self.palette);
     }
 
     fn ensure_ctm_space(&mut self, spatial: SpatialNodeIndex) {
@@ -311,6 +334,7 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
                     self.painter.push_mask(&replay_mask_of(mask));
                     self.applied_mask_frame_count += 1;
                 }
+                FrameData::Dead => unreachable!("a run never records under a tombstoned frame"),
             }
             self.applied_frames.push(frame_index);
         }
@@ -358,10 +382,18 @@ impl<Painter: ReplayPainter> ReplayDriver<'_, Painter> {
             let root_isolation_frame = tree.root_isolation_frame;
             let plane_clip_base_length = usize::from(root_isolation_frame.is_some());
             let contexts = tree.resolve_sorting_contexts();
+            let parent_by_node: Vec<SpatialNodeIndex> = tree.spatial_nodes.iter().map(|node| node.parent).collect();
+            let leaf_to_context_palette = resolve_leaf_to_context_matrices(
+                &contexts,
+                &parent_by_node,
+                &self.palette.local_matrices,
+                &self.palette.flattens_inherited_transform,
+            );
             let plan = build_depth_sorted_replay_plan(
                 self.command_runs,
                 &contexts,
                 &self.palette.to_root_matrices,
+                &leaf_to_context_palette,
                 &self.palette.draw_spaces,
                 &self.palette.backface_culled,
                 &self.frame_has_empty_effective_clip,
@@ -446,6 +478,7 @@ pub fn replay_display_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::node_data::NodeSlotId;
     use crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX;
     use crate::painting::visual_context::{
         BackfaceVisibilityData, ClipData, ClipMode, EffectsData, FrameData, MaskData, MaskLayerOrigin, SpatialData,
@@ -454,6 +487,94 @@ mod tests {
     use libgfx_rust::{
         CompositingAndBlendingOperator, CornerRadii, FloatRect, MaskKind, scale_matrix, translation_matrix,
     };
+
+    #[test]
+    fn a_child_stored_below_its_parent_gets_the_same_palette_entry() {
+        let root = TransformData {
+            matrix: FloatMatrix4x4::identity(),
+            origin: FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+            establishes_sorting_context: false,
+        };
+        let translated = |x: f32, y: f32| {
+            SpatialData::Transform(TransformData {
+                matrix: translation_matrix(x, y, 0.0),
+                ..root
+            })
+        };
+        let flipped = SpatialData::Transform(TransformData {
+            matrix: scale_matrix(-1.0, 1.0, -1.0),
+            ..root
+        });
+
+        let mut in_order = VisualContextTree::create(root);
+        let parent = in_order.append_spatial(translated(10.0, 0.0), VISUAL_VIEWPORT_NODE_INDEX);
+        let child = in_order.append_spatial(translated(0.0, 5.0), parent);
+        let plane = in_order.append_spatial(flipped.clone(), child);
+        let marker = in_order.append_spatial(
+            SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+                plane_root_index: child,
+                flattens_inherited_transform: false,
+            }),
+            plane,
+        );
+
+        let mut permuted = VisualContextTree::create(root);
+        let permuted_marker = permuted.append_spatial(
+            SpatialData::BackfaceVisibility(BackfaceVisibilityData {
+                plane_root_index: SpatialNodeIndex(3),
+                flattens_inherited_transform: false,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let permuted_plane = permuted.append_spatial(flipped, VISUAL_VIEWPORT_NODE_INDEX);
+        let permuted_child = permuted.append_spatial(translated(0.0, 5.0), VISUAL_VIEWPORT_NODE_INDEX);
+        let permuted_parent = permuted.append_spatial(translated(10.0, 0.0), VISUAL_VIEWPORT_NODE_INDEX);
+        permuted.spatial_nodes[permuted_marker.0 as usize].parent = permuted_plane;
+        permuted.spatial_nodes[permuted_plane.0 as usize].parent = permuted_child;
+        permuted.spatial_nodes[permuted_child.0 as usize].parent = permuted_parent;
+
+        let base = scale_matrix(2.0, 2.0, 1.0);
+        let mut in_order_palette = ReplayPaletteStorage::default();
+        fill_replay_palette_in_dependency_order(&in_order, &[], base, &mut in_order_palette);
+        let mut permuted_palette = ReplayPaletteStorage::default();
+        fill_replay_palette_in_dependency_order(&permuted, &[], base, &mut permuted_palette);
+        let pairs = [
+            (VISUAL_VIEWPORT_NODE_INDEX, VISUAL_VIEWPORT_NODE_INDEX),
+            (parent, permuted_parent),
+            (child, permuted_child),
+            (plane, permuted_plane),
+            (marker, permuted_marker),
+        ];
+        let map = |index: SpatialNodeIndex| pairs.iter().find(|(original, _)| *original == index).unwrap().1;
+        for (original, mapped) in pairs {
+            assert_eq!(
+                permuted_palette.to_root_matrices[mapped.0 as usize],
+                in_order_palette.to_root_matrices[original.0 as usize]
+            );
+            assert_eq!(
+                permuted_palette.local_matrices[mapped.0 as usize],
+                in_order_palette.local_matrices[original.0 as usize]
+            );
+            assert_eq!(
+                permuted_palette.draw_spaces[mapped.0 as usize],
+                map(in_order_palette.draw_spaces[original.0 as usize])
+            );
+            assert_eq!(
+                permuted_palette.backface_culled[mapped.0 as usize],
+                in_order_palette.backface_culled[original.0 as usize]
+            );
+            assert_eq!(
+                permuted_palette.flattens_inherited_transform[mapped.0 as usize],
+                in_order_palette.flattens_inherited_transform[original.0 as usize]
+            );
+        }
+        assert!(in_order_palette.backface_culled[marker.0 as usize]);
+        assert_eq!(in_order_palette.draw_spaces[marker.0 as usize], plane);
+    }
 
     #[derive(Debug, PartialEq)]
     enum PainterEvent {
@@ -527,6 +648,7 @@ mod tests {
             flattens_inherited_transform: false,
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
+            establishes_sorting_context: false,
         })
     }
 
@@ -701,6 +823,8 @@ mod tests {
         let scroll_node = tree.append_spatial(
             SpatialData::Scroll(crate::painting::visual_context::ScrollData {
                 state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
