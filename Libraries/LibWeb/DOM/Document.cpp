@@ -703,6 +703,7 @@ void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool esc
 
 void Document::finalize()
 {
+    stop_animation_wakeup_timer();
     if (m_layout_node_arena)
         Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
@@ -2062,6 +2063,9 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
     if (!node.is_connected())
         return;
 
+    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate)
+        flush_throttled_animation_style_update_for_node(node);
+
     auto* document_element = this->document_element();
     auto const may_have_style_query_dependencies = document_element && document_element->is_style_query_container();
     auto const reads_layout_geometry = reason == UpdateLayoutReason::ElementGetClientRects
@@ -2115,7 +2119,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         }
     }
 
-    update_layout(reason);
+    update_layout(reason, ThrottledAnimationSamplingScope::Element);
 }
 
 void Document::flush_deferred_style_change_event()
@@ -2347,9 +2351,17 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
 
 void Document::update_layout(UpdateLayoutReason reason)
 {
+    update_layout(reason, ThrottledAnimationSamplingScope::Document);
+}
+
+void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
+{
     auto navigable = this->navigable();
     if (!navigable || navigable->active_document().ptr() != this)
         return;
+
+    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
+        flush_throttled_animation_style_update();
 
     VERIFY(!m_is_running_update_layout);
     m_is_running_update_layout = true;
@@ -2632,24 +2644,58 @@ void Document::invalidate_style_for_viewport_change()
     });
 }
 
-void Document::update_animated_style_if_needed()
+void Document::sample_animation_effects_needing_style_update()
 {
     if (!m_needs_animated_style_update)
         return;
 
-    Animations::AnimationUpdateContext context;
+    VERIFY(!m_is_updating_animated_style);
+    m_is_updating_animated_style = true;
+    ScopeGuard clear_is_updating_animated_style = [&] {
+        finish_animated_style_update();
+    };
 
     GC::RootVector<GC::Ref<Animations::Animation>> animations;
-
-    for (auto& animation : m_associated_animations) {
-        if (animation.is_idle())
-            continue;
-
-        if (!animation.effect())
-            continue;
-
-        animations.append(animation);
+    if (m_force_throttled_animation_style_update) {
+        for (auto& animation : m_associated_animations) {
+            if (animation.is_idle() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+                continue;
+            animations.append(animation);
+        }
+    } else {
+        for (auto& effect : m_effects_needing_animated_style_update) {
+            auto animation = effect.associated_animation();
+            if (!animation || animation->is_idle())
+                continue;
+            animations.append(*animation);
+        }
     }
+    m_effects_needing_animated_style_update.clear();
+    m_needs_animated_style_update = false;
+
+    if (animations.is_empty()) {
+        m_force_throttled_animation_style_update = false;
+        m_has_throttled_animation_style_update = false;
+        return;
+    }
+
+    bool has_requested_observation_sample = any_of(animations, [](auto const& animation) {
+        return as_if<Animations::KeyframeEffect>(*animation->effect())->observation_sample_requested();
+    });
+
+    GC::RootVector<GC::Ref<Animations::AnimationTimeline>> timelines_with_current_time_override;
+    if (m_force_throttled_animation_style_update || has_requested_observation_sample) {
+        for (auto& timeline : m_associated_animation_timelines)
+            timelines_with_current_time_override.append(timeline);
+        for (auto& timeline : timelines_with_current_time_override)
+            timeline->set_current_time_override_for_style_sampling(timeline->current_time_for_observation());
+    }
+    ScopeGuard clear_current_time_overrides = [&] {
+        for (auto& timeline : timelines_with_current_time_override)
+            timeline->clear_current_time_override_for_style_sampling();
+    };
+
+    Animations::AnimationUpdateContext context;
 
     quick_sort(animations, [](GC::Ref<Animations::Animation>& a, GC::Ref<Animations::Animation>& b) {
         auto& a_effect = as<Animations::KeyframeEffect>(*a->effect());
@@ -2657,14 +2703,135 @@ void Document::update_animated_style_if_needed()
         return Animations::KeyframeEffect::composite_order(a_effect, b_effect) < 0;
     });
 
-    for (auto& animation : animations)
+    bool has_throttled_animation_style_update = m_force_throttled_animation_style_update ? false : m_has_throttled_animation_style_update;
+    for (auto& animation : animations) {
+        auto& effect = *as_if<Animations::KeyframeEffect>(*animation->effect());
+        bool observation_sample_requested = effect.consume_observation_sample_request();
+        if (effect.can_skip_per_frame_style_update()) {
+            has_throttled_animation_style_update = true;
+            if (!m_force_throttled_animation_style_update && !observation_sample_requested)
+                continue;
+        }
         animation->effect()->update_computed_properties(context);
+    }
 
-    m_needs_animated_style_update = false;
+    m_has_throttled_animation_style_update = has_throttled_animation_style_update;
+    if (m_force_throttled_animation_style_update)
+        m_last_forced_throttled_animation_style_update_task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    m_force_throttled_animation_style_update = false;
 }
 
-void Document::set_needs_animated_style_update()
+void Document::flush_throttled_animation_style_update()
 {
+    if (!m_has_throttled_animation_style_update)
+        return;
+    auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    if (!m_needs_animated_style_update
+        && m_last_forced_throttled_animation_style_update_task_generation == task_generation)
+        return;
+    m_has_throttled_animation_style_update = false;
+    m_force_throttled_animation_style_update = true;
+    m_needs_animated_style_update = true;
+}
+
+void Document::flush_throttled_animation_style_update_for_node(Node const& node)
+{
+    auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    for (auto& animation : m_associated_animations) {
+        if (!animation.effect())
+            continue;
+        auto* effect = as_if<Animations::KeyframeEffect>(*animation.effect());
+        if (!effect)
+            continue;
+        auto target = effect->target();
+        if (!target
+            || !effect->can_skip_per_frame_style_update()
+            || (!target->is_shadow_including_inclusive_ancestor_of(node) && !node.is_shadow_including_inclusive_ancestor_of(*target)))
+            continue;
+        if (m_is_updating_animated_style)
+            m_effects_needing_animated_style_update_after_current_update.set(*effect);
+        else
+            effect->request_element_scoped_observation_sample(task_generation);
+    }
+}
+
+void Document::stop_animation_wakeup_timer()
+{
+    if (!m_animation_wakeup_timer)
+        return;
+    m_animation_wakeup_timer->stop();
+    m_animation_wakeup_deadline.clear();
+}
+
+void Document::schedule_animation_wakeup(double delay_ms)
+{
+    auto timer_delay_ms = clamp(static_cast<i64>(ceil(delay_ms)), 1, static_cast<i64>(NumericLimits<int>::max()));
+    auto deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(timer_delay_ms);
+    if (m_animation_wakeup_timer && m_animation_wakeup_timer->is_active()
+        && m_animation_wakeup_deadline.has_value() && *m_animation_wakeup_deadline <= deadline)
+        return;
+
+    m_animation_wakeup_deadline = deadline;
+    if (!m_animation_wakeup_timer) {
+        m_animation_wakeup_timer = Core::Timer::create_single_shot(static_cast<int>(timer_delay_ms), GC::weak_callback(*this, [](auto& document) {
+            document.m_animation_wakeup_deadline.clear();
+            auto timestamp = HighResolutionTime::relative_high_resolution_time(
+                HighResolutionTime::unsafe_shared_current_time(), document.relevant_settings_object().global_object());
+            Optional<double> next_wakeup_delay_ms;
+            bool reached_wakeup = false;
+            for (auto& animation : document.m_associated_animations) {
+                if (!animation.effect())
+                    continue;
+                auto* effect = as_if<Animations::KeyframeEffect>(*animation.effect());
+                if (!effect)
+                    continue;
+                if (animation.play_state() != Bindings::AnimationPlayState::Running
+                    || animation.pending()
+                    || animation.playback_rate() <= 0
+                    || !animation.timeline()
+                    || !animation.timeline()->is_monotonically_increasing()
+                    || effect->start_delay().type != Animations::TimeValue::Type::Milliseconds)
+                    continue;
+                auto timeline_time = animation.timeline()->current_time_at_timestamp(timestamp);
+                auto current_time = animation.current_time_at(timeline_time);
+                if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
+                    continue;
+                if (current_time->value < effect->start_delay().value) {
+                    auto delay = (effect->start_delay().value - current_time->value) / animation.playback_rate();
+                    if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
+                        next_wakeup_delay_ms = delay;
+                    continue;
+                }
+                effect->request_observation_sample();
+                reached_wakeup = true;
+            }
+            if (next_wakeup_delay_ms.has_value())
+                document.schedule_animation_wakeup(*next_wakeup_delay_ms);
+            if (reached_wakeup) {
+                ++document.m_style_invalidation_counters.animation_frame_pump_requests;
+                document.page().client().request_frame();
+            }
+        }));
+    }
+    m_animation_wakeup_timer->restart(static_cast<int>(timer_delay_ms));
+}
+
+void Document::throttled_animation_visibility_changed()
+{
+    if (!m_has_throttled_animation_style_update)
+        return;
+    flush_throttled_animation_style_update();
+    page().client().request_frame();
+}
+
+void Document::set_needs_animated_style_update(Animations::KeyframeEffect& effect)
+{
+    if (m_is_updating_animated_style) {
+        m_effects_needing_animated_style_update_after_current_update.set(effect);
+        return;
+    }
+
+    m_effects_needing_animated_style_update.set(effect);
     if (m_needs_animated_style_update)
         return;
 
@@ -2675,6 +2842,30 @@ void Document::set_needs_animated_style_update()
         return;
 
     page().client().request_frame();
+}
+
+void Document::finish_animated_style_update()
+{
+    VERIFY(m_is_updating_animated_style);
+    m_is_updating_animated_style = false;
+
+    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects;
+    for (auto& effect : m_effects_needing_animated_style_update_after_current_update)
+        effects.append(effect);
+    m_effects_needing_animated_style_update_after_current_update.clear();
+
+    for (auto& effect : effects)
+        effect->request_observation_sample();
+}
+
+void Document::request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const& node)
+{
+    VERIFY(!m_is_updating_animated_style);
+    m_is_updating_animated_style = true;
+    ScopeGuard clear_is_updating_animated_style = [&] {
+        finish_animated_style_update();
+    };
+    flush_throttled_animation_style_update_for_node(node);
 }
 
 void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement)
@@ -5014,8 +5205,10 @@ void Document::update_the_visibility_state(HTML::VisibilityState visibility_stat
     event->set_bubbles(true);
     dispatch_event(event);
 
-    if (m_visibility_state == HTML::VisibilityState::Visible)
+    if (m_visibility_state == HTML::VisibilityState::Visible) {
+        flush_throttled_animation_style_update();
         page().client().request_frame();
+    }
 }
 
 // https://drafts.csswg.org/cssom-view/#document-run-the-resize-steps
@@ -5860,6 +6053,7 @@ void Document::destroy()
 
     // 2. Abort document.
     abort();
+    stop_animation_wakeup_timer();
 
     // AD-HOC: Notify document observers that this document became inactive.
     //         This handles iframe-removal destruction, which doesn't otherwise go through
@@ -6341,6 +6535,7 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 
 void Document::did_stop_being_active_document_in_navigable()
 {
+    stop_animation_wakeup_timer();
     clear_layout_nodes_for_inactive_document();
     tear_down_layout_tree();
 
@@ -7380,6 +7575,11 @@ void Document::associate_with_animation(GC::Ref<Animations::Animation> animation
 
 void Document::disassociate_with_animation(GC::Ref<Animations::Animation> animation)
 {
+    if (animation->effect() && is<Animations::KeyframeEffect>(*animation->effect())) {
+        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
+        m_effects_needing_animated_style_update.remove(effect);
+        m_effects_needing_animated_style_update_after_current_update.remove(effect);
+    }
     m_associated_animations.remove(animation);
 }
 
@@ -7400,6 +7600,34 @@ void Document::append_pending_animation_event(Web::DOM::Document::PendingAnimati
     }
     m_pending_animation_event_queue.append(event);
     ++m_style_invalidation_counters.committed_animation_events;
+}
+
+void Document::prepare_to_observe_css_animation_events()
+{
+    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects_to_synchronize;
+    for (auto& animation : m_associated_animations) {
+        if (!animation.is_css_animation() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+            continue;
+        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+        if (effect.per_frame_animation_tick_was_skipped())
+            effects_to_synchronize.append(effect);
+    }
+    if (effects_to_synchronize.is_empty())
+        return;
+
+    auto timestamp = HighResolutionTime::relative_high_resolution_time(
+        HighResolutionTime::unsafe_shared_current_time(), relevant_settings_object().global_object());
+    auto timelines_to_update = GC::RootVector { m_associated_animation_timelines.values() };
+    for (auto const& timeline : timelines_to_update)
+        timeline->update_current_time(timestamp);
+
+    // OPTIMIZATION: Events which occurred while there were no listeners were intentionally not sampled. Establish
+    //               the current phase as the baseline so a newly added listener only observes future events.
+    for (auto& effect : effects_to_synchronize) {
+        effect->set_previous_phase(effect->phase());
+        effect->set_previous_current_iteration(effect->current_iteration().value_or(0.0));
+        effect->clear_per_frame_animation_tick_was_skipped();
+    }
 }
 
 // https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
@@ -7484,13 +7712,22 @@ void Document::update_animations_and_send_events(double timestamp)
     //         false to true, and the flag is both set and cleared within the same rendering update.
     //         Without this, animations only advance when unrelated tasks happen to schedule rendering
     //         updates. Keep the frame pump going as long as some animation attached to a monotonically
-    //         increasing timeline is running.
+    //         increasing timeline needs main-thread painting or observable animation events.
     for (auto const& animation : m_associated_animations) {
         if (animation.play_state() != Bindings::AnimationPlayState::Running)
             continue;
         auto timeline = animation.timeline();
         if (!timeline || !timeline->is_monotonically_increasing())
             continue;
+        if (animation.effect() && is<Animations::KeyframeEffect>(*animation.effect())) {
+            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+            if (effect.can_skip_per_frame_animation_tick()) {
+                effect.note_per_frame_animation_tick_was_skipped();
+                continue;
+            }
+            effect.clear_per_frame_animation_tick_was_skipped();
+        }
+        ++m_style_invalidation_counters.animation_frame_pump_requests;
         page().client().request_frame();
         break;
     }

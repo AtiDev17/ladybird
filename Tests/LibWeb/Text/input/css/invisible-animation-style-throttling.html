@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+
+    .animated {
+        animation: spin 100s linear infinite;
+    }
+</style>
+<script>
+    function nextFrame() {
+        return new Promise(resolve => requestAnimationFrame(resolve));
+    }
+
+    async function animationOverlayBuildsOverFrames(frameCount) {
+        const before = internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds;
+        for (let i = 0; i < frameCount; ++i)
+            await nextFrame();
+        return internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds - before;
+    }
+
+    asyncTest(async done => {
+        const hidden = document.createElement("div");
+        hidden.className = "animated";
+        hidden.style.visibility = "hidden";
+        document.body.append(hidden);
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+
+        internals.resetStyleInvalidationCounters();
+        println(`hidden animation overlay builds: ${await animationOverlayBuildsOverFrames(4)}`);
+        println(`hidden animation frame pump requests: ${internals.getStyleInvalidationCounters().animationFramePumpRequests}`);
+
+        hidden.getAnimations()[0].currentTime = 250000;
+        let animationIterationEvents = 0;
+        const animationIterationListener = () => ++animationIterationEvents;
+        hidden.addEventListener("animationiteration", animationIterationListener);
+        internals.resetStyleInvalidationCounters();
+        await animationOverlayBuildsOverFrames(4);
+        println(`animation event listener keeps frame pump active: ${internals.getStyleInvalidationCounters().animationFramePumpRequests > 0}`);
+        println(`animation event listener skips past events: ${animationIterationEvents}`);
+        hidden.removeEventListener("animationiteration", animationIterationListener);
+        internals.resetStyleInvalidationCounters();
+        await animationOverlayBuildsOverFrames(4);
+        println(`removing animation event listener stops frame pump: ${internals.getStyleInvalidationCounters().animationFramePumpRequests}`);
+
+        const beforeComputedStyle = internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds;
+        getComputedStyle(hidden).transform;
+        const afterComputedStyle = internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds;
+        println(`computed style samples hidden animation: ${afterComputedStyle > beforeComputedStyle}`);
+
+        const detached = document.createElement("div");
+        detached.className = "animated";
+        document.body.append(detached);
+        const detachedAnimation = detached.getAnimations()[0];
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+        detached.remove();
+        detachedAnimation.play();
+        await detachedAnimation.ready;
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+        const detachedTimeBeforeWait = detachedAnimation.currentTime;
+        internals.resetStyleInvalidationCounters();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        println(`detached animation stops frame pump: ${internals.getStyleInvalidationCounters().animationFramePumpRequests}`);
+        println(`detached animation current time advances: ${detachedAnimation.currentTime > detachedTimeBeforeWait}`);
+        detached.addEventListener("animationend", () => {});
+        internals.resetStyleInvalidationCounters();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        println(`unreachable end listener leaves detached animation throttled: ${internals.getStyleInvalidationCounters().animationFramePumpRequests <= 1}`);
+        let detachedIterationEvents = 0;
+        detached.addEventListener("animationiteration", () => ++detachedIterationEvents);
+        detachedAnimation.currentTime = 99950;
+        internals.resetStyleInvalidationCounters();
+        await new Promise(resolve => setTimeout(resolve, 120));
+        println(`detached animation listener keeps frame pump active: ${internals.getStyleInvalidationCounters().animationFramePumpRequests > 0}`);
+        println(`detached animation dispatches iteration event: ${detachedIterationEvents}`);
+
+        const sampled = document.createElement("div");
+        sampled.style.visibility = "hidden";
+        document.body.append(sampled);
+        const timeline = internals.createInternalAnimationTimeline();
+        const sampledAnimation = new Animation(new KeyframeEffect(sampled, [
+            { transform: "translateX(0px)" },
+            { transform: "translateX(100px)" },
+        ], { duration: 100, iterations: Infinity }), timeline);
+        sampledAnimation.play();
+        timeline.setTime(0);
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+
+        timeline.setTimeForObservation(50);
+        const sampledProgress = sampledAnimation.effect.getComputedTiming().progress;
+        const initialTransform = new DOMMatrix(getComputedStyle(sampled).transform);
+        const initialRect = sampled.getBoundingClientRect();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        timeline.setTimeForObservation(75);
+        const sampledRect = sampled.getBoundingClientRect();
+        const sampledTransform = new DOMMatrix(getComputedStyle(sampled).transform);
+        println(`computed style uses current timeline sample: ${initialTransform.e === 50 && sampledTransform.e === 75}`);
+        println(`computed timing uses current timeline sample: ${sampledProgress === 0.5}`);
+        println(`geometry uses current timeline sample: ${sampledRect.x - initialRect.x === 25}`);
+        sampled.remove();
+
+        const visible = document.createElement("div");
+        visible.className = "animated";
+        document.body.append(visible);
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+        println(`visible animation builds while hidden stays throttled: ${await animationOverlayBuildsOverFrames(4)}`);
+
+        const beforeMixedComputedStyle = internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds;
+        getComputedStyle(hidden).transform;
+        const afterMixedComputedStyle = internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds;
+        println(`computed style samples hidden animation alongside visible animation: ${afterMixedComputedStyle > beforeMixedComputedStyle}`);
+        visible.remove();
+
+        const styleOnlyVisibilityChange = document.createElement("div");
+        styleOnlyVisibilityChange.className = "animated";
+        styleOnlyVisibilityChange.style.visibility = "hidden";
+        document.body.append(styleOnlyVisibilityChange);
+        for (let i = 0; i < 4; ++i)
+            await nextFrame();
+        internals.resetStyleInvalidationCounters();
+        styleOnlyVisibilityChange.style.visibility = "visible";
+        await new Promise(resolve => setTimeout(resolve, 0));
+        println(`style-only visibility change samples animation: ${internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds > 0}`);
+        styleOnlyVisibilityChange.remove();
+
+        const visibleChild = document.createElement("div");
+        visibleChild.style.visibility = "visible";
+        hidden.append(visibleChild);
+        await nextFrame();
+
+        const visibleDescendantBuilds = await animationOverlayBuildsOverFrames(4);
+        println(`visible descendant keeps animation updating: ${visibleDescendantBuilds > 0}`);
+
+        hidden.remove();
+        done();
+    });
+</script>

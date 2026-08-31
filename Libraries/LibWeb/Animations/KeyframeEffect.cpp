@@ -9,6 +9,7 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibWeb/Animations/Animation.h>
+#include <LibWeb/Animations/AnimationTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/PseudoElementParsing.h>
 #include <LibWeb/Bindings/KeyframeEffect.h>
@@ -20,7 +21,11 @@
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Slot.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -1013,8 +1018,9 @@ KeyframeEffect::KeyframeEffect() = default;
 
 void KeyframeEffect::invalidate_effect()
 {
+    m_can_skip_per_frame_style_update_cache.clear();
     if (m_target_element)
-        m_target_element->document().set_needs_animated_style_update();
+        m_target_element->document().set_needs_animated_style_update(*this);
 }
 
 void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
@@ -1022,6 +1028,130 @@ void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_target_element);
     visitor.visit(m_keyframe_objects_cache);
+}
+
+bool KeyframeEffect::can_skip_per_frame_style_update() const
+{
+    auto target = this->target();
+    auto cache_result = [&](bool result) {
+        if (target && target->document().layout_is_up_to_date()) {
+            m_can_skip_per_frame_style_update_cache = CanSkipPerFrameStyleUpdateCache {
+                .target_style_generation = target->animation_style_generation(),
+                .target_subtree_style_generation = target->animation_subtree_style_generation(),
+                .target_is_connected = target->is_connected(),
+                .layout_node = target->unsafe_layout_node(),
+                .result = result,
+            };
+        }
+        return result;
+    };
+    if (target && target->document().layout_is_up_to_date()) {
+        auto const* layout_node = target->unsafe_layout_node();
+        if (m_can_skip_per_frame_style_update_cache.has_value()
+            && m_can_skip_per_frame_style_update_cache->target_style_generation == target->animation_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_subtree_style_generation == target->animation_subtree_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_is_connected == target->is_connected()
+            && m_can_skip_per_frame_style_update_cache->layout_node == layout_node) {
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_hits;
+            return m_can_skip_per_frame_style_update_cache->result;
+        }
+        if (m_can_skip_per_frame_style_update_cache.has_value())
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_misses;
+    }
+
+    // INTEROP: Other engines suppress main-thread style sampling for invisible transform animations. Restrict this
+    // optimization to the infinite transform-only case until animation overflow updates can also be throttled safely.
+    if (!isinf(iteration_count()) || pseudo_element_type().has_value())
+        return cache_result(false);
+
+    if (!target)
+        return false;
+    if (!target->is_connected())
+        return cache_result(true);
+    if (target->namespace_uri() == Namespace::SVG)
+        return cache_result(false);
+
+    bool has_animated_property = false;
+    auto const* key_frame_set = m_key_frame_set.ptr();
+    if (!key_frame_set)
+        return false;
+    for (auto const& keyframe : key_frame_set->keyframes_by_key) {
+        for (auto const& property : keyframe.properties) {
+            has_animated_property = true;
+            if (!first_is_one_of(property.key,
+                    CSS::PropertyID::Transform,
+                    CSS::PropertyID::Translate,
+                    CSS::PropertyID::Rotate,
+                    CSS::PropertyID::Scale))
+                return cache_result(false);
+        }
+    }
+    if (!has_animated_property)
+        return cache_result(false);
+
+    if (!target->document().layout_is_up_to_date())
+        return false;
+    auto const* layout_node = target->unsafe_layout_node();
+    if (!layout_node || layout_node->visibility() != CSS::Visibility::Hidden)
+        return cache_result(false);
+
+    bool has_visible_descendant = false;
+    layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
+        if (descendant.visibility() != CSS::Visibility::Visible)
+            return TraversalDecision::Continue;
+        has_visible_descendant = true;
+        return TraversalDecision::Break;
+    });
+    if (has_visible_descendant)
+        return cache_result(false);
+
+    return cache_result(true);
+}
+
+bool KeyframeEffect::can_skip_per_frame_animation_tick() const
+{
+    if (auto animation = associated_animation(); animation && !animation->pending()
+        && animation->play_state() == Bindings::AnimationPlayState::Running
+        && animation->playback_rate() > 0
+        && animation->timeline() && animation->timeline()->is_monotonically_increasing()
+        && is_in_the_before_phase())
+        return true;
+
+    if (!can_skip_per_frame_style_update())
+        return false;
+
+    // An infinite effect cannot reach its natural end, so animationend listeners do not require a continuous tick.
+    auto has_css_animation_event_listener_requiring_animation_tick = [](DOM::EventTarget const& event_target) {
+        return event_target.has_event_listener(HTML::EventNames::animationcancel)
+            || event_target.has_event_listener(HTML::EventNames::animationiteration)
+            || event_target.has_event_listener(HTML::EventNames::animationstart)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart);
+    };
+
+    auto target = this->target();
+    VERIFY(target);
+    for (auto* node = static_cast<DOM::Node*>(target.ptr()); node;) {
+        if (has_css_animation_event_listener_requiring_animation_tick(*node))
+            return false;
+        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
+            node = assigned_slot.ptr();
+        else
+            node = node->parent_or_shadow_host();
+    }
+    if (auto window = target->document().window(); window && has_css_animation_event_listener_requiring_animation_tick(*window))
+        return false;
+
+    return true;
+}
+
+void KeyframeEffect::request_observation_sample()
+{
+    if (m_needs_observation_sample)
+        return;
+    m_needs_observation_sample = true;
+    if (m_target_element)
+        m_target_element->document().set_needs_animated_style_update(*this);
 }
 
 void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)

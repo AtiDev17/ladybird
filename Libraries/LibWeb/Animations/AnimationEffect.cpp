@@ -5,10 +5,12 @@
  */
 
 #include <AK/Bitmap.h>
+#include <AK/ScopeGuard.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/AnimationTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
@@ -118,6 +120,14 @@ Bindings::EffectTiming AnimationEffect::get_timing() const
 Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
 {
     update_style_if_needed();
+
+    if (m_associated_animation) {
+        m_has_local_time_override_for_observation = true;
+        m_local_time_override_for_observation = m_associated_animation->current_time_for_observation();
+    }
+    ScopeGuard clear_local_time_override = [&] {
+        m_has_local_time_override_for_observation = false;
+    };
 
     // 1. Returns the calculated timing properties for this animation effect.
 
@@ -362,6 +372,9 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
     // 6. Follow the procedure to normalize specified timing.
     normalize_specified_timing();
 
+    if (auto* keyframe_effect = as_if<KeyframeEffect>(*this))
+        keyframe_effect->clear_per_frame_style_update_cache();
+
     // AD-HOC: Notify the associated animation that the effect timing has changed.
     if (auto animation = m_associated_animation)
         animation->effect_timing_changed({});
@@ -411,6 +424,9 @@ TimeValue AnimationEffect::end_time() const
 // https://www.w3.org/TR/web-animations-1/#local-time
 Optional<TimeValue> AnimationEffect::local_time() const
 {
+    if (m_has_local_time_override_for_observation)
+        return m_local_time_override_for_observation;
+
     // The local time of an animation effect at a given moment is based on the first matching condition from the
     // following:
 
@@ -920,6 +936,12 @@ AnimationUpdateContext::~AnimationUpdateContext()
             if (effect.target() != target || effect.pseudo_element_type() != element.pseudo_element())
                 continue;
             effects_to_collect.append(effect);
+        }
+        // A dirty effect may have just become irrelevant. Include it once so rebuilding the
+        // animated overlay removes its terminal contribution.
+        for (auto& dirty_effect : it.value.effects) {
+            if (!effects_to_collect.contains_slow(dirty_effect))
+                effects_to_collect.append(dirty_effect);
         }
         if (!effects_to_collect.is_empty())
             target->document().style_computer().collect_animations_into(element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);

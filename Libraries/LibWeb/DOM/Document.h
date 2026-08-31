@@ -469,6 +469,12 @@ public:
     void obtain_theme_color();
 
     void update_style();
+    void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
+    void flush_throttled_animation_style_update();
+    void flush_throttled_animation_style_update_for_node(Node const&);
+    void schedule_animation_wakeup(double delay_ms);
+    void stop_animation_wakeup_timer();
+    void throttled_animation_visibility_changed();
     void invalidate_style_for_viewport_change();
     bool suppresses_attribute_style_invalidation() const { return m_suppresses_attribute_style_invalidation; }
     void set_suppresses_attribute_style_invalidation(bool suppresses) { m_suppresses_attribute_style_invalidation = suppresses; }
@@ -479,7 +485,12 @@ public:
     };
     bool update_style_for_element(AbstractElement const&);
     bool update_style_for_element(AbstractElement const&, StyleUpdateMode);
+    enum class ThrottledAnimationSamplingScope : u8 {
+        Document,
+        Element,
+    };
     void update_layout(UpdateLayoutReason);
+    void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
     void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
     [[nodiscard]] bool may_have_default_scroll_shift_anchor() const { return m_may_have_default_scroll_shift_anchor; }
@@ -500,10 +511,15 @@ public:
     };
     void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
     void update_paint_and_hit_testing_properties_if_needed();
-    void update_animated_style_if_needed();
+    void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
     bool needs_animated_style_update() const { return m_needs_animated_style_update; }
-    void clear_needs_animated_style_update() { m_needs_animated_style_update = false; }
+    void clear_needs_animated_style_update()
+    {
+        m_needs_animated_style_update = false;
+        m_effects_needing_animated_style_update.clear();
+        m_effects_needing_animated_style_update_after_current_update.clear();
+    }
     bool is_running_update_layout() const { return m_is_running_update_layout; }
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
@@ -1015,6 +1031,7 @@ public:
     };
     void append_pending_animation_event(PendingAnimationEvent const&);
     void update_animations_and_send_events(double timestamp);
+    void prepare_to_observe_css_animation_events();
     void dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation>);
     void remove_replaced_animations();
 
@@ -1054,7 +1071,8 @@ public:
     GC::RootVector<GC::Ref<Element>> elements_from_point(double x, double y);
     GC::Ptr<Element const> scrolling_element() const;
 
-    void set_needs_animated_style_update();
+    void set_needs_animated_style_update(Animations::KeyframeEffect&);
+    void request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const&);
 
     CSS::SheetSetStyleCacheRegistry& sheet_set_style_cache_registry() { return m_sheet_set_style_cache_registry; }
 
@@ -1091,6 +1109,11 @@ public:
         u64 animated_style_reconstruction_fallbacks { 0 };
         u64 animated_style_overlay_builds { 0 };
         u64 animated_style_full_builds { 0 };
+        u64 animation_frame_pump_requests { 0 };
+        u64 animation_timeline_associated_animation_updates { 0 };
+        u64 animation_style_skip_cache_hits { 0 };
+        u64 animation_style_skip_cache_misses { 0 };
+        u64 animation_timeline_synchronizations { 0 };
         u64 base_style_partial_builds { 0 };
         u64 base_style_full_builds { 0 };
         u64 computed_longhand_evaluations { 0 };
@@ -1446,6 +1469,8 @@ protected:
 private:
     friend struct AdoptedStyleSheetsAccess;
 
+    void finish_animated_style_update();
+
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
@@ -1702,6 +1727,12 @@ private:
     u64 m_full_layout_count { 0 };
 
     bool m_needs_animated_style_update { false };
+    GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
+    GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
+    bool m_is_updating_animated_style { false };
+    bool m_has_throttled_animation_style_update { false };
+    bool m_force_throttled_animation_style_update { false };
+    Optional<u64> m_last_forced_throttled_animation_style_update_task_generation;
 
     HashTable<GC::Ptr<NodeIterator>> m_node_iterators;
 
@@ -1808,6 +1839,8 @@ private:
     bool m_will_declaratively_refresh { false };
 
     RefPtr<Core::Timer> m_active_refresh_timer;
+    RefPtr<Core::Timer> m_animation_wakeup_timer;
+    Optional<MonotonicTime> m_animation_wakeup_deadline;
 
     bool m_temporary_document_for_fragment_parsing { false };
 
