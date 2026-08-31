@@ -37,6 +37,7 @@ set(SOURCES
     Compositor/CompositorHost.cpp
     Compositor/SmoothScrollAnimation.cpp
     Compositor/Types.cpp
+    Compositor/VisualAnimation.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
@@ -866,6 +867,7 @@ set(SOURCES
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/ScrollState.cpp
+    Painting/VisualContextTreeTestBuilder.cpp
     Painting/SVGMasking.cpp
     PerformanceTimeline/EntryTypes.cpp
     PerformanceTimeline/EventNames.cpp

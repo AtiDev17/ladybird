@@ -12,10 +12,13 @@ use crate::layout::used_values::FfiCssPixelPoint;
 use crate::layout::used_values::FfiCssPixelRect;
 use crate::layout::used_values::FfiCssPixelSize;
 use crate::layout::{grid_formatting_context, svg_formatting_context, used_values};
+use crate::painting::display_list::commands::FrameNodeIndex;
+use crate::painting::display_list::commands::SpatialNodeIndex;
 use crate::painting::host::FfiRecordedDisplayList;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use std::ffi::c_void;
+use std::rc::Rc;
 
 /// SAFETY: `arena` must be a live handle from `layout_arena_create`, borrowed for this call on
 /// the document thread.
@@ -362,108 +365,90 @@ unsafe fn ffi_slice<'a, T>(data: *const T, length: usize) -> &'a [T] {
 
 /// # Safety
 ///
-/// Every input pointer must address the stated number of initialized values for the duration of the call.
+/// `tree` must be a live retained tree handle.
+unsafe fn tree_from_handle<'a>(tree: *const c_void) -> &'a crate::painting::visual_context::VisualContextTree {
+    // SAFETY: The caller guarantees `tree` is a live retained handle.
+    unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() }
+}
+
+/// # Safety
+///
+/// Both trees must be live retained tree handles and every pointer must address the stated number of
+/// bytes or points for the call. Writes the damage rect through `out_damage_rect` and returns whether
+/// the damage is bounded; unbounded damage means the whole viewport must repaint.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_build_depth_sorted_replay_plan(
-    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
-    command_run_count: usize,
-    transform_palette: *const libgfx_rust::FloatMatrix4x4,
-    draw_space: *const crate::painting::display_list::commands::SpatialNodeIndex,
-    backface_culled: *const bool,
-    frame_has_empty_effective_clip: *const bool,
-    frame_count: usize,
-    node_count: usize,
-    parent_by_node: *const crate::painting::display_list::commands::SpatialNodeIndex,
-    sorting_context_root_by_node: *const crate::painting::display_list::commands::SpatialNodeIndex,
-) -> *mut c_void {
+pub unsafe extern "C" fn display_list_compute_damage(
+    old_command_bytes: *const u8,
+    old_command_bytes_length: usize,
+    old_tree: *const c_void,
+    old_scroll_offsets: *const libgfx_rust::FloatPoint,
+    old_scroll_offsets_len: usize,
+    new_command_bytes: *const u8,
+    new_command_bytes_length: usize,
+    new_tree: *const c_void,
+    new_scroll_offsets: *const libgfx_rust::FloatPoint,
+    new_scroll_offsets_len: usize,
+    viewport_rect: libgfx_rust::IntRect,
+    out_damage_rect: *mut libgfx_rust::IntRect,
+) -> bool {
     abort_on_panic(|| {
-        // SAFETY: The caller guarantees every input pointer addresses the stated number of initialized values.
-        let (
-            command_runs,
-            transform_palette,
-            draw_space,
-            backface_culled,
-            frame_has_empty_effective_clip,
-            parent_by_node,
-            sorting_context_root_by_node,
-        ) = unsafe {
+        let (old_tree, new_tree) = unsafe { (tree_from_handle(old_tree), tree_from_handle(new_tree)) };
+        // SAFETY: The caller guarantees the slices address the stated number of values.
+        let (old_command_bytes, old_scroll_offsets, new_command_bytes, new_scroll_offsets) = unsafe {
             (
-                ffi_slice(command_runs, command_run_count),
-                ffi_slice(transform_palette, node_count),
-                ffi_slice(draw_space, node_count),
-                ffi_slice(backface_culled, node_count),
-                ffi_slice(frame_has_empty_effective_clip, frame_count),
-                ffi_slice(parent_by_node, node_count),
-                ffi_slice(sorting_context_root_by_node, node_count),
+                ffi_slice(old_command_bytes, old_command_bytes_length),
+                ffi_slice(old_scroll_offsets, old_scroll_offsets_len),
+                ffi_slice(new_command_bytes, new_command_bytes_length),
+                ffi_slice(new_scroll_offsets, new_scroll_offsets_len),
             )
         };
-        let contexts = crate::painting::visual_context::resolve_sorting_contexts_over_nodes(node_count, |index| {
-            let root = sorting_context_root_by_node[index];
-            (
-                parent_by_node[index],
-                (root != crate::painting::visual_context::NO_SORTING_CONTEXT).then_some(root),
-            )
-        });
-        let plan = crate::painting::display_list::depth_sorted_plan::build_depth_sorted_replay_plan(
-            command_runs,
-            &contexts,
-            transform_palette,
-            draw_space,
-            backface_culled,
-            frame_has_empty_effective_clip,
+        let damage = crate::painting::display_list::damage::compute_display_list_damage(
+            old_command_bytes,
+            old_tree,
+            old_scroll_offsets,
+            new_command_bytes,
+            new_tree,
+            new_scroll_offsets,
+            viewport_rect,
         );
-        Box::into_raw(Box::new(plan)).cast()
-    })
-}
-
-/// # Safety
-///
-/// `plan` must be a live handle returned by `display_list_build_depth_sorted_replay_plan`, and
-/// `out_count` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_depth_sorted_replay_plan_steps(
-    plan: *const c_void,
-    out_count: *mut usize,
-) -> *const crate::painting::display_list::depth_sorted_plan::FfiDepthSortedReplayStep {
-    abort_on_panic(|| {
-        // SAFETY: The caller guarantees the plan and output pointers are live and writable respectively.
-        let plan = unsafe { &*plan.cast::<crate::painting::display_list::depth_sorted_plan::DepthSortedReplayPlan>() };
-        // SAFETY: The caller guarantees `out_count` is writable.
-        unsafe { *out_count = plan.steps.len() };
-        plan.steps.as_ptr()
-    })
-}
-
-/// # Safety
-///
-/// `plan` must be a live handle returned by `display_list_build_depth_sorted_replay_plan`, and
-/// `out_count` writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_depth_sorted_replay_plan_vertices(
-    plan: *const c_void,
-    out_count: *mut usize,
-) -> *const libgfx_rust::FloatVector3 {
-    abort_on_panic(|| {
-        // SAFETY: The caller guarantees the plan and output pointers are live and writable respectively.
-        let plan = unsafe { &*plan.cast::<crate::painting::display_list::depth_sorted_plan::DepthSortedReplayPlan>() };
-        // SAFETY: The caller guarantees `out_count` is writable.
-        unsafe { *out_count = plan.vertices.len() };
-        plan.vertices.as_ptr()
-    })
-}
-
-/// # Safety
-///
-/// `plan` must be null or a live handle returned by `display_list_build_depth_sorted_replay_plan` exactly once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn display_list_depth_sorted_replay_plan_destroy(plan: *mut c_void) {
-    abort_on_panic(|| {
-        if !plan.is_null() {
-            // SAFETY: The caller transfers the live plan handle back exactly once.
-            drop(unsafe {
-                Box::from_raw(plan.cast::<crate::painting::display_list::depth_sorted_plan::DepthSortedReplayPlan>())
-            });
+        match damage {
+            Some(damage_rect) => {
+                // SAFETY: The caller guarantees `out_damage_rect` is writable.
+                unsafe { *out_damage_rect = damage_rect };
+                true
+            }
+            None => false,
         }
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle, `command_runs` must address `command_run_count`
+/// runs and `scroll_offsets` `scroll_offsets_len` points for the call, and `callbacks` must be
+/// live. The painter callbacks run synchronously and may re-enter this function for a nested
+/// display list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn display_list_replay(
+    tree: *const c_void,
+    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
+    command_run_count: usize,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    callbacks: *const crate::painting::host::FfiDisplayListReplayCallbacks,
+) {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the slices address the stated number of values.
+        let (command_runs, scroll_offsets) = unsafe {
+            (
+                ffi_slice(command_runs, command_run_count),
+                ffi_slice(scroll_offsets, scroll_offsets_len),
+            )
+        };
+        // SAFETY: The caller guarantees `callbacks` is live for the call.
+        let mut painter = unsafe { *callbacks };
+        crate::painting::display_list::replay::replay_display_list(tree, command_runs, scroll_offsets, &mut painter);
     });
 }
 
@@ -931,15 +916,13 @@ pub unsafe extern "C" fn layout_arena_assign_accumulated_visual_contexts(
         let is_compatible = !force_incompatible_rebuild
             && state
                 .tree
-                .as_ref()
+                .as_deref()
                 .is_some_and(|previous| tree.is_compatible_with(previous));
         tree.reused_previous_version = is_compatible;
-        tree.version = if is_compatible {
-            state.tree_version()
-        } else {
-            state.allocate_tree_version()
-        };
-        state.tree = Some(tree);
+        if is_compatible {
+            tree.version = state.tree_version();
+        }
+        state.tree = Some(Rc::new(tree));
         state.paintables_with_mask_nodes = paintables_with_mask_nodes;
         state.scroll_state = scroll_state;
         state.scroll_state_snapshot.clear();
@@ -1011,7 +994,7 @@ pub unsafe extern "C" fn layout_arena_update_visual_context_values(
             crate::painting::visual_context::build::update_visual_context_values(
                 &paintable_rows,
                 &callbacks,
-                tree,
+                Rc::make_mut(tree),
                 paintable,
                 pixel_ratio,
             )
@@ -1042,7 +1025,7 @@ pub unsafe extern "C" fn layout_arena_update_visual_viewport_transform(
             return false;
         };
         let inputs = callbacks.tree_inputs();
-        tree.set_visual_viewport_transform(
+        Rc::make_mut(tree).set_visual_viewport_transform(
             crate::painting::visual_context::node_values::visual_viewport_transform_data(&inputs),
         );
         true
@@ -1086,14 +1069,15 @@ pub unsafe extern "C" fn layout_arena_clear_scroll_state(arena: *mut c_void) {
 pub unsafe extern "C" fn layout_arena_refresh_sticky_constraints(
     arena: *mut c_void,
     callbacks: FfiVisualContextHostCallbacks,
-) {
+) -> bool {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paintable_rows = arena.paintable_rows();
         let mut paint_state = arena.paint_state().borrow_mut();
         let state = &mut paint_state.visual_context;
+        let mut any_sticky_payload_changed = false;
         if let Some(tree) = state.tree.as_mut() {
-            crate::painting::visual_context::refresh::refresh_sticky_constraints(
+            any_sticky_payload_changed = crate::painting::visual_context::refresh::refresh_sticky_constraints(
                 &paintable_rows,
                 &state.scroll_state,
                 tree,
@@ -1101,7 +1085,8 @@ pub unsafe extern "C" fn layout_arena_refresh_sticky_constraints(
             );
         }
         state.needs_to_refresh_scroll_state = true;
-    });
+        any_sticky_payload_changed
+    })
 }
 
 /// # Safety
@@ -1277,20 +1262,31 @@ pub struct FfiImagePaintRecordInputs {
 
 /// # Safety
 ///
-/// `inputs` and its arrays must be live for the call; `consume` is called synchronously.
+/// `inputs` and its arrays must be live for the call; `consume` is called synchronously with a
+/// recording that is only valid during that call and a retained visual context tree handle the
+/// host takes ownership of.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
     inputs: *const FfiImagePaintRecordInputs,
     context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList),
+    consume: unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, *const c_void),
 ) {
     use crate::painting::display_list::commands::{DisplayListResourceId, ImageFrameResourceId};
     use crate::painting::display_list::recorder::{
         ColorStops, ConicGradientData, DisplayListRecorder, LinearGradientData, RadialGradientData,
     };
-    use libgfx_rust::{CompositingAndBlendingOperator, IntRect};
+    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
+    use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, IntRect};
     abort_on_panic(|| {
         let inputs = unsafe { &*inputs };
+        let tree = VisualContextTree::create(TransformData {
+            matrix: FloatMatrix4x4::identity(),
+            origin: FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+        });
         let mut recorder = DisplayListRecorder::new();
         let dest_rect = inputs.dest_rect;
         let dest_int_rect = IntRect::new(
@@ -1373,7 +1369,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
             }
         }
         let recorded = recorder.into_builder().finish();
-        unsafe { consume(context, (&recorded).into()) };
+        unsafe { consume(context, (&recorded).into(), Rc::into_raw(Rc::new(tree)).cast()) };
     });
 }
 
@@ -1389,120 +1385,6 @@ pub unsafe extern "C" fn layout_arena_paint_push_overlay_glyph(sink: *mut c_void
             position: libgfx_rust::FloatPoint { x, y },
             glyph_id,
         });
-    });
-}
-
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_spatial_node_count(tree: *const c_void) -> usize {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        tree.spatial_nodes.len()
-    })
-}
-
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_frame_node_count(tree: *const c_void) -> usize {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        tree.frame_nodes.len()
-    })
-}
-
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_root_is_visual_viewport(tree: *const c_void) -> bool {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        tree.root_is_visual_viewport
-    })
-}
-
-///
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_root_isolation_frame(tree: *const c_void) -> u32 {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        tree.root_isolation_frame
-            .unwrap_or(crate::painting::visual_context::FrameNodeIndex::NONE)
-            .0
-    })
-}
-
-fn export_visual_context_nodes<Node>(
-    nodes: &[Node],
-    begin: usize,
-    out: *mut crate::painting::host::FfiVisualContextNodeExport,
-    capacity: usize,
-    export: fn(&Node) -> crate::painting::host::FfiVisualContextNodeExport,
-) {
-    let nodes = &nodes[begin..begin + capacity];
-    // SAFETY: The caller provides writable storage for `capacity` exports.
-    let out = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
-    for (out, node) in out.iter_mut().zip(nodes) {
-        *out = export(node);
-    }
-}
-
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously; `out` must have room
-/// for `capacity` exports, and `begin..begin + capacity` must lie within the spatial nodes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_export_spatial_nodes(
-    tree: *const c_void,
-    begin: usize,
-    out: *mut crate::painting::host::FfiVisualContextNodeExport,
-    capacity: usize,
-) {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        export_visual_context_nodes(
-            &tree.spatial_nodes,
-            begin,
-            out,
-            capacity,
-            crate::painting::visual_context::export_spatial_node,
-        );
-    });
-}
-
-/// # Safety
-///
-/// `tree` must be the pointer handed to the callback, used synchronously; `out` must have room
-/// for `capacity` exports, and `begin..begin + capacity` must lie within the frame nodes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_visual_context_tree_export_frame_nodes(
-    tree: *const c_void,
-    begin: usize,
-    out: *mut crate::painting::host::FfiVisualContextNodeExport,
-    capacity: usize,
-) {
-    abort_on_panic(|| {
-        // SAFETY: `tree` is the VisualContextTree pointer handed out by the host callback wrapper.
-        let tree = unsafe { &*tree.cast::<crate::painting::visual_context::VisualContextTree>() };
-        export_visual_context_nodes(
-            &tree.frame_nodes,
-            begin,
-            out,
-            capacity,
-            crate::painting::visual_context::export_frame_node,
-        );
     });
 }
 
@@ -2332,9 +2214,11 @@ pub unsafe extern "C" fn layout_arena_stacking_context_tree_child(
 
 /// # Safety
 ///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread. The
+/// returned tree is retained; the caller owns one reference and releases it with
+/// `visual_context_tree_release`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_main_visual_context_tree(arena: *mut c_void) -> *const c_void {
+pub unsafe extern "C" fn layout_arena_main_visual_context_tree_retain(arena: *mut c_void) -> *const c_void {
     abort_on_panic(|| {
         let arena = unsafe { arena_from_handle(arena) };
         let paint_state = arena.paint_state().borrow();
@@ -2342,8 +2226,700 @@ pub unsafe extern "C" fn layout_arena_main_visual_context_tree(arena: *mut c_voi
             .visual_context
             .tree
             .as_ref()
-            .map_or(std::ptr::null(), |tree| std::ptr::from_ref(tree).cast())
+            .map_or(std::ptr::null(), |tree| Rc::into_raw(Rc::clone(tree)).cast())
     })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_has_visual_context_tree(arena: *mut c_void) -> bool {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paint_state = arena.paint_state().borrow();
+        paint_state.visual_context.tree.is_some()
+    })
+}
+
+/// # Safety
+///
+/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_visual_context_tree_version(arena: *mut c_void) -> u64 {
+    abort_on_panic(|| {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paint_state = arena.paint_state().borrow();
+        paint_state.visual_context.tree_version()
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a retained tree handle (from `layout_arena_main_visual_context_tree_retain`,
+/// a host callback, or an earlier retain), used on the thread that owns it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_retain(tree: *const c_void) -> *const c_void {
+    abort_on_panic(|| {
+        // SAFETY: The caller guarantees `tree` is a live retained handle, so the strong count is at least one.
+        unsafe { Rc::increment_strong_count(tree.cast::<crate::painting::visual_context::VisualContextTree>()) };
+        tree
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be null or a retained tree handle that the caller gives up with this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_release(tree: *const c_void) {
+    abort_on_panic(|| {
+        if tree.is_null() {
+            return;
+        }
+        // SAFETY: The caller gives up the reference it retained, and the strong count is at least one.
+        unsafe { Rc::decrement_strong_count(tree.cast::<crate::painting::visual_context::VisualContextTree>()) };
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_version(tree: *const c_void) -> u64 {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.version)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `append` is called synchronously with `sink`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_serialize(
+    tree: *const c_void,
+    sink: *mut c_void,
+    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+) {
+    abort_on_panic(|| {
+        let bytes = unsafe { tree_from_handle(tree) }.to_bytes();
+        // SAFETY: The C++ sink copies the bytes synchronously.
+        unsafe { append(sink, bytes.as_ptr(), bytes.len()) };
+    });
+}
+
+/// # Safety
+///
+/// `bytes` must address `length` readable bytes for the call. Returns a retained tree handle the
+/// caller owns, or null when the bytes do not describe a valid tree.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_deserialize(bytes: *const u8, length: usize) -> *const c_void {
+    abort_on_panic(|| {
+        // SAFETY: The caller guarantees `bytes` addresses `length` readable bytes.
+        let bytes = unsafe { ffi_slice(bytes, length) };
+        match crate::painting::visual_context::VisualContextTree::from_bytes(bytes) {
+            Some(tree) => Rc::into_raw(Rc::new(tree)).cast(),
+            None => std::ptr::null(),
+        }
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_spatial_node_count(tree: *const c_void) -> usize {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.spatial_nodes.len())
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_frame_node_count(tree: *const c_void) -> usize {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.frame_nodes.len())
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len`
+/// points and `out_local_point` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_transform_point_for_hit_test(
+    tree: *const c_void,
+    context: crate::painting::display_list::commands::ContextRef,
+    screen_point: libgfx_rust::FloatPoint,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    respect_clip: bool,
+    out_local_point: *mut libgfx_rust::FloatPoint,
+) -> bool {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+        let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
+        let clip_behavior = crate::painting::visual_context::ClipBehavior::from_respect_clip(respect_clip);
+        match tree.transform_point_for_hit_test(context, screen_point, scroll_offsets, clip_behavior) {
+            Some(local_point) => {
+                // SAFETY: The caller guarantees `out_local_point` is writable.
+                unsafe { *out_local_point = local_point };
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_inverse_transform_point(
+    tree: *const c_void,
+    spatial: SpatialNodeIndex,
+    screen_point: libgfx_rust::FloatPoint,
+) -> libgfx_rust::FloatPoint {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.inverse_transform_point(spatial, screen_point))
+}
+
+fn include_visual_viewport_transform_from(
+    include: bool,
+) -> crate::painting::visual_context::IncludeVisualViewportTransform {
+    if include {
+        crate::painting::visual_context::IncludeVisualViewportTransform::Yes
+    } else {
+        crate::painting::visual_context::IncludeVisualViewportTransform::No
+    }
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_transform_rect_to_viewport(
+    tree: *const c_void,
+    spatial: SpatialNodeIndex,
+    rect: libgfx_rust::FloatRect,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    include_visual_viewport_transform: bool,
+) -> libgfx_rust::FloatRect {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+        let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
+        tree.transform_rect_to_viewport(
+            spatial,
+            rect,
+            scroll_offsets,
+            include_visual_viewport_transform_from(include_visual_viewport_transform),
+        )
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_cumulative_scroll_chain_offset(
+    tree: *const c_void,
+    spatial: SpatialNodeIndex,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+) -> libgfx_rust::FloatPoint {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+        let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
+        tree.cumulative_scroll_chain_offset(spatial, scroll_offsets)
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_accumulated_matrix(
+    tree: *const c_void,
+    spatial: SpatialNodeIndex,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    include_visual_viewport_transform: bool,
+) -> libgfx_rust::FloatMatrix4x4 {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+        let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
+        tree.accumulated_matrix(
+            spatial,
+            scroll_offsets,
+            include_visual_viewport_transform_from(include_visual_viewport_transform),
+        )
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len`
+/// points, and `push` is called synchronously with `sink` for every sticky node's resolved entry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_resolve_sticky_offsets(
+    tree: *const c_void,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    sink: *mut c_void,
+    push: unsafe extern "C" fn(*mut c_void, SpatialNodeIndex, libgfx_rust::FloatPoint),
+) {
+    abort_on_panic(|| {
+        let resolved_sticky_entries = {
+            let tree = unsafe { tree_from_handle(tree) };
+            // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points, and the
+            // borrow ends before the sink may grow the same storage.
+            let scroll_offsets = unsafe { ffi_slice(scroll_offsets, scroll_offsets_len) };
+            tree.resolve_sticky_offsets(scroll_offsets)
+        };
+        for (node_index, offset) in resolved_sticky_entries {
+            // SAFETY: The C++ sink records the entry synchronously.
+            unsafe { push(sink, node_index, offset) };
+        }
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_visual_viewport_transform(
+    tree: *const c_void,
+) -> crate::painting::host::FfiVisualViewportTransform {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        let crate::painting::visual_context::SpatialData::Transform(transform) =
+            &tree.spatial_nodes[crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX.0 as usize].data
+        else {
+            unreachable!("the visual viewport node is a transform");
+        };
+        crate::painting::host::FfiVisualViewportTransform {
+            matrix: transform.matrix,
+            origin: transform.origin,
+        }
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle. Returns a retained handle to a copy of the tree whose
+/// visual viewport node carries the given transform; the copy keeps the version.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_with_visual_viewport_transform(
+    tree: *const c_void,
+    transform: crate::painting::host::FfiVisualViewportTransform,
+) -> *const c_void {
+    abort_on_panic(|| {
+        let mut copy = unsafe { tree_from_handle(tree) }.clone();
+        copy.set_visual_viewport_matrix_and_origin(transform.matrix, transform.origin);
+        Rc::into_raw(Rc::new(copy)).cast()
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `frame_opacities` must address `frame_opacity_count`
+/// samples and `spatial_matrices` `spatial_matrix_count` samples. Returns a retained handle to a copy
+/// of the tree carrying the sampled values; the copy keeps the version.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
+    tree: *const c_void,
+    frame_opacities: *const crate::painting::host::FfiFrameOpacitySample,
+    frame_opacity_count: usize,
+    spatial_matrices: *const crate::painting::host::FfiSpatialTransformSample,
+    spatial_matrix_count: usize,
+) -> *const c_void {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the sample arrays address the stated counts.
+        let (frame_opacities, spatial_matrices) = unsafe {
+            (
+                ffi_slice(frame_opacities, frame_opacity_count),
+                ffi_slice(spatial_matrices, spatial_matrix_count),
+            )
+        };
+        let frame_opacities: Vec<(FrameNodeIndex, f32)> = frame_opacities
+            .iter()
+            .map(|sample| (FrameNodeIndex(sample.frame), sample.opacity))
+            .collect();
+        let spatial_matrices: Vec<(SpatialNodeIndex, libgfx_rust::FloatMatrix4x4)> = spatial_matrices
+            .iter()
+            .map(|sample| (SpatialNodeIndex(sample.spatial), sample.matrix))
+            .collect();
+        let sampled = tree.with_sampled_visual_animation_values(&frame_opacities, &spatial_matrices);
+        Rc::into_raw(Rc::new(sampled)).cast()
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `targets` must address `target_count` node indices.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_visual_animation_targets_are_valid(
+    tree: *const c_void,
+    targets_are_frames: bool,
+    targets: *const u32,
+    target_count: usize,
+) -> bool {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the targets address `target_count` indices.
+        let targets = unsafe { ffi_slice(targets, target_count) };
+        tree.visual_animation_targets_are_valid(targets_are_frames, targets)
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle and `out_opacity` must be writable. Returns whether
+/// `frame` names an effects frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_effects_opacity(
+    tree: *const c_void,
+    frame: FrameNodeIndex,
+    out_opacity: *mut f32,
+) -> bool {
+    abort_on_panic(|| match unsafe { tree_from_handle(tree) }.effects_opacity(frame) {
+        Some(opacity) => {
+            // SAFETY: The caller guarantees `out_opacity` is writable.
+            unsafe { *out_opacity = opacity };
+            true
+        }
+        None => false,
+    })
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `roots` must address `root_count` spatial indices and
+/// `out_flags` must address one writable flag per spatial node (`flag_count` of them).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_mark_spatial_subtrees(
+    tree: *const c_void,
+    roots: *const SpatialNodeIndex,
+    root_count: usize,
+    out_flags: *mut bool,
+    flag_count: usize,
+) {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the roots address `root_count` indices.
+        let roots = unsafe { ffi_slice(roots, root_count) };
+        let in_subtree = tree.spatial_nodes_in_subtrees_of(roots);
+        assert_eq!(in_subtree.len(), flag_count);
+        // SAFETY: The caller guarantees `out_flags` addresses `flag_count` writable flags.
+        unsafe { std::ptr::copy_nonoverlapping(in_subtree.as_ptr(), out_flags, flag_count) };
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_has_unisolated_blending_frame(tree: *const c_void) -> bool {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.has_unisolated_blending_frame())
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `visit` is called synchronously with `context` for every
+/// effects frame that carries a filter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_for_each_effects_filter_bytes(
+    tree: *const c_void,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+) {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        for frame in &tree.frame_nodes {
+            if let crate::painting::visual_context::FrameData::Effects(effects) = &frame.data
+                && let Some(filter_bytes) = &effects.filter
+            {
+                // SAFETY: The C++ visitor reads the bytes synchronously.
+                unsafe { visit(context, filter_bytes.as_ptr(), filter_bytes.len()) };
+            }
+        }
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle; `command_runs` must address `command_run_count` runs;
+/// `owner_label` is called synchronously with `context` and a `Vec<u8>` sink the host fills through
+/// `layout_arena_paint_push_bytes`, returning whether it wrote a label; `append` receives the dump text.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_dump(
+    tree: *const c_void,
+    command_runs: *const crate::painting::display_list::commands::DisplayListCommandRun,
+    command_run_count: usize,
+    context: *mut c_void,
+    owner_label: unsafe extern "C" fn(*mut c_void, bool, u32, *mut c_void) -> bool,
+    sink: *mut c_void,
+    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+) {
+    abort_on_panic(|| {
+        let tree = unsafe { tree_from_handle(tree) };
+        // SAFETY: The caller guarantees the runs address `command_run_count` values.
+        let command_runs = unsafe { ffi_slice(command_runs, command_run_count) };
+        let text = tree.dump_nodes_reachable_from_runs(command_runs, |is_frame, index| {
+            let mut label: Vec<u8> = Vec::new();
+            // SAFETY: The C++ host fills the label sink synchronously through the exported push function.
+            let has_label = unsafe { owner_label(context, is_frame, index, (&raw mut label).cast()) };
+            has_label.then(|| String::from_utf8_lossy(&label).into_owned())
+        });
+        // SAFETY: The C++ sink copies the text synchronously.
+        unsafe { append(sink, text.as_ptr(), text.len()) };
+    });
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_frame_is_isolated_by_layer_frame(
+    tree: *const c_void,
+    frame: FrameNodeIndex,
+) -> bool {
+    abort_on_panic(|| unsafe { tree_from_handle(tree) }.frame_is_isolated_by_layer_frame(frame))
+}
+
+/// # Safety
+///
+/// Returns a builder handle for hand-built test trees rooted at an identity visual viewport
+/// transform; every builder call must receive it until `visual_context_tree_test_builder_finish`
+/// or `visual_context_tree_test_builder_destroy` consumes it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_create() -> *mut c_void {
+    abort_on_panic(|| {
+        let tree = crate::painting::visual_context::VisualContextTree::create(
+            crate::painting::visual_context::TransformData {
+                matrix: libgfx_rust::FloatMatrix4x4::identity(),
+                origin: libgfx_rust::FloatPoint::default(),
+                sorting_context_root_index: None,
+                flattens_inherited_transform: false,
+                role: crate::painting::visual_context::TransformDataRole::CssTransform,
+                synthetic_plane: false,
+            },
+        );
+        Box::into_raw(Box::new(tree)).cast()
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+unsafe fn test_builder_tree<'a>(builder: *mut c_void) -> &'a mut crate::painting::visual_context::VisualContextTree {
+    // SAFETY: The caller guarantees `builder` is the live boxed tree the create call returned.
+    unsafe { &mut *builder.cast::<crate::painting::visual_context::VisualContextTree>() }
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_transform(
+    builder: *mut c_void,
+    parent: u32,
+    matrix: libgfx_rust::FloatMatrix4x4,
+    origin: libgfx_rust::FloatPoint,
+) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        tree.append_spatial(
+            crate::painting::visual_context::SpatialData::Transform(crate::painting::visual_context::TransformData {
+                matrix,
+                origin,
+                sorting_context_root_index: None,
+                flattens_inherited_transform: false,
+                role: crate::painting::visual_context::TransformDataRole::CssTransform,
+                synthetic_plane: false,
+            }),
+            SpatialNodeIndex(parent),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_scroll(builder: *mut c_void, parent: u32) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        tree.append_spatial(
+            crate::painting::visual_context::SpatialData::Scroll(crate::painting::visual_context::ScrollData {
+                state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
+            }),
+            SpatialNodeIndex(parent),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
+    builder: *mut c_void,
+    parent: u32,
+    constraints: crate::painting::host::FfiTestStickyConstraints,
+) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        let inset =
+            |value: crate::painting::display_list::commands::OptionalF32| value.has_value.then_some(value.value);
+        tree.append_spatial(
+            crate::painting::visual_context::SpatialData::Sticky(crate::painting::visual_context::StickyData {
+                scroller: SpatialNodeIndex(constraints.scroller),
+                parent_sticky: constraints
+                    .has_parent_sticky
+                    .then_some(SpatialNodeIndex(constraints.parent_sticky)),
+                position_relative_to_scroller: constraints.position_relative_to_scroller,
+                border_box_size: constraints.border_box_size,
+                scrollport_size: constraints.scrollport_size,
+                containing_block_region: constraints.containing_block_region,
+                needs_parent_offset_adjustment: constraints.needs_parent_offset_adjustment,
+                inset_top: inset(constraints.inset_top),
+                inset_right: inset(constraints.inset_right),
+                inset_bottom: inset(constraints.inset_bottom),
+                inset_left: inset(constraints.inset_left),
+                state_slot: crate::painting::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
+            }),
+            SpatialNodeIndex(parent),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_clip_frame(
+    builder: *mut c_void,
+    parent_frame: u32,
+    spatial: u32,
+    rect: libgfx_rust::FloatRect,
+    corner_radii: libgfx_rust::CornerRadii,
+    mode: crate::painting::visual_context::ClipMode,
+) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        tree.append_frame(
+            crate::painting::visual_context::FrameData::Clip(crate::painting::visual_context::ClipData {
+                rect,
+                corner_radii,
+                mode,
+            }),
+            FrameNodeIndex(parent_frame),
+            SpatialNodeIndex(spatial),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`; `path_bytes`
+/// must address `path_bytes_length` readable bytes of a serialized `Gfx::Path`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_clip_path_frame(
+    builder: *mut c_void,
+    parent_frame: u32,
+    spatial: u32,
+    path_bytes: *const u8,
+    path_bytes_length: usize,
+    bounding_rect: libgfx_rust::IntRect,
+    fill_rule: libgfx_rust::WindingRule,
+) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        // SAFETY: The caller guarantees `path_bytes` addresses `path_bytes_length` readable bytes.
+        let path_bytes = unsafe { ffi_slice(path_bytes, path_bytes_length) };
+        let path = libgfx_rust::path::OwnedPath::from_serialized_bytes(path_bytes);
+        tree.append_frame(
+            crate::painting::visual_context::FrameData::ClipPath(crate::painting::visual_context::ClipPathData {
+                path: Rc::new(path),
+                bounding_rect,
+                fill_rule,
+            }),
+            FrameNodeIndex(parent_frame),
+            SpatialNodeIndex(spatial),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_effects_frame(
+    builder: *mut c_void,
+    parent_frame: u32,
+    spatial: u32,
+    opacity: f32,
+    blend_mode: libgfx_rust::CompositingAndBlendingOperator,
+) -> u32 {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        tree.append_frame(
+            crate::painting::visual_context::FrameData::Effects(crate::painting::visual_context::EffectsData {
+                opacity,
+                blend_mode,
+                filter: None,
+            }),
+            FrameNodeIndex(parent_frame),
+            SpatialNodeIndex(spatial),
+        )
+        .0
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`. Gives the tree
+/// the version another tree carries, so a test can stage a compatible tree-only update.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_set_version(builder: *mut c_void, version: u64) {
+    abort_on_panic(|| {
+        let tree = unsafe { test_builder_tree(builder) };
+        tree.version = version;
+    });
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`, consumed by this
+/// call. Returns a retained tree handle the caller owns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_finish(builder: *mut c_void) -> *const c_void {
+    abort_on_panic(|| {
+        // SAFETY: The caller hands over the boxed tree the create call returned.
+        let tree = unsafe { Box::from_raw(builder.cast::<crate::painting::visual_context::VisualContextTree>()) };
+        Rc::into_raw(Rc::new(*tree)).cast()
+    })
+}
+
+/// # Safety
+///
+/// `builder` must be null or a live handle from `visual_context_tree_test_builder_create`, consumed
+/// by this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_destroy(builder: *mut c_void) {
+    abort_on_panic(|| {
+        if builder.is_null() {
+            return;
+        }
+        // SAFETY: The caller hands over the boxed tree the create call returned.
+        drop(unsafe { Box::from_raw(builder.cast::<crate::painting::visual_context::VisualContextTree>()) });
+    });
 }
 
 /// # Safety
@@ -2679,7 +3255,7 @@ fn with_hit_test_list_and_visual_context_tree<R>(
         return default;
     };
     list.build_derived_structures_if_needed();
-    let Some(tree) = visual_context.tree.as_ref() else {
+    let Some(tree) = visual_context.tree.as_deref() else {
         return default;
     };
     query(list, tree, arena)
@@ -2722,8 +3298,8 @@ pub unsafe extern "C" fn layout_arena_hit_test_find_topmost_items_for_caret(
     point: FfiCssPixelPoint,
 ) -> crate::painting::host::FfiTopmostItemsForCaret {
     abort_on_panic(|| {
-        with_hit_test_list(arena, Default::default(), |list, arena| {
-            let (caret_item, hit_item) = list.find_topmost_items_for_caret(arena, &callbacks, point.into());
+        with_hit_test_list_and_visual_context_tree(arena, Default::default(), |list, tree, arena| {
+            let (caret_item, hit_item) = list.find_topmost_items_for_caret(arena, tree, &callbacks, point.into());
             crate::painting::host::FfiTopmostItemsForCaret {
                 caret_item: ffi_topmost(caret_item),
                 hit_item: ffi_topmost(hit_item),
@@ -2836,9 +3412,10 @@ pub unsafe extern "C" fn layout_arena_hit_test_find_closest_line(
     respect_clip: bool,
 ) -> crate::painting::host::FfiClosestLine {
     abort_on_panic(|| {
-        with_hit_test_list(arena, Default::default(), |list, arena| {
+        with_hit_test_list_and_visual_context_tree(arena, Default::default(), |list, tree, arena| {
             let closest = list.find_closest_line(
                 arena,
+                tree,
                 &callbacks,
                 point.into(),
                 crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode),

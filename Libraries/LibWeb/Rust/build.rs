@@ -2597,13 +2597,15 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "OptionalI64",
             "OptionalUsize",
             "ClipMode",
-            "MaskLayerOrigin",
-            "TransformDataRole",
             "FfiChromeMetrics",
             "SpatialNodeIndex",
             "FrameNodeIndex",
             "ContextRef",
             "DisplayListCommandRun",
+            "ReplayClip",
+            "ReplayLayer",
+            "ReplayMask",
+            "FfiVisualViewportTransform",
         ]
         .map(String::from),
     );
@@ -2639,13 +2641,15 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("OptionalI64", "Optional<i64>"),
         ("OptionalUsize", "Optional<size_t>"),
         ("ClipMode", "Web::Painting::ClipMode"),
-        ("MaskLayerOrigin", "Web::Painting::MaskLayerOrigin"),
-        ("TransformDataRole", "Web::Painting::TransformDataRole"),
         ("FfiChromeMetrics", "Web::ChromeMetrics"),
         ("SpatialNodeIndex", "Web::Painting::SpatialNodeIndex"),
         ("FrameNodeIndex", "Web::Painting::FrameNodeIndex"),
         ("ContextRef", "Web::Painting::ContextRef"),
         ("DisplayListCommandRun", "Web::Painting::DisplayListCommandRun"),
+        ("ReplayClip", "Web::Painting::ReplayClip"),
+        ("ReplayLayer", "Web::Painting::ReplayLayer"),
+        ("ReplayMask", "Web::Painting::ReplayMask"),
+        ("FfiVisualViewportTransform", "Web::Painting::TransformWithOrigin"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -2669,6 +2673,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibWeb/Forward.h",
             "LibWeb/Painting/AccumulatedVisualContext.h",
             "LibWeb/Painting/ChromeMetrics.h",
+            "LibWeb/Painting/DisplayListCommandsGenerated.h",
         ]
         .map(String::from),
     );
@@ -3085,8 +3090,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
     layout_config.export.include = vec![
-        "DepthSortedReplayStepKind".to_string(),
-        "FfiDepthSortedReplayStep".to_string(),
         "FfiFormattingContextType".to_string(),
         "FilterOperationType".to_string(),
     ];
@@ -3116,7 +3119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/painting/host/visual_context.rs"),
             manifest_dir.join("src/painting/host/hit_test.rs"),
             manifest_dir.join("src/painting/host/paint.rs"),
-            manifest_dir.join("src/painting/display_list/depth_sorted_plan.rs"),
+            manifest_dir.join("src/painting/host/replay.rs"),
             manifest_dir.join("src/painting/ffi.rs"),
         ],
         &out_dir,

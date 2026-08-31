@@ -85,27 +85,19 @@ static DOM::Node const* dom_node_for_shell(void* shell)
     return layout_node ? layout_node->dom_node() : nullptr;
 }
 
-static Optional<Gfx::FloatPoint> local_float_point_for_visual_context(ContextRef context, CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior clip_behavior)
-{
-    auto pixel_ratio = static_cast<float>(device_pixels_per_css_pixel);
-    auto const& visual_context_tree = document.visual_context_tree();
-    auto result = visual_context_tree.transform_point_for_hit_test(context, point.to_type<float>() * pixel_ratio, document.scroll_state_snapshot(), clip_behavior);
-    if (!result.has_value())
-        return {};
-    return *result / pixel_ratio;
-}
-
 Optional<CSSPixelPoint> HitTestDisplayList::local_point_for_visual_context(ContextRef context, CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel) const
 {
-    return local_float_point_for_visual_context(context, point, document, device_pixels_per_css_pixel, AccumulatedVisualContextTree::ClipBehavior::Respect)
-        .map([](auto float_point) { return float_point.template to_type<CSSPixels>(); });
+    auto pixel_ratio = static_cast<float>(device_pixels_per_css_pixel);
+    auto result = document.visual_context_tree().transform_point_for_hit_test(context, point.to_type<float>() * pixel_ratio, document.scroll_state_snapshot());
+    if (!result.has_value())
+        return {};
+    return (*result / pixel_ratio).to_type<CSSPixels>();
 }
 
 CSSPixelRect HitTestDisplayList::viewport_rect_for_context(SpatialNodeIndex spatial, CSSPixelRect const& rect, DOM::Document const& document, double device_pixels_per_css_pixel) const
 {
     auto pixel_ratio = static_cast<float>(device_pixels_per_css_pixel);
-    auto const& visual_context_tree = document.visual_context_tree();
-    auto result = visual_context_tree.transform_rect_to_viewport(spatial, rect.to_type<float>() * pixel_ratio, document.scroll_state_snapshot());
+    auto result = document.visual_context_tree().transform_rect_to_viewport(spatial, rect.to_type<float>() * pixel_ratio, document.scroll_state_snapshot());
     return result.scaled(1.0f / pixel_ratio).to_type<CSSPixels>();
 }
 
@@ -127,16 +119,6 @@ struct HitTestDisplayList::QueryContext {
             .chrome_metrics = {},
             .viewport_wheel_overflow_x = 0,
             .viewport_wheel_overflow_y = 0,
-            .local_point_for_visual_context = [](void* context_pointer, ContextRef visual_context, CSSPixelPoint point, bool respect_clip, Gfx::FloatPoint* out) -> bool {
-                auto& context = *static_cast<QueryContext*>(context_pointer);
-                VERIFY(context.document);
-                auto clip_behavior = respect_clip ? AccumulatedVisualContextTree::ClipBehavior::Respect : AccumulatedVisualContextTree::ClipBehavior::Ignore;
-                auto local_point = local_float_point_for_visual_context(visual_context, point, *context.document, context.device_pixels_per_css_pixel, clip_behavior);
-                if (!local_point.has_value())
-                    return false;
-                *out = *local_point;
-                return true;
-            },
             .shell_in_scope = [](void* context_pointer, void* shell) -> bool {
                 auto& context = *static_cast<QueryContext*>(context_pointer);
                 VERIFY(context.scope);
@@ -477,7 +459,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_for_line(size_t line_
 
 Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, CaretPositionMode mode, GC::Ptr<DOM::Node const> constraint_scope) const
 {
-    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree_version() || !is_current())
         return {};
     // First find both the topmost hit-test item and the topmost item that can directly produce a caret.
     // Non-caret items are still needed to keep later line fallback scoped to the hit content.
@@ -572,7 +554,7 @@ Optional<CaretPosition> HitTestDisplayList::caret_position_from_point(CSSPixelPo
 
 Optional<HitTestResult> HitTestDisplayList::hit_test(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics) const
 {
-    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree_version() || !is_current())
         return {};
 
     auto topmost_item = find_topmost_item(point, document, device_pixels_per_css_pixel, chrome_metrics);
@@ -583,7 +565,7 @@ Optional<HitTestResult> HitTestDisplayList::hit_test(CSSPixelPoint point, DOM::D
 
 TraversalDecision HitTestDisplayList::hit_test_all(CSSPixelPoint point, DOM::Document const& document, double device_pixels_per_css_pixel, ChromeMetrics const& chrome_metrics, Function<TraversalDecision(HitTestResult)> const& callback) const
 {
-    if (m_visual_context_tree_version != document.visual_context_tree().version() || !is_current())
+    if (m_visual_context_tree_version != document.visual_context_tree_version() || !is_current())
         return TraversalDecision::Continue;
 
     for (auto item_index : hit_item_indices_topmost_first(point, document, device_pixels_per_css_pixel, chrome_metrics)) {

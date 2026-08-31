@@ -1,6 +1,5 @@
 set(TEST_SOURCES
     TestSiteCompatibility.cpp
-    TestAccumulatedVisualContext.cpp
     TestContentBlocker.cpp
     TestControlMessageQueue.cpp
     TestCSSIDSpeed.cpp
@@ -8,7 +7,6 @@ set(TEST_SOURCES
     TestCSSPixels.cpp
     TestCSSDecodeBytes.cpp
     TestDisplayListCommandRuns.cpp
-    TestDisplayListDamage.cpp
     TestDownloadReader.cpp
     TestDump.cpp
     TestEventLoop.cpp
@@ -35,6 +33,7 @@ set(TEST_SOURCES
     TestStyleStructRef.cpp
     TestTextureUpload.cpp
     TestTrackBufferDemuxer.cpp
+    TestVisualAnimation.cpp
     TestWebGLSpanWithStorage.cpp
     TestWebIDLBuffers.cpp
     TestWindowProxyWorld.cpp
@@ -63,11 +62,9 @@ target_link_libraries(TestContentBlocker PRIVATE LibURL)
 target_link_libraries(TestSiteCompatibility PRIVATE LibURL)
 target_link_libraries(TestControlMessageQueue PRIVATE LibSync)
 target_link_libraries(TestDisplayListCommandRuns PRIVATE LibGfx)
-target_link_libraries(TestDisplayListDamage PRIVATE LibGfx)
 target_link_libraries(TestDownloadReader PRIVATE LibGC LibJS LibURL)
 target_link_libraries(TestFetchResponse PRIVATE LibGC LibHTTP LibJS LibRequests LibURL)
 target_link_libraries(TestFetchURL PRIVATE LibURL)
-target_link_libraries(TestAccumulatedVisualContext PRIVATE LibGfx)
 target_link_libraries(TestImageData PRIVATE LibGC LibJS)
 target_link_libraries(TestWebIDLBuffers PRIVATE LibGC LibJS)
 target_link_libraries(TestWebGLSpanWithStorage PRIVATE LibGC LibJS)

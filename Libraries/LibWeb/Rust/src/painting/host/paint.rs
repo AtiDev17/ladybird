@@ -10,9 +10,7 @@ use crate::layout::used_values;
 use crate::painting::display_list::builder::RecordedDisplayList;
 use crate::painting::display_list::commands::{DisplayListCommandRun, DisplayListResourceId, FrameNodeIndex};
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
-use libgfx_rust::{
-    AffineTransform, Color, FloatMatrix4x4, FloatRect, FloatSize, IntPoint, IntRect, InterpolationColorSpace,
-};
+use libgfx_rust::{AffineTransform, Color, FloatMatrix4x4, FloatRect, FloatSize, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug)]
@@ -403,7 +401,6 @@ pub struct FfiPaintHostCallbacks {
     pub replaced_image_paint:
         unsafe extern "C" fn(*mut c_void, *mut c_void, FloatRect, FloatSize) -> FfiImagePaintFacts,
     pub backdrop_filter_bytes: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
-    pub nested_display_list_from_bytes: unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, IntPoint) -> u64,
     pub svg_image_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgImageFacts,
     pub svg_paint_style: unsafe extern "C" fn(
         *mut c_void,
@@ -412,9 +409,8 @@ pub struct FfiPaintHostCallbacks {
         *const FfiSvgPaintContext,
         *mut c_void,
     ) -> FfiSvgPaintStyle,
-    pub materialize_visual_context_tree: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void,
     pub nested_display_list_from_tree:
-        unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, *mut c_void, *const u64, usize) -> u64,
+        unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, *const c_void, *const u64, usize) -> u64,
     pub overlay_label: unsafe extern "C" fn(
         *mut c_void,
         *mut c_void,
@@ -589,15 +585,6 @@ impl FfiPaintHostCallbacks {
             unsafe { (self.backdrop_filter_bytes)(self.context, layout_node_shell, (&raw mut bytes).cast()) };
         has_filter.then_some(bytes)
     }
-    pub(crate) fn nested_display_list_from_bytes(
-        &self,
-        recorded: &RecordedDisplayList,
-        content_offset: libgfx_rust::IntPoint,
-    ) -> DisplayListResourceId {
-        // SAFETY: The C++ host copies the recording synchronously.
-        let id = unsafe { (self.nested_display_list_from_bytes)(self.context, recorded.into(), content_offset) };
-        DisplayListResourceId(id)
-    }
     pub(crate) fn svg_image_facts(&self, layout_node_shell: *mut c_void) -> FfiSvgImageFacts {
         // SAFETY: The C++ host answers synchronously from a live layout node shell.
         unsafe { (self.svg_image_facts)(self.context, layout_node_shell) }
@@ -621,29 +608,24 @@ impl FfiPaintHostCallbacks {
         };
         (style, sink)
     }
-    pub(crate) fn materialize_visual_context_tree(
-        &self,
-        tree: &crate::painting::visual_context::VisualContextTree,
-    ) -> *mut c_void {
-        // SAFETY: The C++ host reads the tree synchronously through the exported node accessors.
-        unsafe { (self.materialize_visual_context_tree)(self.context, std::ptr::from_ref(tree).cast()) }
-    }
     pub(crate) fn nested_display_list_from_tree(
         &self,
         recorded: &RecordedDisplayList,
-        tree_handle: *mut c_void,
+        tree: crate::painting::visual_context::VisualContextTree,
         mask_registrations: &[(FrameNodeIndex, DisplayListResourceId)],
     ) -> DisplayListResourceId {
         let pairs: Vec<u64> = mask_registrations
             .iter()
             .flat_map(|(frame, id)| [u64::from(frame.0), id.0])
             .collect();
-        // SAFETY: The C++ host copies the recording and consumes the tree synchronously.
+        let retained_tree = std::rc::Rc::into_raw(std::rc::Rc::new(tree)).cast();
+        // SAFETY: The C++ host copies the recording synchronously and takes ownership of the
+        // retained tree handle.
         let id = unsafe {
             (self.nested_display_list_from_tree)(
                 self.context,
                 recorded.into(),
-                tree_handle,
+                retained_tree,
                 pairs.as_ptr(),
                 mask_registrations.len(),
             )

@@ -12,8 +12,8 @@ pub mod paint;
 pub mod traversal;
 
 use crate::css::css_enums;
-use crate::layout::node_data::NodeKind;
 use crate::layout::node_data::NodeSlotId;
+use crate::layout::node_data::{NodeFlag, NodeKind};
 use crate::layout::used_values;
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::builder::RecordedDisplayList;
@@ -271,7 +271,10 @@ impl<'a> PaintRecorder<'a> {
             return facts;
         };
         let effects = style.effects();
-        let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE && effects.opacity != 0.0;
+        let retains_animated_content =
+            self.layout_arena.node_flags_if_live(paintable) & NodeFlag::HasAnimatedOpacityOrTransform as u32 != 0;
+        let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE
+            && (effects.opacity != 0.0 || retains_animated_content);
         let empty_cells_property_applies = self.display(paintable).is_internal_table()
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
             && crate::painting::paint_order::first_paint_child(self.layout_arena, paintable).is_none();
@@ -354,7 +357,7 @@ impl<'a> PaintRecorder<'a> {
                 .map(|frames| frames.iter().copied().collect())
                 .unwrap_or_default();
         }
-        let Some(tree) = self.paint_state.visual_context.tree.as_ref() else {
+        let Some(tree) = self.paint_state.visual_context.tree.as_deref() else {
             return HashMap::new();
         };
         let (begin, end) = self.data(paintable).local_frame_range();
@@ -395,7 +398,7 @@ impl<'a> PaintRecorder<'a> {
         let tree = self
             .nested_tree
             .as_ref()
-            .or(self.paint_state.visual_context.tree.as_ref())
+            .or(self.paint_state.visual_context.tree.as_deref())
             .expect("recording runs against a visual context tree");
         tree.accumulated_2d_scale(
             spatial,

@@ -5,11 +5,13 @@
  */
 
 #include <AK/ByteBuffer.h>
+#include <AK/Tuple.h>
 #include <LibTest/TestCase.h>
 #include <LibWeb/Compositor/AsyncScrollTree.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/ScrollState.h>
+#include <LibWeb/Painting/VisualContextTreeTestBuilder.h>
 
 static Web::Compositor::AsyncScrollNodeID const viewport_node_id { .document_id = Web::UniqueNodeID { 1 }, .scroll_node_index = Web::Painting::SpatialNodeIndex { 1 } };
 
@@ -32,6 +34,12 @@ static Web::Compositor::AsyncScrollTree make_scroll_tree_with_viewport_scroll_no
     return scroll_tree;
 }
 
+static Web::Painting::AccumulatedVisualContextTree make_visual_context_tree()
+{
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    return builder.finish();
+}
+
 static NonnullRefPtr<Web::Painting::DisplayList> make_empty_display_list(Web::Painting::AccumulatedVisualContextTree const& visual_context_tree)
 {
     return Web::Painting::DisplayList::create_from_command_bytes(visual_context_tree, ByteBuffer {}, {});
@@ -39,7 +47,7 @@ static NonnullRefPtr<Web::Painting::DisplayList> make_empty_display_list(Web::Pa
 
 TEST_CASE(wheel_hit_testing_rejects_a_different_visual_context_tree_version)
 {
-    auto visual_context_tree = Web::Painting::AccumulatedVisualContextTree::create();
+    auto visual_context_tree = make_visual_context_tree();
     Web::Compositor::AsyncScrollingState state;
     state.main_thread_wheel_event_regions.append({
         .context = { Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, Web::Painting::NO_FRAME_NODE },
@@ -53,7 +61,7 @@ TEST_CASE(wheel_hit_testing_rejects_a_different_visual_context_tree_version)
         visual_context_tree, { 20, 20 }, { 0, 10 }, Web::Compositor::SnapContainerHandling::ScrollOnCompositor);
     EXPECT(current_result.blocked_by_main_thread_region);
 
-    auto replacement_tree = Web::Painting::AccumulatedVisualContextTree::create();
+    auto replacement_tree = make_visual_context_tree();
     auto replacement_result = scroll_tree.hit_test_scroll_node_for_wheel(
         replacement_tree, { 20, 20 }, { 0, 10 }, Web::Compositor::SnapContainerHandling::ScrollOnCompositor);
     EXPECT(!replacement_result.blocked_by_main_thread_region);
@@ -61,7 +69,7 @@ TEST_CASE(wheel_hit_testing_rejects_a_different_visual_context_tree_version)
 
 TEST_CASE(wheel_hit_testing_ignores_invalid_visual_context_indices)
 {
-    auto visual_context_tree = Web::Painting::AccumulatedVisualContextTree::create();
+    auto visual_context_tree = make_visual_context_tree();
     Web::Compositor::AsyncScrollingState state;
     state.main_thread_wheel_event_regions.append({
         .context = { Web::Painting::SpatialNodeIndex { 100 }, Web::Painting::NO_FRAME_NODE },
@@ -76,9 +84,62 @@ TEST_CASE(wheel_hit_testing_ignores_invalid_visual_context_indices)
     EXPECT(!result.blocked_by_main_thread_region);
 }
 
+TEST_CASE(wheel_hit_testing_prefilters_static_targets_but_tracks_animated_targets)
+{
+    auto make_tree_and_spatial = [](Gfx::FloatMatrix4x4 const& matrix = Gfx::FloatMatrix4x4::identity(), Optional<u64> version = {}) {
+        Web::Painting::VisualContextTreeTestBuilder builder;
+        auto spatial = builder.append_transform(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX, matrix);
+        return Tuple { version.has_value() ? builder.finish_with_version(*version) : builder.finish(), spatial };
+    };
+    auto make_scroll_tree = [](Web::Painting::AccumulatedVisualContextTree const& visual_context_tree, Web::Painting::SpatialNodeIndex spatial) {
+        Web::Compositor::AsyncScrollingState state;
+        state.main_thread_wheel_event_regions.append({
+            .context = { spatial, Web::Painting::NO_FRAME_NODE },
+            .rect = { 0, 0, 10, 10 },
+        });
+        Web::Compositor::AsyncScrollTree scroll_tree;
+        scroll_tree.set_state(move(state));
+        scroll_tree.rebuild_wheel_hit_test_targets(make_empty_display_list(visual_context_tree), &visual_context_tree, {});
+        return scroll_tree;
+    };
+    auto hit_test = [](Web::Compositor::AsyncScrollTree const& scroll_tree, Web::Painting::AccumulatedVisualContextTree const& visual_context_tree) {
+        return scroll_tree.hit_test_scroll_node_for_wheel(
+            visual_context_tree, { 15, 5 }, { 0, 10 }, Web::Compositor::SnapContainerHandling::ScrollOnCompositor);
+    };
+
+    auto static_tree_and_spatial = make_tree_and_spatial();
+    auto static_spatial = static_tree_and_spatial.get<1>();
+    auto static_tree = move(static_tree_and_spatial.get<0>());
+    auto static_scroll_tree = make_scroll_tree(static_tree, static_spatial);
+    auto moved_matrix = Gfx::FloatMatrix4x4::identity();
+    moved_matrix[0, 3] = 10;
+    auto moved_static_tree = move(make_tree_and_spatial(moved_matrix, static_tree.version()).get<0>());
+    EXPECT(!hit_test(static_scroll_tree, moved_static_tree).blocked_by_main_thread_region);
+
+    auto animated_tree_and_spatial = make_tree_and_spatial();
+    auto animated_spatial = animated_tree_and_spatial.get<1>();
+    auto animated_tree = move(animated_tree_and_spatial.get<0>());
+    animated_tree.set_visual_animations({
+        {
+            .target_kind = Web::Compositor::VisualAnimation::TargetKind::Transform,
+            .visual_context_node_indices = { animated_spatial.value() },
+            .monotonic_time_at_anchor_ns = 0,
+            .iteration_duration_ms = 100,
+            .easing = {},
+            .keyframes = {
+                { 0, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::TranslateX, { 0 } } } },
+                { 1, {}, Web::Compositor::VisualAnimationTransformList { { Web::Compositor::VisualAnimationTransformOperationKind::TranslateX, { 20 } } } },
+            },
+        },
+    });
+    auto animated_scroll_tree = make_scroll_tree(animated_tree, animated_spatial);
+    auto sampled_animated_tree = animated_tree.with_visual_animation_samples(50'000'000);
+    EXPECT(hit_test(animated_scroll_tree, sampled_animated_tree).blocked_by_main_thread_region);
+}
+
 TEST_CASE(blocking_wheel_event_hit_testing_fails_closed_for_invalid_visual_context_indices)
 {
-    auto visual_context_tree = Web::Painting::AccumulatedVisualContextTree::create();
+    auto visual_context_tree = make_visual_context_tree();
     Web::Compositor::AsyncScrollingState state;
     state.has_blocking_wheel_event_listeners = true;
     state.blocking_wheel_event_regions.append({
@@ -92,11 +153,11 @@ TEST_CASE(blocking_wheel_event_hit_testing_fails_closed_for_invalid_visual_conte
 
 TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
 {
-    auto visual_context_tree = Web::Painting::AccumulatedVisualContextTree::create();
-    auto viewport_scroll_node = visual_context_tree.append_spatial(Web::Painting::ScrollData {}, Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
+    Web::Painting::VisualContextTreeTestBuilder builder;
+    auto viewport_scroll_node = builder.append_scroll(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
     // A 50px header 100px down the document, sticking to the top of the scrollport within a 2000px containing block.
-    auto header_node = visual_context_tree.append_spatial(
-        Web::Painting::StickyData {
+    auto header_node = builder.append_sticky(viewport_scroll_node,
+        {
             .scroller = viewport_scroll_node,
             .parent_sticky = {},
             .position_relative_to_scroller = { 0, 100 },
@@ -108,11 +169,10 @@ TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
             .inset_right = {},
             .inset_bottom = {},
             .inset_left = {},
-        },
-        viewport_scroll_node);
+        });
     // A 10px bar inside the header, sticking 20px below the scrollport top within the header's box.
-    auto bar_node = visual_context_tree.append_spatial(
-        Web::Painting::StickyData {
+    auto bar_node = builder.append_sticky(header_node,
+        {
             .scroller = viewport_scroll_node,
             .parent_sticky = header_node,
             .position_relative_to_scroller = { 0, 110 },
@@ -124,8 +184,8 @@ TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
             .inset_right = {},
             .inset_bottom = {},
             .inset_left = {},
-        },
-        header_node);
+        });
+    auto visual_context_tree = builder.finish();
 
     auto scroll_tree = make_scroll_tree_with_viewport_scroll_node(2000);
     Web::Painting::ScrollStateSnapshot snapshot;

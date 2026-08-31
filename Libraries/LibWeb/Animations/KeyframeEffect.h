@@ -18,6 +18,7 @@
 #include <LibWeb/Bindings/KeyframeEffect.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
+#include <LibWeb/Compositor/VisualAnimation.h>
 
 namespace Web::Animations {
 
@@ -148,6 +149,35 @@ public:
     bool can_skip_per_frame_style_update() const;
     void clear_per_frame_style_update_cache() { m_can_skip_per_frame_style_update_cache.clear(); }
     bool can_skip_per_frame_animation_tick() const;
+    bool is_compositor_driven() const { return m_is_compositor_driven; }
+    void set_is_compositor_driven(bool value)
+    {
+        if (m_is_compositor_driven == value)
+            return;
+        m_is_compositor_driven = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    bool is_compositor_replaced() const { return m_is_compositor_replaced; }
+    void set_is_compositor_replaced(bool value)
+    {
+        if (m_is_compositor_replaced == value)
+            return;
+        m_is_compositor_replaced = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    Vector<Compositor::VisualAnimation> const& retained_compositor_animations() const { return m_retained_compositor_animations; }
+    void set_retained_compositor_animations(Vector<Compositor::VisualAnimation> animations) { m_retained_compositor_animations = move(animations); }
+    void clear_retained_compositor_animations() { m_retained_compositor_animations.clear(); }
+    void set_is_offscreen_throttled(bool value)
+    {
+        if (m_is_offscreen_throttled == value)
+            return;
+        m_is_offscreen_throttled = value;
+        m_can_skip_per_frame_style_update_cache.clear();
+    }
+    bool is_offscreen_throttled() const { return m_is_offscreen_throttled; }
+    void set_is_observation_relevant_compositor_animation(bool value) { m_is_observation_relevant_compositor_animation = value; }
+    bool is_observation_relevant_compositor_animation() const { return m_is_observation_relevant_compositor_animation; }
     void request_observation_sample();
     bool request_element_scoped_observation_sample(u64 task_generation)
     {
@@ -162,10 +192,28 @@ public:
     bool per_frame_animation_tick_was_skipped() const { return m_per_frame_animation_tick_was_skipped; }
     void note_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = true; }
     void clear_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = false; }
+    struct CompositorKeyframeValueCache {
+        KeyFrameSet const* key_frame_set { nullptr };
+        u64 target_style_generation { 0 };
+        u64 style_environment_version { 0 };
+        float reference_width { 0 };
+        float reference_height { 0 };
+        float device_pixels_per_css_pixel { 0 };
+        bool is_valid { false };
+        Vector<Optional<Compositor::VisualAnimationValue>> values;
+    };
+    Optional<CompositorKeyframeValueCache>& compositor_keyframe_value_cache(Compositor::VisualAnimation::TargetKind target_kind)
+    {
+        return target_kind == Compositor::VisualAnimation::TargetKind::Opacity
+            ? m_compositor_opacity_keyframe_value_cache
+            : m_compositor_transform_keyframe_value_cache;
+    }
     virtual void update_computed_properties(AnimationUpdateContext&) override;
     void update_computed_properties_for_style(AnimationUpdateContext&, DOM::AbstractElement);
 
 private:
+    friend class Animation;
+
     KeyframeEffect();
     virtual ~KeyframeEffect() override = default;
 
@@ -189,6 +237,13 @@ private:
     Vector<GC::Ref<JS::Object>> m_keyframe_objects_cache {};
 
     RefPtr<KeyFrameSet const> m_key_frame_set {};
+    Optional<CompositorKeyframeValueCache> m_compositor_opacity_keyframe_value_cache;
+    Optional<CompositorKeyframeValueCache> m_compositor_transform_keyframe_value_cache;
+    Vector<Compositor::VisualAnimation> m_retained_compositor_animations;
+    bool m_is_compositor_driven { false };
+    bool m_is_compositor_replaced { false };
+    bool m_is_offscreen_throttled { false };
+    bool m_is_observation_relevant_compositor_animation { false };
     bool m_needs_observation_sample { false };
     struct CanSkipPerFrameStyleUpdateCache {
         u64 target_style_generation { 0 };

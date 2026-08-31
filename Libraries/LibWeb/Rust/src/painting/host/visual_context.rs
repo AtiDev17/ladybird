@@ -9,11 +9,7 @@ use super::*;
 use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
 use crate::painting::display_list::commands::OptionalF32;
-use crate::painting::visual_context::{ClipMode, MaskLayerOrigin, TransformDataRole};
-use libgfx_rust::{
-    CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, MaskKind,
-    WindingRule,
-};
+use libgfx_rust::{FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, MaskKind};
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -110,57 +106,40 @@ impl FfiVisualContextHostCallbacks {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiVisualContextNodeKind {
-    Scroll,
-    Clip,
-    Transform,
-    Perspective,
-    BackfaceVisibility,
-    ClipPath,
-    Effects,
-    AnchorScrollShift,
-    Mask,
-    Sticky,
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiVisualViewportTransform {
+    pub matrix: FloatMatrix4x4,
+    pub origin: FloatPoint,
 }
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiVisualContextNodeExport {
-    pub kind: FfiVisualContextNodeKind,
-    pub parent: u32,
+pub struct FfiFrameOpacitySample {
+    pub frame: u32,
+    pub opacity: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiSpatialTransformSample {
     pub spatial: u32,
     pub matrix: FloatMatrix4x4,
-    pub origin: FloatPoint,
-    pub flattens_inherited_transform: bool,
-    pub transform_role: TransformDataRole,
-    pub has_sorting_context_root: bool,
-    pub synthetic_plane: bool,
-    pub rect: IntRect,
-    pub corner_radii: CornerRadii,
-    pub clip_rect: FloatRect,
-    pub clip_mode: ClipMode,
-    pub opacity: f32,
-    pub blend_mode: CompositingAndBlendingOperator,
-    pub filter_bytes: *const u8,
-    pub filter_bytes_length: usize,
-    pub path: *mut c_void,
-    pub winding_rule: WindingRule,
-    pub mask_kind: MaskKind,
-    pub mask_origin: MaskLayerOrigin,
-    pub index_value: u32,
-    pub sticky_parent_sticky_index: u32,
-    pub sticky_position_relative_to_scroller: FloatPoint,
-    pub sticky_border_box_size: FloatSize,
-    pub sticky_scrollport_size: FloatSize,
-    pub sticky_containing_block_region: FloatRect,
-    pub sticky_needs_parent_offset_adjustment: bool,
-    pub sticky_inset_top: OptionalF32,
-    pub sticky_inset_right: OptionalF32,
-    pub sticky_inset_bottom: OptionalF32,
-    pub sticky_inset_left: OptionalF32,
-    pub negate: bool,
-    pub compensate_horizontal_scroll: bool,
-    pub compensate_vertical_scroll: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiTestStickyConstraints {
+    pub scroller: u32,
+    pub has_parent_sticky: bool,
+    pub parent_sticky: u32,
+    pub position_relative_to_scroller: FloatPoint,
+    pub border_box_size: FloatSize,
+    pub scrollport_size: FloatSize,
+    pub containing_block_region: FloatRect,
+    pub needs_parent_offset_adjustment: bool,
+    pub inset_top: OptionalF32,
+    pub inset_right: OptionalF32,
+    pub inset_bottom: OptionalF32,
+    pub inset_left: OptionalF32,
 }

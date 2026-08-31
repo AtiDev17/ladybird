@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    @keyframes reveal-opacity {
+        0%, 50% { opacity: 0; }
+        100% { opacity: 1; }
+    }
+
+    @keyframes reveal-transform {
+        0%, 50% { transform: scale(0); }
+        100% { transform: scale(1); }
+    }
+
+    #opacity {
+        background: rgb(21, 22, 23);
+        animation: reveal-opacity 100s linear;
+    }
+
+    #transform {
+        background: rgb(24, 25, 26);
+        animation: reveal-transform 100s linear;
+    }
+</style>
+<div id="opacity">opacity</div>
+<div id="transform">transform</div>
+<script>
+    asyncTest(async done => {
+        const animations = document.getAnimations();
+        animations.forEach(animation => animation.currentTime = 0);
+
+        for (let i = 0; i < 4; ++i)
+            await new Promise(requestAnimationFrame);
+
+        println(`culled animations move immediately to compositor: ${internals.getStyleInvalidationCounters().compositorVisualAnimations}`);
+        const displayList = internals.dumpDisplayList();
+        println(`opacity-zero animation content is retained: ${displayList.includes("rgb(21, 22, 23)")}`);
+        println(`singular-transform animation content is retained: ${displayList.includes("rgb(24, 25, 26)")}`);
+
+        internals.resetStyleInvalidationCounters();
+        for (let i = 0; i < 4; ++i)
+            await new Promise(requestAnimationFrame);
+
+        println(`culled compositor animations build no overlays: ${internals.getStyleInvalidationCounters().animatedStyleOverlayBuilds === 0}`);
+        done();
+    });
+</script>

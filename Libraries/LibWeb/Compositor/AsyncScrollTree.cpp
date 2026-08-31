@@ -203,8 +203,22 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
     m_visual_context_tree_version = visual_context_tree->version();
 
     auto context_is_valid = [&](Painting::ContextRef context) {
-        return context.spatial.value() < visual_context_tree->spatial_nodes().size()
-            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree->frame_nodes().size());
+        return context.spatial.value() < visual_context_tree->spatial_node_count()
+            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree->frame_node_count());
+    };
+
+    Vector<Painting::SpatialNodeIndex> animated_spatial_nodes;
+    for (auto const& animation : visual_context_tree->visual_animations()) {
+        if (animation.target_kind != VisualAnimation::TargetKind::Transform)
+            continue;
+        for (auto node_index : animation.visual_context_node_indices)
+            animated_spatial_nodes.append(Painting::SpatialNodeIndex { node_index });
+    }
+    auto spatial_context_has_visual_animation = visual_context_tree->spatial_nodes_in_subtrees_of(animated_spatial_nodes);
+    auto viewport_rect_for_context = [&](Painting::ContextRef context, Gfx::FloatRect const& rect) -> Optional<Gfx::FloatRect> {
+        if (spatial_context_has_visual_animation[context.spatial.value()])
+            return {};
+        return visual_context_tree->transform_rect_to_viewport(context.spatial, rect, scroll_state_snapshot);
     };
 
     m_cached_wheel_hit_test_targets.ensure_capacity(m_wheel_hit_test_regions.size());
@@ -216,7 +230,7 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
             .context = target.context,
             .rect = target.rect,
             .corner_radii = target.corner_radii,
-            .viewport_rect = visual_context_tree->transform_rect_to_viewport(target.context.spatial, target.rect, scroll_state_snapshot),
+            .viewport_rect = viewport_rect_for_context(target.context, target.rect),
         });
     }
 
@@ -227,7 +241,7 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
         m_cached_main_thread_wheel_event_targets.append({
             .context = region.context,
             .rect = region.rect,
-            .viewport_rect = visual_context_tree->transform_rect_to_viewport(region.context.spatial, region.rect, scroll_state_snapshot),
+            .viewport_rect = viewport_rect_for_context(region.context, region.rect),
         });
     }
 
@@ -237,7 +251,7 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
         m_cached_blocking_wheel_event_targets.append({
             .context = region.context,
             .rect = region.rect,
-            .viewport_rect = visual_context_tree->transform_rect_to_viewport(region.context.spatial, region.rect, scroll_state_snapshot),
+            .viewport_rect = viewport_rect_for_context(region.context, region.rect),
         });
     }
 }
@@ -304,17 +318,16 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::Acc
         return {};
 
     auto context_is_valid = [&](Painting::ContextRef context) {
-        return context.spatial.value() < visual_context_tree.spatial_nodes().size()
-            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree.frame_nodes().size());
+        return context.spatial.value() < visual_context_tree.spatial_node_count()
+            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree.frame_node_count());
     };
 
     if (m_has_blocking_wheel_event_region_covering_viewport)
         return { {}, false, true };
 
     for (auto const& target : m_cached_main_thread_wheel_event_targets) {
-        if (!target.viewport_rect.contains(position))
+        if (target.viewport_rect.has_value() && !target.viewport_rect->contains(position))
             continue;
-
         if (!context_is_valid(target.context))
             continue;
         auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
@@ -323,9 +336,8 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::Acc
     }
 
     for (auto const& target : m_cached_blocking_wheel_event_targets) {
-        if (!target.viewport_rect.contains(position))
+        if (target.viewport_rect.has_value() && !target.viewport_rect->contains(position))
             continue;
-
         if (!context_is_valid(target.context))
             continue;
         auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
@@ -334,9 +346,8 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::Acc
     }
 
     for (auto const& target : m_cached_wheel_hit_test_targets.in_reverse()) {
-        if (!target.viewport_rect.contains(position))
+        if (target.viewport_rect.has_value() && !target.viewport_rect->contains(position))
             continue;
-
         if (!context_is_valid(target.context))
             continue;
         auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);

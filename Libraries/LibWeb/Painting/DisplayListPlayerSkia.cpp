@@ -11,7 +11,6 @@
 #include <core/SkCanvas.h>
 #include <core/SkColorFilter.h>
 #include <core/SkColorSpace.h>
-#include <core/SkFont.h>
 #include <core/SkMaskFilter.h>
 #include <core/SkPath.h>
 #include <core/SkPathEffect.h>
@@ -32,7 +31,6 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/Font/Font.h>
 #include <LibGfx/PainterSkia.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibGfx/SkiaUtils.h>
@@ -190,23 +188,11 @@ void DisplayListPlayerSkia::paint_scrollbar(Gfx::PaintingSurface& surface, Paint
 
 void DisplayListPlayerSkia::play_command(DrawGlyphRun const& command)
 {
-    auto const& font = resource_storage().font(command.font_id);
     auto glyphs = inline_objects<DisplayListGlyph>(command.glyphs);
     if (glyphs.is_empty())
         return;
 
-    auto sk_font = font.skia_font(command.scale);
-    SkTextBlobBuilder builder;
-    auto const& run = builder.allocRunPos(sk_font, glyphs.size());
-
-    auto font_ascent = font.pixel_metrics().ascent;
-    for (size_t i = 0; i < glyphs.size(); ++i) {
-        run.glyphs[i] = glyphs[i].glyph_id;
-        run.pos[i * 2] = glyphs[i].position.x() * command.scale;
-        run.pos[i * 2 + 1] = (glyphs[i].position.y() + font_ascent) * command.scale;
-    }
-
-    auto blob = builder.make();
+    auto blob = resource_storage().text_blob(command.font_id, command.scale, glyphs);
     if (!blob)
         return;
 
@@ -1117,7 +1103,7 @@ void DisplayListPlayerSkia::play_command(PaintScrollBar const& command)
     paint_scrollbar_into_surface(surface(), command);
 }
 
-void DisplayListPlayerSkia::push_clip(ClipData const& clip)
+void DisplayListPlayerSkia::push_clip(ReplayClip const& clip)
 {
     auto& canvas = surface().canvas();
     canvas.save();
@@ -1130,32 +1116,32 @@ void DisplayListPlayerSkia::push_clip_path(Gfx::Path const& path, Gfx::WindingRu
     clip_path(path, winding_rule, true);
 }
 
-void DisplayListPlayerSkia::push_layer(EffectsData const& effects)
+void DisplayListPlayerSkia::push_layer(ReplayLayer const& layer)
 {
     auto& canvas = surface().canvas();
     SkPaint paint;
 
-    if (effects.opacity < 1.0f)
-        paint.setAlphaf(effects.opacity);
+    if (layer.opacity < 1.0f)
+        paint.setAlphaf(layer.opacity);
 
-    if (effects.blend_mode != Gfx::CompositingAndBlendingOperator::Normal)
-        paint.setBlender(Gfx::to_skia_blender(effects.blend_mode));
+    if (layer.blend_mode != Gfx::CompositingAndBlendingOperator::Normal)
+        paint.setBlender(Gfx::to_skia_blender(layer.blend_mode));
 
-    if (effects.gfx_filter.has_value())
-        paint.setImageFilter(to_skia_image_filter(*effects.gfx_filter));
+    if (layer.filter_bytes_size)
+        paint.setImageFilter(to_skia_image_filter(layer_filter(layer)));
 
     canvas.saveLayer(nullptr, &paint);
 }
 
-void DisplayListPlayerSkia::push_mask(MaskData const& mask)
+void DisplayListPlayerSkia::push_mask(ReplayMask const& mask)
 {
     auto& canvas = surface().canvas();
     canvas.save();
-    canvas.clipRect(to_skia_rect(mask.rect.to_type<int>().to_type<float>()), true);
+    canvas.clipRect(to_skia_rect(mask.rect.to_type<float>()), true);
     canvas.saveLayer(nullptr, nullptr);
 }
 
-void DisplayListPlayerSkia::pop_mask(MaskData const& mask, Optional<DisplayListResourceId> mask_content)
+void DisplayListPlayerSkia::pop_mask(ReplayMask const& mask, Optional<DisplayListResourceId> mask_content)
 {
     auto& canvas = surface().canvas();
     SkPaint paint;
@@ -1164,11 +1150,10 @@ void DisplayListPlayerSkia::pop_mask(MaskData const& mask, Optional<DisplayListR
         paint.setColorFilter(SkLumaColorFilter::Make());
     canvas.saveLayer(nullptr, &paint);
     if (mask_content.has_value()) {
-        auto mask_rect = mask.rect.to_type<int>();
         play_command(PaintNestedDisplayList {
             .display_list_id = *mask_content,
-            .rect = mask_rect.to_type<float>(),
-            .list_size = mask_rect.size(),
+            .rect = mask.rect.to_type<float>(),
+            .list_size = mask.rect.size(),
         });
     }
     canvas.restore();
