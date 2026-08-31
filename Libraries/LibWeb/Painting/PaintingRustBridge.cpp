@@ -495,10 +495,10 @@ static void* layout_arena_handle(DOM::Document const& document)
     return const_cast<DOM::Document&>(document).layout_node_arena().handle();
 }
 
-VisualContextTreeUpdateResult rust_update_accumulated_visual_contexts(DOM::Document& document, bool force_full_rebuild)
+VisualContextTreeUpdateResult rust_update_accumulated_visual_contexts(DOM::Document& document)
 {
     auto update_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-    auto outcome = Layout::RustFFI::layout_arena_update_accumulated_visual_contexts(layout_arena_handle(document), viewport_row_slot(document), visual_context_host_callbacks(document), force_full_rebuild);
+    auto outcome = Layout::RustFFI::layout_arena_update_accumulated_visual_contexts(layout_arena_handle(document), viewport_row_slot(document), visual_context_host_callbacks(document));
     if (rust_painting_timing_enabled())
         dbgln("AVC_UPDATE rust={} µs {}", update_timer.elapsed_time().to_microseconds(), outcome.performed_full_build ? "full"sv : "incremental"sv);
     return {
@@ -506,6 +506,19 @@ VisualContextTreeUpdateResult rust_update_accumulated_visual_contexts(DOM::Docum
         .structural_epoch_changed = outcome.structural_epoch_changed,
         .requires_display_list_recording = outcome.requires_display_list_recording,
     };
+}
+
+Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const& layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList list)
+{
+    Vector<u32> indices;
+    if (!has_committed_box(layout_node))
+        return indices;
+    auto* arena = layout_node.arena_handle();
+    auto slot = committed_row_slot(layout_node);
+    indices.resize(Layout::RustFFI::layout_arena_paintable_visual_context_node_count(arena, slot, list));
+    if (!indices.is_empty())
+        Layout::RustFFI::layout_arena_paintable_visual_context_copy_node_indices(arena, slot, list, indices.data(), indices.size());
+    return indices;
 }
 
 void const* retain_rust_main_visual_context_tree(DOM::Document const& document)

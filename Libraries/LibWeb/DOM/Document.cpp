@@ -7789,7 +7789,7 @@ static bool transform_keyframes_only_translate_horizontally(ReadonlySpan<Composi
 
 static bool keyframe_effect_only_translates_horizontally(Animations::KeyframeEffect& effect, DOM::AbstractElement target, Layout::Node const& layout_node, float device_pixels_per_css_pixel)
 {
-    if (effect.target_properties().size() != 1 || !effect.target_properties().contains(CSS::PropertyID::Transform))
+    if (effect.target_properties().size() != 1 || !effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform)))
         return false;
     auto const* key_frame_set = effect.key_frame_set();
     if (!key_frame_set)
@@ -7797,7 +7797,7 @@ static bool keyframe_effect_only_translates_horizontally(Animations::KeyframeEff
 
     Vector<Compositor::VisualAnimationKeyframe> keyframes;
     for (auto const& entry : key_frame_set->keyframes_by_key) {
-        auto property = entry.properties.get(CSS::PropertyID::Transform);
+        auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform));
         if (!property.has_value())
             continue;
         if (!property->has<CSS::RustStyleValueHandle>())
@@ -7815,19 +7815,6 @@ static bool keyframe_effect_only_translates_horizontally(Animations::KeyframeEff
         });
     }
     return transform_keyframes_only_translate_horizontally(keyframes);
-}
-
-static Vector<u32> owned_visual_context_node_indices(Layout::Node const& layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList list)
-{
-    Vector<u32> indices;
-    if (!Painting::has_committed_box(layout_node))
-        return indices;
-    auto* arena = layout_node.arena_handle();
-    auto slot = Painting::committed_row_slot(layout_node);
-    indices.resize(Layout::RustFFI::layout_arena_paintable_visual_context_node_count(arena, slot, list));
-    if (!indices.is_empty())
-        Layout::RustFFI::layout_arena_paintable_visual_context_copy_node_indices(arena, slot, list, indices.data(), indices.size());
-    return indices;
 }
 
 static Optional<Compositor::VisualAnimation> build_compositor_animation(Animations::KeyframeEffect& effect, Painting::AccumulatedVisualContextTree const& visual_context_tree, Compositor::VisualAnimation::TargetKind target_kind, Optional<bool>& only_translates_horizontally)
@@ -7852,11 +7839,11 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     if (effect.target_properties().is_empty())
         return {};
 
-    bool targets_opacity = target_kind == Compositor::VisualAnimation::TargetKind::Opacity && effect.target_properties().contains(CSS::PropertyID::Opacity);
-    bool targets_transform = target_kind == Compositor::VisualAnimation::TargetKind::Transform && any_of(effect.target_properties(), is_transform_family_property);
+    bool targets_opacity = target_kind == Compositor::VisualAnimation::TargetKind::Opacity && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
+    bool targets_transform = target_kind == Compositor::VisualAnimation::TargetKind::Transform && any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
     if (!targets_opacity && !targets_transform)
         return {};
-    if (any_of(effect.target_properties(), [&](auto property_id) { return property_id != CSS::PropertyID::Opacity && !is_transform_family_property(property_id); }))
+    if (any_of(effect.target_properties(), [&](auto const& property) { return property.id() != CSS::PropertyID::Opacity && !is_transform_family_property(property.id()); }))
         return {};
     auto target = effect.target_abstract_element();
     if (!target.has_value() || target->element().namespace_uri() == Namespace::SVG)
@@ -7869,10 +7856,10 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     if (!layout_node)
         return {};
     if (targets_transform) {
-        if ((!effect.target_properties().contains(CSS::PropertyID::Translate) && layout_node->has_translate())
-            || (!effect.target_properties().contains(CSS::PropertyID::Rotate) && layout_node->has_rotate())
-            || (!effect.target_properties().contains(CSS::PropertyID::Scale) && layout_node->has_scale())
-            || (!effect.target_properties().contains(CSS::PropertyID::Transform) && layout_node->has_transformations())
+        if ((!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Translate)) && layout_node->has_translate())
+            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Rotate)) && layout_node->has_rotate())
+            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Scale)) && layout_node->has_scale())
+            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform)) && layout_node->has_transformations())
             || layout_node->transform_origin().z.to_px(CSSPixels { 0 }) != CSSPixels { 0 })
             return {};
     }
@@ -7912,14 +7899,14 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         };
         new_cache.values.ensure_capacity(key_frame_set->keyframes_by_key.size());
         size_t transform_property_count = 0;
-        for (auto property_id : effect.target_properties()) {
-            if (is_transform_family_property(property_id))
+        for (auto const& property : effect.target_properties()) {
+            if (is_transform_family_property(property.id()))
                 ++transform_property_count;
         }
         for (auto const& entry : key_frame_set->keyframes_by_key) {
             Optional<Compositor::VisualAnimationValue> value;
             if (target_kind == Compositor::VisualAnimation::TargetKind::Opacity) {
-                auto property = entry.properties.get(CSS::PropertyID::Opacity);
+                auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
                 if (!property.has_value() || !property->has<CSS::RustStyleValueHandle>()) {
                     new_cache.values.append({});
                     continue;
@@ -7934,9 +7921,9 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                 Compositor::VisualAnimationTransformList operations;
                 bool skip_keyframe = false;
                 for (auto property_id : { CSS::PropertyID::Translate, CSS::PropertyID::Rotate, CSS::PropertyID::Scale, CSS::PropertyID::Transform }) {
-                    if (!effect.target_properties().contains(property_id))
+                    if (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(property_id)))
                         continue;
-                    auto property = entry.properties.get(property_id);
+                    auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(property_id));
                     if (!property.has_value() || !property->has<CSS::RustStyleValueHandle>()) {
                         if (transform_property_count == 1) {
                             skip_keyframe = true;
@@ -7977,12 +7964,12 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
     auto build_animation_for_target = [&](Compositor::VisualAnimation::TargetKind target_kind) -> Optional<Compositor::VisualAnimation> {
         Vector<u32> visual_context_node_indices;
         if (target_kind == Compositor::VisualAnimation::TargetKind::Opacity) {
-            for (auto index : owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes)) {
+            for (auto index : Painting::rust_owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes)) {
                 if (visual_context_tree.frame_is_effects(Painting::FrameNodeIndex { index }))
                     visual_context_node_indices.append(index);
             }
         } else {
-            for (auto index : owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes)) {
+            for (auto index : Painting::rust_owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes)) {
                 if (visual_context_tree.spatial_node_is_css_transform(Painting::SpatialNodeIndex { index }))
                     visual_context_node_indices.append(index);
             }
@@ -8035,7 +8022,7 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
 
         if (target_kind == Compositor::VisualAnimation::TargetKind::Transform) {
             only_translates_horizontally = effect.target_properties().size() == 1
-                && effect.target_properties().contains(CSS::PropertyID::Transform)
+                && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform))
                 && transform_keyframes_only_translate_horizontally(keyframes);
         }
 
@@ -8195,16 +8182,16 @@ void Document::update_compositor_animations()
 
     auto animated_transform_preserves_axes = [&](Animations::KeyframeEffect& effect, Element& target, Layout::Node const& layout_node) {
         return animated_transform_preserves_axes_cache.ensure(effect, [&] {
-            if (effect.target_properties().contains(CSS::PropertyID::Rotate))
+            if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Rotate)))
                 return false;
-            if (!effect.target_properties().contains(CSS::PropertyID::Transform))
+            if (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform)))
                 return true;
             auto const* key_frame_set = effect.key_frame_set();
             if (!key_frame_set)
                 return false;
             auto device_pixels_per_css_pixel = static_cast<float>(page().client().device_pixels_per_css_pixel());
             for (auto const& entry : key_frame_set->keyframes_by_key) {
-                auto property = entry.properties.get(CSS::PropertyID::Transform);
+                auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform));
                 if (!property.has_value())
                     continue;
                 if (!property->has<CSS::RustStyleValueHandle>())
@@ -8299,7 +8286,7 @@ void Document::update_compositor_animations()
             if (!effect_target || !animated_target.is_shadow_including_inclusive_ancestor_of(*effect_target)
                 || !effect_target->is_shadow_including_inclusive_ancestor_of(observation_target))
                 continue;
-            if (any_of(effect.target_properties(), is_transform_family_property))
+            if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); }))
                 return true;
         }
         return false;
@@ -8374,9 +8361,9 @@ void Document::update_compositor_animations()
             if (!property_effects.winner || Animations::KeyframeEffect::composite_order(*property_effects.winner, effect) < 0)
                 property_effects.winner = effect;
         };
-        if (effect.target_properties().contains(CSS::PropertyID::Opacity))
+        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity)))
             add_competing_effect(effects.opacity);
-        if (any_of(effect.target_properties(), is_transform_family_property)) {
+        if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); })) {
             add_competing_effect(effects.transform);
             in_effect_transform_effects_by_target.ensure(&target->element()).append(effect);
         }
@@ -8443,9 +8430,9 @@ void Document::update_compositor_animations()
             continue;
         auto& target = abstract_target->element();
 
-        bool targets_opacity = effect.target_properties().contains(CSS::PropertyID::Opacity);
-        bool targets_transform = any_of(effect.target_properties(), is_transform_family_property);
-        bool targets_unsupported_property = any_of(effect.target_properties(), [&](auto property_id) { return property_id != CSS::PropertyID::Opacity && !is_transform_family_property(property_id); });
+        bool targets_opacity = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
+        bool targets_transform = any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
+        bool targets_unsupported_property = any_of(effect.target_properties(), [&](auto const& property) { return property.id() != CSS::PropertyID::Opacity && !is_transform_family_property(property.id()); });
         if (targets_unsupported_property)
             continue;
         auto target_effects = competing_effects.get(*abstract_target);
@@ -8757,7 +8744,7 @@ void Document::remove_replaced_animations()
     });
 
     // Lower value = higher priority
-    HashMap<CSS::PropertyID, size_t> highest_property_composite_orders;
+    HashMap<CSS::PropertyNameAndID, size_t> highest_property_composite_orders;
     for (int i = replaceable_animations.size() - 1; i >= 0; i--) {
         auto animation = replaceable_animations[i];
         bool has_any_highest_priority_property = false;
@@ -11023,9 +11010,9 @@ Utf16String Document::dump_display_list()
     spatial_node_owners.set(Painting::VISUAL_VIEWPORT_NODE_INDEX, m_layout_root.ptr());
     spatial_node_owners.set(Painting::own_scroll_node_index(*m_layout_root), m_layout_root.ptr());
     m_layout_root->for_each_in_inclusive_subtree([&](Layout::Node const& layout_node) {
-        for (auto spatial : owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes))
+        for (auto spatial : Painting::rust_owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes))
             spatial_node_owners.set(Painting::SpatialNodeIndex { spatial }, &layout_node);
-        for (auto frame : owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes))
+        for (auto frame : Painting::rust_owned_visual_context_node_indices(layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::FrameNodes))
             frame_node_owners.set(Painting::FrameNodeIndex { frame }, &layout_node);
         return TraversalDecision::Continue;
     });

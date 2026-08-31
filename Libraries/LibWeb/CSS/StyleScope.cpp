@@ -391,7 +391,7 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                 .base_url = base_url.has_value() ? base_url->to_string() : String {},
                 .origin_clean = sheet.is_origin_clean(),
             };
-            HashTable<PropertyID> animated_properties;
+            HashTable<PropertyNameAndID> animated_properties;
 
             // Forwards pass, resolve all the user-specified keyframe properties.
             for (auto const& keyframe_rule : *rule.css_rules()) {
@@ -435,20 +435,29 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                         to_underlying(it.property_id), it.value->rust_style_value_data());
                     for (size_t i = 0; i < expansion.count; ++i) {
                         auto const& property = expansion.properties[i];
-                        auto longhand_property_id = static_cast<PropertyID>(property.property_id);
-                        animated_properties.set(longhand_property_id);
-                        resolved_keyframe.properties.set(longhand_property_id,
+                        auto longhand_property = PropertyNameAndID::from_id(static_cast<PropertyID>(property.property_id));
+                        animated_properties.set(longhand_property);
+                        resolved_keyframe.properties.set(longhand_property,
                             RustStyleValueHandle::retained(static_cast<StyleValueFFI::StyleValueData const*>(property.data)));
                     }
                     ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
+                }
+
+                for (auto const& [name, style_property] : keyframe_style.custom_properties()) {
+                    auto property = PropertyNameAndID::from_name(name);
+                    if (!property.has_value())
+                        continue;
+                    animated_properties.set(*property);
+                    resolved_keyframe.properties.set(*property,
+                        RustStyleValueHandle::retained(style_property.value->rust_style_value_data()));
                 }
 
                 for (auto const& key : keyframe.keys()) {
                     auto resolved_key = static_cast<u64>(key.value() * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
 
                     if (auto* existing_keyframe = keyframe_set->keyframes_by_key.find(resolved_key)) {
-                        for (auto& [property_id, value] : resolved_keyframe.properties)
-                            existing_keyframe->properties.set(property_id, value);
+                        for (auto& [property, value] : resolved_keyframe.properties)
+                            existing_keyframe->properties.set(property, value);
                         if (resolved_keyframe.composite != Bindings::CompositeOperationOrAuto::Auto)
                             existing_keyframe->composite = resolved_keyframe.composite;
                         if (!resolved_keyframe.easing.has<Empty>())

@@ -984,62 +984,86 @@ pub unsafe extern "C" fn layout_arena_build_stacking_context_tree(arena: *mut c_
 
 use crate::painting::host::FfiVisualContextHostCallbacks;
 
-fn full_visual_context_build(
+fn apply_walk_assignments(
+    arena: &mut crate::layout::LayoutNodeArena,
+    viewport: NodeSlotId,
+    outcome: &mut crate::painting::visual_context::incremental::IncrementalUpdateOutcome,
+    state: &mut crate::painting::visual_context::VisualContextState,
+) {
+    {
+        let mut paintable_rows = arena.paintable_rows_mut();
+        for assignment in std::mem::take(&mut outcome.assignments) {
+            assignment.apply(&mut paintable_rows);
+        }
+    }
+    if outcome.mask_node_owners_changed {
+        state.paintables_with_mask_nodes = paintables_with_mask_nodes_in_paint_order(arena, viewport);
+    }
+}
+
+fn fresh_visual_context_tree_build(
     arena: *mut c_void,
     viewport: NodeSlotId,
     callbacks: &FfiVisualContextHostCallbacks,
+    inputs: crate::painting::host::FfiVisualContextTreeInputs,
+    root_background_source: crate::painting::host::FfiRootBackgroundSource,
     state: &mut crate::painting::visual_context::VisualContextState,
-    force_incompatible_rebuild: bool,
 ) -> crate::painting::host::FfiVisualContextUpdateOutcome {
-    let (mut tree, scroll_state, paintables_with_mask_nodes, previous_assignments, assignments) = {
+    use crate::painting::visual_context::dirty::VisualContextUpdateScope;
+    use crate::painting::visual_context::incremental::{
+        IncrementalUpdateResult, debug_assert_every_live_node_is_owned, update_visual_context_tree,
+    };
+    let fresh_tree = {
         let arena = unsafe { arena_from_handle(arena) };
         let paintable_rows = arena.paintable_rows();
-        let previous_assignments = paintable_rows.visual_context_assignments();
-        let (tree, scroll_state, paintables_with_mask_nodes, assignments) =
-            crate::painting::visual_context::build::build_visual_context_tree(&paintable_rows, callbacks, viewport);
-        (
-            tree,
-            scroll_state,
-            paintables_with_mask_nodes,
-            previous_assignments,
-            assignments,
+        crate::painting::visual_context::build::create_fresh_tree_with_viewport_nodes(
+            &paintable_rows,
+            viewport,
+            &inputs,
         )
     };
-    let arena = unsafe { arena_from_handle_mut(arena) };
-    let assignments_changed = {
+    {
+        let arena = unsafe { arena_from_handle_mut(arena) };
         let mut paintable_rows = arena.paintable_rows_mut();
-        for assignment in assignments {
-            assignment.apply(&mut paintable_rows);
-        }
-        previous_assignments != paintable_rows.visual_context_assignments()
-    };
-    state.build_count += 1;
-    let is_compatible = !force_incompatible_rebuild
-        && state
-            .tree
-            .as_deref()
-            .is_some_and(|previous| tree.is_compatible_with(previous));
-    if is_compatible {
-        tree.structural_epoch = state.structural_epoch();
-    } else {
-        arena.mark_all_paint_caches_dirty();
+        paintable_rows.drop_all_visual_context_records();
+        fresh_tree.viewport_assignment.apply(&mut paintable_rows);
     }
-    let structural_epoch = tree.structural_epoch;
-    state.tree = Some(Rc::new(tree));
-    state.paintables_with_mask_nodes = paintables_with_mask_nodes;
-    state.scroll_state = scroll_state;
-    state.scroll_state_snapshot.clear();
-    state.needs_to_refresh_scroll_state = true;
+    state.tree = Some(Rc::new(fresh_tree.tree));
     state.dirty_boxes.clear();
+    state.build_count += 1;
+    let mut outcome = {
+        let arena = unsafe { arena_from_handle(arena) };
+        let paintable_rows = arena.paintable_rows();
+        match update_visual_context_tree(
+            &paintable_rows,
+            callbacks,
+            viewport,
+            inputs,
+            root_background_source,
+            VisualContextUpdateScope::FreshTree,
+            state,
+        ) {
+            IncrementalUpdateResult::Applied(outcome) => outcome,
+            IncrementalUpdateResult::NeedsFullBuild(_) => {
+                unreachable!("a fresh tree walk has a tree and a viewport record")
+            }
+        }
+    };
+    let arena = unsafe { arena_from_handle_mut(arena) };
+    outcome.mask_node_owners_changed = true;
+    apply_walk_assignments(arena, viewport, &mut outcome, state);
+    arena.mark_all_paint_caches_dirty();
     state.quarantined_slots_are_releasable = false;
-    if assignments_changed {
-        arena.mark_all_descendant_subtree_caches_dirty();
-    }
+    debug_assert_every_live_node_is_owned(
+        &arena.paintable_rows(),
+        state.tree.as_deref().expect("a fresh tree walk keeps the tree"),
+        viewport,
+    );
     crate::painting::host::FfiVisualContextUpdateOutcome {
         performed_full_build: true,
-        structural_epoch_changed: !is_compatible,
-        requires_display_list_recording: !is_compatible,
-        structural_epoch,
+        structural_epoch_changed: true,
+        requires_display_list_recording: true,
+        structural_epoch: state.structural_epoch(),
     }
 }
 
@@ -1068,12 +1092,13 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
     arena: *mut c_void,
     viewport: NodeSlotId,
     callbacks: FfiVisualContextHostCallbacks,
-    force_full_rebuild: bool,
 ) -> crate::painting::host::FfiVisualContextUpdateOutcome {
     abort_on_panic(|| {
-        use crate::painting::visual_context::dirty::{VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason};
+        use crate::painting::visual_context::dirty::{
+            VisualContextBoxDirtyKind, VisualContextGlobalRebuildReason, VisualContextUpdateScope,
+        };
         use crate::painting::visual_context::incremental::{
-            IncrementalUpdateResult, update_visual_context_tree_incrementally,
+            IncrementalUpdateResult, debug_assert_every_live_node_is_owned, update_visual_context_tree,
         };
         let arena_ref = unsafe { arena_from_handle(arena) };
         if !arena_ref.paintable_row_is_populated(viewport) {
@@ -1087,9 +1112,6 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
         let mut reason = state.dirty_boxes.global_reason;
         if state.tree.is_none() {
             reason = reason.max(VisualContextGlobalRebuildReason::FirstBuild);
-        }
-        if force_full_rebuild {
-            reason = reason.max(VisualContextGlobalRebuildReason::ForcedForTesting);
         }
         if state.last_tree_inputs.is_some_and(|last| {
             last.device_pixels_per_css_pixel != inputs.device_pixels_per_css_pixel
@@ -1129,52 +1151,66 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
             }
         }
 
-        if reason == VisualContextGlobalRebuildReason::None {
+        loop {
+            let scope = VisualContextUpdateScope::for_reason(reason);
+            if scope == VisualContextUpdateScope::FreshTree {
+                break;
+            }
             let result = {
                 let paintable_rows = arena_ref.paintable_rows();
-                update_visual_context_tree_incrementally(
+                update_visual_context_tree(
                     &paintable_rows,
                     &callbacks,
                     viewport,
                     inputs,
                     root_background_source,
+                    scope,
                     &mut state,
                 )
             };
             match result {
-                IncrementalUpdateResult::Applied(outcome) => {
+                IncrementalUpdateResult::Applied(mut outcome) => {
                     let arena_mut = unsafe { arena_from_handle_mut(arena) };
-                    {
-                        let mut paintable_rows = arena_mut.paintable_rows_mut();
-                        for assignment in outcome.assignments {
-                            assignment.apply(&mut paintable_rows);
-                        }
-                    }
-                    if outcome.mask_node_owners_changed {
-                        state.paintables_with_mask_nodes =
-                            paintables_with_mask_nodes_in_paint_order(arena_mut, viewport);
+                    apply_walk_assignments(arena_mut, viewport, &mut outcome, &mut state);
+                    let performed_full_build = scope == VisualContextUpdateScope::EveryBox;
+                    if performed_full_build {
+                        state.build_count += 1;
+                        state.last_full_build_reason = reason;
+                        debug_assert_every_live_node_is_owned(
+                            &arena_mut.paintable_rows(),
+                            state.tree.as_deref().expect("an applied walk keeps the tree"),
+                            viewport,
+                        );
+                    } else {
+                        state.incremental_update_count += 1;
                     }
                     let structural_epoch_changed = outcome.delta.structural_epoch_changed;
                     let requires_display_list_recording = outcome.delta.requires_display_list_recording;
                     state.dirty_boxes.clear();
-                    state.incremental_update_count += 1;
                     state.last_tree_inputs = Some(inputs);
                     state.last_root_background_source = Some(root_background_source);
                     let structural_epoch = state.structural_epoch();
                     arena_mut.paint_state().borrow_mut().visual_context = state;
                     return crate::painting::host::FfiVisualContextUpdateOutcome {
-                        performed_full_build: false,
+                        performed_full_build,
                         structural_epoch_changed,
                         requires_display_list_recording,
                         structural_epoch,
                     };
                 }
-                IncrementalUpdateResult::NeedsFullBuild(fallback_reason) => reason = fallback_reason,
+                IncrementalUpdateResult::NeedsFullBuild(fallback_reason) => {
+                    assert!(
+                        VisualContextUpdateScope::for_reason(fallback_reason) > scope,
+                        "a fallback widens the update scope"
+                    );
+                    reason = fallback_reason;
+                }
             }
         }
 
         state.last_full_build_reason = reason;
-        let outcome = full_visual_context_build(arena, viewport, &callbacks, &mut state, force_full_rebuild);
+        let outcome =
+            fresh_visual_context_tree_build(arena, viewport, &callbacks, inputs, root_background_source, &mut state);
         state.last_tree_inputs = Some(inputs);
         state.last_root_background_source = Some(root_background_source);
         let arena_ref = unsafe { arena_from_handle(arena) };

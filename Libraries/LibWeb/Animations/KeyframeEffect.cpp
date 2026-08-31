@@ -172,6 +172,8 @@ static WebIDL::ExceptionOr<KeyframeType<AL>> process_a_keyframe_like_object(JS::
             animation_properties.append(name);
         } else if (name == "float"sv || name == "offset"sv) {
             // Ignore these property names
+        } else if (CSS::is_a_custom_property_name_string(name)) {
+            animation_properties.append(name);
         } else if (auto property = CSS::property_id_from_camel_case_string(name); property.has_value()) {
             if (CSS::is_animatable_property(property.value()))
                 animation_properties.append(name);
@@ -543,27 +545,29 @@ static WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_a_keyframes_argument(JS
         //    highlight
         BaseKeyframe::ParsedProperties parsed_properties;
         for (auto& [property_string, value_string] : keyframe.unparsed_properties()) {
-            Optional<CSS::PropertyID> property_id;
+            Optional<CSS::PropertyNameAndID> property;
 
             // Handle some special cases
             if (property_string == "cssFloat"sv) {
-                property_id = CSS::PropertyID::Float;
+                property = CSS::PropertyNameAndID::from_id(CSS::PropertyID::Float);
             } else if (property_string == "cssOffset"sv) {
                 // FIXME: Support CSS offset property
             } else if (property_string == "float"sv || property_string == "offset"sv) {
                 // Ignore these properties
-            } else if (auto property = CSS::property_id_from_camel_case_string(property_string); property.has_value()) {
-                property_id = *property;
+            } else if (CSS::is_a_custom_property_name_string(property_string)) {
+                property = CSS::PropertyNameAndID::from_name(property_string);
+            } else if (auto property_id = CSS::property_id_from_camel_case_string(property_string); property_id.has_value()) {
+                property = CSS::PropertyNameAndID::from_id(*property_id);
             }
 
-            if (!property_id.has_value())
+            if (!property.has_value())
                 continue;
 
-            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, *property_id)) {
+            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, property->id())) {
                 // Handle 'initial' here so we don't have to get the default value of the property every frame in StyleComputer
-                if (style_value->is_initial())
-                    style_value = CSS::property_initial_value(*property_id);
-                parsed_properties.set(*property_id, CSS::RustStyleValueHandle::retained(style_value->rust_style_value_data()));
+                if (style_value->is_initial() && !property->is_custom_property())
+                    style_value = CSS::property_initial_value(property->id());
+                parsed_properties.set(*property, CSS::RustStyleValueHandle::retained(style_value->rust_style_value_data()));
             }
         }
         keyframe.properties.set(move(parsed_properties));
@@ -599,7 +603,7 @@ WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_keyframes(JS::Realm& realm, GC
 }
 
 // https://www.w3.org/TR/css-animations-2/#keyframe-processing
-void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyframe_set, HashTable<CSS::PropertyID> const& animated_properties)
+void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyframe_set, HashTable<CSS::PropertyNameAndID> const& animated_properties)
 {
     // 1. Find or create the initial keyframe, a keyframe with a keyframe offset of 0%, default timing function
     //    as its keyframe timing function, and default composite as its keyframe composite.
@@ -611,13 +615,13 @@ void KeyframeEffect::generate_initial_and_final_frames(RefPtr<KeyFrameSet> keyfr
         initial_keyframe = keyframe_set->keyframes_by_key.find(0);
     }
 
-    auto expanded_properties = [&](HashMap<CSS::PropertyID, Variant<KeyFrameSet::UseInitial, CSS::RustStyleValueHandle>>& properties) {
-        HashTable<CSS::PropertyID> result;
+    auto expanded_properties = [&](HashMap<CSS::PropertyNameAndID, Variant<KeyFrameSet::UseInitial, CSS::RustStyleValueHandle>>& properties) {
+        HashTable<CSS::PropertyNameAndID> result;
 
         for (auto property : properties) {
-            if (property_is_shorthand(property.key)) {
-                for (auto longhand : expanded_longhands_for_shorthand(property.key))
-                    result.set(longhand);
+            if (!property.key.is_custom_property() && property_is_shorthand(property.key.id())) {
+                for (auto longhand : expanded_longhands_for_shorthand(property.key.id()))
+                    result.set(CSS::PropertyNameAndID::from_id(longhand));
             } else {
                 result.set(property.key);
             }
@@ -955,8 +959,8 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<JS::Object>>> KeyframeEffect::get_key
                 TRY(object->set(vm.names.composite, JS::PrimitiveString::create(vm, "auto"sv), JS::Object::ShouldThrowExceptions::Yes));
             }
 
-            for (auto const& [id, value] : keyframe.parsed_properties()) {
-                auto key = CSS::camel_case_string_from_property_id(id);
+            for (auto const& [property, value] : keyframe.parsed_properties()) {
+                auto key = property.is_custom_property() ? property.name() : CSS::camel_case_string_from_property_id(property.id());
                 // Serialization can still fall back to C++, which needs the typed facade; reflection is cold, so
                 // wrap on demand.
                 auto style_value = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(value.data()));
@@ -1003,12 +1007,16 @@ void KeyframeEffect::set_keyframes(Vector<BaseKeyframe> keyframes)
 
         auto key = static_cast<u64>(keyframe.computed_offset.value() * 100 * AnimationKeyFrameKeyScaleFactor);
 
-        for (auto const& [property_id, property_value] : keyframe.parsed_properties()) {
-            resolved_keyframe.properties.set(property_id, property_value);
+        for (auto const& [property, property_value] : keyframe.parsed_properties()) {
+            resolved_keyframe.properties.set(property, property_value);
+            if (property.is_custom_property()) {
+                m_target_properties.set(property);
+                continue;
+            }
             auto expansion = CSS::ComputedValuesFFI::rust_expand_property_shorthands(
-                to_underlying(property_id), property_value.data());
+                to_underlying(property.id()), property_value.data());
             for (size_t i = 0; i < expansion.count; ++i)
-                m_target_properties.set(static_cast<CSS::PropertyID>(expansion.properties[i].property_id));
+                m_target_properties.set(CSS::PropertyNameAndID::from_id(static_cast<CSS::PropertyID>(expansion.properties[i].property_id)));
             CSS::ComputedValuesFFI::rust_shorthand_expansion_destroy(expansion.storage);
         }
 
@@ -1095,7 +1103,7 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
     for (auto const& keyframe : key_frame_set->keyframes_by_key) {
         for (auto const& property : keyframe.properties) {
             has_animated_property = true;
-            if (!first_is_one_of(property.key,
+            if (!first_is_one_of(property.key.id(),
                     CSS::PropertyID::Transform,
                     CSS::PropertyID::Translate,
                     CSS::PropertyID::Rotate,
@@ -1189,7 +1197,7 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
     bool affects_display = false;
     if (auto const* key_frame_set = this->key_frame_set()) {
         for (auto it = key_frame_set->keyframes_by_key.begin(); !affects_display && it != key_frame_set->keyframes_by_key.end(); ++it)
-            affects_display = it->properties.contains(CSS::PropertyID::Display);
+            affects_display = it->properties.contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Display));
     }
     if (!affects_display && target->has_inclusive_ancestor_with_display_none_ignoring_animations()) {
         // FIXME: Reaching this point means we failed to cancel animation for an element that started
