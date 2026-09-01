@@ -14,6 +14,7 @@ use libgfx_rust::*;
 pub enum DisplayListCommandType {
     DrawGlyphRun,
     FillRect,
+    PaintCaret,
     DrawScaledDecodedImageFrame,
     DrawRepeatedDecodedImageFrame,
     DrawRepeatedDisplayList,
@@ -35,6 +36,7 @@ pub enum DisplayListCommandType {
     ApplyBackdropFilter,
     DrawRect,
     PaintNestedDisplayList,
+    DrawIsolatedDisplayList,
     CompositorScrollNode,
     CompositorWheelHitTestTarget,
     CompositorWheelHitTestTargetWithCornerRadii,
@@ -73,6 +75,7 @@ impl DisplayListCommandType {
         match self {
             Self::DrawGlyphRun => "DrawGlyphRun",
             Self::FillRect => "FillRect",
+            Self::PaintCaret => "PaintCaret",
             Self::DrawScaledDecodedImageFrame => "DrawScaledDecodedImageFrame",
             Self::DrawRepeatedDecodedImageFrame => "DrawRepeatedDecodedImageFrame",
             Self::DrawRepeatedDisplayList => "DrawRepeatedDisplayList",
@@ -94,6 +97,7 @@ impl DisplayListCommandType {
             Self::ApplyBackdropFilter => "ApplyBackdropFilter",
             Self::DrawRect => "DrawRect",
             Self::PaintNestedDisplayList => "PaintNestedDisplayList",
+            Self::DrawIsolatedDisplayList => "DrawIsolatedDisplayList",
             Self::CompositorScrollNode => "CompositorScrollNode",
             Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
             Self::CompositorWheelHitTestTargetWithCornerRadii => "CompositorWheelHitTestTargetWithCornerRadii",
@@ -467,7 +471,7 @@ ffi_bytes_fields!(DisplayListGradientColorStops {
 pub struct DisplayListCommandHeader {
     pub command_type: DisplayListCommandType,
     pub has_bounding_rect: bool,
-    pub clips_to_bounding_rect: bool,
+    pub inline_clip_count: u8,
     pub payload_size: u32,
     pub context: ContextRef,
     pub bounding_rect: IntRect,
@@ -475,12 +479,46 @@ pub struct DisplayListCommandHeader {
 ffi_bytes_fields!(DisplayListCommandHeader {
     command_type,
     has_bounding_rect,
-    clips_to_bounding_rect,
+    inline_clip_count,
     payload_size,
     context,
     bounding_rect
 });
 const _: () = assert!(std::mem::size_of::<DisplayListCommandHeader>() == 32);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InlineClipKind {
+    #[default]
+    Rect,
+    RoundedRect,
+    Path,
+}
+ffi_enum_bytes!(InlineClipKind as u8);
+ffi_enum_bytes!(ClipMode as u8);
+
+// A clip applied by the player around a single command dispatch, stored as a
+// fixed-size entry at the tail of the command payload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DisplayListInlineClip {
+    pub clip_rect_or_path_device_bounds: FloatRect,
+    pub corner_radii: CornerRadii,
+    pub path_data: DisplayListDataSpan,
+    pub path_winding_rule: WindingRule,
+    pub kind: InlineClipKind,
+    pub mode: ClipMode,
+}
+ffi_bytes_fields!(DisplayListInlineClip {
+    clip_rect_or_path_device_bounds,
+    corner_radii,
+    path_data,
+    path_winding_rule,
+    kind,
+    mode
+});
+pub const INLINE_CLIP_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineClip>();
+const _: () = assert!(INLINE_CLIP_ENTRY_SIZE == 64);
 
 // A maximal sequence of consecutive commands sharing one visual context, summarized as the tape is
 // built so that replay can enter a context, cull, and depth-sort per run instead of rediscovering
@@ -664,11 +702,38 @@ impl DisplayListCommand for DrawGlyphRun {
 pub struct FillRect {
     pub rect: IntRect,
     pub color: Color,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
-ffi_bytes_fields!(FillRect { rect, color });
+ffi_bytes_fields!(FillRect {
+    rect,
+    color,
+    compositing_and_blending_operator
+});
 
 impl DisplayListCommand for FillRect {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::FillRect;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintCaret {
+    pub rect: IntRect,
+    pub color: Color,
+    pub blink_cycle_start_time_ns: i64,
+    pub should_blink: bool,
+}
+ffi_bytes_fields!(PaintCaret {
+    rect,
+    color,
+    blink_cycle_start_time_ns,
+    should_blink
+});
+
+impl DisplayListCommand for PaintCaret {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintCaret;
     fn bounding_rect(&self) -> Option<IntRect> {
         Some(self.rect)
     }
@@ -735,6 +800,7 @@ pub struct DrawRepeatedDisplayList {
     pub clip_rect: IntRect,
     pub display_list_id: DisplayListResourceId,
     pub scaling_mode: ScalingMode,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub repeat: Repeat,
 }
 ffi_bytes_fields!(DrawRepeatedDisplayList {
@@ -742,6 +808,7 @@ ffi_bytes_fields!(DrawRepeatedDisplayList {
     clip_rect,
     display_list_id,
     scaling_mode,
+    compositing_and_blending_operator,
     repeat
 });
 
@@ -856,6 +923,7 @@ pub struct PaintLinearGradient {
     pub first_stop_position: f32,
     pub repeat_length: f32,
     pub interpolation_method: GradientInterpolationMethod,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
 ffi_bytes_fields!(PaintLinearGradient {
     gradient_rect,
@@ -863,7 +931,8 @@ ffi_bytes_fields!(PaintLinearGradient {
     color_stops,
     first_stop_position,
     repeat_length,
-    interpolation_method
+    interpolation_method,
+    compositing_and_blending_operator
 });
 
 impl DisplayListCommand for PaintLinearGradient {
@@ -997,6 +1066,7 @@ pub struct FillPath {
     pub paint_style: DisplayListPaintStyle,
     pub winding_rule: WindingRule,
     pub should_anti_alias: ShouldAntiAlias,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
 ffi_bytes_fields!(FillPath {
     path_bounding_rect,
@@ -1006,7 +1076,8 @@ ffi_bytes_fields!(FillPath {
     color,
     paint_style,
     winding_rule,
-    should_anti_alias
+    should_anti_alias,
+    compositing_and_blending_operator
 });
 
 impl DisplayListCommand for FillPath {
@@ -1144,13 +1215,15 @@ pub struct PaintRadialGradient {
     pub interpolation_method: GradientInterpolationMethod,
     pub center: IntPoint,
     pub size: IntSize,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
 ffi_bytes_fields!(PaintRadialGradient {
     rect,
     color_stops,
     interpolation_method,
     center,
-    size
+    size,
+    compositing_and_blending_operator
 });
 
 impl DisplayListCommand for PaintRadialGradient {
@@ -1168,13 +1241,15 @@ pub struct PaintConicGradient {
     pub color_stops: DisplayListGradientColorStops,
     pub interpolation_method: GradientInterpolationMethod,
     pub position: IntPoint,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
 }
 ffi_bytes_fields!(PaintConicGradient {
     rect,
     start_angle,
     color_stops,
     interpolation_method,
-    position
+    position,
+    compositing_and_blending_operator
 });
 
 impl DisplayListCommand for PaintConicGradient {
@@ -1200,6 +1275,38 @@ ffi_bytes_fields!(PaintNestedDisplayList {
 
 impl DisplayListCommand for PaintNestedDisplayList {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintNestedDisplayList;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(enclosing_int_rect(self.rect))
+    }
+}
+
+pub const NO_MASK_DISPLAY_LIST: DisplayListResourceId = DisplayListResourceId(0);
+
+// Plays its content list inside an internally scoped saveLayer, optionally
+// masked by a second list composited with DestinationIn, so a group that
+// must not blend with the canvas needs no visual context frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DrawIsolatedDisplayList {
+    pub display_list_id: DisplayListResourceId,
+    pub mask_display_list_id: DisplayListResourceId,
+    pub rect: FloatRect,
+    pub list_size: IntSize,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub mask_kind: MaskKind,
+}
+ffi_bytes_fields!(DrawIsolatedDisplayList {
+    display_list_id,
+    mask_display_list_id,
+    rect,
+    list_size,
+    compositing_and_blending_operator,
+    mask_kind
+});
+const _: () = assert!(std::mem::size_of::<DrawIsolatedDisplayList>() == 48);
+
+impl DisplayListCommand for DrawIsolatedDisplayList {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedDisplayList;
     fn bounding_rect(&self) -> Option<IntRect> {
         Some(enclosing_int_rect(self.rect))
     }

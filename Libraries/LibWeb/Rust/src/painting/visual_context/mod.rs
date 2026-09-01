@@ -11,7 +11,6 @@ pub mod delta;
 pub mod dirty;
 pub mod dump;
 pub mod incremental;
-pub mod local_frames;
 pub mod nested;
 pub mod node_values;
 pub mod queries;
@@ -26,7 +25,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::paintable_data::BorderEdge;
 use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect,
     MaskKind, WindingRule, translation_matrix,
@@ -289,82 +287,21 @@ pub struct SpatialNode {
     pub parent: SpatialNodeIndex,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PieceKey {
-    Box,
-    Piece(u16),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FrameRole {
-    Structural,
-    RootIsolation,
-    ContentCornerClip,
-    ContentClip,
-    OuterShadowClip {
-        piece: PieceKey,
-    },
-    FieldsetBackgroundClip,
-    FieldsetTopBorderBand,
-    LegendCutout,
-    BackgroundIsolation {
-        piece: PieceKey,
-    },
-    BackgroundLayerCornerClip {
-        piece: PieceKey,
-        layer: u16,
-        isolated: bool,
-    },
-    BackgroundLayerClip {
-        piece: PieceKey,
-        layer: u16,
-        isolated: bool,
-    },
-    BackgroundLayerBlend {
-        piece: PieceKey,
-        layer: u16,
-        isolated: bool,
-    },
-    // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
-    BackgroundTextClip {
-        piece: PieceKey,
-    },
-    BackgroundTextContentLayer {
-        piece: PieceKey,
-    },
-    BackgroundTextMask {
-        piece: PieceKey,
-    },
-    PatternedEdge {
-        owner: PatternedEdgeOwner,
-        piece: PieceKey,
-        edge: BorderEdge,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PatternedEdgeOwner {
-    Border,
-    Outline,
-}
-
 #[derive(Clone)]
 pub struct FrameNode {
     pub data: FrameData,
     pub parent: FrameNodeIndex,
     pub spatial: SpatialNodeIndex,
-    pub role: FrameRole,
     pub clips_everything: bool,
 }
 
 impl FrameNode {
-    pub fn new(data: FrameData, parent: FrameNodeIndex, spatial: SpatialNodeIndex, role: FrameRole) -> Self {
+    pub fn new(data: FrameData, parent: FrameNodeIndex, spatial: SpatialNodeIndex) -> Self {
         let clips_everything = data.clips_everything();
         Self {
             data,
             parent,
             spatial,
-            role,
             clips_everything,
         }
     }
@@ -475,6 +412,7 @@ pub fn allocate_structural_epoch() -> u64 {
 
 pub fn resolve_leaf_to_context_matrices(
     contexts: &SortingContexts,
+    nodes_in_dependency_order: &[u32],
     parent_by_node: &[SpatialNodeIndex],
     local_matrix_by_node: &[FloatMatrix4x4],
     flattens_inherited_transform_by_node: &[bool],
@@ -482,16 +420,17 @@ pub fn resolve_leaf_to_context_matrices(
     if contexts.is_empty() {
         return Vec::new();
     }
-    let mut matrices = Vec::with_capacity(local_matrix_by_node.len());
-    for (index, local_matrix) in local_matrix_by_node.iter().enumerate() {
+    let mut matrices = vec![FloatMatrix4x4::identity(); local_matrix_by_node.len()];
+    for &index in nodes_in_dependency_order {
+        let index = index as usize;
         let context = contexts.context_by_node[index];
         if context.0 as usize == index || index == 0 {
-            matrices.push(FloatMatrix4x4::identity());
             continue;
         }
+        let local_matrix = local_matrix_by_node[index];
         let parent = parent_by_node[index].0 as usize;
         if parent == context.0 as usize {
-            matrices.push(*local_matrix);
+            matrices[index] = local_matrix;
             continue;
         }
         let mut base = matrices[parent];
@@ -505,7 +444,7 @@ pub fn resolve_leaf_to_context_matrices(
                 .unwrap_or(FloatMatrix4x4::identity())
                 .multiplied(base);
         }
-        matrices.push(base.multiplied(*local_matrix));
+        matrices[index] = base.multiplied(local_matrix);
     }
     matrices
 }
@@ -741,7 +680,6 @@ impl VisualContextTree {
             FrameData::Dead,
             FrameNodeIndex::NONE,
             VISUAL_VIEWPORT_NODE_INDEX,
-            FrameRole::Structural,
         ));
         (FrameNodeIndex((self.frame_nodes.len() - 1) as u32), false)
     }
@@ -772,7 +710,6 @@ impl VisualContextTree {
             return false;
         }
         node.data = FrameData::Dead;
-        node.role = FrameRole::Structural;
         node.clips_everything = false;
         self.live_frame_node_count -= 1;
         self.quarantined_frame_slots.push(index);
@@ -854,16 +791,6 @@ impl VisualContextTree {
         parent: FrameNodeIndex,
         spatial: SpatialNodeIndex,
     ) -> FrameNodeIndex {
-        self.append_frame_with_role(data, parent, spatial, FrameRole::Structural)
-    }
-
-    pub fn append_frame_with_role(
-        &mut self,
-        data: FrameData,
-        parent: FrameNodeIndex,
-        spatial: SpatialNodeIndex,
-        role: FrameRole,
-    ) -> FrameNodeIndex {
         assert!(
             self.spatial_is_live(spatial),
             "a frame node's spatial node must be a live node"
@@ -874,7 +801,7 @@ impl VisualContextTree {
             let parent_node = &self.frame_nodes[parent.0 as usize];
             debug_assert!(self.spatial_is_ancestor_or_self(parent_node.spatial, spatial));
         }
-        self.frame_nodes.push(FrameNode::new(data, parent, spatial, role));
+        self.frame_nodes.push(FrameNode::new(data, parent, spatial));
         self.live_frame_node_count += 1;
         FrameNodeIndex((self.frame_nodes.len() - 1) as u32)
     }
@@ -1058,7 +985,11 @@ impl VisualContextTree {
     }
 
     pub fn resolve_sorting_contexts(&self) -> SortingContexts {
-        resolve_sorting_contexts_over_nodes(self.spatial_nodes.len(), &self.spatial_dependency_order(), |index| {
+        self.resolve_sorting_contexts_in_order(&self.spatial_dependency_order())
+    }
+
+    pub fn resolve_sorting_contexts_in_order(&self, nodes_in_dependency_order: &[u32]) -> SortingContexts {
+        resolve_sorting_contexts_over_nodes(self.spatial_nodes.len(), nodes_in_dependency_order, |index| {
             let node = &self.spatial_nodes[index];
             let sorting_context_root = if let SpatialData::Transform(transform) = &node.data {
                 transform.sorting_context_root_index
@@ -1088,7 +1019,6 @@ pub trait VisualContextNodeSink {
         data: FrameData,
         parent: FrameNodeIndex,
         spatial: SpatialNodeIndex,
-        role: FrameRole,
     ) -> FrameNodeIndex;
     fn spatial_node_at(&self, index: SpatialNodeIndex) -> &SpatialNode;
     fn next_spatial_node_index(&self) -> SpatialNodeIndex;
@@ -1103,7 +1033,7 @@ pub trait VisualContextNodeSink {
 
     fn append_frame_node_under(&mut self, context: ContextRef, data: FrameData) -> ContextRef {
         ContextRef {
-            frame: self.append_frame_node(data, context.frame, context.spatial, FrameRole::Structural),
+            frame: self.append_frame_node(data, context.frame, context.spatial),
             ..context
         }
     }
@@ -1119,9 +1049,8 @@ impl VisualContextNodeSink for VisualContextTree {
         data: FrameData,
         parent: FrameNodeIndex,
         spatial: SpatialNodeIndex,
-        role: FrameRole,
     ) -> FrameNodeIndex {
-        self.append_frame_with_role(data, parent, spatial, role)
+        self.append_frame(data, parent, spatial)
     }
 
     fn spatial_node_at(&self, index: SpatialNodeIndex) -> &SpatialNode {
@@ -1141,32 +1070,22 @@ impl VisualContextNodeSink for VisualContextTree {
 pub struct BoxVisualContextNodeHandles {
     pub spatial: Vec<SpatialNodeIndex>,
     pub chain_frames: Vec<FrameNodeIndex>,
-    pub local_frames: Vec<FrameNodeIndex>,
     pub descendant_frames: Vec<FrameNodeIndex>,
 }
 
 pub static EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES: BoxVisualContextNodeHandles = BoxVisualContextNodeHandles {
     spatial: Vec::new(),
     chain_frames: Vec::new(),
-    local_frames: Vec::new(),
     descendant_frames: Vec::new(),
 };
 
 impl BoxVisualContextNodeHandles {
     pub fn frame_handles(&self) -> impl Iterator<Item = FrameNodeIndex> + '_ {
-        self.chain_frames
-            .iter()
-            .chain(&self.local_frames)
-            .chain(&self.descendant_frames)
-            .copied()
+        self.chain_frames.iter().chain(&self.descendant_frames).copied()
     }
 
     pub fn contains_frame(&self, frame: FrameNodeIndex) -> bool {
         self.frame_handles().any(|handle| handle == frame)
-    }
-
-    pub fn local_frame_handles(&self) -> &[FrameNodeIndex] {
-        &self.local_frames
     }
 }
 
@@ -1561,12 +1480,7 @@ mod tests {
         assert!(reused);
         assert!(!tree.replace_frame_node(
             slot,
-            FrameNode::new(
-                effects(),
-                FrameNodeIndex::NONE,
-                VISUAL_VIEWPORT_NODE_INDEX,
-                FrameRole::Structural
-            )
+            FrameNode::new(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX)
         ));
         assert_eq!(tree.dead_node_count(), 1);
         tree.debug_assert_slot_accounting();
@@ -1723,11 +1637,26 @@ mod tests {
 
     fn resolve_matrices(parents: &[u32], roots: &[Option<u32>], locals: &[FloatMatrix4x4]) -> Vec<FloatMatrix4x4> {
         let dependency_order: Vec<u32> = (0..parents.len() as u32).collect();
-        let contexts = resolve_sorting_contexts_over_nodes(parents.len(), &dependency_order, |index| {
+        resolve_matrices_in_order(parents, roots, locals, &dependency_order)
+    }
+
+    fn resolve_matrices_in_order(
+        parents: &[u32],
+        roots: &[Option<u32>],
+        locals: &[FloatMatrix4x4],
+        dependency_order: &[u32],
+    ) -> Vec<FloatMatrix4x4> {
+        let contexts = resolve_sorting_contexts_over_nodes(parents.len(), dependency_order, |index| {
             (SpatialNodeIndex(parents[index]), roots[index].map(SpatialNodeIndex))
         });
         let parent_by_node: Vec<SpatialNodeIndex> = parents.iter().map(|parent| SpatialNodeIndex(*parent)).collect();
-        resolve_leaf_to_context_matrices(&contexts, &parent_by_node, locals, &vec![false; parents.len()])
+        resolve_leaf_to_context_matrices(
+            &contexts,
+            dependency_order,
+            &parent_by_node,
+            locals,
+            &vec![false; parents.len()],
+        )
     }
 
     #[test]
@@ -1757,5 +1686,32 @@ mod tests {
         assert_eq!(matrices[2], locals[2]);
         assert_eq!(matrices[3], locals[2].multiplied(locals[3]));
         assert_eq!(matrices[4], locals[3].multiplied(locals[4]));
+    }
+
+    #[test]
+    fn leaf_to_context_matrices_compose_over_a_context_root_at_a_higher_index() {
+        let locals = [
+            FloatMatrix4x4::identity(),
+            translation_matrix(0.0, 0.0, 3.0),
+            translation_matrix(0.0, 2.0, 0.0),
+            translation_matrix(1.0, 0.0, 0.0),
+        ];
+        let matrices = resolve_matrices_in_order(&[0, 2, 3, 0], &[None, None, Some(3), None], &locals, &[0, 3, 2, 1]);
+        assert_eq!(matrices[3], FloatMatrix4x4::identity());
+        assert_eq!(matrices[2], locals[2]);
+        assert_eq!(matrices[1], locals[2].multiplied(locals[1]));
+    }
+
+    #[test]
+    fn leaf_to_context_matrices_leave_a_tombstoned_slot_at_identity() {
+        let locals = [
+            FloatMatrix4x4::identity(),
+            translation_matrix(0.0, 0.0, 3.0),
+            translation_matrix(0.0, 2.0, 0.0),
+            translation_matrix(1.0, 0.0, 0.0),
+        ];
+        let matrices = resolve_matrices_in_order(&[0, 2, 3, 0], &[None, None, Some(3), None], &locals, &[0, 3, 2]);
+        assert_eq!(matrices[1], FloatMatrix4x4::identity());
+        assert_eq!(matrices[2], locals[2]);
     }
 }

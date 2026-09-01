@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::builder::{CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE};
+use super::builder::{CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE, PendingInlineClip};
 use super::commands::*;
 use crate::painting::display_list::ffi_bytes::FfiBytes;
 use libgfx_rust::*;
@@ -236,7 +236,7 @@ pub struct DisplayListRecorder {
     builder: DisplayListBuilder,
     context: ContextRef,
     mask_display_lists: Vec<(FrameNodeIndex, DisplayListResourceId)>,
-    confining_clip: Option<IntRect>,
+    ambient_inline_clips: Vec<PendingInlineClip>,
 }
 
 impl DisplayListRecorder {
@@ -245,10 +245,26 @@ impl DisplayListRecorder {
     }
 
     pub fn record_clipped_to(&mut self, clip: IntRect, record: impl FnOnce(&mut Self)) {
-        let outer_clip = self.confining_clip;
-        self.confining_clip = Some(outer_clip.map_or(clip, |outer| outer.intersected(clip)));
+        self.record_with_inline_clips(&[PendingInlineClip::intersecting_device_rect(clip)], record);
+    }
+
+    pub fn record_with_inline_clips(&mut self, inline_clips: &[PendingInlineClip], record: impl FnOnce(&mut Self)) {
+        let enclosing_scope_clip_count = self.ambient_inline_clip_depth();
+        self.push_ambient_inline_clips(inline_clips);
         record(self);
-        self.confining_clip = outer_clip;
+        self.truncate_ambient_inline_clips(enclosing_scope_clip_count);
+    }
+
+    pub fn ambient_inline_clip_depth(&self) -> usize {
+        self.ambient_inline_clips.len()
+    }
+
+    pub fn push_ambient_inline_clips(&mut self, inline_clips: &[PendingInlineClip]) {
+        self.ambient_inline_clips.extend_from_slice(inline_clips);
+    }
+
+    pub fn truncate_ambient_inline_clips(&mut self, enclosing_scope_clip_count: usize) {
+        self.ambient_inline_clips.truncate(enclosing_scope_clip_count);
     }
 
     pub fn register_mask_display_list(&mut self, frames: &[FrameNodeIndex], display_list_id: DisplayListResourceId) {
@@ -270,6 +286,7 @@ impl DisplayListRecorder {
     }
 
     pub fn into_builder(self) -> DisplayListBuilder {
+        debug_assert!(self.ambient_inline_clips.is_empty());
         self.builder
     }
 
@@ -291,7 +308,7 @@ impl DisplayListRecorder {
 
     fn append_command<C: DisplayListCommand>(&mut self, command: &C, inline_data: &[u8]) {
         self.builder
-            .append_confined_to_clip(command, inline_data, self.context, self.confining_clip);
+            .append_with_inline_clips(command, inline_data, self.context, &self.ambient_inline_clips);
     }
 
     pub fn append_cached_command_range(
@@ -325,10 +342,44 @@ impl DisplayListRecorder {
     }
 
     pub fn fill_rect(&mut self, rect: IntRect, color: Color) {
+        if color.alpha() == 0 {
+            return;
+        }
+        self.fill_rect_with_compositing_and_blending_operator(rect, color, CompositingAndBlendingOperator::Normal);
+    }
+
+    pub fn fill_rect_with_compositing_and_blending_operator(
+        &mut self,
+        rect: IntRect,
+        color: Color,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+    ) {
+        if rect.is_empty() {
+            return;
+        }
+        self.append_command(
+            &FillRect {
+                rect,
+                color,
+                compositing_and_blending_operator,
+            },
+            &[],
+        );
+    }
+
+    pub fn paint_caret(&mut self, rect: IntRect, color: Color, blink_cycle_start_time_ns: i64, should_blink: bool) {
         if rect.is_empty() || color.alpha() == 0 {
             return;
         }
-        self.append_command(&FillRect { rect, color }, &[]);
+        self.append_command(
+            &PaintCaret {
+                rect,
+                color,
+                blink_cycle_start_time_ns,
+                should_blink,
+            },
+            &[],
+        );
     }
 
     pub fn fill_rect_transparent(&mut self, rect: IntRect) {
@@ -339,6 +390,7 @@ impl DisplayListRecorder {
             &FillRect {
                 rect,
                 color: Color::TRANSPARENT,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
             },
             &[],
         );
@@ -357,7 +409,16 @@ impl DisplayListRecorder {
     }
 
     pub fn fill_path(&mut self, params: FillPathParams<'_>) {
-        if let PaintStyleOrColor::Color(color) = &params.paint_style_or_color
+        self.fill_path_with_compositing_and_blending_operator(params, CompositingAndBlendingOperator::Normal);
+    }
+
+    pub fn fill_path_with_compositing_and_blending_operator(
+        &mut self,
+        params: FillPathParams<'_>,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+    ) {
+        if compositing_and_blending_operator == CompositingAndBlendingOperator::Normal
+            && let PaintStyleOrColor::Color(color) = &params.paint_style_or_color
             && color.alpha() == 0
         {
             return;
@@ -378,6 +439,7 @@ impl DisplayListRecorder {
             paint_style,
             winding_rule: params.winding_rule,
             should_anti_alias: params.should_anti_alias,
+            compositing_and_blending_operator,
         };
         self.append_command(&command, payload.inline_data());
     }
@@ -428,7 +490,12 @@ impl DisplayListRecorder {
         self.append_command(&DrawEllipse { rect, color, thickness }, &[]);
     }
 
-    pub fn fill_rect_with_linear_gradient(&mut self, gradient_rect: IntRect, data: &LinearGradientData) {
+    pub fn fill_rect_with_linear_gradient(
+        &mut self,
+        gradient_rect: IntRect,
+        data: &LinearGradientData,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+    ) {
         if gradient_rect.is_empty() {
             return;
         }
@@ -441,11 +508,18 @@ impl DisplayListRecorder {
             first_stop_position: data.first_stop_position,
             repeat_length: data.repeat_length,
             interpolation_method: data.interpolation_method,
+            compositing_and_blending_operator,
         };
         self.append_command(&command, payload.inline_data());
     }
 
-    pub fn fill_rect_with_conic_gradient(&mut self, rect: IntRect, data: &ConicGradientData, position: IntPoint) {
+    pub fn fill_rect_with_conic_gradient(
+        &mut self,
+        rect: IntRect,
+        data: &ConicGradientData,
+        position: IntPoint,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+    ) {
         if rect.is_empty() {
             return;
         }
@@ -457,6 +531,7 @@ impl DisplayListRecorder {
             color_stops,
             interpolation_method: data.interpolation_method,
             position,
+            compositing_and_blending_operator,
         };
         self.append_command(&command, payload.inline_data());
     }
@@ -467,6 +542,7 @@ impl DisplayListRecorder {
         data: &RadialGradientData,
         center: IntPoint,
         size: IntSize,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
     ) {
         if rect.is_empty() {
             return;
@@ -479,6 +555,7 @@ impl DisplayListRecorder {
             interpolation_method: data.interpolation_method,
             center,
             size,
+            compositing_and_blending_operator,
         };
         self.append_command(&command, payload.inline_data());
     }
@@ -615,8 +692,8 @@ impl DisplayListRecorder {
         clip_rect: IntRect,
         display_list_id: DisplayListResourceId,
         scaling_mode: ScalingMode,
-        repeat_x: bool,
-        repeat_y: bool,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+        repeat: Repeat,
     ) {
         if dst_rect.is_empty() || clip_rect.is_empty() {
             return;
@@ -628,10 +705,8 @@ impl DisplayListRecorder {
                     clip_rect,
                     display_list_id,
                     scaling_mode,
-                    repeat: Repeat {
-                        x: repeat_x,
-                        y: repeat_y,
-                    },
+                    compositing_and_blending_operator,
+                    repeat,
                 },
                 &[],
             );
@@ -816,6 +891,28 @@ impl DisplayListRecorder {
                 thumb_color,
                 track_color,
                 vertical,
+            },
+            &[],
+        );
+    }
+
+    pub fn draw_isolated_display_list(
+        &mut self,
+        display_list_id: DisplayListResourceId,
+        mask_display_list_id: DisplayListResourceId,
+        rect: FloatRect,
+        list_size: IntSize,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+        mask_kind: MaskKind,
+    ) {
+        self.append_command(
+            &DrawIsolatedDisplayList {
+                display_list_id,
+                mask_display_list_id,
+                rect,
+                list_size,
+                compositing_and_blending_operator,
+                mask_kind,
             },
             &[],
         );

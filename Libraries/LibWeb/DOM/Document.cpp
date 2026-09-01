@@ -29,7 +29,6 @@
 #include <LibGC/Heap.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
-#include <LibGC/Timer.h>
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibJS/Console.h>
@@ -634,33 +633,6 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
 
     m_is_decoded_svg = m_page->client().is_svg_page_client();
 
-    m_cursor_blink_timer = GC::Heap::the().allocate<GC::Timer>();
-    // NB: In test mode, the caret must not blink so we can deterministically generate display lists. The blink state
-    //     is set whenever the cursor moves (see reset_cursor_blink_cycle()), so the caret is still painted.
-    if (!HTML::Window::in_test_mode()) {
-        m_cursor_blink_timer->start_repeating(500, GC::create_function(GC::Heap::the(), [this] {
-            auto cursor_position = this->cursor_position();
-            if (!cursor_position)
-                return;
-
-            auto navigable = this->navigable();
-            if (!navigable || !navigable->is_focused())
-                return;
-
-            auto node = cursor_position->node();
-            if (auto* text = as_if<DOM::Text>(*node)) {
-                auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
-                if (!layout_text_node)
-                    return;
-                m_cursor_blink_state = !m_cursor_blink_state;
-                layout_text_node->set_needs_repaint();
-            } else if (auto const* layout_node = node->unsafe_layout_node(); layout_node && Painting::has_committed_box(*layout_node)) {
-                m_cursor_blink_state = !m_cursor_blink_state;
-                Painting::set_needs_repaint(*layout_node);
-            }
-        }));
-    }
-
     HTML::main_thread_event_loop().register_document({}, *this);
 }
 
@@ -870,7 +842,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_open_dialogs_list);
     visitor.visit(m_dialog_pointerdown_target);
     visitor.visit(m_console_client);
-    visitor.visit(m_cursor_blink_timer);
     visitor.visit(m_previously_repainted_cursor_position);
     if (m_hit_test_display_list)
         m_hit_test_display_list->visit_edges(visitor);
@@ -10215,11 +10186,7 @@ Optional<CSSPixelRect> Document::current_caret_rect()
 
 void Document::reset_cursor_blink_cycle()
 {
-    m_cursor_blink_state = true;
-
-    // In testing mode, disable timed blinking so we can deterministically generate display lists.
-    if (!HTML::Window::in_test_mode())
-        m_cursor_blink_timer->restart();
+    m_cursor_blink_cycle_start_time_ns = MonotonicTime::now().nanoseconds();
 }
 
 void Document::set_cursor_position_needs_repaint()
@@ -11035,19 +11002,31 @@ Utf16String Document::dump_display_list()
             list.for_each_command_header([&](Painting::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
                 builder.append_repeated(' ', base_indent * 2);
                 Optional<Painting::DisplayListResourceId> nested_display_list_id;
+                Optional<Painting::DisplayListResourceId> nested_mask_display_list_id;
                 Painting::visit_display_list_command(header.command_type, payload, [&]<typename Command>(Command const& command) {
                     builder.appendff("{}@{}", command.command_name, header.context);
                     command.dump(builder);
                     if constexpr (IsSame<Command, Painting::PaintNestedDisplayList>)
                         nested_display_list_id = command.display_list_id;
+                    if constexpr (IsSame<Command, Painting::DrawIsolatedDisplayList>) {
+                        nested_display_list_id = command.display_list_id;
+                        if (command.mask_display_list_id.value() != 0)
+                            nested_mask_display_list_id = command.mask_display_list_id;
+                    }
                 });
-                if (header.clips_to_bounding_rect)
-                    builder.appendff(" clip_to_bounds={}", header.bounding_rect);
+                if (header.inline_clip_count > 0)
+                    Painting::dump_display_list_inline_clips(builder, header, payload);
                 builder.append('\n');
 
                 if (nested_display_list_id.has_value()) {
                     auto& nested_display_list = resource_storage.display_list(*nested_display_list_id);
                     dump_commands(nested_display_list, base_indent + 1);
+                }
+                if (nested_mask_display_list_id.has_value()) {
+                    builder.append_repeated(' ', (base_indent + 1) * 2);
+                    builder.append("Mask:\n"sv);
+                    auto& nested_mask_display_list = resource_storage.display_list(*nested_mask_display_list_id);
+                    dump_commands(nested_mask_display_list, base_indent + 2);
                 }
             });
 

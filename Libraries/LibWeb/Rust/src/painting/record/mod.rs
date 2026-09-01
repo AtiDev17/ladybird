@@ -16,7 +16,7 @@ use crate::layout::node_data::NodeSlotId;
 use crate::layout::node_data::{NodeFlag, NodeKind};
 use crate::layout::used_values;
 use crate::painting::border_radii::BorderRadii;
-use crate::painting::display_list::builder::RecordedDisplayList;
+use crate::painting::display_list::builder::{PendingInlineClip, RecordedDisplayList};
 use crate::painting::display_list::commands::{ContextRef, DisplayListResourceId, FrameNodeIndex, SpatialNodeIndex};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
@@ -28,7 +28,6 @@ use crate::painting::host::{
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::paintable_rows::PaintableRowsRef;
 use crate::painting::stacking_context::{NO_STACKING_CONTEXT, StackingContextTree};
-use crate::painting::visual_context::FrameRole;
 use crate::painting::visual_context::nested::NestedAssignments;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -77,8 +76,7 @@ pub struct PaintRecorder<'a> {
     pub(crate) visual_context_host: &'a FfiVisualContextHostCallbacks,
     pub(crate) nested: Option<NestedRecordingState>,
     pub(crate) nested_tree: Option<crate::painting::visual_context::VisualContextTree>,
-    last_looked_up_box_local_frames_by_role:
-        std::cell::RefCell<Option<(NodeSlotId, HashMap<FrameRole, FrameNodeIndex>)>>,
+    pub(crate) recording_into_context_free_nested_list: bool,
     pub(crate) prerecorded: crate::painting::record::masks::PrerecordedNestedDisplayLists,
     pub(crate) viewport: NodeSlotId,
     command_cache_source: Option<Rc<RecordingOutput>>,
@@ -209,7 +207,7 @@ impl<'a> PaintRecorder<'a> {
             visual_context_host: self.visual_context_host,
             nested,
             nested_tree,
-            last_looked_up_box_local_frames_by_role: std::cell::RefCell::new(None),
+            recording_into_context_free_nested_list: false,
             prerecorded: crate::painting::record::masks::PrerecordedNestedDisplayLists::default(),
             viewport: self.viewport,
             command_cache_source: None,
@@ -329,63 +327,16 @@ impl<'a> PaintRecorder<'a> {
         result
     }
 
-    pub(crate) fn with_optional_context<R>(
+    pub(crate) fn record_with_inline_clips<R>(
         &mut self,
-        context: Option<ContextRef>,
+        inline_clips: &[PendingInlineClip],
         paint: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        match context {
-            Some(context) => self.with_context(context, paint),
-            None => paint(self),
-        }
-    }
-
-    pub(crate) fn local_frame(&self, paintable: NodeSlotId, role: FrameRole) -> Option<FrameNodeIndex> {
-        let mut cache = self.last_looked_up_box_local_frames_by_role.borrow_mut();
-        if cache.as_ref().is_none_or(|(cached, _)| *cached != paintable) {
-            *cache = Some((paintable, self.local_frames_by_role(paintable)));
-        }
-        cache.as_ref().and_then(|(_, frames)| frames.get(&role).copied())
-    }
-
-    fn local_frames_by_role(&self, paintable: NodeSlotId) -> HashMap<FrameRole, FrameNodeIndex> {
-        if let Some(nested) = &self.nested {
-            return nested
-                .assignments
-                .local_frames
-                .get(&paintable.index)
-                .map(|frames| frames.iter().copied().collect())
-                .unwrap_or_default();
-        }
-        let Some(tree) = self.paint_state.visual_context.tree.as_deref() else {
-            return HashMap::new();
-        };
-        self.layout_arena
-            .with_paintable_visual_context_node_handles(paintable, |handles| {
-                handles
-                    .local_frame_handles()
-                    .iter()
-                    .map(|frame| (tree.frame_nodes[frame.0 as usize].role, *frame))
-                    .filter(|(role, _)| *role != FrameRole::Structural)
-                    .collect()
-            })
-    }
-
-    pub(crate) fn local_context(&self, paintable: NodeSlotId, role: FrameRole) -> Option<ContextRef> {
-        let frame = self.local_frame(paintable, role)?;
-        Some(ContextRef {
-            spatial: self.recorder.accumulated_visual_context().spatial,
-            frame,
-        })
-    }
-
-    pub(crate) fn expected_local_context(&self, paintable: NodeSlotId, role: FrameRole) -> ContextRef {
-        let context = self.local_context(paintable, role);
-        debug_assert!(
-            context.is_some(),
-            "the visual context build pass provisions the frame for {role:?}"
-        );
-        context.unwrap_or_else(|| self.recorder.accumulated_visual_context())
+        let enclosing_scope_clip_count = self.recorder.ambient_inline_clip_depth();
+        self.recorder.push_ambient_inline_clips(inline_clips);
+        let result = paint(self);
+        self.recorder.truncate_ambient_inline_clips(enclosing_scope_clip_count);
+        result
     }
 
     pub(crate) fn own_context(&self, paintable: NodeSlotId) -> ContextRef {

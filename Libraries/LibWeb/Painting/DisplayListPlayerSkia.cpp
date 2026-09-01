@@ -6,6 +6,7 @@
  */
 
 #include <AK/TemporaryChange.h>
+#include <AK/Time.h>
 #include <core/SkBitmap.h>
 #include <core/SkBlurTypes.h>
 #include <core/SkCanvas.h>
@@ -216,6 +217,12 @@ void DisplayListPlayerSkia::play_command(DrawGlyphRun const& command)
     }
 }
 
+static void apply_compositing_and_blending_operator(SkPaint& paint, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator)
+{
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        paint.setBlender(Gfx::to_skia_blender(compositing_and_blending_operator));
+}
+
 void DisplayListPlayerSkia::play_command(FillRect const& command)
 {
     auto const& rect = command.rect;
@@ -223,7 +230,20 @@ void DisplayListPlayerSkia::play_command(FillRect const& command)
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setColor(to_skia_color(command.color));
+    apply_compositing_and_blending_operator(paint, command.compositing_and_blending_operator);
     canvas.drawRect(to_skia_rect(rect), paint);
+}
+
+void DisplayListPlayerSkia::play_command(PaintCaret const& command)
+{
+    if (!caret_is_visible_at_time(command, MonotonicTime::now().nanoseconds()))
+        return;
+
+    auto& canvas = surface().canvas();
+    SkPaint paint;
+    paint.setAntiAlias(true);
+    paint.setColor(to_skia_color(command.color));
+    canvas.drawRect(to_skia_rect(command.rect), paint);
 }
 
 void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
@@ -349,7 +369,7 @@ void DisplayListPlayerSkia::play_command(DrawRepeatedDecodedImageFrame const& co
     canvas.drawPaint(paint);
 }
 
-static void paint_repeated_image(SkCanvas& canvas, SkImage& image, Gfx::IntRect const& dst_rect, Gfx::ScalingMode scaling_mode, bool repeat_x, bool repeat_y)
+static void paint_repeated_image(SkCanvas& canvas, SkImage& image, Gfx::IntRect const& dst_rect, Gfx::ScalingMode scaling_mode, Gfx::CompositingAndBlendingOperator compositing_and_blending_operator, bool repeat_x, bool repeat_y)
 {
     SkMatrix matrix;
     matrix.setTranslate(dst_rect.x(), dst_rect.y());
@@ -361,6 +381,7 @@ static void paint_repeated_image(SkCanvas& canvas, SkImage& image, Gfx::IntRect 
     SkPaint paint;
     paint.setAntiAlias(true);
     paint.setShader(shader);
+    apply_compositing_and_blending_operator(paint, compositing_and_blending_operator);
     canvas.drawPaint(paint);
 }
 
@@ -442,7 +463,7 @@ void DisplayListPlayerSkia::play_command(DrawRepeatedDisplayList const& command)
         return;
 
     if (auto image = resource_storage().cached_skia_image_for_display_list(command.display_list_id, tile_size, m_skia_backend_context)) {
-        paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.repeat.x, command.repeat.y);
+        paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.compositing_and_blending_operator, command.repeat.x, command.repeat.y);
         return;
     }
 
@@ -457,7 +478,7 @@ void DisplayListPlayerSkia::play_command(DrawRepeatedDisplayList const& command)
 
     resource_storage().set_cached_skia_image_for_display_list(command.display_list_id, tile_size, m_skia_backend_context, image);
 
-    paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.repeat.x, command.repeat.y);
+    paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.compositing_and_blending_operator, command.repeat.x, command.repeat.y);
 }
 
 static SkGradient::Interpolation to_skia_interpolation(Gfx::GradientInterpolationMethod interpolation_method)
@@ -582,6 +603,7 @@ void DisplayListPlayerSkia::play_command(PaintLinearGradient const& command)
     SkPaint paint;
     paint.setDither(true);
     paint.setShader(shader);
+    apply_compositing_and_blending_operator(paint, command.compositing_and_blending_operator);
     surface().canvas().drawRect(to_skia_rect(rect), paint);
 }
 
@@ -793,6 +815,7 @@ void DisplayListPlayerSkia::play_command(FillPath const& command)
         paint.setColor(to_skia_color(command.color));
     }
     paint.setAntiAlias(command.should_anti_alias == Gfx::ShouldAntiAlias::Yes);
+    apply_compositing_and_blending_operator(paint, command.compositing_and_blending_operator);
     surface().canvas().drawPath(path, paint);
 }
 
@@ -936,6 +959,7 @@ void DisplayListPlayerSkia::play_command(PaintRadialGradient const& command)
     paint.setDither(true);
     paint.setAntiAlias(true);
     paint.setShader(shader);
+    apply_compositing_and_blending_operator(paint, command.compositing_and_blending_operator);
     surface().canvas().drawRect(to_skia_rect(rect), paint);
 }
 
@@ -961,7 +985,31 @@ void DisplayListPlayerSkia::play_command(PaintConicGradient const& command)
     paint.setDither(true);
     paint.setAntiAlias(true);
     paint.setShader(shader);
+    apply_compositing_and_blending_operator(paint, command.compositing_and_blending_operator);
     surface().canvas().drawRect(to_skia_rect(rect), paint);
+}
+
+void DisplayListPlayerSkia::play_command(DrawIsolatedDisplayList const& command)
+{
+    auto& canvas = surface().canvas();
+    canvas.save();
+    canvas.clipRect(to_skia_rect(command.rect), true);
+    SkPaint group_paint;
+    if (command.compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        group_paint.setBlender(Gfx::to_skia_blender(command.compositing_and_blending_operator));
+    canvas.saveLayer(nullptr, &group_paint);
+    play_command(PaintNestedDisplayList { command.display_list_id, command.rect, command.list_size });
+    if (command.mask_display_list_id.value() != 0) {
+        SkPaint mask_paint;
+        mask_paint.setBlender(Gfx::to_skia_blender(Gfx::CompositingAndBlendingOperator::DestinationIn));
+        if (command.mask_kind == Gfx::MaskKind::Luminance)
+            mask_paint.setColorFilter(SkLumaColorFilter::Make());
+        canvas.saveLayer(nullptr, &mask_paint);
+        play_command(PaintNestedDisplayList { command.mask_display_list_id, command.rect, command.list_size });
+        canvas.restore();
+    }
+    canvas.restore();
+    canvas.restore();
 }
 
 void DisplayListPlayerSkia::play_command(PaintNestedDisplayList const& command)

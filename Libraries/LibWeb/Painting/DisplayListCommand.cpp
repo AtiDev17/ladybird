@@ -4,9 +4,49 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGfx/Path.h>
 #include <LibWeb/Painting/DisplayListCommand.h>
 
 namespace Web::Painting {
+
+void dump_display_list_inline_clips(StringBuilder& builder, DisplayListCommandHeader const& header, ReadonlyBytes payload)
+{
+    builder.append(" inline_clips=["sv);
+    bool first = true;
+    for_each_display_list_inline_clip(header, payload, [&](DisplayListInlineClip const& inline_clip) {
+        if (!first)
+            builder.append(", "sv);
+        first = false;
+        if (inline_clip.kind == InlineClipKind::Path) {
+            auto path = Gfx::Path::from_serialized_bytes(payload.slice(inline_clip.path_data.offset, inline_clip.path_data.size));
+            auto svg_path = path.to_svg_string();
+            bool has_curves_with_host_dependent_control_points = svg_path.contains('Q') || svg_path.contains('C');
+            if (has_curves_with_host_dependent_control_points) {
+                size_t path_command_count = 0;
+                for (auto code_point : svg_path.bytes_as_string_view()) {
+                    if (code_point == 'M' || code_point == 'L' || code_point == 'Q' || code_point == 'C' || code_point == 'Z')
+                        ++path_command_count;
+                }
+                builder.appendff("clip_path=[bounds: {}, curved path: {} commands]", inline_clip.clip_rect_or_path_device_bounds, path_command_count);
+            } else {
+                builder.appendff("clip_path=[bounds: {}, path: {}]", inline_clip.clip_rect_or_path_device_bounds, svg_path);
+            }
+        } else {
+            builder.appendff("clip={}", inline_clip.clip_rect_or_path_device_bounds);
+            auto const& corner_radii = inline_clip.corner_radii;
+            if (corner_radii.has_any_radius()) {
+                builder.appendff(" radii=({},{},{},{})",
+                    corner_radii.top_left.horizontal_radius,
+                    corner_radii.top_right.horizontal_radius,
+                    corner_radii.bottom_right.horizontal_radius,
+                    corner_radii.bottom_left.horizontal_radius);
+            }
+        }
+        if (inline_clip.mode == ClipMode::Difference)
+            builder.append(" mode=difference"sv);
+    });
+    builder.append(']');
+}
 
 static StringView line_style_name(Gfx::LineStyle line_style)
 {
@@ -54,6 +94,13 @@ void DrawGlyphRun::dump(StringBuilder& builder) const
 void FillRect::dump(StringBuilder& builder) const
 {
     builder.appendff(" rect={} color={}", rect, color);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
+}
+
+void PaintCaret::dump(StringBuilder& builder) const
+{
+    builder.appendff(" rect={} color={} should_blink={}", rect, color, should_blink);
 }
 
 void DrawScaledDecodedImageFrame::dump(StringBuilder& builder) const
@@ -79,6 +126,8 @@ void DrawRepeatedDecodedImageFrame::dump(StringBuilder& builder) const
 void DrawRepeatedDisplayList::dump(StringBuilder& builder) const
 {
     builder.appendff(" dst_rect={} clip_rect={} scaling_mode={}", dst_rect, clip_rect, scaling_mode_name(scaling_mode));
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
 }
 
 void DrawTiledDecodedImageFrame::dump(StringBuilder& builder) const
@@ -112,16 +161,22 @@ void DrawVideoFrame::dump(StringBuilder& builder) const
 void PaintLinearGradient::dump(StringBuilder& builder) const
 {
     builder.appendff(" rect={}", gradient_rect);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
 }
 
 void PaintRadialGradient::dump(StringBuilder& builder) const
 {
     builder.appendff(" rect={} center={} size={}", rect, center, size);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
 }
 
 void PaintConicGradient::dump(StringBuilder& builder) const
 {
     builder.appendff(" rect={} position={} angle={}", rect, position, start_angle);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
 }
 
 void PaintOuterBoxShadow::dump(StringBuilder& builder) const
@@ -147,6 +202,8 @@ void FillRectWithRoundedCorners::dump(StringBuilder& builder) const
 void FillPath::dump(StringBuilder& builder) const
 {
     builder.appendff(" path_bounding_rect={}", path_bounding_rect);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
 }
 
 void StrokePath::dump(StringBuilder& builder) const
@@ -178,6 +235,15 @@ void ApplyBackdropFilter::dump(StringBuilder& builder) const
 void DrawRect::dump(StringBuilder& builder) const
 {
     builder.appendff(" rect={} color={} rough={}", rect, color, rough);
+}
+
+void DrawIsolatedDisplayList::dump(StringBuilder& builder) const
+{
+    builder.appendff(" rect={} list_size={}", rect, list_size);
+    if (compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
+        builder.appendff(" blend_mode={}", static_cast<int>(compositing_and_blending_operator));
+    if (mask_display_list_id.value() != 0)
+        builder.appendff(" has_mask={}", mask_kind == Gfx::MaskKind::Luminance ? "luminance"sv : "alpha"sv);
 }
 
 void PaintNestedDisplayList::dump(StringBuilder& builder) const

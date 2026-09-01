@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Assertions.h>
+#include <AK/Forward.h>
 #include <AK/Span.h>
 #include <AK/StdLibExtras.h>
 #include <LibGfx/Rect.h>
@@ -17,6 +18,7 @@ namespace Web::Painting {
 #define ENUMERATE_DISPLAY_LIST_COMMANDS(V)                                             \
     V(DrawGlyphRun, draw_glyph_run)                                                    \
     V(FillRect, fill_rect)                                                             \
+    V(PaintCaret, paint_caret)                                                         \
     V(DrawScaledDecodedImageFrame, draw_scaled_decoded_image_frame)                    \
     V(DrawRepeatedDecodedImageFrame, draw_repeated_decoded_image_frame)                \
     V(DrawRepeatedDisplayList, draw_repeated_display_list)                             \
@@ -38,6 +40,7 @@ namespace Web::Painting {
     V(ApplyBackdropFilter, apply_backdrop_filter)                                      \
     V(DrawRect, draw_rect)                                                             \
     V(PaintNestedDisplayList, paint_nested_display_list)                               \
+    V(DrawIsolatedDisplayList, draw_isolated_display_list)                             \
     V(CompositorScrollNode, compositor_scroll_node)                                    \
     V(CompositorWheelHitTestTarget, compositor_wheel_hit_test_target)                  \
     V(CompositorWheelHitTestTargetWithCornerRadii,                                     \
@@ -64,6 +67,17 @@ constexpr bool display_list_command_is_compositor_metadata(DisplayListCommandTyp
 
 inline Gfx::IntRect DrawGlyphRun::bounding_rect() const { return glyph_bounding_rect; }
 inline Gfx::IntRect FillRect::bounding_rect() const { return rect; }
+inline Gfx::IntRect PaintCaret::bounding_rect() const { return rect; }
+constexpr i64 caret_blink_interval_ns = 500'000'000;
+inline bool caret_is_visible_at_time(PaintCaret const& caret, i64 monotonic_time_ns)
+{
+    if (!caret.should_blink)
+        return true;
+    auto elapsed_ns = monotonic_time_ns > caret.blink_cycle_start_time_ns
+        ? monotonic_time_ns - caret.blink_cycle_start_time_ns
+        : 0;
+    return (elapsed_ns / caret_blink_interval_ns) % 2 == 0;
+}
 inline Gfx::IntRect DrawScaledDecodedImageFrame::bounding_rect() const { return Gfx::enclosing_int_rect(dst_rect); }
 inline Gfx::IntRect DrawRepeatedDecodedImageFrame::bounding_rect() const { return clip_rect; }
 inline Gfx::IntRect DrawRepeatedDisplayList::bounding_rect() const { return clip_rect; }
@@ -83,6 +97,7 @@ inline Gfx::IntRect DrawRect::bounding_rect() const { return rect; }
 inline Gfx::IntRect PaintRadialGradient::bounding_rect() const { return rect; }
 inline Gfx::IntRect PaintConicGradient::bounding_rect() const { return rect; }
 inline Gfx::IntRect PaintNestedDisplayList::bounding_rect() const { return Gfx::enclosing_int_rect(rect); }
+inline Gfx::IntRect DrawIsolatedDisplayList::bounding_rect() const { return Gfx::enclosing_int_rect(rect); }
 inline Gfx::IntRect PaintScrollBar::bounding_rect() const { return track_rect.united(thumb_rect); }
 
 template<typename Command>
@@ -150,6 +165,20 @@ static_assert(sizeof(DisplayListCommandHeader) == 32);
 static_assert(IsTriviallyCopyable<DisplayListCommandRun>);
 static_assert(sizeof(DisplayListCommandRun) == 36);
 static_assert(IsTriviallyCopyable<DisplayListGlyph>);
+static_assert(IsTriviallyCopyable<DisplayListInlineClip>);
+static_assert(sizeof(DisplayListInlineClip) == 64);
+
+template<typename Callback>
+void for_each_display_list_inline_clip(DisplayListCommandHeader const& header, ReadonlyBytes payload, Callback&& callback)
+{
+    size_t entries_size = header.inline_clip_count * sizeof(DisplayListInlineClip);
+    VERIFY(entries_size <= payload.size());
+    size_t entry_offset = payload.size() - entries_size;
+    for (u8 index = 0; index < header.inline_clip_count; ++index, entry_offset += sizeof(DisplayListInlineClip))
+        callback(read_display_list_object<DisplayListInlineClip>(payload.slice(entry_offset)));
+}
+
+void dump_display_list_inline_clips(StringBuilder&, DisplayListCommandHeader const&, ReadonlyBytes payload);
 
 inline bool operator==(DisplayListCommandRun const& a, DisplayListCommandRun const& b)
 {
