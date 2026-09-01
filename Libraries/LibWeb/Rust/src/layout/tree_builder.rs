@@ -26,6 +26,8 @@ pub(crate) struct TreeBuilderState {
     reused_child_list_update_roots: Vec<LayoutNode>,
     additional_table_fixup_roots: Vec<LayoutNode>,
     layout_tree_update_escaped_rebuild_roots: bool,
+    new_subtree_root: LayoutNode,
+    layout_tree_rebuild_requests: Vec<*mut c_void>,
 }
 
 impl Default for TreeBuilderState {
@@ -39,6 +41,8 @@ impl Default for TreeBuilderState {
             reused_child_list_update_roots: Vec::new(),
             additional_table_fixup_roots: Vec::new(),
             layout_tree_update_escaped_rebuild_roots: false,
+            new_subtree_root: NodeSlotId::INVALID,
+            layout_tree_rebuild_requests: Vec::new(),
         }
     }
 }
@@ -82,7 +86,6 @@ pub struct FfiDomTreeBuilderCallbacks {
     pub is_svg_element: unsafe extern "C" fn(*mut c_void) -> bool,
     pub clear_stale_layout_node: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub display_contents_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiDisplayContentsFacts,
-    pub clear_synthetic_pseudo_element_layout_nodes: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub clear_stale_subtree: unsafe extern "C" fn(*mut c_void, *mut c_void, FfiStaleSubtreeClearScope),
     pub resolve_counters: unsafe extern "C" fn(*mut c_void, FfiPseudoElement),
     pub principal_descendant_facts:
@@ -103,6 +106,7 @@ pub struct FfiDomTreeBuilderCallbacks {
     pub element_pseudo_layout_node: unsafe extern "C" fn(*mut c_void, FfiPseudoElement) -> NodeSlotId,
     pub principal_node_entry_facts: unsafe extern "C" fn(*mut c_void, *mut c_void, bool) -> FfiPrincipalNodeEntryFacts,
     pub request_top_layer_zone_rebuild: unsafe extern "C" fn(*mut c_void),
+    pub request_layout_tree_rebuild: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub push_principal_frame: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiPrincipalNodeFrame,
     pub pop_principal_frame: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub prepare_principal_element:
@@ -816,11 +820,6 @@ unsafe fn update_layout_tree_for_display_contents(
             context.layout_top_layer = false;
         }
 
-        // SAFETY: The builder and element remain live throughout this call.
-        unsafe {
-            (host.callbacks.clear_synthetic_pseudo_element_layout_nodes)(host.callbacks.builder, element);
-        }
-
         if should_create_layout_node {
             // SAFETY: The builder and element remain live throughout this call.
             unsafe {
@@ -833,7 +832,7 @@ unsafe fn update_layout_tree_for_display_contents(
             }
         }
 
-        if !facts.content_visibility_hidden && !context.has_svg_root {
+        if should_create_layout_node && !facts.content_visibility_hidden && !context.has_svg_root {
             let placed = create_pseudo_element(
                 host,
                 state,
@@ -901,7 +900,7 @@ unsafe fn update_layout_tree_for_display_contents(
             }
         }
 
-        if !facts.content_visibility_hidden && !context.has_svg_root {
+        if should_create_layout_node && !facts.content_visibility_hidden && !context.has_svg_root {
             let placed = create_pseudo_element(
                 host,
                 state,
@@ -1527,6 +1526,10 @@ fn update_principal_node_after_entry(
 
         // SAFETY: `has_layout_node` guarantees that the frame owns a live principal layout node.
         let layout_node = unsafe { (host.callbacks.principal_layout_node)(frame) };
+        let starts_new_subtree = entry_decision.should_create_layout_node && update.state.new_subtree_root.is_invalid();
+        if starts_new_subtree {
+            update.state.new_subtree_root = layout_node;
+        }
         if entry_facts.needs_layout_tree_update
             && entry_facts.may_reuse_layout_node_for_child_list_insertion
             && !entry_decision.should_create_layout_node
@@ -1575,7 +1578,7 @@ fn update_principal_node_after_entry(
 
         if placement.create_backdrop {
             // A backdrop is a sibling of its originating top-layer element. Append it normally, but insert it before
-            // an old box that will be replaced in place so the backdrop remains behind the element.
+            // the placement of an old box that will be replaced in place so the backdrop remains behind the element.
             let insertion_mode = if placement.may_replace_existing_layout_node {
                 None
             } else {
@@ -1586,12 +1589,18 @@ fn update_principal_node_after_entry(
             if let Some(backdrop) = unplaced_backdrop {
                 assert!(placement.may_replace_existing_layout_node);
                 let layout_host = host.layout();
-                let old_parent = layout_host.parent(old_layout_node);
+                let topmost_placement = topmost_layout_node_of_top_layer_placement(host.arena, old_layout_node);
+                let old_placement = if topmost_placement.is_invalid() {
+                    old_layout_node
+                } else {
+                    topmost_placement
+                };
+                let old_parent = layout_host.parent(old_placement);
                 assert!(!old_parent.is_invalid());
-                // The backdrop lands next to the still-attached old box, so this restructures the
-                // old box's parent.
+                // The backdrop lands next to the still-attached old placement, so this restructures
+                // its parent.
                 note_layout_tree_restructuring_at(&layout_host, update.state, old_parent);
-                layout_host.attach_child(old_parent, backdrop, old_layout_node);
+                layout_host.attach_child(old_parent, backdrop, old_placement);
             }
         }
 
@@ -1693,6 +1702,9 @@ fn update_principal_node_after_entry(
         }
         if placement.start_rebuild_root {
             update.state.current_rebuild_root = prior_rebuild_root;
+        }
+        if starts_new_subtree {
+            update.state.new_subtree_root = NodeSlotId::INVALID;
         }
     } else if !construction.handled_display_contents {
         if !update.old_layout_node.is_invalid() {
@@ -1819,6 +1831,11 @@ pub unsafe extern "C" fn rust_build_layout_tree(
                     &state.additional_table_fixup_roots,
                 );
             }
+        }
+
+        for &element in &state.layout_tree_rebuild_requests {
+            // SAFETY: The builder remains live, and the walk that could clear DOM update flags is complete.
+            unsafe { (host.callbacks.request_layout_tree_rebuild)(host.callbacks.builder, element) };
         }
 
         // SAFETY: The builder remains live and copies the reported shell pointers before returning.
@@ -2728,20 +2745,35 @@ fn insertion_parent_for_inline_node(host: &TreeBuilderHost<'_>, parent: LayoutNo
     last_child_creating_anonymous_wrapper_if_needed(host, parent)
 }
 
+fn nearest_rebuildable_container(host: &TreeBuilderHost<'_>, node: LayoutNode) -> LayoutNode {
+    let mut container = node;
+    loop {
+        let data = host.data(container);
+        if !node_has_flag(data, NodeFlag::Anonymous) && data.kind != NodeKind::InlineNode {
+            return container;
+        }
+        container = host.parent(container);
+        assert!(!container.is_invalid());
+    }
+}
+
 fn insertion_parent_for_block_node(
-    host: &TreeBuilderHost<'_>,
+    host: &DomTreeBuilderHost<'_>,
     state: &mut TreeBuilderState,
     parent: LayoutNode,
     node: LayoutNode,
     mode: FfiInsertionMode,
 ) -> LayoutNode {
-    let parent_data = host.data(parent);
+    let layout = host.layout();
+    let parent_data = layout.data(parent);
 
     // Inline is fine for in-flow block children (interrupting blocks) and for out-of-flow children;
     // the inline formatting context emits items for both.
-    if !node_has_flag(host.data(node), NodeFlag::Anonymous)
-        && node_is_inline_outside(host, parent)
-        && host.style(parent).is_some_and(|style| style.display().is_flow_inside())
+    if !node_has_flag(layout.data(node), NodeFlag::Anonymous)
+        && node_is_inline_outside(&layout, parent)
+        && layout
+            .style(parent)
+            .is_some_and(|style| style.display().is_flow_inside())
     {
         return parent;
     }
@@ -2754,34 +2786,43 @@ fn insertion_parent_for_block_node(
 
     // Make sure we're not inserting into an inline node, since those do not support block nodes.
     let mut new_parent = parent;
-    while host.data(new_parent).kind == NodeKind::InlineNode {
-        new_parent = host.parent(new_parent);
+    while layout.data(new_parent).kind == NodeKind::InlineNode {
+        new_parent = layout.parent(new_parent);
         assert!(!new_parent.is_invalid());
     }
 
+    if new_parent != parent && !is_inclusive_layout_ancestor_of(&layout, state.new_subtree_root, new_parent) {
+        let container = nearest_rebuildable_container(&layout, new_parent);
+        // SAFETY: `container` is a live, attached layout node.
+        let element = unsafe { (host.callbacks.layout_node_dom_element)(layout.shell(container)) };
+        if !state.layout_tree_rebuild_requests.contains(&element) {
+            state.layout_tree_rebuild_requests.push(element);
+        }
+    }
+
     // If the parent block has no children, insert this block into parent.
-    if !has_inline_or_in_flow_block_children(host, new_parent) {
+    if !has_inline_or_in_flow_block_children(&layout, new_parent) {
         return new_parent;
     }
 
     // Table-internal boxes may have been blockified before insertion, but table fixup still needs to see them as
     // direct table children instead of grouping them with neighboring table whitespace.
-    if is_out_of_flow_table_internal_child_of_table_root(host, new_parent, node) {
+    if is_out_of_flow_table_internal_child_of_table_root(&layout, new_parent, node) {
         return new_parent;
     }
 
-    let new_parent_data = host.data(new_parent);
+    let new_parent_data = layout.data(new_parent);
 
     // If the block is out-of-flow,
-    if node_is_out_of_flow(host, node) {
-        let last_child = host.last_child(new_parent);
+    if node_is_out_of_flow(&layout, node) {
+        let last_child = layout.last_child(new_parent);
         assert!(!last_child.is_invalid());
-        let last_child_data = host.data(last_child);
+        let last_child_data = layout.data(last_child);
 
         // And we're appending while the parent's last child is an anonymous block, join that
         // anonymous block. Prepended boxes (e.g. an absolutely positioned ::before) belong at the
         // very start of the parent, not at the start of its trailing inline run.
-        let new_parent_display = host.style(new_parent).map(|style| style.display());
+        let new_parent_display = layout.style(new_parent).map(|style| style.display());
         if mode == FfiInsertionMode::Append
             && !new_parent_display.is_some_and(|display| display.is_flex_inside() || display.is_grid_inside())
             && !node_is_generated_for_pseudo_element(last_child_data)
@@ -2801,25 +2842,26 @@ fn insertion_parent_for_block_node(
     }
 
     // Parent block has inline-level children (our siblings); wrap these siblings into an anonymous wrapper block.
-    note_layout_tree_restructuring_at(host, state, new_parent);
+    note_layout_tree_restructuring_at(&layout, state, new_parent);
     let mut children_to_wrap = Vec::new();
-    let mut child = host.first_child(new_parent);
+    let mut child = layout.first_child(new_parent);
     while !child.is_invalid() {
-        if !is_out_of_flow_table_internal_child_of_table_root(host, new_parent, child) {
+        if !is_out_of_flow_table_internal_child_of_table_root(&layout, new_parent, child) {
             children_to_wrap.push(child);
         }
-        child = host.next_sibling(child);
+        child = layout.next_sibling(child);
     }
     // SAFETY: `new_parent` is a live NodeWithStyle.
-    let wrapper = host
-        .created(unsafe { (host.callbacks.create_anonymous_wrapper)(host.callbacks.context, host.shell(new_parent)) });
+    let wrapper = layout.created(unsafe {
+        (layout.callbacks.create_anonymous_wrapper)(layout.callbacks.context, layout.shell(new_parent))
+    });
     let wrapper_slot = wrapper.slot();
-    host.set_children_are_inline(wrapper_slot, true);
+    layout.set_children_are_inline(wrapper_slot, true);
     for child in children_to_wrap {
-        host.move_child(child, wrapper_slot, NodeSlotId::INVALID);
+        layout.move_child(child, wrapper_slot, NodeSlotId::INVALID);
     }
-    host.set_children_are_inline(new_parent, false);
-    host.attach_child(new_parent, wrapper, NodeSlotId::INVALID);
+    layout.set_children_are_inline(new_parent, false);
+    layout.attach_child(new_parent, wrapper, NodeSlotId::INVALID);
 
     // Then it's safe to insert this block into parent.
     new_parent
@@ -2913,7 +2955,7 @@ fn insert_node_into_inline_or_block_ancestor(
     let insertion_point = if is_inline_outside {
         insertion_parent_for_inline_node(&layout, nearest_insertion_ancestor)
     } else {
-        insertion_parent_for_block_node(&layout, state, nearest_insertion_ancestor, node_slot, mode)
+        insertion_parent_for_block_node(host, state, nearest_insertion_ancestor, node_slot, mode)
     };
 
     // Insertion parents can be above the subtree being rebuilt in place: inline ancestors are
@@ -3432,6 +3474,7 @@ fn remove_irrelevant_boxes(host: &TreeBuilderHost<'_>, root: LayoutNode) {
         if node_kind_is_box(data.kind)
             && !parent.is_invalid()
             && is_tabular_container(host, parent)
+            && !node_has_flag(host.data(parent), NodeFlag::Anonymous)
             && is_first_or_last_child_with_table_non_root_sibling_if_any(host, node)
             && is_ignorable_whitespace(host, node)
         {

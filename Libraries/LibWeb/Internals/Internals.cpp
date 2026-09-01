@@ -171,6 +171,19 @@ u64 Internals::visual_context_pending_dirty_box_count()
     return Layout::RustFFI::layout_arena_visual_context_pending_dirty_box_count(document.layout_node_arena().handle());
 }
 
+u64 Internals::layout_tree_pre_order_label_violation_count()
+{
+    auto& document = window().associated_document();
+    return Layout::RustFFI::layout_arena_pre_order_label_violation_count(
+        document.layout_node_arena().handle(), Painting::viewport_row_slot(document));
+}
+
+u64 Internals::layout_tree_pre_order_relabel_count()
+{
+    auto& document = window().associated_document();
+    return Layout::RustFFI::layout_arena_pre_order_relabel_count(document.layout_node_arena().handle());
+}
+
 u64 Internals::visual_context_tree_node_count()
 {
     auto& document = window().associated_document();
@@ -948,6 +961,22 @@ Utf16String Internals::dump_layout_tree(GC::Ref<DOM::Node> node)
 Utf16String Internals::dump_stacking_context_tree()
 {
     return window().associated_document().dump_stacking_context_tree();
+}
+
+Utf16String Internals::stacking_context_structure_verification_report()
+{
+    auto& document = window().associated_document();
+    document.update_layout(DOM::UpdateLayoutReason::DumpDisplayList);
+    if (!document.has_committed_viewport_box())
+        return {};
+    document.update_paint_and_hit_testing_properties_if_needed();
+    StringBuilder builder;
+    Layout::RustFFI::layout_arena_stacking_context_structure_verification_report(
+        document.layout_node_arena().handle(), Painting::viewport_row_slot(document), &builder,
+        [](void* context, u8 const* bytes, size_t byte_count) {
+            static_cast<StringBuilder*>(context)->append(StringView { bytes, byte_count });
+        });
+    return Utf16String::from_utf8_without_validation(builder.string_view());
 }
 
 Utf16String Internals::dump_gc_graph()

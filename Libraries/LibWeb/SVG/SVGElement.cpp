@@ -450,7 +450,31 @@ GC::Ptr<SVGSVGElement> SVGElement::owner_svg_element()
     // The ownerSVGElement IDL attribute represents the nearest ancestor ‘svg’ element.
     // On getting ownerSVGElement, the nearest ancestor ‘svg’ element is returned;
     // if the current element is the outermost svg element, then null is returned.
-    return first_flat_tree_ancestor_of_type<SVGSVGElement>();
+    if (is_svg_svg_element()) {
+        auto const* parent = this->parent();
+
+        if (!parent)
+            return nullptr;
+
+        if (is<SVGForeignObjectElement>(parent))
+            return nullptr;
+
+        // NB: A shadow root belonging to a use element is the only non-SVG parent node for which we are not the
+        //     outermost svg element.
+        if (auto const* shadow_root = as_if<DOM::ShadowRoot>(parent)) {
+            if (!is<SVGUseElement>(shadow_root->host()))
+                return nullptr;
+        } else if (!is<SVGElement>(parent)) {
+            return nullptr;
+        }
+    }
+
+    for (auto* element = parent_or_shadow_host_element(); element; element = element->parent_or_shadow_host_element()) {
+        if (auto* svg_element = as_if<SVGSVGElement>(element))
+            return svg_element;
+    }
+
+    return nullptr;
 }
 
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__viewportElement

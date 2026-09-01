@@ -1147,14 +1147,19 @@ static bool can_detach_layout_subtree_for_removal(Node const& node, Node const& 
         }
         // Once only anonymous wrappers would remain, a full rebuild would place their inline
         // content directly in the parent instead.
-        bool a_non_anonymous_sibling_remains = false;
+        bool an_anonymous_inline_wrapper_remains = false;
+        bool an_in_flow_block_level_sibling_remains = false;
         for (auto sibling = parent_layout_node->first_child(); sibling; sibling = sibling->next_sibling()) {
-            if (sibling.ptr() != layout_node && !sibling->is_anonymous()) {
-                a_non_anonymous_sibling_remains = true;
-                break;
-            }
+            if (sibling.ptr() == layout_node)
+                continue;
+            if (auto const* sibling_with_style = as_if<Layout::NodeWithStyle>(*sibling); sibling_with_style && sibling_with_style->is_out_of_flow())
+                continue;
+            if (sibling->is_anonymous() && sibling->children_are_inline())
+                an_anonymous_inline_wrapper_remains = true;
+            else
+                an_in_flow_block_level_sibling_remains = true;
         }
-        if (!a_non_anonymous_sibling_remains && parent_layout_node->first_child().ptr() != layout_node)
+        if (an_anonymous_inline_wrapper_remains && !an_in_flow_block_level_sibling_remains)
             return false;
         if (box_level == DetachedBoxLevel::FromStyle)
             return layout_node->display().is_block_outside();
@@ -1343,24 +1348,23 @@ void Node::remove(bool suppress_observers)
     }
 
     // 10. If node has an inclusive descendant that is a slot, then:
-    auto has_descendent_slot = false;
-    auto* shadow_root = as_if<ShadowRoot>(parent_root);
+    if (auto* shadow_root = as_if<ShadowRoot>(parent_root)) {
+        Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots;
+        for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
+            shadow_root->unregister_slot(slot);
+            descendant_slots.append(slot);
+            return TraversalDecision::Continue;
+        });
 
-    for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-        has_descendent_slot = true;
-        if (!shadow_root)
-            return TraversalDecision::Break;
-        // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
-        shadow_root->unregister_slot(slot);
-        return TraversalDecision::Continue;
-    });
+        if (!descendant_slots.is_empty()) {
+            // 1. Run assign slottables for a tree with parent’s root.
+            assign_slottables_for_a_tree(parent_root);
 
-    if (has_descendent_slot) {
-        // 1. Run assign slottables for a tree with parent’s root.
-        assign_slottables_for_a_tree(parent_root);
-
-        // 2. Run assign slottables for a tree with node.
-        assign_slottables_for_a_tree(*this);
+            // 2. Run assign slottables for a tree with node.
+            for (auto const& slot : descendant_slots)
+                assign_slottables(slot);
+        }
     }
 
     // NB: Detached subtrees do not need DOM-held record pins, but layout nodes can still outlive
@@ -1720,24 +1724,23 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     }
 
     // 16. If node has an inclusive descendant that is a slot:
-    auto has_descendent_slot = false;
-    auto* shadow_root = as_if<ShadowRoot>(old_parent_root);
+    if (auto* shadow_root = as_if<ShadowRoot>(old_parent_root)) {
+        Vector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots;
+        for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
+            // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
+            shadow_root->unregister_slot(slot);
+            descendant_slots.append(slot);
+            return TraversalDecision::Continue;
+        });
 
-    for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-        has_descendent_slot = true;
-        if (!shadow_root)
-            return TraversalDecision::Break;
-        // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
-        shadow_root->unregister_slot(slot);
-        return TraversalDecision::Continue;
-    });
+        if (!descendant_slots.is_empty()) {
+            // 1. Run assign slottables for a tree with oldParent’s root.
+            assign_slottables_for_a_tree(old_parent_root);
 
-    if (has_descendent_slot) {
-        // 1. Run assign slottables for a tree with oldParent’s root.
-        assign_slottables_for_a_tree(old_parent_root);
-
-        // 2. Run assign slottables for a tree with node.
-        assign_slottables_for_a_tree(*this);
+            // 2. Run assign slottables for a tree with node.
+            for (auto const& slot : descendant_slots)
+                assign_slottables(slot);
+        }
     }
 
     // 17. If child is non-null:
@@ -1785,8 +1788,11 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
         }
     }
     if (is_connected()) {
+        auto moved_subtree_already_needs_layout_tree_update = needs_layout_tree_update() || child_needs_layout_tree_update();
         set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
         new_parent.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
+        if (moved_subtree_already_needs_layout_tree_update)
+            new_parent.set_child_needs_layout_tree_update(true);
     }
 
     // 21. If newParent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then assign a slot for node.
@@ -2252,11 +2258,23 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
     if (m_needs_layout_tree_update) {
         document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
 
+        bool const document_has_top_layer_elements = !document().top_layer_elements().is_empty();
+        auto is_rendered_top_layer_element = [&](Node& node) {
+            if (!document_has_top_layer_elements)
+                return false;
+            auto* element = as_if<Element>(node);
+            return element && element->rendered_in_top_layer();
+        };
+        bool update_is_inside_top_layer_member = is_rendered_top_layer_element(*this);
         for (auto* ancestor = flat_tree_parent(); ancestor; ancestor = ancestor->flat_tree_parent()) {
+            if (!update_is_inside_top_layer_member && is_rendered_top_layer_element(*ancestor))
+                update_is_inside_top_layer_member = true;
             if (ancestor->m_child_needs_layout_tree_update)
                 break;
             ancestor->m_child_needs_layout_tree_update = true;
         }
+        if (update_is_inside_top_layer_member)
+            document().set_child_needs_layout_tree_update(true);
 
         // If this is an element with display: contents, we need to propagate the layout tree update to the parent.
         if (auto* element = as_if<Element>(*this)) {

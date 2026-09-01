@@ -276,7 +276,7 @@ bool visible_for_hit_testing(Layout::Node const& node)
 bool has_stacking_context(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
-    return row && row->stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT;
+    return row && row->establishes_stacking_context;
 }
 
 CSS::Display display(Layout::Node const& node)
@@ -529,7 +529,7 @@ Layout::Node const* nearest_self_painting_inline_box(Layout::Node const& node)
     for (auto const* ancestor = node.nearest_fragmented_inline_ancestor(); ancestor; ancestor = ancestor->nearest_fragmented_inline_ancestor()) {
         auto const* row = committed_row(*ancestor);
         if (row && is_inline_paintable(*ancestor)
-            && (row->stacking_context != Layout::RustFFI::NO_STACKING_CONTEXT || is_positioned(*ancestor)))
+            && (row->establishes_stacking_context || is_positioned(*ancestor)))
             return ancestor;
     }
     return nullptr;
@@ -973,13 +973,14 @@ void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidat
         set_needs_repaint(node);
     if (invalidation.repaint_propagated_text_decorations)
         rust_invalidate_propagated_text_decoration_caches(node);
-}
-
-void invalidate_stacking_context(Layout::Node const& node)
-{
-    if (!has_committed_box(node))
-        return;
-    const_cast<DOM::Document&>(node.document()).paint_state().invalidate_stacking_context_tree();
+    if (invalidation.needs_stacking_context_tree_rebuild()) {
+        auto& document = const_cast<DOM::Document&>(node.document());
+        document.schedule_accumulated_visual_context_update(node, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
+        auto const* table_wrapper_carrying_the_moved_table_properties
+            = display(node).is_table_inside() && node.parent() && node.parent()->is_table_wrapper() ? node.parent() : nullptr;
+        if (table_wrapper_carrying_the_moved_table_properties)
+            document.schedule_accumulated_visual_context_update(*table_wrapper_carrying_the_moved_table_properties, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
+    }
 }
 
 void clear_overflow_data(Layout::Node const& node)

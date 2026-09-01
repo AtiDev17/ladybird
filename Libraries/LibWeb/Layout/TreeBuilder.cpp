@@ -63,6 +63,7 @@ private:
     struct PrincipalNodeFrameStorage;
     struct PseudoElementFrameStorage;
     static TraversalDecision clear_stale_layout_node(DOM::Node&, DOM::Node const* cleared_subtree_root = nullptr);
+    static TraversalDecision clear_stale_layout_node_in_subtree(DOM::Node&, DOM::Node const& subtree_root, DOM::Node const* cleared_subtree_root = nullptr);
 
     RustFFI::FfiDomTreeBuilderCallbacks make_ffi_dom_tree_builder_callbacks();
     RustFFI::FfiPseudoTreeBuilderCallbacks make_ffi_pseudo_tree_builder_callbacks();
@@ -78,6 +79,7 @@ private:
 
     Vector<Layout::Node*> m_rebuilt_subtree_roots;
     bool m_layout_tree_update_escaped_rebuild_roots { false };
+    bool m_needs_another_build_pass { false };
 };
 
 void LayoutTreeBuilderAccess::clear_synthetic_pseudo_element_layout_nodes(DOM::Element& element)
@@ -863,6 +865,16 @@ static bool is_svg_resource_box(Node const& layout_node)
     return layout_node.is_svg_pattern_box() || layout_node.is_svg_mask_box() || layout_node.is_svg_clip_box();
 }
 
+TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node_in_subtree(DOM::Node& node, DOM::Node const& subtree_root, DOM::Node const* cleared_subtree_root)
+{
+    if (&node != &subtree_root) {
+        auto const* element = as_if<DOM::Element>(node);
+        if (element && element->rendered_in_top_layer())
+            return TraversalDecision::SkipChildrenAndContinue;
+    }
+    return clear_stale_layout_node(node, cleared_subtree_root);
+}
+
 TraversalDecision LayoutTreeBuildBridge::clear_stale_layout_node(DOM::Node& node, DOM::Node const* cleared_subtree_root)
 {
     node.set_needs_layout_tree_update(false, DOM::SetNeedsLayoutTreeUpdateReason::None);
@@ -921,7 +933,7 @@ void LayoutTreeBuildBridge::detach_top_layer_element_layout_subtree(DOM::Element
             VERIFY(root_pointer);
             auto& root = *static_cast<DOM::Node*>(root_pointer);
             root.for_each_shadow_including_inclusive_descendant([&](auto& node) {
-                return clear_stale_layout_node(node, &root);
+                return clear_stale_layout_node_in_subtree(node, root, &root);
             }); },
         .slot_element = [](void* element_pointer) -> void* {
             VERIFY(element_pointer);
@@ -1003,9 +1015,6 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
                 .slot_element = slot_element,
             };
         },
-        .clear_synthetic_pseudo_element_layout_nodes = [](void*, void* element_pointer) {
-            VERIFY(element_pointer);
-            LayoutTreeBuilderAccess::clear_synthetic_pseudo_element_layout_nodes(*static_cast<DOM::Element*>(element_pointer)); },
         .clear_stale_subtree = [](void* builder_pointer, void* root_pointer, RustFFI::FfiStaleSubtreeClearScope scope) {
             VERIFY(builder_pointer);
             VERIFY(root_pointer);
@@ -1014,11 +1023,11 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
             auto const* cleared_subtree_root = scope == RustFFI::FfiStaleSubtreeClearScope::Inclusive ? nullptr : &root;
             if (scope == RustFFI::FfiStaleSubtreeClearScope::DescendantsBoundedToRoot) {
                 root.for_each_shadow_including_descendant([&](auto& node) {
-                    return builder.clear_stale_layout_node(node, cleared_subtree_root);
+                    return builder.clear_stale_layout_node_in_subtree(node, root, cleared_subtree_root);
                 });
             } else {
                 root.for_each_shadow_including_inclusive_descendant([&](auto& node) {
-                    return builder.clear_stale_layout_node(node, cleared_subtree_root);
+                    return builder.clear_stale_layout_node_in_subtree(node, root, cleared_subtree_root);
                 });
             } },
         .resolve_counters = [](void* element_pointer, RustFFI::FfiPseudoElement ffi_pseudo) {
@@ -1142,6 +1151,16 @@ RustFFI::FfiDomTreeBuilderCallbacks LayoutTreeBuildBridge::make_ffi_dom_tree_bui
         .request_top_layer_zone_rebuild = [](void* node_pointer) {
             VERIFY(node_pointer);
             static_cast<DOM::Node*>(node_pointer)->document().set_top_layer_needs_layout_zone_rebuild(); },
+        .request_layout_tree_rebuild = [](void* builder_pointer, void* element_pointer) {
+            VERIFY(builder_pointer);
+            auto& builder = *static_cast<LayoutTreeBuildBridge*>(builder_pointer);
+            builder.m_needs_another_build_pass = true;
+            if (element_pointer) {
+                static_cast<DOM::Element*>(element_pointer)->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::PseudoElementBoxEscapedRebuildRoot);
+                return;
+            }
+            VERIFY(builder.m_layout_root);
+            builder.m_layout_root->document().set_needs_full_layout_tree_update(true); },
         .push_principal_frame = [](void* builder_pointer, void* node_pointer) -> RustFFI::FfiPrincipalNodeFrame {
             VERIFY(builder_pointer);
             VERIFY(node_pointer);
@@ -1382,6 +1401,7 @@ LayoutTreeBuildResult LayoutTreeBuildBridge::build(DOM::Node& dom_node)
         .root = move(m_layout_root),
         .rebuilt_subtree_roots = move(m_rebuilt_subtree_roots),
         .layout_tree_update_escaped_rebuild_roots = m_layout_tree_update_escaped_rebuild_roots,
+        .needs_another_build_pass = m_needs_another_build_pass,
     };
 }
 

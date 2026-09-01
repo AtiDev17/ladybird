@@ -12,6 +12,8 @@ interface Internals {
     unsigned long long visualContextTreeStructuralEpoch();
     object visualContextNodeIndices(Element element);
     undefined sendMismatchedVisualContextTreeUpdateToCompositor();
+    unsigned long long layoutTreePreOrderLabelViolationCount();
+    unsigned long long layoutTreePreOrderRelabelCount();
     undefined loadReferenceTestMetadata();
 
     Utf16DOMString setTimeZone(Utf16DOMString timeZone);
@@ -131,6 +133,7 @@ interface Internals {
     Utf16DOMString dumpAccessibilityTree();
     Utf16DOMString dumpLayoutTree(Node node);
     Utf16DOMString dumpStackingContextTree();
+    Utf16DOMString stackingContextStructureVerificationReport();
     Utf16DOMString dumpGCGraph();
     Utf16DOMString dumpSessionHistory();
     Utf16DOMString dumpUIProcessSessionHistory();

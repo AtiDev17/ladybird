@@ -669,39 +669,80 @@ void rust_invalidate_propagated_text_decoration_caches(Layout::Node const& node)
     Layout::RustFFI::layout_arena_paintable_invalidate_paint_cache(node.arena_handle(), committed_row_slot(node), true);
 }
 
-void rust_build_stacking_context_tree(DOM::Document& document)
+Utf16String serialize_painting_dump(
+    AccumulatedVisualContextTree const& visual_context_tree,
+    DisplayList const& display_list,
+    DisplayListResourceStorage const& resource_storage,
+    Function<Optional<String>(SpatialNodeIndex)> const& spatial_node_owner_label,
+    Function<Optional<String>(FrameNodeIndex)> const& frame_node_owner_label)
 {
-    Layout::RustFFI::layout_arena_build_stacking_context_tree(layout_arena_handle(document), viewport_row_slot(document));
-}
+    struct DumpContext {
+        DisplayListResourceStorage const& resource_storage;
+        Function<Optional<String>(SpatialNodeIndex)> const& spatial_node_owner_label;
+        Function<Optional<String>(FrameNodeIndex)> const& frame_node_owner_label;
+        Utf16String dump;
+    } context { resource_storage, spatial_node_owner_label, frame_node_owner_label, {} };
 
-static void dump_stacking_context_node(StringBuilder& builder, void* arena, size_t index, int indent)
-{
-    auto node = Layout::RustFFI::layout_arena_stacking_context_tree_node(arena, index);
-    for (int i = 0; i < indent; ++i)
-        builder.append(' ');
-    if (auto const* layout_node = static_cast<Layout::Node const*>(node.layout_node_shell)) {
-        builder.appendff("SC for {} {} (z-index: ", layout_node->debug_description(), absolute_rect(*layout_node));
-        if (node.has_effective_z_index)
-            builder.appendff("{}", node.effective_z_index);
-        else
-            builder.append("auto"sv);
-        builder.append(')');
-        if (has_css_transform(*layout_node))
-            builder.append(", has_transform"sv);
-    } else {
-        builder.append("SC for (gone)"sv);
-    }
-    builder.append('\n');
-    for (size_t child = 0; child < node.child_count; ++child)
-        dump_stacking_context_node(builder, arena, Layout::RustFFI::layout_arena_stacking_context_tree_child(arena, index, child), indent + 1);
+    Layout::RustFFI::FfiPaintingDumpCallbacks callbacks {
+        .context = &context,
+        .owner_label = [](void* context_pointer, bool is_frame, u32 index, void* label_sink) {
+            auto& context = *static_cast<DumpContext*>(context_pointer);
+            auto label = is_frame
+                ? context.frame_node_owner_label(FrameNodeIndex { index })
+                : context.spatial_node_owner_label(SpatialNodeIndex { index });
+            if (!label.has_value())
+                return false;
+            auto label_bytes = label->bytes();
+            Layout::RustFFI::layout_arena_paint_push_bytes(label_sink, label_bytes.data(), label_bytes.size());
+            return true; },
+        .command_bytes = [](void*, void const* display_list_pointer, size_t* byte_count) -> u8 const* {
+            auto bytes = static_cast<DisplayList const*>(display_list_pointer)->command_bytes();
+            *byte_count = bytes.size();
+            return bytes.data();
+        },
+        .nested_display_list = [](void* context_pointer, u64 display_list_id) -> void const* {
+            auto& context = *static_cast<DumpContext*>(context_pointer);
+            return &context.resource_storage.display_list(DisplayListResourceId { display_list_id });
+        },
+        .mask_display_list_count = [](void*, void const* display_list_pointer) -> size_t {
+            return static_cast<DisplayList const*>(display_list_pointer)->mask_display_lists().size();
+        },
+        .mask_display_lists = [](void*, void const* display_list_pointer, u32* frames, u64* display_list_ids) {
+            size_t index = 0;
+            for (auto const& entry : static_cast<DisplayList const*>(display_list_pointer)->mask_display_lists()) {
+                frames[index] = entry.key.value();
+                display_list_ids[index] = entry.value.value();
+                ++index;
+            } },
+        .append_text = [](void* context_pointer, u8 const* bytes, size_t byte_count) { static_cast<DumpContext*>(context_pointer)->dump = Utf16String::from_utf8_without_validation(StringView { bytes, byte_count }); },
+    };
+    auto command_runs = display_list.command_runs();
+    Layout::RustFFI::painting_dump(visual_context_tree.rust_handle(), command_runs.data(), command_runs.size(), &display_list, callbacks);
+    return move(context.dump);
 }
 
 void dump_stacking_context_tree(StringBuilder& builder, DOM::Document const& document)
 {
-    auto* arena = layout_arena_handle(document);
-    if (Layout::RustFFI::layout_arena_stacking_context_tree_node_count(arena) == 0)
-        return;
-    dump_stacking_context_node(builder, arena, 0, 0);
+    Layout::RustFFI::layout_arena_dump_stacking_context_tree(
+        layout_arena_handle(document), viewport_row_slot(document), &builder,
+        [](void* context, Layout::RustFFI::FfiStackingContextDumpEntry entry) {
+            auto& builder = *static_cast<StringBuilder*>(context);
+            for (size_t i = 0; i < entry.depth; ++i)
+                builder.append(' ');
+            if (auto const* layout_node = static_cast<Layout::Node const*>(entry.layout_node_shell)) {
+                builder.appendff("SC for {} {} (z-index: ", layout_node->debug_description(), absolute_rect(*layout_node));
+                if (entry.has_effective_z_index)
+                    builder.appendff("{}", entry.effective_z_index);
+                else
+                    builder.append("auto"sv);
+                builder.append(')');
+                if (has_css_transform(*layout_node))
+                    builder.append(", has_transform"sv);
+            } else {
+                builder.append("SC for (gone)"sv);
+            }
+            builder.append('\n');
+        });
 }
 
 namespace {
