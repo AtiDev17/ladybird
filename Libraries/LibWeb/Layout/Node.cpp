@@ -67,6 +67,7 @@ Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, AttachToDOMNode att
     set_flag(RustFFI::NodeFlag::IsReplacedElement, node && is<HTML::HTMLInputElement>(*node));
     set_flag(RustFFI::NodeFlag::IsHtmlInputElement, node && is<HTML::HTMLInputElement>(*node));
     set_flag(RustFFI::NodeFlag::IsHtmlHtmlElement, node && node->is_html_html_element());
+    set_flag(RustFFI::NodeFlag::IsDocumentElement, node && node.ptr() == document.document_element());
     set_flag(RustFFI::NodeFlag::IsInUserAgentShadowTree,
         node && node->containing_shadow_root() && node->containing_shadow_root()->is_user_agent_internal());
     set_flag(RustFFI::NodeFlag::UsesButtonLayout,
@@ -150,51 +151,12 @@ void Node::enroll_for_arena_replaced_content_facts_sync_if_eligible()
     if (!RustFFI::layout_node_data_may_have_replaced_content_facts(m_data))
         return;
     m_enrolled_for_arena_replaced_content_facts_sync = true;
-    node_arena().enroll_node_for_replaced_content_facts_sync(*this);
-}
-
-bool Node::fragment_cache_epochs_enabled()
-{
-    // The Rust cache module owns the only LADYBIRD_FC_RUN_CACHE parser; the
-    // bump walks follow whatever mode it resolved.
-    static bool const enabled = RustFFI::layout_fc_run_cache_epochs_enabled();
-    return enabled;
-}
-
-void Node::bump_fragment_cache_epoch()
-{
-    if (!fragment_cache_epochs_enabled())
-        return;
-    ++node_data().fragment_cache_epoch;
+    RustFFI::layout_arena_enroll_node_for_replaced_content_facts_sync(arena_handle(), slot_id(this));
 }
 
 void Node::bump_fragment_cache_epoch_of_self_and_ancestors()
 {
     RustFFI::layout_arena_bump_fragment_cache_epoch_of_self_and_ancestors(arena_handle(), slot_id(this));
-}
-
-// Reset intrinsic size caches for ancestors up to abspos or SVG root boundary.
-// Absolutely positioned elements don't contribute to ancestor intrinsic sizes,
-// so changes inside an abspos box don't require resetting ancestor caches.
-// SVG root elements have intrinsic sizes determined solely by their own attributes
-// (width, height, viewBox), not by their children, so the same logic applies.
-static void reset_cached_intrinsic_sizes_of_ancestors(Node& node)
-{
-    for (auto* ancestor = node.parent(); ancestor; ancestor = ancestor->parent()) {
-        auto* box = as_if<Box>(ancestor);
-        if (!box)
-            continue;
-        box->reset_cached_intrinsic_sizes();
-        if (box->is_absolutely_positioned() || box->is_svg_svg_box())
-            break;
-    }
-}
-
-static void reset_cached_intrinsic_sizes_of_self_and_ancestors(Node& node)
-{
-    if (auto* box = as_if<Box>(node))
-        box->reset_cached_intrinsic_sizes();
-    reset_cached_intrinsic_sizes_of_ancestors(node);
 }
 
 void* Node::arena_handle() const
@@ -212,12 +174,6 @@ Box* Node::containing_block()
     return static_cast<Box*>(tree_node_from_slot_if_live(m_data->containing_block));
 }
 
-static void invalidate_paint_caches(Node& node)
-{
-    if (Painting::has_committed_box(node))
-        Painting::invalidate_paint_cache(node);
-}
-
 void Node::pin_style_record_for_detachment()
 {
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
@@ -227,7 +183,7 @@ void Node::pin_style_record_for_detachment()
 void Node::prepare_for_detach_from_layout_tree()
 {
     pin_style_record_for_detachment();
-    invalidate_paint_caches(*this);
+    Painting::invalidate_paint_cache(*this);
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
         node_with_style->clear_image_observers();
     if (kind() == RustFFI::NodeKind::ImageBox)
@@ -258,135 +214,19 @@ bool Node::is_pseudo_element_principal_box() const
     return pseudo_element.has_value() && pseudo_element_generator()->pseudo_element_unsafe_layout_node(*pseudo_element) == this;
 }
 
-// https://drafts.csswg.org/css-position-3/#fixed-positioning-containing-block
-static bool style_establishes_fixed_positioning_containing_block(NodeWithStyle const& node)
-{
-    // https://drafts.csswg.org/css-will-change/#will-change
-    // If any non-initial value of a property would cause the element to generate a containing block for fixed
-    // positioned elements, specifying that property in will-change must cause the element to generate a containing
-    // block for fixed positioned elements.
-    auto const& will_change = node.will_change();
-    auto has_will_change = !will_change.is_auto();
-    auto will_change_property = [&](CSS::PropertyID property_id) {
-        return has_will_change && will_change.has_property(property_id);
-    };
-
-    Optional<bool> is_transformable;
-    auto node_is_transformable = [&] {
-        if (!is_transformable.has_value())
-            is_transformable = node.is_transformable();
-        return *is_transformable;
-    };
-
-    // https://drafts.csswg.org/css-transforms-1/#propdef-transform
-    // Any computed value other than none for the transform affects containing block and stacking context.
-    if ((node.has_transformations() || will_change_property(CSS::PropertyID::Transform)) && node_is_transformable())
-        return true;
-    if ((node.has_translate() || will_change_property(CSS::PropertyID::Translate)) && node_is_transformable())
-        return true;
-    if ((node.has_rotate() || will_change_property(CSS::PropertyID::Rotate)) && node_is_transformable())
-        return true;
-    if ((node.has_scale() || will_change_property(CSS::PropertyID::Scale)) && node_is_transformable())
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#propdef-perspective
-    // The use of this property with any value other than 'none' establishes a stacking context. It also establishes
-    // a containing block for all descendants, just like the 'transform' property does.
-    if ((node.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective)) && node_is_transformable())
-        return true;
-
-    // https://drafts.csswg.org/filter-effects-1/#FilterProperty
-    // A value other than none for the filter property results in the creation of a containing block for absolute and
-    // fixed positioned descendants, unless the element it applies to is a document root element in the current
-    // browsing context.
-    if ((node.filter().has_filters() || will_change_property(CSS::PropertyID::Filter)) && !node.is_root_element())
-        return true;
-
-    // https://drafts.csswg.org/filter-effects-2/#BackdropFilterProperty
-    // A computed value of other than none results in the creation of both a stacking context and a containing block
-    // for absolute and fixed position descendants, unless the element it applies to is a document root element in the
-    // current browsing context.
-    if ((node.backdrop_filter().has_filters() || will_change_property(CSS::PropertyID::BackdropFilter)) && !node.is_root_element())
-        return true;
-
-    // https://drafts.csswg.org/css-contain-2/#containment-types
-    // 4. The layout containment box establishes an absolute positioning containing block and a fixed positioning
-    //    containing block.
-    // 4. The paint containment box establishes an absolute positioning containing block and a fixed positioning
-    //    containing block.
-    if (will_change_property(CSS::PropertyID::Contain))
-        return true;
-    auto content_visibility_adds_containment = node.content_visibility() == CSS::ContentVisibility::Auto;
-    if ((node.contain().layout_containment || content_visibility_adds_containment) && node.has_layout_containment())
-        return true;
-    if ((node.contain().paint_containment || content_visibility_adds_containment) && node.has_paint_containment())
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#transform-style-property
-    // A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
-    // stacking context and a containing block for all descendants.
-    if ((node.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle)) && node_is_transformable())
-        return true;
-
-    // https://drafts.csswg.org/css-transforms-2/#backface-visibility-property
-    // A computed value of hidden for backface-visibility on a transformable element that participates in a 3D
-    // rendering context establishes both a stacking context and a containing block for all descendants.
-    if ((node.style_group<CSS::ComputedValues::TransformValues>().backface_visibility_value() == CSS::BackfaceVisibility::Hidden || will_change_property(CSS::PropertyID::BackfaceVisibility))
-        && node_is_transformable() && node.participates_in_a_3d_rendering_context())
-        return true;
-
-    // https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-concept
-    // FIXME: The snapshot containing block is considered to be an absolute positioning containing block and a fixed
-    //        positioning containing block for ::view-transition and its descendants.
-
-    return false;
-}
-
-// https://drafts.csswg.org/css-position-3/#absolute-positioning-containing-block
-// Checks if the computed values of this node would establish an absolute positioning
-// containing block. This is separate from establishes_an_absolute_positioning_containing_block()
-// because that function also checks is<Box>, but we need these checks for inline elements too.
-bool NodeWithStyle::style_establishes_absolute_positioning_containing_block() const
-{
-    // https://drafts.csswg.org/css-position/#position-property
-    // Values other than 'static' make the box a positioned box, and cause it to establish an absolute positioning
-    // containing block for its descendants.
-    if (position() != CSS::Positioning::Static
-        || (!will_change().is_auto() && will_change().has_property(CSS::PropertyID::Position)))
-        return true;
-
-    return style_establishes_fixed_positioning_containing_block(*this);
-}
-
-// https://drafts.csswg.org/css-position-3/#absolute-positioning-containing-block
 bool NodeWithStyle::establishes_an_absolute_positioning_containing_block() const
 {
-    if (!is<Box>(*this))
-        return false;
-
-    if (is<Viewport>(*this))
-        return true;
-
-    // https://github.com/w3c/fxtf-drafts/issues/307#issuecomment-499612420
-    // foreignObject establishes a containing block for absolutely and fixed positioned elements.
-    if (is_svg_foreign_object_box())
-        return true;
-
-    return style_establishes_absolute_positioning_containing_block();
+    return RustFFI::layout_arena_node_establishes_an_absolute_positioning_containing_block(arena_handle(), Node::slot_id(this));
 }
 
-// https://drafts.csswg.org/css-position-3/#fixed-positioning-containing-block
 bool NodeWithStyle::establishes_a_fixed_positioning_containing_block() const
 {
-    if (!is<Box>(*this))
-        return false;
+    return RustFFI::layout_arena_node_establishes_a_fixed_positioning_containing_block(arena_handle(), Node::slot_id(this));
+}
 
-    // https://github.com/w3c/fxtf-drafts/issues/307#issuecomment-499612420
-    // foreignObject establishes a containing block for absolutely and fixed positioned elements.
-    if (is_svg_foreign_object_box())
-        return true;
-
-    return style_establishes_fixed_positioning_containing_block(*this);
+bool NodeWithStyle::has_css_transform() const
+{
+    return RustFFI::layout_arena_node_has_css_transform(arena_handle(), Node::slot_id(this));
 }
 
 // FIXME: Containing block handling for absolutely positioned elements needs architectural improvements.
@@ -640,6 +480,7 @@ void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
     m_background_layers.clear();
     m_mask_layers.clear();
     m_border_image.clear();
+    m_list_style_type.clear();
     m_list_style_image.clear();
     m_owned_computed_values = nullptr;
     m_style_record_identity = style_record_identity;
@@ -761,13 +602,6 @@ String Node::debug_description() const
     return MUST(builder.to_string());
 }
 
-bool Node::is_inline() const
-{
-    if (is<TextNode>(*this))
-        return true;
-    return as<NodeWithStyle>(*this).display().is_inline_outside();
-}
-
 bool NodeWithStyle::is_inline_block() const
 {
     auto display = this->display();
@@ -780,11 +614,6 @@ bool NodeWithStyle::is_inline_table() const
     return display.is_inline_outside() && display.is_table_inside();
 }
 
-bool Node::is_replaced_element() const
-{
-    return has_flag(RustFFI::NodeFlag::IsReplacedElement);
-}
-
 bool Node::is_atomic_inline() const
 {
     return RustFFI::layout_node_data_is_atomic_inline(m_data);
@@ -793,17 +622,6 @@ bool Node::is_atomic_inline() const
 bool Node::is_fragmented_inline() const
 {
     return RustFFI::layout_node_data_is_fragmented_inline(m_data);
-}
-
-NodeWithStyle const* Node::nearest_fragmented_inline_ancestor() const
-{
-    for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
-        if (!ancestor->display().is_inline_outside() || !ancestor->display().is_flow_inside())
-            break;
-        if (ancestor->is_fragmented_inline())
-            return static_cast<NodeWithStyle const*>(ancestor);
-    }
-    return nullptr;
 }
 
 // https://drafts.csswg.org/css-transforms-1/#transformable-element
@@ -821,90 +639,6 @@ Gfx::AffineTransform NodeWithStyle::used_svg_element_transform() const
     if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(dom_node()))
         transform.multiply(graphics_element->additional_element_transform());
     return transform;
-}
-
-bool NodeWithStyle::is_transformable() const
-{
-    // A transformable element is an element in one of these categories:
-    auto const* dom_node = this->dom_node();
-
-    // * all SVG paint server elements, the clipPath element and SVG renderable elements with the exception
-    //   of any descendant element of text content elements [SVG2].
-    if (is<SVG::SVGElement>(dom_node)) {
-        // Paint servers and clipPath are always transformable.
-        if (is<SVG::SVGGradientElement>(*dom_node) || is<SVG::SVGPatternElement>(*dom_node) || is<SVG::SVGClipPathElement>(*dom_node))
-            return true;
-        auto const is_renderable = (is_svg_graphics_box() && !is_svg_mask_box()) || is_svg_svg_box() || is_svg_foreign_object_box();
-        if (!is_renderable)
-            return false;
-        // ...with the exception of any descendant of a text content element.
-        for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
-            if (auto const* ancestor_dom_node = ancestor->dom_node(); ancestor_dom_node && is<SVG::SVGTextContentElement>(*ancestor_dom_node))
-                return false;
-        }
-        return true;
-    }
-
-    // * all elements whose layout is governed by the CSS box model except for non-replaced inline boxes,
-    //   table-column boxes, and table-column-group boxes [CSS2].
-    bool is_element_or_pseudo_element = is<DOM::Element>(dom_node) || is_generated_for_pseudo_element();
-    if (is_element_or_pseudo_element && is_box()) {
-        auto display = this->display();
-        if (display.is_table_column() || display.is_table_column_group())
-            return false;
-
-        if (is_inline() && !is_atomic_inline())
-            return false;
-
-        return true;
-    }
-
-    return false;
-}
-
-// https://drafts.csswg.org/css-transforms-2/#grouping-property-values
-CSS::TransformStyle NodeWithStyle::used_transform_style() const
-{
-    if (transform_style() == CSS::TransformStyle::Flat)
-        return CSS::TransformStyle::Flat;
-
-    // Keep this in sync with ComputedValues::has_transform_style_grouping_property().
-    auto has_mask_layer_image = any_of(mask_layers(), [](auto const& layer) { return layer.background_image != nullptr; });
-    bool has_transform_style_grouping_property = (overflow_x() != CSS::Overflow::Visible && overflow_x() != CSS::Overflow::Clip)
-        || (overflow_y() != CSS::Overflow::Visible && overflow_y() != CSS::Overflow::Clip)
-        || opacity() < 1
-        || filter().has_filters()
-        || !clip().is_auto()
-        || clip_path().has_value()
-        || isolation() == CSS::Isolation::Isolate
-        || mask().has_value()
-        || has_mask_layer_image
-        || mix_blend_mode() != CSS::MixBlendMode::Normal
-        || backdrop_filter().has_filters();
-    if (has_transform_style_grouping_property)
-        return CSS::TransformStyle::Flat;
-
-    // contain: paint and any other property/value combination that causes paint containment.
-    // FIXME: has_paint_containment() does not cover content-visibility: hidden, which also causes paint containment.
-    if (has_paint_containment())
-        return CSS::TransformStyle::Flat;
-
-    return CSS::TransformStyle::Preserve3d;
-}
-
-bool NodeWithStyle::establishes_or_extends_a_3d_rendering_context() const
-{
-    return is_transformable() && used_transform_style() == CSS::TransformStyle::Preserve3d;
-}
-
-// https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts
-bool NodeWithStyle::participates_in_a_3d_rendering_context() const
-{
-    // An element participates in a 3D rendering context if its parent establishes or extends a 3D rendering context.
-    auto const* ancestor = parent();
-    while (ancestor && ancestor->is_anonymous())
-        ancestor = ancestor->parent();
-    return ancestor && ancestor->establishes_or_extends_a_3d_rendering_context();
 }
 
 NonnullRefPtr<NodeWithStyle> NodeWithStyle::create_anonymous_wrapper() const
@@ -946,6 +680,7 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
     m_background_layers.clear();
     m_mask_layers.clear();
     m_border_image.clear();
+    m_list_style_type.clear();
     m_list_style_image.clear();
     Optional<DOM::AbstractElement> abstract_element;
     if (is_generated_for_pseudo_element())
@@ -977,7 +712,7 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
 
     if (changes_layout_affecting_style) {
         bump_fragment_cache_epoch_of_self_and_ancestors();
-        reset_cached_intrinsic_sizes_of_self_and_ancestors(*this);
+        RustFFI::layout_arena_reset_cached_intrinsic_sizes_of_self_and_ancestors(arena_handle(), slot_id(this));
     }
 
     for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
@@ -1009,6 +744,7 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
     m_background_layers.clear();
     m_mask_layers.clear();
     m_border_image.clear();
+    m_list_style_type.clear();
     m_list_style_image.clear();
     m_owned_computed_values = nullptr;
     m_style_record_identity = style_record_identity;
@@ -1023,7 +759,7 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
 
     if (changes_layout_affecting_style) {
         bump_fragment_cache_epoch_of_self_and_ancestors();
-        reset_cached_intrinsic_sizes_of_self_and_ancestors(*this);
+        RustFFI::layout_arena_reset_cached_intrinsic_sizes_of_self_and_ancestors(arena_handle(), slot_id(this));
     }
 }
 
@@ -1115,12 +851,7 @@ bool NodeWithStyle::synchronize_table_span_data()
             raw_column_span = column->get_attribute_value(HTML::AttributeNames::span).to_number<u32>().value_or(1);
         }
     }
-    bool effective_spans_changed = node_data().table_column_span != column_span
-        || node_data().table_row_span != row_span;
-    node_data().table_column_span = column_span;
-    node_data().table_row_span = row_span;
-    u32 previous_raw_column_span = RustFFI::layout_arena_set_raw_table_column_span(arena_handle(), slot_id(this), raw_column_span);
-    return effective_spans_changed || previous_raw_column_span != raw_column_span;
+    return RustFFI::layout_arena_set_table_spans(arena_handle(), slot_id(this), column_span, row_span, raw_column_span);
 }
 
 void NodeWithStyle::set_display(CSS::Display display)
@@ -1229,7 +960,6 @@ bool NodeWithStyle::is_scroll_container() const
 
 void Node::clear_committed_box()
 {
-    invalidate_paint_caches(*this);
     RustFFI::layout_arena_paintable_cleared_from_node(arena_handle(), slot_id(this));
 }
 
@@ -1339,144 +1069,18 @@ bool NodeWithStyle::has_size_containment() const
 
     return false;
 }
-// https://drafts.csswg.org/css-contain-2/#containment-layout
-bool NodeWithStyle::has_layout_containment() const
-{
-    auto has_layout_containment = contain().layout_containment;
-
-    // https://drafts.csswg.org/css-contain-2/#valdef-content-visibility-auto
-    // Changes the used value of the 'contain' property so as to turn on layout containment, style containment, and
-    // paint containment for the element.
-    has_layout_containment = has_layout_containment || content_visibility() == CSS::ContentVisibility::Auto;
-    if (!has_layout_containment)
-        return false;
-
-    // However, giving an element layout containment has no effect if any of the following are true:
-
-    // - if the element does not generate a principal box (as is the case with 'display: contents' or 'display: none')
-    // Note: This is the principal box
-
-    // - if its principal box is an internal table box other than 'table-cell'
-    if (display().is_internal_table() && !display().is_table_cell())
-        return false;
-
-    // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Also check for internal ruby boxes.
-    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
-        return false;
-
-    return true;
-}
-// https://drafts.csswg.org/css-contain-2/#containment-style
-bool NodeWithStyle::has_style_containment() const
-{
-    // However, giving an element style containment has no effect if any of the following are true:
-
-    // - if the element does not generate a principal box (as is the case with 'display: contents' or 'display: none')
-    // Note: This is the principal box
-
-    if (contain().style_containment)
-        return true;
-
-    if (container_type().is_size_container || container_type().is_inline_size_container)
-        return true;
-
-    // https://drafts.csswg.org/css-contain-2/#valdef-content-visibility-auto
-    // Changes the used value of the 'contain' property so as to turn on layout containment, style containment, and
-    // paint containment for the element.
-    if (content_visibility() == CSS::ContentVisibility::Auto)
-        return true;
-
-    return false;
-}
-// https://drafts.csswg.org/css-contain-2/#containment-paint
-bool NodeWithStyle::has_paint_containment() const
-{
-    auto has_paint_containment = contain().paint_containment;
-
-    // https://drafts.csswg.org/css-contain-2/#valdef-content-visibility-auto
-    // Changes the used value of the 'contain' property so as to turn on layout containment, style containment, and
-    // paint containment for the element.
-    has_paint_containment = has_paint_containment || content_visibility() == CSS::ContentVisibility::Auto;
-    if (!has_paint_containment)
-        return false;
-
-    // However, giving an element paint containment has no effect if any of the following are true:
-
-    // - if the element does not generate a principal box (as is the case with 'display: contents' or 'display: none')
-    // Note: This is the principal box
-
-    // - if its principal box is an internal table box other than 'table-cell'
-    if (display().is_internal_table() && !display().is_table_cell())
-        return false;
-
-    // - if its principal box is an internal ruby box or a non-atomic inline-level box
-    // FIXME: Also check for internal ruby boxes.
-    if (display().is_inline_outside() && display().is_flow_inside() && !is_replaced_box())
-        return false;
-
-    return true;
-}
-
 void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason, LayoutUpdatePropagation propagation)
 {
-    // Bumped before the already-dirty early return below: a dirty node does not imply its
-    // whole ancestor chain was bumped for the current epoch values, and over-bumping is free.
-    bump_fragment_cache_epoch_of_self_and_ancestors();
-
-    if (needs_layout_update() && propagation == LayoutUpdatePropagation::ThroughAncestors) {
-        // A dirty node normally implies dirty ancestors, but the walk that marked a partial
-        // relayout boundary stopped there and left its ancestors clean, so a through-ancestors
-        // invalidation arriving on the boundary itself must still walk and mark them.
-        auto* box = as_if<Box>(this);
-        if (!box || !box->is_partial_relayout_boundary())
-            return;
-    }
-
-    if (!needs_layout_update()) {
-        if constexpr (UPDATE_LAYOUT_DEBUG) {
-            // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
+    if constexpr (UPDATE_LAYOUT_DEBUG) {
+        // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
+        if (!needs_layout_update()) {
             auto navigable = this->navigable();
             if (navigable && navigable->active_document() == GC::Ptr { &document() })
                 dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", DOM::to_string(reason));
         }
-
-        set_flag(RustFFI::NodeFlag::NeedsLayoutUpdate, true);
-        // Relayout may rebuild an identical fragment whose cached paint output the commit diff
-        // then keeps, even when what this node paints changed (its image data arrived).
-        invalidate_paint_caches(*this);
     }
-
-    if (auto* box = as_if<Box>(this))
-        box->reset_cached_intrinsic_sizes();
-
-    // Mark any anonymous children generated by this node for layout update.
-    // NOTE: if this node generated an anonymous parent, all ancestors are indiscriminately marked below.
-    for_each_child_of_type<Box>([&](Box& child) {
-        if (child.is_anonymous() && !child.is_table_wrapper()) {
-            child.bump_fragment_cache_epoch();
-            child.set_flag(RustFFI::NodeFlag::NeedsLayoutUpdate, true);
-            child.reset_cached_intrinsic_sizes();
-        }
-        return IterationDecision::Continue;
-    });
-
-    if (propagation == LayoutUpdatePropagation::BoundarySelfOnly) {
-        document().partial_relayout_invalidation().record_boundary(as<Box>(*this));
-        return;
-    }
-
-    for (auto* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
-        if (ancestor->needs_layout_update())
-            break;
-        ancestor->set_flag(RustFFI::NodeFlag::NeedsLayoutUpdate, true);
-        if (auto* box = as_if<Box>(ancestor); box && box->is_partial_relayout_boundary()) {
-            document().partial_relayout_invalidation().record_boundary(*box);
-            break;
-        }
-    }
-
-    reset_cached_intrinsic_sizes_of_ancestors(*this);
+    RustFFI::layout_arena_set_needs_layout_update(arena_handle(), slot_id(this),
+        propagation == LayoutUpdatePropagation::ThroughAncestors);
 }
 
 }

@@ -159,16 +159,18 @@ pub(crate) fn has_layout_containment(arena: &LayoutNodeArena, node: NodeSlotId, 
 }
 
 pub(crate) fn is_scroll_container(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
-    if arena.node_kind_if_live(node) == Some(NodeKind::Viewport) {
-        return true;
-    }
-    let Some(style) = arena.node_style_if_live(node) else {
+    let Some(kind) = arena.node_kind_if_live(node) else {
         return false;
     };
-    let overflow_value_makes_box_a_scroll_container =
-        |overflow_keyword: u8| matches!(overflow_keyword, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
-    overflow_value_makes_box_a_scroll_container(style.overflow_x())
-        || overflow_value_makes_box_a_scroll_container(style.overflow_y())
+    node_facts::kind_and_style_make_scroll_container(kind, arena.node_style_if_live(node))
+}
+
+pub(crate) fn has_style_containment(style: ComputedValuesView<'_>) -> bool {
+    let box_values = style.box_values();
+    box_values.style_containment
+        || box_values.is_size_container
+        || box_values.is_inline_size_container
+        || style.content_visibility() == content_visibility::AUTO
 }
 
 pub(crate) fn has_paint_containment(arena: &LayoutNodeArena, node: NodeSlotId, style: ComputedValuesView<'_>) -> bool {

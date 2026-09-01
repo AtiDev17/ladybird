@@ -38,20 +38,6 @@ Box::~Box()
 {
 }
 
-void Box::drop_cached_intrinsic_sizes()
-{
-    node_arena().drop_intrinsic_size_cache(node_data());
-}
-
-void Box::set_default_scroll_shift(WeakPtr<Node> anchor, bool compensates_for_horizontal_scroll, bool compensates_for_vertical_scroll)
-{
-    m_default_scroll_shift_anchor = move(anchor);
-    set_flag(RustFFI::NodeFlag::CompensatesForHorizontalScroll, compensates_for_horizontal_scroll);
-    set_flag(RustFFI::NodeFlag::CompensatesForVerticalScroll, compensates_for_vertical_scroll);
-    if (m_default_scroll_shift_anchor)
-        document().note_default_scroll_shift_anchor();
-}
-
 static ImageProvider const& image_provider_for_element(DOM::Element const& element)
 {
     if (auto const* image = as_if<HTML::HTMLImageElement>(element))
@@ -81,67 +67,9 @@ void Box::set_owned_image_provider(NonnullOwnPtr<ImageProvider> image_provider)
     m_owned_image_provider = move(image_provider);
 }
 
-static bool commit_splice_position_is_derivable_from_layout_ancestors(Box const& box)
-{
-    for (auto const* ancestor = box.parent_ptr(); ancestor; ancestor = ancestor->parent_ptr()) {
-        if (Painting::has_committed_box(*ancestor))
-            return true;
-        if (!ancestor->is_fragmented_inline())
-            return false;
-    }
-    return false;
-}
-
 bool Box::is_partial_relayout_boundary() const
 {
-    // An absolutely or fixed positioned descendant whose containing block is outside this
-    // box's subtree is laid out by a formatting context outside it, which makes subtree
-    // isolation impossible for any kind of boundary.
-    if (abspos_descendant_escapes())
-        return false;
-
-    if (!Painting::has_committed_box(*this) && !commit_splice_position_is_derivable_from_layout_ancestors(*this))
-        return false;
-
-    // An in-flow SVG viewport's used size is determined solely by its own attributes and outer
-    // context, never by its children, so its size and position from the previous layout can be
-    // reused - provided a commit has actually saved them; its content lays out in the viewport's
-    // own user units, so a nested <svg> is just as reproducible from its own root as the
-    // outermost one. An absolutely positioned SVG root's placement is not frozen, so it must
-    // qualify through the saved-inputs replay path below instead.
-    if (is_svg_svg_box() && !is_absolutely_positioned())
-        return has_committed_fragment_link();
-
-    if (!is_absolutely_positioned())
-        return false;
-    if (is_anonymous())
-        return false;
-    if (dom_node() == document().document_element())
-        return false;
-    if (!has_saved_abspos_layout_inputs())
-        return false;
-
-    // Only a full layout pass resolves anchor() functions in the inset properties to plain
-    // values; a replay from saved inputs cannot.
-    if (insets_use_anchor_functions())
-        return false;
-
-    // NOTE: Content-dependent sizing (shrink-to-fit, intrinsic constraints, aspect-ratio) does
-    //       not disqualify a boundary: replay re-solves the boundary's own size, and a resized
-    //       boundary triggers ancestor scrollable overflow recomputation after commit.
-
-    auto formatting_context_type = formatting_context_type_created_by_box(*this);
-    if (!formatting_context_type.has_value())
-        return false;
-    switch (*formatting_context_type) {
-    case RustFFI::FfiFormattingContextType::Block:
-    case RustFFI::FfiFormattingContextType::Flex:
-    case RustFFI::FfiFormattingContextType::Grid:
-    case RustFFI::FfiFormattingContextType::Svg:
-        return true;
-    default:
-        return false;
-    }
+    return RustFFI::layout_arena_node_is_partial_relayout_boundary(arena_handle(), Node::slot_id(this));
 }
 
 static CSS::SizeWithAspectRatio default_preferred_size_for_text_control(HTML::HTMLInputElement const& input_element, Box const& box)
@@ -317,31 +245,6 @@ void Box::notify_content_navigable_of_committed_viewport()
         as<HTML::LocalNavigable>(*content_navigable).set_viewport_size(content_size);
         document().page().client().page_did_update_child_frame_viewport(content_navigable->id(), Painting::absolute_rect(*this));
     }
-}
-
-Optional<CSSPixelFraction> Box::preferred_aspect_ratio() const
-{
-    auto computed_aspect_ratio = aspect_ratio();
-
-    // https://www.w3.org/TR/css-contain-2/#containment-size
-    if (!has_size_containment() && computed_aspect_ratio.use_natural_aspect_ratio_if_available) {
-        if (auto auto_size = auto_content_box_size(); auto_size.has_aspect_ratio())
-            return auto_size.aspect_ratio;
-    }
-
-    if (!computed_aspect_ratio.preferred_ratio.has_value())
-        return {};
-
-    auto ratio = computed_aspect_ratio.preferred_ratio.value();
-    if (ratio.is_degenerate())
-        return {};
-
-    auto fraction = CSSPixelFraction(ratio.numerator(), ratio.denominator());
-    // ratio.is_degenerate() operates on doubles while CSSPixelFraction uses CSSPixels, so we need to check again here.
-    if (fraction == 0)
-        return {};
-
-    return fraction;
 }
 
 }

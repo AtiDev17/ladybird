@@ -211,6 +211,7 @@ public:
     }
 
     bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
+    bool is_document_element() const { return has_flag(RustFFI::NodeFlag::IsDocumentElement); }
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
@@ -221,12 +222,6 @@ public:
     bool needs_layout_update() const { return has_flag(RustFFI::NodeFlag::NeedsLayoutUpdate); }
     void set_retains_compositor_animated_content(bool value) { set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, value); }
 
-    // The formatting-context run cache (LADYBIRD_FC_RUN_CACHE) validates its entries against
-    // these epochs; with the cache disabled nothing reads them, so the walks no-op.
-    static bool fragment_cache_epochs_enabled();
-
-    void bump_fragment_cache_epoch();
-
     // Any invalidation below a node must reach every ancestor's epoch: cached runs capture
     // subtree structure, and unlike intrinsic-size invalidation there is no absolutely-positioned
     // or SVG boundary — those descendants' fragments live in ancestor run trees. The arena runs
@@ -236,14 +231,8 @@ public:
 
     // Set when a style change altered geometry-determining properties of this node itself, so
     // a partial relayout must re-resolve its own size and position instead of reusing them.
-    bool needs_own_geometry_update() const { return has_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate); }
     void set_needs_own_geometry_update() { set_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate, true); }
     void set_needs_layout_update(DOM::SetNeedsLayoutReason, LayoutUpdatePropagation = LayoutUpdatePropagation::ThroughAncestors);
-    void reset_needs_layout_update()
-    {
-        set_flag(RustFFI::NodeFlag::NeedsLayoutUpdate, false);
-        set_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate, false);
-    }
 
     bool is_generated_for_pseudo_element() const { return m_data->generated_for != 0; }
     Optional<CSS::PseudoElement> generated_for_pseudo_element() const
@@ -283,12 +272,8 @@ public:
     bool has_style() const { return has_flag(RustFFI::NodeFlag::HasStyle); }
     bool has_style_or_parent_with_style() const;
 
-    bool is_inline() const;
-
-    bool is_replaced_element() const;
     bool is_atomic_inline() const;
     bool is_fragmented_inline() const;
-    NodeWithStyle const* nearest_fragmented_inline_ancestor() const;
 
     // These optimize hot is<T> variants for the surviving layout classes where dynamic_cast is too slow.
     virtual bool is_box() const { return false; }
@@ -344,8 +329,6 @@ public:
 
     // https://drafts.csswg.org/css-ui/#propdef-user-select
     CSS::UserSelect user_select_used_value() const;
-
-    void set_has_been_wrapped_in_table_wrapper(bool value) { set_flag(RustFFI::NodeFlag::HasBeenWrappedInTableWrapper, value); }
 
     enum class AttachToDOMNode {
         No,
@@ -430,7 +413,6 @@ public:
     ImageObserver const* border_image_source_observer() const { return m_image_observers.border_image_source.ptr(); }
 
     NonnullRefPtr<CSS::ComputedValues const> copy_computed_values() const;
-    CSS::ComputedStyleRecordView computed_style_record_view() const;
     CSS::StyleRecordID style_record_identity() const { return m_style_record_identity; }
 
     template<typename StyleGroup>
@@ -491,16 +473,6 @@ public:
             return {};
         return values.z_index;
     }
-    CSS::AspectRatio aspect_ratio() const
-    {
-        auto const& value = style_group<CSS::ComputedValues::BoxValues>().aspect_ratio;
-        return {
-            value.use_natural_aspect_ratio_if_available,
-            value.has_preferred_ratio ? Optional<CSS::Ratio> { CSS::Ratio { value.preferred_ratio_numerator, value.preferred_ratio_denominator } } : OptionalNone {},
-            value.computed_use_natural_aspect_ratio_if_available,
-            value.has_computed_ratio ? Optional<CSS::Ratio> { CSS::Ratio { value.computed_ratio_numerator, value.computed_ratio_denominator } } : OptionalNone {},
-        };
-    }
     CSS::Containment contain() const
     {
         auto const& values = style_group<CSS::ComputedValues::BoxValues>();
@@ -549,8 +521,8 @@ public:
     ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor() const { return style_group<CSS::ComputedValues::InheritedUIValues>().cursor_span(); }
     ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values() const { return m_cursor_style_values; }
     CSS::PointerEvents pointer_events() const { return style_group<CSS::ComputedValues::InheritedUIValues>().pointer_events_value(); }
-    CSS::ScrollbarColorData scrollbar_color() const { return style_group<CSS::ComputedValues::InheritedUIValues>().scrollbar_color_value(); }
     CSS::Appearance appearance() const { return static_cast<CSS::Appearance>(style_group<CSS::ComputedValues::MiscResetValues>().appearance); }
+    CSS::WillChange will_change() const { return style_group<CSS::ComputedValues::MiscResetValues>().will_change_value(); }
     CSS::LengthBox scroll_margin() const { return length_box(style_group<CSS::ComputedValues::MiscResetValues>().scroll_margin); }
     CSS::LengthBox scroll_padding() const { return length_box(style_group<CSS::ComputedValues::MiscResetValues>().scroll_padding); }
     CSS::ScrollSnapAlignData scroll_snap_align() const { return style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_align_value(); }
@@ -558,7 +530,6 @@ public:
     CSS::ScrollSnapType scroll_snap_type() const { return style_group<CSS::ComputedValues::MiscResetValues>().scroll_snap_type_value(); }
     CSS::ScrollbarWidth scrollbar_width() const { return static_cast<CSS::ScrollbarWidth>(style_group<CSS::ComputedValues::MiscResetValues>().scrollbar_width); }
     CSS::UserSelect user_select() const { return static_cast<CSS::UserSelect>(style_group<CSS::ComputedValues::MiscResetValues>().user_select); }
-    CSS::WillChange will_change() const { return style_group<CSS::ComputedValues::MiscResetValues>().will_change_value(); }
     Optional<Utf16FlyString> view_transition_name() const { return style_group<CSS::ComputedValues::MiscResetValues>().view_transition_name_value(); }
     Color outline_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().outline_color); }
     CSSPixels outline_offset() const { return style_group<CSS::ComputedValues::MiscResetValues>().outline_offset; }
@@ -594,7 +565,6 @@ public:
     CSS::ComputedFilterView backdrop_filter() const { return style_group<CSS::ComputedValues::EffectsValues>().backdrop_filter_value(); }
     CSS::Clip clip() const { return style_group<CSS::ComputedValues::EffectsValues>().clip_value(); }
     CSS::ComputedFilterView filter() const { return style_group<CSS::ComputedValues::EffectsValues>().filter_value(); }
-    CSS::Isolation isolation() const { return style_group<CSS::ComputedValues::EffectsValues>().isolation_value(); }
     CSS::MixBlendMode mix_blend_mode() const { return style_group<CSS::ComputedValues::EffectsValues>().mix_blend_mode_value(); }
     float opacity() const { return style_group<CSS::ComputedValues::EffectsValues>().opacity; }
     ReadonlySpan<CSS::ShadowData> box_shadow() const { return style_group<CSS::ComputedValues::EffectsValues>().box_shadow_span(); }
@@ -608,7 +578,6 @@ public:
             m_border_image = style_group<CSS::ComputedValues::BorderValues>().border_image_value();
         return *m_border_image;
     }
-    RefPtr<CSS::AbstractImageStyleValue const> border_image_source() const { return style_group<CSS::ComputedValues::BorderValues>().border_image_source_value(); }
     Color color() const { return style_group<CSS::ComputedValues::InheritedTextValues>().color_value(); }
     Color webkit_text_fill_color() const { return style_group<CSS::ComputedValues::InheritedTextValues>().webkit_text_fill_color_value(); }
     CSSPixels letter_spacing() const { return style_group<CSS::ComputedValues::InheritedTextValues>().letter_spacing_value(); }
@@ -645,7 +614,6 @@ public:
     {
         style_group<CSS::ComputedValues::TransformValues>().for_each_resolved_transform(callback);
     }
-    CSS::TransformBox transform_box() const { return style_group<CSS::ComputedValues::TransformValues>().transform_box_value(); }
     CSS::TransformOrigin transform_origin() const { return style_group<CSS::ComputedValues::TransformValues>().transform_origin_value(); }
     CSS::TransformStyle transform_style() const { return style_group<CSS::ComputedValues::TransformValues>().transform_style_value(); }
     RefPtr<CSS::TransformationStyleValue const> rotate() const { return style_group<CSS::ComputedValues::TransformValues>().rotate_value(); }
@@ -660,7 +628,6 @@ public:
     Optional<CSS::ClipPathReference> clip_path() const { return style_group<CSS::ComputedValues::MaskValues>().clip_path_value(); }
     Optional<CSS::BaselineMetric> dominant_baseline() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().dominant_baseline_value(); }
     Optional<CSS::SVGPaint> fill() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().fill_value(); }
-    CSS::FillRule fill_rule() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().fill_rule_value(); }
     Optional<CSS::SVGPaint> stroke() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().stroke_value(); }
     float fill_opacity() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().fill_opacity; }
     ReadonlySpan<CSS::ComputedValuesFFI::ComputedSvgDash> stroke_dasharray() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().stroke_dasharray_span(); }
@@ -670,16 +637,11 @@ public:
     double stroke_miterlimit() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().stroke_miterlimit; }
     float stroke_opacity() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().stroke_opacity; }
     CSS::LengthPercentage const& stroke_width() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().stroke_width_value(); }
-    CSS::ClipRule clip_rule() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().clip_rule_value(); }
     CSS::PaintOrderList paint_order() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().paint_order_value(); }
     CSS::TextAnchor text_anchor() const { return style_group<CSS::ComputedValues::InheritedSVGValues>().text_anchor_value(); }
     bool is_inline_block() const;
     bool is_inline_table() const;
-    bool is_transformable() const;
     Gfx::AffineTransform used_svg_element_transform() const;
-    CSS::TransformStyle used_transform_style() const;
-    bool establishes_or_extends_a_3d_rendering_context() const;
-    bool participates_in_a_3d_rendering_context() const;
 
     bool is_floating() const;
     bool is_positioned() const;
@@ -691,21 +653,13 @@ public:
     // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     bool is_out_of_flow() const { return is_floating() || is_absolutely_positioned(); }
 
-    bool style_establishes_absolute_positioning_containing_block() const;
     bool establishes_an_absolute_positioning_containing_block() const;
     bool establishes_a_fixed_positioning_containing_block() const;
 
     // https://drafts.csswg.org/css-contain-2/#containment-types
     bool has_size_containment() const;
-    bool has_layout_containment() const;
-    bool has_style_containment() const;
-    bool has_paint_containment() const;
 
-    [[nodiscard]] bool has_css_transform() const
-    {
-        auto has_transform = has_transformations() || has_rotate() || has_translate() || has_scale();
-        return has_transform && is_transformable();
-    }
+    [[nodiscard]] bool has_css_transform() const;
 
     void clear_image_observers();
     void apply_style(CSS::StyleRecordID);
@@ -733,6 +687,8 @@ public:
     void set_overflow(CSS::Overflow overflow_x, CSS::Overflow overflow_y);
 
 private:
+    CSS::ComputedStyleRecordView computed_style_record_view() const;
+
     virtual bool is_node_with_style() const final { return true; }
 
     void reset_table_box_computed_values_used_by_wrapper_to_init_values();

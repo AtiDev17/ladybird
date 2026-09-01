@@ -8,9 +8,7 @@ use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::layout::{
-    formatting_context, fragment_tree, inline_formatting_context, inline_level_iterator, node_facts, used_values,
-};
+use crate::layout::{formatting_context, fragment_tree, inline_formatting_context, node_facts, used_values};
 use crate::painting::node_painting;
 use crate::painting::paintable_data::*;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
@@ -279,39 +277,11 @@ impl<'a> PaintableCommit<'a> {
                 let (x, y) = fragment.offset();
                 let (x, y) = (x + fragment.relpos_delta.x, y + fragment.relpos_delta.y);
                 let (width, height) = fragment.size();
-                let glyph_run = fragment.glyphs.as_ref().map(|glyph_data| {
-                    let text_type = libgfx_rust::text_layout::TextType::try_from(glyph_data.text_type)
-                        .expect("committed glyph run carries a valid text type");
-                    const _: () = assert!(
-                        std::mem::size_of::<inline_level_iterator::FfiDrawGlyph>()
-                            == std::mem::size_of::<libgfx_rust::text_layout::DrawGlyph>()
-                    );
-                    const _: () = assert!(
-                        std::mem::align_of::<inline_level_iterator::FfiDrawGlyph>()
-                            == std::mem::align_of::<libgfx_rust::text_layout::DrawGlyph>()
-                    );
-                    // SAFETY: FfiDrawGlyph mirrors libgfx's DrawGlyph layout (asserted above), and
-                    // the glyph slice stays valid for the synchronous creation call.
-                    let glyphs_for_gfx: &[libgfx_rust::text_layout::DrawGlyph] = unsafe {
-                        std::slice::from_raw_parts(glyph_data.glyphs.as_ptr().cast(), glyph_data.glyphs.len())
-                    };
-                    // SAFETY: The layout pass borrowed the font from a live cascade list, which is
-                    // live for the duration of this commit.
-                    let retained = unsafe {
-                        libgfx_rust::text_layout::create_glyph_run(
-                            glyph_data.font,
-                            glyphs_for_gfx,
-                            text_type,
-                            glyph_data.width,
-                        )
-                    };
-                    GlyphRunRecord {
-                        glyphs: glyph_data.glyphs.clone(),
-                        // SAFETY: The layout pass borrowed the font from a live cascade list; retaining
-                        // it here keeps it alive for as long as the fragment record.
-                        font: unsafe { libgfx_rust::font::RetainedFont::retain(glyph_data.font) },
-                        retained,
-                    }
+                let glyph_run = fragment.glyphs.as_ref().map(|glyph_data| GlyphRunRecord {
+                    glyphs: glyph_data.glyphs.clone(),
+                    // SAFETY: The layout pass borrowed the font from a live cascade list; retaining
+                    // it here keeps it alive for as long as the fragment record.
+                    font: unsafe { libgfx_rust::font::RetainedFont::retain(glyph_data.font) },
                 });
                 let (
                     dom_start_offset_in_node,

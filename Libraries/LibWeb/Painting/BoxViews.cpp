@@ -41,7 +41,7 @@ bool should_paint_viewport_scrollbars()
     return g_paint_viewport_scrollbars;
 }
 
-bool body_background_is_propagated_to_root(Layout::NodeWithStyle const& layout_node)
+static bool body_background_is_propagated_to_root(Layout::NodeWithStyle const& layout_node)
 {
     if (!layout_node.is_body())
         return false;
@@ -256,12 +256,16 @@ Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const& node)
     return rect;
 }
 
+static bool layout_node_is_visible(Layout::NodeWithStyle const& layout_node)
+{
+    return layout_node.visibility() == CSS::Visibility::Visible && layout_node.opacity() != 0;
+}
+
 bool is_visible(Layout::Node const& node)
 {
     if (!has_committed_box(node))
         return false;
-    auto const& styled_node = as<Layout::NodeWithStyle>(node);
-    return styled_node.visibility() == CSS::Visibility::Visible && styled_node.opacity() != 0;
+    return layout_node_is_visible(as<Layout::NodeWithStyle>(node));
 }
 
 bool visible_for_hit_testing(Layout::Node const& node)
@@ -294,16 +298,6 @@ bool is_positioned(Layout::Node const& node)
 bool is_fixed_position(Layout::Node const& node)
 {
     return has_committed_box(node) && as<Layout::NodeWithStyle>(node).is_fixed_position();
-}
-
-bool has_css_transform(Layout::Node const& node)
-{
-    return has_committed_box(node) && as<Layout::NodeWithStyle>(node).has_css_transform();
-}
-
-bool uses_collapsing_borders_model(Layout::Node const& node)
-{
-    return Layout::RustFFI::layout_arena_paintable_uses_collapsing_borders_model(node.arena_handle(), committed_row_slot(node));
 }
 
 SelectionState selection_state(Layout::Node const& node)
@@ -396,13 +390,6 @@ bool is_svg_path_paintable(Layout::Node const& node)
     }
 }
 
-Optional<int> effective_z_index(Layout::Node const& node)
-{
-    if (!is_positioned(node))
-        return {};
-    return as<Layout::NodeWithStyle>(node).z_index();
-}
-
 bool has_accumulated_visual_context(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
@@ -419,14 +406,6 @@ ContextRef accumulated_visual_context_for_descendants(Layout::Node const& node)
 {
     auto const* row = committed_row(node);
     return row ? row->accumulated_visual_context_for_descendants : ContextRef {};
-}
-
-Optional<ContextRef> fixed_background_visual_context(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    if (!row || !row->has_fixed_background_visual_context)
-        return {};
-    return row->fixed_background_visual_context;
 }
 
 SpatialNodeIndex enclosing_scroll_node_index(Layout::Node const& node)
@@ -524,18 +503,7 @@ bool should_paint_cursor(Layout::Node const& node)
     return editable_node && editable_node->is_editable_or_editing_host();
 }
 
-Layout::Node const* nearest_self_painting_inline_box(Layout::Node const& node)
-{
-    for (auto const* ancestor = node.nearest_fragmented_inline_ancestor(); ancestor; ancestor = ancestor->nearest_fragmented_inline_ancestor()) {
-        auto const* row = committed_row(*ancestor);
-        if (row && is_inline_paintable(*ancestor)
-            && (row->establishes_stacking_context || is_positioned(*ancestor)))
-            return ancestor;
-    }
-    return nullptr;
-}
-
-bool has_content(Layout::Node const& node)
+static bool has_content(Layout::Node const& node)
 {
     // Interrupting block-in-inline children produce only placeholder pieces, so any child
     // paintable also counts as content.
@@ -612,11 +580,6 @@ CSSPixelRect caret_rect_for_child_offset(Layout::Node const& block, size_t offse
 
     rect.set_y(preceding_content_bottom.value_or(content_box.y()) + line_height * preceding_empty_lines);
     return rect;
-}
-
-static bool layout_node_is_visible(Layout::NodeWithStyle const& layout_node)
-{
-    return layout_node.visibility() == CSS::Visibility::Visible && layout_node.opacity() != 0;
 }
 
 Optional<CaretPaint> resolve_caret_paint(Layout::Node const& block, Layout::Node const* owner_inline)

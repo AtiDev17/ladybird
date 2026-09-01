@@ -497,8 +497,6 @@ public:
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
-    void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
-    [[nodiscard]] bool may_have_default_scroll_shift_anchor() const { return m_may_have_default_scroll_shift_anchor; }
     enum class PartialRelayoutResult : u8 {
         NotEligible,
         Done,
@@ -514,7 +512,7 @@ public:
         HandledByAfterLayoutCommit,
         HandledByFullLayoutCommit,
     };
-    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
+    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates);
     void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
@@ -846,21 +844,17 @@ public:
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
     // Attribution of pending updates for partial relayout. Invariant: every update recorded
-    // since the last layout pass is either attributed to a boundary in the registered root
-    // set, or the escape bit is set. The dispatch may only run partial relayout while the
-    // escape bit is clear; a full layout pass re-derives every fact boundary qualification
-    // depends on, so it clears the bit.
+    // since the last layout pass is either attributed to a boundary in the root set the
+    // layout node arena keeps, or the escape bit is set. The dispatch may only run partial
+    // relayout while the escape bit is clear; a full layout pass re-derives every fact
+    // boundary qualification depends on, so it clears the bit.
     class PartialRelayoutInvalidation {
     public:
-        void record_boundary(Layout::Box&);
         void record_escape(PartialRelayoutEscapeReason);
         void clear_escape(PartialRelayoutEscapeClearReason);
         [[nodiscard]] bool escapes() const { return m_escapes; }
-        [[nodiscard]] bool has_registered_roots() const { return !m_registered_roots.is_empty(); }
-        [[nodiscard]] HashTable<WeakPtr<Layout::Box>> take_registered_roots() { return move(m_registered_roots); }
 
     private:
-        HashTable<WeakPtr<Layout::Box>> m_registered_roots;
         bool m_escapes { false };
     };
     [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
@@ -940,6 +934,8 @@ public:
     DocumentUnloadTimingInfo& previous_document_unload_timing() { return m_previous_document_unload_timing; }
     DocumentUnloadTimingInfo const& previous_document_unload_timing() const { return m_previous_document_unload_timing; }
     void set_previous_document_unload_timing(DocumentUnloadTimingInfo const& previous_document_unload_timing) { m_previous_document_unload_timing = previous_document_unload_timing; }
+
+    void set_navigation_timing_entry(GC::Ref<NavigationTiming::PerformanceNavigationTiming> entry) { m_navigation_timing_entry = entry; }
 
     // https://w3c.github.io/editing/docs/execCommand/
     enum class DispatchInputEvent {
@@ -1504,7 +1500,7 @@ private:
     void collect_boxes_with_auto_content_visibility();
     bool needs_style_update_after_layout();
     bool any_anchor_names_are_registered() const;
-    PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    PartialRelayoutResult try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
 
     void process_pending_list_item_renumbers();
     bool reconcile_stale_list_item_counters_after_tree_build(Vector<Layout::Node*> const& rebuilt_subtree_roots);
@@ -1516,7 +1512,7 @@ private:
         Subtree,
         Full,
     };
-    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope, ReadonlySpan<Layout::Box const*> boxes_needing_eager_overflow_measurement = {});
+    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope);
 
     void run_unloading_cleanup_steps();
 
@@ -1580,7 +1576,6 @@ private:
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
     RefPtr<Layout::Viewport> m_layout_root;
     bool m_may_have_content_visibility_auto_style { false };
-    bool m_may_have_default_scroll_shift_anchor { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -1814,6 +1809,9 @@ private:
     // https://html.spec.whatwg.org/multipage/dom.html#previous-document-unload-timing
     DocumentUnloadTimingInfo m_previous_document_unload_timing;
 
+    // https://w3c.github.io/navigation-timing/#dfn-navigation-timing-entry
+    GC::Ptr<NavigationTiming::PerformanceNavigationTiming> m_navigation_timing_entry;
+
     // https://w3c.github.io/selection-api/#dfn-selection
     GC::Ptr<Selection::Selection> m_selection;
 
@@ -1904,9 +1902,6 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
-
-    bool m_needs_full_scrollable_overflow_recalculation { false };
-    Vector<Layout::RustFFI::NodeSlotId> m_boxes_needing_scrollable_overflow_recalculation;
 
     HashMap<Compositor::AsyncScrollNodeStableID, Painting::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;

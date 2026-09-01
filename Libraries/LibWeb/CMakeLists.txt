@@ -787,7 +787,6 @@ set(SOURCES
     Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
-    Layout/BlockContainer.cpp
     Layout/Box.cpp
     Layout/ImageProvider.cpp
     Layout/LayoutRustBridge.cpp
@@ -835,6 +834,7 @@ set(SOURCES
     Namespace.cpp
     NavigationTiming/EntryNames.cpp
     NavigationTiming/PerformanceNavigation.cpp
+    NavigationTiming/PerformanceNavigationTiming.cpp
     NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
     Page/AutoScrollHandler.cpp

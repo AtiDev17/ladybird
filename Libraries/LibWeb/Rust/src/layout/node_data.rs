@@ -140,7 +140,6 @@ pub enum NodeFlag {
     ChildrenAreInline = 1 << 2,
     IsFlexItem = 1 << 3,
     IsGridItem = 1 << 4,
-    HasBeenWrappedInTableWrapper = 1 << 5,
     IsBody = 1 << 6,
     NeedsLayoutUpdate = 1 << 7,
     NeedsOwnGeometryUpdate = 1 << 8,
@@ -165,6 +164,7 @@ pub enum NodeFlag {
     HasPreserve3dTransformStyle = 1 << 27,
     IsMissingTableCell = 1 << 28,
     HasAnimatedOpacityOrTransform = 1 << 29,
+    IsDocumentElement = 1 << 30,
 }
 
 #[repr(C)]
@@ -280,5 +280,6 @@ mod tests {
         assert_eq!(NodeFlag::IsEditingHost as u32, 1 << 17);
         assert_eq!(NodeFlag::ReplacedBoxCanHaveChildren as u32, 1 << 18);
         assert_eq!(NodeFlag::ProducesLineBoxFragmentWhenEmpty as u32, 1 << 22);
+        assert_eq!(NodeFlag::IsDocumentElement as u32, 1 << 30);
     }
 }

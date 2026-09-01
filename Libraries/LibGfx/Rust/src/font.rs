@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 unsafe extern "C" {
+    fn ladybird_gfx_font_id(font: *const c_void) -> u64;
     fn ladybird_gfx_font_glyph_width(font: *const c_void, code_point: u32) -> f32;
     fn ladybird_gfx_font_glyph_id(font: *const c_void, code_point: u32) -> u32;
     fn ladybird_gfx_font_contains_glyph(font: *const c_void, code_point: u32) -> bool;
@@ -16,6 +17,11 @@ unsafe extern "C" {
     fn ladybird_gfx_font_pixel_metrics(font: *const c_void, ascent: *mut f32, descent: *mut f32);
     fn ladybird_gfx_font_pixel_size(font: *const c_void) -> f32;
     fn ladybird_gfx_font_x_height(font: *const c_void) -> f32;
+    fn ladybird_gfx_font_measure_text_width(
+        font: *const c_void,
+        text_utf16: *const u16,
+        length_in_code_units: usize,
+    ) -> f32;
     fn ladybird_gfx_font_cascade_list_font_for_code_point(
         list: *const c_void,
         code_point: u32,
@@ -61,6 +67,15 @@ impl<'a> FontRef<'a> {
         }
     }
 
+    /// The font's process-unique id. Ids are never recycled, so a dead font's
+    /// id can never alias a live font's.
+    #[inline]
+    pub fn id(self) -> u64 {
+        // SAFETY: FontRef's constructor requires the Gfx::Font to remain live
+        // for this reference's lifetime.
+        unsafe { ladybird_gfx_font_id(self.raw.as_ptr()) }
+    }
+
     #[inline]
     pub fn glyph_width(self, code_point: u32) -> f32 {
         // SAFETY: FontRef's constructor requires the Gfx::Font to remain live
@@ -104,6 +119,12 @@ impl<'a> FontRef<'a> {
         // SAFETY: FontRef's constructor requires the Gfx::Font to remain live
         // for this reference's lifetime.
         unsafe { ladybird_gfx_font_x_height(self.raw.as_ptr()) }
+    }
+
+    pub fn measure_text_width(self, text: &[u16]) -> f32 {
+        // SAFETY: The font is live for this reference's lifetime, and the text
+        // slice stays valid for the synchronous measuring call.
+        unsafe { ladybird_gfx_font_measure_text_width(self.raw.as_ptr(), text.as_ptr(), text.len()) }
     }
 
     pub fn is_emoji_font(self) -> bool {

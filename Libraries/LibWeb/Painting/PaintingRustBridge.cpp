@@ -420,7 +420,6 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
             inputs.visual_viewport_offset_x = offset.x();
             inputs.visual_viewport_offset_y = offset.y();
             inputs.visual_viewport_scale = visual_viewport.scale();
-            inputs.may_have_default_scroll_shift_anchor = document.may_have_default_scroll_shift_anchor();
             inputs.viewport_wheel_overflow_x = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Horizontal)));
             inputs.viewport_wheel_overflow_y = static_cast<u8>(to_underlying(overflow_value_applied_to_viewport_for_wheel_scrolling(document, ScrollDirection::Vertical)));
             return inputs;
@@ -478,13 +477,6 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
             Layout::RustFFI::layout_arena_paint_push_bytes(sink, filter_data.data(), filter_data.size());
             result.has_filter = true;
             return result;
-        },
-        .default_scroll_shift_anchor = [](void*, void* layout_node_shell) -> Layout::RustFFI::NodeSlotId {
-            if (auto const* box = as_if<Layout::Box>(static_cast<Layout::Node const*>(layout_node_shell))) {
-                if (auto const* anchor_box = as_if<Layout::Box>(box->default_scroll_shift_anchor()))
-                    return Layout::Node::slot_id(anchor_box);
-            }
-            return Layout::RustFFI::NodeSlotId { Layout::RustFFI::INVALID_NODE_SLOT_INDEX };
         },
     };
 }
@@ -551,12 +543,9 @@ Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions
     return Layout::RustFFI::layout_arena_physical_overflow_directions(box.arena_handle(), committed_row_slot(box));
 }
 
-void rust_measure_scrollable_overflow(Layout::Node const& box)
+static Layout::RustFFI::FfiScrollableOverflowHostCallbacks scrollable_overflow_host_callbacks()
 {
-    auto& document = const_cast<DOM::Document&>(box.document());
-    if (!document.has_committed_viewport_box())
-        return;
-    Layout::RustFFI::FfiScrollableOverflowHostCallbacks overflow_callbacks {
+    return {
         .context = nullptr,
         .layout_node_is_in_focused_text_control = [](void*, void* layout_node_shell) -> bool {
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
@@ -570,7 +559,35 @@ void rust_measure_scrollable_overflow(Layout::Node const& box)
                 && shadow_root->host()->is_focused();
         },
     };
-    Layout::RustFFI::layout_arena_measure_scrollable_overflow(box.arena_handle(), committed_row_slot(box), visual_context_host_callbacks(document), overflow_callbacks);
+}
+
+void rust_measure_scrollable_overflow(Layout::Node const& box)
+{
+    auto& document = const_cast<DOM::Document&>(box.document());
+    if (!document.has_committed_viewport_box())
+        return;
+    Layout::RustFFI::layout_arena_measure_scrollable_overflow(box.arena_handle(), committed_row_slot(box), visual_context_host_callbacks(document), scrollable_overflow_host_callbacks());
+}
+
+Layout::RustFFI::FfiScrollableOverflowUpdateOutcome rust_update_scrollable_overflow(DOM::Document& document, bool handled_by_full_layout_commit)
+{
+    // The scroll offset can become invalid if the scrollable overflow rectangle has changed. For
+    // example, if the scroll container has been scrolled to the very end and then its scrollable
+    // overflow rect becomes smaller, the scroll offset would be out of bounds. Re-applying the
+    // current offset clamps it against the new rect.
+    auto clamp_scroll_offset_if_nonzero = [](void*, void* layout_node_shell) {
+        auto& box = *static_cast<Layout::Node*>(layout_node_shell);
+        if (!scroll_offset(box).is_zero())
+            set_scroll_offset(box, scroll_offset(box));
+    };
+    auto scroll_offset_is_zero = [](void*, void* layout_node_shell) -> bool {
+        return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell)).is_zero();
+    };
+
+    return Layout::RustFFI::layout_arena_update_scrollable_overflow(
+        layout_arena_handle(document), viewport_row_slot(document), handled_by_full_layout_commit,
+        visual_context_host_callbacks(document), scrollable_overflow_host_callbacks(),
+        nullptr, clamp_scroll_offset_if_nonzero, scroll_offset_is_zero);
 }
 
 CSS::ResolvedImage rust_resolve_gradient_for_size(CSS::StyleValue const& gradient_style_value, Layout::NodeWithStyle const& layout_node, CSSPixelSize size)
@@ -723,26 +740,16 @@ Utf16String serialize_painting_dump(
 
 void dump_stacking_context_tree(StringBuilder& builder, DOM::Document const& document)
 {
+    Layout::RustFFI::FfiStackingContextDumpCallbacks callbacks {
+        .context = &builder,
+        .debug_description = [](void*, void* layout_node_shell, void* description_sink) {
+            auto description = static_cast<Layout::Node const*>(layout_node_shell)->debug_description();
+            auto bytes = description.bytes();
+            Layout::RustFFI::layout_arena_paint_push_bytes(description_sink, bytes.data(), bytes.size()); },
+        .append_text = [](void* context, u8 const* bytes, size_t byte_count) { static_cast<StringBuilder*>(context)->append(StringView { bytes, byte_count }); },
+    };
     Layout::RustFFI::layout_arena_dump_stacking_context_tree(
-        layout_arena_handle(document), viewport_row_slot(document), &builder,
-        [](void* context, Layout::RustFFI::FfiStackingContextDumpEntry entry) {
-            auto& builder = *static_cast<StringBuilder*>(context);
-            for (size_t i = 0; i < entry.depth; ++i)
-                builder.append(' ');
-            if (auto const* layout_node = static_cast<Layout::Node const*>(entry.layout_node_shell)) {
-                builder.appendff("SC for {} {} (z-index: ", layout_node->debug_description(), absolute_rect(*layout_node));
-                if (entry.has_effective_z_index)
-                    builder.appendff("{}", entry.effective_z_index);
-                else
-                    builder.append("auto"sv);
-                builder.append(')');
-                if (has_css_transform(*layout_node))
-                    builder.append(", has_transform"sv);
-            } else {
-                builder.append("SC for (gone)"sv);
-            }
-            builder.append('\n');
-        });
+        layout_arena_handle(document), viewport_row_slot(document), callbacks);
 }
 
 namespace {
@@ -778,7 +785,6 @@ Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
         },
         .line_break_caret_targets = [](void*, void* layout_node_shell, void* sink) {
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            VERIFY(is_paintable_with_lines(layout_node));
             auto* dom_node = layout_node.dom_node();
             if (!dom_node)
                 return;
@@ -960,7 +966,6 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
             if (is_inline_paintable(layout_node)) {
                 caret = resolve_empty_editable_caret_paint(layout_node);
             } else {
-                VERIFY(is_paintable_with_lines(layout_node));
                 caret = resolve_caret_paint(layout_node, owner_layout_node);
             }
             if (!caret.has_value())
@@ -1238,38 +1243,26 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 display_list->set_mask_display_list_id(FrameNodeIndex { static_cast<u32>(mask_pairs[i * 2]) }, DisplayListResourceId { mask_pairs[i * 2 + 1] });
             return context.resource_storage.add_display_list(move(display_list), visual_context_tree).value();
         },
-        .overlay_label = [](void* context_pointer, void* layout_node_shell, u16 const* text_units, size_t text_unit_count, size_t utf16_fly_string_raw, float css_font_size, void* sink) -> Layout::RustFFI::FfiOverlayLabelFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            Utf16String text;
-            if (layout_node_shell) {
-                auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-                auto border_rect = absolute_border_box_rect(layout_node);
-                Utf16StringBuilder builder;
-                builder.appendff("{}", layout_node.debug_description());
-                builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
-                text = builder.to_string();
-            } else if (utf16_fly_string_raw) {
-                text = Utf16FlyString::from_raw(utf16_fly_string_raw).to_utf16_string();
-            } else {
-                text = Utf16String::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(text_units), text_unit_count });
-            }
-            auto font = Platform::FontPlugin::the().default_font(css_font_size);
-            auto label_font = font->with_size(font->point_size() * context.device_pixels_per_css_pixel);
-            auto glyph_run = Gfx::shape_text({}, 0, 0, text.utf16_view(), label_font, Gfx::GlyphRun::TextType::Ltr);
-            for (auto const& glyph : glyph_run->glyphs())
-                Layout::RustFFI::layout_arena_paint_push_overlay_glyph(sink, glyph.glyph_id, glyph.position.x(), glyph.position.y());
-            auto bounds = glyph_run->bounding_box(1.0f);
-            auto metrics = label_font->pixel_metrics();
-            return Layout::RustFFI::FfiOverlayLabelFacts {
-                .font_id = context.resource_storage.add_font(glyph_run->font()).value(),
-                .css_width = font->width(text),
-                .css_pixel_size = font->pixel_size(),
-                .device_glyph_width = glyph_run->width(),
-                .device_ascent = metrics.ascent,
-                .device_descent = metrics.descent,
-                .blob_bounds = bounds,
-            };
+        .overlay_label_font = [](void*, float point_size) -> void const* {
+            auto font = Platform::FontPlugin::the().default_font(point_size);
+            VERIFY(font);
+            // The platform font caches keep the font alive; the caller retains
+            // it within the synchronous call.
+            return font.ptr();
         },
+        .overlay_node_label_text = [](void*, void* layout_node_shell, void* sink, void (*emit)(void*, u16 const*, size_t)) {
+            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
+            auto border_rect = absolute_border_box_rect(layout_node);
+            Utf16StringBuilder builder;
+            builder.appendff("{}", layout_node.debug_description());
+            builder.appendff(" {}x{} @ {},{}", border_rect.width(), border_rect.height(), border_rect.x(), border_rect.y());
+            auto text = builder.to_string();
+            auto view = text.utf16_view();
+            Vector<u16> units;
+            units.ensure_capacity(view.length_in_code_units());
+            for (size_t i = 0; i < view.length_in_code_units(); ++i)
+                units.unchecked_append(view.code_unit_at(i));
+            emit(sink, units.data(), units.size()); },
     };
 }
 

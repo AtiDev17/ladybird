@@ -189,7 +189,6 @@ pub struct FfiPrincipalDescendantFacts {
     pub child_needs_layout_tree_update: bool,
     pub is_svg_switch_element: bool,
     pub is_document: bool,
-    pub has_style_containment: bool,
     pub dom_children_parent: *mut c_void,
     pub shadow_root: *mut c_void,
     pub slot_element: *mut c_void,
@@ -1299,7 +1298,9 @@ unsafe fn update_principal_node_descendants(
         // Giving an element style containment has the following effects:
         // 2. The effects of the 'content' property’s 'open-quote', 'close-quote', 'no-open-quote' and 'no-close-quote'
         //    must be scoped to the element’s sub-tree.
-        if facts.has_style_containment {
+        if node_facts::node_style_view(host.layout().data(layout_node))
+            .is_some_and(crate::painting::style_queries::has_style_containment)
+        {
             state.quote_nesting_level = prior_quote_nesting_level;
         }
 
@@ -2407,12 +2408,6 @@ pub extern "C" fn layout_node_kind_is_svg_box(kind: NodeKind) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_node_kind_is_svg_graphics_box(kind: NodeKind) -> bool {
     svg_formatting_context::kind_is_svg_graphics_box(kind)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_node_data_can_have_children(data: *const NodeData) -> bool {
-    // SAFETY: The C++ caller passes the node's live arena slot.
-    node_facts::node_can_have_children(unsafe { &*data })
 }
 
 #[unsafe(no_mangle)]
@@ -3656,8 +3651,6 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
             let wrapper_slot = wrapper.slot();
             host.move_child(table_root, wrapper_slot, NodeSlotId::INVALID);
             host.attach_child(parent, wrapper, nearest_sibling);
-            host.arena()
-                .set_node_flag(table_root, NodeFlag::HasBeenWrappedInTableWrapper, true);
         }
     }
     table_roots_to_wrap

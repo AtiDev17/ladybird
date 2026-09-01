@@ -27,6 +27,7 @@
 #include <harfbuzz/hb.h>
 
 extern "C" {
+u64 ladybird_gfx_font_id(void const*);
 float ladybird_gfx_font_glyph_width(void const*, u32);
 u32 ladybird_gfx_font_glyph_id(void const*, u32);
 bool ladybird_gfx_font_contains_glyph(void const*, u32);
@@ -200,15 +201,6 @@ SkFont Font::skia_font(float scale) const
     return sk_font;
 }
 
-Font::ShapingCache::~ShapingCache() = default;
-
-void Font::ShapingCache::clear()
-{
-    map.clear();
-    for (auto& slot : single_ascii_character_map)
-        slot = nullptr;
-}
-
 static bool hb_face_has_table(hb_face_t* face, hb_tag_t tag)
 {
     hb_blob_t* blob = hb_face_reference_table(face, tag);
@@ -254,6 +246,12 @@ bool Font::is_emoji_font() const
     return m_is_emoji_font == TriState::True;
 }
 
+}
+
+extern "C" u64 ladybird_gfx_font_id(void const* font)
+{
+    VERIFY(font);
+    return static_cast<Gfx::Font const*>(font)->id();
 }
 
 extern "C" float ladybird_gfx_font_glyph_width(void const* font, u32 code_point)

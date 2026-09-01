@@ -6,7 +6,7 @@
 
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
-use crate::layout::{inline_level_iterator, used_values};
+use crate::layout::used_values;
 use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
 use std::cell::Cell;
 
@@ -134,9 +134,24 @@ pub struct LineRecord {
 }
 
 pub struct GlyphRunRecord {
-    pub glyphs: Vec<inline_level_iterator::FfiDrawGlyph>,
+    pub glyphs: Vec<libgfx_rust::text_layout::DrawGlyph>,
     pub font: libgfx_rust::font::RetainedFont,
-    pub retained: libgfx_rust::text_layout::RetainedGlyphRun,
+}
+
+impl GlyphRunRecord {
+    fn font_ref(&self) -> libgfx_rust::font::FontRef<'_> {
+        // SAFETY: The record's RetainedFont keeps the font live for the
+        // lifetime of the returned borrow.
+        unsafe { libgfx_rust::font::FontRef::from_raw(self.font.as_raw()) }
+    }
+
+    pub fn bounding_box(&self, scale: f32) -> [f32; 4] {
+        libgfx_rust::text_layout::glyph_run_bounding_box(self.font_ref(), &self.glyphs, scale)
+    }
+
+    pub fn glyph_intercepts(&self, scale: f32, y_top: f32, y_bottom: f32) -> Vec<f32> {
+        libgfx_rust::text_layout::glyph_run_glyph_intercepts(self.font_ref(), &self.glyphs, scale, y_top, y_bottom)
+    }
 }
 
 pub struct FragmentRecord {

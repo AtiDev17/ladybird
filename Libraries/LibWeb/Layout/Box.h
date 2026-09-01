@@ -15,11 +15,6 @@
 
 namespace Web::Layout {
 
-struct LineBoxFragmentCoordinate {
-    size_t line_box_index { 0 };
-    size_t fragment_index { 0 };
-};
-
 class WEB_API Box : public NodeWithStyle {
 public:
     // A partial relayout boundary is a box whose subtree can be re-laid out in
@@ -37,10 +32,6 @@ public:
     // aspect ratio.
     CSS::SizeWithAspectRatio auto_content_box_size() const;
 
-    // https://www.w3.org/TR/css-sizing-4/#preferred-aspect-ratio
-    Optional<CSSPixelFraction> preferred_aspect_ratio() const;
-    bool has_preferred_aspect_ratio() const { return preferred_aspect_ratio().has_value(); }
-
     RustFFI::FfiReplacedContentFacts build_replaced_content_facts_for_arena() const;
 
     ImageProvider const& image_provider() const;
@@ -56,37 +47,22 @@ public:
 
     void notify_content_navigable_of_committed_viewport();
     bool has_saved_abspos_layout_inputs() const { return has_flag(RustFFI::NodeFlag::HasSavedAbsposLayoutInputs); }
-    bool has_committed_fragment_link() const { return has_flag(RustFFI::NodeFlag::HasCommittedFragmentLink); }
-    bool saved_abspos_cb_derives_from_own_computed_values() const { return has_flag(RustFFI::NodeFlag::SavedAbsposCbDerivesFromOwnComputedValues); }
-    bool saved_abspos_alignment_derives_from_own_computed_values() const { return has_flag(RustFFI::NodeFlag::SavedAbsposAlignmentDerivesFromOwnComputedValues); }
 
     // Whether an absolutely or fixed positioned descendant of this box has its containing
     // block outside this box's subtree, so the descendant's layout escapes the subtree.
     // Re-derived whenever containing block pointers are recomputed.
     bool abspos_descendant_escapes() const { return has_flag(RustFFI::NodeFlag::AbsposDescendantEscapes); }
-    void set_abspos_descendant_escapes(bool value) { set_flag(RustFFI::NodeFlag::AbsposDescendantEscapes, value); }
 
-    void set_default_scroll_shift(WeakPtr<Node> anchor, bool compensates_for_horizontal_scroll, bool compensates_for_vertical_scroll);
-    Node* default_scroll_shift_anchor() const { return m_default_scroll_shift_anchor.ptr(); }
     bool compensates_for_horizontal_scroll() const { return has_flag(RustFFI::NodeFlag::CompensatesForHorizontalScroll); }
     bool compensates_for_vertical_scroll() const { return has_flag(RustFFI::NodeFlag::CompensatesForVerticalScroll); }
-
-    void reset_cached_intrinsic_sizes()
-    {
-        if (++node_data().intrinsic_cache_epoch == 0) [[unlikely]]
-            drop_cached_intrinsic_sizes();
-    }
 
     Box(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::Box);
 
 private:
-    void drop_cached_intrinsic_sizes();
-
     CSS::SizeWithAspectRatio compute_auto_content_box_size() const;
 
     virtual bool is_box() const final { return true; }
 
-    WeakPtr<Node> m_default_scroll_shift_anchor;
     OwnPtr<ImageProvider> m_owned_image_provider;
 };
 

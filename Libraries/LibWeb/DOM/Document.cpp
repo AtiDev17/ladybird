@@ -127,6 +127,7 @@
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
+#include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/AttributeNames.h>
@@ -210,6 +211,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
@@ -472,10 +474,20 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
     // 8. Let loadTimingInfo be a new document load timing info with its navigation start time set to navigationParams's response's timing info's start time.
     DOM::DocumentLoadTimingInfo load_timing_info;
-    // AD-HOC: The response object no longer has an associated timing info object. For now, we use response's non-standard response time property,
-    //         which represents the time that the time that the response object was created.
-    auto response_creation_time = navigation_params.response->monotonic_response_time().nanoseconds() / 1e6;
-    load_timing_info.navigation_start_time = HighResolutionTime::coarsen_time(response_creation_time, HTML::relevant_settings_object(*window).cross_origin_isolated_capability());
+    auto timing_info = Fetch::Infrastructure::FetchTimingInfo::create();
+    if (navigation_params.fetch_controller && navigation_params.fetch_controller->timing_info()) {
+        timing_info = *navigation_params.fetch_controller->timing_info();
+        load_timing_info.navigation_start_time = timing_info->start_time();
+    } else {
+        // AD-HOC: Non-fetch navigations do not have timing info, so use the time at which the response was created.
+        auto response_creation_time = navigation_params.response->monotonic_response_time().nanoseconds() / 1e6;
+        load_timing_info.navigation_start_time = HighResolutionTime::coarsen_time(response_creation_time, HTML::relevant_settings_object(*window).cross_origin_isolated_capability());
+        timing_info->set_start_time(load_timing_info.navigation_start_time);
+        timing_info->set_post_redirect_start_time(load_timing_info.navigation_start_time);
+        timing_info->set_final_network_request_start_time(load_timing_info.navigation_start_time);
+        timing_info->set_final_network_response_start_time(load_timing_info.navigation_start_time);
+        timing_info->set_end_time(load_timing_info.navigation_start_time);
+    }
 
     // 9. Let document be a new Document, with
     //    type: type
@@ -525,6 +537,26 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
+
+    bool has_cross_origin_redirects = false;
+    if (!navigation_params.response->url_list().is_empty()) {
+        auto initial_origin = navigation_params.response->url_list().first().origin();
+        for (auto const& url : navigation_params.response->url_list()) {
+            if (!url.origin().is_same_origin(initial_origin)) {
+                has_cross_origin_redirects = true;
+                break;
+            }
+        }
+    }
+    auto redirect_count = navigation_params.request && !has_cross_origin_redirects ? navigation_params.request->redirect_count() : 0;
+    NavigationTiming::PerformanceNavigationTiming::create_navigation_timing_entry(
+        *document,
+        timing_info,
+        redirect_count,
+        navigation_params.navigation_timing_type,
+        navigation_params.response->cache_state(),
+        navigation_params.response->body_info(),
+        navigation_params.response->status());
 
     // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
     //     objects list creation steps given document and navigationParams's iframe element referrer policy.
@@ -758,6 +790,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_history);
     visitor.visit(m_html_parser_end_state);
     visitor.visit(m_ongoing_navigation_fetch_controller);
+    visitor.visit(m_navigation_timing_entry);
     visitor.visit(m_style_computer);
     visitor.visit(m_font_computer);
     visitor.visit(m_browsing_context);
@@ -1725,11 +1758,6 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
     tear_down_layout_tree();
 }
 
-void Document::PartialRelayoutInvalidation::record_boundary(Layout::Box& box)
-{
-    m_registered_roots.set(box.make_weak_ptr<Layout::Box>());
-}
-
 void Document::PartialRelayoutInvalidation::record_escape(PartialRelayoutEscapeReason reason)
 {
     dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates escape partial relayout boundaries ({})", to_string(reason));
@@ -1840,10 +1868,8 @@ static void relayout_subtree(Layout::Box& subtree_root)
         bridge.compute_subtree_layout(subtree_root);
     }
 
-    subtree_root.for_each_in_inclusive_subtree([](auto& node) {
-        node.reset_needs_layout_update();
-        return TraversalDecision::Continue;
-    });
+    Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
+        subtree_root.arena_handle(), Layout::Node::slot_id(&subtree_root));
 }
 
 // Recomputes containing blocks and derives the abspos escape flags for the inclusive subtree
@@ -1862,7 +1888,7 @@ static void recompute_containing_blocks_in_inclusive_subtree(Layout::NodeArena& 
 
 // Refreshes every structure derived from committed layout results, shared by the partial and
 // full layout paths so neither can forget one.
-void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, LayoutCommitScope layout_commit_scope, ReadonlySpan<Layout::Box const*> boxes_needing_eager_overflow_measurement)
+void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, LayoutCommitScope layout_commit_scope)
 {
     // NB: Called during layout update.
     m_layout_root->invalidate_text_blocks_cache();
@@ -1873,10 +1899,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // A commit that changed the tree can have replaced boxes referenced by the cached
     // contained-boxes index; refresh it before overflow measurement follows them. A pending full
     // recalculation rebuilds the index inside its own measurement traversal instead.
-    if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
+    if (layout_tree_changed == LayoutTreeChanged::Yes && !Layout::RustFFI::layout_arena_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle()))
         Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     if (layout_commit_scope == LayoutCommitScope::Full)
-        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
+        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
     else
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit);
 
@@ -2203,12 +2229,12 @@ bool Document::needs_style_update_after_layout()
 // relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
 // are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
 // the full layout path without rebuilding again.
-Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
+Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
 {
     if (!m_layout_root
         || needs_full_layout_tree_update()
         || m_partial_relayout_invalidation.escapes()
-        || registered_partial_relayout_roots.is_empty()
+        || registered_partial_relayout_root_slots.is_empty()
         || m_layout_root->needs_layout_update()
         || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
         || should_collect_devtools_layout_data
@@ -2246,64 +2272,29 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     for (auto* rebuilt_root : rebuilt_subtree_roots)
         recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *rebuilt_root);
 
-    // Collect the live boundary set from the post-build tree: registered boundaries that
-    // survived the build, plus the nearest boundary containing each rebuilt subtree - which
-    // re-discovers a boundary whose own box the build replaced, since the saved layout inputs
-    // carried over to the replacement.
-    Vector<Layout::Box*> partial_relayout_roots;
-    HashTable<Layout::Box*> collected_boundaries;
-    auto collect_boundary = [&](Layout::Box& box, bool box_was_replaced) {
-        if (collected_boundaries.set(&box) != AK::HashSetResult::InsertedNewEntry)
-            return true;
+    Vector<Layout::RustFFI::NodeSlotId> rebuilt_subtree_root_slots;
+    rebuilt_subtree_root_slots.ensure_capacity(rebuilt_subtree_roots.size());
+    for (auto* rebuilt_root : rebuilt_subtree_roots)
+        rebuilt_subtree_root_slots.unchecked_append(Layout::Node::slot_id(rebuilt_root));
 
-        // A replaced box applies the saved-inputs validity check unconditionally: the change
-        // that drove the replacement cannot be classified anymore.
-        bool saved_inputs_may_be_style_stale = box.needs_own_geometry_update() || box_was_replaced;
-        if (saved_inputs_may_be_style_stale && box.is_absolutely_positioned() && !Layout::can_replay_saved_abspos_layout_inputs_after_style_change(box))
-            return false;
-
-        partial_relayout_roots.append(&box);
-        return true;
-    };
-
-    for (auto const& root : registered_partial_relayout_roots) {
-        auto* box = root.ptr();
-        // A boundary that did not survive the build was either replaced (re-discovered
-        // through the rebuilt subtree roots below) or removed together with the dirt
-        // inside it (the removal dirtied its parent, whose own marking covers the
-        // mutation).
-        if (!box || !box->parent())
-            continue;
-        if (!box->is_partial_relayout_boundary() || !collect_boundary(*box, false))
-            return PartialRelayoutResult::NotEligible;
-    }
-
-    for (auto* rebuilt_root : rebuilt_subtree_roots) {
-        // Every rebuilt subtree must lie inside a boundary for its dirt to be confined.
-        // The rebuilt box itself may qualify with its committed row still pending; boundaries
-        // above it were not replaced and must have one.
-        Layout::Box* containing_boundary = nullptr;
-        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary())
-            containing_boundary = rebuilt_box;
-        for (auto* ancestor = rebuilt_root->parent(); !containing_boundary && ancestor; ancestor = ancestor->parent()) {
-            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && ancestor_box->is_partial_relayout_boundary())
-                containing_boundary = ancestor_box;
-        }
-        if (!containing_boundary || !collect_boundary(*containing_boundary, containing_boundary == rebuilt_root))
-            return PartialRelayoutResult::NotEligible;
-    }
-
-    // A root nested inside another root is relaid out as part of the ancestor's subtree.
-    partial_relayout_roots.remove_all_matching([&](auto* root) {
-        for (auto* ancestor = root->parent(); ancestor; ancestor = ancestor->parent()) {
-            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && collected_boundaries.contains(ancestor_box))
-                return true;
-        }
-        return false;
-    });
-
-    if (partial_relayout_roots.is_empty())
+    Vector<Layout::RustFFI::NodeSlotId> partial_relayout_root_slots;
+    bool boundary_set_supports_partial_relayout = Layout::RustFFI::layout_arena_collect_partial_relayout_roots(
+        layout_node_arena().handle(),
+        registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
+        rebuilt_subtree_root_slots.data(), rebuilt_subtree_root_slots.size(),
+        &partial_relayout_root_slots,
+        [](void* context, Layout::RustFFI::NodeSlotId root) {
+            static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(root);
+        });
+    if (!boundary_set_supports_partial_relayout)
         return PartialRelayoutResult::NotEligible;
+
+    Vector<Layout::Box*> partial_relayout_roots;
+    partial_relayout_roots.ensure_capacity(partial_relayout_root_slots.size());
+    for (auto slot : partial_relayout_root_slots) {
+        auto* root = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), slot));
+        partial_relayout_roots.unchecked_append(&as<Layout::Box>(*root));
+    }
 
     // The final boundary can be wider than the rebuilt roots that led us to it. Replaying such a
     // boundary may re-enter intrinsic sizing for descendants outside those rebuilt roots, including
@@ -2380,7 +2371,12 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             return;
         }
 
-        auto registered_partial_relayout_roots = m_partial_relayout_invalidation.take_registered_roots();
+        Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots;
+        Layout::RustFFI::layout_arena_take_partial_relayout_boundary_roots(
+            layout_node_arena().handle(), &registered_partial_relayout_root_slots,
+            [](void* context, Layout::RustFFI::NodeSlotId slot) {
+                static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(slot);
+            });
 
         // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
         if (m_created_for_appropriate_template_contents)
@@ -2388,7 +2384,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 
         auto needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
 
-        switch (try_partial_relayout(move(registered_partial_relayout_roots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
+        switch (try_partial_relayout(move(registered_partial_relayout_root_slots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
         case PartialRelayoutResult::Done:
             return;
         case PartialRelayoutResult::NeedsAnotherLayoutPass:
@@ -2442,26 +2438,20 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 
         layout_node_arena().sync_enrolled_content_for_layout();
         Layout::LayoutRustBridge bridge;
-        Vector<Layout::Box const*> boxes_needing_eager_overflow_measurement;
         bridge.run_root_layout(
             *m_layout_root,
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
-            if ((&box == m_layout_root.ptr() || box.is_scroll_container() || !Painting::scroll_offset(box).is_zero()) && Painting::has_committed_box(box))
-                boxes_needing_eager_overflow_measurement.append(&box);
-            return TraversalDecision::Continue;
-        });
         Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         style_invalidation_counters().relayouts_performed++;
 
-        m_needs_full_scrollable_overflow_recalculation = true;
+        Layout::RustFFI::layout_arena_set_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle());
 
         ++m_full_layout_count;
 
-        after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full, boxes_needing_eager_overflow_measurement);
+        after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full);
 
         Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
             layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
@@ -2536,7 +2526,7 @@ bool Document::layout_is_up_to_date() const
         && !needs_layout_tree_update()
         && !child_needs_layout_tree_update()
         && !needs_full_layout_tree_update()
-        && !m_partial_relayout_invalidation.has_registered_roots();
+        && (!m_layout_node_arena || !Layout::RustFFI::layout_arena_has_partial_relayout_boundary_roots(m_layout_node_arena->handle()));
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -2821,141 +2811,28 @@ void Document::finish_animated_style_update()
         effect->request_observation_sample();
 }
 
-void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement)
+void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates)
 {
-    // For every box that will be re-measured, the overflow data it had before, so the diff below
-    // can tell what actually changed; an empty value means the box's committed row was reset by a
-    // subtree layout commit and the old data is unknown.
-    HashMap<Layout::Box const*, Optional<Painting::OverflowData>> old_overflow_data_by_box;
-
-    auto pending_boxes = move(m_boxes_needing_scrollable_overflow_recalculation);
-    auto needs_full_recalculation = exchange(m_needs_full_scrollable_overflow_recalculation, false);
-    if (pending_boxes.is_empty() && !needs_full_recalculation)
+    if (!m_layout_node_arena)
         return;
-    if (!has_committed_viewport_box())
+
+    auto outcome = Painting::rust_update_scrollable_overflow(*this,
+        derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
+    if (!outcome.performed_recalculation)
         return;
 
     style_invalidation_counters().scrollable_overflow_recalculations++;
 
-    // The scroll offset can become invalid if the scrollable overflow rectangle has changed. For
-    // example, if the scroll container has been scrolled to the very end and then its scrollable
-    // overflow rect becomes smaller, the scroll offset would be out of bounds. Re-applying the
-    // current offset clamps it against the new rect.
-    auto clamp_scroll_offset = [](Layout::Node const& box) {
-        if (!Painting::scroll_offset(box).is_zero())
-            Painting::set_scroll_offset(const_cast<Layout::Node&>(box), Painting::scroll_offset(box));
-    };
-
-    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit) {
-        VERIFY(needs_full_recalculation);
-
-        // A full-root commit reset every surviving row, including its overflow data and
-        // paint cache. There is therefore no old overflow to preserve or diff. Ordinary boxes are
-        // measured recursively when their overflow contributes to one of these roots, so they do
-        // not need separate eager measurement.
-        for (auto const* box : boxes_needing_eager_measurement) {
-            if (!Painting::has_committed_box(*box))
-                continue;
-            Painting::rust_measure_scrollable_overflow(*box);
-            clamp_scroll_offset(*box);
-        }
-        return;
-    }
-
-    auto record_and_clear_overflow_data = [&](Layout::Box const& box) {
-        if (!Painting::has_committed_box(box))
-            return true;
-        if (old_overflow_data_by_box.contains(&box))
-            return false;
-        old_overflow_data_by_box.set(&box, Painting::overflow_data(box));
-        Painting::clear_overflow_data(box);
-        return true;
-    };
-
-    if (needs_full_recalculation) {
-        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
-            record_and_clear_overflow_data(box);
-            return TraversalDecision::Continue;
-        });
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
-    } else {
-        for (auto const& paintable_slot : pending_boxes) {
-            auto* layout_node = Painting::layout_node_for_committed_slot(layout_node_arena(), paintable_slot);
-            if (!layout_node)
-                continue;
-            auto const* box = as_if<Layout::Box>(*layout_node);
-            if (!box)
-                continue;
-            bool was_reset_by_subtree_layout_commit = !Painting::overflow_data(*box).has_value();
-            if (was_reset_by_subtree_layout_commit) {
-                box->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& subtree_box) {
-                    record_and_clear_overflow_data(subtree_box);
-                    return TraversalDecision::Continue;
-                });
-            }
-            for (auto const* containing_block = box->containing_block(); containing_block; containing_block = containing_block->containing_block()) {
-                if (Painting::has_committed_box(*containing_block))
-                    Painting::clear_cached_overflow_data(*containing_block);
-                if (!record_and_clear_overflow_data(*containing_block))
-                    break;
-            }
-        }
-    }
-
-    if (old_overflow_data_by_box.is_empty())
-        return;
-
-    for (auto const& it : old_overflow_data_by_box) {
-        if (!Painting::has_committed_box(*it.key))
-            continue;
-
-        // Boxes reset by a subtree commit have no previous overflow data. They will be measured
-        // recursively if an ancestor reaches them. Measuring each one here would repeatedly walk
-        // the same containing-block chains after a small subtree update.
-        if (!it.value.has_value() && it.key != m_layout_root.ptr() && !it.key->is_scroll_container() && Painting::scroll_offset(*it.key).is_zero())
-            continue;
-
-        Painting::rust_measure_scrollable_overflow(*it.key);
-        clamp_scroll_offset(*it.key);
-    }
-
-    bool any_overflow_changed = false;
-    bool any_has_scrollable_overflow_flipped = false;
-    for (auto const& [box, old_overflow_data] : old_overflow_data_by_box) {
-        if (!Painting::has_committed_box(*box))
-            continue;
-        auto new_overflow_data = Painting::overflow_data(*box);
-        if (!new_overflow_data.has_value())
-            continue;
-        // A box with no prior overflow data was just created or reset by the layout commit, so
-        // its paint cache is already clean.
-        if (!old_overflow_data.has_value())
-            continue;
-        // Boxes that merely moved do not register here; everything derived below is
-        // translation-invariant, and movement-driven repaint belongs to the layout commit.
-        bool rect_changed = old_overflow_data->scrollable_overflow_rect_relative_to_padding_box != new_overflow_data->scrollable_overflow_rect_relative_to_padding_box;
-        bool has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data->has_scrollable_overflow;
-        if (!rect_changed && !has_scrollable_overflow_flipped)
-            continue;
-        // Cached paint commands and hit-test items capture scrollbar geometry and per-direction
-        // scrollability derived from the overflow rect, so they cannot be reused once it changes.
-        // This must also run for the after-layout-commit path: a subtree relayout re-measures a
-        // surviving ancestor's overflow without resetting the ancestor's committed row.
-        Painting::invalidate_paint_cache(*box);
-        any_overflow_changed = true;
-        any_has_scrollable_overflow_flipped |= has_scrollable_overflow_flipped;
-    }
-
-    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit)
+    if (derived_structure_updates != ScrollableOverflowDerivedStructureUpdates::UpdateAfterMeasure)
         return;
 
     // Nothing derived from scrollable overflow needs updating. In particular, this keeps transform
     // changes that ride the accumulated-visual-context value-update path free of display list
     // re-recording when the overflow they produce is unchanged.
-    if (!any_overflow_changed)
+    if (!outcome.any_overflow_changed)
         return;
 
-    if (any_has_scrollable_overflow_flipped) {
+    if (outcome.any_has_scrollable_overflow_flipped) {
         set_needs_accumulated_visual_contexts_update(true);
     } else if (!m_needs_accumulated_visual_contexts_update) {
         // Sticky insets only depend on scrollport geometry and which ancestor is scrollable, neither of
@@ -2998,10 +2875,9 @@ bool Document::can_compute_client_rects_without_accumulated_visual_contexts_upda
             continue;
         if (node_with_style->has_css_transform() || node_with_style->perspective().has_value() || node_with_style->is_sticky_position())
             return false;
-        if (m_may_have_default_scroll_shift_anchor) {
-            if (auto const* box = as_if<Layout::Box>(*node); box && box->default_scroll_shift_anchor())
-                return false;
-        }
+        if (auto const* box = as_if<Layout::Box>(*node);
+            box && (box->compensates_for_horizontal_scroll() || box->compensates_for_vertical_scroll()))
+            return false;
         // A scroll container's contents move, but its own border box does not.
         if (node != &layout_node) {
             if (!Painting::scroll_offset(*node).is_zero())
@@ -10325,27 +10201,7 @@ void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& la
         return;
     }
 
-    if (auto const* box = as_if<Layout::Box>(layout_node)) {
-        for (auto const* containing_box = box; containing_box; containing_box = containing_box->containing_block()) {
-            if (Painting::has_committed_box(*containing_box))
-                Painting::clear_cached_overflow_data(*containing_box);
-        }
-    }
-
-    if (m_needs_full_scrollable_overflow_recalculation)
-        return;
-
-    // NB: Cap the queue in case it's never consumed (e.g. forced style updates in a document that never
-    //     updates layout).
-    static constexpr size_t max_pending_scrollable_overflow_recalculations = 1024;
-    if (m_boxes_needing_scrollable_overflow_recalculation.size() >= max_pending_scrollable_overflow_recalculations) {
-        m_boxes_needing_scrollable_overflow_recalculation.clear();
-        m_needs_full_scrollable_overflow_recalculation = true;
-        return;
-    }
-
-    if (Painting::has_committed_box(layout_node))
-        m_boxes_needing_scrollable_overflow_recalculation.append(Painting::committed_row_slot(layout_node));
+    Layout::RustFFI::layout_arena_schedule_scrollable_overflow_recalculation(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node));
 }
 
 void Document::schedule_scrollable_overflow_recalculation(Element& element)
