@@ -1976,11 +1976,11 @@ bool Application::supports_clipboard_type(ClipboardType type) const
 
 Utf16String Application::clipboard_text(ClipboardType) const
 {
-    if (!m_clipboard.has_value())
-        return {};
-    for (auto const& representation : m_clipboard->system_clipboard_representations) {
-        if (representation.name == "text/plain"sv)
-            return Utf16String::from_utf8(representation.data);
+    for (auto const& representation : m_clipboard.system_clipboard_representations) {
+        if (representation.name == "text/plain"sv) {
+            if (auto const* data = representation.data.get_pointer<ByteString>())
+                return Utf16String::from_utf8(*data);
+        }
     }
     return {};
 }
@@ -1995,18 +1995,6 @@ void Application::set_clipboard_text(String text, ClipboardType)
             },
         },
     };
-}
-
-Vector<Web::Clipboard::SystemClipboardRepresentation> Application::clipboard_entries() const
-{
-    if (!m_clipboard.has_value())
-        return {};
-    return m_clipboard->system_clipboard_representations;
-}
-
-void Application::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
-{
-    m_clipboard = move(item);
 }
 
 void Application::insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation entry)

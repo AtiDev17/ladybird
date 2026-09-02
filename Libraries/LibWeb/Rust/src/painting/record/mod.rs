@@ -9,42 +9,47 @@ pub mod cache;
 pub mod hit_test_items;
 pub mod masks;
 pub mod paint;
+pub(crate) mod scratch;
 pub mod traversal;
+pub(crate) mod verify;
 
 use crate::css::css_enums;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::node_data::{NodeFlag, NodeKind};
-use crate::layout::used_values;
 use crate::painting::border_radii::BorderRadii;
-use crate::painting::display_list::builder::{PendingInlineClip, RecordedDisplayList};
+use crate::painting::display_list::builder::{CommandRange, PendingInlineClip, RecordedDisplayList};
 use crate::painting::display_list::commands::{ContextRef, DisplayListResourceId, FrameNodeIndex, SpatialNodeIndex};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
 use crate::painting::hit_test::HitTestList;
 use crate::painting::host::{
-    FfiHitTestHostCallbacks, FfiHitTestTextNodeFacts, FfiPaintHostCallbacks, FfiRecordingInputs,
-    FfiVisualContextHostCallbacks,
+    FfiHitTestHostCallbacks, FfiHitTestTextNodeFacts, FfiPaintHostCallbacks, FfiPaintRecordingStats,
+    FfiRecordingInputs, FfiVisualContextHostCallbacks,
 };
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::paintable_rows::PaintableRowsRef;
+use crate::painting::record::cache::{OpenCapture, RecordGen};
 use crate::painting::visual_context::nested::NestedAssignments;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Default)]
 pub struct RecordingOutput {
-    pub id: u64,
     pub recorded_structural_epoch: u64,
     // A default-constructed output's 0.0 never matches a real recording scale.
     pub recorded_device_pixels_per_css_pixel: f64,
     pub hit_test_list: HitTestList,
-    pub display_list: RecordedDisplayList,
+    pub display_list: Rc<RecordedDisplayList>,
     pub has_blocking_wheel_event_listeners: bool,
+    pub wheel_event_listener_state_generation: u64,
     pub mask_display_lists: Vec<(FrameNodeIndex, DisplayListResourceId)>,
-    pub spliced_capture_count: usize,
+    pub recording_stats: FfiPaintRecordingStats,
+    pub is_identical_to_cache_source: bool,
+    pub(crate) capture_log_for_verification: Option<verify::CaptureLog>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PaintPhase {
     Background,
@@ -60,6 +65,12 @@ impl PaintPhase {
 }
 pub(crate) struct NestedRecordingState {
     pub(crate) assignments: NestedAssignments,
+}
+
+pub(crate) struct DeferredWholeTapeSplice {
+    pub(crate) source_display_list: Rc<RecordedDisplayList>,
+    pub(crate) prologue_byte_count: usize,
+    pub(crate) source_range: CommandRange,
 }
 
 pub struct PaintRecorder<'a> {
@@ -79,21 +90,16 @@ pub struct PaintRecorder<'a> {
     pub(crate) viewport: NodeSlotId,
     command_cache_source: Option<Rc<RecordingOutput>>,
     item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
-    display_list_id: u64,
     hit_test_list_generation: u64,
-    pub(crate) has_blocking_wheel_event_listeners: bool,
-    spliced_capture_count: usize,
+    open_capture_stack: Vec<OpenCapture>,
+    deferred_whole_tape_splice: Option<DeferredWholeTapeSplice>,
+    pub(crate) blocking_wheel_event_region_count: u32,
+    pub(crate) recording_stats: FfiPaintRecordingStats,
     uncacheable_paint_generation: u64,
+    pub(crate) capture_log_for_verification: Option<verify::CaptureLog>,
     list: HitTestList,
-    base_paint_facts_cache: Vec<Option<(NodeSlotId, BasePaintFacts)>>,
-    paintable_facts_cache: Vec<Option<(NodeSlotId, hit_test_items::HitTestFacts)>>,
-    pub(crate) absolute_position_cache: Vec<std::cell::Cell<Option<(NodeSlotId, used_values::FfiCssPixelPoint)>>>,
-    // Validity checks must compare against this recording-start snapshot, not the live per-row
-    // cell: the first phase that re-records a moved row updates the cell, and later phases
-    // would then wrongly accept their stale captures.
-    pub(crate) previously_captured_position_cache:
-        Vec<std::cell::Cell<Option<(NodeSlotId, used_values::FfiCssPixelPoint)>>>,
-    pub(crate) completed_record_gen: u64,
+    pub(crate) memo_tables: &'a RefCell<scratch::PerRecordingMemoTables>,
+    pub(crate) completed_record_gen: RecordGen,
     pub(crate) all_paint_caches_dirty: bool,
     pub(crate) all_descendant_subtree_caches_dirty: bool,
     text_node_facts_cache: HashMap<u32, FfiHitTestTextNodeFacts>,
@@ -112,7 +118,7 @@ pub(crate) struct BasePaintFacts {
 }
 
 impl<'a> PaintRecorder<'a> {
-    pub(crate) fn prevent_descendant_subtree_caching(&mut self) {
+    pub(crate) fn mark_open_captures_unsplicable(&mut self) {
         self.uncacheable_paint_generation = self
             .uncacheable_paint_generation
             .checked_add(1)
@@ -132,15 +138,12 @@ impl<'a> PaintRecorder<'a> {
     }
 
     fn paintable_facts(&mut self, paintable: NodeSlotId) -> hit_test_items::HitTestFacts {
-        let index = paintable.slot_index() as usize;
-        if let Some((memoized_id, facts)) = self.paintable_facts_cache[index]
-            && memoized_id == paintable
-        {
+        if let Some(facts) = self.memo_tables.borrow().hit_test_facts(paintable) {
             return facts;
         }
         let dom_facts = self.host.paintable_facts(self.layout_node_shell(paintable));
         let facts = hit_test_items::hit_test_facts(self.layout_arena, paintable, &self.inputs, dom_facts);
-        self.paintable_facts_cache[index] = Some((paintable, facts));
+        self.memo_tables.borrow_mut().set_hit_test_facts(paintable, facts);
         facts
     }
 
@@ -209,20 +212,15 @@ impl<'a> PaintRecorder<'a> {
             viewport: self.viewport,
             command_cache_source: None,
             item_cache_source: None,
-            display_list_id: self.display_list_id,
             hit_test_list_generation: self.hit_test_list_generation,
-            has_blocking_wheel_event_listeners: false,
-            spliced_capture_count: 0,
+            open_capture_stack: Vec::new(),
+            deferred_whole_tape_splice: None,
+            blocking_wheel_event_region_count: 0,
+            recording_stats: FfiPaintRecordingStats::default(),
             uncacheable_paint_generation: 0,
+            capture_log_for_verification: None,
             list: HitTestList::default(),
-            base_paint_facts_cache: vec![None; self.layout_arena.paintable_row_count()],
-            paintable_facts_cache: vec![None; self.layout_arena.paintable_row_count()],
-            absolute_position_cache: (0..self.layout_arena.paintable_row_count())
-                .map(|_| std::cell::Cell::new(None))
-                .collect(),
-            previously_captured_position_cache: (0..self.layout_arena.paintable_row_count())
-                .map(|_| std::cell::Cell::new(None))
-                .collect(),
+            memo_tables: self.memo_tables,
             completed_record_gen: self.completed_record_gen,
             all_paint_caches_dirty: self.all_paint_caches_dirty,
             all_descendant_subtree_caches_dirty: self.all_descendant_subtree_caches_dirty,
@@ -254,15 +252,12 @@ impl<'a> PaintRecorder<'a> {
     }
 
     pub(crate) fn base_paint_facts(&mut self, paintable: NodeSlotId) -> BasePaintFacts {
-        let index = paintable.slot_index() as usize;
-        if let Some((memoized_id, facts)) = self.base_paint_facts_cache[index]
-            && memoized_id == paintable
-        {
+        if let Some(facts) = self.memo_tables.borrow().base_paint_facts(paintable) {
             return facts;
         }
         let Some(style) = self.layout_arena.node_style_if_live(paintable) else {
             let facts = BasePaintFacts::default();
-            self.base_paint_facts_cache[index] = Some((paintable, facts));
+            self.memo_tables.borrow_mut().set_base_paint_facts(paintable, facts);
             return facts;
         };
         let effects = style.effects();
@@ -282,7 +277,7 @@ impl<'a> PaintRecorder<'a> {
             has_backdrop_filter,
             paints_border_image,
         };
-        self.base_paint_facts_cache[index] = Some((paintable, facts));
+        self.memo_tables.borrow_mut().set_base_paint_facts(paintable, facts);
         facts
     }
 

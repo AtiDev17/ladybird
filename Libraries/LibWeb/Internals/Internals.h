@@ -99,6 +99,7 @@ public:
     Utf16String current_cursor();
 
     Utf16String selected_text_for_clipboard();
+    WebIDL::ExceptionOr<void> set_clipboard_file(Utf16String const& name, Utf16String const& mime_type, Utf16String const& data);
 
     void set_marked_text_from_input_method(Utf16String const& text);
     void commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length);
@@ -131,6 +132,8 @@ public:
     WebIDL::UnsignedLongLong table_cell_measurement_cache_miss_count();
     WebIDL::UnsignedLongLong intrinsic_measurement_count();
     WebIDL::UnsignedLongLong accumulated_visual_context_tree_build_count();
+    WebIDL::UnsignedLongLong paint_cache_spliced_capture_count();
+    WebIDL::UnsignedLongLong paint_cache_capture_site_visit_count();
     void set_autoplay_policy(Utf16String const& policy);
 
     Utf16String get_computed_role(DOM::Element& element);

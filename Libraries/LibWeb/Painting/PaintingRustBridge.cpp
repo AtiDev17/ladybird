@@ -580,14 +580,11 @@ Layout::RustFFI::FfiScrollableOverflowUpdateOutcome rust_update_scrollable_overf
         if (!scroll_offset(box).is_zero())
             set_scroll_offset(box, scroll_offset(box));
     };
-    auto scroll_offset_is_zero = [](void*, void* layout_node_shell) -> bool {
-        return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell)).is_zero();
-    };
 
     return Layout::RustFFI::layout_arena_update_scrollable_overflow(
         layout_arena_handle(document), viewport_row_slot(document), handled_by_full_layout_commit,
         visual_context_host_callbacks(document), scrollable_overflow_host_callbacks(),
-        nullptr, clamp_scroll_offset_if_nonzero, scroll_offset_is_zero);
+        nullptr, clamp_scroll_offset_if_nonzero);
 }
 
 CSS::ResolvedImage rust_resolve_gradient_for_size(CSS::StyleValue const& gradient_style_value, Layout::NodeWithStyle const& layout_node, CSSPixelSize size)
@@ -835,6 +832,53 @@ static NonnullRefPtr<DisplayList> display_list_from_rust_recording(AccumulatedVi
     auto command_bytes = MUST(ByteBuffer::copy(recorded.bytes, recorded.byte_count));
     Vector<DisplayListCommandRun> command_runs { ReadonlySpan<DisplayListCommandRun> { recorded.command_runs, recorded.command_run_count } };
     return DisplayList::create_from_command_bytes(visual_context_tree, move(command_bytes), move(command_runs));
+}
+
+static Optional<u64> composited_context_id_for_navigable_container(HTML::NavigableContainer const& navigable_container)
+{
+    auto content_navigable = navigable_container.content_navigable();
+    if (!content_navigable)
+        return {};
+    auto const& local_navigable = as<HTML::LocalNavigable>(*content_navigable);
+    if (local_navigable.has_been_destroyed())
+        return {};
+    auto context_id = navigable_container.document().page().client().compositor_context_id_for_remote_child_frame(content_navigable->id());
+    if (!context_id.has_value() && local_navigable.has_compositor_context()) {
+        auto const* hosted_document = navigable_container.content_document_without_origin_check();
+        if (!hosted_document || !hosted_document->is_render_blocked())
+            context_id = local_navigable.compositor_context().id();
+    }
+    if (!context_id.has_value())
+        return {};
+    return context_id->value();
+}
+
+template<typename Callback>
+static void for_each_child_navigable_including_pending_history_steps(HTML::LocalNavigable const& navigable, Callback callback)
+{
+    for (auto const& child_navigable : HTML::all_local_navigables()) {
+        if (child_navigable->parent().ptr() == &navigable)
+            callback(*child_navigable);
+    }
+}
+
+static void invalidate_navigable_containers_whose_composited_context_changed(DOM::Document& document)
+{
+    if (!document.paint_state().has_painted_navigable_container_foreground())
+        return;
+    auto navigable = document.navigable();
+    if (!navigable)
+        return;
+    for_each_child_navigable_including_pending_history_steps(*navigable, [&](HTML::LocalNavigable& child_navigable) {
+        auto container = child_navigable.container();
+        if (!container || !container->has_painted_foreground())
+            return;
+        auto const* layout_node = container->layout_node();
+        if (!layout_node || !has_committed_box(*layout_node))
+            return;
+        if (container->compositor_context_id_at_last_paint() != composited_context_id_for_navigable_container(*container))
+            invalidate_paint_cache(*layout_node);
+    });
 }
 
 Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& context)
@@ -1096,21 +1140,13 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                     break;
                 }
             } else if (is_navigable_container_viewport_paintable(layout_node)) {
-                auto const& navigable_container = as<HTML::NavigableContainer>(*layout_node.dom_node());
-                auto content_navigable = navigable_container.content_navigable();
-                VERIFY(content_navigable);
-                auto& local_navigable = as<HTML::LocalNavigable>(*content_navigable);
-                if (!local_navigable.has_been_destroyed()) {
-                    auto context_id = layout_node.document().page().client().compositor_context_id_for_remote_child_frame(content_navigable->id());
-                    if (!context_id.has_value() && local_navigable.has_compositor_context()) {
-                        auto* hosted_document = const_cast<DOM::Document*>(navigable_container.content_document_without_origin_check());
-                        if (!hosted_document || !hosted_document->is_render_blocked())
-                            context_id = local_navigable.compositor_context().id();
-                    }
-                    if (context_id.has_value()) {
-                        facts.has_composited_context = true;
-                        facts.composited_context_id = context_id->value();
-                    }
+                auto& navigable_container = const_cast<HTML::NavigableContainer&>(as<HTML::NavigableContainer>(*layout_node.dom_node()));
+                auto context_id = composited_context_id_for_navigable_container(navigable_container);
+                navigable_container.set_compositor_context_id_at_last_paint(context_id);
+                const_cast<DOM::Document&>(*context.document).paint_state().set_has_painted_navigable_container_foreground();
+                if (context_id.has_value()) {
+                    facts.has_composited_context = true;
+                    facts.composited_context_id = *context_id;
                 }
             } else if (kind == Layout::RustFFI::NodeKind::CheckBox || kind == Layout::RustFFI::NodeKind::RadioButton) {
                 auto const& input = as<HTML::HTMLInputElement const>(*layout_node.dom_node());
@@ -1335,7 +1371,6 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
         }
     }
     inputs.paint_command_cache_read_write = cache_mode == PaintCommandCacheMode::ReadWrite;
-    inputs.display_list_id = placeholder_display_list.id();
     {
         auto navigable = document.navigable();
         inputs.window_is_focused = navigable && navigable->is_focused();
@@ -1357,6 +1392,7 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
         inputs.bitmap_rect = bitmap_rect;
         inputs.background_color = document.background_color();
     }
+    invalidate_navigable_containers_whose_composited_context_changed(document);
     PaintHostContext paint_host_context { resource_storage, document, paint_generation_id, device_pixels_per_css_pixel };
     auto rust_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
     auto generation = Layout::RustFFI::layout_arena_record_display_list(arena, viewport_row_slot(document), hit_test_host_callbacks(), paint_host_callbacks(paint_host_context), visual_context_host_callbacks(document), inputs);
@@ -1364,10 +1400,34 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
         return nullptr;
     if (Layout::RustFFI::layout_arena_last_recording_has_blocking_wheel_event_listeners(arena))
         wheel_event_region_state.has_blocking_wheel_event_listeners = true;
+    auto stamp_async_scrolling_metadata_with_current_viewport_rect = [&](DisplayList& display_list) {
+        if (auto navigable = document.navigable()) {
+            display_list.set_async_scrolling_metadata({
+                .viewport_rect = device_viewport_rect.to_type<int>(),
+                .wheel_event_listener_state_generation = navigable->page().wheel_event_listener_state_generation(),
+                .has_blocking_wheel_event_listeners = wheel_event_region_state.has_blocking_wheel_event_listeners,
+                .has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport,
+            });
+        }
+    };
+
+    if (Layout::RustFFI::layout_arena_last_recording_is_identical_to_cache_source(arena)) {
+        if (auto* source = document.paint_state().display_list_used_as_paint_command_cache_source()) {
+            if (rust_painting_timing_enabled())
+                dbgln("PAINT_RECORD rust={} µs identical to the previous recording", rust_timer.elapsed_time().to_microseconds());
+            stamp_async_scrolling_metadata_with_current_viewport_rect(*source);
+            return *source;
+        }
+    }
 
     auto recorded = Layout::RustFFI::layout_arena_recorded_display_list(arena);
-    if (rust_painting_timing_enabled())
-        dbgln("PAINT_RECORD rust={} µs commands={} bytes spliced={} captures", rust_timer.elapsed_time().to_microseconds(), recorded.byte_count, Layout::RustFFI::layout_arena_last_recording_spliced_capture_count(arena));
+    if (rust_painting_timing_enabled()) {
+        auto stats = Layout::RustFFI::layout_arena_last_recording_stats(arena);
+        dbgln("PAINT_RECORD rust={} µs commands={} bytes box_phase_visits={} painted_as_stacking_context={}/{} descendant_subtrees={}/{} box_phase_commands={}/{} box_phase_hit_test_items={} hit_test_items_copied={} command_bytes_spliced={}",
+            rust_timer.elapsed_time().to_microseconds(), recorded.byte_count,
+            stats.box_phase_visits, stats.painted_as_stacking_context_capture_hits, stats.painted_as_stacking_context_capture_attempts, stats.descendant_subtree_capture_hits, stats.descendant_subtree_capture_attempts,
+            stats.box_phase_command_capture_hits, stats.box_phase_command_capture_attempts, stats.box_phase_hit_test_item_capture_hits, stats.hit_test_items_copied_from_source, stats.command_bytes_spliced_from_source);
+    }
 
     auto display_list = display_list_from_rust_recording(document.visual_context_tree(), recorded);
     auto registration_count = Layout::RustFFI::layout_arena_display_list_mask_registration_count(arena);
@@ -1379,14 +1439,7 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
     }
     if (auto color = placeholder_display_list.surface_clear_color(); color.has_value())
         display_list->set_surface_clear_color(*color);
-    if (auto navigable = document.navigable()) {
-        display_list->set_async_scrolling_metadata({
-            .viewport_rect = device_viewport_rect.to_type<int>(),
-            .wheel_event_listener_state_generation = navigable->page().wheel_event_listener_state_generation(),
-            .has_blocking_wheel_event_listeners = wheel_event_region_state.has_blocking_wheel_event_listeners,
-            .has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport,
-        });
-    }
+    stamp_async_scrolling_metadata_with_current_viewport_rect(*display_list);
     return display_list;
 }
 

@@ -35,7 +35,7 @@ pub const CHROME_WIDGET_VERTICAL_SCROLLBAR: u8 = 3;
 
 pub use crate::painting::border_radii::BorderRadii;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HitTestItem {
     pub kind: HitTestItemKind,
     pub paintable: NodeSlotId,
@@ -120,6 +120,7 @@ pub fn rects_overlap_in_block_axis(a: CssPixelRect, b: CssPixelRect, writing_mod
 pub struct HitTestList {
     pub generation: u64,
     pub items: std::rc::Rc<Vec<HitTestItem>>,
+    pub item_capacity_hint_from_previous_list: usize,
     pub derived_structures_built: bool,
     pub caret_item_indices: Vec<usize>,
     pub caret_lines: Vec<CaretLine>,
@@ -133,9 +134,11 @@ impl HitTestList {
             !self.derived_structures_built,
             "hit-test item appended after the derived structures were built"
         );
-        std::rc::Rc::get_mut(&mut self.items)
-            .expect("hit-test items are exclusively owned while recording")
-            .push(item);
+        let items = std::rc::Rc::make_mut(&mut self.items);
+        if items.capacity() == 0 {
+            items.reserve(self.item_capacity_hint_from_previous_list);
+        }
+        items.push(item);
     }
 
     pub fn caret_line_rect_for_item(item: &HitTestItem) -> CssPixelRect {

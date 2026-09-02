@@ -73,6 +73,7 @@ Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, AttachToDOMNode att
     set_flag(RustFFI::NodeFlag::UsesButtonLayout,
         node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout());
     set_flag(RustFFI::NodeFlag::IsEditingHost, node && node->is_editing_host());
+    update_has_scroll_offset_flag();
 
     if (node && attach_to_dom_node == AttachToDOMNode::Yes)
         node->set_layout_node({}, *this);
@@ -505,6 +506,16 @@ void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
 
 void NodeWithStyle::attach_style_resources()
 {
+    // The style engine notes at publication whether a record holds an <image> anywhere this node would load and
+    // observe one. Nearly every style holds none, and that answer is one flag read; the walk below stays for the
+    // styles that do.
+    auto dependency_flags = document().style_computer().style_engine().style_record_dependency_flags(m_style_record_identity);
+    if (!(dependency_flags & to_underlying(CSS::StyleRecordDependencyFlag::HoldsImageValues))) {
+        m_cursor_style_values.clear();
+        clear_image_observers();
+        return;
+    }
+
     auto load_image = [&](CSS::AbstractImageStyleValue const* image) {
         if (image)
             const_cast<CSS::AbstractImageStyleValue&>(*image).load_any_resources(*this);
@@ -1001,6 +1012,32 @@ void Node::set_generated_for(CSS::PseudoElement type, DOM::Element& element)
     m_pseudo_element_generator = element;
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
         node_with_style->bind_generated_style_record(element.style_record_identity(type));
+}
+
+// An element's box holds the element's scroll offset. Everything generated for a pseudo-element
+// names it as generator, but only the pseudo-element's own box is what scrolls, so only that box
+// holds the pseudo-element's offset; the generated content inside it holds none.
+bool Node::dom_target_stores_scroll_offset() const
+{
+    if (auto pseudo_element = generated_for_pseudo_element(); pseudo_element.has_value()) {
+        auto synthetic_pseudo_element = pseudo_element_generator()->get_synthetic_pseudo_element(*pseudo_element);
+        return synthetic_pseudo_element.has_value()
+            && synthetic_pseudo_element->unsafe_layout_node() == this
+            && !synthetic_pseudo_element->scroll_offset().is_zero();
+    }
+    if (auto const* element = as_if<DOM::Element>(dom_node()))
+        return !element->scroll_offset({}).is_zero();
+    return false;
+}
+
+void Node::update_has_scroll_offset_flag()
+{
+    set_flag(RustFFI::NodeFlag::HasScrollOffset, dom_target_stores_scroll_offset());
+}
+
+void Node::verify_has_scroll_offset_flag() const
+{
+    VERIFY(has_flag(RustFFI::NodeFlag::HasScrollOffset) == dom_target_stores_scroll_offset());
 }
 
 DOM::Document& Node::document()

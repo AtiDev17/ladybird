@@ -225,8 +225,28 @@ where
         }
     }
 
+    pub(crate) fn mark_descendant_subtree_caches_dirty_in_paint_subtree(&self, root: NodeSlotId) {
+        if !self.paintable_row_is_populated(root) {
+            return;
+        }
+        self.arena.debug_assert_not_recording();
+        let next_dirty_gen = self.arena.paint_cache_next_dirty_gen();
+        crate::painting::paint_order::for_each_in_paint_subtree(self, root, |slot| {
+            self.arena
+                .paintable_paint_cache(slot)
+                .mark_descendants_dirty(next_dirty_gen);
+        });
+        self.mark_descendant_subtree_caches_dirty_along_paint_chain(root);
+    }
+
     pub(crate) fn invalidate_paint_cache(&self, id: NodeSlotId) {
         self.mark_paint_cache_self_dirty(id);
+    }
+
+    pub(crate) fn invalidate_subtree_for_repaint(&self, id: NodeSlotId) {
+        crate::painting::paint_order::for_each_in_paint_subtree(self, id, |slot| {
+            self.mark_paint_cache_self_dirty(slot);
+        });
     }
 
     pub(crate) fn mark_descendant_subtree_caches_dirty_from_layout_node(&self, mut node: NodeSlotId) {
@@ -580,12 +600,21 @@ impl LayoutNodeArena {
 
     pub(crate) fn note_paint_record_completed_with_cache_writes(&self) {
         let generation = &self.paintable_rows.completed_record_gen;
-        generation.set(
-            generation
-                .get()
-                .checked_add(1)
-                .expect("paint cache record generation overflowed"),
-        );
+        let next = generation.get() + 1;
+        if next >= u64::from(u32::MAX) {
+            self.forget_every_paint_cache_entry_before_record_gen_exceeds_u32();
+            return;
+        }
+        generation.set(next);
+    }
+
+    fn forget_every_paint_cache_entry_before_record_gen_exceeds_u32(&self) {
+        for cache in self.paintable_rows.paint_caches.borrow().iter() {
+            cache.reset_entries_position_and_dirty_gens();
+        }
+        self.paintable_rows.all_paint_caches_dirty_gen.set(0);
+        self.paintable_rows.all_descendant_subtree_caches_dirty_gen.set(0);
+        self.paintable_rows.completed_record_gen.set(0);
     }
 
     pub(crate) fn set_paint_recording_in_progress(&self, in_progress: bool) {
@@ -874,6 +903,10 @@ impl LayoutNodeArena {
 
     pub(crate) fn invalidate_for_repaint(&self, id: NodeSlotId) {
         self.paintable_rows().invalidate_for_repaint(id);
+    }
+
+    pub(crate) fn invalidate_subtree_for_repaint(&self, id: NodeSlotId) {
+        self.paintable_rows().invalidate_subtree_for_repaint(id);
     }
 
     pub(crate) fn invalidate_propagated_text_decoration_caches(&self, root: NodeSlotId) {

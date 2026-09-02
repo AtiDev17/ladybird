@@ -2816,6 +2816,15 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     if (!m_layout_node_arena)
         return;
 
+    // The update reads each box's scroll-offset flag in place of the offset it mirrors.
+    static bool const verify_scroll_offset_flags = getenv("LIBWEB_VERIFY_SCROLL_OFFSET_FLAGS") != nullptr;
+    if (verify_scroll_offset_flags && m_layout_root) {
+        m_layout_root->for_each_in_inclusive_subtree([](Layout::Node const& node) {
+            node.verify_has_scroll_offset_flag();
+            return TraversalDecision::Continue;
+        });
+    }
+
     auto outcome = Painting::rust_update_scrollable_overflow(*this,
         derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
     if (!outcome.performed_recalculation)
@@ -10317,9 +10326,12 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     auto display_list = Painting::record_rust_display_list(*this, *placeholder_display_list, resource_storage, cache_mode, config, overlay_inputs);
     if (!display_list)
         return nullptr;
-    m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
-    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite) {
+    bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
+    if (!recording_returned_the_paint_command_cache_source || !m_hit_test_display_list || !m_hit_test_display_list->is_current())
+        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+
+    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
     }
 

@@ -1377,6 +1377,15 @@ impl StyleEngine {
             return;
         }
         let sequence_match_workspace = MatchEvaluationWorkspace::default();
+        // What an entry's selector says about the parent of its positional test holds for the
+        // whole sequence, so it is decided once per entry here rather than once per moved child.
+        const PARENT_UNDECIDED: u8 = 0;
+        const PARENT_ADMITS: u8 = 1;
+        const PARENT_REJECTS: u8 = 2;
+        let mut parent_verdicts = vec![PARENT_UNDECIDED; entries.len()];
+        let parent_verdict_bytes = (parent_verdicts.capacity() * size_of::<u8>()) as u64;
+        self.memory
+            .reserve_required(MemoryCategory::BatchScratch, parent_verdict_bytes);
         // Where in the sequence the earliest and the latest change happened. A change nobody could
         // place leaves the whole sequence moved, because that is all that is still provable.
         let (first_moved, last_moved) = match change.span {
@@ -1493,7 +1502,15 @@ impl StyleEngine {
                     let path = routing.path_of(entry.route);
                     // A whole sibling sequence shares one parent, so what the selector says the
                     // parent of the positional test is rejects the sequence in one lookup.
-                    if !engine.node_carries_any(routing.parent_dispatch_of(entry.route), parent, None) {
+                    let parent_verdict = &mut parent_verdicts[entry_index];
+                    if *parent_verdict == PARENT_UNDECIDED {
+                        *parent_verdict =
+                            match engine.node_carries_any(routing.parent_dispatch_of(entry.route), parent, None) {
+                                true => PARENT_ADMITS,
+                                false => PARENT_REJECTS,
+                            };
+                    }
+                    if *parent_verdict == PARENT_REJECTS {
                         continue;
                     }
                     // A non-relational positional input sits in one compound of the selector. A
@@ -1572,6 +1589,8 @@ impl StyleEngine {
                 }
             }
         }
+        drop(parent_verdicts);
+        self.memory.release(MemoryCategory::BatchScratch, parent_verdict_bytes);
         let sequence_match_workspace_bytes = sequence_match_workspace.capacity_bytes();
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, sequence_match_workspace_bytes);
@@ -2152,16 +2171,21 @@ impl StyleEngine {
         let mut candidates = Vec::new();
         let attributed_rule = site.attribution();
         regions.for_each_batch(&batch, |candidate| {
+            // A node the entry's subject cannot name matches it on neither side, so it has no
+            // delta to contribute - whether or not an earlier route already planned it. Filtering
+            // before the already-planned check keeps every entry whose batch merely contains a
+            // planned node from queueing a full exact evaluation of that node later.
+            if !(self.node_carries_any(site.subject, candidate, site.in_flux)
+                && self.node_carries_all(site.subject_required, candidate, site.in_flux)
+                && self.path_meets_waypoints(site.path, site.waypoints, candidate, site.in_flux))
+            {
+                return;
+            }
             if regions.contains_node(candidate) {
                 self.record_already_planned_selector_truth(candidate, site);
                 return;
             }
-            if self.node_carries_any(site.subject, candidate, site.in_flux)
-                && self.node_carries_all(site.subject_required, candidate, site.in_flux)
-                && self.path_meets_waypoints(site.path, site.waypoints, candidate, site.in_flux)
-            {
-                candidates.push(candidate);
-            }
+            candidates.push(candidate);
         });
         let charged_bytes = if batch_is_cached {
             (candidates.capacity() * size_of::<StyleNodeID>()) as u64

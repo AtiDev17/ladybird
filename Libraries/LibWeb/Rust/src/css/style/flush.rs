@@ -43,6 +43,13 @@ impl StyleEngine {
         let initial_tree_was_bulk_loaded = self.initial_tree_bulk_load_is_pending && document_root_arrival_is_pending;
         let publish_document_root_arrival = document_root_arrival_is_pending;
 
+        // Whatever the last flush's late exact asks left in the flush-local workspace was measured
+        // in the previous topology. Every exact evaluation below reads current-side sibling
+        // geometry from it, so it starts empty here, before this transaction's tree is applied.
+        let stale_match_workspace_bytes = self.match_workspace.capacity_bytes();
+        self.match_workspace = MatchEvaluationWorkspace::default();
+        self.memory
+            .release(MemoryCategory::BatchScratch, stale_match_workspace_bytes);
         let mut transaction = self.drain_transaction();
         self.apply_staged_transaction(&mut transaction);
         if transaction.is_empty() {
@@ -354,7 +361,15 @@ impl StyleEngine {
                     .collect();
                 self.retain_selector_incidences(&programs, root);
             }
-            let mut resident_nodes: Vec<StyleNodeID> = if outer_arrivals.is_empty() {
+            // Only program routing joins against the resident nodes, and a transaction of pure
+            // DOM inputs has no program joins at all. Walking every element of the document to
+            // enumerate them for such a transaction would be the flush's single largest cost.
+            let program_routing_needs_resident_nodes = !outer_arrivals.is_empty()
+                && transaction
+                    .inputs
+                    .iter()
+                    .any(|input| !transaction.program_joins_for(input.key).is_empty());
+            let mut resident_nodes: Vec<StyleNodeID> = if !program_routing_needs_resident_nodes {
                 Vec::new()
             } else if regions.topology_node_count() == connected_element_count {
                 regions
@@ -428,7 +443,7 @@ impl StyleEngine {
                     &program_delta.arriving_rules,
                     &program_delta.departed_scopes,
                     ProgramRoutingContext {
-                        resident_nodes: (!outer_arrivals.is_empty()).then_some(resident_nodes.as_slice()),
+                        resident_nodes: program_routing_needs_resident_nodes.then_some(resident_nodes.as_slice()),
                         winner_program_version: transaction.program_base_version,
                         document_root: root,
                         attachment_scopes: None,
@@ -449,7 +464,7 @@ impl StyleEngine {
                         &program_delta.arriving_rules,
                         &program_delta.departed_scopes,
                         ProgramRoutingContext {
-                            resident_nodes: (!outer_arrivals.is_empty()).then_some(resident_nodes.as_slice()),
+                            resident_nodes: program_routing_needs_resident_nodes.then_some(resident_nodes.as_slice()),
                             winner_program_version: transaction.program_base_version,
                             document_root: root,
                             attachment_scopes: Some(scopes),
