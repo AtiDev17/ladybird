@@ -235,6 +235,14 @@ StyleEngine::StyleRecordDelta StyleEngine::publish_computed_groups(StyleNodeID n
     return { StyleRecordID { delta.old_style_record }, StyleRecordID { delta.new_style_record } };
 }
 
+Optional<StyleEngine::StyleRecordDelta> StyleEngine::publish_animation_overlay(StyleNodeID node, u8 pseudo_kind, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> payloads)
+{
+    auto delta = StyleEngineFFI::style_engine_publish_animation_overlay(m_impl, node.value(), pseudo_kind, animation_overlay_identity, animated_overlay, payloads.data(), payloads.size());
+    if (delta.new_style_record == 0)
+        return {};
+    return StyleRecordDelta { StyleRecordID { delta.old_style_record }, StyleRecordID { delta.new_style_record } };
+}
+
 StyleEngine::StyleRecordDelta StyleEngine::assign_shared_style_record(StyleNodeID node, u8 pseudo_kind, StyleRecordID style_record, bool inherited_group_swap_eligible)
 {
     auto delta = StyleEngineFFI::style_engine_assign_shared_style_record(m_impl, node.value(), pseudo_kind, style_record.value(), ComputedValues::inherited_style_group_count, inherited_group_swap_eligible);
@@ -254,6 +262,16 @@ u8 StyleEngine::style_record_dependency_flags(StyleRecordID style_record) const
 u32 StyleEngine::compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout) const
 {
     return StyleEngineFFI::style_engine_compare_style_records(m_impl, old_style_record.value(), new_style_record.value(), font_lists_equal, element_folds_transform_into_layout);
+}
+
+bool StyleEngine::animation_overlay_changed(StyleRecordID old_style_record, void const* animated_overlay) const
+{
+    return StyleEngineFFI::style_engine_animation_overlay_changed(m_impl, old_style_record.value(), animated_overlay);
+}
+
+StyleEngineFFI::FfiAnimationInvalidation StyleEngine::compare_animation_overlay(StyleRecordID old_style_record, void const* animated_overlay, ReadonlySpan<void const*> payloads, bool is_document_element) const
+{
+    return StyleEngineFFI::style_engine_compare_animation_overlay(m_impl, old_style_record.value(), animated_overlay, payloads.data(), payloads.size(), is_document_element);
 }
 
 StyleEngine::StyleRecordView StyleEngine::style_record_view(StyleRecordID style_record) const

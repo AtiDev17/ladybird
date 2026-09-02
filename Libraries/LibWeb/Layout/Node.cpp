@@ -40,39 +40,38 @@
 
 namespace Web::Layout {
 
-NodeArenaAllocation::NodeArenaAllocation(DOM::Document& document)
+NodeArenaAllocation::NodeArenaAllocation(DOM::Document& document, RustFFI::FfiNodeConstructionFacts const& construction_facts)
     : m_arena(document.layout_node_arena())
 {
-    auto allocation = m_arena->allocate();
-    m_slot = allocation.slot;
-    m_data = allocation.data;
-    m_slot_generation = allocation.generation;
+    m_slot = m_arena->allocate(construction_facts);
 }
 
 NodeArenaAllocation::~NodeArenaAllocation()
 {
-    m_arena->free(m_slot, m_slot_generation);
+    m_arena->free(m_slot);
 }
 
-Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, AttachToDOMNode attach_to_dom_node)
-    : NodeArenaAllocation(document)
-    , m_dom_node(node ? *node : document)
+static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, void* shell)
 {
-    m_data->shell = this;
-    set_node_kind(RustFFI::NodeKind::Node);
-    set_flag(RustFFI::NodeFlag::Anonymous, node == nullptr);
-    // Some native controls use a generic box so they can host their internal shadow tree, but
-    // remain replaced elements for CSS box generation and inline layout. (Box's constructor
-    // sets the flag for the replaced box kinds.)
-    set_flag(RustFFI::NodeFlag::IsReplacedElement, node && is<HTML::HTMLInputElement>(*node));
-    set_flag(RustFFI::NodeFlag::IsHtmlInputElement, node && is<HTML::HTMLInputElement>(*node));
-    set_flag(RustFFI::NodeFlag::IsHtmlHtmlElement, node && node->is_html_html_element());
-    set_flag(RustFFI::NodeFlag::IsDocumentElement, node && node.ptr() == document.document_element());
-    set_flag(RustFFI::NodeFlag::IsInUserAgentShadowTree,
-        node && node->containing_shadow_root() && node->containing_shadow_root()->is_user_agent_internal());
-    set_flag(RustFFI::NodeFlag::UsesButtonLayout,
-        node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout());
-    set_flag(RustFFI::NodeFlag::IsEditingHost, node && node->is_editing_host());
+    return {
+        .kind = kind,
+        .shell = shell,
+        .is_anonymous = node == nullptr,
+        .is_html_input_element = node && is<HTML::HTMLInputElement>(*node),
+        .is_html_html_element = node && node->is_html_html_element(),
+        .is_document_element = node && node.ptr() == document.document_element(),
+        .is_in_user_agent_shadow_tree = node && node->containing_shadow_root() && node->containing_shadow_root()->is_user_agent_internal(),
+        .uses_button_layout = node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout(),
+        .is_editing_host = node && node->is_editing_host(),
+        .is_body = node && node == GC::Ptr { document.body() },
+    };
+}
+
+Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, AttachToDOMNode attach_to_dom_node)
+    : NodeArenaAllocation(document, build_node_construction_facts(document, node, kind, this))
+    , m_dom_node(node ? *node : document)
+    , m_kind(kind)
+{
     update_has_scroll_offset_flag();
 
     if (node && attach_to_dom_node == AttachToDOMNode::Yes)
@@ -87,12 +86,6 @@ Node::~Node()
 RustFFI::NodeSlotId Node::slot_id(Node const* node)
 {
     return node ? node->m_slot : RustFFI::NodeSlotId_INVALID;
-}
-
-void Node::set_node_kind(RustFFI::NodeKind kind)
-{
-    m_data->kind = kind;
-    enroll_for_arena_replaced_content_facts_sync_if_eligible();
 }
 
 StringView Node::class_name() const
@@ -145,16 +138,6 @@ StringView Node::class_name() const
     VERIFY_NOT_REACHED();
 }
 
-void Node::enroll_for_arena_replaced_content_facts_sync_if_eligible()
-{
-    if (m_enrolled_for_arena_replaced_content_facts_sync)
-        return;
-    if (!RustFFI::layout_node_data_may_have_replaced_content_facts(m_data))
-        return;
-    m_enrolled_for_arena_replaced_content_facts_sync = true;
-    RustFFI::layout_arena_enroll_node_for_replaced_content_facts_sync(arena_handle(), slot_id(this));
-}
-
 void Node::bump_fragment_cache_epoch_of_self_and_ancestors()
 {
     RustFFI::layout_arena_bump_fragment_cache_epoch_of_self_and_ancestors(arena_handle(), slot_id(this));
@@ -167,12 +150,12 @@ void* Node::arena_handle() const
 
 Box const* Node::containing_block() const
 {
-    return static_cast<Box const*>(tree_node_from_slot_if_live(m_data->containing_block));
+    return static_cast<Box const*>(containing_block_node_if_live());
 }
 
 Box* Node::containing_block()
 {
-    return static_cast<Box*>(tree_node_from_slot_if_live(m_data->containing_block));
+    return static_cast<Box*>(containing_block_node_if_live());
 }
 
 void Node::pin_style_record_for_detachment()
@@ -335,9 +318,8 @@ bool NodeWithStyle::is_sticky_position() const
 }
 
 NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, CSS::LayoutStyle style, RustFFI::NodeKind kind)
-    : Node(document, node)
+    : Node(document, node, kind)
 {
-    set_node_kind(kind);
     VERIFY(style);
     if (!!style.style_record_identity()) {
         m_style_record_identity = style.style_record_identity();
@@ -348,8 +330,6 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, C
         m_owned_computed_values = style.values();
         m_style_record_identity = document.style_computer().intern_anonymous_layout_style(*style.values());
     }
-    set_flag(RustFFI::NodeFlag::HasStyle, true);
-    set_flag(RustFFI::NodeFlag::IsBody, node && node == GC::Ptr { document.body() });
     // NB: Nodes constructed from an interned style record own no ComputedValues; read anchor names through the record view there.
     bool has_anchor_names = false;
     bool insets_use_anchor_functions = false;
@@ -366,7 +346,6 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, C
     publish_style_record_to_node_data();
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
     synchronize_table_span_data();
-    enroll_for_arena_replaced_content_facts_sync_if_eligible();
     if (m_owned_computed_values)
         pin_style_record_for_cxx_consumers();
 }
@@ -494,7 +473,6 @@ void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
     // A style change can introduce the properties that make a node carry replaced-content facts,
     // such as size containment arriving on a kept layout node.
-    enroll_for_arena_replaced_content_facts_sync_if_eligible();
     propagate_style_to_anonymous_wrappers();
     attach_style_resources();
     // A pseudo layout node can outlive replacement of the DOM pseudo's record until the layout
@@ -627,12 +605,12 @@ bool NodeWithStyle::is_inline_table() const
 
 bool Node::is_atomic_inline() const
 {
-    return RustFFI::layout_node_data_is_atomic_inline(m_data);
+    return RustFFI::layout_arena_node_is_atomic_inline(arena_handle(), slot_id(this));
 }
 
 bool Node::is_fragmented_inline() const
 {
-    return RustFFI::layout_node_data_is_fragmented_inline(m_data);
+    return RustFFI::layout_arena_node_is_fragmented_inline(arena_handle(), slot_id(this));
 }
 
 // https://drafts.csswg.org/css-transforms-1/#transformable-element
@@ -717,7 +695,6 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
     set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, false);
     publish_style_record_to_node_data();
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
-    enroll_for_arena_replaced_content_facts_sync_if_eligible();
     if (m_owned_computed_values)
         pin_style_record_for_cxx_consumers();
 
@@ -764,7 +741,6 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
     set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, false);
     publish_style_record_to_node_data();
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
-    enroll_for_arena_replaced_content_facts_sync_if_eligible();
     if (should_repin_style_record)
         pin_style_record_for_cxx_consumers();
 
@@ -820,7 +796,8 @@ void NodeWithStyle::publish_style_record_to_node_data()
 {
     auto const* payloads = document().style_computer().style_engine().style_record_payloads(m_style_record_identity);
     VERIFY(payloads);
-    node_data().style = payloads;
+    m_style_payloads = payloads;
+    RustFFI::layout_arena_set_node_style_payloads(arena_handle(), slot_id(this), payloads);
     if (content_visibility() == CSS::ContentVisibility::Auto)
         document().note_content_visibility_auto_style();
 
@@ -1008,7 +985,7 @@ void Node::set_generated_for(CSS::PseudoElement type, DOM::Element& element)
 {
     static_assert(encode_generated_for(CSS::PseudoElement::After) == RustFFI::GENERATED_FOR_AFTER);
     static_assert(encode_generated_for(CSS::PseudoElement::Marker) == RustFFI::GENERATED_FOR_MARKER);
-    m_data->generated_for = encode_generated_for(type);
+    RustFFI::layout_arena_set_node_generated_for(arena_handle(), slot_id(this), encode_generated_for(type));
     m_pseudo_element_generator = element;
     if (auto* node_with_style = as_if<NodeWithStyle>(*this))
         node_with_style->bind_generated_style_record(element.style_record_identity(type));

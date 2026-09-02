@@ -23,16 +23,14 @@ NodeArena::~NodeArena()
     RustFFI::layout_arena_destroy(m_handle);
 }
 
-RustFFI::NodeAllocation NodeArena::allocate()
+RustFFI::NodeSlotId NodeArena::allocate(RustFFI::FfiNodeConstructionFacts const& construction_facts)
 {
-    auto allocation = RustFFI::layout_arena_allocate(m_handle);
-    VERIFY(allocation.data);
-    return allocation;
+    return RustFFI::layout_arena_allocate(m_handle, construction_facts);
 }
 
-void NodeArena::free(RustFFI::NodeSlotId slot, u32 generation)
+void NodeArena::free(RustFFI::NodeSlotId slot)
 {
-    RustFFI::layout_arena_free(m_handle, slot, generation);
+    RustFFI::layout_arena_free(m_handle, slot);
 }
 
 u64 NodeArena::formatting_context_run_cache_hit_count() const

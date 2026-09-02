@@ -16,9 +16,10 @@ use crate::painting::display_list::recorder::DisplayListRecorder;
 use crate::painting::hit_test::*;
 use crate::painting::host::FfiPaintRecordingStats;
 use crate::painting::host::{
-    FfiHitTestHostCallbacks, FfiPaintHostCallbacks, FfiRecordingInputs, FfiVisualContextHostCallbacks,
+    FfiHitTestHostCallbacks, FfiMaskDisplayListRegistration, FfiPaintHostCallbacks, FfiVisualContextHostCallbacks,
 };
 use crate::painting::node_painting;
+use crate::painting::record::RecordingInputs;
 use crate::painting::record::cache::{
     CachedSubtreeCapture, CaptureAddress, CaptureKind, CaptureSite, EnclosingCaptureAnchor, OpenCapture, RecordGen,
     SourceTapePosition, SubtreeCaptureWalkOutcome, narrow_record_gen, resolve_capture_address_in_source_tape,
@@ -69,7 +70,7 @@ pub(crate) fn record_display_list(
     host: &FfiHitTestHostCallbacks,
     paint_host: &FfiPaintHostCallbacks,
     visual_context_host: &FfiVisualContextHostCallbacks,
-    inputs: FfiRecordingInputs,
+    inputs: RecordingInputs,
     hit_test_list_generation: u64,
     command_cache_source: Option<Rc<RecordingOutput>>,
     item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
@@ -141,7 +142,12 @@ pub(crate) fn record_display_list(
     recorder.prerecord_nested_display_lists();
     recorder.paint_and_capture_as_stacking_context(viewport);
     crate::painting::record::paint::inspector_overlay::record_inspector_overlays(&mut recorder);
-    let mask_display_lists = recorder.recorder.take_mask_display_lists();
+    let mask_display_lists: Vec<FfiMaskDisplayListRegistration> = recorder
+        .recorder
+        .take_mask_display_lists()
+        .into_iter()
+        .map(FfiMaskDisplayListRegistration::from)
+        .collect();
     let mut hit_test_list = recorder.list;
     hit_test_list.generation = hit_test_list_generation;
     let recorded = recorder.recorder.into_builder().finish();

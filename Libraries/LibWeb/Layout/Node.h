@@ -31,25 +31,6 @@ namespace Web::Layout {
 static_assert(sizeof(RustFFI::NodeSlotId) == sizeof(u32));
 static_assert(offsetof(RustFFI::NodeSlotId, index) == 0);
 
-static_assert(sizeof(RustFFI::NodeData) == 64);
-static_assert(offsetof(RustFFI::NodeData, parent) == 0);
-static_assert(offsetof(RustFFI::NodeData, first_child) == 4);
-static_assert(offsetof(RustFFI::NodeData, last_child) == 8);
-static_assert(offsetof(RustFFI::NodeData, previous_sibling) == 12);
-static_assert(offsetof(RustFFI::NodeData, next_sibling) == 16);
-static_assert(offsetof(RustFFI::NodeData, containing_block) == 20);
-static_assert(offsetof(RustFFI::NodeData, inline_containing_block) == 24);
-static_assert(offsetof(RustFFI::NodeData, kind) == 28);
-static_assert(offsetof(RustFFI::NodeData, generated_for) == 29);
-static_assert(offsetof(RustFFI::NodeData, intrinsic_cache_epoch) == 30);
-static_assert(offsetof(RustFFI::NodeData, flags) == 32);
-static_assert(offsetof(RustFFI::NodeData, fragment_cache_epoch) == 36);
-static_assert(offsetof(RustFFI::NodeData, slot_generation) == 40);
-static_assert(offsetof(RustFFI::NodeData, table_column_span) == 42);
-static_assert(offsetof(RustFFI::NodeData, table_row_span) == 44);
-static_assert(offsetof(RustFFI::NodeData, style) == 48);
-static_assert(offsetof(RustFFI::NodeData, shell) == 56);
-
 static_assert(sizeof(RustFFI::NodeKind) == sizeof(u8));
 static_assert(sizeof(RustFFI::NodeFlag) == sizeof(u32));
 
@@ -60,13 +41,11 @@ enum class LayoutUpdatePropagation : u8 {
 
 class NodeArenaAllocation {
 protected:
-    explicit NodeArenaAllocation(DOM::Document&);
+    NodeArenaAllocation(DOM::Document&, RustFFI::FfiNodeConstructionFacts const&);
     ~NodeArenaAllocation();
 
     NonnullRefPtr<NodeArena> m_arena;
     RustFFI::NodeSlotId m_slot {};
-    RustFFI::NodeData* m_data { nullptr };
-    u32 m_slot_generation { 0 };
 };
 
 class WEB_API Node
@@ -81,20 +60,20 @@ public:
     StringView class_name() const;
 
     static RustFFI::NodeSlotId slot_id(Node const*);
-    RustFFI::NodeKind kind() const { return m_data->kind; }
+    RustFFI::NodeKind kind() const { return m_kind; }
     u32 arena_slot_index() const { return m_slot.index; }
     void* arena_handle() const;
     NodeArena& node_arena() const { return *m_arena; }
 
-    Node* parent_ptr() { return tree_node_from_slot(m_data->parent); }
-    Node const* parent_ptr() const { return tree_node_from_slot(m_data->parent); }
-    Node* first_child_ptr() { return tree_node_from_slot(m_data->first_child); }
-    Node const* first_child_ptr() const { return tree_node_from_slot(m_data->first_child); }
-    Node* last_child_ptr() { return tree_node_from_slot(m_data->last_child); }
-    Node* next_sibling_ptr() { return tree_node_from_slot(m_data->next_sibling); }
-    Node const* next_sibling_ptr() const { return tree_node_from_slot(m_data->next_sibling); }
-    Node* previous_sibling_ptr() { return tree_node_from_slot(m_data->previous_sibling); }
-    bool has_children() const { return m_data->first_child.index != RustFFI::NodeSlotId_INVALID.index; }
+    Node* parent_ptr() { return linked_node(RustFFI::FfiNodeLink::Parent); }
+    Node const* parent_ptr() const { return linked_node(RustFFI::FfiNodeLink::Parent); }
+    Node* first_child_ptr() { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
+    Node const* first_child_ptr() const { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
+    Node* last_child_ptr() { return linked_node(RustFFI::FfiNodeLink::LastChild); }
+    Node* next_sibling_ptr() { return linked_node(RustFFI::FfiNodeLink::NextSibling); }
+    Node const* next_sibling_ptr() const { return linked_node(RustFFI::FfiNodeLink::NextSibling); }
+    Node* previous_sibling_ptr() { return linked_node(RustFFI::FfiNodeLink::PreviousSibling); }
+    bool has_children() const { return first_child_ptr() != nullptr; }
 
     RefPtr<Node> first_child() { return first_child_ptr(); }
     RefPtr<Node const> first_child() const { return first_child_ptr(); }
@@ -240,19 +219,19 @@ public:
     void set_needs_own_geometry_update() { set_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate, true); }
     void set_needs_layout_update(DOM::SetNeedsLayoutReason, LayoutUpdatePropagation = LayoutUpdatePropagation::ThroughAncestors);
 
-    bool is_generated_for_pseudo_element() const { return m_data->generated_for != 0; }
+    bool is_generated_for_pseudo_element() const { return generated_for() != 0; }
     Optional<CSS::PseudoElement> generated_for_pseudo_element() const
     {
         if (!is_generated_for_pseudo_element())
             return {};
-        return static_cast<CSS::PseudoElement>(m_data->generated_for - 1);
+        return static_cast<CSS::PseudoElement>(generated_for() - 1);
     }
     // The principal box of a pseudo-element has no DOM node, but unlike an anonymous wrapper it has its own
     // computed style.
     bool is_pseudo_element_principal_box() const;
-    bool is_generated_for_before_pseudo_element() const { return m_data->generated_for == encode_generated_for(CSS::PseudoElement::Before); }
-    bool is_generated_for_after_pseudo_element() const { return m_data->generated_for == encode_generated_for(CSS::PseudoElement::After); }
-    bool is_generated_for_backdrop_pseudo_element() const { return m_data->generated_for == encode_generated_for(CSS::PseudoElement::Backdrop); }
+    bool is_generated_for_before_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::Before); }
+    bool is_generated_for_after_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::After); }
+    bool is_generated_for_backdrop_pseudo_element() const { return generated_for() == encode_generated_for(CSS::PseudoElement::Backdrop); }
     void set_generated_for(CSS::PseudoElement type, DOM::Element&);
 
     void clear_committed_box();
@@ -342,25 +321,19 @@ public:
     };
 
 protected:
-    Node(DOM::Document&, GC::Ptr<DOM::Node>, AttachToDOMNode = AttachToDOMNode::Yes);
+    Node(DOM::Document&, GC::Ptr<DOM::Node>, RustFFI::NodeKind, AttachToDOMNode = AttachToDOMNode::Yes);
 
     bool has_flag(RustFFI::NodeFlag flag) const
     {
-        return (m_data->flags & static_cast<u32>(flag)) != 0;
+        return (RustFFI::layout_arena_node_flags(m_arena->handle(), m_slot) & static_cast<u32>(flag)) != 0;
     }
 
     bool dom_target_stores_scroll_offset() const;
 
     void set_flag(RustFFI::NodeFlag flag, bool value)
     {
-        if (value)
-            m_data->flags |= static_cast<u32>(flag);
-        else
-            m_data->flags &= ~static_cast<u32>(flag);
+        RustFFI::layout_arena_set_node_flag(m_arena->handle(), m_slot, flag, value);
     }
-
-    RustFFI::NodeData& node_data() { return *m_data; }
-    RustFFI::NodeData const& node_data() const { return *m_data; }
 
 private:
     friend class NodeWithStyle;
@@ -371,30 +344,26 @@ private:
         return static_cast<u8>(pseudo_element) + 1;
     }
 
-    Node* tree_node_from_slot(RustFFI::NodeSlotId id) const
+    Node* linked_node(RustFFI::FfiNodeLink link) const
     {
-        if (id.index == RustFFI::NodeSlotId_INVALID.index)
-            return nullptr;
-        return static_cast<Node*>(RustFFI::layout_arena_node_data(m_arena->handle(), id)->shell);
+        return static_cast<Node*>(RustFFI::layout_arena_node_link_shell(m_arena->handle(), m_slot, link));
     }
 
-    // Unlike tree_node_from_slot, tolerates freed and stale slots by resolving them to null.
-    Node* tree_node_from_slot_if_live(RustFFI::NodeSlotId id) const
+    // Tolerates a freed containing block slot by resolving it to null.
+    Node* containing_block_node_if_live() const
     {
-        return static_cast<Node*>(RustFFI::layout_arena_node_shell_if_live(m_arena->handle(), id));
+        return static_cast<Node*>(RustFFI::layout_arena_node_containing_block_shell_if_live(m_arena->handle(), m_slot));
     }
+
+    u8 generated_for() const { return RustFFI::layout_arena_node_generated_for(m_arena->handle(), m_slot); }
 
 protected:
-    void set_node_kind(RustFFI::NodeKind);
-    void enroll_for_arena_replaced_content_facts_sync_if_eligible();
-
 private:
     // A DOM mutation can disconnect a node before the next layout-tree update. Keep the DOM node alive until this
     // layout node is destroyed so detach hooks never observe a collected image provider or other element state.
     GC::Root<DOM::Node> m_dom_node;
     GC::Weak<DOM::Element> m_pseudo_element_generator;
-
-    bool m_enrolled_for_arena_replaced_content_facts_sync { false };
+    RustFFI::NodeKind m_kind { RustFFI::NodeKind::Unset };
 };
 
 class WEB_API NodeWithStyle : public Node {
@@ -426,8 +395,8 @@ public:
     template<typename StyleGroup>
     StyleGroup const& style_group() const
     {
-        VERIFY(node_data().style);
-        auto const* payloads = static_cast<void const* const*>(node_data().style);
+        VERIFY(m_style_payloads);
+        auto const* payloads = static_cast<void const* const*>(m_style_payloads);
         auto const* payload = payloads[StyleGroup::style_group_index];
         VERIFY(payload);
         return *static_cast<StyleGroup const*>(payload);
@@ -705,6 +674,7 @@ private:
 
     void rebuild_image_observers();
     CSS::ComputedValues const& owned_computed_values() const;
+    void const* m_style_payloads { nullptr };
     RefPtr<CSS::ComputedValues const> m_owned_computed_values;
     CSS::StyleRecordID m_style_record_identity;
     // Layout nodes are ref-counted rather than GC cells, so this owner cannot be a traced GC::Ptr.

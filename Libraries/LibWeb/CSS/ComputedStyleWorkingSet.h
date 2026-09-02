@@ -66,6 +66,7 @@ public:
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_longhand_table(ComputedValuesFFI::ComputedLonghandTable*);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedStyleWorkingSet const&);
     static NonnullRefPtr<ComputedStyleWorkingSet> create_with_base_values_from(ComputedValues const&);
+    static NonnullRefPtr<ComputedStyleWorkingSet> create_for_animation_update(ComputedValuesFFI::ComputedLonghandTable const*, ComputedValuesFFI::AnimatedOverlay const*);
     ~ComputedStyleWorkingSet();
 
     // Freezes the computed longhand table once the drive has stored every longhand. The
@@ -102,9 +103,8 @@ public:
     void remove_inheritance_dependent_specified_value(PropertyID);
 
     RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
+    ComputedValuesFFI::AnimatedOverlay const* animated_overlay() const;
     bool has_animated_property(PropertyID property_id) const;
-    void reset_non_inherited_animated_properties(Badge<Animations::KeyframeEffect>);
-
     bool is_property_important(PropertyID property_id) const;
     bool is_property_inherited(PropertyID property_id) const;
     bool is_animated_property_inherited(PropertyID property_id) const;
@@ -120,6 +120,8 @@ public:
     ComputedValuesFFI::AnimatedOverlay const* animated_overlay(Badge<StyleComputer>) const;
     void finish_animated_overlay_rust_mutation(Badge<StyleComputer>);
     void did_apply_style_finalization_from_rust(u16 invalidated_longhands);
+    bool requires_animated_post_compute_adjustments() const;
+    void prepare_for_animated_post_compute_adjustments(Badge<StyleComputer>);
     void set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value);
     void clear_animated_properties(Badge<StyleComputer>);
     OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_custom_properties() const { return m_animated_custom_properties; }
@@ -214,8 +216,13 @@ private:
 
     AnimatedProperties const& animated_properties() const;
     AnimatedProperties& mutable_animated_properties();
-    ComputedValuesFFI::FfiComputedStyleMetadata& metadata() { return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table); }
+    ComputedValuesFFI::FfiComputedStyleMetadata& metadata()
+    {
+        ensure_mutable_computed_longhand_table();
+        return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table);
+    }
     ComputedValuesFFI::FfiComputedStyleMetadata const& metadata() const { return *ComputedValuesFFI::rust_computed_longhand_table_metadata(m_computed_longhand_table); }
+    void ensure_mutable_computed_longhand_table();
     void set_animated_property_internal(PropertyID, NonnullRefPtr<StyleValue const>, AnimatedPropertyResultOfTransition, Inherited);
     void clear_computed_font_list_cache()
     {
@@ -227,8 +234,10 @@ private:
     // and evaluation flags plus the recorded inheritance-dependent specified values,
     // written by the store funnels and the flag setters and frozen when the drive completes.
     ComputedValuesFFI::ComputedLonghandTable* m_computed_longhand_table { nullptr };
+    bool m_computed_longhand_table_is_shared { false };
     NonnullRefPtr<WrapperMintCache> m_mint_cache;
     RefPtr<AnimatedProperties> m_animated_properties;
+    bool m_had_animated_post_compute_adjustment_property { false };
     OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> m_animated_custom_properties;
 
     mutable RefPtr<Gfx::FontCascadeList const> m_cached_computed_font_list;
@@ -237,9 +246,12 @@ private:
 
 class AnimatedProperties final : public RefCounted<AnimatedProperties> {
 public:
+    struct InheritedOnly { };
+
     AnimatedProperties();
     AnimatedProperties(AnimatedProperties const&);
     explicit AnimatedProperties(ComputedValuesFFI::AnimatedOverlay const*);
+    AnimatedProperties(ComputedValuesFFI::AnimatedOverlay const*, InheritedOnly);
     ~AnimatedProperties();
 
     u64 identity() const { return m_identity; }
@@ -264,7 +276,6 @@ public:
     StyleValue const& property(PropertyID) const;
 
     void set_property(PropertyID, NonnullRefPtr<StyleValue const>, AnimatedPropertyResultOfTransition, ComputedStyleWorkingSet::Inherited);
-    void reset_non_inherited_properties();
     void clear_wrapper_cache() { m_wrapper_cache.clear(); }
 
 private:

@@ -180,8 +180,12 @@ void FormAssociatedElement::set_form(HTMLFormElement* form)
         ensure_form_associated_rare_data().form = form;
     else if (auto* rare_data = form_associated_rare_data())
         rare_data->form = nullptr;
-    if (form)
+
+    auto in_associated_elements_list = form && &element.root() == &form->root();
+    if (in_associated_elements_list)
         form->add_associated_element({}, element);
+    if (auto* rare_data = form_associated_rare_data())
+        rare_data->in_associated_elements_list = in_associated_elements_list;
     if (old_form.ptr() != form) {
         element.document().bump_form_controls_version();
         form_associated_element_form_owner_changed();
@@ -245,10 +249,16 @@ void FormAssociatedElement::set_parser_inserted(Badge<HTMLParser>)
 void FormAssociatedElement::form_node_was_inserted()
 {
     // 1. If the form-associated element's parser inserted flag is set, then return.
-    auto const* rare_data = form_associated_rare_data();
+    auto* rare_data = form_associated_rare_data();
     if (rare_data && rare_data->parser_inserted) {
-        if (auto* form = this->form())
-            form->default_button_state_maybe_changed();
+        if (auto* form = this->form()) {
+            if (!rare_data->in_associated_elements_list) {
+                form->add_associated_element({}, form_associated_element_to_html_element());
+                rare_data->in_associated_elements_list = true;
+            }
+            if (is_submit_button())
+                form->default_button_state_maybe_changed();
+        }
         return;
     }
 
@@ -263,8 +273,6 @@ void FormAssociatedElement::form_node_was_removed()
     auto* form = this->form();
     if (form && &form_associated_element_to_html_element().root() != &form->root())
         reset_form_owner();
-    else if (form)
-        form->default_button_state_maybe_changed();
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#association-of-controls-and-forms:attr-fae-form-2
@@ -274,8 +282,39 @@ void FormAssociatedElement::form_node_was_moved()
     auto* form = this->form();
     if (form && &form_associated_element_to_html_element().root() != &form->root())
         reset_form_owner();
-    else if (form)
+    else if (form && is_submit_button())
         form->default_button_state_maybe_changed();
+}
+
+void FormAssociatedElement::reposition_associated_elements_after_move(Badge<DOM::Element>, DOM::Node& moved_subtree_root)
+{
+    HashMap<GC::Ref<HTMLFormElement>, Vector<GC::Ref<HTMLElement>>> moved_elements_by_form;
+    moved_subtree_root.for_each_in_inclusive_subtree_of_type<HTMLElement>([&](HTMLElement& element) {
+        if (!element.is_form_associated_element())
+            return TraversalDecision::Continue;
+
+        FormAssociatedElement& form_associated_element = element;
+        auto const* rare_data = form_associated_element.form_associated_rare_data();
+        if (!rare_data || !rare_data->in_associated_elements_list)
+            return TraversalDecision::Continue;
+
+        if (auto* form = form_associated_element.form())
+            moved_elements_by_form.ensure(*form).append(element);
+        return TraversalDecision::Continue;
+    });
+
+    for (auto& [form, moved_elements] : moved_elements_by_form)
+        form->reposition_moved_associated_elements({}, moved_elements);
+}
+
+void FormAssociatedElement::submit_button_state_changed()
+{
+    auto const* rare_data = form_associated_rare_data();
+    if (!rare_data || !rare_data->in_associated_elements_list)
+        return;
+
+    if (auto* form = this->form())
+        form->associated_element_submit_button_state_changed({}, form_associated_element_to_html_element());
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#association-of-controls-and-forms:category-listed-3
@@ -331,7 +370,8 @@ void FormAssociatedElement::reset_form_owner()
     if (auto* form = this->form(); form
         && (!is_listed() || !html_element.has_attribute(HTML::AttributeNames::form))
         && html_element.first_ancestor_of_type<HTMLFormElement>() == form) {
-        form->default_button_state_maybe_changed();
+        if (is_submit_button())
+            form->default_button_state_maybe_changed();
         return;
     }
 
@@ -371,10 +411,12 @@ void FormAssociatedElement::reset_form_owner()
     if (new_form != old_form.ptr() && html_element.is_form_associated_custom_element())
         html_element.enqueue_a_form_associated_callback_reaction(new_form);
 
-    if (old_form)
-        old_form->default_button_state_maybe_changed();
-    if (new_form && new_form != old_form.ptr())
-        new_form->default_button_state_maybe_changed();
+    if (is_submit_button()) {
+        if (old_form)
+            old_form->default_button_state_maybe_changed();
+        if (new_form && new_form != old_form.ptr())
+            new_form->default_button_state_maybe_changed();
+    }
 }
 
 void FormAssociatedElement::form_associated_element_was_inserted()

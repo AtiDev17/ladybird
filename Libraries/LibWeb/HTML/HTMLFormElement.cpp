@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/BinarySearch.h>
 #include <AK/GenericLexer.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
@@ -59,7 +60,7 @@ void HTMLFormElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_elements);
-    visitor.visit(m_associated_elements);
+    visitor.visit(m_associated_elements_in_tree_order);
     visitor.visit(m_planned_navigation);
     visitor.visit(m_rel_list);
     visitor.visit(m_past_names_map);
@@ -367,7 +368,7 @@ void HTMLFormElement::reset_form()
 
     // 2. If reset is true, then invoke the reset algorithm of each resettable element whose form owner is form.
     if (reset) {
-        GC::RootVector<GC::Ref<HTMLElement>> associated_elements_copy { m_associated_elements };
+        GC::RootVector<GC::Ref<HTMLElement>> associated_elements_copy { m_associated_elements_in_tree_order };
         for (auto element : associated_elements_copy) {
             auto& form_associated_element = as<FormAssociatedElement>(*element);
             if (form_associated_element.is_resettable())
@@ -421,14 +422,73 @@ void HTMLFormElement::reset()
     m_locked_for_reset = false;
 }
 
+size_t HTMLFormElement::tree_order_insertion_index(HTMLElement const& element) const
+{
+    return lower_bound_index(m_associated_elements_in_tree_order, element, [](auto const& entry, auto const& new_element) {
+        return new_element.is_before(*entry) ? 1 : -1;
+    });
+}
+
+void HTMLFormElement::recompute_default_button(size_t start_index)
+{
+    m_default_button = nullptr;
+    for (size_t i = start_index; i < m_associated_elements_in_tree_order.size(); ++i) {
+        if (m_associated_elements_in_tree_order[i]->is_submit_button()) {
+            m_default_button = m_associated_elements_in_tree_order[i];
+            break;
+        }
+    }
+}
+
 void HTMLFormElement::add_associated_element(Badge<FormAssociatedElement>, HTMLElement& element)
 {
-    m_associated_elements.append(element);
+    VERIFY(&element.root() == &root());
+    auto index = tree_order_insertion_index(element);
+    auto was_appended = index == m_associated_elements_in_tree_order.size();
+    m_associated_elements_in_tree_order.insert(index, element);
+
+    // OPTIMIZATION: An element that follows every other one cannot precede the default button, so the common case of
+    //               building a form front to back never compares tree positions here.
+    if (element.is_submit_button() && (!m_default_button || (!was_appended && element.is_before(*m_default_button))))
+        m_default_button = element;
+}
+
+void HTMLFormElement::associated_element_submit_button_state_changed(Badge<FormAssociatedElement>, HTMLElement& element)
+{
+    if (element.is_submit_button()) {
+        if (!m_default_button || element.is_before(*m_default_button))
+            m_default_button = element;
+    } else if (m_default_button.ptr().ptr() == &element) {
+        recompute_default_button();
+    }
+}
+
+void HTMLFormElement::reposition_moved_associated_elements(Badge<FormAssociatedElement>, Vector<GC::Ref<HTMLElement>> const& moved_elements)
+{
+    if (moved_elements.size() == m_associated_elements_in_tree_order.size())
+        return;
+
+    HashTable<HTMLElement const*> moved_element_set;
+    for (auto const& element : moved_elements)
+        moved_element_set.set(element.ptr());
+
+    m_associated_elements_in_tree_order.remove_all_matching([&](auto const& entry) { return moved_element_set.contains(entry.ptr()); });
+
+    auto index = tree_order_insertion_index(*moved_elements.first());
+    for (size_t i = 0; i < moved_elements.size(); ++i)
+        m_associated_elements_in_tree_order.insert(index + i, moved_elements[i]);
+
+    recompute_default_button();
 }
 
 void HTMLFormElement::remove_associated_element(Badge<FormAssociatedElement>, HTMLElement& element)
 {
-    m_associated_elements.remove_first_matching([&](auto& entry) { return entry.ptr() == &element; });
+    if (auto index = m_associated_elements_in_tree_order.find_first_index_if([&](auto const& entry) { return entry.ptr() == &element; }); index.has_value()) {
+        m_associated_elements_in_tree_order.remove(*index);
+
+        if (m_default_button.ptr().ptr() == &element)
+            recompute_default_button(*index);
+    }
 
     // If an element listed in a form element's past names map changes form owner, then its entries must be removed from that map.
     m_past_names_map.remove_all_matching([&](auto&, auto const& entry) { return entry.node.ptr() == &element; });
@@ -669,14 +729,10 @@ Vector<GC::Ref<DOM::Element>> HTMLFormElement::get_submittable_elements()
 {
     Vector<GC::Ref<DOM::Element>> submittable_elements;
 
-    root().for_each_in_subtree([&](auto& node) {
-        if (auto* form_associated_element = as_if<FormAssociatedElement>(node)) {
-            if (form_associated_element->is_submittable() && form_associated_element->form() == this)
-                submittable_elements.append(form_associated_element->form_associated_element_to_html_element());
-        }
-
-        return TraversalDecision::Continue;
-    });
+    for (auto const& element : m_associated_elements_in_tree_order) {
+        if (element->is_submittable())
+            submittable_elements.append(element);
+    }
 
     return submittable_elements;
 }
@@ -1050,7 +1106,7 @@ GC::Ptr<DOM::Element> HTMLFormElement::item(size_t index) const
 bool HTMLFormElement::is_supported_property_name(Utf16FlyString const& name) const
 {
     // NB: This is a simplified version of ::supported_property_names() that does not require sorting or allocations.
-    for (auto const& candidate : m_associated_elements) {
+    for (auto const& candidate : m_associated_elements_in_tree_order) {
         if (is_form_control(*candidate, *this) || is<HTMLImageElement>(*candidate)) {
             if (first_is_one_of(name, candidate->id(), candidate->name()))
                 return true;
@@ -1069,7 +1125,8 @@ Vector<Utf16FlyString> HTMLFormElement::supported_property_names() const
     //    where the source is either id, name, or past, and, if the source is past, an age.
     struct SourcedName {
         Utf16FlyString name;
-        GC::Ptr<DOM::Element const> element;
+        // NB: The associated elements are in tree order, so this index stands in for the element's tree position.
+        size_t element_index;
         enum class Source {
             Id,
             Name,
@@ -1081,52 +1138,56 @@ Vector<Utf16FlyString> HTMLFormElement::supported_property_names() const
 
     // 2. For each listed element candidate whose form owner is the form element, with the exception of any
     //    input elements whose type attribute is in the Image Button state:
-    for (auto const& candidate : m_associated_elements) {
+    for (size_t element_index = 0; element_index < m_associated_elements_in_tree_order.size(); ++element_index) {
+        auto const& candidate = m_associated_elements_in_tree_order[element_index];
         if (!is_form_control(*candidate, *this))
             continue;
 
         // 1. If candidate has an id attribute, add an entry to sourced names with that id attribute's value as the
         //    string, candidate as the element, and id as the source.
         if (candidate->id().has_value())
-            sourced_names.append(SourcedName { candidate->id().value(), candidate, SourcedName::Source::Id, {} });
+            sourced_names.append(SourcedName { candidate->id().value(), element_index, SourcedName::Source::Id, {} });
 
         // 2. If candidate has a name attribute, add an entry to sourced names with that name attribute's value as the
         //    string, candidate as the element, and name as the source.
         if (candidate->name().has_value())
-            sourced_names.append(SourcedName { candidate->name().value(), candidate, SourcedName::Source::Name, {} });
+            sourced_names.append(SourcedName { candidate->name().value(), element_index, SourcedName::Source::Name, {} });
     }
 
     // 3. For each img element candidate whose form owner is the form element:
-    for (auto const& candidate : m_associated_elements) {
+    for (size_t element_index = 0; element_index < m_associated_elements_in_tree_order.size(); ++element_index) {
+        auto const& candidate = m_associated_elements_in_tree_order[element_index];
         if (!is<HTMLImageElement>(*candidate))
             continue;
 
-        // Every element in m_associated_elements has this as the form owner.
+        // Every element in m_associated_elements_in_tree_order has this as the form owner.
 
         // 1. If candidate has an id attribute, add an entry to sourced names with that id attribute's value as the
         //    string, candidate as the element, and id as the source.
         if (candidate->id().has_value())
-            sourced_names.append(SourcedName { candidate->id().value(), candidate, SourcedName::Source::Id, {} });
+            sourced_names.append(SourcedName { candidate->id().value(), element_index, SourcedName::Source::Id, {} });
 
         // 2. If candidate has a name attribute, add an entry to sourced names with that name attribute's value as the
         //    string, candidate as the element, and name as the source.
         if (candidate->name().has_value())
-            sourced_names.append(SourcedName { candidate->name().value(), candidate, SourcedName::Source::Name, {} });
+            sourced_names.append(SourcedName { candidate->name().value(), element_index, SourcedName::Source::Name, {} });
     }
 
     // 4. For each entry past entry in the past names map add an entry to sourced names with the past entry's name as
     //    the string, past entry's element as the element, past as the source, and the length of time past entry has
     //    been in the past names map as the age.
     auto const now = MonotonicTime::now();
-    for (auto const& entry : m_past_names_map)
-        sourced_names.append(SourcedName { entry.key, static_cast<DOM::Element const*>(entry.value.node.ptr()), SourcedName::Source::Past, now - entry.value.insertion_time });
+    for (auto const& entry : m_past_names_map) {
+        auto element_index = m_associated_elements_in_tree_order.find_first_index_if([&](auto const& element) { return element.ptr() == entry.value.node.ptr(); });
+        sourced_names.append(SourcedName { entry.key, element_index.value(), SourcedName::Source::Past, now - entry.value.insertion_time });
+    }
 
     // 5. Sort sourced names by tree order of the element entry of each tuple, sorting entries with the same element by
     //    putting entries whose source is id first, then entries whose source is name, and finally entries whose source
     //    is past, and sorting entries with the same element and source by their age, oldest first.
     quick_sort(sourced_names, [](auto const& lhs, auto const& rhs) -> bool {
-        if (lhs.element != rhs.element)
-            return lhs.element->is_before(*rhs.element);
+        if (lhs.element_index != rhs.element_index)
+            return lhs.element_index < rhs.element_index;
         if (lhs.source != rhs.source)
             return lhs.source < rhs.source;
         return lhs.age < rhs.age;
@@ -1160,79 +1221,88 @@ Variant<Empty, GC::Ref<DOM::Node>, GC::Ref<RadioNodeList>> HTMLFormElement::name
     // 1. Let candidates be a live RadioNodeList object containing all the listed elements, whose form owner is the form
     //    element, that have either an id attribute or a name attribute equal to name, with the exception of input
     //    elements whose type attribute is in the Image Button state, in tree order.
-    auto filter = [this, name](auto& node) -> bool {
-        if (!is<DOM::Element>(node))
+    auto filter = [this, name](DOM::Node const& node) -> bool {
+        auto const* element = as_if<DOM::Element>(node);
+        if (!element)
             return false;
-        auto const& element = static_cast<DOM::Element const&>(node);
 
         // Form controls are defined as listed elements, with the exception of input elements in the Image Button state,
         // whose form owner is the form element.
-        if (!is_form_control(element, *this))
+        if (!is_form_control(*element, *this))
             return false;
 
-        return name == element.id() || name == element.name();
+        return name == element->id() || name == element->name();
     };
-    auto candidates = RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::FormControls);
 
     // 2. If candidates is empty, let candidates be a live RadioNodeList object containing all the img elements,
     //    whose form owner is the form element, that have either an id attribute or a name attribute equal to name,
     //    in tree order.
-    if (candidates->length() == 0) {
-        candidates = RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, [this, name](auto& node) -> bool {
-            if (!is<HTMLImageElement>(node))
-                return false;
+    auto image_filter = [this, name](DOM::Node const& node) -> bool {
+        auto const* element = as_if<HTMLImageElement>(node);
+        if (!element)
+            return false;
 
-            auto const& element = static_cast<HTMLImageElement const&>(node);
-            if (element.form() != this)
-                return false;
+        if (element->form() != this)
+            return false;
 
-            return name == element.id() || name == element.name();
-        });
-    }
+        return name == element->id() || name == element->name();
+    };
 
-    auto length = candidates->length();
+    // OPTIMIZATION: The associated elements are in tree order, so the candidates are found by walking them instead of
+    //               by building a live list over the whole tree. Only step 4 hands a list to the caller, so that is
+    //               the only place one is built.
+    GC::Ptr<DOM::Node> first_candidate;
+    size_t candidate_count = 0;
+    auto count_candidates = [&](auto const& candidate_filter) {
+        first_candidate = nullptr;
+        candidate_count = 0;
+        for (auto const& element : m_associated_elements_in_tree_order) {
+            if (!candidate_filter(*element))
+                continue;
+            if (!first_candidate)
+                first_candidate = element;
+            ++candidate_count;
+        }
+    };
+
+    count_candidates(filter);
+    auto candidates_are_images = candidate_count == 0;
+    if (candidates_are_images)
+        count_candidates(image_filter);
 
     // 3. If candidates is empty, name is the name of one of the entries in the form element's past names map: return the object associated with name in that map.
-    if (length == 0) {
+    if (candidate_count == 0) {
         auto it = m_past_names_map.find(name);
         if (it != m_past_names_map.end())
             return GC::Ref { const_cast<DOM::Node&>(*it->value.node) };
+        return Empty {};
     }
 
     // 4. If candidates contains more than one node, return candidates.
-    if (length > 1)
-        return candidates;
+    if (candidate_count > 1) {
+        if (candidates_are_images)
+            return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, move(image_filter));
+        return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::FormControls);
+    }
 
     // 5. Otherwise, candidates contains exactly one node. Add a mapping from name to the node in candidates in the form
     //    element's past names map, replacing the previous entry with the same name, if any.
-    auto* node = candidates->item(0);
-    if (!node)
-        return Empty {};
-    m_past_names_map.set(name, HTMLFormElement::PastNameEntry { .node = node, .insertion_time = MonotonicTime::now() });
+    m_past_names_map.set(name, HTMLFormElement::PastNameEntry { .node = first_candidate, .insertion_time = MonotonicTime::now() });
 
     // 6. Return the node in candidates.
-    return GC::Ref { const_cast<DOM::Node&>(*node) };
+    return GC::Ref { *first_candidate };
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#default-button
 FormAssociatedElement* HTMLFormElement::default_button() const
 {
     // A form element's default button is the first submit button in tree order whose form owner is that form element.
-    FormAssociatedElement* default_button = nullptr;
-
-    for (auto const& element : m_associated_elements) {
-        if (!element->is_submit_button())
-            continue;
-        if (!default_button || element->is_before(default_button->form_associated_element_to_html_element()))
-            default_button = element.ptr();
-    }
-
-    return default_button;
+    return m_default_button.ptr().ptr();
 }
 
 bool HTMLFormElement::has_invalid_associated_element() const
 {
-    for (auto const& element : m_associated_elements) {
+    for (auto const& element : m_associated_elements_in_tree_order) {
         if (element->is_candidate_for_constraint_validation() && !element->satisfies_its_constraints())
             return true;
     }
@@ -1282,7 +1352,7 @@ size_t HTMLFormElement::number_of_fields_blocking_implicit_submission() const
     // Local Date and Time, Number.
     size_t count = 0;
 
-    for (auto element : m_associated_elements) {
+    for (auto element : m_associated_elements_in_tree_order) {
         if (!is<HTMLInputElement>(*element))
             continue;
 

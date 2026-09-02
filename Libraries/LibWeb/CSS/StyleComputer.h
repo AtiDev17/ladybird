@@ -114,6 +114,7 @@ public:
     // Publish a computed style built outside the ordinary cascade path, such as an inherited-group
     // swap, so StyleEngine's final node-to-style relation remains authoritative.
     [[nodiscard]] StyleEngine::StyleRecordDelta publish_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
+    [[nodiscard]] StyleEngine::StyleRecordDelta publish_animation_overlay(DOM::AbstractElement, ComputedValues const&) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
     // without replacing the StyleEngine assignment of its DOM target.
     [[nodiscard]] StyleRecordID intern_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
@@ -172,6 +173,7 @@ public:
     [[nodiscard]] NonnullRefPtr<ComputedValues const> build_animated_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const& previous_values) const;
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties(ComputedValues const&) const;
     void apply_animated_properties_to_reconstruction(ComputedStyleWorkingSet&, ComputedValues const&) const;
+    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties_for_animation(StyleRecordID) const;
 
     void begin_transition_stabilization_epoch();
     void record_transition_stabilization_baseline(DOM::AbstractElement) const;

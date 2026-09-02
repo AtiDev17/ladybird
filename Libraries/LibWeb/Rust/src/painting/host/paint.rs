@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::*;
-
 use crate::layout::used_values;
 use crate::painting::display_list::builder::RecordedDisplayList;
 use crate::painting::display_list::commands::{DisplayListCommandRun, DisplayListResourceId, FrameNodeIndex};
@@ -16,7 +14,6 @@ use std::ffi::c_void;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiRecordingInputs {
-    pub device_pixels_per_css_pixel: f64,
     pub device_viewport_rect: IntRect,
     pub css_viewport_rect: used_values::FfiCssPixelRect,
     pub should_show_line_box_borders: bool,
@@ -25,14 +22,11 @@ pub struct FfiRecordingInputs {
     pub document_id: i64,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     pub wheel_event_listener_state_generation: u64,
-    pub viewport_wheel_overflow_x: u8,
-    pub viewport_wheel_overflow_y: u8,
     pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     pub paint_viewport_scrollbars: bool,
     pub async_scrolling_enabled: bool,
     pub middle_button_scroll_active: bool,
     pub middle_button_scroll_origin: used_values::FfiCssPixelPoint,
-    pub root_background_source: FfiRootBackgroundSource,
     pub canvas_fill_rect: used_values::OptionalIntRect,
     pub canvas_color: Color,
     pub opaque_canvas: bool,
@@ -337,6 +331,22 @@ pub struct FfiImagePaintFacts {
 
 // A recording lent to C++ for the duration of one call. An empty Vec's pointer is dangling, so
 // the C++ side never dereferences a pointer whose count is zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiMaskDisplayListRegistration {
+    pub frame: FrameNodeIndex,
+    pub display_list_id: u64,
+}
+
+impl From<(FrameNodeIndex, DisplayListResourceId)> for FfiMaskDisplayListRegistration {
+    fn from((frame, display_list_id): (FrameNodeIndex, DisplayListResourceId)) -> Self {
+        Self {
+            frame,
+            display_list_id: display_list_id.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiRecordedDisplayList {
@@ -344,6 +354,8 @@ pub struct FfiRecordedDisplayList {
     pub byte_count: usize,
     pub command_runs: *const DisplayListCommandRun,
     pub command_run_count: usize,
+    pub mask_registrations: *const FfiMaskDisplayListRegistration,
+    pub mask_registration_count: usize,
 }
 
 impl FfiRecordedDisplayList {
@@ -353,6 +365,19 @@ impl FfiRecordedDisplayList {
             byte_count: 0,
             command_runs: std::ptr::null(),
             command_run_count: 0,
+            mask_registrations: std::ptr::null(),
+            mask_registration_count: 0,
+        }
+    }
+
+    pub fn with_mask_registrations(
+        recorded: &RecordedDisplayList,
+        mask_registrations: &[FfiMaskDisplayListRegistration],
+    ) -> Self {
+        Self {
+            mask_registrations: mask_registrations.as_ptr(),
+            mask_registration_count: mask_registrations.len(),
+            ..Self::from(recorded)
         }
     }
 }
@@ -364,6 +389,8 @@ impl From<&RecordedDisplayList> for FfiRecordedDisplayList {
             byte_count: recorded.bytes.len(),
             command_runs: recorded.command_runs.as_ptr(),
             command_run_count: recorded.command_runs.len(),
+            mask_registrations: std::ptr::null(),
+            mask_registration_count: 0,
         }
     }
 }
@@ -397,7 +424,6 @@ pub struct FfiPaintHostCallbacks {
         FfiLayerImageList,
         u32,
         FloatRect,
-        used_values::FfiCssPixelSize,
         u8,
         FloatSize,
     ) -> FfiImagePaintFacts,
@@ -413,15 +439,9 @@ pub struct FfiPaintHostCallbacks {
         *const FfiSvgPaintContext,
         *mut c_void,
     ) -> FfiSvgPaintStyle,
-    pub nested_display_list_from_tree:
-        unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, *const c_void, *const u64, usize) -> u64,
+    pub nested_display_list_from_tree: unsafe extern "C" fn(*mut c_void, FfiRecordedDisplayList, *const c_void) -> u64,
     pub overlay_label_font: unsafe extern "C" fn(*mut c_void, f32) -> *const c_void,
-    pub overlay_node_label_text: unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        unsafe extern "C" fn(*mut c_void, *const u16, usize),
-    ),
+    pub overlay_node_label_text: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
 }
 
 #[derive(Default)]
@@ -448,22 +468,11 @@ impl FfiPaintHostCallbacks {
     }
 
     pub(crate) fn overlay_node_label_text(&self, layout_node_shell: *mut c_void) -> Vec<u16> {
-        unsafe extern "C" fn emit(sink: *mut c_void, units: *const u16, count: usize) {
-            // SAFETY: `sink` is the Vec passed below, and the units stay live
-            // for this synchronous callback.
-            let text = unsafe { &mut *sink.cast::<Vec<u16>>() };
-            assert!(count == 0 || !units.is_null());
-            if count != 0 {
-                // SAFETY: The C++ host hands a pointer to count code units
-                // that outlive the callback.
-                text.extend_from_slice(unsafe { std::slice::from_raw_parts(units, count) });
-            }
-        }
-        let mut text: Vec<u16> = Vec::new();
-        // SAFETY: The C++ host answers synchronously from a live layout node
-        // shell; emit runs against the local Vec.
-        unsafe { (self.overlay_node_label_text)(self.context, layout_node_shell, (&raw mut text).cast(), emit) };
-        text
+        let mut label = Vec::new();
+        // SAFETY: The C++ host fills the label sink synchronously through the exported push
+        // function.
+        unsafe { (self.overlay_node_label_text)(self.context, layout_node_shell, (&raw mut label).cast()) };
+        String::from_utf8_lossy(&label).encode_utf16().collect()
     }
     pub(crate) fn text_control_selection(&self, layout_node_shell: *mut c_void) -> FfiTextControlSelection {
         // SAFETY: The C++ host answers synchronously from a live layout node shell.
@@ -534,14 +543,12 @@ impl FfiPaintHostCallbacks {
             (self.layer_image_current_frame)(self.context, layout_node_shell, list, computed_index, device_dest_rect)
         }
     }
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn layer_image_paint(
         &self,
         layout_node_shell: *mut c_void,
         list: FfiLayerImageList,
         computed_index: u32,
         dest: FloatRect,
-        css_tile_size: used_values::FfiCssPixelSize,
         image_rendering: u8,
         accumulated_scale: libgfx_rust::FloatSize,
     ) -> FfiImagePaintFacts {
@@ -553,7 +560,6 @@ impl FfiPaintHostCallbacks {
                 list,
                 computed_index,
                 dest,
-                css_tile_size,
                 image_rendering,
                 accumulated_scale,
             )
@@ -615,22 +621,16 @@ impl FfiPaintHostCallbacks {
         &self,
         recorded: &RecordedDisplayList,
         tree: crate::painting::visual_context::VisualContextTree,
-        mask_registrations: &[(FrameNodeIndex, DisplayListResourceId)],
+        mask_registrations: &[FfiMaskDisplayListRegistration],
     ) -> DisplayListResourceId {
-        let pairs: Vec<u64> = mask_registrations
-            .iter()
-            .flat_map(|(frame, id)| [u64::from(frame.0), id.0])
-            .collect();
         let retained_tree = std::rc::Rc::into_raw(std::rc::Rc::new(tree)).cast();
-        // SAFETY: The C++ host copies the recording synchronously and takes ownership of the
-        // retained tree handle.
+        // SAFETY: The C++ host copies the recording and its mask registrations synchronously and
+        // takes ownership of the retained tree handle.
         let id = unsafe {
             (self.nested_display_list_from_tree)(
                 self.context,
-                recorded.into(),
+                FfiRecordedDisplayList::with_mask_registrations(recorded, mask_registrations),
                 retained_tree,
-                pairs.as_ptr(),
-                mask_registrations.len(),
             )
         };
         DisplayListResourceId(id)

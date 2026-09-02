@@ -361,7 +361,7 @@ pub unsafe extern "C" fn rust_evaluate_easing(
     input_progress: f64,
     before_flag: bool,
 ) -> f64 {
-    crate::abort_on_panic(|| evaluate_easing_descriptor(unsafe { &*descriptor }, input_progress, before_flag))
+    evaluate_easing_descriptor(unsafe { &*descriptor }, input_progress, before_flag)
 }
 
 fn evaluate_easing_descriptor(descriptor: &FfiEasingDescriptor, input_progress: f64, before_flag: bool) -> f64 {
@@ -387,6 +387,7 @@ fn evaluate_easing_descriptor(descriptor: &FfiEasingDescriptor, input_progress: 
     }
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiAnimationFontMetrics {
     pub font_size: f64,
@@ -396,6 +397,7 @@ pub struct FfiAnimationFontMetrics {
     pub line_height: f64,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiAnimationLengthResolutionContext {
     pub viewport_width: f64,
@@ -406,6 +408,7 @@ pub struct FfiAnimationLengthResolutionContext {
     pub root_font_metrics_depend_on_viewport_metrics: bool,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiAnimationContext {
     pub allow_discrete: bool,
@@ -451,9 +454,26 @@ pub struct FfiAnimationBatch {
     pub important_property_bitmap_length: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiAnimationPreparationEffect {
+    pub identity: u64,
+    pub generation: u64,
+}
+
+#[repr(C)]
+pub struct FfiAnimationPreparationKey {
+    pub effects: *const FfiAnimationPreparationEffect,
+    pub effect_count: usize,
+}
+
 #[repr(C)]
 pub struct FfiComputedAnimationBatch {
     pub context: FfiAnimationContext,
+    pub preparation_key: *const FfiAnimationPreparationKey,
+    pub current_keys: *const f64,
+    pub current_key_count: usize,
+    pub cache_preparation: bool,
     pub resolved_animation_storage: *mut std::ffi::c_void,
     pub computed_keyframe_storage: *mut std::ffi::c_void,
     pub underlying_longhand_table: *const std::ffi::c_void,
@@ -775,7 +795,7 @@ fn resolve_animation_declarations(
         }
     }
     let mut value_plans = Vec::new();
-    for effect in effects {
+    for (effect_index, effect) in effects.iter().enumerate() {
         let keyframe_end = effect
             .first_keyframe_index
             .checked_add(effect.keyframe_count)
@@ -804,7 +824,7 @@ fn resolve_animation_declarations(
                 property_id,
                 custom_name_id,
                 result_of_transition: effect.result_of_transition,
-                current_key: effect.current_key,
+                effect_index,
                 property_indices,
             });
         }
@@ -882,7 +902,7 @@ struct AnimationValuePlan {
     property_id: u16,
     custom_name_id: u32,
     result_of_transition: bool,
-    current_key: f64,
+    effect_index: usize,
     property_indices: Vec<usize>,
 }
 
@@ -7087,201 +7107,271 @@ fn evaluate_animation_value(
 pub unsafe extern "C" fn rust_resolve_animation_declarations(
     batch: *const FfiAnimationBatch,
 ) -> FfiResolvedAnimationProperties {
-    crate::abort_on_panic(|| {
-        let batch = unsafe { &*batch };
-        let declarations = unsafe { std::slice::from_raw_parts(batch.declarations, batch.declaration_count) };
-        let effects = unsafe { std::slice::from_raw_parts(batch.effects, batch.effect_count) };
-        let keyframes = unsafe { std::slice::from_raw_parts(batch.keyframes, batch.keyframe_count) };
-        let important_property_bitmap = unsafe {
-            std::slice::from_raw_parts(batch.important_property_bitmap, batch.important_property_bitmap_length)
+    let batch = unsafe { &*batch };
+    let declarations = unsafe { std::slice::from_raw_parts(batch.declarations, batch.declaration_count) };
+    let effects = unsafe { std::slice::from_raw_parts(batch.effects, batch.effect_count) };
+    let keyframes = unsafe { std::slice::from_raw_parts(batch.keyframes, batch.keyframe_count) };
+    let important_property_bitmap =
+        unsafe { std::slice::from_raw_parts(batch.important_property_bitmap, batch.important_property_bitmap_length) };
+    let resolved = resolve_animation_declarations(
+        declarations,
+        effects,
+        keyframes,
+        batch.writing_mode,
+        batch.direction,
+        important_property_bitmap,
+    );
+    if resolved.properties.is_empty() {
+        return FfiResolvedAnimationProperties {
+            properties: std::ptr::null(),
+            count: 0,
+            animation_value_count: 0,
+            uses_tree_counting_function: false,
+            container_relative_length_unit_mask: 0,
+            needs_document_base_url: false,
+            unfixed_random_sharings: std::ptr::null(),
+            unfixed_random_sharing_count: 0,
+            storage: std::ptr::null_mut(),
         };
-        let resolved = resolve_animation_declarations(
-            declarations,
-            effects,
-            keyframes,
-            batch.writing_mode,
-            batch.direction,
-            important_property_bitmap,
-        );
-        if resolved.properties.is_empty() {
-            return FfiResolvedAnimationProperties {
-                properties: std::ptr::null(),
-                count: 0,
-                animation_value_count: 0,
-                uses_tree_counting_function: false,
-                container_relative_length_unit_mask: 0,
-                needs_document_base_url: false,
-                unfixed_random_sharings: std::ptr::null(),
-                unfixed_random_sharing_count: 0,
-                storage: std::ptr::null_mut(),
-            };
+    }
+    let resolved = Box::new(resolved);
+    let properties = resolved.properties.as_ptr();
+    let count = resolved.properties.len();
+    let animation_value_count = resolved.value_plans.len();
+    FfiResolvedAnimationProperties {
+        properties,
+        count,
+        animation_value_count,
+        uses_tree_counting_function: resolved.uses_tree_counting_function,
+        container_relative_length_unit_mask: resolved.container_relative_length_unit_mask,
+        needs_document_base_url: resolved.needs_document_base_url,
+        unfixed_random_sharings: resolved.unfixed_random_sharings.as_ptr(),
+        unfixed_random_sharing_count: resolved.unfixed_random_sharings.len(),
+        storage: Box::into_raw(resolved).cast(),
+    }
+}
+
+struct AnimationPreparationKey {
+    effects: Vec<FfiAnimationPreparationEffect>,
+}
+
+impl AnimationPreparationKey {
+    unsafe fn from_ffi(key: &FfiAnimationPreparationKey) -> Self {
+        Self {
+            effects: unsafe { std::slice::from_raw_parts(key.effects, key.effect_count) }.to_vec(),
         }
-        let resolved = Box::new(resolved);
-        let properties = resolved.properties.as_ptr();
-        let count = resolved.properties.len();
-        let animation_value_count = resolved.value_plans.len();
-        FfiResolvedAnimationProperties {
-            properties,
-            count,
-            animation_value_count,
-            uses_tree_counting_function: resolved.uses_tree_counting_function,
-            container_relative_length_unit_mask: resolved.container_relative_length_unit_mask,
-            needs_document_base_url: resolved.needs_document_base_url,
-            unfixed_random_sharings: resolved.unfixed_random_sharings.as_ptr(),
-            unfixed_random_sharing_count: resolved.unfixed_random_sharings.len(),
-            storage: Box::into_raw(resolved).cast(),
-        }
-    })
+    }
+
+    unsafe fn matches_ffi(&self, key: &FfiAnimationPreparationKey) -> bool {
+        self.effects.as_slice() == unsafe { std::slice::from_raw_parts(key.effects, key.effect_count) }
+    }
+}
+
+pub(crate) struct PreparedAnimationBatch {
+    key: AnimationPreparationKey,
+    resolved: ResolvedAnimationDeclarations,
+    // Retain the allocations referenced by `keyframes_by_value`.
+    _computed_keyframe_values: Vec<RetainedStyleValueData>,
+    keyframes_by_value: Vec<Vec<FfiAnimationKeyframeValue>>,
+    context: FfiAnimationContext,
+}
+
+/// Whether an animated overlay already holds the endpoint preparation identified by `key`.
+///
+/// # Safety
+/// `overlay` and `key` must point at live values and the key's effect range must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_animation_preparation_matches(
+    overlay: *const std::ffi::c_void,
+    key: *const FfiAnimationPreparationKey,
+) -> bool {
+    if overlay.is_null() || key.is_null() {
+        return false;
+    }
+    let overlay = unsafe { &*overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() };
+    let key = unsafe { &*key };
+    overlay
+        .animation_preparation
+        .as_ref()
+        .is_some_and(|preparation| unsafe { preparation.key.matches_ffi(key) })
 }
 
 /// Complete the Rust-owned animation plan and compose every interval without
-/// consulting C++ or the DOM. This consumes both Rust allocations produced by
-/// declaration resolution and keyframe longhand computation.
+/// consulting C++ or the DOM. On the first sample this consumes the Rust allocations produced by
+/// declaration resolution and keyframe longhand computation. Later samples can reuse that
+/// preparation from the animated overlay.
 ///
 /// # Safety
-/// `computed` must point to a live batch. Both storage pointers must be live,
-/// unconsumed results from their producing calls. `underlying_longhand_table`
-/// and `overlay` must point at live values, and the overlay must be uniquely
-/// owned for the duration of the call.
+/// `computed` must point to a live batch. Its preparation key and current-key range must be
+/// readable. On a cache miss both storage pointers must be live, unconsumed results from their
+/// producing calls. `underlying_longhand_table` and `overlay` must point at live values, and the
+/// overlay must be uniquely owned for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_evaluate_animations(computed: *const FfiComputedAnimationBatch) -> usize {
-    crate::abort_on_panic(|| {
-        crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
-        let computed = unsafe { &*computed };
-        assert!(!computed.resolved_animation_storage.is_null());
-        assert!(!computed.computed_keyframe_storage.is_null());
-        assert!(!computed.underlying_longhand_table.is_null());
-        let resolved = unsafe {
-            Box::from_raw(
-                computed
-                    .resolved_animation_storage
-                    .cast::<ResolvedAnimationDeclarations>(),
-            )
-        };
-        let computed_keyframe_values = unsafe {
-            crate::css::style_compute::take_animation_keyframe_longhand_values(computed.computed_keyframe_storage)
-        };
-        assert_eq!(computed_keyframe_values.len(), resolved.properties.len());
-        let underlying_longhand_table = unsafe {
-            &*computed
-                .underlying_longhand_table
-                .cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
-        };
-
-        let mut keyframes_by_value = Vec::with_capacity(resolved.value_plans.len());
-        for plan in &resolved.value_plans {
-            let mut keyframes = Vec::with_capacity(plan.property_indices.len());
-            for &property_index in &plan.property_indices {
-                let property = &resolved.properties[property_index];
-                let keyframe = &resolved.keyframes[property.keyframe_index];
-                keyframes.push(FfiAnimationKeyframeValue {
-                    key: keyframe.key,
-                    value: computed_keyframe_values[property_index].pointer(),
-                    easing: keyframe.easing_descriptor(),
-                    composite: keyframe.composite,
-                });
-            }
-            keyframes_by_value.push(keyframes);
-        }
-        let mut inputs = Vec::with_capacity(resolved.value_plans.len());
-        for (plan, keyframes) in resolved.value_plans.iter().zip(&keyframes_by_value) {
-            let (underlying, initial) = if plan.custom_name_id != 0 {
-                let custom_index = (plan.custom_name_id - 1) as usize;
-                assert!(custom_index < computed.custom_value_count);
-                (
-                    unsafe { *computed.custom_underlying_values.add(custom_index) },
-                    unsafe { *computed.custom_initial_values.add(custom_index) },
-                )
-            } else {
-                let underlying = underlying_longhand_table
-                    .get(plan.property_id)
-                    .expect("an animated longhand must have an underlying computed value");
-                (
-                    underlying.pointer(),
-                    crate::css::style_compute::initial_value_data(plan.property_id),
+    crate::css::ffi_stats::rust_style_ffi_note_animation_evaluation();
+    let computed = unsafe { &*computed };
+    assert!(!computed.preparation_key.is_null());
+    assert!(!computed.underlying_longhand_table.is_null());
+    assert!(!computed.overlay.is_null());
+    let preparation_key = unsafe { &*computed.preparation_key };
+    let current_keys = unsafe { std::slice::from_raw_parts(computed.current_keys, computed.current_key_count) };
+    let overlay = unsafe { &mut *computed.overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() };
+    let preparation = overlay
+        .animation_preparation
+        .as_ref()
+        .filter(|preparation| unsafe { preparation.key.matches_ffi(preparation_key) })
+        .cloned()
+        .unwrap_or_else(|| {
+            assert!(!computed.resolved_animation_storage.is_null());
+            assert!(!computed.computed_keyframe_storage.is_null());
+            let resolved = *unsafe {
+                Box::from_raw(
+                    computed
+                        .resolved_animation_storage
+                        .cast::<ResolvedAnimationDeclarations>(),
                 )
             };
-            inputs.push(FfiAnimationValueInput {
-                property_id: plan.property_id,
-                custom_name_id: plan.custom_name_id,
-                result_of_transition: plan.result_of_transition,
-                underlying,
-                initial,
-                current_key: plan.current_key,
-                keyframes: keyframes.as_ptr(),
-                keyframe_count: keyframes.len(),
-            });
-        }
-        let overlay = unsafe { &mut *computed.overlay.cast::<crate::css::animated_overlay::AnimatedOverlay>() };
-
-        // https://www.w3.org/TR/web-animations-1/#effect-stacks
-        // NB: Inputs arrive in composite order. Keep each result as the underlying value for the
-        //     next effect affecting the same property.
-        let mut custom_final_values = Vec::<(u32, RetainedStyleValueData)>::new();
-        let mut previous_values = Vec::<(u16, u32, *const StyleValueData)>::new();
-        for input in &inputs {
-            let previous_value = previous_values
+            let computed_keyframe_values = unsafe {
+                crate::css::style_compute::take_animation_keyframe_longhand_values(computed.computed_keyframe_storage)
+            };
+            assert_eq!(computed_keyframe_values.len(), resolved.properties.len());
+            let keyframes_by_value = resolved
+                .value_plans
                 .iter()
-                .rev()
-                .find(|(property_id, custom_name_id, _)| {
-                    *property_id == input.property_id && *custom_name_id == input.custom_name_id
+                .map(|plan| {
+                    plan.property_indices
+                        .iter()
+                        .map(|&property_index| {
+                            let property = &resolved.properties[property_index];
+                            let keyframe = &resolved.keyframes[property.keyframe_index];
+                            FfiAnimationKeyframeValue {
+                                key: keyframe.key,
+                                value: computed_keyframe_values[property_index].pointer(),
+                                easing: keyframe.easing_descriptor(),
+                                composite: keyframe.composite,
+                            }
+                        })
+                        .collect()
                 })
-                .map(|(_, _, value)| unsafe { &**value });
-            let result = evaluate_animation_value(&computed.context, input, previous_value);
-            if !result.apply {
-                assert!(result.value.is_null());
-                continue;
-            }
-            if input.custom_name_id != 0 {
-                if !result.value.is_null() {
-                    previous_values.push((input.property_id, input.custom_name_id, result.value));
-                    custom_final_values.push((input.custom_name_id, unsafe {
-                        RetainedStyleValueData::from_retained_pointer(result.value)
-                    }));
-                }
-                continue;
-            }
+                .collect();
+            std::rc::Rc::new(PreparedAnimationBatch {
+                key: unsafe { AnimationPreparationKey::from_ffi(preparation_key) },
+                resolved,
+                _computed_keyframe_values: computed_keyframe_values,
+                keyframes_by_value,
+                context: computed.context,
+            })
+        });
+    if computed.cache_preparation {
+        overlay.animation_preparation = Some(preparation.clone());
+    } else {
+        overlay.animation_preparation = None;
+    }
+    let resolved = &preparation.resolved;
+    let mut context = preparation.context;
+    context.current_color = computed.context.current_color;
+    context.has_transform_reference_box = computed.context.has_transform_reference_box;
+    context.transform_reference_box_width = computed.context.transform_reference_box_width;
+    context.transform_reference_box_height = computed.context.transform_reference_box_height;
+    let underlying_longhand_table = unsafe {
+        &*computed
+            .underlying_longhand_table
+            .cast::<crate::css::computed_longhand_table::ComputedLonghandTable>()
+    };
+
+    // https://www.w3.org/TR/web-animations-1/#effect-stacks
+    // NB: Inputs arrive in composite order. Keep each result as the underlying value for the
+    //     next effect affecting the same property.
+    let mut custom_final_values = Vec::<(u32, RetainedStyleValueData)>::new();
+    let mut previous_values = Vec::<(u16, u32, *const StyleValueData)>::with_capacity(resolved.value_plans.len());
+    for (plan, keyframes) in resolved.value_plans.iter().zip(&preparation.keyframes_by_value) {
+        assert!(plan.effect_index < current_keys.len());
+        let (underlying, initial) = if plan.custom_name_id != 0 {
+            let custom_index = (plan.custom_name_id - 1) as usize;
+            assert!(custom_index < computed.custom_value_count);
+            (
+                unsafe { *computed.custom_underlying_values.add(custom_index) },
+                unsafe { *computed.custom_initial_values.add(custom_index) },
+            )
+        } else {
+            let underlying = underlying_longhand_table
+                .get(plan.property_id)
+                .expect("an animated longhand must have an underlying computed value");
+            (
+                underlying.pointer(),
+                crate::css::style_compute::initial_value_data(plan.property_id),
+            )
+        };
+        let input = FfiAnimationValueInput {
+            property_id: plan.property_id,
+            custom_name_id: plan.custom_name_id,
+            result_of_transition: plan.result_of_transition,
+            underlying,
+            initial,
+            current_key: current_keys[plan.effect_index],
+            keyframes: keyframes.as_ptr(),
+            keyframe_count: keyframes.len(),
+        };
+        let previous_value = previous_values
+            .iter()
+            .rev()
+            .find(|(property_id, custom_name_id, _)| {
+                *property_id == input.property_id && *custom_name_id == input.custom_name_id
+            })
+            .map(|(_, _, value)| unsafe { &**value });
+        let result = evaluate_animation_value(&context, &input, previous_value);
+        if !result.apply {
+            assert!(result.value.is_null());
+            continue;
+        }
+        if input.custom_name_id != 0 {
             if !result.value.is_null() {
                 previous_values.push((input.property_id, input.custom_name_id, result.value));
-                let value = unsafe { RetainedStyleValueData::from_retained_pointer(result.value) };
-                overlay.set_owned(input.property_id, value, false, input.result_of_transition);
-            } else {
-                let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {
-                    keyword: crate::css::css_enums::keyword::HIDDEN,
+                custom_final_values.push((input.custom_name_id, unsafe {
+                    RetainedStyleValueData::from_retained_pointer(result.value)
+                }));
+            }
+            continue;
+        }
+        if !result.value.is_null() {
+            previous_values.push((input.property_id, input.custom_name_id, result.value));
+            let value = unsafe { RetainedStyleValueData::from_retained_pointer(result.value) };
+            overlay.set_owned(input.property_id, value, false, input.result_of_transition);
+        } else {
+            let value = RetainedStyleValueData::from_owned(StyleValueData::Keyword {
+                keyword: crate::css::css_enums::keyword::HIDDEN,
+            });
+            overlay.set_owned(
+                crate::css::property_metadata::property_id::VISIBILITY,
+                value,
+                false,
+                input.result_of_transition,
+            );
+        }
+    }
+    if !custom_final_values.is_empty() {
+        assert!(!computed.custom_results.is_null());
+        assert!(!computed.custom_result_count.is_null());
+        let mut final_by_name = std::collections::BTreeMap::<u32, RetainedStyleValueData>::new();
+        for (custom_name_id, value) in custom_final_values {
+            final_by_name.insert(custom_name_id, value);
+        }
+        let mut written = 0;
+        for (custom_name_id, value) in final_by_name {
+            assert!(written < computed.custom_value_count);
+            let pointer = value.pointer();
+            std::mem::forget(value);
+            unsafe {
+                computed.custom_results.add(written).write(FfiAnimatedCustomProperty {
+                    custom_name_id,
+                    value: pointer,
                 });
-                overlay.set_owned(
-                    crate::css::property_metadata::property_id::VISIBILITY,
-                    value,
-                    false,
-                    input.result_of_transition,
-                );
             }
+            written += 1;
         }
-        if !custom_final_values.is_empty() {
-            assert!(!computed.custom_results.is_null());
-            assert!(!computed.custom_result_count.is_null());
-            let mut final_by_name = std::collections::BTreeMap::<u32, RetainedStyleValueData>::new();
-            for (custom_name_id, value) in custom_final_values {
-                final_by_name.insert(custom_name_id, value);
-            }
-            let mut written = 0;
-            for (custom_name_id, value) in final_by_name {
-                assert!(written < computed.custom_value_count);
-                let pointer = value.pointer();
-                std::mem::forget(value);
-                unsafe {
-                    computed.custom_results.add(written).write(FfiAnimatedCustomProperty {
-                        custom_name_id,
-                        value: pointer,
-                    });
-                }
-                written += 1;
-            }
-            unsafe { computed.custom_result_count.write(written) };
-        }
-        overlay.refresh_ffi_entries();
-        inputs.len()
-    })
+        unsafe { computed.custom_result_count.write(written) };
+    }
+    resolved.value_plans.len()
 }
 
 /// Attempt Rust-owned style value interpolation without consulting C++ or the DOM.
@@ -7297,15 +7387,13 @@ pub unsafe extern "C" fn rust_interpolate_scalar_style_value(
     to: *const StyleValueData,
     delta: f32,
 ) -> FfiAnimationValueResult {
-    crate::abort_on_panic(|| {
-        interpolate_value(
-            unsafe { context.as_ref() },
-            property_id,
-            unsafe { &*from },
-            unsafe { &*to },
-            delta,
-        )
-    })
+    interpolate_value(
+        unsafe { context.as_ref() },
+        property_id,
+        unsafe { &*from },
+        unsafe { &*to },
+        delta,
+    )
 }
 
 /// Test-only bridge for exercising Rust-owned style value composition without constructing an
@@ -7319,7 +7407,7 @@ pub unsafe extern "C" fn rust_test_composite_style_value(
     animated: *const StyleValueData,
     operation: FfiCompositeOperation,
 ) -> FfiAnimationValueResult {
-    crate::abort_on_panic(|| composite_scalar_value(unsafe { &*underlying }, unsafe { &*animated }, operation))
+    composite_scalar_value(unsafe { &*underlying }, unsafe { &*animated }, operation)
 }
 
 #[cfg(test)]

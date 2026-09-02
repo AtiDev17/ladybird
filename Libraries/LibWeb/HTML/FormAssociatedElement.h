@@ -54,6 +54,8 @@ public:
 
     void set_parser_inserted(Badge<HTMLParser>);
 
+    static void reposition_associated_elements_after_move(Badge<DOM::Element>, DOM::Node& moved_subtree_root);
+
     // https://html.spec.whatwg.org/multipage/forms.html#category-listed
     virtual bool is_listed() const;
 
@@ -168,6 +170,7 @@ protected:
     void form_node_was_removed();
     void form_node_was_moved();
     void form_node_attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&);
+    void submit_button_state_changed();
 
     struct FACERareData {
         ValidityStateFlags validity_flags {};
@@ -201,6 +204,8 @@ protected:
 
         // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#parser-inserted-flag
         bool parser_inserted { false };
+
+        bool in_associated_elements_list { false };
 
         // State used only by form-associated custom elements.
         OwnPtr<FACERareData> face_rare_data;

@@ -21,22 +21,18 @@
 namespace Web::Painting {
 
 struct ImagePaint;
+struct ImagePaintRequest;
 
 WEB_API void dump_stacking_context_tree(StringBuilder&, DOM::Document const&);
 
-struct VisualContextTreeUpdateResult {
-    bool performed_full_build { false };
-    bool structural_epoch_changed { false };
-    bool requires_display_list_recording { false };
-};
-WEB_API VisualContextTreeUpdateResult rust_update_accumulated_visual_contexts(DOM::Document&);
+WEB_API Layout::RustFFI::FfiVisualContextUpdateOutcome rust_update_accumulated_visual_contexts(DOM::Document&);
 WEB_API Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const&, Layout::RustFFI::FfiVisualContextBoxNodeList);
+WEB_API Vector<u32> rust_visual_animation_target_node_indices(Layout::Node const&, AccumulatedVisualContextTree const&, bool targets_are_frames);
 WEB_API void const* retain_rust_main_visual_context_tree(DOM::Document const&);
-WEB_API Optional<TransformWithOrigin> rust_compute_css_transform(Layout::Node const&, double pixel_ratio);
+WEB_API CSSPixelRect rust_apply_css_transform_to_rect(Layout::Node const&, CSSPixelRect const&);
 WEB_API Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const&);
 WEB_API void rust_measure_scrollable_overflow(Layout::Node const&);
 WEB_API Layout::RustFFI::FfiScrollableOverflowUpdateOutcome rust_update_scrollable_overflow(DOM::Document&, bool handled_by_full_layout_commit);
-WEB_API CSS::ResolvedImage rust_resolve_gradient_for_size(CSS::StyleValue const&, Layout::NodeWithStyle const&, CSSPixelSize);
 WEB_API void rust_update_visual_viewport_transform(DOM::Document&);
 WEB_API void rust_refresh_scroll_state(DOM::Document&);
 WEB_API ScrollStateSnapshot rust_scroll_state_snapshot(DOM::Document&);
@@ -64,13 +60,9 @@ struct InspectorOverlayInputs {
 };
 
 WEB_API RefPtr<DisplayList> record_rust_display_list(DOM::Document&, DisplayList const& placeholder_display_list, DisplayListResourceStorage&, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&);
-WEB_API Utf16String serialize_painting_dump(
-    AccumulatedVisualContextTree const&,
-    DisplayList const&,
-    DisplayListResourceStorage const&,
-    Function<Optional<String>(SpatialNodeIndex)> const& spatial_node_owner_label,
-    Function<Optional<String>(FrameNodeIndex)> const& frame_node_owner_label);
+WEB_API Utf16String serialize_painting_dump(DOM::Document const&, AccumulatedVisualContextTree const&, DisplayList const&, DisplayListResourceStorage const&);
 
-WEB_API DisplayListResource record_image_paint_display_list(ImagePaint const&, Gfx::FloatRect dest_rect, CSS::ImageRendering, double device_pixels_per_css_pixel, DisplayListResourceStorage&);
+WEB_API CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layout::NodeWithStyle const&);
+WEB_API DisplayListResource record_image_paint_display_list(ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel);
 
 }

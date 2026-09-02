@@ -91,6 +91,7 @@
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLBaseElement.h>
@@ -1391,28 +1392,9 @@ void Element::run_attribute_change_steps(Utf16FlyString const& local_name, Optio
 
 static CSS::StyleComputer::ComputedStyleInvalidation decode_style_record_invalidation(u32 packed)
 {
-    using enum CSS::StyleEngineFFI::FfiStyleInvalidationField;
-    static_assert(CSS::ComputedValues::inherited_style_group_count <= 7);
     CSS::StyleComputer::ComputedStyleInvalidation result;
-    result.invalidation.ensure_at_least(static_cast<CSS::InvalidationLevel>(packed & to_underlying(LevelMask)));
-    result.invalidation.ensure_at_least(static_cast<CSS::AccumulatedVisualContextInvalidation>((packed >> to_underlying(VisualContextShift)) & to_underlying(LevelMask)));
-    if (result.invalidation.needs_layout_tree_rebuild())
-        result.invalidation.set_layout_tree_rebuild_root(static_cast<CSS::LayoutTreeRebuildRoot>((packed >> to_underlying(RebuildRootShift)) & to_underlying(LevelMask)));
-    if (packed & to_underlying(RebuildStackingContext))
-        result.invalidation.set_needs_stacking_context_tree_rebuild();
-    if (packed & to_underlying(RecalculateScrollableOverflow))
-        result.invalidation.set_needs_scrollable_overflow_recalculation();
-    result.invalidation.needs_scroll_container_resnap = packed & to_underlying(ResnapScrollContainer);
-    result.invalidation.recompute_descendant_styles = packed & to_underlying(RecomputeDescendants);
-    auto inherited_groups = static_cast<u8>((packed >> to_underlying(InheritedGroupsShift)) & to_underlying(InheritedGroupsMask));
-    for (u8 group = 0; group < CSS::ComputedValues::inherited_style_group_count; ++group) {
-        if (inherited_groups & (1 << group))
-            result.invalidation.mark_inherited_style_group_changed(group);
-    }
-    result.invalidation.changes_containing_block_establishment = packed & to_underlying(ChangesContainingBlock);
-    result.invalidation.repaint_propagated_text_decorations = packed & to_underlying(RepaintTextDecorations);
-    result.invalidation.non_inherited_property_inheritance_sources_changed = packed & to_underlying(NonInheritedInheritanceSource);
-    result.any_computed_value_changed = packed & to_underlying(AnyComputedValueChanged);
+    result.invalidation = CSS::decode_style_invalidation(packed);
+    result.any_computed_value_changed = packed & to_underlying(CSS::StyleEngineFFI::FfiStyleInvalidationField::AnyComputedValueChanged);
     return result;
 }
 struct ElementDependentInvalidationState {
@@ -1427,8 +1409,12 @@ struct ElementDependentInvalidationState {
             return;
         if (auto const& content = layout_node->content(); content.has_value())
             content_counter_style_dependencies = content->counter_style_dependencies;
-        if (auto const& list_style_type = layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-            list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
+        // Only a list item renders a marker, so only its counter style can matter; a display
+        // change to or from list-item rebuilds the box regardless.
+        if (layout_node->display().is_list_item()) {
+            if (auto const& list_style_type = layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
+                list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
+        }
         layout_node = nullptr;
         has_snapshot = true;
     }
@@ -1460,8 +1446,10 @@ static void add_element_dependent_invalidation(CSS::RequiredInvalidationAfterSty
         if (auto const& content = old_state.layout_node->content(); content.has_value())
             old_content_dependencies = content->counter_style_dependencies;
         Optional<ValueComparingRefPtr<CSS::CounterStyle const>> old_list_counter_style;
-        if (auto const& list_style_type = old_state.layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
-            old_list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
+        if (old_state.layout_node->display().is_list_item()) {
+            if (auto const& list_style_type = old_state.layout_node->list_style_type(); list_style_type.has<RefPtr<CSS::CounterStyle const>>())
+                old_list_counter_style = list_style_type.get<RefPtr<CSS::CounterStyle const>>();
+        }
         compare(old_content_dependencies, old_list_counter_style);
     } else if (old_state.has_snapshot) {
         compare(old_state.content_counter_style_dependencies, old_state.list_counter_style);
@@ -1559,8 +1547,16 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     // Any document change that can cause this element's style to change, could also affect its pseudo-elements.
     auto recompute_pseudo_element_style = [&](CSS::PseudoElement pseudo_element, bool has_implicit_style = false) {
         auto old_style_record = style_record_identity(pseudo_element);
-        auto pseudo_element_style = computed_style(pseudo_element);
         auto preserved_style_record = preserved_pseudo_element_styles ? preserved_pseudo_element_styles->at(to_underlying(pseudo_element)) : CSS::StyleRecordID {};
+        // Most elements have no style for most pseudo-elements. Decide that from the record
+        // identities before materializing any record view.
+        if (!has_implicit_style
+            && !old_style_record
+            && !preserved_style_record
+            && !(old_originating_style && old_originating_style->has_pseudo_element_style(pseudo_element))
+            && !(originating_style && originating_style->has_pseudo_element_style(pseudo_element)))
+            return;
+        auto pseudo_element_style = computed_style(pseudo_element);
         if (!old_style_record)
             old_style_record = preserved_style_record;
         auto preserved_pseudo_element_style = style_computer.computed_style_record_view(preserved_style_record);
@@ -3021,6 +3017,9 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
 void Element::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
 {
     Base::moved_from(is_subtree_root, old_ancestor);
+
+    if (is_subtree_root == IsSubtreeRoot::Yes)
+        HTML::FormAssociatedElement::reposition_associated_elements_after_move({}, *this);
 }
 
 void Element::children_changed(ChildrenChangedMetadata const& metadata)

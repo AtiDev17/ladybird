@@ -102,12 +102,15 @@ public:
     // return its previous and current StyleRecordID assignments. A zero node interns an unassigned
     // record for a style target which is not registered in the engine.
     [[nodiscard]] StyleRecordDelta publish_computed_groups(StyleNodeID node, u8 pseudo_kind, ReadonlySpan<void const*> payloads, size_t inherited_group_count, u64 custom_property_environment, bool inherited_group_swap_candidate, u64 counter_style_environment_identity, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> animation_overlay_payloads, void const* computed_longhand_table);
+    [[nodiscard]] Optional<StyleRecordDelta> publish_animation_overlay(StyleNodeID node, u8 pseudo_kind, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> payloads);
     [[nodiscard]] StyleRecordDelta assign_shared_style_record(StyleNodeID node, u8 pseudo_kind, StyleRecordID style_record, bool inherited_group_swap_eligible);
     // The borrowed payload array is stable while a base record exists or an animation-overlay
     // generation remains assigned or pinned.
     [[nodiscard]] void const* style_record_payloads(StyleRecordID style_record) const;
     [[nodiscard]] u8 style_record_dependency_flags(StyleRecordID style_record) const;
     [[nodiscard]] u32 compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout) const;
+    [[nodiscard]] bool animation_overlay_changed(StyleRecordID old_style_record, void const* animated_overlay) const;
+    [[nodiscard]] StyleEngineFFI::FfiAnimationInvalidation compare_animation_overlay(StyleRecordID old_style_record, void const* animated_overlay, ReadonlySpan<void const*> payloads, bool is_document_element) const;
     [[nodiscard]] StyleRecordView style_record_view(StyleRecordID style_record) const;
     void decide_transitions(StyleRecordID before_style_record, void const* after_longhand_table, void const* after_animated_overlay, StyleValueFFI::FfiTransitionInput&, StyleValueFFI::FfiTransitionAction*) const;
     // Remove the retained input identities for one pseudo-element kind and return its removal.

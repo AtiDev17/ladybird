@@ -120,13 +120,11 @@ impl Drop for OwnedLayoutNode {
 }
 
 fn parent_of(arena: &LayoutNodeArena, node: NodeSlotId) -> NodeSlotId {
-    // SAFETY: data() validated that node names a live slot; the link is a plain value.
-    unsafe { (&raw const (*arena.data(node)).parent).read() }
+    arena.data(node).parent.get()
 }
 
 fn next_sibling_of(arena: &LayoutNodeArena, node: NodeSlotId) -> NodeSlotId {
-    // SAFETY: data() validated that node names a live slot; the link is a plain value.
-    unsafe { (&raw const (*arena.data(node)).next_sibling).read() }
+    arena.data(node).next_sibling.get()
 }
 
 impl LayoutNodeArena {
@@ -190,20 +188,18 @@ mod tests {
     }
 
     fn links(arena: &LayoutNodeArena, node: NodeSlotId) -> Links {
-        // SAFETY: Every test keeps its allocations live while reading them.
-        let data = unsafe { &*arena.data(node) };
+        let data = arena.data(node);
         Links {
-            parent: data.parent,
-            first_child: data.first_child,
-            last_child: data.last_child,
-            previous_sibling: data.previous_sibling,
-            next_sibling: data.next_sibling,
+            parent: data.parent.get(),
+            first_child: data.first_child.get(),
+            last_child: data.last_child.get(),
+            previous_sibling: data.previous_sibling.get(),
+            next_sibling: data.next_sibling.get(),
         }
     }
 
     fn fragment_cache_epoch(arena: &LayoutNodeArena, node: NodeSlotId) -> u32 {
-        // SAFETY: Every test keeps its allocations live while reading them.
-        unsafe { (*arena.data(node)).fragment_cache_epoch }
+        arena.data(node).fragment_cache_epoch.get()
     }
 
     fn owned(slot: NodeSlotId) -> OwnedLayoutNode {
@@ -212,17 +208,14 @@ mod tests {
     }
 
     fn free(arena: &mut LayoutNodeArena, allocation: NodeAllocation) {
-        arena
-            .free(allocation.slot, allocation.generation)
-            .detached_children
-            .release_all();
+        arena.free(allocation.slot).detached_children.release_all();
     }
 
     #[test]
     fn attaching_an_owned_child_and_detaching_it_round_trips_the_links() {
         let mut arena = LayoutNodeArena::new();
-        let parent = arena.allocate();
-        let child = arena.allocate();
+        let parent = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
 
         arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
         assert_eq!(links(&arena, parent.slot).first_child, child.slot);
@@ -240,8 +233,8 @@ mod tests {
     #[test]
     fn detaching_from_the_parent_unlinks_an_attached_child_and_skips_a_root() {
         let mut arena = LayoutNodeArena::new();
-        let parent = arena.allocate();
-        let child = arena.allocate();
+        let parent = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
         arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
 
         arena.detach_from_parent(child.slot).expect("attached child").release();
@@ -255,11 +248,11 @@ mod tests {
     #[test]
     fn replacing_a_child_keeps_the_sibling_position() {
         let mut arena = LayoutNodeArena::new();
-        let parent = arena.allocate();
-        let a = arena.allocate();
-        let b = arena.allocate();
-        let c = arena.allocate();
-        let d = arena.allocate();
+        let parent = arena.allocate_for_test();
+        let a = arena.allocate_for_test();
+        let b = arena.allocate_for_test();
+        let c = arena.allocate_for_test();
+        let d = arena.allocate_for_test();
         for child in [a.slot, b.slot, c.slot] {
             arena.attach_child(parent.slot, owned(child), NodeSlotId::INVALID);
         }
@@ -284,11 +277,11 @@ mod tests {
     #[test]
     fn moving_a_child_relinks_it_under_the_new_parent() {
         let mut arena = LayoutNodeArena::new();
-        let first_parent = arena.allocate();
-        let second_parent = arena.allocate();
-        let a = arena.allocate();
-        let b = arena.allocate();
-        let c = arena.allocate();
+        let first_parent = arena.allocate_for_test();
+        let second_parent = arena.allocate_for_test();
+        let a = arena.allocate_for_test();
+        let b = arena.allocate_for_test();
+        let c = arena.allocate_for_test();
         arena.attach_child(first_parent.slot, owned(a.slot), NodeSlotId::INVALID);
         arena.attach_child(first_parent.slot, owned(b.slot), NodeSlotId::INVALID);
         arena.attach_child(second_parent.slot, owned(c.slot), NodeSlotId::INVALID);
@@ -311,13 +304,13 @@ mod tests {
     #[test]
     fn freeing_a_node_unlinks_its_children_and_hands_back_their_references() {
         let mut arena = LayoutNodeArena::new();
-        let root = arena.allocate();
-        let a = arena.allocate();
-        let b = arena.allocate();
+        let root = arena.allocate_for_test();
+        let a = arena.allocate_for_test();
+        let b = arena.allocate_for_test();
         arena.attach_child(root.slot, owned(a.slot), NodeSlotId::INVALID);
         arena.attach_child(root.slot, owned(b.slot), NodeSlotId::INVALID);
 
-        let freed = arena.free(root.slot, root.generation);
+        let freed = arena.free(root.slot);
         assert_eq!(freed.detached_children.len(), 2);
         assert!(links(&arena, a.slot).parent.is_invalid());
         assert!(links(&arena, b.slot).parent.is_invalid());
@@ -332,10 +325,10 @@ mod tests {
     #[should_panic(expected = "still linked under a parent")]
     fn freeing_a_node_still_linked_under_a_parent_panics() {
         let mut arena = LayoutNodeArena::new();
-        let parent = arena.allocate();
-        let child = arena.allocate();
+        let parent = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
         arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
-        let _ = arena.free(child.slot, child.generation);
+        let _ = arena.free(child.slot);
     }
 
     #[test]
@@ -346,10 +339,10 @@ mod tests {
             return;
         }
         let mut arena = LayoutNodeArena::new();
-        let grandparent = arena.allocate();
-        let parent = arena.allocate();
-        let sibling = arena.allocate();
-        let child = arena.allocate();
+        let grandparent = arena.allocate_for_test();
+        let parent = arena.allocate_for_test();
+        let sibling = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
         arena.attach_child(grandparent.slot, owned(parent.slot), NodeSlotId::INVALID);
         arena.attach_child(grandparent.slot, owned(sibling.slot), NodeSlotId::INVALID);
         let grandparent_epoch = fragment_cache_epoch(&arena, grandparent.slot);
@@ -372,14 +365,11 @@ mod tests {
     #[test]
     fn a_structural_change_clears_the_overflow_validity_of_box_ancestors_only() {
         let mut arena = LayoutNodeArena::new();
-        let grandparent = arena.allocate();
-        let parent = arena.allocate();
-        let child = arena.allocate();
-        // SAFETY: The allocations stay live for the whole test.
-        unsafe {
-            (*grandparent.data).kind = NodeKind::BlockContainer;
-            (*parent.data).kind = NodeKind::InlineNode;
-        }
+        let grandparent = arena.allocate_for_test();
+        let parent = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
+        arena.data(grandparent.slot).kind.set(NodeKind::BlockContainer);
+        arena.data(parent.slot).kind.set(NodeKind::InlineNode);
         arena.attach_child(grandparent.slot, owned(parent.slot), NodeSlotId::INVALID);
         for node in [grandparent.slot, parent.slot] {
             arena.populate_paintable_row(node);
@@ -414,8 +404,8 @@ mod tests {
     #[should_panic(expected = "without being released")]
     fn dropping_a_detached_shell_without_releasing_it_panics() {
         let mut arena = LayoutNodeArena::new();
-        let parent = arena.allocate();
-        let child = arena.allocate();
+        let parent = arena.allocate_for_test();
+        let child = arena.allocate_for_test();
         arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
         let _ = arena.detach_child(parent.slot, child.slot);
     }
@@ -425,7 +415,7 @@ mod tests {
     #[should_panic(expected = "leaked without being attached or released")]
     fn dropping_an_owned_layout_node_without_placing_it_panics() {
         let mut arena = LayoutNodeArena::new();
-        let node = arena.allocate();
+        let node = arena.allocate_for_test();
         // SAFETY: Test nodes have no shell, and the hooks skip null shells.
         let _ = unsafe { OwnedLayoutNode::adopt_created(node.slot) };
     }
