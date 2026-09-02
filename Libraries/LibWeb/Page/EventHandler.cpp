@@ -1680,7 +1680,7 @@ static void write_data_transfer_to_clipboard(DOM::Document& document, HTML::Drag
         if (item.type_string != u"text/plain"sv && item.type_string != u"text/html"sv)
             continue;
         auto mime_type = item.type_string == u"text/plain"sv ? "text/plain"_string : "text/html"_string;
-        representations.empend(item.data.to_byte_string(), move(mime_type));
+        representations.empend(move(mime_type), item.data.to_byte_string());
     }
     if (!representations.is_empty())
         document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
@@ -1709,9 +1709,9 @@ EventResult EventHandler::perform_copy_action()
         auto html = m_navigable->selected_html_for_clipboard();
         Vector<Clipboard::SystemClipboardRepresentation> representations;
         if (!html.is_empty())
-            representations.empend(html.to_byte_string(), "text/html"_string);
+            representations.empend("text/html"_string, html.to_byte_string());
         if (!text.is_empty())
-            representations.empend(text.to_byte_string(), "text/plain"_string);
+            representations.empend("text/plain"_string, text.to_byte_string());
         if (!representations.is_empty())
             document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
 
@@ -1754,9 +1754,9 @@ EventResult EventHandler::perform_cut_action()
                 //    text/html and text/plain clipboard formats when content in a web page is selected.
                 Vector<Clipboard::SystemClipboardRepresentation> representations;
                 if (!html.is_empty())
-                    representations.empend(html.to_byte_string(), "text/html"_string);
+                    representations.empend("text/html"_string, html.to_byte_string());
                 if (!text.is_empty())
-                    representations.empend(text.to_byte_string(), "text/plain"_string);
+                    representations.empend("text/plain"_string, text.to_byte_string());
                 document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
 
                 // 2. Remove the contents of the selection from the document and collapse the selection.
@@ -1782,7 +1782,7 @@ EventResult EventHandler::perform_cut_action()
     return EventResult::Handled;
 }
 
-// https://w3c.github.io/clipboard-apis/#the-paste-action
+// https://w3c.github.io/clipboard-apis/#paste-action
 EventResult EventHandler::perform_paste_action()
 {
     auto document = m_navigable->active_document();
@@ -1797,9 +1797,9 @@ EventResult EventHandler::perform_paste_action()
             for (auto const& representation : items.first().system_clipboard_representations) {
                 // NB: The clipboard representation's type may carry parameters, e.g. "text/plain;charset=utf-8".
                 Utf16FlyString type;
-                if (representation.mime_type == "text/plain"sv || representation.mime_type.starts_with_bytes("text/plain;"sv))
+                if (representation.name == "text/plain"sv || representation.name.starts_with_bytes("text/plain;"sv))
                     type = "text/plain"_utf16_fly_string;
-                else if (representation.mime_type == "text/html"sv || representation.mime_type.starts_with_bytes("text/html;"sv))
+                else if (representation.name == "text/html"sv || representation.name.starts_with_bytes("text/html;"sv))
                     type = "text/html"_utf16_fly_string;
                 else
                     continue;
@@ -1820,7 +1820,7 @@ EventResult EventHandler::perform_paste_action()
     return EventResult::Handled;
 }
 
-// https://w3c.github.io/clipboard-apis/#the-paste-action
+// https://w3c.github.io/clipboard-apis/#paste-action
 // This is the paste action from the point where the content to paste is already in hand, either because async retrieval
 // of the system clipboard's contents above finished, or because the paste arrived through LocalNavigable::paste() —
 // which the UI process hands the content to paste directly.
