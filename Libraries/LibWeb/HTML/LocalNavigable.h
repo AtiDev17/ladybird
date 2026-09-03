@@ -14,8 +14,8 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
+#include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Navigation.h>
-#include <LibWeb/Bindings/Window.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/Compositor/SmoothScrollAnimation.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
@@ -151,13 +151,9 @@ public:
         Tag
     };
 
-    enum class NavigationAPIAbortBehavior {
-        Abort,
-        Preserve
-    };
-
     Variant<Empty, Traversal, Utf16String> ongoing_navigation() const { return m_ongoing_navigation; }
-    void set_ongoing_navigation(Variant<Empty, Traversal, Utf16String> ongoing_navigation, NavigationAPIAbortBehavior = NavigationAPIAbortBehavior::Abort);
+    void set_ongoing_navigation(Variant<Empty, Traversal, Utf16String> ongoing_navigation);
+    void set_ongoing_navigation_without_informing_navigation_api(Variant<Empty, Traversal, Utf16String> ongoing_navigation);
 
     bool resume_navigation_params_creation(Utf16String const& navigation_id, Optional<NavigationPopulationRequest>);
     void run_navigation_unload_check(Utf16String const& navigation_id, GC::Ref<GC::Function<void(bool)>> completion_steps);
@@ -229,6 +225,7 @@ public:
     // https://github.com/whatwg/html/issues/9690
     [[nodiscard]] bool has_been_destroyed() const { return m_has_been_destroyed; }
     void set_has_been_destroyed();
+    void report_child_frame_destroyed();
     void remove_from_all_local_navigables();
 
     CSSPixelPoint to_top_level_position(CSSPixelPoint);
@@ -515,6 +512,7 @@ private:
     NavigationObserver::NavigationObserversList m_navigation_observers;
 
     bool m_has_been_destroyed { false };
+    bool m_child_frame_destruction_reported { false };
 
     CSSPixelSize m_viewport_size;
     CSSPixelPoint m_viewport_scroll_offset;

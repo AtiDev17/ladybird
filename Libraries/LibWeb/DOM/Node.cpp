@@ -1184,8 +1184,8 @@ static bool can_detach_layout_subtree_for_removal(Node const& node, Node const& 
         // content directly in the parent instead.
         bool an_anonymous_inline_wrapper_remains = false;
         bool an_in_flow_block_level_sibling_remains = false;
-        for (auto sibling = parent_layout_node->first_child(); sibling; sibling = sibling->next_sibling()) {
-            if (sibling.ptr() == layout_node)
+        for (auto const* sibling = parent_layout_node->first_child(); sibling; sibling = sibling->next_sibling()) {
+            if (sibling == layout_node)
                 continue;
             if (auto const* sibling_with_style = as_if<Layout::NodeWithStyle>(*sibling); sibling_with_style && sibling_with_style->is_out_of_flow())
                 continue;
@@ -1350,13 +1350,13 @@ void Node::remove(bool suppress_observers)
             if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*parent)) {
                 first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
             } else if (can_detach_layout_subtree_for_removal(*this, *parent)) {
-                RefPtr<Layout::Node> layout_node = unsafe_layout_node();
+                auto* layout_node = unsafe_layout_node();
                 layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
                     node.clear_committed_box();
                     return TraversalDecision::Continue;
                 });
                 layout_node->prepare_subtree_for_detach_from_layout_tree();
-                VERIFY(Layout::detach_layout_node_for_destruction(*layout_node));
+                VERIFY(Layout::destroy_layout_subtree(*layout_node));
                 if (auto* parent_layout_node = parent->unsafe_layout_node(); !parent_layout_node->has_children())
                     parent_layout_node->set_children_are_inline(false);
                 parent->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
@@ -2428,7 +2428,7 @@ void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
     if (m_layout_node) {
         if (auto* top_layer_placement = m_layout_node->topmost_layout_node_of_top_layer_placement()) {
             top_layer_placement->prepare_subtree_for_detach_from_layout_tree();
-            VERIFY(Layout::detach_layout_node_for_destruction(*top_layer_placement));
+            VERIFY(Layout::destroy_layout_subtree(*top_layer_placement));
         }
     }
     m_layout_node = nullptr;

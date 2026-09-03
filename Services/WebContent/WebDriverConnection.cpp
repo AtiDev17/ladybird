@@ -32,6 +32,7 @@
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
@@ -2785,7 +2786,7 @@ void WebDriverConnection::wait_for_visibility_state(GC::Ref<GC::Function<void()>
 
     auto* document = current_top_level_browsing_context()->active_document();
 
-    if (document->visibility_state_value() == target_visibility_state) {
+    if (document->visibility_state() == target_visibility_state) {
         on_complete->function()();
         return;
     }

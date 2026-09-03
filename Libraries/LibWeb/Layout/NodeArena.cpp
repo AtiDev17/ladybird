@@ -5,6 +5,7 @@
  */
 
 #include <AK/Assertions.h>
+#include <LibWeb/DOM/Node.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -28,9 +29,9 @@ RustFFI::NodeSlotId NodeArena::allocate(RustFFI::FfiNodeConstructionFacts const&
     return RustFFI::layout_arena_allocate(m_handle, construction_facts);
 }
 
-void NodeArena::free(RustFFI::NodeSlotId slot)
+void NodeArena::free_subtree(RustFFI::NodeSlotId root)
 {
-    RustFFI::layout_arena_free(m_handle, slot);
+    RustFFI::layout_arena_free_subtree(m_handle, root);
 }
 
 u64 NodeArena::formatting_context_run_cache_hit_count() const
@@ -48,9 +49,16 @@ u64 NodeArena::intrinsic_measurement_count() const
     return RustFFI::layout_arena_intrinsic_measurement_count(m_handle);
 }
 
-bool detach_layout_node_for_destruction(Node& node)
+void NodeArena::visit_dom_nodes(GC::Cell::Visitor& visitor) const
 {
-    return RustFFI::layout_arena_detach_node_for_destruction(node.arena_handle(), Node::slot_id(&node));
+    RustFFI::layout_arena_visit_dom_nodes(m_handle, &visitor, [](void* visitor_pointer, void* dom_node_pointer) {
+        static_cast<GC::Cell::Visitor*>(visitor_pointer)->visit(static_cast<DOM::Node*>(dom_node_pointer));
+    });
+}
+
+bool destroy_layout_subtree(Node& node)
+{
+    return RustFFI::layout_arena_detach_and_free_subtree(node.arena_handle(), Node::slot_id(&node));
 }
 
 void NodeArena::sync_enrolled_content_for_layout()

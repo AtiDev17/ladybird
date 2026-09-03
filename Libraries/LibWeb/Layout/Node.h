@@ -39,24 +39,16 @@ enum class LayoutUpdatePropagation : u8 {
     BoundarySelfOnly,
 };
 
-class NodeArenaAllocation {
-protected:
-    NodeArenaAllocation(DOM::Document&, RustFFI::FfiNodeConstructionFacts const&);
-    ~NodeArenaAllocation();
-
-    NonnullRefPtr<NodeArena> m_arena;
-    RustFFI::NodeSlotId m_slot {};
+enum class BindToPreparedArenaSlot {
+    Yes,
 };
 
-class WEB_API Node
-    : public RefCounted<Node>
-    , public Weakable<Node>
-    , private NodeArenaAllocation {
-
+class WEB_API Node : public Weakable<Node> {
 public:
     AK_ALLOC_WITH_KMALLOC_PARTITION(HeapPartition::Layout);
 
     virtual ~Node();
+    static void delete_arena_owned_shell(Node&);
     StringView class_name() const;
 
     static RustFFI::NodeSlotId slot_id(Node const*);
@@ -65,6 +57,8 @@ public:
     void* arena_handle() const;
     NodeArena& node_arena() const { return *m_arena; }
 
+    RustFFI::NodeSlotId linked_slot(RustFFI::FfiNodeLink link) const { return RustFFI::layout_arena_node_link_slot(m_arena->handle(), m_slot, link); }
+    bool has_parent() const { return linked_slot(RustFFI::FfiNodeLink::Parent).index != RustFFI::INVALID_NODE_SLOT_INDEX; }
     Node* parent_ptr() { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node const* parent_ptr() const { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node* first_child_ptr() { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
@@ -75,23 +69,23 @@ public:
     Node* previous_sibling_ptr() { return linked_node(RustFFI::FfiNodeLink::PreviousSibling); }
     bool has_children() const { return first_child_ptr() != nullptr; }
 
-    RefPtr<Node> first_child() { return first_child_ptr(); }
-    RefPtr<Node const> first_child() const { return first_child_ptr(); }
-    RefPtr<Node> next_sibling() { return next_sibling_ptr(); }
-    RefPtr<Node const> next_sibling() const { return next_sibling_ptr(); }
-    RefPtr<Node> previous_sibling() { return previous_sibling_ptr(); }
-    RefPtr<Node const> previous_sibling() const { return const_cast<Node*>(this)->previous_sibling_ptr(); }
+    Node* first_child() { return first_child_ptr(); }
+    Node const* first_child() const { return first_child_ptr(); }
+    Node* next_sibling() { return next_sibling_ptr(); }
+    Node const* next_sibling() const { return next_sibling_ptr(); }
+    Node* previous_sibling() { return previous_sibling_ptr(); }
+    Node const* previous_sibling() const { return const_cast<Node*>(this)->previous_sibling_ptr(); }
 
     template<typename Callback>
     TraversalDecision for_each_in_inclusive_subtree(Callback callback) const
     {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::Yes, callback);
+        return traverse_preorder(*this, IncludeTraversalRoot::Yes, callback);
     }
 
     template<typename Callback>
     TraversalDecision for_each_in_inclusive_subtree(Callback callback)
     {
-        return traverse_ref_counted_preorder(*this, IncludeRefCountedTreeRoot::Yes, callback);
+        return traverse_preorder(*this, IncludeTraversalRoot::Yes, callback);
     }
 
     template<typename U, typename Callback>
@@ -322,6 +316,7 @@ public:
 
 protected:
     Node(DOM::Document&, GC::Ptr<DOM::Node>, RustFFI::NodeKind, AttachToDOMNode = AttachToDOMNode::Yes);
+    Node(DOM::Document&, BindToPreparedArenaSlot, RustFFI::NodeSlotId, RustFFI::NodeKind);
 
     bool has_flag(RustFFI::NodeFlag flag) const
     {
@@ -357,18 +352,26 @@ private:
 
     u8 generated_for() const { return RustFFI::layout_arena_node_generated_for(m_arena->handle(), m_slot); }
 
-protected:
-private:
-    // A DOM mutation can disconnect a node before the next layout-tree update. Keep the DOM node alive until this
-    // layout node is destroyed so detach hooks never observe a collected image provider or other element state.
-    GC::Root<DOM::Node> m_dom_node;
+    NonnullRefPtr<NodeArena> m_arena;
+    RustFFI::NodeSlotId m_slot;
+    // A DOM mutation can disconnect a node before the next layout-tree update. The arena roots the DOM node
+    // through Document::visit_edges while this slot is live, so detach hooks never observe a collected element.
+    GC::RawPtr<DOM::Node> m_dom_node;
     GC::Weak<DOM::Element> m_pseudo_element_generator;
     RustFFI::NodeKind m_kind { RustFFI::NodeKind::Unset };
+    bool m_arena_is_destroying_shell { false };
 };
+
+template<typename T, typename... Args>
+T& allocate_layout_node(Args&&... args)
+{
+    return *new T(forward<Args>(args)...);
+}
 
 class WEB_API NodeWithStyle : public Node {
 public:
     NodeWithStyle(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::NodeWithStyle);
+    NodeWithStyle(DOM::Document&, BindToPreparedArenaSlot, RustFFI::NodeSlotId, RustFFI::NodeKind);
 
     virtual ~NodeWithStyle() override;
 
@@ -646,15 +649,15 @@ public:
     Gfx::Font const& first_available_font() const;
     CSS::StyleScope const& style_scope() const;
 
-    NonnullRefPtr<NodeWithStyle> create_anonymous_wrapper() const;
-
-    void transfer_table_box_computed_values_to_wrapper_computed_values(CSS::ComputedValues::Builder& wrapper_computed_values);
+    void reset_table_box_computed_values_used_by_wrapper_to_init_values();
 
     bool is_body() const { return has_flag(RustFFI::NodeFlag::IsBody); }
     bool is_scroll_container() const;
 
     void set_computed_values(NonnullRefPtr<CSS::ComputedValues const>);
     void set_style_record_identity(CSS::StyleRecordID);
+    void refresh_style_from_arena();
+    bool reinherit_owned_computed_values_from(CSS::StyleRecordID parent_style_record_identity);
     void pin_style_record_for_cxx_consumers();
     void release_pinned_style_record();
     void bind_generated_style_record(CSS::StyleRecordID);
@@ -668,8 +671,7 @@ private:
 
     virtual bool is_node_with_style() const final { return true; }
 
-    void reset_table_box_computed_values_used_by_wrapper_to_init_values();
-    void propagate_style_to_anonymous_wrappers();
+    void initialize_from_style_record();
     void publish_style_record_to_node_data();
 
     void rebuild_image_observers();
@@ -677,11 +679,10 @@ private:
     void const* m_style_payloads { nullptr };
     RefPtr<CSS::ComputedValues const> m_owned_computed_values;
     CSS::StyleRecordID m_style_record_identity;
-    // Layout nodes are ref-counted rather than GC cells, so this owner cannot be a traced GC::Ptr.
-    // Document::tear_down_layout_tree() must drop the layout root, which destroys these nodes and
-    // unpins their records before this root is cleared. Every document destruction path goes
-    // through that teardown.
-    GC::Root<DOM::Document> m_style_record_owner;
+    // The pin is released through the arena's document, so Document::tear_down_layout_tree()
+    // must free the layout root before the document's style computer goes away. Every document
+    // destruction path goes through that teardown.
+    bool m_style_record_pinned { false };
     struct ImageObserverSlots {
         Vector<OwnPtr<ImageObserver>> background_layers;
         Vector<OwnPtr<ImageObserver>> mask_layers;

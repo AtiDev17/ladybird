@@ -736,6 +736,18 @@ GC::Ref<WebIDL::Promise> Internals::delete_all_cookies()
     return promise;
 }
 
+WebIDL::ExceptionOr<bool> Internals::has_cookie_for_url(Utf16String const& url, String const& name, String const& value)
+{
+    auto parsed_url = URL::Parser::basic_parse(url.utf16_view());
+    if (!parsed_url.has_value())
+        return WebIDL::SimpleException { .type = WebIDL::SimpleExceptionType::TypeError, .message = Utf16String::formatted("Invalid URL: '{}'", url) };
+
+    auto cookies = page().client().page_did_request_all_cookies_webdriver(parsed_url.value());
+    return any_of(cookies, [&](auto const& cookie) {
+        return cookie.name == name && cookie.value == value;
+    });
+}
+
 bool Internals::set_http_memory_cache_enabled(bool enabled)
 {
     auto was_enabled = Web::Fetch::Fetching::http_memory_cache_enabled();
@@ -1483,6 +1495,20 @@ u64 Internals::layout_node_identity(DOM::Node& node)
     node.document().update_layout(DOM::UpdateLayoutReason::Debugging);
     auto const* layout_node = node.layout_node();
     return layout_node ? static_cast<u64>(layout_node->arena_slot_index()) + 1 : 0;
+}
+
+u64 Internals::layout_arena_live_slot_count()
+{
+    auto& document = window().associated_document();
+    document.update_layout(DOM::UpdateLayoutReason::Debugging);
+    return Layout::RustFFI::layout_arena_live_slot_count(document.layout_node_arena().handle());
+}
+
+u64 Internals::layout_arena_shell_count()
+{
+    auto& document = window().associated_document();
+    document.update_layout(DOM::UpdateLayoutReason::Debugging);
+    return Layout::RustFFI::layout_arena_shell_count(document.layout_node_arena().handle());
 }
 
 GC::Ref<JS::Object> Internals::style_engine_transaction_reactions()

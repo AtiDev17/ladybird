@@ -332,8 +332,12 @@ public:
     void did_create_top_level_traversable(Badge<WebContentClient>, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry);
     void request_history_operation(Badge<WebContentClient>, WebContentClient&, u64 requesting_page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters);
     void did_receive_history_operation_ready(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult);
-    void did_receive_history_step_unload_cancelation_result(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult);
-    void did_receive_changing_navigable_history_job_ready(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition);
+    void did_receive_history_step_unload_cancelation_result(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
+    void did_receive_history_step_beforeunload_check_result(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
+    void did_receive_changing_navigable_history_job_ready(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition, Web::HTML::UnloadDisplayedDocument);
+    void did_receive_changing_navigable_unload_preparation_complete(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
+    void did_receive_descendant_unload_task_complete(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id);
+    void did_receive_child_navigable_unload_request(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId navigable_id);
     void did_receive_changing_navigable_continuation_applied(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state);
     void did_receive_nonchanging_navigable_history_state_updated(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id);
     void did_reset_session_history_for_testing(Badge<WebContentClient>, Web::HTML::SessionHistoryEntryDescriptor);
@@ -623,12 +627,6 @@ protected:
         // exactly when the process does not host it.
         bool hosts_committed_entry { true };
     } m_client_state;
-
-    enum class HistoryOperationHandling : u8 {
-        Abandon,
-        Preserve,
-    };
-    HistoryOperationHandling m_history_operation_handling_for_next_client { HistoryOperationHandling::Abandon };
 
     IsPrivate m_is_private { IsPrivate::No };
 

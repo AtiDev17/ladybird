@@ -119,6 +119,7 @@ public:
 
     void expire_cookies_with_time_offset(WebIDL::LongLong seconds);
     GC::Ref<WebIDL::Promise> delete_all_cookies();
+    WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
     bool set_http_memory_cache_enabled(bool enabled);
     void simulate_request_server_connection_loss();
@@ -212,6 +213,8 @@ public:
     u64 before_layout_style_record_identity(DOM::Element&);
     u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
+    u64 layout_arena_live_slot_count();
+    u64 layout_arena_shell_count();
     double style_engine_match_document();
     Utf16String style_engine_matched_rules();
     GC::Ref<JS::Object> style_engine_transaction_reactions();

@@ -665,7 +665,6 @@ public:
 
     GC::Ref<Document> appropriate_template_contents_owner_document();
 
-    Utf16FlyString ready_state() const;
     HTML::DocumentReadyState readiness() const { return m_readiness; }
     void update_readiness(HTML::DocumentReadyState);
 
@@ -753,8 +752,7 @@ public:
     void set_page_showing(bool);
 
     bool hidden() const;
-    Utf16FlyString visibility_state() const;
-    HTML::VisibilityState visibility_state_value() const { return m_visibility_state; }
+    HTML::VisibilityState visibility_state() const { return m_visibility_state; }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#update-the-visibility-state
     void update_the_visibility_state(HTML::VisibilityState);
@@ -910,8 +908,6 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document
     void unload(GC::Ptr<Document> new_document = nullptr);
-    // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
-    void unload_a_document_and_its_descendants(GC::Ptr<Document> new_document, GC::Ptr<GC::Function<void()>> after_all_unloads = {});
 
     // https://html.spec.whatwg.org/multipage/dom.html#active-parser
     GC::Ptr<HTML::HTMLParser> active_parser();
@@ -1188,7 +1184,7 @@ public:
     [[nodiscard]] bool may_have_scroll_snap_areas() const { return m_may_have_scroll_snap_areas; }
 
     void register_scroll_snap_container(Layout::Node const&);
-    [[nodiscard]] Vector<NonnullRefPtr<Layout::Node const>> collect_scroll_snap_containers();
+    [[nodiscard]] Vector<WeakPtr<Layout::Node const>> collect_scroll_snap_containers();
 
     virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
@@ -1566,7 +1562,7 @@ private:
     RefPtr<Layout::NodeArena> m_layout_node_arena;
     OwnPtr<Painting::DocumentPaintState> m_paint_state;
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
-    RefPtr<Layout::Viewport> m_layout_root;
+    Layout::Viewport* m_layout_root { nullptr };
     bool m_may_have_content_visibility_auto_style { false };
 
     GC::Ptr<Node> m_hovered_node;

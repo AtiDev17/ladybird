@@ -27,6 +27,7 @@
 #include <LibCore/Timer.h>
 #include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapVector.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
 #include <LibHTTP/Cookie/Cookie.h>
@@ -42,6 +43,7 @@
 #include <LibWeb/Animations/AnimationTimeline.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/TimeValue.h>
+#include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Document.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
@@ -202,7 +204,8 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
-#include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/AnonymousBoxStyle.h>
+#include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
@@ -689,6 +692,44 @@ Layout::NodeArena& Document::layout_node_arena()
     // fragment-parsing documents) skip the Rust arena round-trip entirely.
     if (!m_layout_node_arena) {
         m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
+        m_layout_node_arena->set_document({}, this);
+        Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
+            .context = this,
+            .derive_anonymous_style_record = [](void* context, u64 parent_style_record, Layout::RustFFI::FfiAnonymousStyleKind kind, Layout::RustFFI::FfiAnonymousStyleOverrides overrides) -> Layout::RustFFI::FfiDerivedStyleRecord {
+                auto& style_computer = static_cast<Document*>(context)->style_computer();
+                auto style_record = Layout::derive_pinned_anonymous_box_style_record(style_computer, CSS::StyleRecordID { parent_style_record }, kind, overrides);
+                return { .record = style_record.value(), .payloads = style_computer.style_record_payloads(style_record) };
+            },
+            .reinherit_anonymous_style_record = [](void* context, u64 style_record, u64 parent_style_record) -> Layout::RustFFI::FfiDerivedStyleRecord {
+                auto& style_computer = static_cast<Document*>(context)->style_computer();
+                auto reinherited_style_record = Layout::reinherit_pinned_anonymous_box_style_record(style_computer, CSS::StyleRecordID { style_record }, CSS::StyleRecordID { parent_style_record });
+                return { .record = reinherited_style_record.value(), .payloads = style_computer.style_record_payloads(reinherited_style_record) };
+            },
+            .unpin_style_record = [](void* context, u64 style_record) { static_cast<Document*>(context)->style_computer().unpin_style_record(CSS::StyleRecordID { style_record }); },
+            .reinherit_owned_anonymous_box_style = [](void*, void* shell, u64 parent_style_record) -> bool {
+                return as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).reinherit_owned_computed_values_from(CSS::StyleRecordID { parent_style_record });
+            },
+            .reset_table_box_style_used_by_wrapper = [](void*, void* table_box_shell) { as<Layout::Box>(*static_cast<Layout::Node*>(table_box_shell)).reset_table_box_computed_values_used_by_wrapper_to_init_values(); },
+            .shell_style_changed = [](void*, void* shell) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(); },
+        };
+        Layout::RustFFI::layout_arena_set_style_record_host_callbacks(m_layout_node_arena->handle(), style_record_host_callbacks);
+        Layout::RustFFI::layout_arena_set_shell_factory(m_layout_node_arena->handle(), this, [](void* context, Layout::RustFFI::NodeSlotId slot, Layout::RustFFI::NodeKind kind) {
+            auto& document = *static_cast<Document*>(context);
+            switch (kind) {
+            case Layout::RustFFI::NodeKind::BlockContainer:
+            case Layout::RustFFI::NodeKind::TableWrapper:
+                Layout::allocate_layout_node<Layout::BlockContainer>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::Box:
+                Layout::allocate_layout_node<Layout::Box>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind);
+                return;
+            case Layout::RustFFI::NodeKind::InlineNode:
+                Layout::allocate_layout_node<Layout::NodeWithStyle>(document, Layout::BindToPreparedArenaSlot::Yes, slot, kind).attach_style_resources();
+                return;
+            default:
+                VERIFY_NOT_REACHED();
+            }
+        });
         Layout::RustFFI::layout_arena_set_chrome_state_callback(
             m_layout_node_arena->handle(), this,
             [](void* context, Layout::RustFFI::NodeSlotId slot, Layout::RustFFI::PaintableRowResetKind kind) {
@@ -717,8 +758,14 @@ void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool esc
 void Document::finalize()
 {
     stop_compositor_animation_timers();
-    if (m_layout_node_arena)
+    tear_down_layout_tree();
+    if (m_layout_node_arena) {
         Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
+        Layout::RustFFI::layout_arena_clear_style_record_host_callbacks(m_layout_node_arena->handle());
+        Layout::RustFFI::layout_arena_clear_shell_factory(m_layout_node_arena->handle());
+        VERIFY(Layout::RustFFI::layout_arena_live_slot_count(m_layout_node_arena->handle()) == 0);
+        m_layout_node_arena->set_document({}, nullptr);
+    }
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
     Base::finalize();
     HTML::main_thread_event_loop().unregister_document({}, *this);
@@ -880,6 +927,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_previously_repainted_cursor_position);
     if (m_hit_test_display_list)
         m_hit_test_display_list->visit_edges(visitor);
+    if (m_layout_node_arena)
+        m_layout_node_arena->visit_dom_nodes(visitor);
     visitor.visit(m_editing_host_manager);
     visitor.visit(m_editing_history);
     visitor.visit(m_local_storage_holder);
@@ -1474,9 +1523,13 @@ WebIDL::ExceptionOr<void> Document::set_title(Utf16View title)
 
 void Document::set_layout_root(Layout::Viewport& viewport)
 {
-    if (m_layout_root.ptr() == &viewport)
+    if (m_layout_root == &viewport)
         return;
-    m_layout_root = viewport;
+    if (auto* replaced_layout_root = exchange(m_layout_root, nullptr)) {
+        replaced_layout_root->prepare_subtree_for_detach_from_layout_tree();
+        layout_node_arena().free_subtree(Layout::Node::slot_id(replaced_layout_root));
+    }
+    m_layout_root = &viewport;
     m_paint_state = make<Painting::DocumentPaintState>(layout_node_arena());
 }
 
@@ -1486,7 +1539,8 @@ void Document::tear_down_layout_tree()
         m_layout_root->prepare_subtree_for_detach_from_layout_tree();
     m_hit_test_display_list = nullptr;
     m_chrome_widget_registry->clear();
-    m_layout_root = nullptr;
+    if (auto* layout_root = exchange(m_layout_root, nullptr))
+        layout_node_arena().free_subtree(Layout::Node::slot_id(layout_root));
     m_paint_state = nullptr;
     if (m_layout_node_arena)
         Layout::RustFFI::layout_arena_clear_scrollable_overflow_contained_boxes(m_layout_node_arena->handle());
@@ -1902,7 +1956,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // contained-boxes index; refresh it before overflow measurement follows them. A pending full
     // recalculation rebuilds the index inside its own measurement traversal instead.
     if (layout_tree_changed == LayoutTreeChanged::Yes && !Layout::RustFFI::layout_arena_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle()))
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
     if (layout_commit_scope == LayoutCommitScope::Full)
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
     else
@@ -2249,7 +2303,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
     if (needs_layout_tree_rebuild) {
         auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
         auto tree_build_result = Layout::build_layout_tree(*this);
-        set_layout_root(as<Layout::Viewport>(*tree_build_result.root));
+        set_layout_root(*tree_build_result.root);
         record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
         needs_layout_tree_rebuild = false;
         if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots) || tree_build_result.needs_another_build_pass)
@@ -2402,7 +2456,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 
         if (needs_layout_tree_rebuild) {
             auto tree_build_result = Layout::build_layout_tree(*this);
-            set_layout_root(as<Layout::Viewport>(*tree_build_result.root));
+            set_layout_root(*tree_build_result.root);
             record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
 
             // NB: Called during layout update.
@@ -2445,7 +2499,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
 
         style_invalidation_counters().relayouts_performed++;
 
@@ -2456,7 +2510,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
         after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full);
 
         Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
-            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
+            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
@@ -4597,19 +4651,6 @@ void Document::scroll_to_the_beginning_of_the_document()
         navigable->perform_scroll_of_viewport_scrolling_box({ 0, 0 });
 }
 
-Utf16FlyString Document::ready_state() const
-{
-    switch (m_readiness) {
-    case HTML::DocumentReadyState::Loading:
-        return "loading"_utf16_fly_string;
-    case HTML::DocumentReadyState::Interactive:
-        return "interactive"_utf16_fly_string;
-    case HTML::DocumentReadyState::Complete:
-        return "complete"_utf16_fly_string;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 // https://html.spec.whatwg.org/multipage/dom.html#update-the-current-document-readiness
 void Document::update_readiness(HTML::DocumentReadyState readiness_value)
 {
@@ -4984,18 +5025,6 @@ GC::Ptr<HTML::Location> Document::location()
 bool Document::hidden() const
 {
     return m_visibility_state == HTML::VisibilityState::Hidden;
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#dom-document-visibilitystate
-Utf16FlyString Document::visibility_state() const
-{
-    switch (m_visibility_state) {
-    case HTML::VisibilityState::Hidden:
-        return "hidden"_utf16_fly_string;
-    case HTML::VisibilityState::Visible:
-        return "visible"_utf16_fly_string;
-    }
-    VERIFY_NOT_REACHED();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#update-the-visibility-state
@@ -5725,8 +5754,7 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::inclusive_descendant_navigables
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
-    //        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
-    //        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    //        essentially destroying the document too early. See: https://github.com/LadybirdBrowser/ladybird/issues/7825
     auto document_node_navigable = navigable();
     if (!document_node_navigable)
         return {};
@@ -5747,8 +5775,7 @@ GC::RootVector<GC::Ref<HTML::Navigable>> Document::ancestor_navigables()
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
-    //        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
-    //        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    //        essentially destroying the document too early. See: https://github.com/LadybirdBrowser/ladybird/issues/7825
     auto document_node_navigable = navigable();
     if (!document_node_navigable)
         return {};
@@ -5782,8 +5809,7 @@ GC::RootVector<GC::Ref<HTML::Navigable>> Document::inclusive_ancestor_navigables
 {
     // FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
     //        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
-    //        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
-    //        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    //        essentially destroying the document too early. See: https://github.com/LadybirdBrowser/ladybird/issues/7825
     auto document_node_navigable = navigable();
     if (!document_node_navigable)
         return {};
@@ -5900,9 +5926,8 @@ void Document::destroy()
     // 6. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
     run_unloading_cleanup_steps();
 
-    // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable(),
-    //         but stale per-node and root layout pointers can still keep the old
-    //         layout tree alive until GC runs.
+    // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
+    //         Tear the layout tree down now instead of holding it until finalization.
     clear_layout_nodes_for_inactive_document();
     tear_down_layout_tree();
 
@@ -5926,6 +5951,7 @@ void Document::destroy()
     for (auto& navigable_container : HTML::NavigableContainer::all_instances()) {
         if (&navigable_container->document() == this && navigable_container->content_navigable()) {
             auto& child_navigable = as<HTML::LocalNavigable>(*navigable_container->content_navigable());
+            child_navigable.report_child_frame_destroyed();
             child_navigable.set_has_been_destroyed();
             child_navigable.remove_from_all_local_navigables();
         }
@@ -6252,59 +6278,6 @@ void Document::unload(GC::Ptr<Document>)
     //     unloadTimingInfo.
 
     did_stop_being_active_document_in_navigable();
-}
-
-// https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
-void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_document, GC::Ptr<GC::Function<void()>> after_all_unloads)
-{
-    // FIXME: 1. Assert: this is running within document's node navigable's traversable navigable's session history traversal
-    //    queue.
-
-    // 2. Let childNavigables be document's child navigables.
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = navigable()->child_navigables();
-
-    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
-    //    perform the following steps:
-    auto finish_callback = GC::create_function(GC::Heap::the(), [document = this, new_document, after_all_unloads] {
-        // FIXME: 1. If firePageSwapSteps is given, then run firePageSwapSteps.
-
-        // 2. Unload document, passing along newDocument if it is not null.
-        document->unload(new_document);
-
-        // 3. If afterAllUnloads was given, then run it.
-        if (after_all_unloads)
-            after_all_unloads->function()();
-    });
-
-    // AD-HOC: We avoid allocating a DocumentLifecycleState in case there's no child navigables.
-    //         Queue with null document to ensure the task is always runnable. The document
-    //         can become non-fully-active during unloading, which would make the task stuck.
-    if (child_navigables.is_empty()) {
-        HTML::queue_a_task(HTML::Task::Source::NavigationAndTraversal, nullptr, nullptr, finish_callback);
-        return;
-    }
-
-    // 3. Let numberUnloaded be 0.
-    auto unload_state = GC::Heap::the().allocate<DocumentLifecycleState>(*this, child_navigables.size(), finish_callback);
-
-    // 4. For each childNavigable of childNavigables [[ in what order? ]], queue a global task on the navigation and
-    //    traversal task source given childNavigable's active window to perform the following steps:
-    for (auto& child_navigable : child_navigables) {
-        HTML::queue_a_task(HTML::Task::Source::NavigationAndTraversal, nullptr, nullptr,
-            GC::create_function(GC::Heap::the(), [unload_state, child_navigable = child_navigable.ptr()] {
-                // 1. Let incrementUnloaded be an algorithm step which increments numberUnloaded.
-                auto increment_unloaded = GC::create_function(GC::Heap::the(), [unload_state] { unload_state->did_process_child(); });
-
-                // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
-                if (auto active_document = child_navigable->active_document())
-                    active_document->unload_a_document_and_its_descendants({}, increment_unloaded);
-                else
-                    increment_unloaded->function()();
-            }));
-    }
-
-    // 5. Wait until numberUnloaded equals childNavigables's size.
-    // NB: This is handled by unload_state.
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
@@ -10247,20 +10220,20 @@ void Document::register_scroll_snap_container(Layout::Node const& snap_container
     m_scroll_snap_containers.append(snap_container.make_weak_ptr());
 }
 
-Vector<NonnullRefPtr<Layout::Node const>> Document::collect_scroll_snap_containers()
+Vector<WeakPtr<Layout::Node const>> Document::collect_scroll_snap_containers()
 {
     // A registered box whose layout node a style or layout update dropped is no longer a box of this document.
     m_scroll_snap_containers.remove_all_matching([](auto const& registered) {
         return !registered;
     });
 
-    Vector<NonnullRefPtr<Layout::Node const>> snap_containers;
+    Vector<WeakPtr<Layout::Node const>> snap_containers;
     snap_containers.ensure_capacity(m_scroll_snap_containers.size());
     for (auto const& registered : m_scroll_snap_containers) {
         // The scroll snap properties of a registered box can stop making it a snap container without its layout node
         // being rebuilt, and a registered box the latest commit left out has no committed box to snap with.
         if (Painting::has_committed_box(*registered) && Painting::is_scroll_snap_container(*registered))
-            snap_containers.unchecked_append(*registered);
+            snap_containers.unchecked_append(registered);
     }
     return snap_containers;
 }

@@ -137,6 +137,7 @@ Optional<WebContentClient&> WebContentClient::client_for_compositor_context_id(W
 
 void WebContentClient::die()
 {
+    m_process_lost = true;
     cancel_navigation_transactions();
     fail_renderer_owned_downloads();
 }
@@ -307,6 +308,13 @@ CanonicalNavigable* WebContentClient::embedded_page_host(u64 page_id)
     return child_frame;
 }
 
+bool WebContentClient::is_page_open(u64 page_id) const
+{
+    if (m_process_lost)
+        return false;
+    return m_views.contains(page_id) || m_embedded_pages.contains(page_id);
+}
+
 CanonicalNavigable* WebContentClient::navigable_for_page(u64 page_id)
 {
     if (auto* child_frame = embedded_page_host(page_id))
@@ -429,7 +437,20 @@ void WebContentClient::notify_compositor_process_reconnected(Badge<Application>)
 
 void WebContentClient::notify_all_views_of_crash()
 {
+    // Every page must read as closed before pending history work resolves against this endpoint.
+    m_process_lost = true;
+
     destroy_all_compositor_contexts();
+
+    // Resolve any history work waiting on this endpoint before removing the canonical page subtrees that identify
+    // their owning traversables. A missing renderer is an exactly-once completion for descendant unload tasks.
+    for (auto& view_entry : m_views)
+        view_entry.value->traversable().did_lose_history_job_endpoint(*this, view_entry.key);
+    for (auto& embedded_page_entry : m_embedded_pages) {
+        if (auto* host = embedded_page_entry.value.ptr())
+            host->top_level_traversable().did_lose_history_job_endpoint(*this, embedded_page_entry.key);
+    }
+
     SiteIsolationManager::the().remove_all_pages_for_client(*this);
 
     // Collect view IDs first, then use deferred_invoke to handle crashes safely
@@ -550,9 +571,14 @@ void WebContentClient::did_request_navigation_start(u64 page_id, Web::HTML::Cros
         target_navigable = child_frame.has_value() ? &*child_frame : nullptr;
     }
 
+    // AD-HOC: The local ongoing-navigation check can run before the UI traversal queue sets its canonical value.
+    //         Recheck it here so navigation admission and history traversal remain ordered by the UI process.
+    auto navigation_is_blocked_by_history_traversal = target_navigable
+        && target_navigable->ongoing_navigation_is_traversal();
     if (!target_navigable
         || target_navigable->id() != navigable_id
-        || (start_request.has_value() && start_request->navigable_id != navigable_id)) {
+        || (start_request.has_value() && start_request->navigable_id != navigable_id)
+        || navigation_is_blocked_by_history_traversal) {
         async_cancel_navigation_params_creation(page_id, navigable_id, navigation_id);
         return;
     }
@@ -641,9 +667,14 @@ void WebContentClient::did_request_navigation_population(u64 page_id, Web::HTML:
         target_navigable = child_frame.has_value() ? &*child_frame : nullptr;
     }
 
+    // AD-HOC: A population request can race with the UI traversal queue in the same way as a navigation-start
+    //         request, so validate the canonical ongoing-navigation value before admitting it.
+    auto navigation_is_blocked_by_history_traversal = target_navigable
+        && target_navigable->ongoing_navigation_is_traversal();
     if (!target_navigable
         || target_navigable->id() != navigable_id
-        || request.navigable_id != navigable_id) {
+        || request.navigable_id != navigable_id
+        || navigation_is_blocked_by_history_traversal) {
         async_cancel_navigation_params_creation(page_id, navigable_id, request.navigation_id);
         return;
     }
@@ -1950,8 +1981,9 @@ void WebContentClient::did_request_activate_tab(u64 page_id)
 void WebContentClient::did_close_browsing_context(u64 page_id)
 {
     SiteIsolationManager::the().remove_page(*this, page_id);
-    unregister_embedded_page(page_id);
+    // NB: Before unregistering, so an acknowledged embedded discard closes an otherwise-unused server immediately.
     m_detached_pages_pending_close.remove(page_id);
+    unregister_embedded_page(page_id);
 
     if (auto registered_view = m_views.get(page_id); registered_view.has_value()) {
         auto view = *registered_view;
@@ -2278,16 +2310,40 @@ void WebContentClient::history_operation_ready(u64 page_id, Web::HTML::CrossProc
         view->did_receive_history_operation_ready({}, *this, page_id, operation_id, move(result));
 }
 
-void WebContentClient::history_step_unload_cancelation_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result)
+void WebContentClient::history_step_unload_cancelation_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown)
 {
     if (auto view = owning_view_for_page_id(page_id); view.has_value())
-        view->did_receive_history_step_unload_cancelation_result({}, *this, page_id, operation_id, result);
+        view->did_receive_history_step_unload_cancelation_result({}, *this, page_id, operation_id, result, unload_prompt_shown);
 }
 
-void WebContentClient::changing_navigable_history_job_ready(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition)
+void WebContentClient::history_step_beforeunload_check_result(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult result, Web::HTML::UnloadPromptShown unload_prompt_shown)
 {
     if (auto view = owning_view_for_page_id(page_id); view.has_value())
-        view->did_receive_changing_navigable_history_job_ready({}, *this, page_id, operation_id, navigable_id, disposition);
+        view->did_receive_history_step_beforeunload_check_result({}, *this, page_id, operation_id, result, unload_prompt_shown);
+}
+
+void WebContentClient::changing_navigable_history_job_ready(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document)
+{
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
+        view->did_receive_changing_navigable_history_job_ready({}, *this, page_id, operation_id, navigable_id, disposition, unload_displayed_document);
+}
+
+void WebContentClient::changing_navigable_unload_preparation_complete(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
+        view->did_receive_changing_navigable_unload_preparation_complete({}, *this, page_id, operation_id, navigable_id);
+}
+
+void WebContentClient::descendant_unload_task_complete(u64 page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
+        view->did_receive_descendant_unload_task_complete({}, *this, page_id, unload_id, navigable_id);
+}
+
+void WebContentClient::request_child_navigable_unload(u64 page_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto view = owning_view_for_page_id(page_id); view.has_value())
+        view->did_receive_child_navigable_unload_request({}, *this, page_id, navigable_id);
 }
 
 void WebContentClient::changing_navigable_continuation_applied(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::ReplicatedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state)

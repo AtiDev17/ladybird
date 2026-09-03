@@ -101,7 +101,7 @@ void NavigableContainer::create_new_child_navigable()
     GC::Ref<LocalNavigable> navigable = *GC::Heap::the().allocate<LocalNavigable>(page, false);
 
     // 8. Initialize the navigable navigable given documentState and parentNavigable.
-    navigable->initialize_navigable(document_state, parent_navigable, *document, parent_navigable->active_document()->visibility_state_value());
+    navigable->initialize_navigable(document_state, parent_navigable, *document, parent_navigable->active_document()->visibility_state());
 
     // 9. Set element's content navigable to navigable.
     m_content_navigable = navigable;
@@ -352,6 +352,7 @@ void NavigableContainer::destroy_the_child_navigable()
         }
 
         // Not in the spec:
+        as<LocalNavigable>(*navigable).report_child_frame_destroyed();
         navigable->remove_from_all_local_navigables();
 
         // 6. Let parentDocState be container's node navigable's active session history entry's document state.
@@ -387,8 +388,8 @@ void NavigableContainer::destroy_the_child_navigable()
     //         container, we reach step 5 with navigable's active document already null. We
     //         treat the unload step as a no-op in that case and proceed with the remaining
     //         post-destruction cleanup.
-    if (auto active_document = local_navigable.active_document())
-        active_document->unload_a_document_and_its_descendants({}, after_document_destruction);
+    if (local_navigable.active_document())
+        local_navigable.traversable_navigable()->unload_child_navigable_before_destruction(local_navigable, after_document_destruction);
     else
         after_document_destruction->function()();
 }

@@ -40,22 +40,12 @@
 
 namespace Web::Layout {
 
-NodeArenaAllocation::NodeArenaAllocation(DOM::Document& document, RustFFI::FfiNodeConstructionFacts const& construction_facts)
-    : m_arena(document.layout_node_arena())
-{
-    m_slot = m_arena->allocate(construction_facts);
-}
-
-NodeArenaAllocation::~NodeArenaAllocation()
-{
-    m_arena->free(m_slot);
-}
-
 static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, void* shell)
 {
     return {
         .kind = kind,
         .shell = shell,
+        .dom_node = node.ptr(),
         .is_anonymous = node == nullptr,
         .is_html_input_element = node && is<HTML::HTMLInputElement>(*node),
         .is_html_html_element = node && node->is_html_html_element(),
@@ -68,19 +58,36 @@ static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Docu
 }
 
 Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, AttachToDOMNode attach_to_dom_node)
-    : NodeArenaAllocation(document, build_node_construction_facts(document, node, kind, this))
-    , m_dom_node(node ? *node : document)
+    : m_arena(document.layout_node_arena())
+    , m_slot(m_arena->allocate(build_node_construction_facts(document, node, kind, this)))
+    , m_dom_node(node)
     , m_kind(kind)
 {
+    VERIFY(RustFFI::layout_arena_node_dom_node(m_arena->handle(), m_slot) == m_dom_node.ptr());
     update_has_scroll_offset_flag();
 
     if (node && attach_to_dom_node == AttachToDOMNode::Yes)
         node->set_layout_node({}, *this);
 }
 
+Node::Node(DOM::Document& document, BindToPreparedArenaSlot, RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
+    : m_arena(document.layout_node_arena())
+    , m_slot(slot)
+    , m_kind(kind)
+{
+    VERIFY(RustFFI::layout_arena_node_dom_node(m_arena->handle(), m_slot) == nullptr);
+    RustFFI::layout_arena_attach_shell(m_arena->handle(), m_slot, this);
+}
+
 Node::~Node()
 {
-    VERIFY(!parent_ptr());
+    VERIFY(m_arena_is_destroying_shell);
+}
+
+void Node::delete_arena_owned_shell(Node& node)
+{
+    node.m_arena_is_destroying_shell = true;
+    delete &node;
 }
 
 RustFFI::NodeSlotId Node::slot_id(Node const* node)
@@ -330,6 +337,22 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, C
         m_owned_computed_values = style.values();
         m_style_record_identity = document.style_computer().intern_anonymous_layout_style(*style.values());
     }
+    initialize_from_style_record();
+    if (m_owned_computed_values)
+        pin_style_record_for_cxx_consumers();
+}
+
+NodeWithStyle::NodeWithStyle(DOM::Document& document, BindToPreparedArenaSlot bind, RustFFI::NodeSlotId slot, RustFFI::NodeKind kind)
+    : Node(document, bind, slot, kind)
+{
+    m_style_record_identity = CSS::StyleRecordID { RustFFI::layout_arena_node_style_record(arena_handle(), slot) };
+    VERIFY(m_style_record_identity);
+    m_style_payloads = RustFFI::layout_arena_node_style_payloads(arena_handle(), slot);
+    VERIFY(m_style_payloads);
+}
+
+void NodeWithStyle::initialize_from_style_record()
+{
     // NB: Nodes constructed from an interned style record own no ComputedValues; read anchor names through the record view there.
     bool has_anchor_names = false;
     bool insets_use_anchor_functions = false;
@@ -346,8 +369,6 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, GC::Ptr<DOM::Node> node, C
     publish_style_record_to_node_data();
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
     synchronize_table_span_data();
-    if (m_owned_computed_values)
-        pin_style_record_for_cxx_consumers();
 }
 
 CSS::ComputedValues const& NodeWithStyle::owned_computed_values() const
@@ -473,7 +494,7 @@ void NodeWithStyle::apply_style(CSS::StyleRecordID style_record_identity)
     set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
     // A style change can introduce the properties that make a node carry replaced-content facts,
     // such as size containment arriving on a kept layout node.
-    propagate_style_to_anonymous_wrappers();
+    RustFFI::layout_arena_reinherit_anonymous_descendants(arena_handle(), slot_id(this));
     attach_style_resources();
     // A pseudo layout node can outlive replacement of the DOM pseudo's record until the layout
     // tree is rebuilt. Root its record across that gap, including metadata-only style changes that
@@ -531,38 +552,37 @@ CSS::StyleScope const& NodeWithStyle::style_scope() const
     return document().style_scope();
 }
 
-void NodeWithStyle::propagate_style_to_anonymous_wrappers()
+void NodeWithStyle::refresh_style_from_arena()
 {
-    // Update the style of any anonymous wrappers that inherit from this node.
-    // FIXME: This is pretty hackish. It would be nicer if they shared the inherited style
-    //        data structure somehow, so this wasn't necessary.
+    m_style_record_identity = CSS::StyleRecordID { RustFFI::layout_arena_node_style_record(arena_handle(), slot_id(this)) };
+    VERIFY(m_style_record_identity);
+    m_background_layers.clear();
+    m_mask_layers.clear();
+    m_border_image.clear();
+    m_list_style_type.clear();
+    m_list_style_image.clear();
+    auto record_view = computed_style_record_view();
+    VERIFY(record_view);
+    set_flag(RustFFI::NodeFlag::HasAnchorNames, !record_view->anchor_names().is_empty());
+    set_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions, record_view->inset_properties_contain_anchor_functions());
+    set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, false);
+    publish_style_record_to_node_data();
+    set_flag(RustFFI::NodeFlag::HasPreserve3dTransformStyle, transform_style() == CSS::TransformStyle::Preserve3d);
+}
 
-    // If this is a `display:table` box with an anonymous wrapper parent,
-    // the parent inherits style from *this* node, not the other way around.
-    if (auto* table_wrapper = parent() && parent()->is_table_wrapper() ? parent() : nullptr; table_wrapper && display().is_table_inside()) {
-        CSS::ComputedValues::Builder builder(table_wrapper->owned_computed_values());
-        auto values = copy_computed_values();
-        builder->inherit_from(*values);
-        transfer_table_box_computed_values_to_wrapper_computed_values(builder);
-        table_wrapper->set_computed_values(move(builder).build());
-    }
-
-    // Propagate style to all anonymous children (except table wrappers!)
-    for_each_child_of_type<NodeWithStyle>([&](NodeWithStyle& child) {
-        if (child.is_anonymous() && !child.is_table_wrapper()) {
-            // NB: The principal box of a pseudo-element (::before, ::after, ::marker, etc) has its own computed
-            //     style, which is applied to it separately. Don't clobber that style with inherited values from
-            //     this node.
-            if (child.is_pseudo_element_principal_box())
-                return IterationDecision::Continue;
-            CSS::ComputedValues::Builder builder(child.owned_computed_values());
-            auto values = copy_computed_values();
-            builder->inherit_from(*values);
-            child.set_computed_values(move(builder).build());
-            child.propagate_style_to_anonymous_wrappers();
-        }
-        return IterationDecision::Continue;
-    });
+bool NodeWithStyle::reinherit_owned_computed_values_from(CSS::StyleRecordID parent_style_record_identity)
+{
+    // NB: The principal box of a pseudo-element (::before, ::after, ::marker, etc) has its own computed
+    //     style, which is applied to it separately. Don't clobber that style with inherited values from
+    //     the parent.
+    if (is_pseudo_element_principal_box())
+        return false;
+    auto parent_record_view = document().style_computer().computed_style_record_view(parent_style_record_identity);
+    VERIFY(parent_record_view);
+    CSS::ComputedValues::Builder builder(owned_computed_values());
+    builder->inherit_from(*parent_record_view);
+    set_computed_values(move(builder).build());
+    return true;
 }
 
 bool Node::is_root_element() const
@@ -630,19 +650,6 @@ Gfx::AffineTransform NodeWithStyle::used_svg_element_transform() const
     return transform;
 }
 
-NonnullRefPtr<NodeWithStyle> NodeWithStyle::create_anonymous_wrapper() const
-{
-    auto values = copy_computed_values();
-    auto builder = CSS::ComputedValues::Builder::create_inheriting_from(*values);
-    builder->set_display(CSS::Display(CSS::DisplayOutside::Block, CSS::DisplayInside::Flow));
-    // CSS 2.2 9.2.1.1 creates anonymous block boxes, but 9.4.1 states inline-block creates a BFC.
-    // Set wrapper to inline-block to participate correctly in the IFC within the parent inline-block.
-    if (display().is_inline_block() && !has_children())
-        builder->set_display(CSS::Display::from_short(CSS::Display::Short::InlineBlock));
-    auto wrapper = adopt_ref(*new BlockContainer(const_cast<DOM::Document&>(document()), nullptr, move(builder).build()));
-    return *wrapper;
-}
-
 void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const> computed_values)
 {
     VERIFY(!layout_pass_currently_running());
@@ -703,10 +710,7 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
         RustFFI::layout_arena_reset_cached_intrinsic_sizes_of_self_and_ancestors(arena_handle(), slot_id(this));
     }
 
-    for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
-        if (auto* text_child = as_if<TextNode>(*child))
-            text_child->enroll_for_arena_text_content_sync();
-    }
+    RustFFI::layout_arena_enroll_text_children_for_content_sync(arena_handle(), slot_id(this));
 }
 
 void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_identity)
@@ -720,7 +724,7 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
         return;
     }
 
-    bool should_repin_style_record = m_style_record_owner;
+    bool should_repin_style_record = m_style_record_pinned;
     auto new_record_view = document().style_computer().computed_style_record_view(style_record_identity);
     VERIFY(new_record_view);
     auto old_record_view = computed_style_record_view();
@@ -752,21 +756,20 @@ void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_id
 
 void NodeWithStyle::pin_style_record_for_cxx_consumers()
 {
-    if (m_style_record_owner)
+    if (m_style_record_pinned)
         return;
 
     VERIFY(m_style_record_identity);
-    auto& owner = document();
-    owner.style_computer().pin_style_record(m_style_record_identity);
-    m_style_record_owner = owner;
+    document().style_computer().pin_style_record(m_style_record_identity);
+    m_style_record_pinned = true;
 }
 
 void NodeWithStyle::release_pinned_style_record()
 {
-    if (!m_style_record_owner)
+    if (!m_style_record_pinned)
         return;
-    m_style_record_owner->style_computer().unpin_style_record(m_style_record_identity);
-    m_style_record_owner = {};
+    document().style_computer().unpin_style_record(m_style_record_identity);
+    m_style_record_pinned = false;
 }
 
 void NodeWithStyle::bind_generated_style_record(CSS::StyleRecordID target_style_record_identity)
@@ -797,7 +800,7 @@ void NodeWithStyle::publish_style_record_to_node_data()
     auto const* payloads = document().style_computer().style_engine().style_record_payloads(m_style_record_identity);
     VERIFY(payloads);
     m_style_payloads = payloads;
-    RustFFI::layout_arena_set_node_style_payloads(arena_handle(), slot_id(this), payloads);
+    RustFFI::layout_arena_set_node_style(arena_handle(), slot_id(this), m_style_record_identity.value(), payloads);
     if (content_visibility() == CSS::ContentVisibility::Auto)
         document().note_content_visibility_auto_style();
 
@@ -885,41 +888,6 @@ void NodeWithStyle::reset_table_box_computed_values_used_by_wrapper_to_init_valu
         values.set_clip(CSS::InitialValues::clip());
         values.set_vertical_align(CSS::InitialValues::vertical_align());
     });
-}
-
-void NodeWithStyle::transfer_table_box_computed_values_to_wrapper_computed_values(CSS::ComputedValues::Builder& builder)
-{
-    // The computed values of properties 'position', 'float', 'margin-*', 'top', 'right', 'bottom', and 'left' on the table element are used on the table wrapper box and not the table box;
-    // all other values of non-inheritable properties are used on the table box and not the table wrapper box.
-    // (Where the table element's values are not used on the table and table wrapper boxes, the initial values are used instead.)
-    if (display().is_inline_outside())
-        builder->set_display(CSS::Display::from_short(CSS::Display::Short::InlineBlock));
-    else
-        builder->set_display(CSS::Display::from_short(CSS::Display::Short::FlowRoot));
-    builder->set_position(position());
-    builder->set_position_anchor(position_anchor_value());
-    builder->set_inset(inset());
-    builder->set_float(float_());
-    builder->set_clear(clear());
-    // CSS 2 moves table-root positioning and margins to the wrapper. The wrapper is also the grid item for
-    // display:table, so grid placement, self-alignment, and order need to move there as well.
-    builder->copy_grid_placements_from(style_group<CSS::ComputedValues::GridValues>());
-    builder->set_align_self(align_self());
-    builder->set_justify_self(justify_self());
-    builder->set_order(order());
-    builder->set_margin(margin());
-    // AD-HOC:
-    // To match other browsers, z-index needs to be moved to the wrapper box as well,
-    // even if the spec does not mention that: https://github.com/w3c/csswg-drafts/issues/11689
-    // Note that there may be more properties that need to be added to this list.
-    builder->set_z_index(z_index());
-    // "clip" only takes effect on absolutely-positioned elements; the table box isn't one — the wrapper is.
-    builder->set_clip(clip());
-    // AD-HOC: The wrapper box participates in inline layout in place of the table box, so vertical-align
-    //         must be moved to the wrapper to have any effect.
-    builder->set_vertical_align(vertical_align());
-
-    reset_table_box_computed_values_used_by_wrapper_to_init_values();
 }
 
 bool overflow_value_makes_box_a_scroll_container(CSS::Overflow overflow)
@@ -1019,14 +987,14 @@ void Node::verify_has_scroll_offset_flag() const
 
 DOM::Document& Node::document()
 {
-    VERIFY(m_dom_node);
-    return m_dom_node->document();
+    VERIFY(m_arena->document());
+    return *m_arena->document();
 }
 
 DOM::Document const& Node::document() const
 {
-    VERIFY(m_dom_node);
-    return m_dom_node->document();
+    VERIFY(m_arena->document());
+    return *m_arena->document();
 }
 
 // https://drafts.csswg.org/css-ui/#propdef-user-select

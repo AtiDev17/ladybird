@@ -256,7 +256,12 @@ void CanonicalNavigable::detach_remote_host()
 {
     if (has_remote_host()) {
         m_remote_client->async_set_page_parent_context(m_remote_page_id, {});
-        m_remote_client->request_close(m_remote_page_id);
+        m_remote_client->async_discard_embedded_page(m_remote_page_id);
+        // The page stops being a history job endpoint now; queued history work must not start against it. Its
+        // client outlives the discard acknowledgement, so a shared process is not closed under the page.
+        m_remote_client->prepare_for_detached_close(m_remote_page_id);
+        m_remote_client->unregister_embedded_page(m_remote_page_id);
+        top_level_traversable().did_lose_history_job_endpoint(*m_remote_client, m_remote_page_id);
     }
 
     m_host_locality = HostLocality::Local;
@@ -352,9 +357,21 @@ void CanonicalNavigable::set_ongoing_navigation(OngoingNavigation ongoing_naviga
     m_ongoing_navigation = move(ongoing_navigation);
 }
 
+void CanonicalNavigable::set_ongoing_navigation_to_traversal(Web::HTML::CrossProcessId operation_id)
+{
+    m_ongoing_navigation_traversal_operation_id = operation_id;
+}
+
+void CanonicalNavigable::clear_ongoing_navigation_traversal(Web::HTML::CrossProcessId operation_id)
+{
+    if (m_ongoing_navigation_traversal_operation_id == operation_id)
+        m_ongoing_navigation_traversal_operation_id.clear();
+}
+
 void CanonicalNavigable::clear_ongoing_navigation()
 {
     m_ongoing_navigation.clear();
+    m_ongoing_navigation_traversal_operation_id.clear();
 }
 
 void CanonicalNavigable::set_navigation_population_worker(WebContentClient& client, u64 page_id)

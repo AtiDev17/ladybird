@@ -675,14 +675,19 @@ LocalNavigable::~LocalNavigable() = default;
 
 void LocalNavigable::set_has_been_destroyed()
 {
-    if (!m_has_been_destroyed && parent())
-        page().client().page_did_destroy_child_frame(id());
-
     cancel_hover_update_after_async_scroll();
     destroy_compositor_context();
     m_has_been_destroyed = true;
     resolve_all_pending_async_scroll_operations();
     cancel_user_scroll_settlement();
+}
+
+void LocalNavigable::report_child_frame_destroyed()
+{
+    if (m_child_frame_destruction_reported || !parent())
+        return;
+    m_child_frame_destruction_reported = true;
+    page().client().page_did_destroy_child_frame(id());
 }
 
 void LocalNavigable::remove_from_all_local_navigables()
@@ -1128,24 +1133,31 @@ GC::Ptr<LocalTraversableNavigable> LocalNavigable::traversable_navigable() const
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#set-the-ongoing-navigation
-void LocalNavigable::set_ongoing_navigation(Variant<Empty, Traversal, Utf16String> ongoing_navigation, NavigationAPIAbortBehavior navigation_api_abort_behavior)
+void LocalNavigable::set_ongoing_navigation(Variant<Empty, Traversal, Utf16String> ongoing_navigation)
 {
     // 1. If navigable's ongoing navigation is equal to newValue, then return.
     if (m_ongoing_navigation == ongoing_navigation)
         return;
 
     // 2. Inform the navigation API about aborting navigation given navigable.
-    if (navigation_api_abort_behavior == NavigationAPIAbortBehavior::Abort)
-        inform_the_navigation_api_about_aborting_navigation();
+    inform_the_navigation_api_about_aborting_navigation();
 
-    // A UI-approved traversal supersedes any older navigation parked while the UI process
-    // coordinates population. Do not let that navigation resume after the traversal finishes.
+    // 3. Set navigable's ongoing navigation to newValue.
+    set_ongoing_navigation_without_informing_navigation_api(move(ongoing_navigation));
+}
+
+void LocalNavigable::set_ongoing_navigation_without_informing_navigation_api(Variant<Empty, Traversal, Utf16String> ongoing_navigation)
+{
+    if (m_ongoing_navigation == ongoing_navigation)
+        return;
+
+    // AD-HOC: A UI-approved traversal supersedes any older navigation parked while the UI process coordinates
+    //         population. Do not let that navigation resume after the traversal finishes.
     if (ongoing_navigation.has<Traversal>() && m_ongoing_navigation.has<Utf16String>()) {
         if (take_navigation_parked_for_population(m_ongoing_navigation.get<Utf16String>()).has_value())
             set_delaying_load_events(false);
     }
 
-    // 3. Set navigable's ongoing navigation to newValue.
     auto was_traversal = m_ongoing_navigation.has<Traversal>();
     m_ongoing_navigation = ongoing_navigation;
 
@@ -3014,7 +3026,7 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
             //         to finish. Preserve the Navigation API state: an intercepted navigate event stays ongoing
             //         until its handlers settle.
             if (ongoing_navigation() == navigation_id)
-                set_ongoing_navigation(Empty {}, NavigationAPIAbortBehavior::Preserve);
+                set_ongoing_navigation_without_informing_navigation_api(Empty {});
             return;
         }
     }
@@ -3571,6 +3583,15 @@ static Optional<Web::CrossDocumentNavigationFinalizationHostState> prepare_to_fi
         return {};
     }
 
+    // The history operation can reach its queue position after its page has started closing. In that case the
+    // navigable may not have been marked destroyed yet, while destruction has already detached the pending document
+    // from its browsing context or destroyed the active document. There is no live navigation left to finalize.
+    auto active_document = navigable->active_document();
+    if (pending_document && (pending_document->has_been_destroyed() || !pending_document->browsing_context() || !active_document || active_document->has_been_destroyed())) {
+        navigable->set_delaying_load_events(false);
+        return {};
+    }
+
     // The UI process has reached this navigation's position on the session history traversal queue. Perform the
     // parts of finalization that need the live navigable and Document, then return the facts needed to continue the
     // algorithm there.
@@ -3597,7 +3618,7 @@ static Optional<Web::CrossDocumentNavigationFinalizationHostState> prepare_to_fi
     return Web::CrossDocumentNavigationFinalizationHostState {
         .pending_document_is_in_auxiliary_browsing_context_with_opener = pending_document->browsing_context()->is_auxiliary() && pending_document->browsing_context()->opener_browsing_context() != nullptr,
         .pending_document_origin = pending_document->origin(),
-        .active_document_origin = navigable->active_document()->origin(),
+        .active_document_origin = active_document->origin(),
     };
 }
 
@@ -4263,8 +4284,11 @@ void LocalNavigable::re_snap_scroll_containers_after_layout_change()
     auto snap_containers = document->collect_scroll_snap_containers();
 
     bool any_snap_container_deferred = false;
-    for (auto const& snap_container : snap_containers) {
-        auto stable_node_id = Painting::async_scroll_node_stable_id(snap_container);
+    for (auto const& registered_snap_container : snap_containers) {
+        auto const* snap_container = registered_snap_container.ptr();
+        if (!snap_container)
+            continue;
+        auto stable_node_id = Painting::async_scroll_node_stable_id(*snap_container);
         if (!stable_node_id.has_value())
             continue;
 
