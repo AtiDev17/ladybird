@@ -144,6 +144,47 @@ test("unicode and surrogate pairs", () => {
     expect(JSON.parse('{"\uD800":"\uDC00"}')["\uD800"].charCodeAt(0)).toBe(0xdc00);
 });
 
+test("lone surrogates among non-ASCII text", () => {
+    const mixed = JSON.parse('"日\uD800本\uDC00語"');
+    expect(mixed).toHaveLength(5);
+    expect(mixed.charCodeAt(1)).toBe(0xd800);
+    expect(mixed.charCodeAt(3)).toBe(0xdc00);
+    expect(mixed[4]).toBe("語");
+
+    const consecutive = JSON.parse('["\uD800\uD800", "\uDC00\uDC00", "é\uDC00"]');
+    expect(consecutive[0]).toHaveLength(2);
+    expect(consecutive[0].charCodeAt(1)).toBe(0xd800);
+    expect(consecutive[1]).toHaveLength(2);
+    expect(consecutive[1].charCodeAt(0)).toBe(0xdc00);
+    expect(consecutive[2]).toBe("é\uDC00");
+
+    expect(JSON.parse('{"日\uD800":"\uD83D\uDE00"}')["日\uD800"]).toBe("😀");
+    expect(() => JSON.parse("\uD800")).toThrow(SyntaxError);
+});
+
+test("object keys repeated across many objects", () => {
+    const text = JSON.stringify(
+        Array.from({ length: 300 }, (_, i) => ({ title: "やること " + i, completed: i % 2 === 0, id: "id" + i }))
+    );
+    const parsed = JSON.parse(text);
+    expect(parsed).toHaveLength(300);
+    expect(parsed[299]).toEqual({ title: "やること 299", completed: false, id: "id299" });
+    expect(Object.keys(parsed[7])).toEqual(["title", "completed", "id"]);
+
+    const similar = JSON.parse('[{"abc":1,"aXc":2,"abd":3},{"abc":4,"aXc":5,"abd":6}]');
+    expect(similar[1]).toEqual({ abc: 4, aXc: 5, abd: 6 });
+
+    const numeric = JSON.parse('[{"1":"a","01":"b","x":"c"},{"1":"d","01":"e","x":"f"}]');
+    expect(Object.keys(numeric[1])).toEqual(["1", "01", "x"]);
+    expect(numeric[1][1]).toBe("d");
+
+    const longKey = "k".repeat(40);
+    expect(JSON.parse(`[{"${longKey}":1},{"${longKey}":2}]`)[1][longKey]).toBe(2);
+
+    expect(JSON.parse('{"a":1,"\\u0061":2}')).toEqual({ a: 2 });
+    expect(JSON.parse('{"":1,"":2}')).toEqual({ "": 2 });
+});
+
 test("whitespace handling", () => {
     expect(JSON.parse(" null")).toBe(null);
     expect(JSON.parse("null ")).toBe(null);
