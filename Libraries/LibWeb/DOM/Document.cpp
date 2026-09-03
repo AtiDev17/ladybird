@@ -840,6 +840,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
     m_anchor_name_map.visit_edges(visitor);
     if (m_query_selector_result_cache)
         m_query_selector_result_cache->visit_edges(visitor);
+    if (m_isolated_selector_query_engine_cache)
+        m_isolated_selector_query_engine_cache->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -2543,8 +2545,13 @@ void Document::set_quirks_mode(QuirksMode mode)
         return;
     m_quirks_mode = mode;
 
-    // Quirks mode changes how id and class selectors match, so cached query results must not survive it.
+    // Quirks mode changes how id and class selectors match, so cached query results must not survive it. Nor may
+    // the engines built for queries against disconnected trees, which have it compiled in.
     bump_dom_tree_version();
+    if (m_query_selector_result_cache)
+        m_query_selector_result_cache->clear();
+    if (m_isolated_selector_query_engine_cache)
+        m_isolated_selector_query_engine_cache->clear();
 
     // It also changes which case a rule cache buckets id and class selectors under, and brings a user
     // agent stylesheet with it, so no scope's rule cache and no element's style survives it either.
@@ -3982,11 +3989,6 @@ void Document::adopt_node_steps(Node& node)
             for (auto range : ranges_to_transfer)
                 range->update_owner_document({});
         }
-
-        // AD-HOC: A parentless node leaves oldDocument without any mutation observable through oldDocument's
-        //         dom_tree_version. Bump it so that caches keyed on that version can't serve stale results for this
-        //         node if it is later adopted back after being mutated under another document.
-        old_document.bump_dom_tree_version();
     }
 }
 
@@ -11183,6 +11185,13 @@ QuerySelectorResultCache& Document::query_selector_result_cache()
     if (!m_query_selector_result_cache)
         m_query_selector_result_cache = make<QuerySelectorResultCache>();
     return *m_query_selector_result_cache;
+}
+
+IsolatedSelectorQueryEngineCache& Document::isolated_selector_query_engine_cache()
+{
+    if (!m_isolated_selector_query_engine_cache)
+        m_isolated_selector_query_engine_cache = make<IsolatedSelectorQueryEngineCache>();
+    return *m_isolated_selector_query_engine_cache;
 }
 
 }

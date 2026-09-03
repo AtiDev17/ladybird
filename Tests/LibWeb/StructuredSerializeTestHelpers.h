@@ -36,10 +36,13 @@
 #include <LibWeb/Crypto/CryptoKey.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
 #include <LibWeb/Crypto/KeyAlgorithms.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/FileAPI/Blob.h>
 #include <LibWeb/Geometry/DOMPoint.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/Platform/FontPlugin.h>
 
 using Web::HTML::ValueTag;
 
@@ -389,8 +392,8 @@ inline Web::HTML::StorageSerializationRecord frozen_image_data_record(ReadonlyBy
     return serializable_storage_record("ImageData"sv, 1, body);
 }
 
-// CryptoKey is [SecureContext], so decode it through a principal realm.
-inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
+// CryptoKey is [SecureContext], and WebAssembly module compilation consults Content Security Policy, so decode them through a principal realm.
+inline Web::WebIDL::ExceptionOr<JS::Value> principal_storage_deserialize(Web::HTML::StorageSerializationRecord const& record)
 {
     static GC::Root<JS::Realm> realm;
     auto& vm = test_realm().vm();
@@ -399,6 +402,18 @@ inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML:
         realm = Web::Bindings::create_a_principal_javascript_realm();
         while (vm.execution_context_stack().size() > depth)
             vm.pop_execution_context();
+
+        // The Content Security Policy requires a document.
+        static Web::Platform::FontPlugin font_plugin { false };
+        Web::Platform::FontPlugin::install(font_plugin);
+
+        auto* window = Web::HTML::window_from_global_object(realm->global_object());
+        VERIFY(window);
+
+        auto& settings = Web::Bindings::principal_host_defined_environment_settings_object(*realm);
+        auto document = Web::DOM::Document::create(Web::Bindings::principal_host_defined_page(*realm), *window, settings.creation_url);
+        window->set_associated_document(document);
+        document->set_window(*window);
     }
 
     auto& settings = Web::Bindings::principal_host_defined_environment_settings_object(*realm);
@@ -412,6 +427,15 @@ inline Web::WebIDL::ExceptionOr<JS::Value> crypto_storage_deserialize(Web::HTML:
     while (vm.execution_context_stack().size() > depth)
         vm.pop_execution_context();
     return result;
+}
+
+constexpr inline auto s_minimal_webassembly_module_bytes = to_array<u8>({ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+
+inline Web::HTML::StorageSerializationRecord webassembly_module_storage_record(ReadonlyBytes module_bytes)
+{
+    Vector<u8> body;
+    append_storage_bytes(body, module_bytes);
+    return serializable_storage_record("Module"sv, 1, body);
 }
 
 // `declared_handle_size` lets tests overstate the raw ByteBuffer handle length.
@@ -678,7 +702,7 @@ inline Vector<CryptoHandleGolden> crypto_handle_goldens()
 // Deserialize first so encode goldens use slot-consistent CryptoKeys.
 inline GC::Ref<Web::Crypto::CryptoKey> build_live_crypto_key(StringView type, StringView usage, Vector<u8> const& algorithm, Vector<u8> const& handle)
 {
-    auto value = MUST(crypto_storage_deserialize(crypto_key_full_record(type, usage, algorithm, handle)));
+    auto value = MUST(principal_storage_deserialize(crypto_key_full_record(type, usage, algorithm, handle)));
     return unwrap_wrappable<Web::Crypto::CryptoKey>(value);
 }
 

@@ -76,7 +76,8 @@ impl StyleEngine {
             specified_values: SpecifiedValues::new(),
             winner_groups: WinnerGroups::new(),
             computed_group_sets: ComputedGroupSets::default(),
-            pending_style_computation_selections: HashMap::default(),
+            pending_element_style_computation_selections: HashMap::default(),
+            pending_pseudo_style_computation_selections: HashMap::default(),
             computed_group_set_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
             custom_property_environment_memory: MemoryLease::new(MemoryCategory::CustomPropertyEnvironment),
             computed_fixed_metadata_memory: MemoryLease::new(MemoryCategory::ComputedFixedMetadata),
@@ -1328,8 +1329,8 @@ impl StyleEngine {
             self.winner_groups.remove(node);
             let live_animation_overlays_before = self.computed_group_sets.live_animation_overlay_records();
             self.computed_group_sets.remove(node);
-            self.pending_style_computation_selections
-                .retain(|target, _| target.node() != node);
+            self.pending_element_style_computation_selections.remove(&node);
+            self.pending_pseudo_style_computation_selections.remove(&node);
             let live_animation_overlays_after = self.computed_group_sets.live_animation_overlay_records();
             self.settle_computed_memory();
             self.counters.add(
@@ -1731,7 +1732,7 @@ impl StyleEngine {
     pub(super) fn regions_reachable_from_scopes(
         &self,
         scopes: &[TreeScopeID],
-        leaves_scope: bool,
+        subject_leaves_scope: bool,
         host_is_a_subject: bool,
     ) -> Option<Vec<ImpactRegion>> {
         if scopes.is_empty() {
@@ -1754,10 +1755,10 @@ impl StyleEngine {
                 //
                 // A program that leaves its scope reaches the host instead, so it needs the root to
                 // find one, and a scope with no root names no host either.
-                None if !leaves_scope => continue,
+                None if !subject_leaves_scope => continue,
                 None => continue,
             };
-            match leaves_scope {
+            match subject_leaves_scope {
                 // `:host` and `::slotted()` describe the host and what is slotted into it, which are
                 // in the host's own tree and not in the one the sheet is attached to. A rule using
                 // them says nothing about the shadow tree, so naming it would be the widest part of
@@ -1814,6 +1815,7 @@ impl StyleEngine {
         compiled: &SelectorProgram,
         entry: usize,
         document_root: StyleNodeID,
+        bounding_scopes: Option<&[TreeScopeID]>,
     ) -> Option<Vec<ImpactRegion>> {
         if compiled.subject_is_only_the_root(entry) {
             return Some(vec![ImpactRegion::Node(document_root)]);
@@ -1845,6 +1847,11 @@ impl StyleEngine {
             match self.facts.postings().lookup(key) {
                 Lookup::Known(posting) => {
                     for relative in posting.candidates() {
+                        if bounding_scopes
+                            .is_some_and(|scopes| scopes.binary_search(&self.tree.tree_scope(relative)).is_err())
+                        {
+                            continue;
+                        }
                         regions.push(region(relative));
                     }
                 }

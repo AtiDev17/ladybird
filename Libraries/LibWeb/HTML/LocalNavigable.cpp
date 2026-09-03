@@ -4464,7 +4464,7 @@ void LocalNavigable::user_scroll_did_settle(UserScrollSettlement settlement)
         if (snaps_at_this_settlement && !can_snap && !entry.awaits_layout_for_snapping) {
             entry.awaits_layout_for_snapping = true;
             m_pending_user_scrollend_targets.append(move(entry));
-            main_thread_event_loop().queue_task_to_update_the_rendering();
+            page().client().request_frame();
             continue;
         }
 
@@ -4497,7 +4497,7 @@ void LocalNavigable::user_scroll_did_settle(UserScrollSettlement settlement)
     }
 
     if (queued_any_scrollend_event)
-        main_thread_event_loop().queue_task_to_update_the_rendering();
+        page().client().request_frame();
 }
 
 void LocalNavigable::resolve_pending_smooth_scrolls(Compositor::AsyncScrollNodeStableID stable_node_id, SmoothScrollAbortCause abort_cause)
@@ -4569,7 +4569,7 @@ void LocalNavigable::process_main_thread_smooth_scrolls()
     settle_user_scroll_gesture_if_input_deadline_passed();
 
     if (!m_main_thread_smooth_scrolls.is_empty())
-        main_thread_event_loop().queue_task_to_update_the_rendering();
+        page().client().request_frame();
 }
 
 static bool adopt_async_viewport_scroll_delta(LocalNavigable& navigable, CSSPixelPoint scroll_delta)
@@ -4742,8 +4742,9 @@ bool LocalNavigable::has_a_rendering_opportunity() const
     // or whether its active document's visibility state is "visible".
     // Rendering opportunities typically occur at regular intervals.
 
-    // FIXME: Return `false` here if we're an inactive browser tab.
-    return true;
+    if (main_thread_event_loop().running_synchronous_rendering_update())
+        return true;
+    return page().client().has_rendering_opportunity();
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#inform-the-navigation-api-about-child-navigable-destruction
@@ -5455,7 +5456,7 @@ GC::Ref<WebIDL::Promise> LocalNavigable::perform_a_scroll_of_a_scrolling_box(Com
         .promises = { scroll_promise },
         .trigger = trigger,
     });
-    main_thread_event_loop().queue_task_to_update_the_rendering();
+    page().client().request_frame();
     return scroll_promise;
 }
 

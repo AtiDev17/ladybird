@@ -468,7 +468,7 @@ JS::ThrowCompletionOr<NonnullRefPtr<Wasm::ModuleInstance>> instantiate_module(JS
 
 // https://webassembly.github.io/spec/js-api/#compile-a-webassembly-module
 // https://webassembly.github.io/content-security-policy/js-api/#compile-a-webassembly-module
-JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webassembly_module(JS::Realm& realm, ByteBuffer data)
+JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webassembly_module(JS::Realm& realm, ReadonlyBytes data)
 {
     auto& vm = realm.vm();
     TRY(host_ensure_can_compile_wasm_bytes(realm));
@@ -477,7 +477,7 @@ JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webass
     stats.input_size_bytes = data.size();
 
     auto parse_start = MonotonicTime::now();
-    FixedMemoryStream stream { data.bytes() };
+    FixedMemoryStream stream { data };
     auto module_result = Wasm::Module::parse(stream);
     stats.parse_time = MonotonicTime::now() - parse_start;
     if (module_result.is_error()) {
@@ -495,7 +495,7 @@ JS::ThrowCompletionOr<NonnullRefPtr<CompiledWebAssemblyModule>> compile_a_webass
     // Content-keyed disk cache: hash the wasm bytes, slot into the HTTP side-data shelf under a synthetic wasm-cache://<hex> URL
     Optional<Wasm::CompileCacheConfig> wasm_cache_config;
     if (ResourceLoader::is_initialized() && ResourceLoader::the().request_client()) {
-        auto digest = ::Crypto::Hash::SHA256::hash(data.data(), data.size());
+        auto digest = ::Crypto::Hash::SHA256::hash(data);
         __builtin_memcpy(stats.wasm_hash.data(), digest.bytes().data(), 32);
 
         StringBuilder hex_builder;
@@ -986,10 +986,10 @@ GC::Ref<WebIDL::Promise> asynchronously_compile_webassembly_module(JS::Realm& re
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&realm, bytes = move(bytes), promise, task_source]() mutable {
         HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
         // 1. Compile the WebAssembly module bytes and store the result as module.
-        auto module_or_error = Detail::compile_a_webassembly_module(realm, move(bytes));
+        auto module_or_error = Detail::compile_a_webassembly_module(realm, bytes);
 
         // 2. Queue a task to perform the following steps. If taskSource was provided, queue the task on that task source.
-        HTML::queue_a_task(task_source, nullptr, nullptr, GC::create_function(GC::Heap::the(), [&realm, promise, module_or_error = move(module_or_error)]() mutable {
+        HTML::queue_a_task(task_source, nullptr, nullptr, GC::create_function(GC::Heap::the(), [&realm, bytes = move(bytes), promise, module_or_error = move(module_or_error)]() mutable {
             HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
             auto& realm = HTML::relevant_realm(*promise->promise());
 
@@ -1001,8 +1001,7 @@ GC::Ref<WebIDL::Promise> asynchronously_compile_webassembly_module(JS::Realm& re
             // 2. Otherwise,
             else {
                 // 1. Construct a WebAssembly module object from module and bytes, and let moduleObject be the result.
-                // FIXME: Save bytes to the Module instance instead of moving into compile_a_webassembly_module
-                auto module_object = GC::Heap::the().allocate<Module>(module_or_error.release_value());
+                auto module_object = GC::Heap::the().allocate<Module>(module_or_error.release_value(), move(bytes));
 
                 // 2. Resolve promise with moduleObject.
                 Bindings::resolve_webassembly_module_promise(realm, promise, module_object);
