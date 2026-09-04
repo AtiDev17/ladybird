@@ -1,0 +1,24 @@
+new transition remains pending: true
+new transition start time remains unresolved: true
+new transition ready promise remains pending: true
+new transition start event remains pending: true
+new transition starts on compositor: true
+next update resolves pending play: true
+next update resolves start time: true
+next update resolves ready promise: true
+next update dispatches transition events: true
+transition remains on compositor: true
+resolved start retains compositor anchor: true
+pending current-time seek re-anchors compositor: true
+pending start-time change re-anchors compositor: true
+pending transition retarget replaces descriptor: true
+static opacity transition declarations do not create effects frames: true
+paired opacity and translate transitions start on compositor: true
+paired transitions share their provisional timing anchor: true
+pending fade-out creates an effects frame: true
+withdrawn fade-out removes its forced effects frame: true
+adding an opacity animation creates an effects frame: true
+adding a filter keeps mixed effect on compositor: true
+adding a filter retains the forced effects frame: true
+retargeted opacity starts with paired translate on compositor: true
+retargeted paired transitions share their provisional timing anchor: true

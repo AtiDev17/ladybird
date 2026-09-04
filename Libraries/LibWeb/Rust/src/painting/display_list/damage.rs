@@ -150,7 +150,8 @@ fn display_list_commands_are_equal(a: &CommandReference<'_>, b: &CommandReferenc
                 4,
             )
             && first.optional_color_at(offset_of!(DrawScaledDecodedImageFrame, isolated_backdrop_color))
-                == second.optional_color_at(offset_of!(DrawScaledDecodedImageFrame, isolated_backdrop_color));
+                == second.optional_color_at(offset_of!(DrawScaledDecodedImageFrame, isolated_backdrop_color))
+            && same_field(offset_of!(DrawScaledDecodedImageFrame, apply_force_dark), 1);
     }
 
     if a.header.command_type == DisplayListCommandType::DrawGlyphRun {
@@ -216,6 +217,7 @@ fn spatial_data_is_equal(
 
 fn frame_data_is_equal(a: &FrameData, b: &FrameData) -> bool {
     match (a, b) {
+        (FrameData::BackgroundColorAnimation, FrameData::BackgroundColorAnimation) => true,
         (FrameData::Clip(data), FrameData::Clip(other)) => data == other,
         (FrameData::ClipPath(data), FrameData::ClipPath(other)) => {
             data.bounding_rect == other.bounding_rect
@@ -328,6 +330,28 @@ impl TreeChainComparison<'_> {
             new_frame = new_node.parent;
         }
         true
+    }
+
+    fn changing_filter_may_affect_output_bounds(&self, old_context: ContextRef, new_context: ContextRef) -> bool {
+        let mut old_frame = old_context.frame;
+        let mut new_frame = new_context.frame;
+        while !old_frame.is_none() {
+            let old_node = &self.old_tree.frame_nodes[old_frame.0 as usize];
+            let new_node = &self.new_tree.frame_nodes[new_frame.0 as usize];
+            if let (FrameData::Effects(old_effects), FrameData::Effects(new_effects)) = (&old_node.data, &new_node.data)
+                && old_effects.filter != new_effects.filter
+                && old_effects
+                    .filter
+                    .iter()
+                    .chain(new_effects.filter.iter())
+                    .any(|filter| crate::painting::filter_bytes::may_affect_output_bounds(filter))
+            {
+                return true;
+            }
+            old_frame = old_node.parent;
+            new_frame = new_node.parent;
+        }
+        false
     }
 }
 
@@ -489,6 +513,10 @@ pub fn compute_display_list_damage(
     let add_visual_context_damage =
         |damage: &mut DamageAccumulator, old_command: &CommandReference<'_>, new_command: &CommandReference<'_>| {
             if chains.chains_are_equal(old_command.header.context, new_command.header.context) {
+                return;
+            }
+            if chains.changing_filter_may_affect_output_bounds(old_command.header.context, new_command.header.context) {
+                damage.changed_unbounded_command = true;
                 return;
             }
             if !old_command.header.has_bounding_rect || !new_command.header.has_bounding_rect {
@@ -676,6 +704,7 @@ mod tests {
                 rect,
                 color,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(rect),
             ContextRef::default(),
@@ -767,6 +796,57 @@ mod tests {
         })
     }
 
+    fn effects(filter: Vec<u8>) -> FrameData {
+        FrameData::Effects(EffectsData {
+            opacity: 1.0,
+            blend_mode: CompositingAndBlendingOperator::Normal,
+            filter: Some(Rc::new(filter)),
+        })
+    }
+
+    fn blur_filter(radius: f32) -> Vec<u8> {
+        let mut bytes = vec![crate::painting::ffi::FilterOperationType::Blur as u8];
+        bytes.extend_from_slice(&radius.to_ne_bytes());
+        bytes.extend_from_slice(&radius.to_ne_bytes());
+        bytes.push(0);
+        bytes
+    }
+
+    fn color_filter(amount: f32) -> Vec<u8> {
+        let mut bytes = vec![crate::painting::ffi::FilterOperationType::ColorFilter as u8];
+        bytes.extend_from_slice(&0i32.to_ne_bytes());
+        bytes.extend_from_slice(&amount.to_ne_bytes());
+        bytes.push(0);
+        bytes
+    }
+
+    fn drop_shadow_filter(offset: f32, radius: f32) -> Vec<u8> {
+        let mut bytes = vec![crate::painting::ffi::FilterOperationType::DropShadow as u8];
+        bytes.extend_from_slice(&offset.to_ne_bytes());
+        bytes.extend_from_slice(&offset.to_ne_bytes());
+        bytes.extend_from_slice(&radius.to_ne_bytes());
+        bytes.extend_from_slice(&RED.0.to_ne_bytes());
+        bytes.push(0);
+        bytes
+    }
+
+    fn damage_for_filter_change(old_filter: Vec<u8>, new_filter: Vec<u8>) -> Option<IntRect> {
+        let mut old_tree = identity_tree();
+        let old_frame = old_tree.append_frame(effects(old_filter), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        let mut new_tree = identity_tree();
+        let new_frame = new_tree.append_frame(effects(new_filter), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
+        let rect = IntRect::new(10, 10, 20, 20);
+        let fill = FillRect {
+            rect,
+            color: RED,
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            background_color_animation_frame: FrameNodeIndex::NONE,
+        };
+        let old_display_list = command_bytes(&fill, Some(rect), context_in(VISUAL_VIEWPORT_NODE_INDEX, old_frame));
+        let new_display_list = command_bytes(&fill, Some(rect), context_in(VISUAL_VIEWPORT_NODE_INDEX, new_frame));
+        damage(&old_display_list, &old_tree, &new_display_list, &new_tree)
+    }
+
     fn damage(
         old_bytes: &[u8],
         old_tree: &VisualContextTree,
@@ -825,6 +905,7 @@ mod tests {
                 rect,
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(rect),
             context_in(in_order_transform, FrameNodeIndex::NONE),
@@ -834,6 +915,7 @@ mod tests {
                 rect,
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(rect),
             context_in(permuted_transform, FrameNodeIndex::NONE),
@@ -864,6 +946,7 @@ mod tests {
             scaling_mode: ScalingMode::Bilinear,
             compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
             isolated_backdrop_color: OptionalColor::none(),
+            apply_force_dark: false,
         };
         let old_display_list = command_bytes(&command, Some(IntRect::new(0, 0, 100, 100)), ContextRef::default());
         let mut new_display_list = old_display_list.clone();
@@ -873,6 +956,29 @@ mod tests {
         assert_eq!(
             damage(&old_display_list, &tree, &new_display_list, &tree),
             Some(IntRect::default())
+        );
+    }
+
+    #[test]
+    fn force_dark_reach_change_damages_scaled_images() {
+        // A force-dark flip re-records the same image draw with only apply_force_dark moved; the raster output
+        // changes, so the comparison has to see the field.
+        let tree = identity_tree();
+        let mut command = DrawScaledDecodedImageFrame {
+            dst_rect: FloatRect::new(0.0, 0.0, 100.0, 100.0),
+            src_rect: OptionalFloatRect::none(),
+            frame_id: ImageFrameResourceId(1),
+            scaling_mode: ScalingMode::Bilinear,
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            isolated_backdrop_color: OptionalColor::none(),
+            apply_force_dark: false,
+        };
+        let old_display_list = command_bytes(&command, Some(IntRect::new(0, 0, 100, 100)), ContextRef::default());
+        command.apply_force_dark = true;
+        let new_display_list = command_bytes(&command, Some(IntRect::new(0, 0, 100, 100)), ContextRef::default());
+        assert_eq!(
+            damage(&old_display_list, &tree, &new_display_list, &tree),
+            Some(IntRect::new(0, 0, 100, 100))
         );
     }
 
@@ -910,6 +1016,7 @@ mod tests {
                 rect,
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             &[],
             Some(rect),
@@ -967,6 +1074,7 @@ mod tests {
                 rect: IntRect::new(0, 0, 10, 10),
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             None,
             ContextRef::default(),
@@ -976,6 +1084,7 @@ mod tests {
                 rect: IntRect::new(0, 0, 10, 10),
                 color: BLUE,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             None,
             ContextRef::default(),
@@ -1018,6 +1127,23 @@ mod tests {
     }
 
     #[test]
+    fn changed_extent_affecting_filter_has_unbounded_damage() {
+        assert_eq!(damage_for_filter_change(blur_filter(1.0), blur_filter(10.0)), None);
+        assert_eq!(
+            damage_for_filter_change(drop_shadow_filter(1.0, 1.0), drop_shadow_filter(10.0, 10.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn changed_color_filter_has_bounded_damage() {
+        assert_eq!(
+            damage_for_filter_change(color_filter(0.5), color_filter(1.0)),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
     fn mask_visual_context_damages_affected_commands() {
         let mut old_tree = identity_tree();
         let old_mask_frame = old_tree.append_frame(
@@ -1036,6 +1162,7 @@ mod tests {
                 rect: IntRect::new(10, 10, 20, 20),
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(IntRect::new(10, 10, 20, 20)),
             context_in(VISUAL_VIEWPORT_NODE_INDEX, old_mask_frame),
@@ -1065,6 +1192,7 @@ mod tests {
                 rect: IntRect::new(10, 10, 20, 20),
                 color: RED,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(IntRect::new(10, 10, 20, 20)),
             context_in(VISUAL_VIEWPORT_NODE_INDEX, old_frame),
@@ -1074,6 +1202,7 @@ mod tests {
                 rect: IntRect::new(30, 30, 20, 20),
                 color: BLUE,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_frame: FrameNodeIndex::NONE,
             },
             Some(IntRect::new(30, 30, 20, 20)),
             context_in(VISUAL_VIEWPORT_NODE_INDEX, new_frame),
@@ -1102,6 +1231,7 @@ mod tests {
             rect: IntRect::new(10, 10, 20, 20),
             color: RED,
             compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            background_color_animation_frame: FrameNodeIndex::NONE,
         };
         let old_display_list = command_bytes(
             &fill,
@@ -1144,6 +1274,7 @@ mod tests {
             rect: IntRect::new(10, 10, 20, 20),
             color: RED,
             compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            background_color_animation_frame: FrameNodeIndex::NONE,
         };
         let old_display_list = command_bytes(
             &fill,

@@ -194,6 +194,10 @@ public:
 
     bool needs_layout_update() const { return has_flag(RustFFI::NodeFlag::NeedsLayoutUpdate); }
     void set_retains_compositor_animated_content(bool value) { set_flag(RustFFI::NodeFlag::HasAnimatedOpacityOrTransform, value); }
+    bool needs_compositor_effects_layer() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::Opacity); }
+    void set_needs_compositor_effects_layer(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::Opacity, value); }
+    bool needs_compositor_background_color_frame() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor); }
+    void set_needs_compositor_background_color_frame(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor, value); }
 
     // The arena measures a box that holds a scroll offset eagerly after a full commit, so the box carries that fact
     // as a flag: it is set when a box becomes an element's or a pseudo-element's box, and again whenever the stored
@@ -324,6 +328,16 @@ protected:
     }
 
     bool dom_target_stores_scroll_offset() const;
+
+    bool has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind) const
+    {
+        return RustFFI::layout_arena_node_has_compositor_animation_frame(m_arena->handle(), m_slot, kind);
+    }
+
+    void set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind kind, bool value)
+    {
+        RustFFI::layout_arena_set_node_needs_compositor_animation_frame(m_arena->handle(), m_slot, kind, value);
+    }
 
     void set_flag(RustFFI::NodeFlag flag, bool value)
     {
@@ -498,6 +512,7 @@ public:
     Optional<Color> accent_color() const { return style_group<CSS::ComputedValues::InheritedUIValues>().accent_color_value(); }
     CSS::PreferredColorScheme color_scheme() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_scheme_value(); }
     ReadonlySpan<Utf16FlyString> color_schemes() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_schemes_span(); }
+    bool color_scheme_only() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_scheme_only; }
     ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor() const { return style_group<CSS::ComputedValues::InheritedUIValues>().cursor_span(); }
     ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values() const { return m_cursor_style_values; }
     CSS::PointerEvents pointer_events() const { return style_group<CSS::ComputedValues::InheritedUIValues>().pointer_events_value(); }
@@ -512,6 +527,7 @@ public:
     CSS::UserSelect user_select() const { return static_cast<CSS::UserSelect>(style_group<CSS::ComputedValues::MiscResetValues>().user_select); }
     Optional<Utf16FlyString> view_transition_name() const { return style_group<CSS::ComputedValues::MiscResetValues>().view_transition_name_value(); }
     Color outline_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().outline_color); }
+    Color column_rule_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().column_rule_color); }
     CSSPixels outline_offset() const { return style_group<CSS::ComputedValues::MiscResetValues>().outline_offset; }
     CSS::OutlineStyle outline_style() const { return static_cast<CSS::OutlineStyle>(style_group<CSS::ComputedValues::MiscResetValues>().outline_style); }
     CSSPixels outline_width() const { return style_group<CSS::ComputedValues::MiscResetValues>().outline_width; }

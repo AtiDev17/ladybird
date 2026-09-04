@@ -16,6 +16,7 @@ use crate::painting::display_list::commands::{
     DisplayListResourceId, ImageFrameResourceId, NO_MASK_DISPLAY_LIST, OptionalAffineTransform, Repeat,
 };
 use crate::painting::display_list::recorder::{DisplayListRecorder, FillPathParams, PaintStyle, PaintStyleOrColor};
+use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::{FfiImagePaintFacts, FfiLayerImagePrepareFacts};
 use crate::painting::node_painting;
 use crate::painting::paintable_data::FfiPixelBox;
@@ -112,7 +113,6 @@ pub(crate) fn paint_resolved_background(
     let background_rect = resolved.background_rect;
     let color_box = resolved.color_box;
     let layers = &resolved.layers;
-
     // https://drafts.fxtf.org/compositing/#background-blend-mode
     // Background layers must not blend with the content that is behind the element, instead they
     // must act as if they are rendered into an isolated group.
@@ -146,7 +146,8 @@ pub(crate) fn paint_resolved_background(
             .united(converter.enclosing_device_rect(color_box.rect))
     };
     let record_into_nested_list = |recorder: &mut PaintRecorder<'_>, record: &mut dyn FnMut(&mut PaintRecorder<'_>)| {
-        let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new());
+        let force_dark_settings = recorder.recorder.force_dark_settings();
+        let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new(force_dark_settings));
         let recording_into_enclosing_nested_list =
             std::mem::replace(&mut recorder.recording_into_context_free_nested_list, true);
         record(recorder);
@@ -189,7 +190,8 @@ fn record_into_context_free_nested_list(
     content_origin: IntPoint,
     record: impl FnOnce(&mut PaintRecorder<'_>),
 ) -> DisplayListResourceId {
-    let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new());
+    let force_dark_settings = recorder.recorder.force_dark_settings();
+    let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new(force_dark_settings));
     let recording_into_enclosing_nested_list =
         std::mem::replace(&mut recorder.recording_into_context_free_nested_list, true);
     record(recorder);
@@ -218,6 +220,14 @@ fn paint_background_layers(
     let background_rect = resolved.background_rect;
     let color_box = resolved.color_box;
     let layers = &resolved.layers;
+    let background_color_animation_frame = recorder
+        .layout_arena
+        .node_has_compositor_animation_frame(
+            paintable,
+            crate::layout::node_data::CompositorAnimationFrameKind::BackgroundColor,
+        )
+        .then_some(recorder.recorder.accumulated_visual_context().frame)
+        .filter(|frame| !frame.is_none());
 
     let border_box = BackgroundBox {
         rect: background_rect,
@@ -227,14 +237,20 @@ fn paint_background_layers(
     let border = crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable);
 
     if is_root_element {
-        recorder
-            .recorder
-            .fill_rect(converter.enclosing_device_rect(color_box.rect), color);
+        recorder.recorder.fill_animated_background_color(
+            converter.enclosing_device_rect(color_box.rect),
+            color,
+            libgfx_rust::CornerRadii::default(),
+            background_color_animation_frame,
+            ForceDarkRole::Background,
+        );
     } else {
-        recorder.recorder.fill_rect_with_rounded_corners(
+        recorder.recorder.fill_animated_background_color(
             converter.rounded_device_rect(color_box.rect),
             color,
             color_box.radii.as_corners(&converter),
+            background_color_animation_frame,
+            ForceDarkRole::Background,
         );
     }
 
@@ -439,6 +455,13 @@ pub(crate) fn paint_image_with_compositing_and_blending_operator(
             );
             let scaling_mode =
                 to_gfx_scaling_mode(image_rendering, (facts.natural_width, facts.natural_height), target);
+            let force_dark_role = crate::painting::force_dark::role_for_image(
+                ForceDarkRole::Background,
+                dest_rect.width,
+                dest_rect.height,
+                recorder.inputs.device_pixels_per_css_pixel,
+                (facts.natural_width, facts.natural_height),
+            );
             recorder.recorder.draw_scaled_decoded_image_frame(
                 dest_rect,
                 None,
@@ -446,6 +469,7 @@ pub(crate) fn paint_image_with_compositing_and_blending_operator(
                 scaling_mode,
                 compositing_and_blending_operator,
                 None,
+                force_dark_role,
             );
         }
         crate::painting::host::FfiImagePaintKind::NestedDisplayList => {
@@ -669,14 +693,17 @@ fn paint_image_layer(
             });
         }
         if inline_operator == CompositingAndBlendingOperator::Normal {
-            recorder
-                .recorder
-                .fill_rect(fill_rect.unwrap_or_default(), prepare.single_pixel_color.value);
+            recorder.recorder.fill_rect(
+                fill_rect.unwrap_or_default(),
+                prepare.single_pixel_color.value,
+                ForceDarkRole::Background,
+            );
         } else {
             recorder.recorder.fill_rect_with_compositing_and_blending_operator(
                 fill_rect.unwrap_or_default(),
                 prepare.single_pixel_color.value,
                 inline_operator,
+                ForceDarkRole::Background,
             );
         }
     } else if prepare.is_image_style_value
@@ -741,6 +768,15 @@ fn paint_image_layer(
                     ),
                     (visible_rect.width, visible_rect.height),
                 );
+                // Judge the tile's layout size and the full frame, like the multi-tile branch: the visible clip and
+                // its source crop shrink at an edge, which would flip a photo-sized image into an invertible icon.
+                let force_dark_role = crate::painting::force_dark::role_for_image(
+                    ForceDarkRole::Background,
+                    tile_device_rect.width as f32,
+                    tile_device_rect.height as f32,
+                    recorder.inputs.device_pixels_per_css_pixel,
+                    (frame.frame_width, frame.frame_height),
+                );
                 recorder.recorder.draw_scaled_decoded_image_frame(
                     visible_rect.to_float(),
                     Some(source_rect),
@@ -748,12 +784,20 @@ fn paint_image_layer(
                     scaling_mode,
                     compositing_and_blending_operator,
                     backdrop.opaque_color_under_lone_layer(),
+                    force_dark_role,
                 );
             } else if tile_count > 1.0 {
                 let scaling_mode = to_gfx_scaling_mode(
                     image_rendering,
                     (frame.frame_width, frame.frame_height),
                     (tile_device_rect.width, tile_device_rect.height),
+                );
+                let force_dark_role = crate::painting::force_dark::role_for_image(
+                    ForceDarkRole::Background,
+                    tile_device_rect.width as f32,
+                    tile_device_rect.height as f32,
+                    recorder.inputs.device_pixels_per_css_pixel,
+                    (frame.frame_width, frame.frame_height),
                 );
                 recorder.recorder.draw_repeated_decoded_image_frame(
                     tile_device_rect,
@@ -764,6 +808,7 @@ fn paint_image_layer(
                     repeat_y,
                     compositing_and_blending_operator,
                     backdrop.opaque_color_under_lone_layer(),
+                    force_dark_role,
                 );
             }
         }
@@ -785,7 +830,8 @@ fn paint_image_layer(
             tile_device_rect.height = 1;
         }
 
-        let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new());
+        let force_dark_settings = recorder.recorder.force_dark_settings();
+        let outer_recorder = std::mem::replace(&mut recorder.recorder, DisplayListRecorder::new(force_dark_settings));
         let tile_dest_rect = tile_device_rect.to_float();
         if let Some(gradient) = &resolved_gradient {
             record_gradient_fill(
@@ -842,6 +888,7 @@ fn paint_image_layer(
         let path = path.build();
         recorder.recorder.fill_path_with_compositing_and_blending_operator(
             FillPathParams {
+                force_dark_role: ForceDarkRole::Background,
                 path: &path,
                 opacity: 1.0,
                 paint_style_or_color: PaintStyleOrColor::PaintStyle(PaintStyle::Pattern {
@@ -956,6 +1003,7 @@ fn append_text_clip_paths(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotI
             scale,
             emission.orientation,
             emission.glyph_bounding_rect,
+            ForceDarkRole::None,
         );
     };
 

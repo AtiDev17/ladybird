@@ -453,8 +453,11 @@ public:
     void set_visited_link_color(Optional<Color>);
 
     Optional<Vector<Utf16FlyString> const&> supported_color_schemes() const;
-    void set_supported_color_schemes(Vector<Utf16FlyString>);
-    void set_supported_color_schemes(Optional<Vector<Utf16FlyString>>);
+    // 'only' is a modifier on the scheme list rather than a member of it, so it travels alongside; both setters
+    // take it so the two can't drift apart.
+    bool supported_color_schemes_are_only() const { return m_supported_color_schemes_are_only; }
+    void set_supported_color_schemes(Vector<Utf16FlyString>, bool only = false);
+    void set_supported_color_schemes(Optional<Vector<Utf16FlyString>>, bool only = false);
     void obtain_supported_color_schemes();
 
     void obtain_theme_color();
@@ -466,6 +469,7 @@ public:
     void schedule_compositor_animation_wakeup(double delay_ms);
     void stop_compositor_animation_timers();
     void arm_compositor_animation_timers_for_testing(Badge<Internals::Internals>);
+    void fire_compositor_animation_wakeup_for_testing(Badge<Internals::Internals>, double frame_time_ms);
     void request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const&);
     bool run_empty_animation_style_update_for_testing(Badge<Internals::Internals>);
     bool compositor_animation_wakeup_timer_is_active() const;
@@ -1103,6 +1107,7 @@ public:
         u64 animation_timeline_synchronizations { 0 };
         u64 animation_timeline_associated_animation_updates { 0 };
         u64 compositor_visual_animation_updates { 0 };
+        u64 compositor_visual_animation_timing_anchor_updates { 0 };
         u64 compositor_keyframe_value_resolutions { 0 };
         u64 base_style_partial_builds { 0 };
         u64 base_style_full_builds { 0 };
@@ -1466,6 +1471,7 @@ private:
     friend struct AdoptedStyleSheetsAccess;
 
     void finish_animated_style_update();
+    void service_compositor_animation_wakeup(double timestamp);
 
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
@@ -1588,6 +1594,7 @@ private:
     Optional<Color> m_visited_link_color;
 
     Optional<Vector<Utf16FlyString>> m_supported_color_schemes;
+    bool m_supported_color_schemes_are_only { false };
 
     GC::Ptr<HTML::HTMLParser> m_parser;
     u64 m_parser_generation { 0 };
@@ -1840,6 +1847,8 @@ private:
     RefPtr<Core::Timer> m_compositor_animation_wakeup_timer;
     Optional<MonotonicTime> m_compositor_animation_wakeup_deadline;
     RefPtr<Core::Timer> m_compositor_animation_observation_timer;
+    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_effects_layer;
+    Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_background_color_frame;
 
     bool m_temporary_document_for_fragment_parsing { false };
 

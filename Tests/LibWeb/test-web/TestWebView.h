@@ -23,6 +23,8 @@ public:
     static NonnullOwnPtr<TestWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size);
 
     void clear_content_blockers();
+    void reset_force_dark();
+    void reset_line_box_borders();
     NonnullRefPtr<Core::Promise<Empty>> reset_session_history();
     pid_t web_content_pid() const;
 
@@ -34,6 +36,8 @@ public:
 
 private:
     TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size);
+
+    virtual void force_dark_settings_changed() override;
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const override { return m_clipboard_item; }
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem item) override { m_clipboard_item = move(item); }

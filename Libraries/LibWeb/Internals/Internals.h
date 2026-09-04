@@ -48,6 +48,9 @@ public:
     void signal_test_is_done(Utf16String const& text);
     void set_test_timeout(double milliseconds);
     void force_incompatible_visual_context_tree_rebuild();
+    void set_force_dark_enabled(bool);
+    void set_show_line_box_borders(bool);
+    void set_force_dark_thresholds(i32, i32);
     u64 visual_context_tree_node_count();
     u64 visual_context_pending_dirty_box_count();
     u64 accumulated_visual_context_incremental_update_count();
@@ -201,6 +204,7 @@ public:
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();
     void arm_compositor_animation_timers_for_testing();
+    void fire_compositor_animation_wakeup_for_testing(double frame_time_ms);
     void request_reentrant_animation_style_flush_for_testing(GC::Ref<DOM::Node>);
     GC::Ref<JS::Object> layout_tree_build_stats();
     GC::Ref<JS::Object> compare_layout_tree_with_full_rebuild();

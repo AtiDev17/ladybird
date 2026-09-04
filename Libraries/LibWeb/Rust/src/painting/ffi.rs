@@ -13,6 +13,7 @@ use crate::layout::used_values::FfiCssPixelSize;
 use crate::layout::{grid_formatting_context, svg_formatting_context, used_values};
 use crate::painting::display_list::commands::FrameNodeIndex;
 use crate::painting::display_list::commands::SpatialNodeIndex;
+use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::FfiRecordedDisplayList;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_rows::PaintableRowsRead;
@@ -118,6 +119,26 @@ pub unsafe extern "C" fn layout_arena_paintable_set_scrollbar_enlarged(
         ScrollDirection::Vertical => PaintableFlag::VerticalScrollbarEnlarged,
     };
     rows.paintable_data_mut(slot).set_flag(flag, enlarged);
+}
+
+/// Decide if force-dark should invert an image: the caller owns the sampling, this owns the policy. Returns false
+/// for an empty or null buffer, which leaves the image untouched.
+///
+/// # Safety
+/// `samples` must point to `count` packed colors, or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ladybird_web_force_dark_should_filter_image(
+    samples: *const u32,
+    count: usize,
+    transparency_ratio: f32,
+) -> bool {
+    if samples.is_null() || count == 0 {
+        return false;
+    }
+    // Color is repr(transparent) over u32, so the buffer needs no copy to be read as colors.
+    let colors = unsafe { std::slice::from_raw_parts(samples.cast::<libgfx_rust::Color>(), count) };
+    let features = crate::painting::force_dark::features_from_samples(colors, transparency_ratio);
+    crate::painting::force_dark::should_filter(&features)
 }
 
 /// # Safety
@@ -1220,25 +1241,47 @@ pub unsafe extern "C" fn layout_arena_paintable_visual_animation_target_indices(
     arena: *mut c_void,
     slot: NodeSlotId,
     tree: *const c_void,
-    targets_are_frames: bool,
+    target_kind: crate::painting::host::FfiVisualAnimationTargetKind,
     context: *mut c_void,
     append: unsafe extern "C" fn(*mut c_void, u32),
 ) {
     let arena = unsafe { arena_from_handle(arena) };
     let tree = unsafe { tree_from_handle(tree) };
     arena.with_paintable_visual_context_node_handles(slot, |handles| {
-        let owned_indices: Vec<u32> = if targets_are_frames {
-            handles.frame_handles().map(|index| index.0).collect()
-        } else {
-            handles.spatial.iter().map(|index| index.0).collect()
+        let owned_indices: Vec<u32> = match target_kind {
+            crate::painting::host::FfiVisualAnimationTargetKind::Opacity
+            | crate::painting::host::FfiVisualAnimationTargetKind::BackgroundColor
+            | crate::painting::host::FfiVisualAnimationTargetKind::Filter => {
+                handles.frame_handles().map(|index| index.0).collect()
+            }
+            crate::painting::host::FfiVisualAnimationTargetKind::Transform => {
+                handles.spatial.iter().map(|index| index.0).collect()
+            }
         };
         for index in owned_indices {
-            if tree.visual_animation_target_is_valid(targets_are_frames, index) {
+            if tree.visual_animation_target_is_valid(target_kind, index) {
                 // SAFETY: the host appends into its own storage synchronously.
                 unsafe { append(context, index) };
             }
         }
     });
+}
+
+/// # Safety
+///
+/// `arena` must be a live layout arena handle used on the document thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_background_color_can_be_compositor_animated(
+    arena: *mut c_void,
+    slot: NodeSlotId,
+    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+) -> bool {
+    let arena = unsafe { arena_from_handle(arena) };
+    crate::painting::record::paint::background_resolution::background_color_can_be_compositor_animated(
+        &arena.paintable_rows(),
+        slot,
+        root_background_source,
+    )
 }
 
 /// # Safety
@@ -1883,7 +1926,9 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
         synthetic_plane: false,
         establishes_sorting_context: false,
     });
-    let mut recorder = DisplayListRecorder::new();
+    // Force-dark never reaches here: an image is darkened by classifying the image itself — not by inverting the
+    // fills that raster it.
+    let mut recorder = DisplayListRecorder::new(None);
     let dest_rect = inputs.dest_rect;
     match inputs.kind {
         FfiImagePaintRecordKind::DecodedFrame => recorder.draw_scaled_decoded_image_frame(
@@ -1893,6 +1938,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
             inputs.scaling_mode,
             CompositingAndBlendingOperator::Normal,
             None,
+            ForceDarkRole::None,
         ),
         FfiImagePaintRecordKind::NestedDisplayList => recorder.paint_nested_display_list(
             DisplayListResourceId(inputs.nested_display_list_id),
@@ -1923,6 +1969,7 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
                 &resolved,
                 dest_rect,
                 CompositingAndBlendingOperator::Normal,
+                ForceDarkRole::None,
             );
         }
     }
@@ -2998,22 +3045,28 @@ pub unsafe extern "C" fn visual_context_tree_with_visual_viewport_transform(
 
 /// # Safety
 ///
-/// `tree` must be a live retained tree handle; `frame_opacities` must address `frame_opacity_count`
-/// samples and `spatial_matrices` `spatial_matrix_count` samples. Returns a retained handle to a copy
-/// of the tree carrying the sampled values; the copy keeps the structural epoch.
+/// `tree` must be a live retained tree handle; each sample array must address its stated count, and
+/// each non-empty filter sample must address its stated byte count. Returns a retained handle to a
+/// copy of the tree carrying the sampled values; the copy keeps the structural epoch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
     tree: *const c_void,
     frame_opacities: *const crate::painting::host::FfiFrameOpacitySample,
     frame_opacity_count: usize,
+    frame_background_colors: *const crate::painting::host::FfiFrameBackgroundColorSample,
+    frame_background_color_count: usize,
+    frame_filters: *const crate::painting::host::FfiFrameFilterSample,
+    frame_filter_count: usize,
     spatial_matrices: *const crate::painting::host::FfiSpatialTransformSample,
     spatial_matrix_count: usize,
 ) -> *const c_void {
     let tree = unsafe { tree_from_handle(tree) };
     // SAFETY: The caller guarantees the sample arrays address the stated counts.
-    let (frame_opacities, spatial_matrices) = unsafe {
+    let (frame_opacities, frame_background_colors, frame_filters, spatial_matrices) = unsafe {
         (
             ffi_slice(frame_opacities, frame_opacity_count),
+            ffi_slice(frame_background_colors, frame_background_color_count),
+            ffi_slice(frame_filters, frame_filter_count),
             ffi_slice(spatial_matrices, spatial_matrix_count),
         )
     };
@@ -3021,12 +3074,53 @@ pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
         .iter()
         .map(|sample| (FrameNodeIndex(sample.frame), sample.opacity))
         .collect();
+    let frame_background_colors: Vec<(FrameNodeIndex, libgfx_rust::Color)> = frame_background_colors
+        .iter()
+        .map(|sample| (FrameNodeIndex(sample.frame), sample.color))
+        .collect();
+    let frame_filters: Vec<(FrameNodeIndex, Option<Rc<Vec<u8>>>)> = frame_filters
+        .iter()
+        .map(|sample| {
+            let filter = if sample.filter_size == 0 {
+                None
+            } else {
+                // SAFETY: The caller guarantees each filter byte range addresses the stated size.
+                Some(Rc::new(
+                    unsafe { ffi_slice(sample.filter_bytes, sample.filter_size) }.to_vec(),
+                ))
+            };
+            (FrameNodeIndex(sample.frame), filter)
+        })
+        .collect();
     let spatial_matrices: Vec<(SpatialNodeIndex, libgfx_rust::FloatMatrix4x4)> = spatial_matrices
         .iter()
         .map(|sample| (SpatialNodeIndex(sample.spatial), sample.matrix))
         .collect();
-    let sampled = tree.with_sampled_visual_animation_values(&frame_opacities, &spatial_matrices);
+    let sampled = tree.with_sampled_visual_animation_values(
+        &frame_opacities,
+        &frame_background_colors,
+        &frame_filters,
+        &spatial_matrices,
+    );
     Rc::into_raw(Rc::new(sampled)).cast()
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle and `color` must point to writable storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_sampled_background_color(
+    tree: *const c_void,
+    frame: FrameNodeIndex,
+    color: *mut libgfx_rust::Color,
+) -> bool {
+    let tree = unsafe { tree_from_handle(tree) };
+    let Some(sampled_color) = tree.sampled_background_color(frame) else {
+        return false;
+    };
+    // SAFETY: The caller guarantees that `color` points to writable storage.
+    unsafe { *color = sampled_color };
+    true
 }
 
 /// # Safety
@@ -3035,14 +3129,14 @@ pub unsafe extern "C" fn visual_context_tree_with_sampled_values(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_visual_animation_targets_are_valid(
     tree: *const c_void,
-    targets_are_frames: bool,
+    target_kind: crate::painting::host::FfiVisualAnimationTargetKind,
     targets: *const u32,
     target_count: usize,
 ) -> bool {
     let tree = unsafe { tree_from_handle(tree) };
     // SAFETY: The caller guarantees the targets address `target_count` indices.
     let targets = unsafe { ffi_slice(targets, target_count) };
-    tree.visual_animation_targets_are_valid(targets_are_frames, targets)
+    tree.visual_animation_targets_are_valid(target_kind, targets)
 }
 
 /// # Safety
@@ -3255,6 +3349,24 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_clip_frame(
             corner_radii,
             mode,
         }),
+        FrameNodeIndex(parent_frame),
+        SpatialNodeIndex(spatial),
+    )
+    .0
+}
+
+/// # Safety
+///
+/// `builder` must be a live handle from `visual_context_tree_test_builder_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_test_builder_append_background_color_animation_frame(
+    builder: *mut c_void,
+    parent_frame: u32,
+    spatial: u32,
+) -> u32 {
+    let tree = unsafe { test_builder_tree(builder) };
+    tree.append_frame(
+        crate::painting::visual_context::FrameData::BackgroundColorAnimation,
         FrameNodeIndex(parent_frame),
         SpatialNodeIndex(spatial),
     )

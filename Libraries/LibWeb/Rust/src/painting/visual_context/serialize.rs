@@ -34,6 +34,7 @@ const FRAME_KIND_CLIP_PATH: u8 = 1;
 const FRAME_KIND_EFFECTS: u8 = 2;
 const FRAME_KIND_MASK: u8 = 3;
 const FRAME_KIND_DEAD: u8 = 4;
+const FRAME_KIND_BACKGROUND_COLOR_ANIMATION: u8 = 5;
 
 const MINIMUM_SERIALIZED_SPATIAL_NODE_SIZE: usize = 5;
 const MINIMUM_SERIALIZED_FRAME_NODE_SIZE: usize = 9;
@@ -371,6 +372,7 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
 
 fn write_frame_data(writer: &mut TreeByteWriter, data: &FrameData) {
     match data {
+        FrameData::BackgroundColorAnimation => writer.u8(FRAME_KIND_BACKGROUND_COLOR_ANIMATION),
         FrameData::Clip(clip) => {
             writer.u8(FRAME_KIND_CLIP);
             writer.float_rect(clip.rect);
@@ -402,6 +404,7 @@ fn write_frame_data(writer: &mut TreeByteWriter, data: &FrameData) {
 
 fn read_frame_data(reader: &mut TreeByteReader<'_>) -> Option<FrameData> {
     Some(match reader.u8()? {
+        FRAME_KIND_BACKGROUND_COLOR_ANIMATION => FrameData::BackgroundColorAnimation,
         FRAME_KIND_CLIP => FrameData::Clip(ClipData {
             rect: reader.float_rect()?,
             corner_radii: reader.corner_radii()?,
@@ -449,7 +452,7 @@ fn spatial_node_has_ancestor(nodes: &[SpatialNode], mut node: usize, ancestor: S
 }
 
 impl VisualContextTree {
-    fn decoded_references_are_consistent(&self) -> bool {
+    pub(super) fn node_references_are_consistent(&self) -> bool {
         let spatial_nodes = &self.spatial_nodes;
         let root = &spatial_nodes[VISUAL_VIEWPORT_NODE_INDEX.0 as usize];
         if root.parent != VISUAL_VIEWPORT_NODE_INDEX || !matches!(root.data, SpatialData::Transform(_)) {
@@ -576,8 +579,9 @@ impl VisualContextTree {
             free_frame_slots: Vec::new(),
             quarantined_spatial_slots: Vec::new(),
             quarantined_frame_slots: Vec::new(),
+            sampled_background_colors: std::collections::HashMap::new(),
         };
-        tree.decoded_references_are_consistent().then_some(tree)
+        tree.node_references_are_consistent().then_some(tree)
     }
 }
 
@@ -782,6 +786,7 @@ mod tests {
 
     fn frame_data_matches(a: &FrameData, b: &FrameData) -> bool {
         match (a, b) {
+            (FrameData::BackgroundColorAnimation, FrameData::BackgroundColorAnimation) => true,
             (FrameData::Clip(a), FrameData::Clip(b)) => a == b,
             (FrameData::ClipPath(a), FrameData::ClipPath(b)) => {
                 a.bounding_rect == b.bounding_rect && a.fill_rule == b.fill_rule
@@ -925,6 +930,7 @@ mod tests {
             frame_under_tombstone.append_frame(effects(), FrameNodeIndex::NONE, VISUAL_VIEWPORT_NODE_INDEX);
         frame_under_tombstone.append_frame(effects(), parent_frame, VISUAL_VIEWPORT_NODE_INDEX);
         assert!(frame_under_tombstone.tombstone_frame_slot(parent_frame));
+        assert!(!frame_under_tombstone.node_references_are_consistent());
         assert!(VisualContextTree::from_bytes(&encode_tree(&frame_under_tombstone)).is_none());
 
         let mut frame_in_tombstone = VisualContextTree::create(transform(FloatMatrix4x4::identity()));

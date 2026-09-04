@@ -569,6 +569,12 @@ impl_computed_payload_clone_and_eq!(MiscResetValues {
     scroll_padding,
     overflow_clip_margin,
     column_span,
+    break_before,
+    break_after,
+    break_inside,
+    column_rule_style,
+    box_decoration_break,
+    column_fill,
     appearance,
     computed_appearance,
     outline_style,
@@ -576,6 +582,8 @@ impl_computed_payload_clone_and_eq!(MiscResetValues {
     column_height,
     outline_color,
     outline_width,
+    column_rule_color,
+    column_rule_width,
     outline_offset,
     user_select,
     object_position_x,
@@ -1797,7 +1805,7 @@ enum GroupFieldPoke {
     Data(u32, *const crate::css::style_value::StyleValueData),
 }
 
-const MAX_GROUP_FIELD_COUNT: usize = 40;
+pub(crate) const MAX_GROUP_FIELD_COUNT: usize = 48;
 
 struct GroupFieldPokes {
     entries: [std::mem::MaybeUninit<GroupFieldPoke>; MAX_GROUP_FIELD_COUNT],
@@ -3014,6 +3022,12 @@ impl MiscResetValues {
             scroll_padding: ComputedLengthBox::auto(),
             overflow_clip_margin: ComputedOverflowClipMargin::initial(),
             column_span: 0,
+            break_before: crate::css::css_enums::break_between::AUTO,
+            break_after: crate::css::css_enums::break_between::AUTO,
+            break_inside: crate::css::css_enums::break_inside::AUTO,
+            column_rule_style: crate::css::css_enums::line_style::NONE,
+            box_decoration_break: crate::css::css_enums::box_decoration_break::SLICE,
+            column_fill: crate::css::css_enums::column_fill::BALANCE,
             appearance: 0,
             computed_appearance: 7,
             outline_style: 1,
@@ -3021,6 +3035,8 @@ impl MiscResetValues {
             column_height: ComputedSize::keyword(ComputedSizeKind::Auto),
             outline_color: 0xff000000,
             outline_width: CssPixels::from_integer(3),
+            column_rule_color: 0xff000000,
+            column_rule_width: CssPixels::from_integer(3),
             outline_offset: CssPixels::from_raw(0),
             user_select: 1,
             object_position_x: ComputedStyleValueHandle::percentage(50.0),

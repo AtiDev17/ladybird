@@ -146,6 +146,30 @@ pub struct FfiFrameOpacitySample {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+pub struct FfiFrameBackgroundColorSample {
+    pub frame: u32,
+    pub color: libgfx_rust::Color,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum FfiVisualAnimationTargetKind {
+    Opacity,
+    BackgroundColor,
+    Filter,
+    Transform,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiFrameFilterSample {
+    pub frame: u32,
+    pub filter_bytes: *const u8,
+    pub filter_size: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct FfiSpatialTransformSample {
     pub spatial: u32,
     pub matrix: FloatMatrix4x4,

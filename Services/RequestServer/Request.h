@@ -13,6 +13,7 @@
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
 #include <LibCore/Proxy.h>
+#include <LibCore/Timer.h>
 #include <LibDNS/Resolver.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cache/CacheRequest.h>
@@ -87,7 +88,14 @@ public:
     ErrorOr<void> transfer_to_client(ConnectionFromClient&, u64 request_id, Optional<Requests::RequestTransferLeaseKey>);
     void release_transfer_lease() { m_transfer_lease.clear(); }
 
+    // The disk cache defers a request while another request holds its cache entry open. These bound how long that other
+    // request may go without making progress before the deferred one goes to the network without the cache — and how
+    // long a background revalidation may go without receiving any data before it's abandoned. Tests shorten both.
+    static void set_wait_for_cache_timeout(AK::Duration);
+    static void set_revalidation_stall_timeout(AK::Duration);
+
     virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override;
+    virtual Optional<MonotonicTime> last_activity_time() const override { return m_last_activity_time; }
     bool notify_retrieved_http_cookie(Badge<ConnectionFromClient>, u64 cookie_request_id, StringView cookie);
     void notify_fetch_complete(Badge<ConnectionFromClient>, int result_code);
     void retry_after_aia(Badge<ConnectionFromClient>);
@@ -180,6 +188,8 @@ private:
 
     void handle_initial_state();
     void handle_read_cache_state();
+    void handle_wait_for_cache_state();
+    void wait_for_cache_timed_out();
     void handle_failed_cache_only_state();
     void handle_serve_substitution_state();
     void handle_dns_lookup_state();
@@ -191,6 +201,10 @@ private:
 
     static size_t on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data);
     static size_t on_data_received(void* buffer, size_t size, size_t nmemb, void* user_data);
+
+    // A state change, response bytes from curl, or bytes written to the cache entry count as progress — and a
+    // request waiting on the cache entry this request holds open judges by it whether this request has stalled.
+    void mark_activity() { m_last_activity_time = MonotonicTime::now(); }
 
     ErrorOr<void> detach_curl_handle_from_multi();
     ErrorOr<void> free_curl_structs();
@@ -238,6 +252,7 @@ private:
     ByteString m_method;
 
     UnixDateTime m_request_start_time { UnixDateTime::now() };
+    MonotonicTime m_last_activity_time { MonotonicTime::now() };
     NonnullRefPtr<HTTP::HeaderList> m_request_headers;
     ByteBuffer m_request_body;
 
@@ -254,6 +269,7 @@ private:
 
     AllocatingMemoryStream m_response_buffer;
     RefPtr<Core::Notifier> m_client_writer_notifier;
+    RefPtr<Core::Timer> m_wait_for_cache_timer;
     Optional<RequestPipe> m_client_request_pipe;
     Optional<TransferredBodyFile> m_transferred_body_file;
     size_t m_bytes_transferred_to_client { 0 };

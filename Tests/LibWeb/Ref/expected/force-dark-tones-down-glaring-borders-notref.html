@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<style>
+    body { margin: 0; background: #181818; color: #e8e8e8; }
+    #box { width: 100px; height: 100px; border: 8px solid #dddddd; }
+</style>
+<div id="box"></div>
+<script>
+    // The same page with force-dark off: the glaring border as authored. The test page must not match this.
+    if (window.internals)
+        internals.setForceDarkEnabled(false);
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            document.documentElement.classList.remove("reftest-wait");
+        });
+    });
+</script>
+</html>

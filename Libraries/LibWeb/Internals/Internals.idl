@@ -4,6 +4,9 @@ interface Internals {
     undefined signalTestIsDone(DOMString text);
     undefined setTestTimeout(double milliseconds);
     undefined forceIncompatibleVisualContextTreeRebuild();
+    undefined setForceDarkEnabled(boolean enabled);
+    undefined setShowLineBoxBorders(boolean enabled);
+    undefined setForceDarkThresholds(long foreground, long background);
     unsigned long long visualContextTreeNodeCount();
     unsigned long long visualContextPendingDirtyBoxCount();
     unsigned long long accumulatedVisualContextIncrementalUpdateCount();
@@ -185,6 +188,7 @@ interface Internals {
     undefined updateCompositorAnimations();
     boolean runEmptyAnimationStyleUpdateForTesting();
     undefined armCompositorAnimationTimersForTesting();
+    undefined fireCompositorAnimationWakeupForTesting(double frameTimeMs);
     undefined requestReentrantAnimationStyleFlushForTesting(Node node);
     // Returns the confinement report of the most recent layout tree build for the current
     // document. Keys: builds (cumulative build count), lastBuildRebuiltSubtreeRoots (number of

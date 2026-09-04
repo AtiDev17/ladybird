@@ -78,11 +78,14 @@
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
+#include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/TransitionEvent.h>
@@ -2986,17 +2989,18 @@ Optional<Vector<Utf16FlyString> const&> Document::supported_color_schemes() cons
     return m_supported_color_schemes;
 }
 
-void Document::set_supported_color_schemes(Vector<Utf16FlyString> supported_color_schemes)
+void Document::set_supported_color_schemes(Vector<Utf16FlyString> supported_color_schemes, bool only)
 {
-    set_supported_color_schemes(Optional<Vector<Utf16FlyString>> { move(supported_color_schemes) });
+    set_supported_color_schemes(Optional<Vector<Utf16FlyString>> { move(supported_color_schemes) }, only);
 }
 
-void Document::set_supported_color_schemes(Optional<Vector<Utf16FlyString>> supported_color_schemes)
+void Document::set_supported_color_schemes(Optional<Vector<Utf16FlyString>> supported_color_schemes, bool only)
 {
-    if (m_supported_color_schemes == supported_color_schemes)
+    if (m_supported_color_schemes == supported_color_schemes && m_supported_color_schemes_are_only == only)
         return;
 
     m_supported_color_schemes = move(supported_color_schemes);
+    m_supported_color_schemes_are_only = only;
     record_style_environment_change();
     set_needs_media_query_evaluation();
 }
@@ -3005,6 +3009,7 @@ void Document::set_supported_color_schemes(Optional<Vector<Utf16FlyString>> supp
 void Document::obtain_supported_color_schemes()
 {
     Optional<Vector<Utf16FlyString>> supported_color_schemes;
+    auto supported_color_schemes_are_only = false;
 
     // 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
     for_each_in_subtree_of_type<HTML::HTMLMetaElement>([&](HTML::HTMLMetaElement& element) {
@@ -3022,6 +3027,7 @@ void Document::obtain_supported_color_schemes()
             // 2. If parsed is a valid CSS 'color-scheme' property value, then return parsed.
             if (!parsed.is_null() && parsed->is_color_scheme()) {
                 supported_color_schemes = parsed->as_color_scheme().schemes();
+                supported_color_schemes_are_only = parsed->as_color_scheme().only();
                 return TraversalDecision::Break;
             }
         }
@@ -3030,7 +3036,7 @@ void Document::obtain_supported_color_schemes()
     });
 
     // 3. Return null.
-    set_supported_color_schemes(move(supported_color_schemes));
+    set_supported_color_schemes(move(supported_color_schemes), supported_color_schemes_are_only);
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
@@ -7470,11 +7476,16 @@ static Optional<CSS::Length> compositor_transform_percentage_basis(CSS::Transfor
 
 static Optional<Compositor::VisualAnimationTransformOperation> compositor_transform_operation(CSS::TransformationStyleValue const& transformation, CSSPixelSize reference_size, float device_pixels_per_css_pixel)
 {
-    auto kind = compositor_transform_operation_kind(transformation.transform_function());
+    auto transform_function = transformation.transform_function();
+    Optional<Compositor::VisualAnimationTransformOperationKind> kind;
+    if (transform_function == CSS::TransformFunction::Rotate3d)
+        kind = Compositor::VisualAnimationTransformOperationKind::Rotate;
+    else
+        kind = compositor_transform_operation_kind(transform_function);
     if (!kind.has_value())
         return {};
 
-    auto metadata = CSS::transform_function_metadata(transformation.transform_function());
+    auto metadata = CSS::transform_function_metadata(transform_function);
     auto style_values = transformation.values();
     Vector<float> values;
     values.ensure_capacity(style_values.size());
@@ -7487,7 +7498,7 @@ static Optional<Compositor::VisualAnimationTransformOperation> compositor_transf
             case CSS::TransformFunctionParameterType::Length:
             case CSS::TransformFunctionParameterType::LengthNone:
             case CSS::TransformFunctionParameterType::LengthPercentage:
-                return CSS::Length::from_style_value(style_value, compositor_transform_percentage_basis(transformation.transform_function(), index, reference_size)).absolute_length_to_px().to_float() * device_pixels_per_css_pixel;
+                return CSS::Length::from_style_value(style_value, compositor_transform_percentage_basis(transform_function, index, reference_size)).absolute_length_to_px().to_float() * device_pixels_per_css_pixel;
             case CSS::TransformFunctionParameterType::Number:
             case CSS::TransformFunctionParameterType::NumberPercentage:
                 return CSS::number_from_style_value(style_value, 1);
@@ -7497,6 +7508,26 @@ static Optional<Compositor::VisualAnimationTransformOperation> compositor_transf
         if (!isfinite(value))
             return {};
         values.unchecked_append(value);
+    }
+    if (transform_function == CSS::TransformFunction::Rotate3d) {
+        if (values.size() != 4)
+            return {};
+        float axis;
+        if (values[0] != 0 && values[1] == 0 && values[2] == 0) {
+            *kind = Compositor::VisualAnimationTransformOperationKind::RotateX;
+            axis = values[0];
+        } else if (values[0] == 0 && values[1] != 0 && values[2] == 0) {
+            *kind = Compositor::VisualAnimationTransformOperationKind::RotateY;
+            axis = values[1];
+        } else if (values[0] == 0 && values[1] == 0 && values[2] != 0) {
+            *kind = Compositor::VisualAnimationTransformOperationKind::RotateZ;
+            axis = values[2];
+        } else {
+            return {};
+        }
+        auto angle = axis < 0 ? -values[3] : values[3];
+        values.clear();
+        values.append(angle);
     }
     if (*kind == Compositor::VisualAnimationTransformOperationKind::Translate && values.size() == 1)
         kind = Compositor::VisualAnimationTransformOperationKind::TranslateX;
@@ -7547,8 +7578,43 @@ static bool is_transform_family_property(CSS::PropertyID property_id)
         CSS::PropertyID::Transform);
 }
 
-static Optional<Compositor::VisualAnimationTransformList> compositor_transform_animation_value(CSS::PropertyID property_id, CSS::StyleValue const& style_value, Layout::Node const& layout_node, float device_pixels_per_css_pixel)
+static Optional<Compositor::VisualAnimationTransformList> compositor_transform_animation_value(CSS::PropertyID property_id, CSS::StyleValue const& style_value, Layout::Node const& layout_node, float device_pixels_per_css_pixel, Compositor::VisualAnimationTransformList const* transform_identity_shape = nullptr)
 {
+    if (style_value.is_keyword() && style_value.to_keyword() == CSS::Keyword::None) {
+        Compositor::VisualAnimationTransformList identity;
+        if (transform_identity_shape) {
+            identity.ensure_capacity(transform_identity_shape->size());
+            for (auto const& operation : *transform_identity_shape) {
+                Vector<float> values;
+                values.resize(operation.values.size());
+                if (first_is_one_of(operation.kind,
+                        Compositor::VisualAnimationTransformOperationKind::Scale,
+                        Compositor::VisualAnimationTransformOperationKind::Scale3d,
+                        Compositor::VisualAnimationTransformOperationKind::ScaleX,
+                        Compositor::VisualAnimationTransformOperationKind::ScaleY,
+                        Compositor::VisualAnimationTransformOperationKind::ScaleZ))
+                    values.fill(1);
+                identity.append({ operation.kind, move(values) });
+            }
+            return identity;
+        }
+        switch (property_id) {
+        case CSS::PropertyID::Translate:
+            identity.append({ Compositor::VisualAnimationTransformOperationKind::Translate, { 0, 0 } });
+            return identity;
+        case CSS::PropertyID::Rotate:
+            identity.append({ Compositor::VisualAnimationTransformOperationKind::Rotate, { 0 } });
+            return identity;
+        case CSS::PropertyID::Scale:
+            identity.append({ Compositor::VisualAnimationTransformOperationKind::Scale, { 1, 1 } });
+            return identity;
+        case CSS::PropertyID::Transform:
+            return {};
+        default:
+            return {};
+        }
+    }
+
     Vector<NonnullRefPtr<CSS::TransformationStyleValue const>> transformations;
     if (property_id == CSS::PropertyID::Transform) {
         transformations = CSS::transformations_for_style_value(style_value);
@@ -7579,6 +7645,87 @@ static Optional<float> compositor_opacity_animation_value(CSS::StyleValue const&
     if (!isfinite(opacity))
         return {};
     return opacity;
+}
+
+static Optional<Gfx::Color> compositor_background_color_animation_value(CSS::StyleValue const& style_value, DOM::AbstractElement target)
+{
+    // Legacy sRGB colors interpolate in gamma-encoded sRGB, which the compositor sampler matches. Keep modern
+    // color syntaxes on the main thread until compositor values can retain their interpolation color space.
+    if (style_value.to_keyword() == CSS::Keyword::Currentcolor)
+        return {};
+    if (style_value.is_color() && style_value.as_color().color_syntax() != CSS::ColorSyntax::Legacy)
+        return {};
+    auto color = style_value.to_color(CSS::ColorResolutionContext::for_element(target));
+    if (!color.has_value())
+        return {};
+    return color.release_value();
+}
+
+static Optional<Compositor::VisualAnimationFilterList> compositor_filter_animation_value(CSS::StyleValue const& style_value, DOM::AbstractElement target, float device_pixels_per_css_pixel)
+{
+    if (style_value.to_keyword() == CSS::Keyword::None)
+        return Compositor::VisualAnimationFilterList {};
+    if (!style_value.is_value_list())
+        return {};
+
+    Compositor::VisualAnimationFilterList operations;
+    operations.ensure_capacity(style_value.as_value_list().size());
+    for (auto const& value : style_value.as_value_list().values()) {
+        if (!value->is_filter())
+            return {};
+        auto const& filter = value->as_filter();
+        switch (filter.kind()) {
+        case CSS::FilterStyleValue::Kind::Blur: {
+            auto const& blur = static_cast<CSS::BlurFilterStyleValue const&>(filter);
+            operations.append({
+                .kind = Compositor::VisualAnimationFilterOperationKind::Blur,
+                .amount = CSSPixels::nearest_value_for(blur.resolved_radius()).to_float() * device_pixels_per_css_pixel,
+            });
+            break;
+        }
+        case CSS::FilterStyleValue::Kind::DropShadow: {
+            auto const& drop_shadow = static_cast<CSS::DropShadowFilterStyleValue const&>(filter);
+            auto color_value = drop_shadow.color();
+            // Gfx filters hold 8-bit sRGB colors. Keep modern color interpolation and currentcolor on the main thread
+            // until compositor filter values can retain the interpolation color space and source color syntax.
+            if (!color_value || !color_value->is_color() || color_value->as_color().color_syntax() != CSS::ColorSyntax::Legacy)
+                return {};
+            auto color = color_value->to_color(CSS::ColorResolutionContext::for_element(target));
+            if (!color.has_value())
+                return {};
+            auto resolve_length = [&](CSS::StyleValue const& length) {
+                auto css_pixels = CSSPixels::nearest_value_for(CSS::Length::from_style_value(length, {}).absolute_length_to_px_without_rounding());
+                return css_pixels.to_float() * device_pixels_per_css_pixel;
+            };
+            operations.append({
+                .kind = Compositor::VisualAnimationFilterOperationKind::DropShadow,
+                .amount = drop_shadow.radius() ? resolve_length(*drop_shadow.radius()) : 0,
+                .offset_x = resolve_length(*drop_shadow.offset_x()),
+                .offset_y = resolve_length(*drop_shadow.offset_y()),
+                .color = color.release_value(),
+            });
+            break;
+        }
+        case CSS::FilterStyleValue::Kind::Color: {
+            auto const& color = static_cast<CSS::ColorFilterStyleValue const&>(filter);
+            operations.append({
+                .kind = Compositor::VisualAnimationFilterOperationKind::Color,
+                .amount = color.resolved_amount(),
+                .color_operation = color.operation(),
+            });
+            break;
+        }
+        case CSS::FilterStyleValue::Kind::HueRotate: {
+            auto const& hue_rotate = static_cast<CSS::HueRotateFilterStyleValue const&>(filter);
+            operations.append({
+                .kind = Compositor::VisualAnimationFilterOperationKind::HueRotate,
+                .amount = hue_rotate.angle_degrees(),
+            });
+            break;
+        }
+        }
+    }
+    return operations;
 }
 
 static bool transform_keyframes_only_translate_horizontally(ReadonlySpan<Compositor::VisualAnimationKeyframe> keyframes)
@@ -7642,13 +7789,23 @@ static bool keyframe_effect_only_translates_horizontally(Animations::KeyframeEff
     return transform_keyframes_only_translate_horizontally(keyframes);
 }
 
-static Optional<Compositor::VisualAnimation> build_compositor_animation(Animations::KeyframeEffect& effect, Painting::AccumulatedVisualContextTree const& visual_context_tree, Compositor::VisualAnimation::TargetKind target_kind, Optional<bool>& only_translates_horizontally)
+static Optional<Compositor::VisualAnimation> build_compositor_animation(Animations::KeyframeEffect& effect, Painting::AccumulatedVisualContextTree const& visual_context_tree, Compositor::VisualAnimation::TargetKind target_kind, Optional<bool>& only_translates_horizontally, bool* missing_visual_context_node = nullptr)
 {
+    if (missing_visual_context_node)
+        *missing_visual_context_node = false;
+
     auto animation = effect.associated_animation();
-    if (!animation || animation->play_state() != Bindings::AnimationPlayState::Running || animation->pending())
+    if (!animation || animation->play_state() != Bindings::AnimationPlayState::Running)
+        return {};
+    bool is_initial_pending_css_transition = animation->pending()
+        && animation->has_pending_play_task()
+        && animation->is_css_transition()
+        && as<CSS::CSSTransition>(*animation).previous_phase() == CSS::CSSTransition::Phase::Idle;
+    if (animation->pending() && !is_initial_pending_css_transition)
         return {};
     auto timeline = animation->timeline();
-    if (!timeline || !timeline->is_monotonically_increasing() || !effect.is_in_the_active_phase())
+    if (!timeline || !timeline->is_monotonically_increasing()
+        || (!effect.is_in_the_before_phase() && !effect.is_in_the_active_phase()))
         return {};
     if ((!isinf(effect.iteration_count()) && effect.iteration_count() != 1) || effect.composite() != Bindings::CompositeOperation::Replace)
         return {};
@@ -7658,6 +7815,8 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
         || effect.iteration_duration().value <= 0)
         return {};
+    if (effect.is_in_the_before_phase() && effect.before_active_boundary_time() != effect.start_delay())
+        return {};
     auto current_time = animation->current_time();
     if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
         return {};
@@ -7665,18 +7824,40 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         return {};
 
     bool targets_opacity = target_kind == Compositor::VisualAnimation::TargetKind::Opacity && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
+    bool targets_background_color = target_kind == Compositor::VisualAnimation::TargetKind::BackgroundColor && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
+    bool targets_filter = target_kind == Compositor::VisualAnimation::TargetKind::Filter && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
     bool targets_transform = target_kind == Compositor::VisualAnimation::TargetKind::Transform && any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
-    if (!targets_opacity && !targets_transform)
+    if (!targets_opacity && !targets_background_color && !targets_filter && !targets_transform)
         return {};
-    if (any_of(effect.target_properties(), [&](auto const& property) { return property.id() != CSS::PropertyID::Opacity && !is_transform_family_property(property.id()); }))
+    if (any_of(effect.target_properties(), [&](auto const& property) { return !first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter) && !is_transform_family_property(property.id()); }))
         return {};
     auto target = effect.target_abstract_element();
     if (!target.has_value() || target->element().namespace_uri() == Namespace::SVG)
         return {};
-    auto frame_timestamp = target->document().last_animation_frame_timestamp();
-    if (!frame_timestamp.has_value())
+    auto monotonic_time_at_anchor_ms = [&]() -> Optional<double> {
+        if (!is_initial_pending_css_transition) {
+            auto frame_timestamp = target->document().last_animation_frame_timestamp();
+            if (!frame_timestamp.has_value())
+                return {};
+            return *frame_timestamp + target->document().relevant_settings_object().time_origin();
+        }
+
+        // OPTIMIZATION: A new CSS transition is play-pending until the next animation update. Start its compositor
+        //               descriptor at the style change event time without resolving the Animation's pending task.
+        auto const& transition = as<CSS::CSSTransition>(*animation);
+        auto style_change_event_time = Animations::TimeValue {
+            Animations::TimeValue::Type::Milliseconds,
+            transition.transition_start_time() - effect.start_delay().value,
+        };
+        if (!timeline->can_convert_a_timeline_time_to_an_origin_relative_time())
+            return {};
+        auto origin_relative_time = timeline->convert_a_timeline_time_to_an_origin_relative_time(style_change_event_time);
+        if (!origin_relative_time.has_value())
+            return {};
+        return *origin_relative_time + target->document().relevant_settings_object().time_origin();
+    }();
+    if (!monotonic_time_at_anchor_ms.has_value())
         return {};
-    auto monotonic_time_at_anchor_ms = *frame_timestamp + target->document().relevant_settings_object().time_origin();
     auto const* layout_node = target->unsafe_layout_node();
     if (!layout_node)
         return {};
@@ -7723,6 +7904,22 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
             .values = {},
         };
         new_cache.values.ensure_capacity(key_frame_set->keyframes_by_key.size());
+        HashMap<CSS::PropertyID, Optional<Compositor::VisualAnimationTransformList>> transform_identity_shapes;
+        auto resolve_transform_identity_shape = [&](CSS::PropertyID property_id) -> Compositor::VisualAnimationTransformList const* {
+            auto& transform_identity_shape = transform_identity_shapes.ensure(property_id, [&]() -> Optional<Compositor::VisualAnimationTransformList> {
+                for (auto const& candidate_entry : key_frame_set->keyframes_by_key) {
+                    auto candidate = candidate_entry.properties.get(CSS::PropertyNameAndID::from_id(property_id));
+                    if (!candidate.has_value() || !candidate->has<CSS::RustStyleValueHandle>())
+                        continue;
+                    auto candidate_style_value = resolved_compositor_animation_style_value(property_id, candidate->get<CSS::RustStyleValueHandle>(), *target);
+                    if (!candidate_style_value || (candidate_style_value->is_keyword() && candidate_style_value->to_keyword() == CSS::Keyword::None))
+                        continue;
+                    return compositor_transform_animation_value(property_id, *candidate_style_value, *layout_node, device_pixels_per_css_pixel);
+                }
+                return {};
+            });
+            return transform_identity_shape.has_value() ? &*transform_identity_shape : nullptr;
+        };
         size_t transform_property_count = 0;
         for (auto const& property : effect.target_properties()) {
             if (is_transform_family_property(property.id()))
@@ -7741,6 +7938,30 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                     auto opacity = compositor_opacity_animation_value(*style_value);
                     if (opacity.has_value())
                         value = Compositor::VisualAnimationValue { opacity.release_value() };
+                }
+            } else if (target_kind == Compositor::VisualAnimation::TargetKind::BackgroundColor) {
+                auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
+                if (!property.has_value() || !property->has<CSS::RustStyleValueHandle>()) {
+                    new_cache.values.append({});
+                    continue;
+                }
+                auto style_value = resolved_compositor_animation_style_value(CSS::PropertyID::BackgroundColor, property->get<CSS::RustStyleValueHandle>(), *target);
+                if (style_value) {
+                    auto color = compositor_background_color_animation_value(*style_value, *target);
+                    if (color.has_value())
+                        value = Compositor::VisualAnimationValue { color.release_value() };
+                }
+            } else if (target_kind == Compositor::VisualAnimation::TargetKind::Filter) {
+                auto property = entry.properties.get(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
+                if (!property.has_value() || !property->has<CSS::RustStyleValueHandle>()) {
+                    new_cache.values.append({});
+                    continue;
+                }
+                auto style_value = resolved_compositor_animation_style_value(CSS::PropertyID::Filter, property->get<CSS::RustStyleValueHandle>(), *target);
+                if (style_value) {
+                    auto filter = compositor_filter_animation_value(*style_value, *target, device_pixels_per_css_pixel);
+                    if (filter.has_value())
+                        value = Compositor::VisualAnimationValue { filter.release_value() };
                 }
             } else {
                 Compositor::VisualAnimationTransformList operations;
@@ -7762,7 +7983,10 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                         new_cache.is_valid = false;
                         break;
                     }
-                    auto property_operations = compositor_transform_animation_value(property_id, *style_value, *layout_node, device_pixels_per_css_pixel);
+                    auto const* transform_identity_shape = style_value->is_keyword() && style_value->to_keyword() == CSS::Keyword::None
+                        ? resolve_transform_identity_shape(property_id)
+                        : nullptr;
+                    auto property_operations = compositor_transform_animation_value(property_id, *style_value, *layout_node, device_pixels_per_css_pixel, transform_identity_shape);
                     if (!property_operations.has_value()) {
                         new_cache.is_valid = false;
                         break;
@@ -7787,10 +8011,6 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         return *cached_values;
     };
     auto build_animation_for_target = [&](Compositor::VisualAnimation::TargetKind target_kind) -> Optional<Compositor::VisualAnimation> {
-        auto visual_context_node_indices = Painting::rust_visual_animation_target_node_indices(*layout_node, visual_context_tree, target_kind == Compositor::VisualAnimation::TargetKind::Opacity);
-        if (visual_context_node_indices.is_empty())
-            return {};
-
         Vector<Compositor::VisualAnimationEasing> keyframe_easings;
         keyframe_easings.ensure_capacity(key_frame_set->keyframes_by_key.size());
         for (auto it = key_frame_set->keyframes_by_key.begin(); it != key_frame_set->keyframes_by_key.end(); ++it) {
@@ -7840,10 +8060,30 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
                 && transform_keyframes_only_translate_horizontally(keyframes);
         }
 
+        auto ffi_target_kind = [&] {
+            switch (target_kind) {
+            case Compositor::VisualAnimation::TargetKind::Opacity:
+                return Layout::RustFFI::FfiVisualAnimationTargetKind::Opacity;
+            case Compositor::VisualAnimation::TargetKind::BackgroundColor:
+                return Layout::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor;
+            case Compositor::VisualAnimation::TargetKind::Filter:
+                return Layout::RustFFI::FfiVisualAnimationTargetKind::Filter;
+            case Compositor::VisualAnimation::TargetKind::Transform:
+                return Layout::RustFFI::FfiVisualAnimationTargetKind::Transform;
+            }
+            VERIFY_NOT_REACHED();
+        }();
+        auto visual_context_node_indices = Painting::rust_visual_animation_target_node_indices(*layout_node, visual_context_tree, ffi_target_kind);
+        if (visual_context_node_indices.is_empty()) {
+            if (missing_visual_context_node)
+                *missing_visual_context_node = true;
+            return {};
+        }
+
         Compositor::VisualAnimation visual_animation {
             .target_kind = target_kind,
             .visual_context_node_indices = move(visual_context_node_indices),
-            .monotonic_time_at_anchor_ns = static_cast<i64>(monotonic_time_at_anchor_ms * 1'000'000.0),
+            .monotonic_time_at_anchor_ns = static_cast<i64>(*monotonic_time_at_anchor_ms * 1'000'000.0),
             .local_time_at_anchor_ms = current_time->value,
             .playback_rate = animation->playback_rate(),
             .start_delay_ms = effect.start_delay().value,
@@ -7851,6 +8091,9 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
             .iteration_count = effect.iteration_count(),
             .iteration_start = effect.iteration_start(),
             .playback_direction = static_cast<Compositor::VisualAnimationPlaybackDirection>(to_underlying(effect.playback_direction())),
+            .fill_mode = first_is_one_of(effect.fill_mode(), Bindings::FillMode::Backwards, Bindings::FillMode::Both)
+                ? Compositor::VisualAnimationFillMode::Backwards
+                : Compositor::VisualAnimationFillMode::None,
             .easing = Compositor::VisualAnimationEasing::from_css(effect.timing_function()),
             .keyframes = move(keyframes),
         };
@@ -7878,54 +8121,71 @@ void Document::schedule_compositor_animation_wakeup(double delay_ms)
             document.m_compositor_animation_wakeup_deadline.clear();
             auto timestamp = HighResolutionTime::relative_high_resolution_time(
                 HighResolutionTime::unsafe_shared_current_time(), document.relevant_settings_object().global_object());
-            Optional<double> next_wakeup_delay_ms;
-            bool reached_wakeup = false;
-            for (auto& animation : document.m_associated_animations) {
-                if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-                    continue;
-                auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-                auto timeline_time = animation.timeline() ? animation.timeline()->current_time_at_timestamp(timestamp) : Optional<Animations::TimeValue> {};
-                auto current_time = animation.current_time_at(timeline_time);
-                if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
-                    continue;
-                if (!effect.is_compositor_driven()
-                    && !animation.pending()
-                    && animation.playback_rate() > 0
-                    && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds) {
-                    if (current_time->value < effect.start_delay().value) {
-                        auto delay = (effect.start_delay().value - current_time->value) / animation.playback_rate();
-                        if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
-                            next_wakeup_delay_ms = delay;
-                        continue;
-                    }
-                    effect.request_observation_sample();
-                    reached_wakeup = true;
-                    continue;
-                }
-                bool is_compositor_handled = effect.is_compositor_driven()
-                    || effect.is_compositor_replaced()
-                    || !effect.retained_compositor_animations().is_empty();
-                if (!is_compositor_handled || isinf(effect.iteration_count()))
-                    continue;
-                auto active_end = effect.start_delay().value + effect.iteration_duration().value * effect.iteration_count();
-                if (current_time->value < active_end) {
-                    auto delay = (active_end - current_time->value) / animation.playback_rate();
-                    if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
-                        next_wakeup_delay_ms = delay;
-                    continue;
-                }
-                effect.request_observation_sample();
-                reached_wakeup = true;
-            }
-            if (next_wakeup_delay_ms.has_value())
-                document.schedule_compositor_animation_wakeup(*next_wakeup_delay_ms);
-            if (reached_wakeup) {
-                ++document.m_style_invalidation_counters.animation_frame_pump_requests;
-                document.page().client().request_frame();
-            }
+            document.service_compositor_animation_wakeup(timestamp);
         }));
     }
     m_compositor_animation_wakeup_timer->restart(static_cast<int>(timer_delay_ms));
+}
+
+void Document::service_compositor_animation_wakeup(double timestamp)
+{
+    Optional<double> next_wakeup_delay_ms;
+    bool reached_wakeup = false;
+    bool reached_compositor_active_start = false;
+    for (auto& animation : m_associated_animations) {
+        if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+            continue;
+        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+        auto timeline_time = animation.timeline() ? animation.timeline()->current_time_at_timestamp(timestamp) : Optional<Animations::TimeValue> {};
+        auto current_time = animation.current_time_at(timeline_time);
+        if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
+            continue;
+        bool is_compositor_handled = effect.is_compositor_driven()
+            || effect.is_compositor_replaced()
+            || !effect.retained_compositor_animations().is_empty();
+        if (!animation.pending()
+            && animation.playback_rate() > 0
+            && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
+            && effect.is_in_the_before_phase()) {
+            if (current_time->value < effect.start_delay().value) {
+                auto delay = (effect.start_delay().value - current_time->value) / animation.playback_rate();
+                if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
+                    next_wakeup_delay_ms = delay;
+            } else {
+                effect.request_observation_sample();
+                reached_wakeup = true;
+                if (is_compositor_handled)
+                    reached_compositor_active_start = true;
+            }
+        }
+        if (!is_compositor_handled || isinf(effect.iteration_count()))
+            continue;
+        auto active_end = effect.start_delay().value + effect.iteration_duration().value * effect.iteration_count();
+        if (current_time->value < active_end) {
+            auto delay = (active_end - current_time->value) / animation.playback_rate();
+            if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
+                next_wakeup_delay_ms = delay;
+            continue;
+        }
+        effect.request_observation_sample();
+        reached_wakeup = true;
+    }
+    if (next_wakeup_delay_ms.has_value())
+        schedule_compositor_animation_wakeup(*next_wakeup_delay_ms);
+    if (reached_wakeup) {
+        if (reached_compositor_active_start)
+            paint_state().republish_visual_animations(*this);
+        ++m_style_invalidation_counters.animation_frame_pump_requests;
+        page().client().request_frame();
+    }
+}
+
+void Document::fire_compositor_animation_wakeup_for_testing(Badge<Internals::Internals>, double frame_time_ms)
+{
+    if (m_compositor_animation_wakeup_timer)
+        m_compositor_animation_wakeup_timer->stop();
+    m_compositor_animation_wakeup_deadline.clear();
+    service_compositor_animation_wakeup(relevant_settings_object().time_origin() + frame_time_ms);
 }
 
 void Document::update_compositor_animations()
@@ -7936,6 +8196,8 @@ void Document::update_compositor_animations()
     };
     struct CompetingEffects {
         CompetingPropertyEffects opacity;
+        CompetingPropertyEffects background_color;
+        CompetingPropertyEffects filter;
         CompetingPropertyEffects transform;
     };
 
@@ -7952,6 +8214,8 @@ void Document::update_compositor_animations()
     HashMap<GC::Ptr<Element>, CSSPixelRect> observation_target_rect_cache;
     GC::RootHashTable<GC::Ref<Element>> elements_with_intersection_observation_descendants;
     GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
+    auto layout_nodes_with_stale_forced_effects_layer = move(m_layout_nodes_with_forced_compositor_effects_layer);
+    auto layout_nodes_with_stale_forced_background_color_frame = move(m_layout_nodes_with_forced_compositor_background_color_frame);
     Optional<double> compositor_animation_wakeup_delay_ms;
 
     auto index_shadow_including_element_ancestors = [](Node& node, GC::RootHashTable<GC::Ref<Element>>& index) {
@@ -8163,20 +8427,28 @@ void Document::update_compositor_animations()
         effect.set_is_offscreen_throttled(false);
         effect.set_is_observation_relevant_compositor_animation(false);
 
-        if (animation.is_idle() || !effect.is_in_effect())
+        if (animation.is_idle() || (!effect.is_in_effect() && !effect.is_in_the_before_phase()))
             continue;
         auto target = effect.target_abstract_element();
         if (!target.has_value())
             continue;
         auto& effects = competing_effects.ensure(*target);
         auto add_competing_effect = [&](CompetingPropertyEffects& property_effects) {
-            if (effect.composite() != Bindings::CompositeOperation::Replace)
+            bool effect_produces_output = effect.is_in_effect();
+            if (effect_produces_output && effect.composite() != Bindings::CompositeOperation::Replace)
                 property_effects.all_effects_use_replace = false;
-            if (!property_effects.winner || Animations::KeyframeEffect::composite_order(*property_effects.winner, effect) < 0)
+            bool winner_produces_output = property_effects.winner && property_effects.winner->is_in_effect();
+            if (!property_effects.winner
+                || (effect_produces_output && !winner_produces_output)
+                || (effect_produces_output == winner_produces_output && Animations::KeyframeEffect::composite_order(*property_effects.winner, effect) < 0))
                 property_effects.winner = effect;
         };
         if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity)))
             add_competing_effect(effects.opacity);
+        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor)))
+            add_competing_effect(effects.background_color);
+        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter)))
+            add_competing_effect(effects.filter);
         if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); })) {
             add_competing_effect(effects.transform);
             in_effect_transform_effects_by_target.ensure(&target->element()).append(effect);
@@ -8201,24 +8473,78 @@ void Document::update_compositor_animations()
                 property_effects.winner = nullptr;
         };
         validate_winner(effects.opacity);
+        validate_winner(effects.background_color);
+        validate_winner(effects.filter);
         validate_winner(effects.transform);
     }
 
+    // An opacity of 1 does not otherwise create an effects frame. Give an otherwise publishable opacity
+    // animation a target before the normal handoff loop, and retain that target while the effect remains live.
+    auto can_force_opacity_effects_layer = [](Animations::KeyframeEffect const& effect) {
+        return all_of(effect.target_properties(), [](auto const& property) {
+            return first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor)
+                || is_transform_family_property(property.id());
+        });
+    };
+    bool forced_opacity_effects_layer = false;
+    for (auto& [target, effects] : competing_effects) {
+        auto effect = effects.opacity.winner;
+        if (!effect || opacity_affects_visibility_observation(target.element()) || !can_force_opacity_effects_layer(*effect))
+            continue;
+
+        Optional<bool> only_translates_horizontally;
+        bool missing_visual_context_node = false;
+        (void)build_compositor_animation(*effect, visual_context_tree, Compositor::VisualAnimation::TargetKind::Opacity, only_translates_horizontally, &missing_visual_context_node);
+        auto* layout_node = target.unsafe_layout_node();
+        if (!layout_node)
+            continue;
+        bool already_forced_effects_layer = any_of(layout_nodes_with_stale_forced_effects_layer, [&](auto const& stale_layout_node) {
+            return stale_layout_node.ptr() == layout_node;
+        });
+        if (!missing_visual_context_node && !already_forced_effects_layer)
+            continue;
+
+        if (missing_visual_context_node && !layout_node->needs_compositor_effects_layer()) {
+            layout_node->set_needs_compositor_effects_layer(true);
+            schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
+            CSS::RequiredInvalidationAfterStyleChange invalidation;
+            invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+            Painting::repaint_after_style_change(*layout_node, invalidation);
+            forced_opacity_effects_layer = true;
+        }
+        if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == layout_node; }))
+            m_layout_nodes_with_forced_compositor_effects_layer.append(*layout_node);
+        layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto const& stale_layout_node) {
+            return stale_layout_node.ptr() == layout_node;
+        });
+    }
+    if (forced_opacity_effects_layer)
+        visual_context_tree = paint_state().visual_context_tree(*this);
+
     bool has_observation_relevant_compositor_animation = false;
     bool requested_withdrawn_effect_sample = false;
-    auto schedule_active_end_wakeup = [&](Animations::KeyframeEffect const& effect, Animations::Animation const& animation) {
-        if (isinf(effect.iteration_count())
-            || effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
+    auto schedule_next_phase_wakeup = [&](Animations::KeyframeEffect const& effect, Animations::Animation const& animation) {
+        if (effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
             || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
             || !animation.current_time().has_value()
             || animation.current_time()->type != Animations::TimeValue::Type::Milliseconds
             || animation.playback_rate() <= 0)
             return;
-        auto active_end = effect.start_delay().value + effect.iteration_duration().value * effect.iteration_count();
-        auto delay = (active_end - animation.current_time()->value) / animation.playback_rate();
+        auto next_phase_boundary = effect.start_delay().value;
+        if (animation.current_time()->value >= next_phase_boundary) {
+            if (isinf(effect.iteration_count()))
+                return;
+            next_phase_boundary += effect.iteration_duration().value * effect.iteration_count();
+        }
+        auto delay = (next_phase_boundary - animation.current_time()->value) / animation.playback_rate();
         if (delay > 0 && (!compositor_animation_wakeup_delay_ms.has_value() || delay < *compositor_animation_wakeup_delay_ms))
             compositor_animation_wakeup_delay_ms = delay;
     };
+    // Force-dark resolves colors when the display list is recorded, on the main thread. A compositor-driven
+    // background color is sampled at play time instead, and would paint as authored — so while force-dark applies,
+    // background-color animations stay on the main thread, where every tick re-records the darkened color.
+    auto navigable = this->navigable();
+    bool force_dark_applies = navigable && navigable->force_dark_applies_to_active_document();
     for (auto& animation : m_associated_animations) {
         if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
             continue;
@@ -8240,24 +8566,81 @@ void Document::update_compositor_animations()
         auto abstract_target = effect.target_abstract_element();
         if (!abstract_target.has_value() || effect.target_properties().is_empty())
             continue;
-        if (animation.is_idle() || !effect.is_in_effect())
+        if (animation.is_idle() || (!effect.is_in_effect() && !effect.is_in_the_before_phase()))
             continue;
         auto& target = abstract_target->element();
 
         bool targets_opacity = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
+        bool targets_background_color = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
+        bool targets_filter = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
         bool targets_transform = any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
-        bool targets_unsupported_property = any_of(effect.target_properties(), [&](auto const& property) { return property.id() != CSS::PropertyID::Opacity && !is_transform_family_property(property.id()); });
+        bool targets_unsupported_property = any_of(effect.target_properties(), [&](auto const& property) { return !first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter) && !is_transform_family_property(property.id()); });
         if (targets_unsupported_property)
             continue;
         auto target_effects = competing_effects.get(*abstract_target);
         VERIFY(target_effects.has_value());
         bool opacity_has_replace_winner = !targets_opacity || target_effects->opacity.winner;
+        bool background_color_has_replace_winner = !targets_background_color || target_effects->background_color.winner;
+        bool filter_has_replace_winner = !targets_filter || target_effects->filter.winner;
         bool transform_has_replace_winner = !targets_transform || target_effects->transform.winner;
         bool selected_for_opacity = targets_opacity && target_effects->opacity.winner.ptr() == &effect;
+        bool selected_for_background_color = targets_background_color && target_effects->background_color.winner.ptr() == &effect;
+        bool selected_for_filter = targets_filter && target_effects->filter.winner.ptr() == &effect;
         bool selected_for_transform = targets_transform && target_effects->transform.winner.ptr() == &effect;
-        bool all_targeted_properties_have_replace_winners = opacity_has_replace_winner && transform_has_replace_winner;
+        bool all_targeted_properties_have_replace_winners = opacity_has_replace_winner && background_color_has_replace_winner && filter_has_replace_winner && transform_has_replace_winner;
 
-        if (!selected_for_opacity && !selected_for_transform) {
+        Optional<bool> only_translates_horizontally;
+
+        // Background colors are display-list content, so associate their fill commands with a dedicated metadata
+        // frame. Validate the descriptor before forcing that frame, which requires one repaint before the animation
+        // can move to the compositor.
+        Layout::Node* background_color_layout_node = nullptr;
+        Optional<Compositor::VisualAnimation> background_color_visual_animation;
+        bool background_color_animation_is_valid = false;
+        if (selected_for_background_color) {
+            if (auto* layout_node = abstract_target->unsafe_layout_node()) {
+                if (!force_dark_applies && Painting::rust_background_color_can_be_compositor_animated(*layout_node)) {
+                    background_color_layout_node = layout_node;
+                    bool missing_visual_context_node = false;
+                    background_color_visual_animation = build_compositor_animation(effect, visual_context_tree, Compositor::VisualAnimation::TargetKind::BackgroundColor, only_translates_horizontally, &missing_visual_context_node);
+                    background_color_animation_is_valid = background_color_visual_animation.has_value() || missing_visual_context_node;
+                    if (!background_color_animation_is_valid) {
+                        background_color_layout_node = nullptr;
+                    } else if (missing_visual_context_node && !layout_node->needs_compositor_background_color_frame()) {
+                        layout_node->set_needs_compositor_background_color_frame(true);
+                        schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
+                        CSS::RequiredInvalidationAfterStyleChange invalidation;
+                        invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+                        Painting::repaint_after_style_change(*layout_node, invalidation);
+                    }
+                }
+            }
+        }
+
+        // Filters need an effects frame whose filter payload can be replaced. Validate the descriptor before forcing
+        // that frame, which requires one repaint before the animation can move to the compositor.
+        Layout::Node* filter_layout_node = nullptr;
+        Optional<Compositor::VisualAnimation> filter_visual_animation;
+        bool filter_animation_is_valid = false;
+        if (selected_for_filter) {
+            if (auto* layout_node = abstract_target->unsafe_layout_node()) {
+                filter_layout_node = layout_node;
+                bool missing_visual_context_node = false;
+                filter_visual_animation = build_compositor_animation(effect, visual_context_tree, Compositor::VisualAnimation::TargetKind::Filter, only_translates_horizontally, &missing_visual_context_node);
+                filter_animation_is_valid = filter_visual_animation.has_value() || missing_visual_context_node;
+                if (!filter_animation_is_valid) {
+                    filter_layout_node = nullptr;
+                } else if (missing_visual_context_node && !layout_node->needs_compositor_effects_layer()) {
+                    layout_node->set_needs_compositor_effects_layer(true);
+                    schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
+                    CSS::RequiredInvalidationAfterStyleChange invalidation;
+                    invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+                    Painting::repaint_after_style_change(*layout_node, invalidation);
+                }
+            }
+        }
+
+        if (!selected_for_opacity && !selected_for_background_color && !selected_for_filter && !selected_for_transform) {
             bool can_throttle_replaced_effect = animation.play_state() == Bindings::AnimationPlayState::Running
                 && !animation.pending()
                 && animation.playback_rate() > 0
@@ -8268,12 +8651,11 @@ void Document::update_compositor_animations()
                 && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds;
             if (all_targeted_properties_have_replace_winners && can_throttle_replaced_effect) {
                 effect.set_is_compositor_replaced(true);
-                schedule_active_end_wakeup(effect, animation);
+                schedule_next_phase_wakeup(effect, animation);
             }
             continue;
         }
 
-        Optional<bool> only_translates_horizontally;
         Vector<Compositor::VisualAnimation> effect_visual_animations;
         bool opacity_was_handed_off = !selected_for_opacity;
         if (selected_for_opacity) {
@@ -8282,6 +8664,30 @@ void Document::update_compositor_animations()
                 effect_visual_animations.append(visual_animation.release_value());
                 opacity_was_handed_off = true;
             }
+        }
+        bool background_color_was_handed_off = !selected_for_background_color;
+        if (background_color_visual_animation.has_value()) {
+            effect_visual_animations.append(background_color_visual_animation.release_value());
+            background_color_was_handed_off = true;
+        }
+        if (background_color_layout_node && background_color_animation_is_valid) {
+            if (!any_of(m_layout_nodes_with_forced_compositor_background_color_frame, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == background_color_layout_node; }))
+                m_layout_nodes_with_forced_compositor_background_color_frame.append(*background_color_layout_node);
+            layout_nodes_with_stale_forced_background_color_frame.remove_first_matching([&](auto const& stale_layout_node) {
+                return stale_layout_node.ptr() == background_color_layout_node;
+            });
+        }
+        bool filter_was_handed_off = !selected_for_filter;
+        if (filter_visual_animation.has_value()) {
+            effect_visual_animations.append(filter_visual_animation.release_value());
+            filter_was_handed_off = true;
+        }
+        if (filter_layout_node && filter_animation_is_valid) {
+            if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto const& forced_layout_node) { return forced_layout_node.ptr() == filter_layout_node; }))
+                m_layout_nodes_with_forced_compositor_effects_layer.append(*filter_layout_node);
+            layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto const& stale_layout_node) {
+                return stale_layout_node.ptr() == filter_layout_node;
+            });
         }
         bool transform_was_handed_off = !selected_for_transform;
         if (selected_for_transform) {
@@ -8338,16 +8744,35 @@ void Document::update_compositor_animations()
                 }
             }
         }
-        if (all_targeted_properties_have_replace_winners && opacity_was_handed_off && transform_was_handed_off)
+        if (all_targeted_properties_have_replace_winners && opacity_was_handed_off && background_color_was_handed_off && filter_was_handed_off && transform_was_handed_off)
             effect.set_is_compositor_driven(true);
         effect.set_is_observation_relevant_compositor_animation(transform_affects_observation);
-        schedule_active_end_wakeup(effect, animation);
+        schedule_next_phase_wakeup(effect, animation);
         for (auto const& visual_animation : effect_visual_animations)
             visual_animations.append(visual_animation);
         effect.set_retained_compositor_animations(move(effect_visual_animations));
         if (auto* layout_node = abstract_target->unsafe_layout_node())
             layout_node->set_retains_compositor_animated_content(true);
         published_compositor_animation = true;
+    }
+
+    for (auto& layout_node : layout_nodes_with_stale_forced_effects_layer) {
+        if (!layout_node)
+            continue;
+        layout_node->set_needs_compositor_effects_layer(false);
+        schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
+        CSS::RequiredInvalidationAfterStyleChange invalidation;
+        invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+        Painting::repaint_after_style_change(*layout_node, invalidation);
+    }
+    for (auto& layout_node : layout_nodes_with_stale_forced_background_color_frame) {
+        if (!layout_node)
+            continue;
+        layout_node->set_needs_compositor_background_color_frame(false);
+        schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
+        CSS::RequiredInvalidationAfterStyleChange invalidation;
+        invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+        Painting::repaint_after_style_change(*layout_node, invalidation);
     }
 
     paint_state().set_visual_animations(*this, move(visual_animations));

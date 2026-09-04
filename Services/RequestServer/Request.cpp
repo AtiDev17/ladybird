@@ -29,6 +29,8 @@ namespace RequestServer {
 extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 static long s_connect_timeout_seconds = 90L;
+static AK::Duration s_wait_for_cache_timeout = AK::Duration::from_seconds(10);
+static AK::Duration s_revalidation_stall_timeout = AK::Duration::from_seconds(30);
 
 static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, [[maybe_unused]] void* aia_collector)
 {
@@ -545,6 +547,16 @@ Request::Request(
         wire_stats().ensure(this).created_at = MonotonicTime::now();
 }
 
+void Request::set_wait_for_cache_timeout(AK::Duration timeout)
+{
+    s_wait_for_cache_timeout = timeout;
+}
+
+void Request::set_revalidation_stall_timeout(AK::Duration timeout)
+{
+    s_revalidation_stall_timeout = timeout;
+}
+
 Request::~Request()
 {
     if constexpr (REQUESTSERVER_DEBUG) {
@@ -567,8 +579,14 @@ Request::~Request()
 
 void Request::notify_request_unblocked(Badge<HTTP::DiskCache>)
 {
-    // FIXME: We may want a timer to limit how long we are waiting for a request before proceeding with a network
-    //        request that skips the disk cache.
+    // The wait may already have timed out, in which case this request went on without the disk cache.
+    if (m_state != State::WaitForCache)
+        return;
+
+    if (m_wait_for_cache_timer) {
+        m_wait_for_cache_timer->stop();
+        m_wait_for_cache_timer = nullptr;
+    }
     transition_to_state(State::Init);
 }
 
@@ -706,6 +724,7 @@ void Request::transition_to_state(State state)
 {
     dbgln_if(REQUESTSERVER_DEBUG, "Request::Transition[{}]: {} -> {} ({} {})", m_request_id, state_name(m_state), state_name(state), m_method, m_url);
     m_state = state;
+    mark_activity();
     process();
 }
 
@@ -719,7 +738,7 @@ void Request::process()
         handle_read_cache_state();
         break;
     case State::WaitForCache:
-        // Do nothing; we are waiting for the disk cache to notify us to proceed.
+        handle_wait_for_cache_state();
         break;
     case State::WaitForAIA:
         // Do nothing; we are waiting for the AIA intermediate-certificate fetch to notify us to proceed.
@@ -819,6 +838,58 @@ void Request::handle_initial_state()
             return;
     }
 
+    transition_to_state(State::DNSLookup);
+}
+
+void Request::handle_wait_for_cache_state()
+{
+    // The disk cache notifies us once the request holding our cache entry open completes. If that request has stalled,
+    // it never will: a connection that silently died keeps a transfer alive indefinitely, and the entry it holds would
+    // otherwise block every later request for the same URL for the lifetime of this process. So, check on it once a
+    // wait limit has passed.
+    if (m_wait_for_cache_timer)
+        return;
+
+    m_wait_for_cache_timer = Core::Timer::create_single_shot(static_cast<int>(s_wait_for_cache_timeout.to_milliseconds()), [this] {
+        wait_for_cache_timed_out();
+    });
+    m_wait_for_cache_timer->start();
+}
+
+void Request::wait_for_cache_timed_out()
+{
+    if (m_state != State::WaitForCache)
+        return;
+
+    // A request that's still filling or revalidating the entry — however slowly — releases it when it's done. So,
+    // only a holder that's shown no sign of life for a whole wait limit counts as stalled. Otherwise, keep waiting —
+    // and look again once the holder has had a full limit's worth of time to go quiet.
+    if (auto last_activity_time = m_disk_cache->last_activity_time_of_open_entries(m_url, m_method); last_activity_time.has_value()) {
+        auto idle_time = MonotonicTime::now() - *last_activity_time;
+        if (idle_time < s_wait_for_cache_timeout) {
+            auto time_until_stalled = s_wait_for_cache_timeout - idle_time;
+            m_wait_for_cache_timer->start(max(static_cast<int>(time_until_stalled.to_milliseconds()), 1));
+            return;
+        }
+    }
+
+    dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: Request {} gave up waiting for the cache entry of {}: the request holding it has made no progress for {}ms; continuing without the disk cache", m_request_id, m_url, s_wait_for_cache_timeout.to_milliseconds());
+
+    // A background revalidation exists only to refresh the entry it could not open, so there's nothing left for it
+    // to do.
+    if (m_type == RequestType::BackgroundRevalidation) {
+        transition_to_state(State::Complete);
+        return;
+    }
+
+    if (is_cache_only_request()) {
+        transition_to_state(State::FailedCacheOnly);
+        return;
+    }
+
+    // Fetch over the network without reading from or writing to the disk cache. We remain in the cache's list of
+    // waiting requests, and notify_request_unblocked() ignores the notification when it eventually arrives.
+    m_cache_status = CacheStatus::NotCached;
     transition_to_state(State::DNSLookup);
 }
 
@@ -1104,6 +1175,14 @@ void Request::handle_fetch_state()
     if (m_alt_svc_cache_path.has_value())
         set_option(CURLOPT_ALTSVC, m_alt_svc_cache_path->characters());
 
+    // Nobody waits on a background revalidation, so nothing else would ever notice one whose connection silently died.
+    // While it lives, it holds its cache entry open and every request for the same URL waits on it, so give up on it
+    // once it has stopped receiving data.
+    if (m_type == RequestType::BackgroundRevalidation) {
+        set_option(CURLOPT_LOW_SPEED_LIMIT, 1L);
+        set_option(CURLOPT_LOW_SPEED_TIME, static_cast<long>(s_revalidation_stall_timeout.to_seconds()));
+    }
+
     set_option(CURLOPT_CUSTOMREQUEST, m_method.characters());
     set_option(CURLOPT_FOLLOWLOCATION, 0);
     if constexpr (CURL_DEBUG) {
@@ -1275,6 +1354,7 @@ void Request::handle_error_state()
 size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data)
 {
     auto& request = *static_cast<Request*>(user_data);
+    request.mark_activity();
 
     auto total_size = size * nmemb;
     auto header_line = StringView { static_cast<char const*>(buffer), total_size };
@@ -1309,6 +1389,7 @@ size_t Request::on_header_received(void* buffer, size_t size, size_t nmemb, void
 size_t Request::on_data_received(void* buffer, size_t size, size_t nmemb, void* user_data)
 {
     auto& request = *static_cast<Request*>(user_data);
+    request.mark_activity();
 
     if (request.m_type == RequestType::Fetch || request.m_type == RequestType::BackgroundRevalidation)
         record_chunk(&request, size * nmemb);
@@ -1547,8 +1628,14 @@ ErrorOr<void> Request::write_queued_bytes_without_blocking()
         if (!m_cache_entry_writer.has_value())
             return;
 
-        if (m_cache_entry_writer->write_data(bytes).is_error())
+        if (m_cache_entry_writer->write_data(bytes).is_error()) {
             m_cache_entry_writer.clear();
+            return;
+        }
+
+        // The entry is still filling, even once curl has nothing left to deliver: A client that reads its response
+        // slowly keeps these writes coming long after the transfer is over — so they count as progress too.
+        mark_activity();
     };
 
     if (m_type == RequestType::BackgroundRevalidation) {
