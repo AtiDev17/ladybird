@@ -27,6 +27,7 @@
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/InitialInsertion.h>
 #include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/NavigateParams.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
 #include <LibWeb/HTML/NavigationPopulationRequest.h>
@@ -130,18 +131,16 @@ public:
 
     GC::Ptr<LocalTraversableNavigable> traversable_navigable() const;
 
-    virtual bool is_top_level_traversable() const { return false; }
-
     [[nodiscard]] bool is_focused() const;
 
     struct ChosenNavigable {
-        GC::Ptr<LocalNavigable> navigable;
+        GC::Ptr<Navigable> navigable;
         WindowType window_type;
     };
 
     ChosenNavigable choose_a_navigable(Utf16View name, TokenizedFeature::NoOpener no_opener, ActivateTab = ActivateTab::Yes, Optional<TokenizedFeature::Map const&> window_features = {});
 
-    GC::Ptr<LocalNavigable> find_a_navigable_by_target_name(Utf16View name);
+    GC::Ptr<Navigable> find_a_navigable_by_target_name(Utf16View name);
 
     void handle_as_a_download(GC::Ref<Fetch::Infrastructure::Response>, URL::URL const& fallback_url, GC::Ptr<Fetch::Infrastructure::FetchController>, Optional<ByteString> proposed_filename, Optional<URL::Origin> interface_origin);
 
@@ -194,31 +193,9 @@ public:
 
     void create_navigation_params_for_navigation(NavigationPopulationRequest, GC::Ref<SourceSnapshotParams>, NavigationParamsVariant, Bindings::NavigationTimingType);
 
-    struct NavigateParams {
-        URL::URL url;
-        GC::Ptr<DOM::Document> source_document = nullptr;
-        DocumentResource document_resource = Empty {};
-        GC::Ptr<Fetch::Infrastructure::Response> response = nullptr;
-        bool exceptions_enabled = false;
-        Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto;
-        Optional<StorageSerializationRecord> navigation_api_state = {};
-        Optional<Vector<XHR::FormDataEntry>> form_data_entry_list = {};
-        ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
-        UserNavigationInvolvement user_involvement = UserNavigationInvolvement::None;
-        // NB: A load requested by the UI process carries the ID the UI generated when it recorded the
-        //     navigation; otherwise step 7 of the navigate algorithm generates one.
-        Optional<Utf16String> navigation_id = {};
-        GC::Ptr<DOM::Element> source_element = nullptr;
-        InitialInsertion initial_insertion = InitialInsertion::No;
-
-        void visit_edges(Cell::Visitor& visitor);
-    };
-
-    WebIDL::ExceptionOr<void> navigate(NavigateParams);
+    virtual WebIDL::ExceptionOr<void> navigate(NavigateParams) override;
 
     GC::Ptr<DOM::Document> evaluate_javascript_url(URL::URL const&, URL::Origin const& new_document_origin, UserNavigationInvolvement, Utf16String navigation_id);
-
-    bool allowed_by_sandboxing_to_navigate(LocalNavigable const& target, SourceSnapshotParams const&);
 
     void reload(Optional<StorageSerializationRecord> navigation_api_state = {}, UserNavigationInvolvement = UserNavigationInvolvement::None);
 

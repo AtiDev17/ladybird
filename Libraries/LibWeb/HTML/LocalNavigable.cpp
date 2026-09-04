@@ -44,7 +44,6 @@
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
-#include <LibWeb/FileAPI/File.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
@@ -734,19 +733,6 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
         visitor.visit(entry.target);
 }
 
-void LocalNavigable::NavigateParams::visit_edges(Cell::Visitor& visitor)
-{
-    visitor.visit(response);
-    visitor.visit(source_document);
-    visitor.visit(source_element);
-    if (form_data_entry_list.has_value()) {
-        for (auto& entry : form_data_entry_list.value()) {
-            entry.value.visit([&](GC::Ref<FileAPI::File> const& file) { visitor.visit(file); },
-                [&](auto const&) {});
-        }
-    }
-}
-
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable
 bool LocalNavigable::is_script_closable()
 {
@@ -1253,7 +1239,7 @@ void LocalNavigable::prepare_to_populate_reconstructed_history_entry(Utf16String
 LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View name, TokenizedFeature::NoOpener no_opener, ActivateTab activate_tab, Optional<TokenizedFeature::Map const&> window_features)
 {
     // 1. Let chosen be null.
-    GC::Ptr<LocalNavigable> chosen = nullptr;
+    GC::Ptr<Navigable> chosen;
 
     // 2. Let windowType be "existing or none".
     auto window_type = WindowType::ExistingOrNone;
@@ -1270,7 +1256,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
     //    set chosen to currentNavigable's parent, if any, and currentNavigable otherwise.
     else if (name.equals_ignoring_ascii_case(u"_parent"sv)) {
         if (auto parent = this->parent())
-            chosen = as<LocalNavigable>(*parent);
+            chosen = parent;
         else
             chosen = this;
     }
@@ -1281,9 +1267,9 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
         chosen = traversable_navigable();
     }
 
-    // 7. Otherwise, if name is not an ASCII case-insensitive match for "_blank" and noopener is false, then set chosen
-    //    to the result of finding a navigable by target name given name and currentNavigable.
-    else if (!name.equals_ignoring_ascii_case(u"_blank"sv) && no_opener == TokenizedFeature::NoOpener::No) {
+    // 7. Otherwise, if name is not an ASCII case-insensitive match for "_blank", then set chosen to the result of
+    //    finding a navigable by target name given name and currentNavigable.
+    else if (!name.equals_ignoring_ascii_case(u"_blank"sv)) {
         chosen = find_a_navigable_by_target_name(name);
     }
 
@@ -1345,7 +1331,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
             if (!name.equals_ignoring_ascii_case(u"_blank"sv))
                 target_name = Utf16String::from_utf16(name);
 
-            auto create_new_traversable_closure = [page = new_web_view.page, system_visibility_state = new_web_view.system_visibility_state, window_handle = move(new_web_view.window_handle), target_name](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalNavigable> {
+            auto create_new_traversable_closure = [page = new_web_view.page, system_visibility_state = new_web_view.system_visibility_state, window_handle = move(new_web_view.window_handle), target_name](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalTraversableNavigable> {
                 auto traversable = LocalTraversableNavigable::create_a_new_top_level_traversable(*page, opener, target_name, {}, system_visibility_state);
                 page->set_top_level_traversable(traversable);
                 traversable->set_window_handle(Utf16String::from_ascii_without_validation(window_handle.bytes()));
@@ -1373,13 +1359,13 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
                 // 2. If sandboxingFlagSet's sandboxed navigation browsing context flag is set,
                 //    then set chosen's active browsing context's one permitted sandboxed navigator to currentNavigable's active browsing context.
                 if (has_flag(sandboxing_flag_set, SandboxingFlagSet::SandboxedNavigation))
-                    chosen->active_browsing_context()->set_the_one_permitted_sandboxed_navigator(active_browsing_context().ptr());
+                    as<LocalNavigable>(*chosen).active_browsing_context()->set_the_one_permitted_sandboxed_navigator(active_browsing_context().ptr());
             }
 
             // 9. If sandboxingFlagSet's sandbox propagates to auxiliary browsing contexts flag is set,
             //     then all the flags that are set in sandboxingFlagSet must be set in chosen's active browsing context's popup sandboxing flag set.
             if (has_flag(sandboxing_flag_set, SandboxingFlagSet::SandboxPropagatesToAuxiliaryBrowsingContexts))
-                chosen->active_browsing_context()->set_popup_sandboxing_flag_set(chosen->active_browsing_context()->popup_sandboxing_flag_set() | sandboxing_flag_set);
+                as<LocalNavigable>(*chosen).active_browsing_context()->set_popup_sandboxing_flag_set(as<LocalNavigable>(*chosen).active_browsing_context()->popup_sandboxing_flag_set() | sandboxing_flag_set);
 
             // 10. Set chosen's is created by web content to true.
             as<LocalTraversableNavigable>(*chosen).set_is_created_by_web_content(true);
@@ -1398,11 +1384,11 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
     }
 
     // 9. Return chosen and windowType
-    return { chosen.ptr(), window_type };
+    return { chosen, window_type };
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#find-a-navigable-by-target-name
-GC::Ptr<LocalNavigable> LocalNavigable::find_a_navigable_by_target_name(Utf16View name)
+GC::Ptr<Navigable> LocalNavigable::find_a_navigable_by_target_name(Utf16View name)
 {
     // 1. Let currentDocument be currentNavigable's active document.
     auto& current_document = *active_document();
@@ -2620,6 +2606,7 @@ void LocalNavigable::create_navigation_params_for_navigation(NavigationPopulatio
         received_navigation_params);
 }
 
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
 WebIDL::ExceptionOr<void> LocalNavigable::navigate(NavigateParams params)
 {
     // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
@@ -3505,68 +3492,6 @@ void LocalNavigable::reload(Optional<StorageSerializationRecord> navigation_api_
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document)
 {
     return url.scheme() == "javascript"sv || document.is_initial_about_blank();
-}
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#allowed-to-navigate
-bool LocalNavigable::allowed_by_sandboxing_to_navigate(LocalNavigable const& target, SourceSnapshotParams const& source_snapshot_params)
-{
-    auto& source = *this;
-
-    auto is_ancestor_of = [](LocalNavigable const& a, LocalNavigable const& b) {
-        for (auto parent = b.parent(); parent; parent = parent->parent()) {
-            if (parent.ptr() == &a)
-                return true;
-        }
-        return false;
-    };
-
-    // A navigable source is allowed by sandboxing to navigate a second navigable target,
-    // given a source snapshot params sourceSnapshotParams, if the following steps return true:
-
-    // 1. If source is target, then return true.
-    if (&source == &target)
-        return true;
-
-    // 2. If source is an ancestor of target, then return true.
-    if (is_ancestor_of(source, target))
-        return true;
-
-    // 3. If target is an ancestor of source, then:
-    if (is_ancestor_of(target, source)) {
-
-        // 1. If target is not a top-level traversable, then return true.
-        if (!target.is_top_level_traversable())
-            return true;
-
-        // 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
-        //    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
-        if (source_snapshot_params.has_transient_activation && has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedTopLevelNavigationWithUserActivation))
-            return false;
-
-        // 3. If sourceSnapshotParams's has transient activation is false, and sourceSnapshotParams's sandboxing flags's
-        //    sandboxed top-level navigation without user activation browsing context flag is set, then return false.
-        if (!source_snapshot_params.has_transient_activation && has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedTopLevelNavigationWithoutUserActivation))
-            return false;
-
-        // 4. Return true.
-        return true;
-    }
-
-    // 4. If target is a top-level traversable:
-    if (target.is_top_level_traversable()) {
-        // FIXME: 1. If source is the one permitted sandboxed navigator of target, then return true.
-
-        // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
-        if (has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation))
-            return false;
-
-        // 3. Return true.
-        return true;
-    }
-
-    // 5. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
-    // 6. Return true.
-    return !has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation);
 }
 
 static Optional<Web::CrossDocumentNavigationFinalizationHostState> prepare_to_finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> const& expected_ongoing_navigation_id)
