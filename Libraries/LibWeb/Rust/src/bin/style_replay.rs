@@ -779,12 +779,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             value: event.payload.read_u64()?,
                             operator: read_cascade_operator(&mut event.payload)?,
                             animation_relevance: event.payload.read_u32()?,
+                            important: event.payload.read_bool()?,
                         });
                     }
                     let expected = read_exact_cascade_publication(&mut event.payload)?;
                     let recorded_had_previous = match event.payload.remaining_bytes() {
                         0 => None,
                         _ => Some(event.payload.read_bool()?),
+                    };
+                    let (donor_node, donor_style_record) = match event.payload.remaining_bytes() {
+                        0 => (0, 0),
+                        _ => (event.payload.read_u32()?, event.payload.read_u64()?),
                     };
                     let (actual, actual_had_previous) = unsafe {
                         bridge::replay_publish_exact_cascade_state(
@@ -793,6 +798,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             pseudo_kind,
                             &winners,
                             inherited_style_groups,
+                            donor_node,
+                            donor_style_record,
                         )
                     };
                     // Retention differs legitimately between the recording session and replay, and
@@ -2143,6 +2150,7 @@ fn read_exact_cascade_publication(
     Ok(FfiExactCascadePublication {
         computed_group_mask: payload.read_u32()?,
         unchanged: payload.read_bool()?,
+        donor_used: payload.read_bool()?,
     })
 }
 
@@ -2598,6 +2606,7 @@ mod tests {
         let expected = FfiExactCascadePublication {
             computed_group_mask: 1,
             unchanged: false,
+            donor_used: false,
         };
         let mut actual = expected;
         actual.computed_group_mask = 8;

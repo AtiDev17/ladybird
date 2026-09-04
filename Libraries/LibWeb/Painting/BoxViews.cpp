@@ -712,11 +712,6 @@ CSSPixelRect transform_reference_box(Layout::Node const& node)
 
 CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
 {
-    return transform_rect_to_viewport(node, rect, node.document().visual_context_tree(), include_visual_viewport_transform);
-}
-
-CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, AccumulatedVisualContextTree const& visual_context_tree, AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
-{
     auto const* row = committed_row(node);
     if (!row)
         return {};
@@ -724,7 +719,7 @@ CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect c
     if (!document.layout_node() || !has_committed_box(*document.layout_node()))
         return rect;
     auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto result = visual_context_tree.transform_rect_to_viewport(
+    auto result = document.visual_context_tree().transform_rect_to_viewport(
         row->accumulated_visual_context.spatial, rect.to_type<float>() * pixel_ratio,
         document.scroll_state_snapshot(), include_visual_viewport_transform);
     return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
@@ -950,13 +945,38 @@ void clear_cached_overflow_data(Layout::Node const& node)
     Layout::RustFFI::layout_arena_paintable_clear_cached_overflow_data(node.arena_handle(), committed_row_slot(node));
 }
 
-void inline_piece_border_box_rects(Layout::Node const& node, Vector<CSSPixelRect>& rects)
+Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform()
 {
-    Layout::RustFFI::layout_arena_inline_paintable_piece_border_box_rects(
-        node.arena_handle(), committed_row_slot(node), &rects,
+    return {};
+}
+
+Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const& document, AccumulatedVisualContextTree const& visual_context_tree)
+{
+    if (!document.has_committed_viewport_box())
+        return identity_rect_to_viewport_transform();
+    auto scroll_offsets = document.scroll_state_snapshot().device_offsets();
+    return {
+        .visual_context_tree = visual_context_tree.rust_handle(),
+        .scroll_offsets = scroll_offsets.data(),
+        .scroll_offsets_len = scroll_offsets.size(),
+        .device_pixels_per_css_pixel = static_cast<float>(document.page().client().device_pixels_per_css_pixel()),
+    };
+}
+
+Vector<CSSPixelRect> client_rects(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+{
+    Vector<CSSPixelRect> rects;
+    Layout::RustFFI::layout_arena_client_rects(
+        node.arena_handle(), committed_row_slot(node), rect_to_viewport_transform, &rects,
         [](void* context, CSSPixelRect rect) {
             static_cast<Vector<CSSPixelRect>*>(context)->append(rect);
         });
+    return rects;
+}
+
+CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+{
+    return Layout::RustFFI::layout_arena_bounding_client_rect(node.arena_handle(), committed_row_slot(node), rect_to_viewport_transform);
 }
 
 CSSPixelPoint cumulative_scroll_compensation(Layout::Node const& node)
