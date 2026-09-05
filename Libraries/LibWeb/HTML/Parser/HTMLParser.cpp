@@ -8,9 +8,11 @@
  */
 
 #include <AK/AnyOf.h>
+#include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/FFIHelpers.h>
 #include <LibGC/Heap.h>
+#include <LibGC/RootVector.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -95,6 +97,15 @@ static Utf16String utf16_string_from_ffi(u16 const* ptr, size_t len)
     return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(ptr), len });
 }
 
+static Utf16String utf8_string_from_ffi(u8 const* ptr, size_t len)
+{
+    if (len == 0)
+        return {};
+    return Utf16String::from_utf8_without_validation({ reinterpret_cast<char const*>(ptr), len });
+}
+
+static Optional<Utf16FlyString> attribute_namespace_from_html_parser_ffi(RustFfiHtmlAttributeNamespace);
+
 static Utf16String utf16_string_from_standardized_encoding_label(StringView label)
 {
     return Utf16String::from_ascii_without_validation(label.bytes());
@@ -116,7 +127,7 @@ extern "C" size_t ladybird_html_parser_document_html_element(void*);
 extern "C" void ladybird_html_parser_set_document_quirks_mode(void*, RustFfiHtmlQuirksMode);
 extern "C" size_t ladybird_html_parser_create_document_type(void*, u16 const*, size_t, u16 const*, size_t, u16 const*, size_t);
 extern "C" size_t ladybird_html_parser_create_comment(void*, u16 const*, size_t);
-extern "C" void ladybird_html_parser_insert_text(size_t, size_t, u16 const*, size_t);
+extern "C" void ladybird_html_parser_insert_text(size_t, size_t, u8 const*, size_t);
 extern "C" void ladybird_html_parser_add_missing_attribute(size_t, size_t, u16 const*, size_t);
 extern "C" void ladybird_html_parser_remove_node(size_t);
 extern "C" void ladybird_html_parser_handle_element_popped(size_t);
@@ -260,17 +271,6 @@ void HTMLParser::pop_all_open_elements()
 
 void HTMLParser::configure_element_created_by_rust_parser(DOM::Element& element)
 {
-    if (element.local_name() == HTML::TagNames::link && element.namespace_uri() == Namespace::HTML) {
-        // AD-HOC: Let <link> elements know which document they were originally parsed for.
-        //         This is used for the render-blocking logic.
-        auto& link_element = as<HTMLLinkElement>(element);
-        if (!m_parsing_fragment) {
-            link_element.set_parser_document({}, document());
-            link_element.set_was_enabled_when_created_by_parser({}, !element.has_attribute(HTML::AttributeNames::disabled));
-        }
-        return;
-    }
-
     if (element.local_name() != HTML::TagNames::script || element.namespace_uri() != Namespace::HTML)
         return;
 
@@ -282,9 +282,9 @@ void HTMLParser::configure_element_created_by_rust_parser(DOM::Element& element)
         script_element.set_already_started(Badge<HTMLParser> {}, true);
 }
 
-GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(HTMLToken const& token, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement> form_element, bool has_template_element_on_stack)
+GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(Utf16FlyString const& local_name, ReadonlySpan<RustFfiHtmlParserAttribute> attributes, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement> form_element, bool has_template_element_on_stack)
 {
-    auto element = create_element_for(token, namespace_, intended_parent);
+    auto element = create_element_for(local_name, attributes, namespace_, intended_parent);
     configure_element_created_by_rust_parser(element);
 
     // AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is done.
@@ -903,7 +903,7 @@ void HTMLParserEndState::complete()
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#create-an-element-for-the-token
-GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent)
+GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local_name, ReadonlySpan<RustFfiHtmlParserAttribute> attributes, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent)
 {
     // 1. If the active speculative HTML parser is not null, then return the result of creating a speculative mock element given namespace, token's tag name, and token's attributes.
     // The active speculative HTML parser runs synchronously to completion, so it is null whenever the real parser
@@ -917,12 +917,19 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
     GC::Ref<DOM::Document> document = intended_parent.document();
 
     // 4. Let localName be token's tag name.
-    auto local_name = token.tag_name();
+
+    auto attribute_value = [&](Utf16FlyString const& name) -> Optional<StringView> {
+        for (auto const& attribute : attributes) {
+            if (attribute.local_name == name.raw_identity())
+                return StringView { reinterpret_cast<char const*>(attribute.value_ptr), attribute.value_len };
+        }
+        return {};
+    };
 
     // 5. Let is be the value of the "is" attribute in token, if such an attribute exists; otherwise null.
     Optional<Utf16FlyString> is_value;
-    if (auto is_attribute = token.attribute(AttributeNames::is); is_attribute.has_value())
-        is_value = Utf16FlyString::from_utf16(is_attribute->utf16_view());
+    if (auto is_attribute = attribute_value(AttributeNames::is); is_attribute.has_value())
+        is_value = Utf16FlyString::from_utf8_without_validation(*is_attribute);
 
     // 6. Let registry be the result of looking up a custom element registry given intendedParent.
     auto registry = look_up_a_custom_element_registry(intended_parent);
@@ -953,17 +960,12 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
     //     willExecuteScript, and registry.
     auto element = DOM::create_element(*document, local_name, namespace_, {}, is_value, will_execute_script, registry).release_value_but_fixme_should_propagate_errors();
 
-    // AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is done.
-    if (token.had_duplicate_attribute()) {
-        element->set_had_duplicate_attribute_during_tokenization({});
-    }
-
     // AD-HOC: Let <link> elements know which document they were originally parsed for.
     //         This is used for the render-blocking logic.
     if (!m_parsing_fragment && local_name == HTML::TagNames::link && namespace_ == Namespace::HTML) {
         auto& link_element = as<HTMLLinkElement>(*element);
         link_element.set_parser_document({}, document);
-        link_element.set_was_enabled_when_created_by_parser({}, !token.has_attribute(HTML::AttributeNames::disabled));
+        link_element.set_was_enabled_when_created_by_parser({}, !attribute_value(HTML::AttributeNames::disabled).has_value());
     }
 
     // AD-HOC: Let style elements know which document they were originally parsed for.
@@ -972,11 +974,13 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(HTMLToken const& token, Opt
         style_element->set_parser_document({}, document);
 
     // 11. Append each attribute in the given token to element.
-    token.for_each_attribute([&](auto const& attribute) {
-        DOM::QualifiedName qualified_name { attribute.local_name, attribute.prefix, attribute.namespace_ };
-        element->append_attribute(move(qualified_name), attribute.value);
-        return IterationDecision::Continue;
-    });
+    for (auto const& attribute : attributes) {
+        Optional<Utf16FlyString> prefix;
+        if (attribute.prefix_len != 0)
+            prefix = Utf16FlyString::from_utf8_without_validation({ reinterpret_cast<char const*>(attribute.prefix_ptr), attribute.prefix_len });
+        DOM::QualifiedName qualified_name { Utf16FlyString::from_raw(attribute.local_name), move(prefix), attribute_namespace_from_html_parser_ffi(attribute.namespace_) };
+        element->append_attribute(move(qualified_name), utf8_string_from_ffi(attribute.value_ptr, attribute.value_len));
+    }
 
     // AD-HOC: The muted attribute on media elements is only set if the muted content attribute is present when the element is first created.
     if (element->is_html_media_element() && namespace_ == Namespace::HTML) {
@@ -1159,6 +1163,251 @@ DOM::Document& HTMLParser::document()
     return *m_document;
 }
 
+namespace {
+
+struct FragmentAttribute {
+    StringView name;
+    StringView value;
+};
+
+Utf16FlyString const* supported_fragment_tag(StringView name)
+{
+    // Keep this subset deliberately small. Adding a tag requires checking its in-body tree-builder rules,
+    // its insertion steps, and interactions with every other supported tag.
+    if (name == "a"sv)
+        return &TagNames::a;
+    if (name == "b"sv)
+        return &TagNames::b;
+    if (name == "br"sv)
+        return &TagNames::br;
+    if (name == "button"sv)
+        return &TagNames::button;
+    if (name == "div"sv)
+        return &TagNames::div;
+    if (name == "footer"sv)
+        return &TagNames::footer;
+    if (name == "i"sv)
+        return &TagNames::i;
+    if (name == "input"sv)
+        return &TagNames::input;
+    if (name == "label"sv)
+        return &TagNames::label;
+    if (name == "li"sv)
+        return &TagNames::li;
+    if (name == "ol"sv)
+        return &TagNames::ol;
+    if (name == "span"sv)
+        return &TagNames::span;
+    if (name == "strong"sv)
+        return &TagNames::strong;
+    if (name == "ul"sv)
+        return &TagNames::ul;
+    if (name == "article"sv)
+        return &TagNames::article;
+    if (name == "aside"sv)
+        return &TagNames::aside;
+    if (name == "header"sv)
+        return &TagNames::header;
+    if (name == "main"sv)
+        return &TagNames::main;
+    if (name == "nav"sv)
+        return &TagNames::nav;
+    if (name == "section"sv)
+        return &TagNames::section;
+    if (name == "big"sv)
+        return &TagNames::big;
+    if (name == "code"sv)
+        return &TagNames::code;
+    if (name == "em"sv)
+        return &TagNames::em;
+    if (name == "s"sv)
+        return &TagNames::s;
+    if (name == "small"sv)
+        return &TagNames::small;
+    if (name == "strike"sv)
+        return &TagNames::strike;
+    if (name == "tt"sv)
+        return &TagNames::tt;
+    if (name == "u"sv)
+        return &TagNames::u;
+    return nullptr;
+}
+
+class FragmentScanner {
+public:
+    explicit FragmentScanner(StringView input)
+        : m_input(input)
+    {
+    }
+
+    template<typename Open, typename Close, typename Text>
+    bool parse(Open&& open, Close&& close, Text&& text)
+    {
+        Vector<Utf16FlyString const*, 32> stack;
+        Vector<FragmentAttribute, 16> attributes;
+        while (m_offset < m_input.length()) {
+            if (peek() != '<') {
+                auto start = m_offset;
+                while (m_offset < m_input.length() && peek() != '<') {
+                    if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                        return false;
+                    ++m_offset;
+                }
+                text(m_input.substring_view(start, m_offset - start));
+                continue;
+            }
+            ++m_offset;
+            bool is_end_tag = consume('/');
+            auto name = scan_name();
+            auto* tag = supported_fragment_tag(name);
+            if (!tag)
+                return false;
+            if (is_end_tag) {
+                skip_whitespace();
+                if (!consume('>') || stack.is_empty() || stack.take_last() != tag)
+                    return false;
+                close();
+                continue;
+            }
+
+            // Leave implicit closing of anchors, buttons, and list items to the general parser.
+            if ((tag == &TagNames::a || tag == &TagNames::button) && stack.contains_slow(tag))
+                return false;
+            if (tag == &TagNames::li) {
+                for (size_t i = stack.size(); i > 0; --i) {
+                    auto* ancestor = stack[i - 1];
+                    if (ancestor == &TagNames::li)
+                        return false;
+                    // A nested list stops the in-body rule from closing an outer list item.
+                    if (ancestor == &TagNames::ul || ancestor == &TagNames::ol)
+                        break;
+                }
+            }
+            if (stack.size() >= 128)
+                return false;
+
+            attributes.clear_with_capacity();
+            while (true) {
+                skip_whitespace();
+                if (peek() == '>' || peek() == '/')
+                    break;
+                auto attribute_name = scan_name();
+                if (attribute_name.is_empty() || attribute_name == "is"sv || attributes.size() >= 64)
+                    return false;
+                for (auto const& attribute : attributes) {
+                    if (attribute.name == attribute_name)
+                        return false;
+                }
+                skip_whitespace();
+                StringView value = ""sv;
+                if (consume('=')) {
+                    skip_whitespace();
+                    char quote = peek();
+                    if (quote != '\'' && quote != '"')
+                        return false;
+                    ++m_offset;
+                    auto start = m_offset;
+                    while (m_offset < m_input.length() && peek() != quote) {
+                        if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                            return false;
+                        ++m_offset;
+                    }
+                    value = m_input.substring_view(start, m_offset - start);
+                    if (!consume(quote))
+                        return false;
+                }
+                if (tag == &TagNames::input && attribute_name == "type"sv && !value.is_one_of("text"sv, "checkbox"sv))
+                    return false;
+                attributes.append({ attribute_name, value });
+            }
+            bool is_void = tag == &TagNames::br || tag == &TagNames::input;
+            if (consume('/') && !is_void)
+                return false;
+            if (!consume('>'))
+                return false;
+            open(*tag, attributes.span(), is_void);
+            if (!is_void)
+                stack.append(tag);
+        }
+        return stack.is_empty();
+    }
+
+private:
+    char peek() const { return m_offset < m_input.length() ? m_input[m_offset] : '\0'; }
+
+    bool consume(char ch)
+    {
+        if (m_offset == m_input.length() || peek() != ch)
+            return false;
+        ++m_offset;
+        return true;
+    }
+
+    void skip_whitespace()
+    {
+        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\f')
+            ++m_offset;
+    }
+
+    StringView scan_name()
+    {
+        auto start = m_offset;
+        while (is_ascii_lower_alpha(peek()) || is_ascii_digit(peek()) || peek() == '-')
+            ++m_offset;
+        return m_input.substring_view(start, m_offset - start);
+    }
+
+    StringView m_input;
+    size_t m_offset { 0 };
+};
+
+}
+
+GC::Ptr<DOM::DocumentFragment> HTMLParser::try_parse_html_fragment_fast(DOM::Element& context, Utf16View input)
+{
+    // OPTIMIZATION: Validate a restricted in-body grammar before allocating or exposing any DOM nodes. The second
+    //               pass borrows input spans and constructs elements directly, bypassing tokenization and tree building.
+    //               All unsupported syntax falls back without side effects, including custom elements and foreign content.
+    if (context.namespace_uri() != Namespace::HTML || !input.has_ascii_storage())
+        return nullptr;
+    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
+            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
+        return nullptr;
+    if (context.first_ancestor_of_type<HTMLFormElement>())
+        return nullptr;
+
+    StringView source { input.ascii_span().data(), input.length_in_code_units() };
+    // Character references and input preprocessing use the general parser.
+    if (!FragmentScanner { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { }))
+        return nullptr;
+
+    auto fragment = DOM::DocumentFragment::create(context.document());
+    auto registry = look_up_a_custom_element_registry(context);
+    GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
+    parents.append(fragment);
+    auto success = FragmentScanner { source }.parse(
+        [&](Utf16FlyString const& tag, ReadonlySpan<FragmentAttribute> attributes, bool is_void) {
+            auto& parent = *parents.last();
+            auto element = MUST(DOM::create_element(context.document(), tag, Namespace::HTML, {}, {}, false, registry));
+            for (auto const& attribute : attributes) {
+                DOM::QualifiedName name { Utf16FlyString::from_utf8_without_validation(attribute.name), {}, {} };
+                element->append_attribute(move(name), Utf16String::from_utf8_without_validation(attribute.value));
+            }
+            auto& html_element = as<HTMLElement>(*element);
+            if (html_element.is_form_associated_element() && html_element.is_resettable())
+                html_element.reset_algorithm();
+            MUST(parent.append_child(element));
+            if (!is_void)
+                parents.append(element);
+        },
+        [&] { parents.take_last(); },
+        [&](StringView text) {
+            MUST(parents.last()->append_child(DOM::Text::create(context.document(), Utf16String::from_utf8_without_validation(text))));
+        });
+    VERIFY(success);
+    return fragment;
+}
+
 // https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
 WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View input, AllowDeclarativeShadowRoots allow_declarative_shadow_roots, ParserScriptingMode scripting_mode)
 {
@@ -1172,6 +1421,12 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
 
     // 3. Assert: context is non-null.
     VERIFY(context);
+
+    // OPTIMIZATION: A validated subset of in-body fragments can be constructed directly from input spans.
+    if (target.has<GC::Ref<DOM::Element>>()) {
+        if (auto fragment = try_parse_html_fragment_fast(*context, input))
+            return GC::Ref { *fragment };
+    }
 
     // 4. Let document be a Document node whose type is "html".
 
@@ -2244,7 +2499,7 @@ extern "C" size_t ladybird_html_parser_create_comment(void* parser, u16 const* d
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#insert-a-character
-extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u16 const* data_ptr, size_t data_len)
+extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u8 const* data_ptr, size_t data_len)
 {
     auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
     auto& parent_node = *insertion_location.node;
@@ -2254,7 +2509,7 @@ extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u
     if (parent_node.is_document())
         return;
 
-    auto data = utf16_string_from_ffi(data_ptr, data_len);
+    auto data = utf8_string_from_ffi(data_ptr, data_len);
     if (auto* previous_text = as_if<DOM::Text>(insertion_location.previous_child())) {
         (void)previous_text->append_data(data);
         return;
@@ -2338,26 +2593,11 @@ extern "C" size_t ladybird_html_parser_create_element(void* parser, size_t inten
 {
     auto& html_parser = parser_from_html_parser_ffi(parser);
     auto local_name = Utf16FlyString::from_raw(local_name_raw);
-    auto token = HTMLToken::make_start_tag(local_name);
-
-    for (size_t i = 0; i < attribute_count; ++i) {
-        auto const& attribute = attributes[i];
-        Optional<Utf16FlyString> prefix;
-        if (attribute.prefix_len != 0)
-            prefix = utf16_fly_string_from_ffi(attribute.prefix_ptr, attribute.prefix_len);
-        HTMLToken::Attribute token_attribute;
-        token_attribute.prefix = move(prefix);
-        token_attribute.local_name = Utf16FlyString::from_raw(attribute.local_name);
-        token_attribute.namespace_ = attribute_namespace_from_html_parser_ffi(attribute.namespace_);
-        token_attribute.value = utf16_string_from_ffi(attribute.value_ptr, attribute.value_len);
-        token.add_attribute(move(token_attribute));
-    }
-
     auto& intended_parent_node = node_from_html_parser_ffi(intended_parent);
     GC::Ptr<HTMLFormElement> form_element_ptr;
     if (form_element)
         form_element_ptr = as<HTMLFormElement>(node_from_html_parser_ffi(form_element));
-    auto element = html_parser.create_element_for_rust_parser(token, namespace_from_html_parser_ffi(namespace_, namespace_uri_ptr, namespace_uri_len), intended_parent_node, had_duplicate_attribute, form_element_ptr, has_template_element_on_stack);
+    auto element = html_parser.create_element_for_rust_parser(local_name, { attributes, attribute_count }, namespace_from_html_parser_ffi(namespace_, namespace_uri_ptr, namespace_uri_len), intended_parent_node, had_duplicate_attribute, form_element_ptr, has_template_element_on_stack);
 
     return reinterpret_cast<size_t>(element.ptr());
 }
