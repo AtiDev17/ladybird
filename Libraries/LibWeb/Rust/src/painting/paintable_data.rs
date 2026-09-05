@@ -49,7 +49,6 @@ pub struct PaintableData {
 
     pub overflow_relative_to_padding_box: FfiOverflowData,
     pub overflow_measured_this_commit: bool,
-    pub overflow_valid_across_recommits: bool,
 
     pub establishes_stacking_context: bool,
 
@@ -76,7 +75,6 @@ impl Default for PaintableData {
             local_border_box_union: used_values::FfiCssPixelRect::default(),
             overflow_relative_to_padding_box: FfiOverflowData::default(),
             overflow_measured_this_commit: false,
-            overflow_valid_across_recommits: false,
             establishes_stacking_context: false,
             enclosing_scroll_node_index: SpatialNodeIndex::default(),
             own_scroll_node_index: SpatialNodeIndex::default(),
@@ -108,6 +106,7 @@ impl PaintableData {
 #[repr(C)]
 pub struct FfiSelectionEntry {
     pub is_text_node_entry: bool,
+    // Text entries name the DOM text's primary layout node; Rust expands its slices.
     pub layout_node: NodeSlotId,
     pub state: u8,
 }
@@ -126,66 +125,7 @@ pub enum PaintableRowResetKind {
     Freed = 2,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LineRecord {
-    pub rect: used_values::FfiCssPixelRect,
-    pub baseline: CssPixels,
-    pub fragment_count: u32,
-}
-
-pub struct GlyphRunRecord {
-    pub glyphs: Vec<libgfx_rust::text_layout::DrawGlyph>,
-    pub font: libgfx_rust::font::RetainedFont,
-}
-
-impl GlyphRunRecord {
-    fn font_ref(&self) -> libgfx_rust::font::FontRef<'_> {
-        // SAFETY: The record's RetainedFont keeps the font live for the
-        // lifetime of the returned borrow.
-        unsafe { libgfx_rust::font::FontRef::from_raw(self.font.as_raw()) }
-    }
-
-    pub fn bounding_box(&self, scale: f32) -> [f32; 4] {
-        libgfx_rust::text_layout::glyph_run_bounding_box(self.font_ref(), &self.glyphs, scale)
-    }
-
-    pub fn glyph_intercepts(&self, scale: f32, y_top: f32, y_bottom: f32) -> Vec<f32> {
-        libgfx_rust::text_layout::glyph_run_glyph_intercepts(self.font_ref(), &self.glyphs, scale, y_top, y_bottom)
-    }
-}
-
-pub struct FragmentRecord {
-    pub layout_node: NodeSlotId,
-    pub style_source: NodeSlotId,
-    pub offset: used_values::FfiCssPixelPoint,
-    pub size: used_values::FfiCssPixelSize,
-    pub line_index: u32,
-    pub start_offset: usize,
-    pub length_in_code_units: usize,
-    pub dom_start_offset_in_node: usize,
-    pub dom_end_offset_in_node: usize,
-    pub dom_end_offset_with_trailing_whitespace: usize,
-    pub trailing_whitespace_length_in_code_units: usize,
-    pub baseline: CssPixels,
-    pub accumulated_vertical_shift: CssPixels,
-    pub writing_mode: u8,
-    pub is_block_ellipsis: bool,
-    pub selection_state: u8,
-    pub glyph_run: Option<GlyphRunRecord>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct InlineBoxPieceRecord {
-    pub node: NodeSlotId,
-    pub first_fragment_index: u32,
-    pub fragment_count: u32,
-    pub line_index: u32,
-    pub border_box_rect: used_values::FfiCssPixelRect,
-    pub baseline: CssPixels,
-    pub accumulated_vertical_shift: CssPixels,
-    pub present_edges: u8,
-    pub is_geometry_only_placeholder: bool,
-}
+pub use crate::layout::inline_content::{FragmentRecord, GlyphRunRecord, InlineBoxPieceRecord};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BorderEdge {
@@ -227,9 +167,10 @@ impl InlineBoxPieceRecord {
 
 #[derive(Default)]
 pub struct PaintableSideData {
-    pub(crate) lines: Vec<LineRecord>,
-    pub(crate) fragments: Vec<FragmentRecord>,
-    pub(crate) inline_box_pieces: Vec<InlineBoxPieceRecord>,
+    // Invalidation also runs while paint geometry is borrowed. Keep this
+    // mutable cache state out of the plain-data row shared with C++.
+    pub(crate) overflow_valid_across_recommits: Cell<bool>,
+    pub(crate) inline_content: Option<std::rc::Rc<crate::layout::inline_content::InlineContent>>,
     pub(crate) piece_indices: Vec<u32>,
     pub(crate) svg_filter_bounds: Cell<Option<used_values::FfiCssPixelRect>>,
     // Only meaningful while is_self_painting(); assigned by the containing block's
@@ -239,10 +180,20 @@ pub struct PaintableSideData {
 
 impl PaintableSideData {
     pub(crate) fn clear_committed_records(&mut self) {
-        self.lines.clear();
-        self.fragments.clear();
-        self.inline_box_pieces.clear();
+        self.inline_content = None;
         self.piece_indices.clear();
         self.fragment_ownership = None;
+    }
+
+    pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
+        self.inline_content.as_ref().map_or(&[], |content| &content.lines)
+    }
+    pub(crate) fn fragments(&self) -> &[FragmentRecord] {
+        self.inline_content.as_ref().map_or(&[], |content| &content.fragments)
+    }
+    pub(crate) fn inline_box_pieces(&self) -> &[InlineBoxPieceRecord] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| &content.inline_box_pieces)
     }
 }

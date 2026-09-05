@@ -13,6 +13,13 @@ unsafe extern "C" {
     fn unicode_layout_line_segmenter_create(text: *const u16, length_in_code_units: usize) -> *mut c_void;
     fn unicode_layout_segmenter_next_boundary(handle: *mut c_void, index: usize, inclusive: bool) -> i64;
     fn unicode_layout_segmenter_destroy(handle: *mut c_void);
+    fn unicode_layout_word_boundaries(
+        text: *const u16,
+        length: usize,
+        offset: usize,
+        start: *mut usize,
+        end: *mut usize,
+    );
     fn ladybird_layout_text_type_for_code_point(code_point: u32) -> u8;
     fn ladybird_layout_code_point_has_break_all_line_break_class(code_point: u32) -> bool;
     fn ladybird_layout_code_point_has_keep_all_line_break_class(code_point: u32) -> bool;
@@ -50,6 +57,15 @@ pub(crate) fn chunk_text(inputs: TextChunkInputs<'_>) -> Vec<TextChunk> {
         chunks.push(chunk);
     }
     chunks
+}
+
+pub(super) fn word_boundaries(text: &[u16], offset: usize) -> std::ops::Range<usize> {
+    let mut start = 0;
+    let mut end = text.len();
+    // SAFETY: The Unicode service borrows the buffer only for this call and
+    // writes its boundaries into the two live output slots.
+    unsafe { unicode_layout_word_boundaries(text.as_ptr(), text.len(), offset, &raw mut start, &raw mut end) };
+    start..end
 }
 
 pub(crate) struct IcuSegmenterHandle {
@@ -139,7 +155,7 @@ fn is_utf16_low_surrogate(code_unit: u16) -> bool {
 
 /// Mirrors AK::Utf16View::code_point_at, including its lone-surrogate
 /// pass-through behavior.
-fn code_point_at(text: &[u16], index: usize) -> u32 {
+pub(super) fn code_point_at(text: &[u16], index: usize) -> u32 {
     let code_unit = text[index];
     let code_point = u32::from(code_unit);
     if !is_utf16_high_surrogate(code_unit) && !is_utf16_low_surrogate(code_unit) {
@@ -166,7 +182,7 @@ fn previous_code_point_at(text: &[u16], index: &mut usize) -> u32 {
     code_point_at(text, *index)
 }
 
-fn code_unit_length_for_code_point(code_point: u32) -> usize {
+pub(super) fn code_unit_length_for_code_point(code_point: u32) -> usize {
     if code_point >= 0x10000 { 2 } else { 1 }
 }
 
@@ -581,14 +597,14 @@ impl<'text> TextChunker<'text> {
 }
 
 pub(crate) fn text_chunks(
-    callbacks: &FfiLayoutFcCallbacks,
+    callbacks: &LayoutPass<'_>,
     node: Node,
     should_wrap_lines: bool,
     should_respect_linebreaks: bool,
     unidirectional_ltr: bool,
-) -> &'static [TextChunk] {
+) -> std::rc::Rc<super::rendered_text::CachedTextChunks> {
     let parent_style = StyleValues::for_node(callbacks, callbacks.parent(node));
-    let key = crate::layout::layout_node_arena::TextChunkCacheKey {
+    let key = super::rendered_text::TextChunkCacheKey {
         should_wrap_lines,
         should_respect_linebreaks,
         unidirectional_ltr,
@@ -598,7 +614,7 @@ pub(crate) fn text_chunks(
         font_cascade_list: parent_style.font_cascade_list(),
     };
     let text = &callbacks.text_content(node).text;
-    callbacks.arena().text_chunks(node, key, || {
+    callbacks.text_content(node).text_chunks(key, || {
         chunk_text(TextChunkInputs {
             text,
             font_cascade_list: key.font_cascade_list,

@@ -21,6 +21,8 @@
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/WebDriver/Error.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalBrowsingContext.h>
+#include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/FontService.h>
@@ -28,6 +30,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/SiteIsolationManager.h>
 #include <LibWebView/SourceHighlighter.h>
 #include <LibWebView/ViewImplementation.h>
@@ -214,7 +217,7 @@ void WebContentClient::assign_view(Badge<Application>, ViewImplementation& view)
     m_views.set(m_initial_page_id, view);
 
     if (m_initial_top_level_history_entry_awaiting_view.has_value())
-        view.did_create_top_level_traversable({}, m_initial_top_level_history_entry_awaiting_view.release_value());
+        view.did_create_top_level_traversable({}, m_initial_top_level_history_entry_awaiting_view.release_value(), {}, *this);
 }
 
 void WebContentClient::set_compositor_connection_id(Badge<Application>, i32 compositor_connection_id)
@@ -330,6 +333,19 @@ CanonicalNavigable* WebContentClient::navigable_for_page(u64 page_id)
         return &view->traversable();
 
     return nullptr;
+}
+
+Optional<CanonicalNavigable&> WebContentClient::hosted_navigable(Web::HTML::CrossProcessId navigable_id)
+{
+    for (auto const& view : m_views) {
+        if (auto navigable = hosted_navigable_for_page(view.key, navigable_id); navigable.has_value())
+            return navigable;
+    }
+    for (auto const& embedded_page : m_embedded_pages) {
+        if (auto navigable = hosted_navigable_for_page(embedded_page.key, navigable_id); navigable.has_value())
+            return navigable;
+    }
+    return {};
 }
 
 Optional<CanonicalNavigable&> WebContentClient::hosted_navigable_for_page(u64 page_id, Web::HTML::CrossProcessId navigable_id)
@@ -586,7 +602,7 @@ void WebContentClient::cancel_navigation_transactions()
     });
 }
 
-void WebContentClient::did_request_navigation_start(u64 page_id, Web::HTML::CrossProcessId navigable_id, URL::URL current_url, Web::NavigationTarget target, URL::URL url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request)
+void WebContentClient::did_request_navigation_start(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, URL::URL url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request)
 {
     auto* target_navigable = navigable_for_page(page_id);
     if (target == Web::NavigationTarget::IFrame) {
@@ -622,8 +638,6 @@ void WebContentClient::did_request_navigation_start(u64 page_id, Web::HTML::Cros
     if (!start_request.has_value()) {
         target_navigable->set_ongoing_navigation(CanonicalNavigable::OngoingNavigation {
             .url = url,
-            .current_url = move(current_url),
-            .target = target,
             .navigation_id = navigation_id,
             .sequence_number = sequence_number,
         });
@@ -637,8 +651,6 @@ void WebContentClient::did_request_navigation_start(u64 page_id, Web::HTML::Cros
 
     target_navigable->set_ongoing_navigation(CanonicalNavigable::OngoingNavigation {
         .url = move(url),
-        .current_url = move(current_url),
-        .target = target,
         .navigation_id = navigation_id,
         .start_request = move(start_request),
         .sequence_number = sequence_number,
@@ -679,7 +691,7 @@ void WebContentClient::did_complete_navigation_unload_check(u64 page_id, Web::HT
     }
 }
 
-void WebContentClient::did_request_navigation_population(u64 page_id, Web::HTML::CrossProcessId navigable_id, URL::URL current_url, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request)
+void WebContentClient::did_request_navigation_population(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request)
 {
     auto const& target_url = request.history_entry.url;
 
@@ -719,15 +731,11 @@ void WebContentClient::did_request_navigation_population(u64 page_id, Web::HTML:
     if (continues_reconstructed_child_navigation) {
         auto& ongoing_navigation = *target_navigable->ongoing_navigation();
         ongoing_navigation.url = target_url;
-        ongoing_navigation.current_url = move(current_url);
-        ongoing_navigation.target = target;
         ongoing_navigation.phase = CanonicalNavigable::OngoingNavigation::Phase::Populating;
         ongoing_navigation.loader = NavigationLoader::create(m_is_private, move(request));
     } else {
         target_navigable->set_ongoing_navigation(CanonicalNavigable::OngoingNavigation {
             .url = target_url,
-            .current_url = move(current_url),
-            .target = target,
             .navigation_id = request.navigation_id,
             .sequence_number = target_navigable->top_level_traversable().next_sequence_number(),
             .phase = CanonicalNavigable::OngoingNavigation::Phase::Populating,
@@ -779,9 +787,7 @@ void WebContentClient::did_finish_navigation_params_creation(u64 page_id, Web::H
     }
 
     auto& ongoing_navigation = navigable->ongoing_navigation();
-    if (!ongoing_navigation.has_value()
-        || !ongoing_navigation->loader
-        || !ongoing_navigation->current_url.has_value()) {
+    if (!ongoing_navigation.has_value() || !ongoing_navigation->loader) {
         NavigationLoader::discard(m_is_private, *result);
         end_recorded_load_for_canceled_navigation();
         navigable->clear_ongoing_navigation();
@@ -818,6 +824,16 @@ void WebContentClient::did_finish_navigation_params_creation(u64 page_id, Web::H
     });
 }
 
+void WebContentClient::did_finish_history_navigation_params_creation(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
+{
+    auto* host = navigable_for_page(page_id);
+    if (!host) {
+        NavigationLoader::discard(m_is_private, population.result);
+        return;
+    }
+    host->top_level_traversable().did_finish_history_navigation_params_creation(*this, page_id, operation_id, move(population));
+}
+
 void WebContentClient::did_fail_navigation_population(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
 {
     auto navigable = population_worker_navigable_for_page(page_id, navigable_id);
@@ -849,7 +865,8 @@ void WebContentClient::did_fail_navigation_population(u64 page_id, Web::HTML::Cr
 
 bool WebContentClient::continue_navigation_population_in_selected_process(u64 page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
 {
-    auto navigable = hosted_navigable_for_page(page_id, navigable_id);
+    // The population steps up to the response ran in the population worker, which delivered the result here.
+    auto navigable = population_worker_navigable_for_page(page_id, navigable_id);
     if (!navigable.has_value())
         return false;
 
@@ -861,74 +878,67 @@ bool WebContentClient::continue_navigation_population_in_selected_process(u64 pa
         return false;
     }
 
-    auto const& result = ongoing_navigation->loader->result();
-    auto const& current_url = *ongoing_navigation->current_url;
-    auto const& target_url = *ongoing_navigation->url;
-
-    // Step 6 of https://html.spec.whatwg.org/multipage/browsing-the-web.html#process-a-navigate-response
-    // A 204 or 205 response does not load a document, so keep the active document's process as the host.
-    auto creates_a_document = true;
-    if (result.navigation_params.has<Web::HTML::NavigationParamsDescriptor>()) {
-        auto status = result.navigation_params.get<Web::HTML::NavigationParamsDescriptor>().response.status;
-        creates_a_document = status != 204 && status != 205;
-    }
-
-    auto requires_process_swap = false;
-    if (creates_a_document) {
-        if (navigable->is_top_level_traversable()) {
-            requires_process_swap = SiteIsolationManager::the().navigation_requires_process_swap(current_url, target_url, ongoing_navigation->target.value_or(Web::NavigationTarget::TopLevel));
-        } else {
-            requires_process_swap = SiteIsolationManager::the().child_frame_navigation_requires_process_swap(*navigable, current_url, target_url);
-        }
-    }
-
+    auto& loader = *ongoing_navigation->loader;
     ongoing_navigation->phase = CanonicalNavigable::OngoingNavigation::Phase::Populating;
 
-    if (!requires_process_swap) {
-        navigable->set_navigation_host(*this, page_id);
-        async_populate_navigation(page_id, ongoing_navigation->loader->request(), ongoing_navigation->loader->take_result());
+    auto populate_in = [&](WebContentClient& host, u64 host_page_id) {
+        navigable->set_navigation_host(host, host_page_id);
+        host.async_populate_navigation(host_page_id, loader.request(), loader.take_result());
         return true;
-    }
+    };
+
+    // The task queued by step 5 of attempting to populate the history entry's document runs in the process hosting
+    // the browsing context that the document it creates belongs to. A response that creates no document is finished
+    // by the process that fetched it.
+    auto document = loader.response_document();
+    if (!document.has_value())
+        return populate_in(*this, page_id);
+
+    // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
+    // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
+    auto browsing_context = navigable->obtain_a_browsing_context_to_use_for_a_navigation_response(document->coop_enforcement_result);
+    auto browsing_context_group_switch = browsing_context.ptr() != &navigable->active_browsing_context();
 
     if (navigable->is_top_level_traversable()) {
-        if (auto view = view_for_page_id(page_id); view.has_value()) {
-            return view->create_new_process_for_cross_site_navigation(navigation_id);
-        } else {
+        auto& traversable = navigable->top_level_traversable();
+        auto site_isolation_process_swap = SiteIsolationManager::the().top_level_navigation_requires_process_swap(
+            traversable.active_browsing_context(),
+            traversable.replicated_state()->active_document_url,
+            document->url);
+        if (!browsing_context_group_switch && !site_isolation_process_swap)
+            return populate_in(*this, page_id);
+
+        auto view = view_for_page_id(page_id);
+        if (!view.has_value()) {
             navigable->clear_ongoing_navigation();
             return false;
         }
+        if (browsing_context_group_switch)
+            ongoing_navigation->destination_browsing_context = move(browsing_context);
+        return view->create_new_process_for_cross_site_navigation(navigation_id);
     }
 
-    auto current_step = navigable->top_level_traversable().session_history().current_step();
-    VERIFY(current_step.has_value());
-    auto const* current_entry = navigable->top_level_traversable().session_history().get_the_target_history_entry(*navigable, *current_step);
-    VERIFY(current_entry);
+    // A child navigable's document is created in the process hosting the agent cluster of the document's origin
+    // within the browsing context group. Without iframe isolation, every agent cluster of a child's document is
+    // hosted by its container document's process.
+    auto browsing_context_group = navigable->top_level_traversable().active_browsing_context().group();
+    VERIFY(browsing_context_group);
+    if (site_isolation_mode() != SiteIsolationMode::IFrame)
+        return populate_in(*this, page_id);
 
-    auto remote_process_or_error = Application::the().launch_child_frame_web_content_process(m_is_private, navigable_id, current_entry->document_state.id);
-    if (remote_process_or_error.is_error()) {
-        warnln("Unable to create WebContent process for child frame navigation: {}", remote_process_or_error.error());
+    // FIXME: Pass the document's requestsOAC value once Origin-Agent-Cluster is implemented.
+    auto agent = browsing_context_group->obtain_similar_origin_window_agent(document->origin, false);
+
+    auto host_or_error = SiteIsolationManager::the().obtain_child_document_host(*navigable, *agent);
+    if (host_or_error.is_error()) {
+        warnln("Unable to create WebContent page for child frame navigation: {}", host_or_error.error());
         navigable->clear_ongoing_navigation();
         return false;
     }
-
-    auto remote_process = remote_process_or_error.release_value();
-    auto remote_page_id = remote_process.page_id;
-    auto remote_client = move(remote_process.client);
-    navigable->set_navigation_host(*remote_client, remote_page_id);
-    remote_client->register_embedded_page(remote_page_id, *navigable);
-    remote_client->async_set_page_parent_context(remote_page_id, Web::Compositor::compositor_context_id_for_page(navigable->reporting_page_id()));
-    if (navigable->viewport_rect().has_value()) {
-        remote_client->async_set_viewport(
-            remote_page_id,
-            navigable->viewport_rect()->size(),
-            navigable->device_pixel_ratio(),
-            Web::ViewportIsFullscreen::No);
-    }
-    remote_client->async_update_visibility_state(remote_page_id, navigable->id(), navigable->top_level_traversable().system_visibility_state());
-    remote_client->async_populate_navigation(remote_page_id, ongoing_navigation->loader->request(), ongoing_navigation->loader->take_result());
-
-    SiteIsolationManager::the().transition_child_frame_to_remote(navigable->reporting_client(), navigable->reporting_page_id(), navigable_id, move(remote_client), remote_page_id);
-    return true;
+    auto host = host_or_error.release_value();
+    navigable->set_navigation_host(*host.client, host.page_id);
+    SiteIsolationManager::the().set_child_document_host(*navigable, host);
+    return populate_in(*host.client, host.page_id);
 }
 
 void WebContentClient::did_create_child_frame(u64 page_id, Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState replicated_state)
@@ -936,8 +946,27 @@ void WebContentClient::did_create_child_frame(u64 page_id, Web::HTML::CrossProce
     auto* host = navigable_for_page(page_id);
     if (!host)
         return;
+    auto& traversable = host->top_level_traversable();
 
-    host->top_level_traversable().insert(*this, page_id, move(parent_frame_id), move(frame_id), move(replicated_state), *host);
+    // A process materializing a frame that exists re-hosts its document. The canonical navigable's browsing context
+    // stays as it is.
+    if (auto existing_navigable = traversable.find(frame_id); existing_navigable.has_value()) {
+        traversable.insert(*this, page_id, move(parent_frame_id), move(frame_id), move(replicated_state), existing_navigable->active_browsing_context(), *host);
+        return;
+    }
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-new-child-navigable
+    // 2. Let group be element's node document's browsing context's top-level browsing context's group.
+    auto group = traversable.browsing_context_for_document_creation(*this, page_id).group();
+    VERIFY(group);
+
+    // 3. Let browsingContext and document be the result of creating a new browsing context and document given element's node document, element, and group.
+    auto browsing_context = CanonicalBrowsingContext::create_a_new_browsing_context_and_document(*group, replicated_state.active_document_origin, *this);
+
+    // 6. Let documentState be a new document state, with [...]
+    // 7. Let navigable be a new navigable.
+    // 8. Initialize the navigable navigable given documentState and parentNavigable.
+    traversable.insert(*this, page_id, move(parent_frame_id), move(frame_id), move(replicated_state), move(browsing_context), *host);
 }
 
 void WebContentClient::did_update_child_frame_viewport(u64 page_id, Web::HTML::CrossProcessId frame_id, Web::DevicePixelRect viewport_rect, double device_pixel_ratio)
@@ -1967,7 +1996,7 @@ void WebContentClient::did_post_broadcast_channel_message(u64, Web::HTML::Broadc
     WorkerProcessManager::the().broadcast_channel_message_from_web_content(message, m_is_private);
 }
 
-Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, bool clone_session_storage)
+Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints)
 {
     auto new_page_id = Application::the().allocate_page_id();
     String handle;
@@ -1980,11 +2009,6 @@ Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_r
     auto view = view_for_page_id(new_page_id);
     if (!view.has_value())
         return { {}, {}, Web::HTML::VisibilityState::Hidden, move(handle) };
-
-    // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-traversable
-    // 10. If opener is non-null, then legacy-clone a traversable storage shed given opener's top-level traversable and traversable. [STORAGE]
-    if (clone_session_storage && opener_view.has_value())
-        view->traversable().clone_session_storage_from(opener_view->traversable());
 
     auto root_navigable_id = Application::the().allocate_ui_process_cross_process_id();
     view->traversable().set_id(root_navigable_id);
@@ -2240,7 +2264,7 @@ void WebContentClient::did_change_screen_wake_lock_state(u64 page_id, Web::Scree
         view->did_change_screen_wake_lock_state({}, wake_lock_state);
 }
 
-void WebContentClient::did_create_top_level_traversable(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry)
+void WebContentClient::did_create_top_level_traversable(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Optional<Web::HTML::CrossProcessId> opener_navigable_id)
 {
     if (page_id == m_initial_page_id && navigable_id == m_root_navigable_id) {
         if (m_did_create_initial_top_level_traversable)
@@ -2260,7 +2284,11 @@ void WebContentClient::did_create_top_level_traversable(u64 page_id, Web::HTML::
     auto view = ViewImplementation::find_view_for_traversable(navigable->top_level_traversable());
     if (!view.has_value())
         return;
-    view->did_create_top_level_traversable({}, move(initial_history_entry));
+
+    Optional<CanonicalNavigable&> opener;
+    if (opener_navigable_id.has_value())
+        opener = hosted_navigable(*opener_navigable_id);
+    view->did_create_top_level_traversable({}, move(initial_history_entry), opener, *this);
 }
 
 void WebContentClient::did_update_session_history_entry_navigation_api_state(u64 page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state)

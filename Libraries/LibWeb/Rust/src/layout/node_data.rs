@@ -10,6 +10,7 @@ use std::ffi::c_void;
 
 pub const INVALID_NODE_SLOT_INDEX: u32 = u32::MAX;
 pub const GENERATED_FOR_AFTER: u8 = 1;
+pub const GENERATED_FOR_FIRST_LETTER: u8 = 4;
 pub const GENERATED_FOR_MARKER: u8 = 6;
 
 // The full C++ StyleGroupIndex space; LayoutRustBridge.cpp static-asserts the
@@ -128,7 +129,6 @@ pub enum NodeKind {
     TextAreaBox = 33,
     TextInputBox = 34,
     TextNode = 35,
-    TextSliceNode = 36,
     VideoBox = 37,
     Viewport = 38,
 }

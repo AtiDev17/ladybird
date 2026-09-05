@@ -85,6 +85,9 @@
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/UIEvents/CompositionEvent.h>
+#include <LibWeb/UIEvents/EventNames.h>
+#include <LibWeb/UIEvents/InputEvent.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWeb/XHR/FormData.h>
@@ -1283,7 +1286,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
         auto request_new_web_view = [&] {
             TokenizedFeature::Map empty_window_features;
             auto hints = WebViewHints::from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, traversable_navigable()->page());
-            return traversable_navigable()->page().client().page_did_request_new_web_view(activate_tab, hints, no_opener);
+            return traversable_navigable()->page().client().page_did_request_new_web_view(activate_tab, hints);
         };
 
         // --> If currentNavigable's active window does not have transient activation and the user agent has been configured to
@@ -1334,30 +1337,23 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
             if (!name.equals_ignoring_ascii_case(u"_blank"sv))
                 target_name = Utf16String::from_utf16(name);
 
-            auto create_new_traversable_closure = [page = new_web_view.page, system_visibility_state = new_web_view.system_visibility_state, window_handle = move(new_web_view.window_handle), target_name](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalTraversableNavigable> {
-                auto traversable = LocalTraversableNavigable::create_a_new_top_level_traversable(*page, opener, target_name, {}, system_visibility_state);
-                page->set_top_level_traversable(traversable);
-                traversable->set_window_handle(Utf16String::from_ascii_without_validation(window_handle.bytes()));
-
-                auto initial_history_entry = traversable->active_session_history_entry();
-                VERIFY(initial_history_entry);
-                page->client().page_did_create_top_level_traversable(
-                    traversable->id(),
-                    create_session_history_entry_descriptor(*initial_history_entry));
+            auto create_new_traversable = [&](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalTraversableNavigable> {
+                auto traversable = LocalTraversableNavigable::create_a_new_top_level_traversable(*new_web_view.page, opener, target_name, {}, new_web_view.system_visibility_state);
+                new_web_view.page->set_top_level_traversable(traversable);
+                traversable->set_window_handle(Utf16String::from_ascii_without_validation(new_web_view.window_handle.bytes()));
                 return traversable;
             };
-            auto create_new_traversable = GC::create_function(heap(), move(create_new_traversable_closure));
 
             // 7. If noopener is true, then set chosen to the result of creating a new top-level traversable given null and targetName.
             if (no_opener == TokenizedFeature::NoOpener::Yes) {
-                chosen = create_new_traversable->function()(nullptr);
+                chosen = create_new_traversable(nullptr);
             }
 
             // 8. Otherwise:
             else {
                 // 1. Set chosen to the result of creating a new top-level traversable given currentNavigable's active browsing context, targetName, and currentNavigable.
                 // FIXME: "and currentNavigable", which is the openerNavigableForWebDriver parameter.
-                chosen = create_new_traversable->function()(active_browsing_context());
+                chosen = create_new_traversable(active_browsing_context());
 
                 // 2. If sandboxingFlagSet's sandboxed navigation browsing context flag is set,
                 //    then set chosen's active browsing context's one permitted sandboxed navigator to currentNavigable's active browsing context.
@@ -2315,19 +2311,53 @@ void LocalNavigable::populate_session_history_entry_document(
     NavigationParamsVariant navigation_params,
     ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type,
     bool allow_POST,
-    GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps)
+    GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps,
+    GC::Ptr<GC::Function<void(NavigationPopulationResult)>> response_steps)
 {
     // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
     if (!active_window()) {
         stop_or_resume_response_body_delivery(navigation_params);
+        if (response_steps) {
+            response_steps->function()({
+                .navigation_params = NavigationParamsNullOrError { "Navigable has no active window"_utf16 },
+                .redirected_url = {},
+                .classic_history_api_state = {},
+                .replacement_document_state = {},
+            });
+        }
         return;
     }
 
     auto navigation_timing_type = reload_pending ? Bindings::NavigationTimingType::Reload : Bindings::NavigationTimingType::BackForward;
-    auto received_navigation_params = GC::create_function(heap(), [this, url, navigation_id, navigation_timing_type, user_involvement, completion_steps, csp_navigation_type, source_snapshot_params](GC::Ref<InternalNavigationResult> result) {
+    auto received_navigation_params = GC::create_function(heap(), [this, url, navigation_id, navigation_timing_type, user_involvement, completion_steps, csp_navigation_type, source_snapshot_params, response_steps](GC::Ref<InternalNavigationResult> result) {
         // AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
         if (!active_window()) {
             stop_or_resume_response_body_delivery(result->navigation_params);
+            if (response_steps) {
+                response_steps->function()({
+                    .navigation_params = NavigationParamsNullOrError { "Navigable has no active window"_utf16 },
+                    .redirected_url = {},
+                    .classic_history_api_state = {},
+                    .replacement_document_state = {},
+                });
+            }
+            return;
+        }
+
+        if (response_steps) {
+            auto& realm = active_window()->principal_realm();
+            create_navigation_params_descriptor(realm, result->navigation_params, GC::create_function(heap(), [result, response_steps](NavigationParamsVariantDescriptor params) {
+                Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
+                if (result->replacement_document_state)
+                    replacement_document_state = create_session_history_document_state_descriptor(*result->replacement_document_state);
+                response_steps->function()({
+                    .navigation_params = move(params),
+                    .redirected_url = move(result->redirected_url),
+                    .classic_history_api_state = move(result->classic_history_api_state),
+                    .replacement_document_state = move(replacement_document_state),
+                    .resource_cleared = result->resource_cleared,
+                });
+            }));
             return;
         }
 
@@ -2902,7 +2932,7 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     // 20. If url's scheme is "javascript", then:
     if (url.scheme() == "javascript"sv) {
         if (is_top_level_traversable())
-            active_browsing_context()->page().client().request_navigation_start(*this, active_document.url(), NavigationTarget::TopLevel, url, navigation_id, {});
+            active_browsing_context()->page().client().request_navigation_start(*this, NavigationTarget::TopLevel, url, navigation_id, {});
 
         // 1. Queue a global task on the navigation and traversal task source given navigable's active window to navigate to a javascript: URL given navigable, url, historyHandling, sourceSnapshotParams, initiatorOriginSnapshot, userInvolvement, cspNavigationType, initialInsertion, and navigationId.
         VERIFY(active_window());
@@ -3005,7 +3035,7 @@ void LocalNavigable::begin_navigation(PreparedNavigation navigation)
     park_navigation_for_population(navigation_id, move(navigation), continue_steps);
 
     auto target = is_top_level_traversable() ? NavigationTarget::TopLevel : NavigationTarget::IFrame;
-    active_browsing_context()->page().client().request_navigation_start(*this, active_document.url(), target, url, navigation_id, move(start_request));
+    active_browsing_context()->page().client().request_navigation_start(*this, target, url, navigation_id, move(start_request));
     return;
 }
 
@@ -3081,7 +3111,7 @@ void LocalNavigable::request_population_for_reconstructed_history_entry(Navigati
     });
 
     park_navigation_for_population(navigation_id, {}, continue_steps);
-    page().client().request_navigation_population(*this, active_document()->url(), NavigationTarget::IFrame, move(request));
+    page().client().request_navigation_population(*this, NavigationTarget::IFrame, move(request));
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-fragid
@@ -4819,6 +4849,44 @@ void LocalNavigable::redo()
     (void)Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
 }
 
+bool LocalNavigable::dispatch_composition_event(Utf16FlyString const& event_name, Utf16View data)
+{
+    // https://w3c.github.io/uievents/#events-compositionevents
+    auto document = active_document();
+    if (!document || !document->is_fully_active())
+        return true;
+
+    // https://w3c.github.io/uievents/#event-type-compositionstart
+    // Event.target: focused element processing the composition
+    GC::Ptr<DOM::EventTarget> target = document->focused_area();
+    if (!target)
+        target = document->body();
+    if (!target)
+        target = &document->root();
+
+    UIEvents::CompositionEventInit event_init {};
+    // https://w3c.github.io/uievents/#event-type-compositionstart
+    //   Bubbles: Yes, Cancelable: Yes
+    // https://w3c.github.io/uievents/#event-type-compositionupdate
+    //   Bubbles: Yes, Cancelable: No
+    // https://w3c.github.io/uievents/#event-type-compositionend
+    //   Bubbles: Yes, Cancelable: No
+    event_init.bubbles = true;
+    event_init.cancelable = event_name == UIEvents::EventNames::compositionstart;
+    // INTEROP: All engines also mark composition events as composed (Blink ComposedMode::kComposed, WebKit
+    //          IsComposed::Yes). So, they cross shadow boundaries — like the keyboard events they accompany.
+    event_init.composed = true;
+    // https://w3c.github.io/uievents/#dom-compositionevent-data
+    // data holds the value of the characters generated by an input method.
+    event_init.data = Utf16String::from_utf16(data);
+    // UIEvent.view: Window
+    event_init.view = document->window() ? GC::Ptr<HTML::WindowProxy> { document->window()->window() } : nullptr;
+
+    auto event = UIEvents::CompositionEvent::create(event_name, event_init, HighResolutionTime::current_high_resolution_time(relevant_global_object(*document)));
+    event->set_is_trusted(true);
+    return target->dispatch_event(event);
+}
+
 void LocalNavigable::set_marked_text_from_input_method(Utf16View text)
 {
     // Platform input methods call this on each composition update, with the current marked/preedit text. LibWeb owns
@@ -4826,9 +4894,14 @@ void LocalNavigable::set_marked_text_from_input_method(Utf16View text)
     // extent or pass a replacement length. An empty marked string means there's no preedit: so, clear any text marked
     // thus far, and end the composition — rather than starting or keeping a composition that has no marked text.
     if (text.is_empty()) {
-        if (m_input_method_composition_node)
-            replace_input_method_marked_text(text);
-        m_input_method_composition_node = nullptr;
+        if (m_input_method_composition_node || m_input_method_composition_active) {
+            if (m_input_method_composition_node)
+                replace_input_method_marked_text(text);
+            // https://w3c.github.io/uievents/#event-type-compositionend
+            // CompositionEvent.data: the string comprising the final result of the composition session, which MAY be
+            // the empty string if the content has been deleted or if the composition process has been canceled
+            end_input_method_composition(text);
+        }
         return;
     }
     replace_input_method_marked_text(text);
@@ -4837,21 +4910,106 @@ void LocalNavigable::set_marked_text_from_input_method(Utf16View text)
 void LocalNavigable::commit_text_from_input_method(Utf16View text, i32 replacement_start, i32 replacement_length)
 {
     if ((replacement_start != 0 || replacement_length != 0) && apply_input_method_commit_replacement(text, replacement_start, replacement_length)) {
-        m_input_method_composition_node = nullptr;
+        end_input_method_composition(text);
         return;
     }
 
     // The input method has committed text and finished the composition. Replace the marked text with the committed
     // text, then end the composition — so the text becomes ordinary editable content.
+    // INTEROP: Like Blink (InputMethodController::ReplaceComposition) and WebKit (Editor::confirmComposition), commit-
+    //          ted text is inserted as one last composition update: inputType insertCompositionText, with isComposing
+    //          true — and then, compositionend is dispatched. No separate insertText pair is fired for the commit.
     replace_input_method_marked_text(text);
-    m_input_method_composition_node = nullptr;
+    end_input_method_composition(text);
 }
 
 void LocalNavigable::unmark_text_from_input_method()
 {
     // The input method has finished the composition — leaving the current marked text in place. End the composition
     // without altering the content.
+    // https://w3c.github.io/uievents/#event-type-compositionend
+    // A user agent MUST dispatch this event when a text composition system completes or cancels the current composition
+    // session, and the compositionend event MUST be dispatched after the control is updated.
+    end_input_method_composition({});
+}
+
+// Drop every trace of a composition session without dispatching anything. Only for when the document a session belonged
+// to is gone: A LocalNavigable outlives its documents — so session state left behind here would leak into the next one.
+void LocalNavigable::forget_input_method_composition_session()
+{
     m_input_method_composition_node = nullptr;
+    m_input_method_composition_active = false;
+    m_input_method_last_marked_text = {};
+}
+
+void LocalNavigable::end_input_method_composition(Optional<Utf16View> final_text)
+{
+    // Only a session that actually began (and so dispatched compositionstart) ends with compositionend.
+    // https://w3c.github.io/uievents/#events-compositionevents
+    auto was_active = m_input_method_composition_active;
+    m_input_method_composition_active = false;
+    m_input_method_composition_node = nullptr;
+    auto last_marked_text = move(m_input_method_last_marked_text);
+    if (auto document = active_document())
+        document->set_is_input_method_composing(false);
+    if (!was_active)
+        return;
+
+    // https://w3c.github.io/uievents/#event-type-compositionend
+    // A user agent MUST dispatch this event when a text composition system completes or cancels the current composition
+    // session, and the compositionend event MUST be dispatched after the control is updated.
+    // https://w3c.github.io/uievents/#events-composition-input-events
+    // Since there are no DOM updates associated with the compositionend event, beforeinput and input events should not
+    // be sent at that time.
+    // https://w3c.github.io/uievents/#event-type-compositionend
+    // CompositionEvent.data: the string comprising the final result of the composition session
+    // NB: When the input method finishes without committing new text (unmark), the marked text stays in place and is
+    //     that final result.
+    dispatch_composition_event(UIEvents::EventNames::compositionend, final_text.has_value() ? *final_text : last_marked_text.utf16_view());
+}
+
+// Dispatching an event runs author script — which may move focus, detach the editable, or navigate. So, a target
+// resolved before a dispatch may no longer be the one the input method addressed. Anything that edits through a
+// target across a dispatch re-checks it with this first — and abandons the composition when it no longer holds.
+static bool input_method_target_is_still(DOM::Document& document, InputEventsTarget const* expected)
+{
+    return document.is_fully_active() && document.active_input_events_target() == expected;
+}
+
+// Dispatch the beforeinput that precedes an input-method insertion. Every such insertion needs one: Neither editing
+// hosts nor text controls dispatch it themselves — the editing command and the text control's value change each fire
+// only the matching input event.
+static void dispatch_composition_beforeinput(DOM::Document& document, Utf16View text)
+{
+    UIEvents::InputEventInit input_event_init {};
+    input_event_init.bubbles = true;
+    input_event_init.composed = true;
+    input_event_init.input_type = UIEvents::InputTypes::insertCompositionText;
+    input_event_init.data = Utf16String::from_utf16(text);
+    // https://w3c.github.io/uievents/#dom-inputevent-iscomposing
+    // true while a composition session is in progress — which is what the matching input event will report too.
+    input_event_init.is_composing = document.is_input_method_composing();
+
+    // https://w3c.github.io/input-events/#event-order-during-composition
+    // The beforeinput and input events:
+    // - Have a targetRange that surrounds the active text passage of the composition
+    GC::RootVector<GC::Ref<DOM::StaticRange>> target_ranges;
+    if (auto selection = document.get_selection(); selection) {
+        if (auto range = selection->range())
+            target_ranges.append(GC::Heap::the().allocate<DOM::StaticRange>(range->start_container(), range->start_offset(), range->end_container(), range->end_offset()));
+    }
+    auto beforeinput = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, input_event_init, target_ranges, HighResolutionTime::current_high_resolution_time(relevant_global_object(document)));
+    beforeinput->set_is_trusted(true);
+    // https://w3c.github.io/input-events/#event-order-during-composition
+    // The beforeinput and input events:
+    // - Are not cancellable
+    beforeinput->set_cancelable(false);
+    GC::Ptr<DOM::EventTarget> event_target = document.focused_area();
+    if (!event_target)
+        event_target = document.body();
+    if (!event_target)
+        event_target = &document.root();
+    event_target->dispatch_event(beforeinput);
 }
 
 void LocalNavigable::replace_input_method_marked_text(Utf16View text)
@@ -4860,41 +5018,142 @@ void LocalNavigable::replace_input_method_marked_text(Utf16View text)
     // that keyboard typing uses — so observers see the correct InputEvent.inputType.
     auto document = active_document();
     if (!document || !document->is_fully_active()) {
-        m_input_method_composition_node = nullptr;
+        // No document left to dispatch compositionend at. Forget the session outright: This navigable outlives its
+        // documents — so a session left marked active here would make the next document's first preedit look like the
+        // continuation of one that document never saw begin.
+        forget_input_method_composition_session();
         return;
     }
     auto* target = document->active_input_events_target();
     if (!target) {
-        m_input_method_composition_node = nullptr;
+        // Nothing editable to compose into. The document is still here, so end the session properly rather than
+        // forgetting it.
+        end_input_method_composition(Utf16View { u""sv });
         return;
     }
 
     // Drop a stale composition start (for example, if the editable content was replaced out from under us, or focus moved
     // to a different editable).
-    if (m_input_method_composition_node && (!m_input_method_composition_node->is_connected() || document->active_input_events_target(m_input_method_composition_node.ptr()) != target))
+    // NB: The offset is checked against the node's current length as well. Script that runs from a composition event
+    //     can shorten the node, and set_selection_anchor() below reaches Selection::collapse() through MUST() — which
+    //     throws IndexSizeError for an offset past the node's length, and so would be fatal.
+    if (m_input_method_composition_node
+        && (!m_input_method_composition_node->is_connected()
+            || document->active_input_events_target(m_input_method_composition_node.ptr()) != target
+            || m_input_method_composition_offset > m_input_method_composition_node->length())) {
         m_input_method_composition_node = nullptr;
+    }
 
-    // The caret is the end of the marked text. Read it while the selection is still collapsed. Forming the marked-text
-    // selection below would otherwise make cursor_position() return null for form controls.
-    auto caret = document->cursor_position();
-    if (!caret) {
-        if (!m_input_method_composition_node)
-            target->handle_insert(UIEvents::InputTypes::insertText, text);
+    // https://w3c.github.io/uievents/#event-type-compositionstart
+    // CompositionEvent.data: the original string being edited, otherwise the empty string
+    // NB: Read the selected text before anything below collapses or replaces it. Selection::to_string() returns a
+    //     focused text control's own selected text as well — which its document Selection doesn't otherwise reflect.
+    Utf16String original_string;
+    if (auto selection = document->get_selection(); selection)
+        original_string = selection->to_string();
+
+    // https://w3c.github.io/uievents/#event-type-compositionstart
+    // A user agent MUST dispatch this event when a text composition system is enabled and a new composition session is
+    // about to begin (or has begun, depending on the text composition system) in preparation for composing a passage
+    // of text.
+    if (!m_input_method_composition_active) {
+        document->set_is_input_method_composing(true);
+        m_input_method_composition_active = true;
+        // https://w3c.github.io/uievents/#events-composition-canceling
+        // If the initial compositionstart event is canceled then the text composition session SHOULD be terminated.
+        // Regardless of whether or not the composition session is terminated, the compositionend event MUST be sent.
+        // INTEROP: Blink honors the cancel the same way (InputMethodController::SetComposition returns without
+        //          composing, when DispatchCompositionStartEvent() reports the event was canceled).
+        if (!dispatch_composition_event(UIEvents::EventNames::compositionstart, original_string)) {
+            end_input_method_composition(Utf16View { u""sv });
+            return;
+        }
+        if (!input_method_target_is_still(*document, target)) {
+            end_input_method_composition(Utf16View { u""sv });
+            return;
+        }
+    }
+
+    // When a marked-text range is already tracked, select it [composition start, caret] — so this update replaces it.
+    // Otherwise, on the first update with a caret, remember that caret as where the marked text begins: the pre-insert
+    // caret is used (rather than one derived after the insertion) because inserting into an editing host can replace
+    // the text node — which would leave a post-insert start stale on the next update.
+    // A caret is available whenever the selection is collapsed; a text control with a non-collapsed selection has none.
+    if (auto caret = document->cursor_position(); caret) {
+        if (m_input_method_composition_node) {
+            target->set_selection_anchor(*m_input_method_composition_node, m_input_method_composition_offset);
+            target->set_selection_focus(caret->node(), caret->offset());
+        } else {
+            m_input_method_composition_node = caret->node();
+            m_input_method_composition_offset = caret->offset();
+        }
+    }
+
+    // https://w3c.github.io/input-events/#event-order-during-composition
+    // During a composition session, whenever a text composition system updates its active text passage, a
+    // compositionupdate event is dispatched. After each compositionupdate event, a pair of beforeinput and input events
+    // are dispatched. The beforeinput and input events:
+    //   Are not cancellable
+    //   Have an inputType set to "insertCompositionText"
+    //   Have a data attribute equal to that of the compositionupdate event
+    //   Have a targetRange that surrounds the active text passage of the composition
+    // The DOM contents of the active text passage are updated after the beforeinput event is dispatched and before the
+    // input event is dispatched.
+    //
+    // NB: The UI Events spec (https://w3c.github.io/uievents/#events-composition-input-events) orders those the other
+    //     way around: beforeinput, then compositionupdate, then the DOM update, then input. But no engine does that;
+    //     Blink (InputMethodController::SetComposition), WebKit (Editor::setComposition) and Gecko (TextComposition)
+    //     all dispatch compositionupdate first, then beforeinput, then update the DOM.
+    // https://github.com/w3c/uievents/issues/354
+    // INTEROP: We match the ordering in other engines and the Input Events spec — rather than the UI-Events-spec order.
+    //
+    // https://w3c.github.io/uievents/#event-type-compositionupdate
+    // A user agent SHOULD dispatch this event during a composition session when a text composition system updates its
+    // active text passage with a new character, which is reflected in the string in CompositionEvent.data. In text
+    // composition systems which keep the ongoing composition in sync with the input control, the compositionupdate event
+    // MUST be dispatched before the control is updated.
+    m_input_method_last_marked_text = Utf16String::from_utf16(text);
+    dispatch_composition_event(UIEvents::EventNames::compositionupdate, text);
+
+    // The beforeinput event for this insertion, targeting the active text passage.
+    dispatch_composition_beforeinput(*document, text);
+    if (!input_method_target_is_still(*document, target)) {
+        end_input_method_composition(Utf16View { u""sv });
         return;
     }
 
-    if (m_input_method_composition_node) {
-        // A composition is already in progress. Select the existing marked text [composition start, caret] — so that
-        // the insertion below replaces it.
-        target->set_selection_anchor(*m_input_method_composition_node, m_input_method_composition_offset);
-        target->set_selection_focus(caret->node(), caret->offset());
-    } else {
-        // Begin a new composition at the caret. The marked text spans from here to the caret as it is updated.
-        m_input_method_composition_node = caret->node();
-        m_input_method_composition_offset = caret->offset();
+    // The DOM update, which fires the matching input event (inputType insertCompositionText, isComposing true) from the
+    // editing command for an editing host, or from the text control's value change for a form control.
+    target->handle_insert(UIEvents::InputTypes::insertCompositionText, text);
+
+    // The first update over a non-collapsed selection had no pre-insert caret to remember as the marked-text start.
+    // Derive it now from the post-insert caret — which the insertion above collapsed to the end of the inserted text.
+    // So the marked text begins text's length before it.
+    if (!m_input_method_composition_node) {
+        if (auto end_caret = document->cursor_position(); end_caret && end_caret->offset() >= text.length_in_code_units()) {
+            m_input_method_composition_node = end_caret->node();
+            m_input_method_composition_offset = end_caret->offset() - text.length_in_code_units();
+        }
+    }
+}
+
+// The events that precede a replacement commit's insertion. Returns whether the insertion may still proceed: the
+// dispatches below run author script — which can move focus out from under the target.
+// INTEROP: Blink runs the same pair for a commit that replaces a range (CommitText -> ReplaceComposition ->
+//          InsertTextDuringCompositionWithEvents — which dispatches compositionupdate and then beforeinput).
+bool LocalNavigable::dispatch_input_method_replacement_events(DOM::Document& document, InputEventsTarget const* target, Utf16View text)
+{
+    // Only within a session; a compositionupdate outside one would've had no compositionstart to belong to. A
+    // replacement can arrive without a session at all — an input method correcting a word that was never composed.
+    if (m_input_method_composition_active) {
+        m_input_method_last_marked_text = Utf16String::from_utf16(text);
+        dispatch_composition_event(UIEvents::EventNames::compositionupdate, text);
+        if (!input_method_target_is_still(document, target))
+            return false;
     }
 
-    target->handle_insert(UIEvents::InputTypes::insertText, text);
+    dispatch_composition_beforeinput(document, text);
+    return input_method_target_is_still(document, target);
 }
 
 bool LocalNavigable::apply_input_method_commit_replacement(Utf16View text, i32 replacement_start, i32 replacement_length)
@@ -4904,12 +5163,12 @@ bool LocalNavigable::apply_input_method_commit_replacement(Utf16View text, i32 r
 
     auto document = active_document();
     if (!document || !document->is_fully_active()) {
-        m_input_method_composition_node = nullptr;
+        forget_input_method_composition_session();
         return true;
     }
     auto* target = document->active_input_events_target();
     if (!target) {
-        m_input_method_composition_node = nullptr;
+        end_input_method_composition(Utf16View { u""sv });
         return true;
     }
 
@@ -4919,7 +5178,9 @@ bool LocalNavigable::apply_input_method_commit_replacement(Utf16View text, i32 r
     auto caret = document->cursor_position();
     if (!caret) {
         if (!m_input_method_composition_node) {
-            target->handle_insert(UIEvents::InputTypes::insertText, text);
+            if (!dispatch_input_method_replacement_events(*document, target, text))
+                return true;
+            target->handle_insert(UIEvents::InputTypes::insertCompositionText, text);
             return true;
         }
         return false;
@@ -4949,7 +5210,11 @@ bool LocalNavigable::apply_input_method_commit_replacement(Utf16View text, i32 r
 
     target->set_selection_anchor(*preedit_start_node, replacement_start_offset);
     target->set_selection_focus(*preedit_start_node, replacement_start_offset + replacement_length_as_size);
-    target->handle_insert(UIEvents::InputTypes::insertText, text);
+    // INTEROP: A commit that replaces text around the caret is still composition-typed input (Blink CommitText ->
+    //          kInsertCompositionText) — so it carries inputType insertCompositionText, like every other IME insertion.
+    if (!dispatch_input_method_replacement_events(*document, target, text))
+        return true;
+    target->handle_insert(UIEvents::InputTypes::insertCompositionText, text);
     return true;
 }
 

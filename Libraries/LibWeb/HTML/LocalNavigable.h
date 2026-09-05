@@ -177,7 +177,8 @@ public:
         NavigationParamsVariant navigation_params,
         ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type,
         bool allow_POST,
-        GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps);
+        GC::Ptr<GC::Function<void(GC::Ptr<PopulateSessionHistoryEntryDocumentOutput>)>> completion_steps,
+        GC::Ptr<GC::Function<void(NavigationPopulationResult)>> response_steps = {});
 
     void queue_navigation_and_traversal_task_for_session_history_entry_population(
         URL::URL url,
@@ -478,8 +479,19 @@ private:
     //         from there to the caret. A null node means no composition is in progress.
     void replace_input_method_marked_text(Utf16View text);
     bool apply_input_method_commit_replacement(Utf16View text, i32 replacement_start, i32 replacement_length);
+    bool dispatch_composition_event(Utf16FlyString const& event_name, Utf16View data);
+    bool dispatch_input_method_replacement_events(DOM::Document&, InputEventsTarget const* target, Utf16View text);
+    void end_input_method_composition(Optional<Utf16View> final_text);
+    void forget_input_method_composition_session();
     GC::Ptr<DOM::Node> m_input_method_composition_node;
     size_t m_input_method_composition_offset { 0 };
+    // The most-recent marked text of the composition: What compositionend reports as the final result when the input
+    // method finishes the composition without committing new text (unmark).
+    Utf16String m_input_method_last_marked_text;
+    // Whether a composition session has begun (compositionstart was dispatched and not cancelled) — independently of
+    // whether a marked-text range is tracked: A text control with a non-collapsed selection has no tracked caret — but
+    // still composes through the same session.
+    bool m_input_method_composition_active { false };
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#is-closing
     bool m_closing { false };

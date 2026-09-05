@@ -940,6 +940,7 @@ struct DeserializedTransferRecord;
 struct EmbedderPolicy;
 struct Environment;
 struct EnvironmentSettingsObject;
+struct HistoryNavigationPopulation;
 struct NavigationPopulationRequest;
 struct NavigationPopulationResult;
 struct NavigationStartRequest;
@@ -1015,7 +1016,6 @@ class Node;
 class NodeArena;
 class NodeWithStyle;
 class TextNode;
-class TextOffsetMapping;
 class LayoutTreeBuilderAccess;
 class Viewport;
 

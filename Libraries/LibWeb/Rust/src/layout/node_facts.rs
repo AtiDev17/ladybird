@@ -216,10 +216,7 @@ pub(crate) fn has_flag(data: &NodeData, flag: NodeFlag) -> bool {
 }
 
 pub(crate) fn kind_is_text(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::GeneratedTextNode | NodeKind::TextNode | NodeKind::TextSliceNode
-    )
+    matches!(kind, NodeKind::GeneratedTextNode | NodeKind::TextNode)
 }
 
 pub(crate) fn kind_and_style_make_scroll_container(kind: NodeKind, style: Option<ComputedValuesView<'_>>) -> bool {
@@ -245,7 +242,6 @@ pub(crate) fn kind_is_box(kind: NodeKind) -> bool {
             | NodeKind::NodeWithStyle
             | NodeKind::GeneratedTextNode
             | NodeKind::TextNode
-            | NodeKind::TextSliceNode
     )
 }
 
@@ -302,7 +298,7 @@ pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
 /// Nothing is materialized per node, so every answer is as live as its source.
 #[derive(Clone, Copy)]
 pub(crate) struct NodeFacts<'pass> {
-    callbacks: &'pass FfiLayoutFcCallbacks,
+    callbacks: LayoutPass<'pass>,
     node: Node,
     data: &'pass NodeData,
     style_payloads: Option<&'pass FfiStylePayloads>,
@@ -310,15 +306,11 @@ pub(crate) struct NodeFacts<'pass> {
 
 impl<'pass> NodeFacts<'pass> {
     #[inline]
-    pub(crate) fn new(callbacks: &'pass FfiLayoutFcCallbacks, node: Node) -> Self {
+    pub(crate) fn new(callbacks: &LayoutPass<'pass>, node: Node) -> Self {
         let data = callbacks.node_data(node);
-        // SAFETY: A non-null style pointer addresses the container's group
-        // pointer array, which FfiStylePayloads mirrors exactly. The node's
-        // ComputedValues keep the container alive for the layout pass.
-        let style_payloads =
-            (!data.style.get().is_null()).then(|| unsafe { &*data.style.get().cast::<FfiStylePayloads>() });
+        let style_payloads = callbacks.arena().style_payloads(node);
         Self {
-            callbacks,
+            callbacks: *callbacks,
             node,
             data,
             style_payloads,
@@ -447,7 +439,6 @@ impl<'pass> NodeFacts<'pass> {
                 | NodeKind::NodeWithStyle
                 | NodeKind::GeneratedTextNode
                 | NodeKind::TextNode
-                | NodeKind::TextSliceNode
         )
     }
 

@@ -5,12 +5,10 @@
  */
 
 use crate::css::css_pixels::CssPixelRect;
-use crate::css::css_pixels::CssPixels;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::layout::{formatting_context, fragment_tree, inline_formatting_context, node_facts, used_values};
+use crate::layout::{formatting_context, fragment_tree, node_facts, used_values};
 use crate::painting::node_painting;
-use crate::painting::paintable_data::*;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 
 #[derive(Clone, Copy, Debug)]
@@ -25,29 +23,28 @@ pub(crate) struct ReplacedCommittedFragmentLink {
 }
 
 pub(crate) struct PaintableCommit<'a> {
-    callbacks: &'a formatting_context::FfiLayoutFcCallbacks,
+    arena: &'a mut LayoutNodeArena,
     committed_offsets_before_recommit_reset: std::collections::HashMap<NodeSlotId, used_values::FfiCssPixelPoint>,
     committed_navigable_container_viewports: Vec<NodeSlotId>,
+    row_reset_notifications: Vec<crate::painting::paintable_rows::PaintableRowReset>,
 }
 
 impl<'a> PaintableCommit<'a> {
-    pub(crate) fn new(callbacks: &'a formatting_context::FfiLayoutFcCallbacks) -> Self {
+    pub(crate) fn new(arena: &'a mut LayoutNodeArena) -> Self {
         Self {
-            callbacks,
+            arena,
             committed_offsets_before_recommit_reset: std::collections::HashMap::new(),
             committed_navigable_container_viewports: Vec::new(),
+            row_reset_notifications: Vec::new(),
         }
     }
 
-    fn arena(&self) -> &LayoutNodeArena {
-        self.callbacks.arena()
+    pub(crate) fn arena(&self) -> &LayoutNodeArena {
+        self.arena
     }
 
     fn arena_mut(&mut self) -> &mut LayoutNodeArena {
-        // SAFETY: Layout commit is synchronous on the document thread. The mutable
-        // PaintableCommit borrow prevents Rust code from retaining another arena
-        // borrow across this callback-free mutation phase.
-        unsafe { LayoutNodeArena::from_handle_mut(self.callbacks.arena) }
+        self.arena
     }
 
     pub(crate) fn discard_absolute_rects_memoized_during_commit(&self) {
@@ -66,10 +63,11 @@ impl<'a> PaintableCommit<'a> {
         enclosing_line_root_content_changed: bool,
     ) -> PreparedPaintable {
         let (wants_paintable, node_kind) = {
-            let facts = node_facts::NodeFacts::new(self.callbacks, node);
-            let data = self.callbacks.node_data(node);
+            let data = self.arena().data(node);
+            let is_fragmented_inline = node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data));
+            let has_dom_node = !node_facts::has_flag(data, crate::layout::node_data::NodeFlag::Anonymous);
             (
-                (has_used_values || (facts.is_fragmented_inline() && facts.has_dom_node()))
+                (has_used_values || (is_fragmented_inline && has_dom_node))
                     && node_painting::has_paintable(data.kind.get()),
                 data.kind.get(),
             )
@@ -85,7 +83,7 @@ impl<'a> PaintableCommit<'a> {
                         .prepare_paintable_row_cleared_reset(node)
                         .expect("live row for node could not be cleared")
                 };
-                reset.invoke_callback();
+                self.row_reset_notifications.push(reset);
                 self.arena_mut().paintable_row_cleared(reset);
             }
             return PreparedPaintable {
@@ -127,7 +125,7 @@ impl<'a> PaintableCommit<'a> {
                 )
             };
             self.committed_offsets_before_recommit_reset.insert(node, offset);
-            notification.invoke_callback();
+            self.row_reset_notifications.push(notification);
         }
         let arena = self.arena_mut();
         if row_existed_before_this_commit {
@@ -145,10 +143,14 @@ impl<'a> PaintableCommit<'a> {
         }
     }
 
+    pub(crate) fn take_row_reset_notifications(&mut self) -> Vec<crate::painting::paintable_rows::PaintableRowReset> {
+        std::mem::take(&mut self.row_reset_notifications)
+    }
+
     pub(crate) fn committed_navigable_container_viewport_shells(&self) -> Vec<*mut std::ffi::c_void> {
         self.committed_navigable_container_viewports
             .iter()
-            .map(|node| self.callbacks.shell(*node))
+            .map(|node| self.arena().node_shell(*node))
             .collect()
     }
 
@@ -184,8 +186,10 @@ impl<'a> PaintableCommit<'a> {
             content_size_change = Some((old_content_size, new_content_size));
         }
         let committed_fragment_identity_changed = old_identity != fragment.identity;
-        let painted_geometry_lives_in_enclosing_line_root =
-            || node_facts::NodeFacts::new(self.callbacks, node).is_fragmented_inline();
+        let painted_geometry_lives_in_enclosing_line_root = || {
+            let data = self.arena().data(node);
+            node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data))
+        };
         let painted_content_changed = committed_fragment_identity_changed
             || (enclosing_line_root_content_changed && painted_geometry_lives_in_enclosing_line_root());
         // A reused committed subtree's root counts as unchanged even though its run-root
@@ -206,17 +210,18 @@ impl<'a> PaintableCommit<'a> {
             self.arena()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::RecommittedInPlace);
         }
+        if painted_content_changed {
+            self.arena().paintable_rows().clear_cached_overflow_data(node);
+        }
         {
             let arena = self.arena_mut();
             let mut paintable_rows = arena.paintable_rows_mut();
             let data = paintable_rows.paintable_data_mut(node);
-            if painted_content_changed {
-                data.overflow_valid_across_recommits = false;
-            }
             data.content_size = new_content_size;
             data.offset = link.committed_offset;
         }
-        self.callbacks.set_committed_fragment_link(node, link.clone());
+        self.arena()
+            .set_committed_fragment_link(self.arena().data(node), link.clone());
         ReplacedCommittedFragmentLink {
             content_size_change,
             committed_fragment_identity_changed,
@@ -226,24 +231,14 @@ impl<'a> PaintableCommit<'a> {
     pub(crate) fn set_line_data(
         &self,
         slot: NodeSlotId,
-        line_data: &used_values::LineData,
-        content_inline_size: CssPixels,
+        line_data: &std::rc::Rc<crate::layout::inline_content::InlineContent>,
     ) -> bool {
         if !node_painting::has_lines(self.arena(), slot) {
             return false;
         }
-        let (lines, fragments, pieces) = self.build_line_records(line_data, content_inline_size);
-        let has_pieces = !pieces.is_empty();
+        let has_pieces = !line_data.inline_box_pieces.is_empty();
         let mut side = self.arena().paintable_side_data_mut(slot);
-        side.lines = lines;
-        side.fragments = fragments;
-        side.inline_box_pieces = pieces;
-        for piece in &side.inline_box_pieces {
-            assert!(
-                (piece.first_fragment_index + piece.fragment_count) as usize <= side.fragments.len(),
-                "inline box piece fragment range exceeds the committed fragments"
-            );
-        }
+        side.inline_content = Some(line_data.clone());
         drop(side);
         if has_pieces {
             self.arena().note_line_root_needs_fragment_ownership(slot);
@@ -251,150 +246,8 @@ impl<'a> PaintableCommit<'a> {
         has_pieces
     }
 
-    fn build_line_records(
-        &self,
-        data: &used_values::LineData,
-        content_inline_size: CssPixels,
-    ) -> (Vec<LineRecord>, Vec<FragmentRecord>, Vec<InlineBoxPieceRecord>) {
-        let mut lines = Vec::with_capacity(data.line_boxes.len());
-        let mut fragments = Vec::new();
-        for line in &data.line_boxes {
-            let committed_fragment_count = line.visible_fragments().count() as u32;
-            lines.push(LineRecord {
-                rect: inline_formatting_context::line_rect(line, content_inline_size),
-                baseline: line.block_start + line.baseline,
-                fragment_count: committed_fragment_count,
-            });
-            let line_index = (lines.len() - 1) as u32;
-            for fragment in &line.fragments {
-                if fragment.is_fully_truncated {
-                    continue;
-                }
-                let (x, y) = fragment.offset();
-                let (x, y) = (x + fragment.relpos_delta.x, y + fragment.relpos_delta.y);
-                let (width, height) = fragment.size();
-                let glyph_run = fragment.glyphs.as_ref().map(|glyph_data| GlyphRunRecord {
-                    glyphs: glyph_data.glyphs.clone(),
-                    // SAFETY: The layout pass borrowed the font from a live cascade list; retaining
-                    // it here keeps it alive for as long as the fragment record.
-                    font: unsafe { libgfx_rust::font::RetainedFont::retain(glyph_data.font) },
-                });
-                let (
-                    dom_start_offset_in_node,
-                    dom_end_offset_in_node,
-                    dom_end_offset_with_trailing_whitespace,
-                    trailing_whitespace_length_in_code_units,
-                ) = self.fragment_dom_offsets(
-                    fragment.layout_node,
-                    fragment.start,
-                    fragment.length_in_code_units,
-                    fragment.has_trailing_whitespace,
-                );
-                fragments.push(FragmentRecord {
-                    layout_node: fragment.layout_node,
-                    style_source: fragment.style_source,
-                    offset: used_values::FfiCssPixelPoint { x, y },
-                    size: used_values::FfiCssPixelSize { width, height },
-                    line_index,
-                    start_offset: fragment.start,
-                    length_in_code_units: fragment.length_in_code_units,
-                    dom_start_offset_in_node,
-                    dom_end_offset_in_node,
-                    dom_end_offset_with_trailing_whitespace,
-                    trailing_whitespace_length_in_code_units,
-                    baseline: fragment.baseline,
-                    accumulated_vertical_shift: fragment.accumulated_vertical_shift,
-                    writing_mode: fragment.writing_mode,
-                    is_block_ellipsis: fragment.is_block_ellipsis,
-                    selection_state: 0,
-                    glyph_run,
-                });
-            }
-        }
-        let pieces = data
-            .inline_box_pieces
-            .iter()
-            .map(|piece| InlineBoxPieceRecord {
-                node: piece.node,
-                first_fragment_index: piece.first_fragment_index,
-                fragment_count: piece.fragment_count,
-                line_index: piece.line_index,
-                border_box_rect: used_values::FfiCssPixelRect {
-                    x: piece.border_box_rect.x + piece.relpos_delta.x,
-                    y: piece.border_box_rect.y + piece.relpos_delta.y,
-                    width: piece.border_box_rect.width,
-                    height: piece.border_box_rect.height,
-                },
-                baseline: piece.baseline + piece.relpos_delta.y,
-                accumulated_vertical_shift: piece.accumulated_vertical_shift,
-                present_edges: piece.present_edges,
-                is_geometry_only_placeholder: piece.is_geometry_only_placeholder,
-            })
-            .collect();
-        (lines, fragments, pieces)
-    }
-
-    fn fragment_dom_offsets(
-        &self,
-        layout_node: NodeSlotId,
-        start_offset: usize,
-        length_in_code_units: usize,
-        has_trailing_whitespace: bool,
-    ) -> (usize, usize, usize, usize) {
-        let data = self.callbacks.node_data(layout_node);
-        if !node_facts::kind_is_text(data.kind.get()) {
-            return (
-                start_offset,
-                start_offset + length_in_code_units,
-                start_offset + length_in_code_units,
-                0,
-            );
-        }
-        let content = self.callbacks.text_content(layout_node);
-        let mut trailing_whitespace_length = 0;
-        if has_trailing_whitespace {
-            let position = start_offset + length_in_code_units;
-            while let Some(code_unit) = content.text.get(position + trailing_whitespace_length) {
-                if *code_unit != u16::from(b' ') && *code_unit != u16::from(b'\t') {
-                    break;
-                }
-                trailing_whitespace_length += 1;
-            }
-        }
-        let arena = self.callbacks.arena();
-        let dom_start_offset_in_node = arena.dom_offset_for_rendered_text_offset(
-            layout_node,
-            start_offset,
-            crate::layout::RenderedTextBoundary::Start,
-        );
-        let dom_end_offset_in_node = if length_in_code_units == 0 {
-            dom_start_offset_in_node
-        } else {
-            arena.dom_offset_for_rendered_text_offset(
-                layout_node,
-                start_offset + length_in_code_units,
-                crate::layout::RenderedTextBoundary::End,
-            )
-        };
-        let dom_end_offset_with_trailing_whitespace = if trailing_whitespace_length == 0 {
-            dom_end_offset_in_node
-        } else {
-            arena.dom_offset_for_rendered_text_offset(
-                layout_node,
-                start_offset + length_in_code_units + trailing_whitespace_length,
-                crate::layout::RenderedTextBoundary::End,
-            )
-        };
-        (
-            dom_start_offset_in_node,
-            dom_end_offset_in_node,
-            dom_end_offset_with_trailing_whitespace,
-            trailing_whitespace_length,
-        )
-    }
-
     pub(crate) fn stamp_containing_block(&mut self, node: formatting_context::Node) {
-        let containing_block = self.callbacks.node_data(node).containing_block.get();
+        let containing_block = self.arena().data(node).containing_block.get();
         let arena = self.arena_mut();
         let mut paintable_rows = arena.paintable_rows_mut();
         if !paintable_rows.paintable_row_is_populated(node) {
@@ -419,7 +272,7 @@ impl<'a> PaintableCommit<'a> {
         let mut piece_indices_by_node: Vec<(NodeSlotId, Vec<u32>)> = Vec::new();
         for (piece_index, piece) in paintable_rows
             .paintable_side_data(slot)
-            .inline_box_pieces
+            .inline_box_pieces()
             .iter()
             .enumerate()
         {
@@ -457,7 +310,7 @@ impl<'a> PaintableCommit<'a> {
                 }
             };
             for piece_index in &piece_indices {
-                let piece = paintable_rows.paintable_side_data(slot).inline_box_pieces[*piece_index as usize];
+                let piece = paintable_rows.paintable_side_data(slot).inline_box_pieces()[*piece_index as usize];
                 let border_rect = CssPixelRect::from(piece.border_box_rect);
                 if piece.is_geometry_only_placeholder {
                     let content_rect = border_rect;

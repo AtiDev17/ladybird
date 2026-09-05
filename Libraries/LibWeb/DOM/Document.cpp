@@ -213,7 +213,6 @@
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TextNode.h>
-#include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -328,85 +327,13 @@ static size_t retain_registered_property_utf16_fly_string(u16 const* code_units,
 
 GC_DEFINE_ALLOCATOR(Document);
 
-// https://html.spec.whatwg.org/multipage/origin.html#obtain-browsing-context-navigation
-static GC::Ref<HTML::BrowsingContext> obtain_a_browsing_context_to_use_for_a_navigation_response(HTML::NavigationParams const& navigation_params)
-{
-    // 1. Let browsingContext be navigationParams's navigable's active browsing context.
-    auto& browsing_context = *navigation_params.navigable->active_browsing_context();
-
-    // 2. If browsingContext is not a top-level browsing context, return browsingContext.
-    if (!browsing_context.is_top_level())
-        return browsing_context;
-
-    // 3. Let coopEnforcementResult be navigationParams's COOP enforcement result.
-    auto& coop_enforcement_result = navigation_params.coop_enforcement_result;
-
-    // 4. Let swapGroup be coopEnforcementResult's needs a browsing context group switch.
-    auto swap_group = coop_enforcement_result.needs_a_browsing_context_group_switch;
-
-    // 5. Let sourceOrigin be browsingContext's active document's origin.
-    auto& source_origin = browsing_context.active_document()->origin();
-
-    // 6. Let destinationOrigin be navigationParams's origin.
-    auto& destination_origin = navigation_params.origin;
-
-    // 7. If sourceOrigin is not same site with destinationOrigin:
-    if (!source_origin.is_same_site(destination_origin)) {
-        // FIXME: 1. If either of sourceOrigin or destinationOrigin have a scheme that is not an HTTP(S) scheme
-        //    and the user agent considers it necessary for sourceOrigin and destinationOrigin to be
-        //    isolated from each other (for implementation-defined reasons), optionally set swapGroup to true.
-
-        // FIXME: 2. If navigationParams's user involvement is "browser UI", optionally set swapGroup to true.
-    }
-
-    // FIXME: 8. If browsingContext's group's browsing context set's size is 1, optionally set swapGroup to true.
-
-    // 9. If swapGroup is false, then:
-    if (!swap_group) {
-        // 1. If coopEnforcementResult's would need a browsing context group switch due to report-only is true,
-        //    set browsingContext's virtual browsing context group ID to a new unique identifier.
-        if (coop_enforcement_result.would_need_a_browsing_context_group_switch_due_to_report_only) {
-            // FIXME: set browsingContext's virtual browsing context group ID to a new unique identifier.
-        }
-
-        // 2. Return browsingContext.
-        return browsing_context;
-    }
-
-    // 10. Let newBrowsingContext be the first return value of creating a new top-level browsing context and document.
-    auto browsing_context_and_document = HTML::create_a_new_top_level_browsing_context_and_document(browsing_context.page());
-    auto new_browsing_context = browsing_context_and_document.browsing_context;
-
-    // 11. Let navigationCOOP be navigationParams's cross-origin opener policy.
-    auto navigation_coop = navigation_params.opener_policy;
-
-    // FIXME: 12. If navigationCOOP's value is "same-origin-plus-COEP", then set newBrowsingContext's group's cross-origin
-    //     isolation mode to either "logical" or "concrete". The choice of which is implementation-defined.
-
-    // 13. Let sandboxFlags be a clone of navigationParams's final sandboxing flag set.
-    auto sandbox_flags = navigation_params.final_sandboxing_flag_set;
-
-    // 14. If sandboxFlags is not empty, then:
-    if (!is_empty(sandbox_flags)) {
-        // 1. Assert: navigationCOOP's value is "unsafe-none".
-        VERIFY(navigation_coop.value == HTML::OpenerPolicyValue::UnsafeNone);
-
-        // 2. Assert: newBrowsingContext's popup sandboxing flag set is empty.
-        VERIFY(is_empty(new_browsing_context->popup_sandboxing_flag_set()));
-
-        // 3. Set newBrowsingContext's popup sandboxing flag set to sandboxFlags.
-        new_browsing_context->set_popup_sandboxing_flag_set(sandbox_flags);
-    }
-
-    // 15. Return newBrowsingContext.
-    return new_browsing_context;
-}
-
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
 WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type, Utf16FlyString content_type, HTML::NavigationParams const& navigation_params)
 {
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    auto browsing_context = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
+    // NB: The UI process has already performed this algorithm and selected this WebContent process.
+    auto browsing_context = navigation_params.navigable->active_browsing_context();
+    VERIFY(browsing_context);
 
     // FIXME: 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's navigable's container, navigationParams's origin, and navigationParams's response.
 
@@ -1991,7 +1918,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
 
     set_needs_accumulated_visual_contexts_update(true);
 
-    // Selection state lives on committed fragments, which the commit has rebuilt.
+    // A tree update can replace layout nodes referenced by selection state.
     if (auto range = get_selection()->range())
         paint_state().recompute_selection_states(*this, *range);
 
@@ -9891,56 +9818,28 @@ Vector<GC::Root<Range>> Document::find_matching_text(Utf16View query, CaseSensit
     if (!layout_node())
         return {};
 
-    auto const& text_blocks = layout_node()->text_blocks();
-    if (text_blocks.is_empty())
-        return {};
-
     Vector<GC::Root<Range>> matches;
-    for (auto const& text_block : text_blocks) {
-        size_t offset = 0;
-        size_t i = 0;
-        Utf16View text_view { text_block.text };
-        auto* match_start_position = text_block.positions.data();
-        while (true) {
-            auto match_index = case_sensitivity == CaseSensitivity::CaseInsensitive
-                ? text_view.find_code_unit_offset_ignoring_case(query, offset)
-                : text_view.find_code_unit_offset(query, offset);
-            if (!match_index.has_value())
-                break;
-
-            for (; i < text_block.positions.size() - 1 && match_index.value() > text_block.positions[i + 1].start_offset; ++i)
-                match_start_position = &text_block.positions[i + 1];
-
-            auto start_position = match_index.value() - match_start_position->start_offset + match_start_position->dom_offset_within_node;
-            auto start_dom_node = match_start_position->dom_node.ptr();
-            VERIFY(start_dom_node);
-
-            auto* match_end_position = match_start_position;
-            for (; i < text_block.positions.size() - 1 && (match_index.value() + query.length_in_code_units() > text_block.positions[i + 1].start_offset); ++i)
-                match_end_position = &text_block.positions[i + 1];
-
-            auto end_dom_node = match_end_position->dom_node.ptr();
-            VERIFY(end_dom_node);
-            auto end_position = match_index.value() + query.length_in_code_units() - match_end_position->start_offset + match_end_position->dom_offset_within_node;
-
-            if (&start_dom_node->root() != &end_dom_node->root()
-                || !start_dom_node->is_connected()
-                || !end_dom_node->is_connected()
-                || start_position > start_dom_node->length()
-                || end_position > end_dom_node->length()) {
-                offset = match_index.value() + query.length_in_code_units() + 1;
-                if (offset >= text_view.length_in_code_units())
-                    break;
-                continue;
-            }
-
-            matches.append(Range::create(*start_dom_node, start_position, *end_dom_node, end_position));
-            match_start_position = match_end_position;
-            offset = match_index.value() + query.length_in_code_units() + 1;
-            if (offset >= text_view.length_in_code_units())
-                break;
-        }
-    }
+    auto query_view = Layout::RustFFI::FfiUtf16View {
+        .ascii = query.has_ascii_storage() ? reinterpret_cast<u8 const*>(query.ascii_span().data()) : nullptr,
+        .utf16 = query.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(query.utf16_span().data()),
+        .length = query.length_in_code_units(),
+    };
+    Layout::RustFFI::layout_arena_find_matching_text(
+        layout_node()->arena_handle(), Layout::Node::slot_id(layout_node()), query_view,
+        case_sensitivity == CaseSensitivity::CaseSensitive,
+        [](void* dom_node) {
+            // Inert text is excluded from find-in-page.
+            return !static_cast<DOM::Text const*>(dom_node)->is_inert();
+        },
+        &matches, [](void* context, Layout::RustFFI::FfiDomTextRange match) {
+            auto* start = static_cast<DOM::Text*>(match.start_node);
+            auto* end = static_cast<DOM::Text*>(match.end_node);
+            if (!start || !end || &start->root() != &end->root()
+                || !start->is_connected() || !end->is_connected()
+                || match.start_offset > start->length() || match.end_offset > end->length())
+                return;
+            static_cast<Vector<GC::Root<Range>>*>(context)->append(
+                Range::create(*start, match.start_offset, *end, match.end_offset)); });
 
     return matches;
 }
@@ -10372,14 +10271,11 @@ Optional<CSSPixelRect> Document::current_caret_rect()
         return navigable->to_top_level_rect(viewport_rect);
     };
 
-    if (auto* text = as_if<DOM::Text>(dom_node)) {
-        auto text_slots = Layout::TextOffsetMapping { *text }.slot_ids();
-        if (!text_slots.is_empty()) {
-            auto result = Layout::RustFFI::layout_arena_text_caret_rect_in_dom_range(
-                layout_node->arena_handle(), text_slots.data(), text_slots.size(), position->offset());
-            if (result.has_value)
-                return to_viewport_rect(result.rect);
-        }
+    if (is<DOM::Text>(dom_node)) {
+        auto result = Layout::RustFFI::layout_arena_text_caret_rect_in_dom_range(
+            layout_node->arena_handle(), Layout::Node::slot_id(layout_node), position->offset());
+        if (result.has_value)
+            return to_viewport_rect(result.rect);
     }
 
     // Empty editable elements have no fragments; fall back to the caret position for the cursor's child offset

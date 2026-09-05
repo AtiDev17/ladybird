@@ -9,9 +9,10 @@ use super::formatting_context::DerivedBaselines;
 use super::formatting_context::LayoutMode;
 use super::geometry::AvailableSize;
 use super::geometry::AvailableSpace;
+use super::rendered_text::{FfiTextSource, FfiTextSourceRange, RenderedTextBoundary, TextContent, TextFragments};
 use super::used_values::SizeConstraint;
 use super::used_values::UsedValues;
-use crate::css::style::fast_hash::FastMap as HashMap;
+use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
 use crate::layout::ComputedValuesView;
 use crate::layout::CssPixels;
 use crate::layout::FfiReplacedContentFacts;
@@ -22,25 +23,6 @@ use crate::layout::node_data::{
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::c_void;
-
-unsafe extern "C" {
-    fn ladybird_layout_text_node_dom_offset_for_rendered_text_offset(
-        node: *mut c_void,
-        offset: usize,
-        use_end_boundary: bool,
-    ) -> usize;
-    fn ladybird_layout_text_node_rendered_text_offset_for_dom_offset(
-        node: *mut c_void,
-        offset: usize,
-        use_end_boundary: bool,
-    ) -> usize;
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum RenderedTextBoundary {
-    Start,
-    End,
-}
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::thread;
@@ -338,57 +320,22 @@ struct DefaultScrollShiftAnchorSlot {
 }
 
 #[derive(Default)]
-pub(crate) struct TextContent {
-    pub(crate) text: Vec<u16>,
-    pub(crate) untransformed_text_is_ascii_whitespace: bool,
-    pub(crate) may_require_bidi_processing: bool,
-    pub(crate) dom_start_offset: usize,
-    /// Whether rendering changed the length of any part of the DOM text. Otherwise a rendered
-    /// offset converts to a DOM offset by adding the DOM start offset alone.
-    pub(crate) rendered_text_has_edits: bool,
-    grapheme_segmenter: std::cell::OnceCell<super::text_chunker::GraphemeSegmenter>,
-}
-
-impl TextContent {
-    pub(crate) fn grapheme_segmenter(&self) -> &super::text_chunker::GraphemeSegmenter {
-        self.grapheme_segmenter
-            .get_or_init(|| super::text_chunker::GraphemeSegmenter::new(&self.text))
-    }
+struct TextNodeSlot {
+    generation: u8,
+    state: Option<Box<TextNodeState>>,
 }
 
 #[derive(Default)]
-struct TextContentSlot {
-    generation: u8,
-    content: Option<Box<TextContent>>,
+struct TextNodeState {
+    source_range: Option<FfiTextSourceRange>,
+    first_letter: NodeSlotId,
+    content: Option<TextContent>,
 }
 
 #[derive(Default)]
 struct ReplacedContentFactsSlot {
     generation: u8,
     facts: Option<FfiReplacedContentFacts>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct TextChunkCacheKey {
-    pub(crate) should_wrap_lines: bool,
-    pub(crate) should_respect_linebreaks: bool,
-    pub(crate) unidirectional_ltr: bool,
-    pub(crate) white_space_collapse: u8,
-    pub(crate) word_break: u8,
-    pub(crate) font_variant_emoji: u8,
-    pub(crate) font_cascade_list: *const c_void,
-}
-
-struct TextChunkCacheEntry {
-    key: TextChunkCacheKey,
-    _retained_font_cascade_list: libgfx_rust::font::RetainedFontCascadeList,
-    chunks: Vec<super::text_chunker::TextChunk>,
-}
-
-#[derive(Default)]
-struct TextChunkCacheSlot {
-    generation: u8,
-    entry: Option<Box<TextChunkCacheEntry>>,
 }
 
 #[derive(Default)]
@@ -586,8 +533,9 @@ pub(crate) struct LayoutNodeArena {
     saved_abspos_layout_inputs: RefCell<Vec<SavedAbsposLayoutInputsSlot>>,
     default_scroll_shift_anchors: RefCell<Vec<DefaultScrollShiftAnchorSlot>>,
     any_default_scroll_shift_anchor_ever_stored: Cell<bool>,
-    text_contents: Vec<TextContentSlot>,
-    text_chunk_caches: RefCell<Vec<TextChunkCacheSlot>>,
+    text_nodes: Vec<TextNodeSlot>,
+    pub(super) text_source_callback: Option<unsafe extern "C" fn(*mut c_void) -> FfiTextSource>,
+    pub(super) searchable_text: Option<Vec<super::text_queries::MappedText>>,
     replaced_content_facts: Vec<ReplacedContentFactsSlot>,
     raw_table_column_spans: HashMap<NodeSlotId, u32>,
     run_used_records: RefCell<Vec<RunRecordSlot>>,
@@ -599,7 +547,7 @@ pub(crate) struct LayoutNodeArena {
     pub(crate) partial_relayout_boundary_roots: RefCell<Vec<NodeSlotId>>,
     pub(crate) boxes_needing_scrollable_overflow_recalculation: RefCell<Vec<NodeSlotId>>,
     pub(crate) needs_full_scrollable_overflow_recalculation: Cell<bool>,
-    text_nodes_enrolled_for_content_sync: RefCell<Vec<NodeSlotId>>,
+    text_nodes_enrolled_for_content_sync: RefCell<HashSet<NodeSlotId>>,
     nodes_enrolled_for_replaced_content_facts_sync: RefCell<Vec<NodeSlotId>>,
     owner_thread: thread::ThreadId,
 }
@@ -626,8 +574,9 @@ impl LayoutNodeArena {
             saved_abspos_layout_inputs: RefCell::new(Vec::new()),
             default_scroll_shift_anchors: RefCell::new(Vec::new()),
             any_default_scroll_shift_anchor_ever_stored: Cell::new(false),
-            text_contents: Vec::new(),
-            text_chunk_caches: RefCell::new(Vec::new()),
+            text_nodes: Vec::new(),
+            text_source_callback: None,
+            searchable_text: None,
             replaced_content_facts: Vec::new(),
             raw_table_column_spans: HashMap::default(),
             run_used_records: RefCell::new(Vec::new()),
@@ -639,7 +588,7 @@ impl LayoutNodeArena {
             partial_relayout_boundary_roots: RefCell::new(Vec::new()),
             boxes_needing_scrollable_overflow_recalculation: RefCell::new(Vec::new()),
             needs_full_scrollable_overflow_recalculation: Cell::new(false),
-            text_nodes_enrolled_for_content_sync: RefCell::new(Vec::new()),
+            text_nodes_enrolled_for_content_sync: RefCell::new(HashSet::default()),
             nodes_enrolled_for_replaced_content_facts_sync: RefCell::new(Vec::new()),
             owner_thread: thread::current().id(),
         }
@@ -858,6 +807,7 @@ impl LayoutNodeArena {
     }
 
     fn free_unlinked_slot(&mut self, id: NodeSlotId) -> Option<crate::painting::paintable_rows::PaintableRowReset> {
+        self.searchable_text = None;
         let index = id.slot_index();
         let id_generation = id.generation();
         let should_reuse = {
@@ -890,12 +840,10 @@ impl LayoutNodeArena {
             *slot = DefaultScrollShiftAnchorSlot::default();
         }
         self.paintable_rows.reset_committed_fragment_link_slot(index);
-        if let Some(slot) = self.text_contents.get_mut(index as usize) {
-            *slot = TextContentSlot::default();
+        if let Some(slot) = self.text_nodes.get_mut(index as usize) {
+            *slot = TextNodeSlot::default();
         }
-        if let Some(slot) = self.text_chunk_caches.get_mut().get_mut(index as usize) {
-            *slot = TextChunkCacheSlot::default();
-        }
+        self.text_nodes_enrolled_for_content_sync.get_mut().remove(&id);
         if let Some(slot) = self.replaced_content_facts.get_mut(index as usize) {
             *slot = ReplacedContentFactsSlot::default();
         }
@@ -958,6 +906,7 @@ impl LayoutNodeArena {
         let data = self.data(id);
         data.style.set(payloads);
         self.style_records[id.slot_index() as usize].set(style_record);
+        self.enroll_text_children_for_content_sync(id);
         self.enroll_node_for_replaced_content_facts_sync_if_eligible(id);
     }
 
@@ -1083,13 +1032,6 @@ impl LayoutNodeArena {
             self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
             self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
         }
-        let mut child = self.data(slot).first_child.get();
-        while !child.is_invalid() {
-            if super::node_facts::kind_is_text(self.data(child).kind.get()) {
-                self.enroll_text_node_for_content_sync(child);
-            }
-            child = self.data(child).next_sibling.get();
-        }
         let shell = self.data(slot).shell.get();
         if !shell.is_null() {
             let host = self.style_record_host();
@@ -1101,7 +1043,7 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn enroll_text_node_for_content_sync(&self, node: NodeSlotId) {
-        self.text_nodes_enrolled_for_content_sync.borrow_mut().push(node);
+        self.text_nodes_enrolled_for_content_sync.borrow_mut().insert(node);
     }
 
     pub(crate) fn stamp_anonymous_box(&self, slot: NodeSlotId, kind: NodeKind, derived: FfiDerivedStyleRecord) {
@@ -1184,6 +1126,7 @@ impl LayoutNodeArena {
         assert!(derived.record != 0 && !derived.payloads.is_null());
         let previous_style_record = self.style_records[slot.slot_index() as usize].replace(derived.record);
         self.data(slot).style.set(derived.payloads);
+        self.enroll_text_children_for_content_sync(slot);
         self.enroll_node_for_replaced_content_facts_sync_if_eligible(slot);
         if previous_style_record != derived.record {
             let host = self.style_record_host();
@@ -1951,51 +1894,78 @@ impl LayoutNodeArena {
         drop(self.take_committed_fragment_link(self.data(id)));
     }
 
-    pub(crate) fn set_text_content(
-        &mut self,
-        id: NodeSlotId,
-        text: Vec<u16>,
-        untransformed_text_is_ascii_whitespace: bool,
-        may_require_bidi_processing: bool,
-        dom_start_offset: usize,
-        rendered_text_has_edits: bool,
-    ) -> bool {
+    fn text_node_state_mut(&mut self, id: NodeSlotId) -> &mut TextNodeState {
         self.assert_owner_thread();
         self.data(id);
         let index = id.slot_index() as usize;
-        if self.text_contents.len() <= index {
-            self.text_contents.resize_with(index + 1, TextContentSlot::default);
+        if self.text_nodes.len() <= index {
+            self.text_nodes.resize_with(index + 1, TextNodeSlot::default);
         }
-        let previous = &self.text_contents[index];
-        let changed = previous.generation != id.generation()
-            || match &previous.content {
-                Some(content) => {
-                    content.text != text
-                        || content.untransformed_text_is_ascii_whitespace != untransformed_text_is_ascii_whitespace
-                        || content.may_require_bidi_processing != may_require_bidi_processing
-                        || content.dom_start_offset != dom_start_offset
-                        || content.rendered_text_has_edits != rendered_text_has_edits
-                }
-                None => true,
+        let slot = &mut self.text_nodes[index];
+        if slot.generation != id.generation() {
+            *slot = TextNodeSlot {
+                generation: id.generation(),
+                ..TextNodeSlot::default()
             };
-        if !changed {
-            return false;
         }
-        self.text_contents[index] = TextContentSlot {
-            generation: id.generation(),
-            content: Some(Box::new(TextContent {
-                text,
-                untransformed_text_is_ascii_whitespace,
-                may_require_bidi_processing,
-                dom_start_offset,
-                rendered_text_has_edits,
-                grapheme_segmenter: std::cell::OnceCell::new(),
-            })),
-        };
-        if let Some(slot) = self.text_chunk_caches.get_mut().get_mut(index) {
-            *slot = TextChunkCacheSlot::default();
+        slot.state.get_or_insert_with(Default::default)
+    }
+
+    fn text_node_state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
+        if !self.slot_is_live(id) {
+            return None;
         }
-        true
+        self.text_nodes
+            .get(id.slot_index() as usize)
+            .filter(|slot| slot.generation == id.generation())
+            .and_then(|slot| slot.state.as_deref())
+    }
+
+    pub(crate) fn set_text_content(&mut self, id: NodeSlotId, content: TextContent) {
+        let state = self.text_node_state_mut(id);
+        if let Some(previous) = state.content.as_mut()
+            && previous.has_same_content_as(&content)
+        {
+            previous.rendering_key = content.rendering_key;
+            return;
+        }
+        state.content = Some(content);
+        self.searchable_text = None;
+        // Publication can happen through a C++ text read before the enrolled
+        // sync runs. Invalidate here so every publication invalidates layout,
+        // including mapping-only changes with identical rendered code units.
+        self.bump_fragment_cache_epoch_of_self_and_ancestors(id);
+    }
+
+    pub(super) fn invalidate_text_content(&mut self, id: NodeSlotId) {
+        self.data(id);
+        if let Some(slot) = self.text_nodes.get_mut(id.slot_index() as usize)
+            && slot.generation == id.generation()
+            && let Some(state) = slot.state.as_mut()
+            && let Some(content) = state.content.as_mut()
+        {
+            content.rendering_key = None;
+        }
+        self.enroll_text_node_for_content_sync(id);
+    }
+
+    pub(super) fn finish_text_content_sync(&self, id: NodeSlotId) {
+        self.text_nodes_enrolled_for_content_sync.borrow_mut().remove(&id);
+    }
+
+    pub(super) fn pending_text_nodes_for_content_sync(&self) -> Vec<NodeSlotId> {
+        self.text_nodes_enrolled_for_content_sync
+            .borrow()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub(super) fn text_content_needs_sync(&self, id: NodeSlotId) -> bool {
+        self.text_nodes_enrolled_for_content_sync.borrow().contains(&id)
+            || !self
+                .text_content(id)
+                .is_some_and(|content| content.rendering_key.is_some())
     }
 
     pub(crate) fn set_replaced_content_facts(&mut self, id: NodeSlotId, facts: FfiReplacedContentFacts) -> bool {
@@ -2040,11 +2010,66 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn text_content(&self, id: NodeSlotId) -> Option<&TextContent> {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
-        self.text_contents
-            .get(id.slot_index() as usize)
-            .filter(|slot| slot.generation == id.generation())
-            .and_then(|slot| slot.content.as_deref())
+        self.text_node_state(id)?.content.as_ref()
+    }
+
+    pub(super) fn set_first_letter_slices(
+        &mut self,
+        first_letter: NodeSlotId,
+        remainder: NodeSlotId,
+        letter_end: usize,
+        source_length: usize,
+    ) {
+        assert_ne!(first_letter, remainder);
+        assert_eq!(self.data(first_letter).kind.get(), NodeKind::TextNode);
+        assert_eq!(self.data(remainder).kind.get(), NodeKind::TextNode);
+        assert!(letter_end <= source_length);
+        self.text_node_state_mut(first_letter).source_range = Some(FfiTextSourceRange {
+            start: 0,
+            length: letter_end,
+        });
+        let remainder_state = self.text_node_state_mut(remainder);
+        remainder_state.source_range = Some(FfiTextSourceRange {
+            start: letter_end,
+            length: source_length - letter_end,
+        });
+        remainder_state.first_letter = first_letter;
+        self.invalidate_text_content(first_letter);
+        self.invalidate_text_content(remainder);
+    }
+
+    pub(crate) fn text_source_range(&self, id: NodeSlotId, source_length: usize) -> FfiTextSourceRange {
+        self.data(id);
+        self.text_node_state(id)
+            .and_then(|state| state.source_range)
+            .unwrap_or(FfiTextSourceRange {
+                start: 0,
+                length: source_length,
+            })
+    }
+
+    pub(super) fn text_has_source_range(&self, id: NodeSlotId) -> bool {
+        self.text_node_state(id)
+            .is_some_and(|state| state.source_range.is_some())
+    }
+
+    pub(crate) fn text_fragments(&self, primary: NodeSlotId) -> TextFragments {
+        let mut fragments = TextFragments {
+            nodes: [NodeSlotId::INVALID; 2],
+            length: 0,
+        };
+        if !self.slot_is_live(primary) || !super::node_facts::kind_is_text(self.data(primary).kind.get()) {
+            return fragments;
+        }
+        if let Some(state) = self.text_node_state(primary)
+            && self.slot_is_live(state.first_letter)
+        {
+            fragments.nodes[0] = state.first_letter;
+            fragments.length = 1;
+        }
+        fragments.nodes[fragments.length] = primary;
+        fragments.length += 1;
+        fragments
     }
 
     /// The node's group payload pointer array, read in place from the
@@ -2057,53 +2082,6 @@ impl LayoutNodeArena {
         // SAFETY: A non-null style pointer addresses the container's group
         // pointer array, which FfiStylePayloads mirrors exactly.
         (!style.is_null()).then(|| unsafe { &*style.cast::<FfiStylePayloads>() })
-    }
-
-    pub(crate) fn text_chunks(
-        &self,
-        id: NodeSlotId,
-        key: TextChunkCacheKey,
-        compute: impl FnOnce() -> Vec<super::text_chunker::TextChunk>,
-    ) -> &'static [super::text_chunker::TextChunk] {
-        // data() validates that id names a live slot with a matching generation.
-        self.data(id);
-        let index = id.slot_index() as usize;
-
-        // SAFETY (for both laundered returns below): an entry is only replaced
-        // when its key changes or its slot is freed, and every key input is
-        // fixed for a given node within one layout pass while the arena
-        // itself outlives the pass, so a slice handed out during a pass stays
-        // valid for that pass.
-        {
-            let slots = self.text_chunk_caches.borrow();
-            if let Some(slot) = slots.get(index)
-                && slot.generation == id.generation()
-                && let Some(entry) = slot.entry.as_deref()
-                && entry.key == key
-            {
-                return unsafe { std::slice::from_raw_parts(entry.chunks.as_ptr(), entry.chunks.len()) };
-            }
-        }
-
-        let chunks = compute();
-        let mut slots = self.text_chunk_caches.borrow_mut();
-        if slots.len() <= index {
-            slots.resize_with(index + 1, TextChunkCacheSlot::default);
-        }
-        slots[index] = TextChunkCacheSlot {
-            generation: id.generation(),
-            entry: Some(Box::new(TextChunkCacheEntry {
-                key,
-                // SAFETY: The caller derives the key's cascade-list pointer
-                // from a live style snapshot.
-                _retained_font_cascade_list: unsafe {
-                    libgfx_rust::font::RetainedFontCascadeList::retain(key.font_cascade_list)
-                },
-                chunks,
-            })),
-        };
-        let entry = slots[index].entry.as_deref().expect("entry was just stored");
-        unsafe { std::slice::from_raw_parts(entry.chunks.as_ptr(), entry.chunks.len()) }
     }
 
     pub(crate) fn allocate_run_nonce(&self) -> u64 {
@@ -2529,23 +2507,12 @@ impl LayoutNodeArena {
         offset: usize,
         boundary: RenderedTextBoundary,
     ) -> usize {
-        let shell = self.shell_if_live(id);
-        if shell.is_null() || !self.node_kind_if_live(id).is_some_and(super::node_facts::kind_is_text) {
+        if !self.node_kind_if_live(id).is_some_and(super::node_facts::kind_is_text) {
             return offset;
         }
-        if let Some(content) = self.text_content(id)
-            && !content.rendered_text_has_edits
-        {
-            return content.dom_start_offset + offset.min(content.text.len());
-        }
-        // SAFETY: shell_if_live() returned the live C++ TextNode corresponding to this text layout node.
-        unsafe {
-            ladybird_layout_text_node_dom_offset_for_rendered_text_offset(
-                shell,
-                offset,
-                matches!(boundary, RenderedTextBoundary::End),
-            )
-        }
+        self.text_content(id)
+            .expect("text must be published before mapping rendered offsets")
+            .dom_offset_for_rendered_text_offset(offset, boundary)
     }
 
     pub(crate) fn rendered_text_offset_for_dom_offset(
@@ -2554,24 +2521,12 @@ impl LayoutNodeArena {
         offset: usize,
         boundary: RenderedTextBoundary,
     ) -> usize {
-        let shell = self.shell_if_live(id);
-        if shell.is_null() || !self.node_kind_if_live(id).is_some_and(super::node_facts::kind_is_text) {
+        if !self.node_kind_if_live(id).is_some_and(super::node_facts::kind_is_text) {
             return offset;
         }
-        if let Some(content) = self.text_content(id)
-            && !content.rendered_text_has_edits
-        {
-            let dom_end_offset = content.dom_start_offset + content.text.len();
-            return offset.clamp(content.dom_start_offset, dom_end_offset) - content.dom_start_offset;
-        }
-        // SAFETY: shell_if_live() returned the live C++ TextNode corresponding to this text layout node.
-        unsafe {
-            ladybird_layout_text_node_rendered_text_offset_for_dom_offset(
-                shell,
-                offset,
-                matches!(boundary, RenderedTextBoundary::End),
-            )
-        }
+        self.text_content(id)
+            .expect("text must be published before mapping DOM offsets")
+            .rendered_text_offset_for_dom_offset(offset, boundary)
     }
 
     pub(crate) unsafe fn from_handle<'a>(arena: *mut c_void) -> &'a Self {
@@ -2617,8 +2572,10 @@ pub(crate) struct NodeAllocation {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_arena_create() -> *mut c_void {
-    Box::into_raw(Box::new(LayoutNodeArena::new())).cast()
+pub extern "C" fn layout_arena_create(text_source: unsafe extern "C" fn(*mut c_void) -> FfiTextSource) -> *mut c_void {
+    let mut arena = Box::new(LayoutNodeArena::new());
+    arena.text_source_callback = Some(text_source);
+    Box::into_raw(arena).cast()
 }
 
 #[unsafe(no_mangle)]
@@ -2889,46 +2846,6 @@ pub unsafe extern "C" fn layout_arena_bump_fragment_cache_epoch_of_self_and_ance
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_text_content(
-    arena: *mut c_void,
-    id: NodeSlotId,
-    ascii_text: *const u8,
-    utf16_text: *const u16,
-    length_in_code_units: usize,
-    untransformed_text_is_ascii_whitespace: bool,
-    may_require_bidi_processing: bool,
-    dom_start_offset: usize,
-    rendered_text_has_edits: bool,
-) -> bool {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    let text = if length_in_code_units == 0 {
-        Vec::new()
-    } else if !ascii_text.is_null() {
-        // SAFETY: The C++ caller passes the live ASCII storage of the
-        // node's rendered text for the duration of this synchronous call.
-        unsafe { std::slice::from_raw_parts(ascii_text, length_in_code_units) }
-            .iter()
-            .map(|unit| u16::from(*unit))
-            .collect()
-    } else {
-        assert!(!utf16_text.is_null(), "text content push carries no storage");
-        // SAFETY: The C++ caller passes the live UTF-16 storage of the
-        // node's rendered text for the duration of this synchronous call.
-        unsafe { std::slice::from_raw_parts(utf16_text, length_in_code_units) }.to_vec()
-    };
-    // SAFETY: The C++ wrapper keeps the arena alive for this call and
-    // serializes all access on the document thread.
-    unsafe { &mut *arena.cast::<LayoutNodeArena>() }.set_text_content(
-        id,
-        text,
-        untransformed_text_is_ascii_whitespace,
-        may_require_bidi_processing,
-        dom_start_offset,
-        rendered_text_has_edits,
-    )
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_set_replaced_content_facts(
     arena: *mut c_void,
     id: NodeSlotId,
@@ -3076,29 +2993,6 @@ pub unsafe extern "C" fn layout_arena_clear_style_record_host_callbacks(arena: *
 
 /// # Safety
 ///
-/// The arena must remain valid for the duration of the call, and `parent` must name a live node
-/// in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_enroll_text_children_for_content_sync(arena: *mut c_void, parent: NodeSlotId) {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: The C++ wrapper keeps the arena alive for this call and
-    // serializes all access on the document thread.
-    unsafe { &*arena.cast::<LayoutNodeArena>() }.enroll_text_children_for_content_sync(parent);
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_enroll_text_node_for_content_sync(arena: *mut c_void, node: NodeSlotId) {
-    assert!(!arena.is_null(), "layout node arena handle is null");
-    // SAFETY: The C++ wrapper keeps the arena alive for this call and
-    // serializes all access on the document thread.
-    unsafe { &*arena.cast::<LayoutNodeArena>() }
-        .text_nodes_enrolled_for_content_sync
-        .borrow_mut()
-        .push(node);
-}
-
-/// # Safety
-///
 /// The arena must remain valid for the duration of the call, and `node` must name a live node
 /// in this arena.
 #[unsafe(no_mangle)]
@@ -3114,49 +3008,30 @@ pub unsafe extern "C" fn layout_arena_enroll_node_for_replaced_content_facts_syn
 /// # Safety
 ///
 /// The arena must remain valid for the duration of the call. The callbacks receive live layout
-/// node shells; the text callback may re-enter the enroll entry points but nothing else.
+/// node shells. Source callbacks lend views until the next host callback or DOM mutation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_arena_sync_enrolled_content_for_layout(
     arena: *mut c_void,
     context: *mut c_void,
-    sync_text_content: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut FfiReplacedContentFacts),
 ) {
     assert!(!arena.is_null(), "layout node arena handle is null");
     // SAFETY (for every derive below): the C++ wrapper keeps the arena alive for this call
     // and serializes all access on the document thread; no shared borrow outlives a callback.
-    let enrolled_text_nodes = std::mem::take(
-        &mut *unsafe { &*arena.cast::<LayoutNodeArena>() }
-            .text_nodes_enrolled_for_content_sync
-            .borrow_mut(),
-    );
-    // A node that is alive but detached keeps its enrollment: it cannot
-    // resolve style-dependent text without a parent, and it may be reinserted
-    // by a later tree update without another enrollment trigger.
-    let mut still_detached_text_nodes = Vec::new();
+    let enrolled_text_nodes = unsafe { &*arena.cast::<LayoutNodeArena>() }.pending_text_nodes_for_content_sync();
     for node in enrolled_text_nodes {
         let shell = unsafe { &*arena.cast::<LayoutNodeArena>() }.shell_if_live(node);
         if shell.is_null() {
             continue;
         }
-        // SAFETY: shell_if_live established a live slot of this generation.
         let parent = unsafe { &*arena.cast::<LayoutNodeArena>() }.data(node).parent.get();
+        // Detached nodes retain enrollment until a parent supplies their style.
         if parent.is_invalid() {
-            still_detached_text_nodes.push(node);
             continue;
         }
-        // Changed rendered text invalidates cached formatting-context runs regardless of
-        // which channel produced the change, including sources with no invalidation of
-        // their own (e.g. lang-keyed locale-sensitive casing).
-        // SAFETY: The callback receives a live shell.
-        if unsafe { sync_text_content(context, shell) } {
-            unsafe { &*arena.cast::<LayoutNodeArena>() }.bump_fragment_cache_epoch_of_self_and_ancestors(node);
-        }
+        // SAFETY: The slot is live, and no arena borrow survives the source callback.
+        unsafe { super::rendered_text::ensure_text_content(arena.cast(), node) };
     }
-    unsafe { &*arena.cast::<LayoutNodeArena>() }
-        .text_nodes_enrolled_for_content_sync
-        .borrow_mut()
-        .extend(still_detached_text_nodes);
 
     let enrolled_replaced_nodes = unsafe { &*arena.cast::<LayoutNodeArena>() }
         .nodes_enrolled_for_replaced_content_facts_sync

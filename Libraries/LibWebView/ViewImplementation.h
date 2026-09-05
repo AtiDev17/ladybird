@@ -104,10 +104,9 @@ public:
     Optional<String> const& favicon_hash() const { return m_favicon_hash; }
 
     String const& handle() const { return m_client_state.client_handle; }
-    Optional<URL::URL> const& top_level_process_site_url() const { return m_client_state.site_url; }
 
     bool create_new_process_for_cross_site_navigation(Utf16String const& navigation_id);
-    void replace_web_content_process_for_history_traversal(Web::HTML::CrossProcessId target_document_state_id, URL::URL const& target_url);
+    void replace_web_content_process_for_history_traversal(Web::HTML::CrossProcessId target_document_state_id);
 
     void server_did_paint(Badge<WebContentClient>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect);
 
@@ -329,7 +328,7 @@ public:
     void did_change_screen_wake_lock_state(Badge<WebContentClient>, Web::ScreenWakeLockState);
     Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
-    void did_create_top_level_traversable(Badge<WebContentClient>, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry);
+    void did_create_top_level_traversable(Badge<WebContentClient>, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Optional<CanonicalNavigable&> opener, WebContentClient& process);
     void request_history_operation(Badge<WebContentClient>, WebContentClient&, u64 requesting_page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters);
     void did_receive_history_operation_ready(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationReadyResult);
     void did_receive_history_step_unload_cancelation_result(Badge<WebContentClient>, WebContentClient&, u64 source_page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryStepResult, Web::HTML::UnloadPromptShown);
@@ -619,7 +618,6 @@ protected:
         String client_handle;
         SharedBitmap front_bitmap;
         Vector<SharedBitmap> other_bitmaps;
-        Optional<URL::URL> site_url;
         u64 page_index { 0 };
         bool has_usable_bitmap { false };
         // Whether this process hosts the document of the canonical current session history entry. A

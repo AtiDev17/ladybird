@@ -238,19 +238,24 @@ Web::HTML::CrossProcessId PageClient::allocate_navigable_id()
     return allocate_cross_process_id();
 }
 
-void PageClient::request_navigation_start(Web::HTML::LocalNavigable& navigable, URL::URL const& current_url, Web::NavigationTarget target, URL::URL const& url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request)
+void PageClient::request_navigation_start(Web::HTML::LocalNavigable& navigable, Web::NavigationTarget target, URL::URL const& url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request)
 {
-    client().async_did_request_navigation_start(m_id, navigable.id(), current_url, target, url, move(navigation_id), move(start_request));
+    client().async_did_request_navigation_start(m_id, navigable.id(), target, url, move(navigation_id), move(start_request));
 }
 
-void PageClient::request_navigation_population(Web::HTML::LocalNavigable& navigable, URL::URL const& current_url, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request)
+void PageClient::request_navigation_population(Web::HTML::LocalNavigable& navigable, Web::NavigationTarget target, Web::HTML::NavigationPopulationRequest request)
 {
-    client().async_did_request_navigation_population(m_id, navigable.id(), current_url, target, move(request));
+    client().async_did_request_navigation_population(m_id, navigable.id(), target, move(request));
 }
 
 void PageClient::navigation_params_creation_finished(Web::HTML::LocalNavigable& navigable, Web::HTML::NavigationPopulationRequest request, Web::HTML::NavigationPopulationResult result)
 {
     client().async_did_finish_navigation_params_creation(m_id, navigable.id(), request.navigation_id, move(result));
+}
+
+void PageClient::history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
+{
+    client().async_did_finish_history_navigation_params_creation(m_id, operation_id, move(population));
 }
 
 void PageClient::navigation_population_failed(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id)
@@ -1359,16 +1364,13 @@ void PageClient::page_did_update_resource_count(i32 count_waiting)
     client().async_did_update_resource_count(m_id, count_waiting);
 }
 
-PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Web::HTML::TokenizedFeature::NoOpener no_opener)
+PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints)
 {
-    if (no_opener == Web::HTML::TokenizedFeature::NoOpener::Yes) {
-        // FIXME: Create an abstraction to let this WebContent process know about a new process we create?
-        // FIXME: For now, just create a new page in the same process anyway
-        // FIXME: Proper agent-cluster separation must also cover same-process
-        // COOP/noopener popups before they receive distinct main-world cells.
-    }
-
-    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestNewWebView>(m_id, activate_tab, hints, no_opener == Web::HTML::TokenizedFeature::NoOpener::No);
+    // FIXME: Create an abstraction to let this WebContent process know about a new process we create?
+    // FIXME: For now, just create a new page in the same process anyway
+    // FIXME: Proper agent-cluster separation must also cover same-process
+    // COOP/noopener popups before they receive distinct main-world cells.
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestNewWebView>(m_id, activate_tab, hints);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestNewWebView. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
@@ -1399,9 +1401,9 @@ void PageClient::page_did_close_top_level_traversable()
     m_owner.remove_page({}, m_id);
 }
 
-void PageClient::page_did_create_top_level_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& initial_history_entry)
+void PageClient::page_did_create_top_level_traversable(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor const& initial_history_entry, Optional<Web::HTML::CrossProcessId> opener_navigable_id)
 {
-    client().async_did_create_top_level_traversable(m_id, navigable_id, initial_history_entry);
+    client().async_did_create_top_level_traversable(m_id, navigable_id, initial_history_entry, opener_navigable_id);
 }
 
 void PageClient::page_did_change_needs_beforeunload_check(bool needs_beforeunload_check)

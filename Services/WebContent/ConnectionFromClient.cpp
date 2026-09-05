@@ -199,6 +199,12 @@ void ConnectionFromClient::initialize(u64 initial_page_id, Web::HTML::CrossProce
     m_page_host->initialize(initial_page_id, root_navigable_id, cross_process_id_allocator, initial_document_state_id, system_visibility_state);
 }
 
+void ConnectionFromClient::create_embedded_page(u64 page_id, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessId initial_document_state_id, Web::HTML::VisibilityState system_visibility_state)
+{
+    auto& page = m_page_host->create_page(page_id, root_navigable_id);
+    Web::HTML::LocalTraversableNavigable::create_a_fresh_top_level_traversable(page.page(), URL::about_blank(), Empty {}, initial_document_state_id, system_visibility_state);
+}
+
 void ConnectionFromClient::set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId> parent_context_id)
 {
     auto page = this->page(page_id);
@@ -488,6 +494,25 @@ void ConnectionFromClient::queue_navigation_api_state_clear_task(u64 page_id, We
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().top_level_traversable()->queue_navigation_api_state_clear_task(navigable_id);
+}
+
+void ConnectionFromClient::continue_history_navigation_population(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType> navigation_type, Web::HTML::HistoryNavigationPopulation population)
+{
+    auto page = this->page(page_id);
+    auto navigable_id = population.request.navigable_id;
+    if (!page.has_value()) {
+        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, Web::HTML::UnloadDisplayedDocument::No);
+        return;
+    }
+    auto traversable = page->page().top_level_traversable();
+    if (traversable->resume_history_navigation_population(operation_id, move(population)))
+        return;
+    auto user_involvement = population.request.user_involvement;
+    traversable->run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, false,
+        GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, Web::HTML::UnloadDisplayedDocument unload_displayed_document) {
+            async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, unload_displayed_document);
+        }),
+        move(population));
 }
 
 void ConnectionFromClient::run_changing_navigable_history_job(u64 page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, bool superseded_by_newer_navigation)
