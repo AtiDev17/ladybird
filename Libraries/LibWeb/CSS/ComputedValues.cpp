@@ -37,7 +37,6 @@
 #include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/IntegerStyleValue.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
@@ -284,6 +283,7 @@ static void register_style_group_field_descriptors()
     add(inherited_text, PropertyID::WhiteSpaceCollapse, offsetof(InheritedText, white_space_collapse), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_white_space_collapse>());
     add(inherited_text, PropertyID::WordBreak, offsetof(InheritedText, word_break), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_word_break>());
     add(inherited_text, PropertyID::OverflowWrap, offsetof(InheritedText, overflow_wrap), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_overflow_wrap>());
+    add(inherited_text, PropertyID::BlockEllipsis, offsetof(InheritedText, block_ellipsis), GROUP_FIELD_RETAINED_DATA, 0, nullptr);
     add(inherited_text, PropertyID::WordSpacing, offsetof(InheritedText, word_spacing), GROUP_FIELD_CSS_PIXELS, 0, nullptr);
     add(inherited_text, PropertyID::WordSpacing, offsetof(InheritedText, word_spacing_style_value), GROUP_FIELD_RETAINED_DATA, 0, nullptr);
     add(inherited_text, PropertyID::LetterSpacing, offsetof(InheritedText, letter_spacing), GROUP_FIELD_CSS_PIXELS, 0, nullptr);
@@ -432,7 +432,7 @@ static void register_style_group_field_descriptors()
     for (auto property : { PropertyID::Width, PropertyID::MinWidth, PropertyID::MaxWidth,
              PropertyID::Height, PropertyID::MinHeight, PropertyID::MaxHeight })
         bind_property_to_group(property, to_underlying(StyleGroupIndex::SizingValues));
-    for (auto property : { PropertyID::FlexDirection, PropertyID::FlexWrap, PropertyID::FlexBasis,
+    for (auto property : { PropertyID::WebkitBoxOrient, PropertyID::FlexDirection, PropertyID::FlexWrap, PropertyID::FlexBasis,
              PropertyID::FlexGrow, PropertyID::FlexShrink, PropertyID::Order,
              PropertyID::AlignContent, PropertyID::AlignItems, PropertyID::AlignSelf,
              PropertyID::JustifyContent, PropertyID::JustifyItems, PropertyID::JustifySelf,
@@ -452,9 +452,10 @@ static void register_style_group_field_descriptors()
     for (auto property : { PropertyID::Display, PropertyID::Float, PropertyID::Clear, PropertyID::Position,
              PropertyID::OverflowX, PropertyID::OverflowY, PropertyID::BoxSizing, PropertyID::Resize,
              PropertyID::TextOverflow, PropertyID::UnicodeBidi, PropertyID::TableLayout, PropertyID::GridAutoFlow,
-             PropertyID::ColumnWidth, PropertyID::ColumnCount, PropertyID::ZIndex, PropertyID::VerticalAlign,
-             PropertyID::AspectRatio, PropertyID::ContainIntrinsicWidth, PropertyID::ContainIntrinsicHeight,
-             PropertyID::Contain, PropertyID::ContainerType, PropertyID::ContainerName })
+             PropertyID::ColumnWidth, PropertyID::ColumnCount, PropertyID::Continue, PropertyID::MaxLines,
+             PropertyID::ZIndex, PropertyID::VerticalAlign, PropertyID::AspectRatio,
+             PropertyID::ContainIntrinsicWidth, PropertyID::ContainIntrinsicHeight, PropertyID::Contain,
+             PropertyID::ContainerType, PropertyID::ContainerName })
         bind_property_to_group(property, to_underlying(StyleGroupIndex::BoxValues));
     // The font group builds in C++; only bindings verified against its setters are made.
     for (auto property : { PropertyID::FontSize, PropertyID::FontWeight, PropertyID::FontWidth, PropertyID::LineHeight })
@@ -1145,49 +1146,9 @@ QuotesData ComputedValues::InheritedListValues::quotes_value() const
     return result;
 }
 
-ComputedContentData ComputedValues::ContentValues::computed_content_value() const
+NonnullRefPtr<StyleValue const> ComputedValues::ContentValues::computed_content_value() const
 {
-    auto value = animation_style_value(content);
-    if (value->is_keyword()) {
-        ComputedContentData result;
-        result.type = value->to_keyword() == Keyword::None ? ComputedContentData::Type::None : ComputedContentData::Type::Normal;
-        return result;
-    }
-
-    auto append_item = [](StyleValue const& item, Vector<ComputedContentItem>& items) {
-        if (item.is_string()) {
-            items.append(item.as_string().string_value().to_utf16_string());
-        } else if (item.is_keyword()) {
-            items.append(item.to_keyword());
-        } else if (item.is_counter()) {
-            auto const& counter = item.as_counter();
-            ComputedContentCounter computed_counter {
-                .function = counter.function_type() == CounterStyleValue::CounterFunction::Counters ? ComputedContentCounter::Function::Counters : ComputedContentCounter::Function::Counter,
-                .name = counter.counter_name(),
-                .join_string = counter.join_string(),
-                .style = counter.counter_style()->as_counter_style().value().visit(
-                    [](Utf16FlyString const& name) -> Variant<Utf16FlyString, ComputedContentCounter::SymbolsFunction> { return name; },
-                    [](CounterStyleStyleValue::SymbolsFunction const& symbols) -> Variant<Utf16FlyString, ComputedContentCounter::SymbolsFunction> {
-                        return ComputedContentCounter::SymbolsFunction { .type = symbols.type, .symbols = symbols.symbols };
-                    }),
-            };
-            items.append(move(computed_counter));
-        } else {
-            VERIFY(item.is_abstract_image());
-            items.append(NonnullRefPtr<AbstractImageStyleValue const> { item.as_abstract_image() });
-        }
-    };
-
-    ComputedContentData result;
-    result.type = ComputedContentData::Type::List;
-    auto const& content_value = value->as_content();
-    for (auto const& item : content_value.content().values())
-        append_item(item, result.items);
-    if (auto const* alt_text = content_value.alt_text()) {
-        for (auto const& item : alt_text->values())
-            append_item(item, result.alt_text);
-    }
-    return result;
+    return animation_style_value(content);
 }
 
 bool ComputedValues::ContentValues::content_is_normal() const
@@ -2058,54 +2019,11 @@ static ContentDataAndQuoteNestingLevel resolve_content(StyleValue const& value, 
     return { {}, quote_nesting_level };
 }
 
-static NonnullRefPtr<StyleValue const> computed_content_item_style_value(ComputedContentItem const& item)
-{
-    return item.visit(
-        [](Utf16String const& string) -> NonnullRefPtr<StyleValue const> { return StringStyleValue::create(string); },
-        [](Keyword keyword) -> NonnullRefPtr<StyleValue const> { return KeywordStyleValue::create(keyword); },
-        [](ComputedContentCounter const& counter) -> NonnullRefPtr<StyleValue const> {
-            auto counter_style = CounterStyleStyleValue::create(counter.style.visit(
-                [](Utf16FlyString const& name) -> Variant<Utf16FlyString, CounterStyleStyleValue::SymbolsFunction> { return name; },
-                [](ComputedContentCounter::SymbolsFunction const& symbols) -> Variant<Utf16FlyString, CounterStyleStyleValue::SymbolsFunction> {
-                    return CounterStyleStyleValue::SymbolsFunction { .type = symbols.type, .symbols = symbols.symbols };
-                }));
-            if (counter.function == ComputedContentCounter::Function::Counters)
-                return CounterStyleValue::create_counters(counter.name, counter.join_string, move(counter_style));
-            return CounterStyleValue::create_counter(counter.name, move(counter_style));
-        },
-        [](NonnullRefPtr<AbstractImageStyleValue const> const& image) -> NonnullRefPtr<StyleValue const> { return image; });
-}
-
 ContentDataAndQuoteNestingLevel ComputedValues::resolved_content(DOM::AbstractElement& element_reference, u32 initial_quote_nesting_level, NotifyListItemCounterRendered notify_list_item_counter_rendered) const
 {
-    // The content value resolve_content() consumes is rebuilt from the content group's data
-    // rather than minted from the longhand table: the group holds the live image style values
-    // whose loads this style already started, and layout must receive those exact objects.
-    auto computed_content_value = computed_content();
-    auto content_style_value = [&]() -> NonnullRefPtr<StyleValue const> {
-        switch (computed_content_value.type) {
-        case ComputedContentData::Type::Normal:
-            return KeywordStyleValue::create(Keyword::Normal);
-        case ComputedContentData::Type::None:
-            return KeywordStyleValue::create(Keyword::None);
-        case ComputedContentData::Type::List: {
-            StyleValueVector items;
-            for (auto const& item : computed_content_value.items)
-                items.append(computed_content_item_style_value(item));
-            StyleValueVector alt_text;
-            for (auto const& item : computed_content_value.alt_text)
-                alt_text.append(computed_content_item_style_value(item));
-            ValueComparingRefPtr<StyleValueList const> alt_text_style_value;
-            if (!alt_text.is_empty())
-                alt_text_style_value = StyleValueList::create(move(alt_text), StyleValueList::Separator::Space);
-            return ContentStyleValue::create(
-                StyleValueList::create(move(items), StyleValueList::Separator::Space),
-                move(alt_text_style_value));
-        }
-        }
-        VERIFY_NOT_REACHED();
-    }();
-    return resolve_content(content_style_value, quotes(), element_reference, initial_quote_nesting_level, notify_list_item_counter_rendered);
+    // Read the content group's value directly, including the resource context attached to its images.
+    auto value = computed_content();
+    return resolve_content(value, quotes(), element_reference, initial_quote_nesting_level, notify_list_item_counter_rendered);
 }
 
 }

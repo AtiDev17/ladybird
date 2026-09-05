@@ -77,6 +77,7 @@
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -847,6 +848,12 @@ WebIDL::ExceptionOr<void> Internals::set_site_compatibility_data(Utf16String con
     return {};
 }
 
+// Tests run with every [Experimental] interface exposed, so this is the only way one can watch the gate itself.
+void Internals::set_experimental_interfaces_exposed(bool exposed)
+{
+    HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(exposed);
+}
+
 void Internals::set_content_blocking_enabled(bool enabled)
 {
     page().set_content_blocking_enabled(enabled);
@@ -1194,6 +1201,11 @@ Utf16String Internals::dump_session_store_tab_state()
 Utf16String Internals::dump_site_isolation_process_tree()
 {
     return dump_string_to_utf16(window().associated_document().page().client().dump_site_isolation_process_tree_for_testing());
+}
+
+void Internals::crash_remote_frame_processes()
+{
+    window().associated_document().page().client().crash_remote_frame_processes_for_testing();
 }
 
 GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()

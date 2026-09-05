@@ -733,7 +733,9 @@ pub(crate) fn derive_baselines(
             if container_skips_anonymous_whitespace_runs && callbacks.can_skip_is_anonymous_text_run(child) {
                 continue;
             }
-            let child_state = records.used_values(child);
+            let Some(child_state) = records.used_values_if_owned(child) else {
+                continue;
+            };
             match baseline_set {
                 BaselineSet::First if child_state.has_first_baseline.get() => {}
                 BaselineSet::Last if child_state.has_last_baseline.get() => {}
@@ -781,6 +783,7 @@ pub(crate) struct ChildLayoutResult {
     pub automatic_content_inline_size: CssPixels,
     pub min_content_inline_size_from_max_content_layout: Option<CssPixels>,
     pub automatic_content_block_size: CssPixels,
+    pub automatic_line_clamp_max_lines: Option<usize>,
     pub baselines: DerivedBaselines,
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
     pub depends_on_percentage_block_size: bool,
@@ -1745,6 +1748,7 @@ fn execute_formatting_context_run(
                     min_content_inline_size_from_max_content_layout: context
                         .min_content_inline_size_from_max_content_layout(),
                     automatic_content_block_size: context.automatic_content_block_size(),
+                    automatic_line_clamp_max_lines: context.automatic_line_clamp_max_lines(),
                     baselines,
                     table_box_in_wrapper_border_box_block_size: context.table_box_in_wrapper_border_box_block_size(),
                     depends_on_percentage_block_size: false,
@@ -2016,7 +2020,7 @@ pub(crate) fn layout_inside_child(
         );
     };
     if !force_independent_context_run
-        && layout_mode == LayoutMode::IntrinsicSizing
+        && (layout_mode == LayoutMode::IntrinsicSizing || !facts.node_has_size_containment())
         && matches!(
             input.participation,
             ParticipationInParentFormattingContext::AtomicInline
@@ -2024,8 +2028,8 @@ pub(crate) fn layout_inside_child(
         && formatting_context_type_created_by_box(facts) == Some(FfiFormattingContextType::Block)
         && run.callbacks.first_child(child).is_invalid()
     {
-        // OPTIMIZATION: An empty atomic block has no formatting-context body output. Size it directly in the
-        // parent measurement instead of constructing a child run for both min-content and max-content layout.
+        // OPTIMIZATION: An empty atomic block has no formatting-context body output. Size it in the
+        // parent run, which will also construct its fragment when placing the box.
         let sizing = run.sizing();
         sizing.dimension_atomic_root(
             child,
@@ -2041,6 +2045,20 @@ pub(crate) fn layout_inside_child(
             Some(CssPixels::default()),
             || unreachable!("an empty atomic block has a zero automatic content block size"),
         );
+        if layout_mode == LayoutMode::Normal
+            && !sizing.box_is_sized_as_replaced_element(
+                child,
+                input.available_space,
+                input.containing_block_constraints,
+            )
+        {
+            sizing.resolve_used_block_size_if_not_treated_as_auto(
+                child,
+                input.available_space,
+                input.containing_block_constraints,
+            );
+        }
+        store_derived_baselines(&used, DerivedBaselines::default());
         note_skipped_child_dependency();
         return ChildLayoutOutcome::Skipped;
     }

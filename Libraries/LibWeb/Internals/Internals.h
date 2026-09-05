@@ -129,6 +129,7 @@ public:
     void simulate_worker_request_server_connection_loss();
     WebIDL::ExceptionOr<void> set_content_blockers(Utf16String const& patterns);
     WebIDL::ExceptionOr<void> set_site_compatibility_data(Utf16String const& source);
+    void set_experimental_interfaces_exposed(bool exposed);
     void set_content_blocking_enabled(bool enabled);
     WebIDL::UnsignedLongLong partial_layout_count();
     WebIDL::UnsignedLongLong full_layout_count();
@@ -174,6 +175,7 @@ public:
     bool register_session_store_tab();
     Utf16String dump_session_store_tab_state();
     Utf16String dump_site_isolation_process_tree();
+    void crash_remote_frame_processes();
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
     bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
 

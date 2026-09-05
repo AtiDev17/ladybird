@@ -114,6 +114,7 @@ interface Internals {
     undefined simulateWorkerRequestServerConnectionLoss();
     undefined setContentBlockers(DOMString patterns);
     undefined setSiteCompatibilityData(DOMString source);
+    undefined setExperimentalInterfacesExposed(boolean exposed);
     undefined setContentBlockingEnabled(boolean enabled);
     unsigned long long partialLayoutCount();
     unsigned long long fullLayoutCount();
@@ -157,6 +158,7 @@ interface Internals {
     boolean registerSessionStoreTab();
     DOMString dumpSessionStoreTabState();
     DOMString dumpSiteIsolationProcessTree();
+    undefined crashRemoteFrameProcesses();
     Promise<undefined> flushSessionHistoryTraversalQueue();
 
     boolean hasHTMLParserEndState(Document document);
