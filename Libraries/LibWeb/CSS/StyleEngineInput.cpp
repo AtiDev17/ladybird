@@ -714,8 +714,10 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
         // foreignObject elements above it. A preserved move changes that chain without giving
         // the moved subtree another arrival notification.
         element.for_each_shadow_including_inclusive_descendant([&](auto& node) {
-            if (auto* descendant = as_if<DOM::Element>(node); descendant && descendant->namespace_uri() == Namespace::SVG && descendant->style_node_id() != no_style_node)
+            if (auto* descendant = as_if<DOM::Element>(node); descendant && descendant->namespace_uri() == Namespace::SVG && descendant->style_node_id() != no_style_node) {
                 style_engine->set_element_adjustment_facts(descendant->style_node_id(), element_style_adjustment_facts(*descendant));
+                style_engine->record_element_style_input_change(descendant->style_node_id(), StyleEngine::RecomputeStyle);
+            }
             return TraversalDecision::Continue;
         });
 
@@ -1227,10 +1229,6 @@ bool record_element_presentational_hint_properties(DOM::Element& element, Readon
 void record_element_declarations_changed(DOM::Element& element, ElementDeclarationKind kind, bool had_declarations, bool has_declarations)
 {
     element.document().flush_deferred_style_change_event();
-    // A declaration the element itself sources is named in its style input record by its identity,
-    // and this is the write that moves what that identity says without moving the identity.
-    element.retire_style_input_record();
-
     auto* style_engine = style_engine_for(element);
     if (!style_engine || element.style_node_id() == no_style_node || has_pending_initial_features(element))
         return;
@@ -1554,6 +1552,14 @@ struct RuleCompilationContext {
     bool gated_by_container_query { false };
 };
 
+static void publish_layer_order_for_sheet(CSSStyleSheet& sheet, DOM::Document const& document)
+{
+    sheet.for_each_owning_style_scope([&](StyleScope& scope) {
+        if (&scope.document() == &document)
+            scope.publish_cascade_layer_order();
+    });
+}
+
 static void compile_rules_into(RuleCompilationContext const& context, CSSRule& rule)
 {
     auto& style_engine = context.style_engine;
@@ -1647,11 +1653,11 @@ static void compile_rules_into(RuleCompilationContext const& context, CSSRule& r
     // the way in as well. A declaration behind a condition that does not hold declares nothing, so it
     // moves no order.
     if (conditions_hold && declares_a_layer(rule)) {
-        style_engine.record_layer_statement(sheet_handle);
         // NB: The layer order is otherwise published lazily with the rule cache, which is after
         //     transaction has already ranked with the old order. Publish it now so the
         //     plan for this very statement ranks with the order it establishes.
-        style_computer.document().style_scope().publish_cascade_layer_order();
+        if (auto* sheet = rule.parent_style_sheet())
+            publish_layer_order_for_sheet(*sheet, document);
     }
     if (is<CSSLayerStatementRule>(rule))
         return;
@@ -1913,6 +1919,32 @@ static void collect_enclosing_group_context(GC::RootVector<GC::Ref<CSSRule>> con
     context.in_a_layer = in_a_layer;
 }
 
+static bool rule_change_needs_style_environment_bump(CSSRule const& rule)
+{
+    switch (rule.type()) {
+    case CSSRule::Type::Style:
+    case CSSRule::Type::Media:
+    case CSSRule::Type::Supports:
+    case CSSRule::Type::Container:
+    case CSSRule::Type::Scope:
+    case CSSRule::Type::LayerBlock:
+        return any_of(as<CSSGroupingRule>(rule).css_rules(), [](auto& child) {
+            return rule_change_needs_style_environment_bump(child);
+        });
+    case CSSRule::Type::NestedDeclarations:
+    case CSSRule::Type::Property:
+    case CSSRule::Type::LayerStatement:
+    case CSSRule::Type::Keyframes:
+    case CSSRule::Type::FontFace:
+    case CSSRule::Type::Function:
+    case CSSRule::Type::CounterStyle:
+    case CSSRule::Type::FontFeatureValues:
+        return false;
+    default:
+        return true;
+    }
+}
+
 // A rule arrived in one document's engine. Compile it, and everything it brings with it, into the
 // position it holds there.
 static void record_style_rule_inserted_in(CSSRule& rule, CSSStyleSheet& sheet, DOM::Document& document)
@@ -1923,7 +1955,7 @@ static void record_style_rule_inserted_in(CSSRule& rule, CSSStyleSheet& sheet, D
     if (sheet_id == 0)
         return;
 
-    if (!is<CSSPropertyRule>(rule))
+    if (rule_change_needs_style_environment_bump(rule))
         document.bump_style_environment_version();
 
     Vector<void const*> scope_roots;
@@ -1986,7 +2018,7 @@ void record_style_rule_removed(CSSStyleSheet& sheet_it_left, CSSRule& rule)
     for_each_document_with_engine_copy(sheet_it_left, [&](DOM::Document& document) {
         any_engine_heard = true;
         document.flush_deferred_style_change_event();
-        if (removed.size() != 1 || !is<CSSPropertyRule>(*removed.first()))
+        if (rule_change_needs_style_environment_bump(rule))
             document.bump_style_environment_version();
 
         auto& style_computer = document.style_computer();
@@ -1995,9 +2027,7 @@ void record_style_rule_removed(CSSStyleSheet& sheet_it_left, CSSRule& rule)
             // A layer declaration leaving reorders the layers as much as one arriving does, and it holds no
             // rule identity that removing would carry the change for.
             if (declares_a_layer(entry)) {
-                if (auto sheet_id = style_computer.style_engine_sheet_id_for(sheet_it_left); sheet_id != 0)
-                    style_engine.record_layer_statement(sheet_id);
-                document.style_scope().publish_cascade_layer_order();
+                publish_layer_order_for_sheet(sheet_it_left, document);
             }
             if (auto rule_id = style_computer.style_engine_rule_id_for(entry); rule_id != 0) {
                 style_engine.remove_rule(rule_id);
@@ -2106,8 +2136,8 @@ void record_style_rule_declarations_changed(CSSRule& rule)
         if (rule_id == 0)
             return;
 
-        // Every style input record naming this block names it by its identity, which has not moved.
-        document.bump_style_environment_version();
+        if (rule_change_needs_style_environment_bump(rule_to_report))
+            document.bump_style_environment_version();
 
         auto& style_engine = style_computer.style_engine();
         style_engine.record_rule_declarations_changed(rule_id, style_engine.next_declaration_block_version());

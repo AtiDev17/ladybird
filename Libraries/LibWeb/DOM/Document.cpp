@@ -627,17 +627,19 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
 
 Document::~Document() = default;
 
+void Document::mark_style_attribute_dirty(Element& element)
+{
+    if (element.is_connected())
+        m_elements_with_dirty_style_attributes.set(element);
+}
+
 void Document::synchronize_dirty_style_attributes()
 {
-    if (!m_has_dirty_style_attributes)
-        return;
-
-    m_has_dirty_style_attributes = false;
-    for_each_shadow_including_descendant([](Node& node) {
-        if (auto* element = as_if<Element>(node))
-            element->synchronize_all_attributes();
-        return TraversalDecision::Continue;
-    });
+    auto elements = move(m_elements_with_dirty_style_attributes);
+    for (auto& element : elements) {
+        if (element.is_connected() && &element.document() == this)
+            element.synchronize_all_attributes();
+    }
 }
 
 Layout::NodeArena& Document::layout_node_arena()
@@ -1768,17 +1770,13 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
     tear_down_layout_tree();
 }
 
-void Document::PartialRelayoutInvalidation::record_escape(PartialRelayoutEscapeReason reason)
+void Document::record_partial_relayout_escape(PartialRelayoutEscapeReason reason)
 {
     dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates escape partial relayout boundaries ({})", to_string(reason));
-    m_escapes = true;
-}
-
-void Document::PartialRelayoutInvalidation::clear_escape(PartialRelayoutEscapeClearReason reason)
-{
-    if (m_escapes)
-        dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates no longer escape partial relayout boundaries ({})", to_string(reason));
-    m_escapes = false;
+    // A document without an arena has no layout root either, and the full pass that builds one
+    // clears the bit before any boundary can be registered.
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_record_partial_relayout_escape(m_layout_node_arena->handle());
 }
 
 // Anchor names publish geometry that anchor() functions on positioned boxes anywhere in the
@@ -1871,29 +1869,11 @@ static void relayout_subtree(Layout::Box& subtree_root)
     // the previous commit. The commit sink resolves the committed row to splice out in either
     // path.
     if (subtree_root.is_absolutely_positioned()) {
-        VERIFY(subtree_root.containing_block());
         VERIFY(subtree_root.has_saved_abspos_layout_inputs());
         bridge.replay_saved_abspos_layout(subtree_root);
     } else {
         bridge.compute_subtree_layout(subtree_root);
     }
-
-    Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
-        subtree_root.arena_handle(), Layout::Node::slot_id(&subtree_root));
-}
-
-// Recomputes containing blocks and derives the abspos escape flags for the inclusive subtree
-// inside the Rust arena; the DOM-ancestry half of the inline containing-block workaround stays
-// on the C++ side as the callback.
-static void recompute_containing_blocks_in_inclusive_subtree(Layout::NodeArena& arena, Layout::Node& subtree_root)
-{
-    Layout::RustFFI::layout_arena_recompute_containing_blocks(
-        arena.handle(), Layout::Node::slot_id(&subtree_root),
-        [](void* node_shell, void* containing_block_shell) -> Layout::RustFFI::NodeSlotId {
-            auto const& node = *static_cast<Layout::Node const*>(node_shell);
-            auto const& containing_block = *static_cast<Layout::Box const*>(containing_block_shell);
-            return Layout::Node::slot_id(node.find_inline_containing_block(containing_block));
-        });
 }
 
 // Refreshes every structure derived from committed layout results, shared by the partial and
@@ -1935,144 +1915,6 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     m_document->set_needs_repaint();
 }
 
-static void propagate_scrollbar_width_to_viewport(Element& root_element, Layout::Viewport& viewport)
-{
-    // https://drafts.csswg.org/css-scrollbars/#scrollbar-width
-    // UAs must apply the scrollbar-color value set on the root element to the viewport.
-    // NB: Called during layout tree construction.
-    auto scrollbar_width = root_element.unsafe_layout_node()->scrollbar_width();
-    viewport.modify_computed_values([&](auto& values) {
-        values.set_scrollbar_width(scrollbar_width);
-    });
-}
-
-// https://drafts.csswg.org/css-writing-modes-4/#principal-flow
-static void propagate_principal_writing_mode_to_viewport(Element& root_element, Layout::Viewport& viewport)
-{
-    // The principal writing mode of the document is determined by the used writing-mode, direction, and
-    // text-orientation values of the root element.
-    auto const* root_inherited_box_values = root_element.style_group<CSS::ComputedValues::InheritedBoxValues>();
-    VERIFY(root_inherited_box_values);
-    auto writing_mode = static_cast<CSS::WritingMode>(root_inherited_box_values->writing_mode);
-    auto direction = static_cast<CSS::Direction>(root_inherited_box_values->direction);
-
-    // As a special case for handling HTML documents, if the root element has a body child element [HTML] whose
-    // display value is not none, the used value of the of writing-mode and direction properties on root element
-    // are taken from the computed writing-mode and direction of the first such child element instead of from the
-    // root element's own values.
-    // NOTE: Using containment disables this special handling of the HTML body element.
-    auto* body_element = root_element.first_child_of_type<HTML::HTMLBodyElement>();
-    auto const* root_box_values = root_element.style_group<CSS::ComputedValues::BoxValues>();
-    VERIFY(root_box_values);
-    auto const* body_box_values = body_element ? body_element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-    auto const* body_inherited_box_values = body_element ? body_element->style_group<CSS::ComputedValues::InheritedBoxValues>() : nullptr;
-    auto has_containment = [](CSS::ComputedValues::BoxValues const& values) {
-        return values.size_containment || values.inline_size_containment || values.layout_containment || values.style_containment || values.paint_containment;
-    };
-    bool propagation_is_disabled_by_containment = has_containment(*root_box_values)
-        || (body_box_values && has_containment(*body_box_values));
-    if (root_element.is_html_html_element() && !propagation_is_disabled_by_containment
-        && body_box_values && body_inherited_box_values && !CSS::display_from_ffi_display(body_box_values->display).is_none()) {
-        writing_mode = static_cast<CSS::WritingMode>(body_inherited_box_values->writing_mode);
-        direction = static_cast<CSS::Direction>(body_inherited_box_values->direction);
-    }
-    root_element.unsafe_layout_node()->modify_computed_values([&](auto& values) {
-        values.set_writing_mode(writing_mode);
-        values.set_direction(direction);
-    });
-
-    // https://drafts.csswg.org/css-writing-modes-4/#icb
-    // The principal writing mode is propagated to the initial containing block and to the viewport, thereby
-    // affecting the layout of the root element and the scrolling direction of the viewport.
-    viewport.modify_computed_values([&](auto& values) {
-        values.set_writing_mode(writing_mode);
-        values.set_direction(direction);
-    });
-}
-
-// https://drafts.csswg.org/css-overflow-3/#overflow-propagation
-static void propagate_overflow_to_viewport(Element& root_element, Layout::Viewport& viewport)
-{
-    // https://drafts.csswg.org/css-contain-2/#contain-property
-    // Additionally, when any containments are active on either the HTML <html> or <body> elements, propagation of
-    // properties from the <body> element to the initial containing block, the viewport, or the canvas background, is
-    // disabled. Notably, this affects:
-    // - 'overflow' and its longhands (see CSS Overflow 3 § 3.3 Overflow Viewport Propagation)
-    auto* body_element = root_element.first_child_of_type<HTML::HTMLBodyElement>();
-    auto const* root_box_values = root_element.style_group<CSS::ComputedValues::BoxValues>();
-    VERIFY(root_box_values);
-    auto has_containment = [](CSS::ComputedValues::BoxValues const& values) {
-        return values.size_containment || values.inline_size_containment || values.layout_containment || values.style_containment || values.paint_containment;
-    };
-    auto const* body_box_values = body_element ? body_element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-    bool body_element_can_propagate_overflow = body_element
-        && body_box_values
-        && !CSS::display_from_ffi_display(body_box_values->display).is_none()
-        && body_element->unsafe_layout_node();
-    bool body_propagation_is_disabled_by_containment = root_element.is_html_html_element() && has_containment(*root_box_values);
-    if (body_box_values && has_containment(*body_box_values))
-        body_propagation_is_disabled_by_containment = true;
-
-    // UAs must apply the overflow-* values set on the root element to the viewport
-    // when the root element’s display value is not none.
-    auto root_element_layout_node = root_element.unsafe_layout_node();
-    auto root_overflow_x = static_cast<CSS::Overflow>(root_box_values->overflow_x);
-    auto root_overflow_y = static_cast<CSS::Overflow>(root_box_values->overflow_y);
-
-    Element* overflow_origin_element = &root_element;
-
-    // However, when the root element is an [HTML] html element (including XML syntax for HTML)
-    // whose overflow value is visible (in both axes), and that element has as a child
-    // a body element whose display value is also not none,
-    // user agents must instead apply the overflow-* values of the first such child element to the viewport.
-    if (root_element.is_html_html_element() && !body_propagation_is_disabled_by_containment) {
-        if (root_overflow_x == CSS::Overflow::Visible && root_overflow_y == CSS::Overflow::Visible) {
-            if (body_element_can_propagate_overflow)
-                overflow_origin_element = body_element;
-        }
-    }
-
-    // If 'visible' is applied to the viewport, it must be interpreted as 'auto'. If 'clip' is applied to the viewport, it must be interpreted as 'hidden'.
-    auto const* overflow_origin_box_values = overflow_origin_element == &root_element ? root_box_values : body_box_values;
-    auto overflow_x_to_apply = static_cast<CSS::Overflow>(overflow_origin_box_values->overflow_x);
-    if (overflow_x_to_apply == CSS::Overflow::Visible) {
-        overflow_x_to_apply = CSS::Overflow::Auto;
-    } else if (overflow_x_to_apply == CSS::Overflow::Clip) {
-        overflow_x_to_apply = CSS::Overflow::Hidden;
-    }
-    auto overflow_y_to_apply = static_cast<CSS::Overflow>(overflow_origin_box_values->overflow_y);
-    if (overflow_y_to_apply == CSS::Overflow::Visible) {
-        overflow_y_to_apply = CSS::Overflow::Auto;
-    } else if (overflow_y_to_apply == CSS::Overflow::Clip) {
-        overflow_y_to_apply = CSS::Overflow::Hidden;
-    }
-    // Every node receives its final values exactly once: a steady-state pass then leaves
-    // every style group payload untouched instead of oscillating values within the pass.
-    viewport.modify_computed_values([&](auto& values) {
-        values.set_overflow_x(overflow_x_to_apply);
-        values.set_overflow_y(overflow_y_to_apply);
-    });
-
-    // UAs must apply the overflow-* values set on the root element to the viewport
-    // when the root element's display value is not none.
-    // The element from which the value is propagated must then have a used overflow value of visible.
-    // FIXME: Apply this to the used values, not the computed ones.
-    bool root_element_is_overflow_origin = overflow_origin_element == &root_element;
-    root_element_layout_node->modify_computed_values([&](auto& values) {
-        values.set_overflow_x(root_element_is_overflow_origin ? CSS::Overflow::Visible : root_overflow_x);
-        values.set_overflow_y(root_element_is_overflow_origin ? CSS::Overflow::Visible : root_overflow_y);
-    });
-    if (body_element_can_propagate_overflow) {
-        bool body_element_is_overflow_origin = overflow_origin_element == body_element;
-        auto body_overflow_x = static_cast<CSS::Overflow>(body_box_values->overflow_x);
-        auto body_overflow_y = static_cast<CSS::Overflow>(body_box_values->overflow_y);
-        body_element->unsafe_layout_node()->modify_computed_values([&](auto& values) {
-            values.set_overflow_x(body_element_is_overflow_origin ? CSS::Overflow::Visible : body_overflow_x);
-            values.set_overflow_y(body_element_is_overflow_origin ? CSS::Overflow::Visible : body_overflow_y);
-        });
-    }
-}
-
 void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutReason reason)
 {
     if (!node.is_connected())
@@ -2101,7 +1943,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         auto document_is_clean_for_layout_geometry_read = [](Document const& document) {
             return document.m_has_completed_style_update
                 && document.layout_is_up_to_date()
-                && !document.m_has_dirty_style_attributes
+                && document.m_elements_with_dirty_style_attributes.is_empty()
                 && !document.style_computer().style_engine().has_pending_transaction()
                 && !document.m_needs_media_rule_evaluation
                 && !document.m_needs_animated_style_update
@@ -2241,18 +2083,20 @@ bool Document::needs_style_update_after_layout()
 // the full layout path without rebuilding again.
 Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
 {
-    if (!m_layout_root
-        || needs_full_layout_tree_update()
-        || m_partial_relayout_invalidation.escapes()
-        || registered_partial_relayout_root_slots.is_empty()
-        || m_layout_root->needs_layout_update()
-        || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
-        || should_collect_devtools_layout_data
-        || any_anchor_names_are_registered())
+    Layout::RustFFI::FfiPartialRelayoutHostFacts host_facts {
+        .document_needs_full_layout_tree_update = needs_full_layout_tree_update(),
+        .container_query_evaluation_is_pending = !m_query_containers_needing_container_query_evaluation_after_layout.is_empty(),
+        .should_collect_devtools_layout_data = should_collect_devtools_layout_data,
+        .any_anchor_names_are_registered = any_anchor_names_are_registered(),
+    };
+    if (!Layout::RustFFI::layout_arena_partial_relayout_may_be_attempted(
+            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root),
+            registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
+            host_facts))
         return PartialRelayoutResult::NotEligible;
 
     bool layout_tree_was_built_in_partial_branch = false;
-    bool pending_updates_escaped_during_partial_build = false;
+    bool layout_tree_update_escaped_rebuild_roots = false;
     Vector<Layout::Node*> rebuilt_subtree_roots;
     if (needs_layout_tree_rebuild) {
         auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
@@ -2263,9 +2107,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
         if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots) || tree_build_result.needs_another_build_pass)
             return PartialRelayoutResult::NeedsAnotherLayoutPass;
         layout_tree_was_built_in_partial_branch = true;
-        pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
-            || tree_build_result.layout_tree_update_escaped_rebuild_roots;
-        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::PartialLayoutTreeBuild);
+        layout_tree_update_escaped_rebuild_roots = tree_build_result.layout_tree_update_escaped_rebuild_roots;
         rebuilt_subtree_roots = move(tree_build_result.rebuilt_subtree_roots);
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
@@ -2273,25 +2115,17 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
         }
     }
 
-    if (m_layout_root->needs_layout_update() || pending_updates_escaped_during_partial_build)
-        return PartialRelayoutResult::NotEligible;
-
-    // Nodes created by the incremental build have no containing blocks assigned yet, and the
-    // mutation may have moved where existing out-of-flow descendants belong; recompute both so
-    // boundary qualification below reads facts matching the just-built tree.
-    for (auto* rebuilt_root : rebuilt_subtree_roots)
-        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *rebuilt_root);
-
     Vector<Layout::RustFFI::NodeSlotId> rebuilt_subtree_root_slots;
     rebuilt_subtree_root_slots.ensure_capacity(rebuilt_subtree_roots.size());
     for (auto* rebuilt_root : rebuilt_subtree_roots)
         rebuilt_subtree_root_slots.unchecked_append(Layout::Node::slot_id(rebuilt_root));
 
     Vector<Layout::RustFFI::NodeSlotId> partial_relayout_root_slots;
-    bool boundary_set_supports_partial_relayout = Layout::RustFFI::layout_arena_collect_partial_relayout_roots(
-        layout_node_arena().handle(),
+    bool boundary_set_supports_partial_relayout = Layout::RustFFI::layout_arena_plan_partial_relayout(
+        layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root),
         registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
         rebuilt_subtree_root_slots.data(), rebuilt_subtree_root_slots.size(),
+        layout_tree_update_escaped_rebuild_roots,
         &partial_relayout_root_slots,
         [](void* context, Layout::RustFFI::NodeSlotId root) {
             static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(root);
@@ -2306,20 +2140,9 @@ Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::Ru
         partial_relayout_roots.unchecked_append(&as<Layout::Box>(*root));
     }
 
-    // The final boundary can be wider than the rebuilt roots that led us to it. Replaying such a
-    // boundary may re-enter intrinsic sizing for descendants outside those rebuilt roots, including
-    // anonymous layout nodes created during the incremental tree build, so refresh the metadata for
-    // the whole subtree that is about to be laid out.
-    for (auto* root : partial_relayout_roots)
-        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *root);
-
     layout_node_arena().sync_enrolled_content_for_layout();
-    for (auto* root : partial_relayout_roots) {
+    for (auto* root : partial_relayout_roots)
         relayout_subtree(*root);
-        // NB: The subtree commit reset the root's descendant rows, and the subtree's
-        //     new size may change ancestor scrollable overflow; scheduling the root covers both.
-        schedule_scrollable_overflow_recalculation(*root);
-    }
 
     ++m_partial_layout_count;
 
@@ -2410,7 +2233,6 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             break;
         }
 
-        auto* document_element = this->document_element();
         auto viewport_rect = navigable->viewport_rect();
 
         auto timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
@@ -2419,10 +2241,6 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             auto tree_build_result = Layout::build_layout_tree(*this);
             set_layout_root(*tree_build_result.root);
             record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
-
-            // NB: Called during layout update.
-            if (document_element && document_element->unsafe_layout_node())
-                propagate_scrollbar_width_to_viewport(*document_element, *m_layout_root);
 
             if (tree_build_result.needs_another_build_pass)
                 continue;
@@ -2437,41 +2255,17 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
                 continue;
         }
 
-        if (document_element && document_element->unsafe_layout_node()) {
-            propagate_principal_writing_mode_to_viewport(*document_element, *m_layout_root);
-            propagate_overflow_to_viewport(*document_element, *m_layout_root);
-        } else {
-            m_layout_root->modify_computed_values([](auto& values) {
-                values.set_overflow_x(CSS::Overflow::Auto);
-                values.set_overflow_y(CSS::Overflow::Auto);
-            });
-        }
-
-        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *m_layout_root);
-
-        // The walk above re-derived every fact partial relayout boundary qualification depends
-        // on, so pending changes that escaped classification are accounted for from here on.
-        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::FullLayoutPass);
-
-        layout_node_arena().sync_enrolled_content_for_layout();
         Layout::LayoutRustBridge bridge;
         bridge.run_root_layout(
             *m_layout_root,
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
 
         style_invalidation_counters().relayouts_performed++;
-
-        Layout::RustFFI::layout_arena_set_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle());
-
         ++m_full_layout_count;
 
         after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full);
-
-        Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
-            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root));
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
@@ -8089,6 +7883,11 @@ void Document::fire_compositor_animation_wakeup_for_testing(Badge<Internals::Int
     service_compositor_animation_wakeup(relevant_settings_object().time_origin() + frame_time_ms);
 }
 
+void Document::force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing(Badge<Internals::Internals>)
+{
+    m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing = true;
+}
+
 void Document::update_compositor_animations()
 {
     struct CompetingPropertyEffects {
@@ -8650,6 +8449,19 @@ void Document::update_compositor_animations()
         CSS::RequiredInvalidationAfterStyleChange invalidation;
         invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
         Painting::repaint_after_style_change(*layout_node, invalidation);
+    }
+
+    if (m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing) {
+        m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing = false;
+        schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::FfiVisualContextGlobalRebuildReason::ForcedForTesting);
+    }
+
+    // A descriptor must target the tree it is published with. The selection pass above can force
+    // or release animation-only visual context nodes, so redo it after applying those updates.
+    if (m_needs_accumulated_visual_contexts_update) {
+        paint_state().set_visual_animations(*this, {});
+        update_compositor_animations();
+        return;
     }
 
     paint_state().set_visual_animations(*this, move(visual_animations));
@@ -11356,18 +11168,6 @@ Utf16View to_string(PartialRelayoutEscapeReason reason)
         return #e##sv;
         ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON)
 #undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON
-    }
-    VERIFY_NOT_REACHED();
-}
-
-Utf16View to_string(PartialRelayoutEscapeClearReason reason)
-{
-    switch (reason) {
-#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) \
-    case PartialRelayoutEscapeClearReason::e:             \
-        return #e##sv;
-        ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
-#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
     }
     VERIFY_NOT_REACHED();
 }

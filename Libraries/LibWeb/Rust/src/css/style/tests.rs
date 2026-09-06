@@ -28,11 +28,11 @@ fn environment_memo_retains_its_written_value_keys() {
     let inputs = custom_property_environments::EnvironmentInputs {
         parent: 0,
         registration_generation: 0,
-        cascaded: vec![custom_property_environments::CascadedCustomProperty {
+        cascaded: Box::new([custom_property_environments::CascadedCustomProperty {
             name: StyleAtomID(1),
             important: false,
             written_value: written_pointer as usize,
-        }],
+        }]),
     };
     environments.remember(inputs, 1, vec![written.clone_retained()]);
 
@@ -359,14 +359,20 @@ fn attribute_changes_publish_one_name_route() {
         new: InputValue::Feature(FeatureValue::Atom(new_value)),
     };
 
-    assert_eq!(routing_keys_for_input(&changed), [RoutingKey::AttributeName(name)]);
+    assert_eq!(
+        routing_keys_for_input(&changed).as_slice(),
+        [RoutingKey::AttributeName(name)]
+    );
 
     let added = NormalizedInput {
         old: InputValue::Feature(FeatureValue::Absent),
         new: InputValue::Feature(FeatureValue::Atom(new_value)),
         ..changed
     };
-    assert_eq!(routing_keys_for_input(&added), [RoutingKey::AttributeName(name)]);
+    assert_eq!(
+        routing_keys_for_input(&added).as_slice(),
+        [RoutingKey::AttributeName(name)]
+    );
 }
 
 #[test]
@@ -2001,6 +2007,33 @@ fn linear_document() -> (StyleEngine, Vec<StyleNodeID>) {
 }
 
 /// Builds `root -> outer -> inner -> target`.
+fn attach_shadow_tree(
+    engine: &mut StyleEngine,
+    host: StyleNodeID,
+    scope: TreeScopeID,
+    depth: usize,
+) -> Vec<StyleNodeID> {
+    let mut raw = vec![0_u32; depth + 1];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<_> = raw.iter().map(|&id| StyleNodeID::from_raw(id).unwrap()).collect();
+    engine.record_tree_delta(nodes[0], None, Some(TreeRelations::detached(scope)));
+    for pair in nodes.windows(2) {
+        engine.record_tree_delta(
+            pair[1],
+            None,
+            Some(TreeRelations {
+                parent: Some(pair[0]),
+                tree_scope: scope,
+                ..TreeRelations::detached(scope)
+            }),
+        );
+        set_atom_feature(engine, pair[1], LocalFeatureKey::TagName, StyleAtomID(100));
+    }
+    engine.set_shadow_root(host, nodes[0]);
+    engine.set_tree_scope_root(scope, nodes[0]);
+    nodes
+}
+
 fn nested_document() -> (StyleEngine, Vec<StyleNodeID>) {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
     let mut raw = [0_u32; 4];
@@ -3055,6 +3088,35 @@ fn an_evicted_retained_match_answer_falls_back_to_cold_matching() {
             .get(Counter::MatchElementCallsDuringPublishedStyleTransaction),
         0
     );
+}
+
+#[test]
+fn layer_order_inputs_only_name_rules_whose_rank_changed() {
+    let (mut engine, _) = linear_document();
+    let base = CascadeLayerID(1);
+    let middle = CascadeLayerID(2);
+    let theme = CascadeLayerID(3);
+    let mut rules = Vec::new();
+    for (index, layer) in [base, middle, theme].into_iter().enumerate() {
+        let rule = add_target_rule(&mut engine, StyleSheetObjectID(index as u32 + 1), StyleAtomID(200));
+        engine.set_rule_layer(rule, layer);
+        engine.set_rule_in_a_layer(rule);
+        rules.push(rule);
+    }
+    engine.set_layer_order(TreeScopeID::DOCUMENT, &[base, middle, theme]);
+    discard_transaction(&mut engine);
+
+    engine.set_layer_order(TreeScopeID::DOCUMENT, &[theme, middle, base]);
+    let transaction = engine.take_transaction();
+    let mut changed: Vec<_> = transaction.program_joins.iter().map(|delta| delta.rule).collect();
+    changed.sort_unstable();
+    assert_eq!(changed, vec![rules[0], rules[2]]);
+    engine.release_transaction(transaction);
+
+    engine.set_layer_order(TreeScopeID::DOCUMENT, &[theme, middle, base, CascadeLayerID(4)]);
+    let transaction = engine.take_transaction();
+    assert!(transaction.program_joins.is_empty());
+    engine.release_transaction(transaction);
 }
 
 #[test]
@@ -4358,6 +4420,64 @@ fn element_declaration_edits_repair_only_their_property_inventory() {
 }
 
 #[test]
+fn element_declaration_repairs_materialize_only_rules_declaring_their_properties() {
+    let (mut engine, nodes) = linear_document();
+    let deciding = add_target_rule(&mut engine, StyleSheetObjectID(1), StyleAtomID(200));
+    engine.set_rule_declared_properties_with_values(deciding, &[(1, false, SpecifiedValueID(101))], true);
+    let unrelated = add_target_rule(&mut engine, StyleSheetObjectID(2), StyleAtomID(200));
+    engine.set_rule_declared_properties_with_values(unrelated, &[(5, false, SpecifiedValueID(105))], true);
+    for kind in ElementDeclarationKind::ALL {
+        engine.set_element_declared_properties(nodes[0], kind, &[], Vec::new(), Vec::new(), Vec::new(), true);
+    }
+    commit_test_setup(&mut engine);
+    let matches = vec![
+        concrete_rule_match(&engine, nodes[0], deciding, 0, None),
+        concrete_rule_match(&engine, nodes[0], unrelated, 1, None),
+    ];
+    engine.matches_for_cascade(matches.clone(), false, Some(nodes[0]));
+    engine.remember_retained_match_answer(nodes[0], &matches);
+
+    let materialized_before = engine.counters().get(Counter::ElementDeclarationRepairMatches);
+    engine.set_element_declared_properties(
+        nodes[0],
+        ElementDeclarationKind::PresentationalHint,
+        &[
+            DeclaredProperty {
+                property: 1,
+                important: false,
+                operator: CascadeOperator::Declared,
+                value: SpecifiedValueID(301),
+            },
+            DeclaredProperty {
+                property: 3,
+                important: false,
+                operator: CascadeOperator::Declared,
+                value: SpecifiedValueID(303),
+            },
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        true,
+    );
+    assert_eq!(
+        engine.counters().get(Counter::ElementDeclarationRepairMatches) - materialized_before,
+        1
+    );
+
+    let key = WinnerGroupKey::current(nodes[0], engine.program.version());
+    assert!(
+        matches!(engine.winner_groups.winner(key, 1), Lookup::Known(winner) if winner.source == WinnerSource::Rule(deciding) && winner.key.value == SpecifiedValueID(101))
+    );
+    assert!(
+        matches!(engine.winner_groups.winner(key, 3), Lookup::Known(winner) if winner.source == WinnerSource::Element(ElementDeclarationKind::PresentationalHint) && winner.key.value == SpecifiedValueID(303))
+    );
+    assert!(
+        matches!(engine.winner_groups.winner(key, 5), Lookup::Known(winner) if winner.source == WinnerSource::Rule(unrelated) && winner.key.value == SpecifiedValueID(105))
+    );
+}
+
+#[test]
 fn rule_declaration_edits_repair_only_their_property_inventory() {
     let (mut engine, nodes) = linear_document();
     let target = StyleAtomID(200);
@@ -5637,6 +5757,200 @@ fn retained_prefix_transitions_supply_invalidation_and_matching() {
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
     assert_eq!(planned, vec![nodes[3].raw()]);
     assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+}
+
+#[test]
+fn a_foreign_scope_input_keeps_the_document_prefix_relation() {
+    let (mut engine, nodes) = nested_document();
+    let scope = TreeScopeID(1);
+    let shadow_child = attach_shadow_tree(&mut engine, nodes[3], scope, 1)[1];
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    let adopted_program = engine
+        .programs
+        .add(test_class_selector_program(".target", &[("target", target)], None));
+    let adopted_sheet = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
+    let adopted_rule = engine.append_rule(adopted_sheet, None, RuleKind::Style);
+    engine.add_routing_rule(adopted_rule, adopted_program);
+    let mut version = engine.program.rule_version(adopted_rule);
+    version.selector_program = Some(adopted_program);
+    version.declaration_block = Some(DeclarationBlockID(1));
+    engine.replace_rule_version(adopted_rule, version);
+    discard_transaction(&mut engine);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    add_feature(&mut engine, shadow_child, LocalFeatureKey::Class(guard));
+    remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+    let mut planned = Vec::new();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert_eq!(planned, vec![nodes[3].raw()]);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationUpdates), 1);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert!(engine.match_element(nodes[3]).unwrap().is_empty());
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    engine.attach_sheet(adopted_sheet, scope);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+    planned.clear();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert!(planned.contains(&nodes[3].raw()));
+    assert_eq!(engine.counters().get(Counter::PrefixRelationUpdates), 2);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+}
+
+#[test]
+fn a_maintained_relation_leaves_shadow_scope_routes_to_their_own_program() {
+    let (mut engine, nodes) = nested_document();
+    let scope = TreeScopeID(1);
+    let shadow = attach_shadow_tree(&mut engine, nodes[3], scope, 2);
+    let (shadow_outer, shadow_inner) = (shadow[1], shadow[2]);
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    let inner = StyleAtomID(202);
+    add_guard_target_rule(&mut engine, guard, target);
+    let shadow_program = engine.programs.add(test_selector_program_with_metadata(
+        ".guard .inner",
+        &[("guard", guard), ("inner", inner)],
+        Some(Specificity {
+            classes: 2,
+            ..Specificity::default()
+        }),
+        None,
+    ));
+    let shadow_sheet = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
+    engine.attach_sheet(shadow_sheet, scope);
+    let shadow_rule = engine.append_rule(shadow_sheet, None, RuleKind::Style);
+    engine.add_routing_rule(shadow_rule, shadow_program);
+    let mut version = engine.program.rule_version(shadow_rule);
+    version.selector_program = Some(shadow_program);
+    version.declaration_block = Some(DeclarationBlockID(2));
+    engine.replace_rule_version(shadow_rule, version);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target), (shadow_inner, inner)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    assert!(engine.match_element(shadow_inner).unwrap().is_empty());
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    add_feature(&mut engine, shadow_outer, LocalFeatureKey::Class(guard));
+    let mut planned = Vec::new();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert_eq!(planned, vec![shadow_inner.raw()]);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(shadow_inner).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+}
+
+#[test]
+fn a_maintained_relation_leaves_shared_selector_shadow_routes_to_their_own_program() {
+    let (mut engine, nodes) = nested_document();
+    let scope = TreeScopeID(1);
+    let shadow = attach_shadow_tree(&mut engine, nodes[3], scope, 2);
+    let (shadow_outer, shadow_inner) = (shadow[1], shadow[2]);
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    let program = engine.programs.add(test_selector_program_with_metadata(
+        ".guard .target",
+        &[("guard", guard), ("target", target)],
+        Some(Specificity {
+            classes: 2,
+            ..Specificity::default()
+        }),
+        None,
+    ));
+    let shadow_sheet = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
+    engine.attach_sheet(shadow_sheet, scope);
+    let shadow_rule = engine.append_rule(shadow_sheet, None, RuleKind::Style);
+    engine.add_routing_rule(shadow_rule, program);
+    let mut version = engine.program.rule_version(shadow_rule);
+    version.selector_program = Some(program);
+    version.declaration_block = Some(DeclarationBlockID(2));
+    engine.replace_rule_version(shadow_rule, version);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target), (shadow_inner, target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    assert!(engine.match_element(shadow_inner).unwrap().is_empty());
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    add_feature(&mut engine, shadow_outer, LocalFeatureKey::Class(guard));
+    let mut planned = Vec::new();
+    assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+    assert_eq!(planned, vec![shadow_inner.raw()]);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(shadow_inner).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+}
+
+#[test]
+fn a_refused_prefix_transition_cache_keeps_the_maintained_relation() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    for (node, class) in [(nodes[1], guard), (nodes[3], target)] {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], true);
+    assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+    assert!(engine.memory().bytes_in_category(MemoryCategory::PrefixRelation) > 0);
+
+    engine.memory.set_tier3_limit_for_test(0);
+    for present in [false, true] {
+        if present {
+            add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+        } else {
+            remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+        }
+        let mut planned = Vec::new();
+        assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
+        assert_eq!(planned, vec![nodes[3].raw()]);
+        engine.begin_published_match_answer_completion_batch(nodes[0], true);
+        assert_eq!(engine.match_element(nodes[3]).unwrap().len(), usize::from(present));
+        engine.end_published_match_answer_completion_batch();
+    }
+    assert_eq!(engine.counters().get(Counter::PrefixRelationUpdates), 2);
+    assert_eq!(engine.counters().get(Counter::PrefixRelationBuilds), 1);
+    assert_eq!(
+        engine.memory().bytes_in_category(MemoryCategory::PrefixTransitionCache),
+        0
+    );
+    assert!(engine.memory().bytes_in_category(MemoryCategory::PrefixRelation) > 0);
 }
 
 #[test]
@@ -7966,6 +8280,77 @@ fn a_published_local_reaction_names_its_semantic_provenance() {
 }
 
 #[test]
+fn element_inputs_force_only_their_own_retained_answer_reactions() {
+    for declaration_input in [false, true] {
+        let (mut engine, nodes) = nested_document();
+        discard_transaction(&mut engine);
+        for &node in &nodes {
+            let matches = engine.match_element(node).unwrap();
+            let compact = engine.matches_for_cascade(matches.clone(), false, None);
+            engine.remember_retained_match_answer(node, &matches);
+            engine.remember_cascade_input(node, &compact);
+        }
+        if declaration_input {
+            engine.record_input(
+                InputKey::ElementDeclaration(nodes[2], ElementDeclarationKind::InlineStyle),
+                InputValue::ElementDeclaration(None),
+                InputValue::ElementDeclaration(Some(DeclarationBlockID(1))),
+            );
+        } else {
+            engine.record_input(
+                InputKey::ElementStyleInput(nodes[2]),
+                InputValue::ElementStyleInput {
+                    reaction: 0,
+                    inherited_style_groups: 0,
+                },
+                InputValue::ElementStyleInput {
+                    reaction: transaction::STYLE_REACTION_RECOMPUTE_STYLE,
+                    inherited_style_groups: 0,
+                },
+            );
+        }
+        let transaction = engine.take_transaction();
+        let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
+        let mut patch = engine.prepare_retained_answer_patch(selection);
+        for &node in &nodes {
+            let outcome = engine
+                .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
+                .unwrap();
+            assert_eq!(outcome.emit, node == nodes[2]);
+            assert!(outcome.identity_preserved);
+        }
+        engine.release_transaction(transaction);
+    }
+}
+
+#[test]
+fn keyframes_force_only_their_named_consumers_retained_answer_reactions() {
+    let (mut engine, nodes) = nested_document();
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    let name = StyleAtomID(101);
+    engine.set_element_animation_names(nodes[2], &[name]);
+    discard_transaction(&mut engine);
+    for &node in &nodes {
+        let matches = engine.match_element(node).unwrap();
+        engine.remember_retained_match_answer(node, &matches);
+        engine.remember_cascade_input(node, &matches);
+    }
+    engine.add_keyframes_rule(sheet, None, name);
+    let transaction = engine.take_transaction();
+    let selection = engine.rules_for_retained_answer_patch(&transaction).unwrap();
+    let mut patch = engine.prepare_retained_answer_patch(selection);
+    for &node in &nodes {
+        let outcome = engine
+            .patch_retained_match_answer(node, &mut patch, SelectorTruthPatch::Direct(&[]))
+            .unwrap();
+        assert_eq!(outcome.emit, node == nodes[2]);
+        assert!(outcome.identity_preserved);
+    }
+    engine.release_transaction(transaction);
+}
+
+#[test]
 fn an_element_style_input_publishes_an_exact_reaction_without_matching() {
     let (mut engine, nodes) = nested_document();
     discard_transaction(&mut engine);
@@ -9336,6 +9721,58 @@ fn sheet_attachment_commits_at_the_transaction_barrier() {
 }
 
 #[test]
+fn sheet_order_inputs_only_name_sheets_whose_position_changed() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let user_agent = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::UserAgent);
+    let first = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
+    let second = engine.add_sheet(StyleSheetObjectID(3), CascadeOrigin::Author);
+    for sheet in [user_agent, first, second] {
+        engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    }
+    engine.append_rule(user_agent, None, RuleKind::Style);
+    let first_rule = engine.append_rule(first, None, RuleKind::Style);
+    let second_rule = engine.append_rule(second, None, RuleKind::Style);
+    discard_transaction(&mut engine);
+
+    engine.attach_sheet(first, TreeScopeID::DOCUMENT);
+    let transaction = engine.take_transaction();
+    let mut rules: Vec<_> = transaction.program_joins.iter().map(|delta| delta.rule).collect();
+    rules.sort_unstable();
+    assert_eq!(rules, vec![first_rule, second_rule]);
+    engine.release_transaction(transaction);
+
+    engine.attach_sheet(user_agent, TreeScopeID::DOCUMENT);
+    let transaction = engine.take_transaction();
+    assert!(transaction.program_joins.is_empty());
+    engine.release_transaction(transaction);
+
+    engine.detach_sheet(first, TreeScopeID::DOCUMENT);
+    engine.attach_sheet(first, TreeScopeID::DOCUMENT);
+    let transaction = engine.take_transaction();
+    assert!(transaction.program_joins.is_empty());
+    engine.release_transaction(transaction);
+}
+
+#[test]
+fn edits_to_a_temporarily_detached_sheet_keep_their_rule_inputs() {
+    let (mut engine, sheet, rule) = authoring_engine();
+    engine.detach_sheet(sheet, TreeScopeID::DOCUMENT);
+    let mut contents = engine.program.rule_version(rule);
+    contents.selector_program = Some(SelectorProgramID(2));
+    engine.replace_rule_version(rule, contents);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+
+    let transaction = engine.take_transaction();
+    assert!(transaction.program_joins.iter().any(|delta| {
+        delta.rule == rule
+            && delta.kind == ProgramJoinDeltaKind::ActiveRuleMatch
+            && delta.before_program == Some(SelectorProgramID(1))
+            && delta.after_program == Some(SelectorProgramID(2))
+    }));
+    engine.release_transaction(transaction);
+}
+
+#[test]
 fn rule_changes_share_one_sheet_attachment_decision_per_transaction() {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
@@ -9983,7 +10420,12 @@ fn engine_atom_reuse_replaces_custom_property_names() {
         engine.note_custom_property_name(new_name, 0, &new_text);
     }
     assert_eq!(
-        engine.custom_property_environments.name(new_name).unwrap().text,
+        engine
+            .custom_property_environments
+            .name(new_name)
+            .unwrap()
+            .text
+            .as_ref(),
         new_text
     );
 }
@@ -10062,6 +10504,7 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
     let parent_record = publish(&mut engine, nodes[0], 0);
     let record = publish(&mut engine, nodes[1], 1);
     let other_parent_record = publish(&mut engine, nodes[2], 2);
+    engine.document_style_computation_inputs = Some(bridge::FfiDocumentStyleComputationInputs::default());
     engine.begin_style_record_view_epoch();
     let context = computed::SharedComputationContext {
         parent_record,
@@ -10074,6 +10517,7 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
                 .inherited_groups_for_shared_style(parent_record)
                 .unwrap(),
             environment: 3,
+            font_environment_generation: 0,
             shape: [4, 5, 6, 7],
         },
     };
@@ -10102,6 +10546,15 @@ fn shared_computation_context_checks_fixed_inputs_and_record_liveness() {
             None
         );
     }
+    let mut different_font_environment = context;
+    different_font_environment.key.font_environment_generation += 1;
+    engine
+        .computed_group_sets
+        .remember_shared_computation_context(nodes[1], different_font_environment);
+    assert_eq!(
+        engine.take_shared_computation_context(nodes[1], parent_record, 3, [4, 5, 6, 7], 1),
+        None
+    );
     let mut different_scope = context;
     different_scope.key.tree_scope += 1;
     engine

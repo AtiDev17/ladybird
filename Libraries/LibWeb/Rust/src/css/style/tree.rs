@@ -184,10 +184,9 @@ pub(super) struct TreeRelationStaging {
 }
 
 type StagedTreeRows = Vec<(StyleNodeID, Option<TreeRelations>, Option<TreeRelations>)>;
-type StagedFirstChildren = Vec<(StyleNodeID, Option<StyleNodeID>, Option<StyleNodeID>)>;
 
 fn radix_sort_style_node_ids(mut nodes: Vec<StyleNodeID>) -> Vec<StyleNodeID> {
-    if nodes.len() < 2 {
+    if nodes.is_sorted() {
         return nodes;
     }
     let mut scratch = vec![nodes[0]; nodes.len()];
@@ -314,18 +313,16 @@ impl TreeRelationStaging {
             .collect()
     }
 
-    pub(super) fn dirty_first_children(&self) -> StagedFirstChildren {
-        self.dirty_first_children
-            .iter()
-            .copied()
-            .map(|parent| {
-                let pair = self
-                    .first_children
-                    .get(parent)
-                    .expect("dirty first-child row must be staged");
-                (parent, pair.before, pair.after)
-            })
-            .collect()
+    pub(super) fn dirty_first_children(
+        &self,
+    ) -> impl Iterator<Item = (StyleNodeID, Option<StyleNodeID>, Option<StyleNodeID>)> + '_ {
+        self.dirty_first_children.iter().copied().map(|parent| {
+            let pair = self
+                .first_children
+                .get(parent)
+                .expect("dirty first-child row must be staged");
+            (parent, pair.before, pair.after)
+        })
     }
 
     pub(super) fn before_relations(&self, node: StyleNodeID, resident: Option<TreeRelations>) -> Option<TreeRelations> {
@@ -850,7 +847,7 @@ impl StyleNodeTree {
         if pairs.is_empty() {
             shadow.part_hosts.remove(&node);
         } else {
-            shadow.part_hosts.insert(node, pairs.to_vec());
+            pairs.clone_into(shadow.part_hosts.entry(node).or_default());
         }
         let current = self.shadow_capacity_bytes();
         self.record_capacity_change(memory, before, current);
@@ -1245,7 +1242,7 @@ mod tests {
         staging.stage_first_child(parent, None, Some(node));
         staging.mark_applied();
         assert!(staging.dirty_rows().is_empty());
-        assert!(staging.dirty_first_children().is_empty());
+        assert!(staging.dirty_first_children().next().is_none());
         staging.stage_row(node, Some(first_after), Some(final_after));
         staging.stage_first_child(parent, Some(node), Some(final_first_child));
 

@@ -1567,6 +1567,13 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
                 return;
         }
         auto old_style_record = style_record_identity(pseudo_element);
+        if (pseudo_element == CSS::PseudoElement::Selection && !document().selection_styles_are_observable()) {
+            if (!!old_style_record) {
+                auto delta = style_computer.style_engine().remove_computed_pseudo(style_node_id(), to_underlying(pseudo_element));
+                set_computed_style(pseudo_element, delta.new_style_record);
+            }
+            return;
+        }
         auto preserved_style_record = preserved_pseudo_element_styles ? preserved_pseudo_element_styles->at(to_underlying(pseudo_element)) : CSS::StyleRecordID {};
         // Most elements have no style for most pseudo-elements. Decide that from the record
         // identities before materializing any record view.
@@ -1982,11 +1989,6 @@ void Element::set_style_input_record(OwnPtr<CSS::StyleInputRecord> record)
     m_style_input_record = move(record);
 }
 
-void Element::retire_style_input_record()
-{
-    m_style_input_record = nullptr;
-}
-
 OwnPtr<CSS::StyleInputRecord> Element::take_style_input_record()
 {
     return move(m_style_input_record);
@@ -2185,7 +2187,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
             counters.element_computed_style_changes++;
         // The input record's declaration half described the cascade that produced the old record, so
         // the next computation on this element derives a fresh one.
-        retire_style_input_record();
+        set_style_input_record(nullptr);
         set_computed_style({}, new_style_record);
         if (is_html_html_element()) {
             // Root-relative units read document-global font metrics rather than inherited style.
@@ -2412,7 +2414,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
         // live anchor-name maps, while positioned boxes anywhere may hold geometry resolved
         // against them; names still registered keep that check refusing partial relayout.
         if (element_had_registered_anchor_names && !element_has_anchor_names)
-            document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
+            document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
     }
 
     // Which animations an element references is an index StyleEngine keeps, in the same shape as the
@@ -2511,7 +2513,7 @@ void Element::clear_computed_styles_from_display_none_descendants()
         // Anchor names are registered outside the style record, so unregister them before discarding the only record
         // that identifies them. Rematerializing the element's style will register its current names again.
         if (element->is_connected() && unregister_current_anchor_names(*element, element->root()))
-            element->document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
+            element->document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
 
         // The layout tree is torn down after the style transaction. Keep its style alive until then without
         // retaining the record as the descendant's current computed style.
@@ -2917,8 +2919,9 @@ void Element::did_update_inline_style()
     if (auto history = document().editing_history_if_exists())
         history->notify_dom_mutation();
 
+    if (!m_style_attribute_is_dirty)
+        document().mark_style_attribute_dirty(*this);
     m_style_attribute_is_dirty = true;
-    document().mark_style_attribute_dirty();
     queue_mutation_record(MutationType::attributes, HTML::AttributeNames::style, {}, old_value, {}, {}, nullptr, nullptr);
 
     if (!document().suppresses_attribute_style_invalidation())
@@ -3155,6 +3158,8 @@ void Element::inserted()
     Base::inserted();
 
     if (is_connected()) {
+        if (m_style_attribute_is_dirty)
+            document().mark_style_attribute_dirty(*this);
         // The MathML and SVG user-agent sheets decide only for elements in their own namespaces, so
         // the first such element to connect is what brings them into the document's user-agent
         // origin. Asking here rather than at style time keeps a page without either from ever
@@ -3192,7 +3197,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
         if (unregister_current_anchor_names(*this, old_root)) {
             // Positioned boxes anywhere may hold geometry resolved against these names, which
             // the dispatch-time check of the live anchor-name maps can no longer see.
-            document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
+            document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
         }
     }
 

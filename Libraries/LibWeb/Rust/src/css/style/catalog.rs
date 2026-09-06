@@ -138,7 +138,7 @@ impl MatchAnswerCatalog {
             if let Some(identity) = self.identity(prepared, hash) {
                 return identity;
             }
-            return self.insert_new(prepared.to_vec(), hash);
+            return self.insert_new(Rc::from(&*prepared), hash);
         }
         let mut prepared: Vec<RetainedRuleMatch> =
             answer.iter().copied().map(RetainedRuleMatch::from_rule_match).collect();
@@ -151,10 +151,10 @@ impl MatchAnswerCatalog {
         if let Some(identity) = self.identity(&answer, hash) {
             return identity;
         }
-        self.insert_new(answer, hash)
+        self.insert_new(answer.into(), hash)
     }
 
-    pub(super) fn insert_new(&mut self, answer: Vec<RetainedRuleMatch>, hash: u64) -> MatchAnswerID {
+    pub(super) fn insert_new(&mut self, answer: Rc<[RetainedRuleMatch]>, hash: u64) -> MatchAnswerID {
         let identity = MatchAnswerID(
             u32::try_from(self.answers.len())
                 .ok()
@@ -165,7 +165,7 @@ impl MatchAnswerCatalog {
             hash,
             identity,
             Some(MatchAnswerCatalogEntry {
-                answer: answer.into(),
+                answer,
                 prefix_references: 0,
                 cascade_references: 0,
                 cascade_payload_accounted: false,
@@ -308,7 +308,7 @@ impl MatchAnswerCatalog {
 
     pub(super) fn insert_retained(&mut self, answer: Vec<RetainedRuleMatch>, hash: u64) -> MatchAnswerID {
         debug_assert!(self.identity(&answer, hash).is_none());
-        let identity = self.insert_new(answer, hash);
+        let identity = self.insert_new(answer.into(), hash);
         self.retain_identity(identity);
         identity
     }
@@ -776,6 +776,14 @@ pub(super) fn prepare_selector_truth_set(
 }
 
 pub(super) fn merge_retained_match_answers(answer: &mut Vec<RetainedRuleMatch>, suffix: &[RetainedRuleMatch]) {
+    if answer
+        .last()
+        .zip(suffix.first())
+        .is_none_or(|(last, first)| last <= first)
+    {
+        answer.extend_from_slice(suffix);
+        return;
+    }
     let mut answer_index = answer.len();
     let mut suffix_index = suffix.len();
     answer.extend_from_slice(suffix);
@@ -809,7 +817,8 @@ pub(super) struct RetainedMatchAnswers {
 /// exact selector truth without evaluating the selector again. It is Tier-3 state: incomplete
 /// retained coverage or closed admission simply leaves program routing on its cold path.
 pub(super) struct RetainedSelectorIncidences {
-    pub(super) by_program: Vec<Option<Rc<[RetainedSelectorIncidence]>>>,
+    by_program: Vec<Option<Rc<[RetainedSelectorIncidence]>>>,
+    nested_capacity_bytes: u64,
     pub(super) residency: MemoryLease,
 }
 
@@ -823,6 +832,7 @@ impl Default for RetainedSelectorIncidences {
     fn default() -> Self {
         Self {
             by_program: Vec::new(),
+            nested_capacity_bytes: 0,
             residency: MemoryLease::new(MemoryCategory::RetainedSelectorIncidence),
         }
     }
@@ -836,13 +846,8 @@ impl RetainedSelectorIncidences {
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [self.by_program];
-            cached [];
-            nested [self
-                .by_program
-                .iter()
-                .flatten()
-                .map(|incidences| incidences.len() * size_of::<RetainedSelectorIncidence>())
-                .sum::<usize>()];
+            cached [self.nested_capacity_bytes];
+            nested [];
             skip [self.residency];
         }
     }
@@ -863,7 +868,10 @@ impl RetainedSelectorIncidences {
         if self.by_program.len() < required_len {
             self.by_program.resize(required_len, None);
         }
-        self.by_program[program.0 as usize] = Some(Rc::clone(&incidences));
+        if let Some(previous) = self.by_program[program.0 as usize].replace(Rc::clone(&incidences)) {
+            self.nested_capacity_bytes -= size_of_val(previous.as_ref()) as u64;
+        }
+        self.nested_capacity_bytes += size_of_val(incidences.as_ref()) as u64;
         let bytes = self.capacity_bytes();
         self.residency.reconcile_committed(memory, bytes);
         memory.finish_committed_acceleration_growth(MemoryCategory::RetainedSelectorIncidence);
@@ -872,6 +880,7 @@ impl RetainedSelectorIncidences {
 
     pub(super) fn clear(&mut self) {
         self.by_program = Vec::new();
+        self.nested_capacity_bytes = 0;
         self.residency.release();
     }
 }
@@ -902,6 +911,8 @@ pub(super) struct RetainedAnswerPatch {
     pub(super) prefix_caches: Rc<RefCell<PrefixCaches>>,
     pub(super) dispatch_workspace: DispatchCandidateWorkspace,
     pub(super) always_emit: bool,
+    pub(super) has_non_selector_inputs: bool,
+    pub(super) always_emit_nodes: Vec<StyleNodeID>,
     /// A program join can make a rule contribute without producing a signed selector-truth delta
     /// for every node the join reaches. Those nodes must evaluate the affected rule set instead of
     /// treating deltas from concurrent element inputs as a complete patch.
@@ -941,7 +952,6 @@ impl RetainedAnswerDeltaMemoEntry {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct RetainedAnswerDeltaTransition {
     pub(super) new_answer: MatchAnswerID,
     /// The compact identity after the transition. Equal to the asker's old identity exactly when
@@ -975,10 +985,22 @@ pub(super) struct IncrementalCascadeAnswer {
 }
 
 impl RetainedAnswerPatch {
+    pub(super) fn orders_shifted_for(&self, retained: &[RetainedRuleMatch]) -> bool {
+        self.orders_shifted
+            && retained
+                .iter()
+                .any(|entry| self.cascade_update_rules.binary_search(&entry.rule).is_ok())
+    }
+
+    pub(super) fn always_emit_for(&self, node: StyleNodeID) -> bool {
+        self.always_emit || self.always_emit_nodes.binary_search(&node).is_ok()
+    }
+
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [
                 self.rule_keys,
+                self.always_emit_nodes,
                 self.cascade_update_properties,
                 self.cascade_update_rules,
                 self.custom_changed_rules,
@@ -1003,6 +1025,8 @@ impl RetainedAnswerPatch {
 pub(super) struct RetainedAnswerPatchSelection {
     pub(super) affected: Vec<RetainedAnswerPatchSelectionRule>,
     pub(super) always_emit: bool,
+    pub(super) has_non_selector_inputs: bool,
+    pub(super) always_emit_nodes: Vec<StyleNodeID>,
     pub(super) orders_shifted: bool,
     pub(super) requires_full_match: bool,
     pub(super) cascade_update_properties: Vec<u16>,

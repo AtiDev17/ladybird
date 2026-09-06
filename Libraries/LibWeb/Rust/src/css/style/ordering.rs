@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::cascade::{CascadeAttachment, Top1Winner};
+use smallvec::SmallVec;
+
+use super::cascade::{CascadeAttachment, CascadeContinuationID, Top1Winner};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -238,19 +240,26 @@ impl StyleEngine {
         let wants = |property| properties.is_none_or(|properties| properties.binary_search(&property).is_ok());
         candidates.clear();
         for entry in matches.iter().filter(|entry| entry.pseudo_element == pseudo) {
+            let mut priority_and_stratum_by_importance = [None; 2];
             for &declared in self.program.declared_properties_of(entry.rule) {
                 // A shorthand written with a substitution is declared whole beside the longhands
                 // it pends; the longhands are the winners, the shorthand names no column.
                 if !wants(declared.property) || !property_is_longhand(declared.property) {
                     continue;
                 }
-                let priority = self.cascade_priority_of(
-                    entry.rule,
-                    entry.tree_scope,
-                    entry.specificity,
-                    entry.scope_proximity,
-                    declared.important,
-                );
+                let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
+                    .get_or_insert_with(|| {
+                        (
+                            self.cascade_priority_of(
+                                entry.rule,
+                                entry.tree_scope,
+                                entry.specificity,
+                                entry.scope_proximity,
+                                declared.important,
+                            ),
+                            self.cascade_stratum_of(entry.rule, entry.tree_scope, declared.important),
+                        )
+                    });
                 candidates.push(OrderedCascadeCandidate {
                     winner: PropertyWinner {
                         property: declared.property,
@@ -259,8 +268,7 @@ impl StyleEngine {
                         priority,
                         source: WinnerSource::Rule(entry.rule),
                     },
-                    priority,
-                    stratum: self.cascade_stratum_of(entry.rule, entry.tree_scope, declared.important),
+                    stratum,
                 });
             }
         }
@@ -275,11 +283,18 @@ impl StyleEngine {
                 {
                     continue;
                 }
+                let mut priority_and_stratum_by_importance = [None; 2];
                 for &declared in declared_properties {
                     if !wants(declared.property) || !property_is_longhand(declared.property) {
                         continue;
                     }
-                    let priority = self.element_cascade_priority(node, kind, declared.important);
+                    let (priority, stratum) = *priority_and_stratum_by_importance[declared.important as usize]
+                        .get_or_insert_with(|| {
+                            (
+                                self.element_cascade_priority(node, kind, declared.important),
+                                self.element_cascade_stratum(node, kind, declared.important),
+                            )
+                        });
                     candidates.push(OrderedCascadeCandidate {
                         winner: PropertyWinner {
                             property: declared.property,
@@ -288,8 +303,7 @@ impl StyleEngine {
                             priority,
                             source: WinnerSource::Element(kind),
                         },
-                        priority,
-                        stratum: self.element_cascade_stratum(node, kind, declared.important),
+                        stratum,
                     });
                 }
             }
@@ -433,30 +447,20 @@ impl StyleEngine {
                 continue;
             }
             let declared_properties = self.program.declared_properties_of(entry.rule);
-            let normal_priority = self.cascade_priority_of(
-                entry.rule,
-                entry.tree_scope,
-                entry.specificity,
-                entry.scope_proximity,
-                false,
-            );
-            let mut important_priority = None;
+            let mut priorities = [None; 2];
             for declared in declared_properties {
                 if !property_is_longhand(declared.property) {
                     continue;
                 }
-                let priority = match declared.important {
-                    true => *important_priority.get_or_insert_with(|| {
-                        self.cascade_priority_of(
-                            entry.rule,
-                            entry.tree_scope,
-                            entry.specificity,
-                            entry.scope_proximity,
-                            true,
-                        )
-                    }),
-                    false => normal_priority,
-                };
+                let priority = *priorities[declared.important as usize].get_or_insert_with(|| {
+                    self.cascade_priority_of(
+                        entry.rule,
+                        entry.tree_scope,
+                        entry.specificity,
+                        entry.scope_proximity,
+                        declared.important,
+                    )
+                });
                 match entry.pseudo_element {
                     Some(_) => top_1.consider(
                         (entry.pseudo_element, declared.property),
@@ -480,13 +484,16 @@ impl StyleEngine {
                 {
                     continue;
                 }
+                let mut priorities = [None; 2];
                 for &declared in declared_properties {
                     if !property_is_longhand(declared.property) {
                         continue;
                     }
+                    let priority = *priorities[declared.important as usize]
+                        .get_or_insert_with(|| self.element_cascade_priority(node, kind, declared.important));
                     element_top_1.consider(
                         declared.property,
-                        self.element_cascade_priority(node, kind, declared.important),
+                        priority,
                         CascadeCompactionCandidate::Element(kind, declared),
                     );
                 }
@@ -495,7 +502,8 @@ impl StyleEngine {
         let mut scratch_bytes = 0;
 
         let published_winners = if let Some(node) = publish_winners_for {
-            let mut targets = vec![None];
+            let mut targets: SmallVec<[Option<tree::PseudoElementTarget>; 3]> = SmallVec::new();
+            targets.push(None);
             for target in all.iter().filter_map(|entry| entry.pseudo_element) {
                 if !targets.contains(&Some(target)) {
                     targets.push(Some(target));
@@ -517,7 +525,7 @@ impl StyleEngine {
                             let winners = self.resolved_cascade_winners_for_properties(node, all, target, None);
                             (target, winners)
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<SmallVec<[_; 3]>>(),
                 )
             } else {
                 Some(
@@ -568,7 +576,7 @@ impl StyleEngine {
                             };
                             (target, winners)
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<SmallVec<[_; 3]>>(),
                 )
             }
         } else {
@@ -617,8 +625,7 @@ impl StyleEngine {
             return;
         }
 
-        let compaction_scratch_bytes =
-            (all.len().div_ceil(8) + all.len() * size_of::<tree::PseudoElementTarget>()) as u64;
+        let compaction_scratch_bytes = (all.len() * size_of::<bool>()) as u64;
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, compaction_scratch_bytes);
         scratch_bytes += compaction_scratch_bytes;
@@ -628,12 +635,12 @@ impl StyleEngine {
                 keep[index] = true;
             }
         }
-        for winner in top_1.winners() {
+        for winner in top_1.unordered_winners() {
             if let CascadeCompactionCandidate::Rule(match_index) = winner.payload {
                 keep[match_index] = true;
             }
         }
-        for winner in element_top_1.winners() {
+        for winner in &element_top_1.winners {
             if let CascadeCompactionCandidate::Rule(match_index) = winner.payload {
                 keep[match_index] = true;
             }
@@ -655,7 +662,7 @@ impl StyleEngine {
             }
         }
 
-        let mut retained_pseudo_targets = Vec::with_capacity(all.len());
+        let mut retained_pseudo_targets: SmallVec<[tree::PseudoElementTarget; 2]> = SmallVec::new();
         for (index, entry) in all.iter().enumerate() {
             if keep[index]
                 && let Some(target) = entry.pseudo_element
@@ -673,9 +680,12 @@ impl StyleEngine {
             }
         }
 
-        let actual_scratch_bytes = (keep.capacity().div_ceil(8)
-            + retained_pseudo_targets.capacity() * size_of::<tree::PseudoElementTarget>())
-            as u64;
+        let pseudo_target_scratch_bytes = if retained_pseudo_targets.spilled() {
+            retained_pseudo_targets.capacity() * size_of::<tree::PseudoElementTarget>()
+        } else {
+            0
+        };
+        let actual_scratch_bytes = (keep.capacity() * size_of::<bool>() + pseudo_target_scratch_bytes) as u64;
         if actual_scratch_bytes > scratch_bytes {
             self.memory
                 .reserve_required(MemoryCategory::BatchScratch, actual_scratch_bytes - scratch_bytes);
@@ -764,16 +774,15 @@ impl StyleEngine {
             candidates,
         );
 
+        // Winners are an ordered subset of the requested properties.
+        let mut winners = winners.into_iter().peekable();
         Some(
             properties
                 .iter()
                 .copied()
                 .map(|property| PropertyWinnerUpdate {
                     property,
-                    winner: winners
-                        .binary_search_by_key(&property, |winner| winner.property)
-                        .ok()
-                        .map(|index| winners[index]),
+                    winner: winners.next_if(|winner| winner.property == property),
                 })
                 .collect(),
         )
@@ -790,7 +799,7 @@ impl StyleEngine {
         deltas: &[SelectorTruthDelta],
         candidates: &mut Vec<OrderedCascadeCandidate>,
     ) -> bool {
-        let mut targets = Vec::new();
+        let mut targets: SmallVec<[Option<tree::PseudoElementTarget>; 3]> = SmallVec::new();
         for delta in deltas {
             let entry = self.programs.entry(delta.entry).1;
             if !targets.contains(&entry.pseudo_element) {
@@ -823,22 +832,30 @@ impl StyleEngine {
 
         let mut repair_properties = Vec::new();
         let mut updates: Vec<PropertyWinnerUpdate> = Vec::new();
-        let mut update_priorities = Vec::new();
         for delta in deltas {
             let entry = *self.programs.entry(delta.entry).1;
             if entry.pseudo_element != pseudo {
                 continue;
             }
+            let mut matched_rule = None;
+            let mut priorities = [None; 2];
             for &declared in self.program.declared_properties_of(delta.rule) {
                 if !property_is_longhand(declared.property) {
                     continue;
                 }
-                let retained_winner_has_continuation = self
-                    .winner_groups
-                    .winner_in_state(previous, declared.property)
-                    .is_some_and(|winner| self.winner_groups.continuation(winner.key.continuation).is_some());
                 if delta.change == SetChange::Removed
-                    || retained_winner_has_continuation
+                    && self
+                        .winner_groups
+                        .winner_in_state(previous, declared.property)
+                        .is_some_and(|winner| {
+                            winner.source != WinnerSource::Rule(delta.rule)
+                                && winner.source != WinnerSource::ExactCascade
+                                && winner.key.continuation == CascadeContinuationID::default()
+                        })
+                {
+                    continue;
+                }
+                if delta.change == SetChange::Removed
                     || matches!(
                         declared.operator,
                         CascadeOperator::Revert | CascadeOperator::RevertLayer
@@ -847,18 +864,32 @@ impl StyleEngine {
                     repair_properties.push(declared.property);
                     continue;
                 }
-                let Some(matched) = matches.iter().find(|matched| {
-                    matched.rule == delta.rule && self.programs.entry_id(matched.program, matched.entry) == delta.entry
-                }) else {
+                let previous_winner = self.winner_groups.winner_in_state(previous, declared.property);
+                if previous_winner.is_some_and(|winner| winner.key.continuation != CascadeContinuationID::default()) {
+                    repair_properties.push(declared.property);
+                    continue;
+                }
+                if matched_rule.is_none() {
+                    matched_rule = matches.iter().find(|matched| {
+                        matched.rule == delta.rule
+                            && self.programs.entry_id(matched.program, matched.entry) == delta.entry
+                    });
+                }
+                let Some(matched) = matched_rule else {
                     return false;
                 };
-                let priority = self.cascade_priority_of(
-                    delta.rule,
-                    matched.tree_scope,
-                    entry.specificity,
-                    matched.scope_proximity,
-                    declared.important,
-                );
+                let priority = *priorities[declared.important as usize].get_or_insert_with(|| {
+                    self.cascade_priority_of(
+                        delta.rule,
+                        matched.tree_scope,
+                        entry.specificity,
+                        matched.scope_proximity,
+                        declared.important,
+                    )
+                });
+                if previous_winner.is_some_and(|winner| priority < winner.priority) {
+                    continue;
+                }
                 let winner = PropertyWinner {
                     property: declared.property,
                     important: declared.important,
@@ -866,25 +897,16 @@ impl StyleEngine {
                     priority,
                     source: WinnerSource::Rule(delta.rule),
                 };
-                if let Some(index) = updates.iter().position(|update| update.property == declared.property) {
-                    if priority >= update_priorities[index] {
-                        updates[index].winner = Some(winner);
-                        update_priorities[index] = priority;
-                    }
-                } else if let Some(previous_winner) = self.winner_groups.winner_in_state(previous, declared.property) {
-                    if priority >= previous_winner.priority {
-                        updates.push(PropertyWinnerUpdate {
-                            property: declared.property,
-                            winner: Some(winner),
-                        });
-                        update_priorities.push(priority);
+                if let Some(update) = updates.iter_mut().find(|update| update.property == declared.property) {
+                    let pending = update.winner.as_mut().expect("an added declaration carries a winner");
+                    if priority >= pending.priority {
+                        *pending = winner;
                     }
                 } else {
                     updates.push(PropertyWinnerUpdate {
                         property: declared.property,
                         winner: Some(winner),
                     });
-                    update_priorities.push(priority);
                 }
             }
         }
@@ -1114,6 +1136,9 @@ impl StyleEngine {
     }
 
     pub(super) fn cascade_context_scope(&self, rule: RuleID, tree_scope: TreeScopeID) -> TreeScopeID {
+        if tree_scope == TreeScopeID::DOCUMENT {
+            return tree_scope;
+        }
         let sheet = self.program.rule_sheet(rule);
         match self.program.attachment_in_scope(sheet, tree_scope).is_some() {
             true => tree_scope,
@@ -1137,12 +1162,10 @@ impl StyleEngine {
     ) -> CascadePriority {
         let sheet = self.program.rule_sheet(rule);
         let version = self.program.rule_version(rule);
-        // A sheet the rule's own scope does not hold is one of the origins that decide everywhere,
-        // and those are attached to the document.
-        let attachment = self.program.attachment_in_scope(sheet, tree_scope);
         // A sheet the element's own scope does not hold is one of the origins that decide
         // everywhere, and those are attached to the document, which is the outermost context.
-        let context_scope = self.cascade_context_scope(rule, tree_scope);
+        let attachment = self.program.attachment_in_scope(sheet, tree_scope);
+        let context_scope = attachment.map_or(TreeScopeID::DOCUMENT, |attachment| attachment.tree_scope);
         let attachment = attachment.or_else(|| self.program.attachment_in_scope(sheet, TreeScopeID::DOCUMENT));
         CascadePriority::new(PriorityInputs {
             origin: self.program.sheet_origin(sheet),
@@ -1233,8 +1256,10 @@ impl StyleEngine {
         declaration_changes.retain(|change| {
             transaction
                 .inputs
-                .iter()
-                .any(|input| input.key == InputKey::RuleField(change.rule, RuleField::Declarations))
+                .binary_search_by_key(&InputKey::RuleField(change.rule, RuleField::Declarations), |input| {
+                    input.key
+                })
+                .is_ok()
         });
         transaction.install_rule_declaration_changes(
             declaration_changes
@@ -1397,16 +1422,17 @@ impl StyleEngine {
         let mut reclaimable = self.atoms.reclaimable_for_sweep(&live);
         if let Some(recorded) = replay_reclaimed {
             assert!(
-                recorded.iter().all(|atom| reclaimable.contains(atom)),
+                recorded.iter().all(|atom| reclaimable.binary_search(atom).is_ok()),
                 "a recorded atom release still has a semantic replay owner"
             );
             reclaimable = recorded;
+            reclaimable.sort_unstable();
         }
         self.facts.forget_atoms(&reclaimable);
         self.custom_property_environments.forget_names(&reclaimable);
         let requirement_count = self.attribute_value_text_names.len();
         self.attribute_value_text_names
-            .retain(|atom| !reclaimable.contains(atom));
+            .retain(|atom| reclaimable.binary_search(atom).is_err());
         if self.attribute_value_text_names.len() != requirement_count {
             self.attribute_value_text_requirements_version += 1;
         }

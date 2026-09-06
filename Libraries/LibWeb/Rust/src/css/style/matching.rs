@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use smallvec::SmallVec;
+
 use super::batch_matcher::{append_selector_truth_matches, insert_scope_rule};
+use super::cascade::CascadeContinuationID;
 use super::selector::{AttributeCase, AttributeOperator};
 use super::*;
 
@@ -294,7 +297,7 @@ impl StyleEngine {
     /// Refresh `query_sorted_candidates` for this program's subject keys under `root` — or report
     /// that postings can't name every entry's candidates, and the caller has to walk.
     fn ensure_sorted_query_candidates(&mut self, program: &SelectorProgram, root: StyleNodeID) -> bool {
-        let mut keys: Vec<DispatchKey> = Vec::new();
+        let mut keys: SmallVec<[DispatchKey; 1]> = SmallVec::new();
         for (entry_index, entry) in program.entries().iter().enumerate() {
             if entry.pseudo_element.is_some() {
                 continue;
@@ -319,7 +322,7 @@ impl StyleEngine {
         if let Some(stamp) = &self.query_sorted_candidates_stamp
             && stamp.generation == generation
             && stamp.root == root
-            && stamp.keys == keys
+            && stamp.keys == keys.as_slice()
         {
             return true;
         }
@@ -329,12 +332,14 @@ impl StyleEngine {
         let mut candidates: Vec<StyleNodeID> = Vec::new();
         for &key in &keys {
             match self.facts.postings().lookup(key) {
-                Lookup::Known(posting) => candidates.extend(posting.candidates()),
+                Lookup::Known(posting) => posting.append_candidates_to(&mut candidates),
                 Lookup::KnownAbsent => {}
                 Lookup::Missing(_) => return false,
             }
         }
-        self.ensure_query_preorder_ranks(root);
+        if !candidates.is_empty() {
+            self.ensure_query_preorder_ranks(root);
+        }
         let ranks = &self.query_preorder_ranks;
         // A candidate without a rank lies outside the queried subtree.
         let mut ranked: Vec<(u32, StyleNodeID)> = candidates
@@ -342,11 +347,17 @@ impl StyleEngine {
             .filter_map(|node| ranks.get(&node).map(|&rank| (rank, node)))
             .collect();
         ranked.sort_unstable();
-        ranked.dedup();
+        if keys.len() > 1 {
+            ranked.dedup();
+        }
         self.query_sorted_candidates.clear();
         self.query_sorted_candidates
             .extend(ranked.into_iter().map(|(_, node)| node));
-        self.query_sorted_candidates_stamp = Some(QuerySortedCandidatesStamp { generation, root, keys });
+        self.query_sorted_candidates_stamp = Some(QuerySortedCandidatesStamp {
+            generation,
+            root,
+            keys: keys.into_vec(),
+        });
         true
     }
 
@@ -430,7 +441,7 @@ impl StyleEngine {
             if let Some(values) = &cache.attribute_values[entry_index]
                 && let Some(value_candidates) = self.facts.attribute_value_candidates(values)
             {
-                candidates.extend(value_candidates);
+                candidates = value_candidates;
                 used_attribute_value_posting = true;
             }
             let mut use_all_nodes = !used_attribute_value_posting && dispatch_keys.is_empty();
@@ -442,7 +453,7 @@ impl StyleEngine {
                     }
                     match self.facts.postings().lookup(key) {
                         Lookup::Known(posting) => {
-                            candidates.extend(posting.candidates());
+                            posting.append_candidates_to(&mut candidates);
                         }
                         Lookup::KnownAbsent => {}
                         Lookup::Missing(_) => {
@@ -459,10 +470,11 @@ impl StyleEngine {
                         .preorder(context.root)
                         .filter(|&node| context.include_root || node != context.root),
                 );
+            } else {
+                candidates.retain(|&node| {
+                    (context.include_root || node != context.root) && self.tree.is_in_subtree_of(node, context.root)
+                });
             }
-            candidates.retain(|&node| {
-                (context.include_root || node != context.root) && self.tree.is_in_subtree_of(node, context.root)
-            });
             candidates.sort_unstable();
             candidates.dedup();
             self.counters.add(
@@ -556,7 +568,7 @@ impl StyleEngine {
 
     pub(super) fn retain_prefix_states(&mut self) {
         if !self.prefix_caches.borrow_mut().states.retain(&mut self.memory) {
-            self.prefix_caches.borrow_mut().states.release();
+            self.prefix_caches.borrow_mut().states.release_transition_states();
         }
     }
 
@@ -683,7 +695,7 @@ impl StyleEngine {
                     caches.answers.release(&mut self.match_answers);
                 }
             } else {
-                caches.states.release();
+                caches.states.release_transition_states();
                 caches.answers.release(&mut self.match_answers);
             }
         }
@@ -960,7 +972,7 @@ impl StyleEngine {
     #[must_use]
     pub(super) fn elements_under(&self, root: StyleNodeID) -> Vec<StyleNodeID> {
         let mut nodes: Vec<StyleNodeID> = Vec::new();
-        let mut roots = vec![root];
+        let mut roots = SmallVec::from_buf([root]);
         while let Some(next) = roots.pop() {
             for node in self.tree.preorder(next) {
                 if self.tree.host_of(node).is_none() {
@@ -1122,7 +1134,7 @@ impl StyleEngine {
                 if declared.iter().any(|property| property.important) {
                     return None;
                 }
-                Some(declared.iter().map(|property| property.property).collect())
+                Some(declared.iter().map(|property| property.property))
             },
         );
         dispatch.settle_memory(&mut self.memory);
@@ -1843,11 +1855,11 @@ impl StyleEngine {
         if let Some(incidences) = self.retained_selector_incidences.lookup(program) {
             return Some(Rc::clone(incidences));
         }
-        let (scope_program, dispatch) = self.ranked_scope_program(TreeScopeID::DOCUMENT);
-        let compiled = self.programs.get(program);
-        if compiled.can_leave_its_scope() {
+        if self.programs.get(program).can_leave_its_scope() {
             return None;
         }
+        let (scope_program, dispatch) = self.ranked_scope_program(TreeScopeID::DOCUMENT);
+        let compiled = self.programs.get(program);
         let mut incidences = Vec::new();
         for (entry_index, entry) in compiled.entries().iter().enumerate() {
             let posting_key = compiled.dispatch_key(entry);
@@ -1861,6 +1873,15 @@ impl StyleEngine {
             };
             let subject_required = compiled.subject_required_keys(entry_index);
             let position = compiled.subject_position(entry_index);
+            let prefix_entry = entry
+                .has_prefix_chain()
+                .then(|| {
+                    self.programs.entry_id(
+                        program,
+                        u32::try_from(entry_index).expect("selector entry identity space exhausted"),
+                    )
+                })
+                .filter(|&entry| dispatch.prefixes().contains_entry(entry));
             for node in candidates {
                 if !self.node_is_within_subject_position(node, position) {
                     continue;
@@ -1882,20 +1903,13 @@ impl StyleEngine {
                 if !carries_required {
                     continue;
                 }
-                if entry.has_prefix_chain()
-                    && dispatch.prefixes().contains_entry(self.programs.entry_id(
-                        program,
-                        u32::try_from(entry_index).expect("selector entry identity space exhausted"),
-                    ))
-                {
+                if let Some(prefix_entry) = prefix_entry {
                     let retained_prefix_match = {
                         let caches = self.prefix_caches.borrow();
                         caches.states.lookup(scope_program).sparse().ok().and_then(|states| {
-                            states.retained_matches_for(node).map(|matches| {
-                                matches
-                                    .iter()
-                                    .any(|&matched| matched == self.programs.entry_id(program, entry_index as u32))
-                            })
+                            states
+                                .retained_matches_for(node)
+                                .map(|matches| matches.contains(&prefix_entry))
                         })
                     };
                     if let Some(matches) = retained_prefix_match {
@@ -1911,7 +1925,7 @@ impl StyleEngine {
                 match MatchEvaluator::new(&self.tree, self.facts.primary()).matches_entry_after_dispatch(
                     compiled,
                     entry,
-                    compiled.dispatch_key(entry),
+                    posting_key,
                     node,
                     &mut self.counters,
                 ) {
@@ -1926,10 +1940,11 @@ impl StyleEngine {
         }
         incidences.sort_unstable();
         incidences.dedup();
-        let mut selected = Vec::<RetainedSelectorIncidence>::new();
-        for incidence in incidences {
+        let mut selected_count = 0;
+        for index in 0..incidences.len() {
+            let incidence = incidences[index];
             let entry = &compiled.entries()[incidence.entry as usize];
-            let existing = selected
+            let existing = incidences[..selected_count]
                 .iter_mut()
                 .rev()
                 .take_while(|existing| existing.node == incidence.node)
@@ -1939,12 +1954,14 @@ impl StyleEngine {
                     *existing = incidence;
                 }
             } else {
-                selected.push(incidence);
+                incidences[selected_count] = incidence;
+                selected_count += 1;
             }
         }
-        selected.sort_unstable();
+        incidences.truncate(selected_count);
+        incidences.sort_unstable();
         self.retained_selector_incidences
-            .remember(program, selected, &mut self.memory)
+            .remember(program, incidences, &mut self.memory)
     }
 
     /// Read one selector entry's pre-transaction truth from the retained exact answer.
@@ -2009,7 +2026,7 @@ impl StyleEngine {
             MemoryCategory::RetainedSelectorIncidence => self.retained_selector_incidences.clear(),
             MemoryCategory::RetainedMatchAnswer => self.retained_match_answers.evict(&mut self.match_answers),
             MemoryCategory::PrefixTransitionCache => {
-                self.prefix_caches.borrow_mut().states.release();
+                self.prefix_caches.borrow_mut().states.release_transition_states();
             }
             MemoryCategory::PrefixAnswerCache => {
                 self.prefix_caches.borrow_mut().answers.release(&mut self.match_answers);
@@ -2085,6 +2102,8 @@ impl StyleEngine {
 
         let mut affected = Vec::new();
         let mut always_emit = false;
+        let mut has_non_selector_inputs = false;
+        let mut always_emit_nodes = Vec::new();
         let mut orders_shifted = false;
         let mut requires_full_match = false;
         let mut tree_mutation_rules_selected = false;
@@ -2118,19 +2137,63 @@ impl StyleEngine {
             }
             let join_deltas = transaction.program_joins_for(input.key);
             if !join_deltas.is_empty() {
-                if matches!(
-                    input.key,
-                    InputKey::SheetAttachment(_, tree_scope)
-                        | InputKey::CascadeTopology(
-                            TopologyAxis::LayerOrder(tree_scope) | TopologyAxis::SheetOrder(tree_scope)
-                        ) if tree_scope != TreeScopeID::DOCUMENT
-                ) {
+                if input
+                    .key
+                    .program_tree_scope()
+                    .is_some_and(|scope| scope != TreeScopeID::DOCUMENT)
+                {
                     return None;
                 }
                 for delta in join_deltas {
+                    let version = self.program.rule_version(delta.rule);
+                    if version.kind == RuleKind::Property {
+                        if let Some(name) = version.declared_name {
+                            match self.custom_property_registration_consumers(name) {
+                                Ok(consumers) => always_emit_nodes.extend(consumers),
+                                Err(_) => {
+                                    always_emit = true;
+                                    has_non_selector_inputs = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if version.kind == RuleKind::Keyframes {
+                        if let Some(name) = version.declared_name {
+                            match self.facts.postings().lookup(DependencyPostingKey::AnimationName(name)) {
+                                Lookup::Known(posting) => always_emit_nodes.extend(posting.candidates()),
+                                Lookup::KnownAbsent => {}
+                                Lookup::Missing(_) => {
+                                    always_emit = true;
+                                    has_non_selector_inputs = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if version.kind == RuleKind::Function {
+                        match self.facts.postings().lookup(DependencyPostingKey::AnyCustomFunction) {
+                            Lookup::Known(posting) => always_emit_nodes.extend(posting.candidates()),
+                            Lookup::KnownAbsent => {}
+                            Lookup::Missing(_) => {
+                                always_emit = true;
+                                has_non_selector_inputs = true;
+                            }
+                        }
+                        continue;
+                    }
                     match delta.kind {
-                        ProgramJoinDeltaKind::Declarations => always_emit = true,
+                        ProgramJoinDeltaKind::Declarations => {
+                            always_emit = true;
+                            has_non_selector_inputs |= !version.kind.matches_elements();
+                        }
                         ProgramJoinDeltaKind::Priority => {
+                            // NB: Named rules have no retained selector matches, but changing
+                            //     their priority can still change the definition consumers use.
+                            if !version.kind.matches_elements() {
+                                always_emit = true;
+                                has_non_selector_inputs = true;
+                            }
                             orders_shifted = true;
                             cascade_update_rules.push(delta.rule);
                             cascade_update_properties.extend(
@@ -2190,6 +2253,7 @@ impl StyleEngine {
                                 && delta.after_program.is_none()
                             {
                                 always_emit = true;
+                                has_non_selector_inputs = true;
                             }
                         }
                     }
@@ -2197,6 +2261,7 @@ impl StyleEngine {
                 continue;
             }
             let keys = match input.key {
+                InputKey::CascadeTopology(TopologyAxis::SheetOrder(_) | TopologyAxis::LayerOrder(_)) => continue,
                 InputKey::LocalFeature(_, LocalFeatureKey::PartExposure) => return None,
                 InputKey::TreeRelations(_) | InputKey::LocalFeature(_, LocalFeatureKey::ArrivingFacts) => {
                     // A subtree arriving, leaving, or moving cannot change a resident answer
@@ -2236,16 +2301,18 @@ impl StyleEngine {
                     keys
                 }
                 InputKey::LocalFeature(..) | InputKey::State(..) => routing_keys_for_input(input),
-                InputKey::ElementDeclaration(..) => {
-                    always_emit = true;
+                InputKey::ElementDeclaration(node, _) | InputKey::ElementStyleInput(node) => {
+                    always_emit_nodes.push(node);
                     continue;
                 }
-                InputKey::ElementStyleInput(..) => {
-                    always_emit = true;
-                    continue;
-                }
-                InputKey::CustomPropertyRegistration(..) => {
-                    always_emit = true;
+                InputKey::CustomPropertyRegistration(name) => {
+                    match self.custom_property_registration_consumers(name) {
+                        Ok(consumers) => always_emit_nodes.extend(consumers),
+                        Err(_) => {
+                            always_emit = true;
+                            has_non_selector_inputs = true;
+                        }
+                    }
                     continue;
                 }
                 _ => return None,
@@ -2273,24 +2340,26 @@ impl StyleEngine {
                     evaluate: true,
                 }),
         );
-        let removed_programs: Vec<SelectorProgramID> = affected
+        let mut removed_programs: Vec<SelectorProgramID> = affected
             .iter()
             .filter_map(|affected| (!affected.evaluate).then_some(affected.program))
             .collect();
-        for program in removed_programs {
+        if !removed_programs.is_empty() {
+            removed_programs.sort_unstable();
+            removed_programs.dedup();
             affected.extend(
                 self.program
                     .sheets_in_scope(TreeScopeID::DOCUMENT)
                     .iter()
                     .flat_map(|&sheet| self.program.rules_in_sheet(sheet))
                     .filter_map(|current_rule| {
-                        (self.program.rule_version(current_rule).selector_program == Some(program)).then_some(
-                            RetainedAnswerPatchSelectionRule {
-                                rule: current_rule,
-                                program,
-                                evaluate: true,
-                            },
-                        )
+                        let program = self.program.rule_version(current_rule).selector_program?;
+                        removed_programs.binary_search(&program).ok()?;
+                        Some(RetainedAnswerPatchSelectionRule {
+                            rule: current_rule,
+                            program,
+                            evaluate: true,
+                        })
                     }),
             );
         }
@@ -2318,6 +2387,8 @@ impl StyleEngine {
         Some(RetainedAnswerPatchSelection {
             affected,
             always_emit,
+            has_non_selector_inputs,
+            always_emit_nodes,
             orders_shifted,
             requires_full_match,
             custom_changed_rules,
@@ -2352,6 +2423,9 @@ impl StyleEngine {
         let mut custom_changed_rules = selection.custom_changed_rules;
         custom_changed_rules.sort_unstable();
         custom_changed_rules.dedup();
+        let mut always_emit_nodes = selection.always_emit_nodes;
+        always_emit_nodes.sort_unstable();
+        always_emit_nodes.dedup();
         RetainedAnswerPatch {
             rule_keys,
             scope_program,
@@ -2360,6 +2434,8 @@ impl StyleEngine {
             prefix_caches: Rc::clone(&self.prefix_caches),
             dispatch_workspace,
             always_emit: selection.always_emit,
+            has_non_selector_inputs: selection.has_non_selector_inputs,
+            always_emit_nodes,
             orders_shifted: selection.orders_shifted,
             requires_full_match: selection.requires_full_match,
             cascade_update_properties,
@@ -2457,6 +2533,8 @@ impl StyleEngine {
         // An edit to a matched rule's custom declarations moves no winner; the node reacts to it
         // all the same, since its environment is computed from those declarations.
         let emit = !delta.is_empty()
+            || patch.has_non_selector_inputs
+            || patch.always_emit_nodes.binary_search(&node).is_ok()
             || exact_answer.iter().any(|entry| {
                 entry.pseudo_element.is_none() && patch.custom_changed_rules.binary_search(&entry.rule).is_ok()
             });
@@ -2531,7 +2609,7 @@ impl StyleEngine {
                 let Some(winner) = self.winner_groups.winner_in_state(previous, declared.property) else {
                     return false;
                 };
-                if self.winner_groups.continuation(winner.key.continuation).is_some() {
+                if winner.key.continuation != CascadeContinuationID::default() {
                     return false;
                 }
                 match delta.change {
@@ -2671,6 +2749,11 @@ impl StyleEngine {
         old_cascade_input: MatchAnswerID,
         deltas: &[SelectorTruthDelta],
     ) -> Option<RetainedAnswerPatchOutcome> {
+        let orders_shifted = patch.orders_shifted_for(retained)
+            || (patch.orders_shifted
+                && deltas
+                    .iter()
+                    .any(|delta| patch.cascade_update_rules.binary_search(&delta.rule).is_ok()));
         if !patch.cascade_update_properties.is_empty() {
             if !deltas.is_empty() {
                 return None;
@@ -2681,10 +2764,10 @@ impl StyleEngine {
         }
         // Empty signed truth preserves the exact answer. Unless cascade order itself moved, its
         // compact identity is also unchanged, so stop without rebuilding either representation.
-        if deltas.is_empty() && !patch.orders_shifted {
+        if deltas.is_empty() && !orders_shifted {
             self.publish_cascade_input(node, old_cascade_input);
             self.counters.bump(Counter::RetainedMatchAnswerDeltaPatches);
-            let emit = patch.always_emit;
+            let emit = patch.always_emit_for(node);
             if !emit {
                 self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
             }
@@ -2700,12 +2783,13 @@ impl StyleEngine {
         // reduction, and the stop verdict are all node-independent for comparable document-scope
         // answers under one patch's fixed cascade orders. A stopping transition therefore runs
         // once per cohort; every further member is one column store.
-        let memo_key = (!patch.always_emit && !patch.orders_shifted && !self.node_has_element_declaration_input(node))
-            .then(|| Self::retained_answer_delta_memo_key(old_identity, old_cascade_input, deltas));
+        let memo_key =
+            (!patch.always_emit_for(node) && !orders_shifted && !self.node_has_element_declaration_input(node))
+                .then(|| Self::retained_answer_delta_memo_key(old_identity, old_cascade_input, deltas));
         if let Some(key) = &memo_key
             && let Some(entry) = patch.delta_memo.get(key)
             && Self::retained_answer_delta_memo_entry_matches(entry, deltas)
-            && let transition = entry.transition.clone()
+            && let transition = &entry.transition
             && self
                 .retained_match_answers
                 .set_interned_identity(node, &mut self.match_answers, transition.new_answer)
@@ -2714,10 +2798,6 @@ impl StyleEngine {
             let stopped = transition.new_cascade_input == old_cascade_input;
             if let Some((state, version)) = transition.winner_state {
                 let _ = self.winner_groups.set(node, state, version);
-                // The pseudo-element rows replay with the winner state, of the same version.
-                for &(pseudo, state) in transition.pseudo_winner_states.iter() {
-                    let _ = self.winner_groups.set_pseudo(node, pseudo, state, version);
-                }
             }
             // Pseudo-element rows are independent of the element's sparse winner row.
             for &(pseudo, state) in transition.pseudo_winner_states.iter() {
@@ -2751,12 +2831,12 @@ impl StyleEngine {
 
         let (answer, applied) = self.retained_answer_after_deltas(node, patch, retained, deltas)?;
 
-        if !patch.orders_shifted && self.retained_match_deltas_cannot_change_cascade(node, retained, deltas) {
+        if !orders_shifted && self.retained_match_deltas_cannot_change_cascade(node, retained, deltas) {
             self.remember_prepared_retained_match_answer(node, answer);
             self.publish_cascade_input(node, old_cascade_input);
             self.counters.bump(Counter::RetainedMatchAnswerDeltaPatches);
             self.counters.add(Counter::RetainedMatchAnswerDeltaEntries, applied);
-            if !patch.always_emit {
+            if !patch.always_emit_for(node) {
                 self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
             }
             if let Some(key) = memo_key
@@ -2786,7 +2866,7 @@ impl StyleEngine {
             }
             return Some(RetainedAnswerPatchOutcome {
                 identity_preserved: true,
-                emit: patch.always_emit,
+                emit: patch.always_emit_for(node),
                 incremental_cascade_answer: None,
             });
         }
@@ -2819,7 +2899,7 @@ impl StyleEngine {
         self.publish_cascade_input(node, new_cascade_input);
         self.counters.bump(Counter::RetainedMatchAnswerDeltaPatches);
         self.counters.add(Counter::RetainedMatchAnswerDeltaEntries, applied);
-        let emit = patch.always_emit || changed;
+        let emit = patch.always_emit_for(node) || changed || orders_shifted;
         if !emit {
             self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
         }
@@ -3025,7 +3105,7 @@ impl StyleEngine {
         });
         if let Some(keys) = narrowed_keys.as_deref() {
             self.counters.bump(Counter::RetainedMatchAnswerFilteredPatches);
-            if keys.is_empty() {
+            if keys.is_empty() && patch.cascade_update_properties.is_empty() && !patch.orders_shifted_for(&retained) {
                 if let Some(deltas) = mixed_deltas
                     && delta_base.is_some()
                 {
@@ -3041,12 +3121,12 @@ impl StyleEngine {
                 // Nothing this transaction affects reached the node through a rule-naming route.
                 self.publish_cascade_input(node, old_cascade_input);
                 self.counters.bump(Counter::RetainedMatchAnswerPatches);
-                if !patch.always_emit {
+                if !patch.always_emit_for(node) {
                     self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
                 }
                 return Some(RetainedAnswerPatchOutcome {
                     identity_preserved: true,
-                    emit: patch.always_emit,
+                    emit: patch.always_emit_for(node),
                     incremental_cascade_answer: None,
                 });
             }
@@ -3062,27 +3142,21 @@ impl StyleEngine {
         // Reuse the replacement allocation and append only old entries which survive into the
         // repaired answer. The compact retained slice is the old side for delta derivation below,
         // so no materialized old snapshot is needed.
-        // Both inputs are ordered by (rule, program), so count survivors with one merge walk.
+        // Both inputs are ordered by (rule, program), so find survivors with a merge walk.
         let mut affected_index = 0;
-        let unaffected_count = retained_base
-            .iter()
-            .filter(|entry| {
-                let key = (entry.rule, entry.program);
-                while affected_keys
-                    .get(affected_index)
-                    .is_some_and(|affected| *affected < key)
-                {
-                    affected_index += 1;
-                }
-                affected_keys.get(affected_index) != Some(&key)
-            })
-            .count();
-        let mut patched_answer = replacement;
-        patched_answer.reserve_exact(unaffected_count);
-        for &entry in retained_base {
-            if affected_keys.binary_search(&(entry.rule, entry.program)).is_ok() {
-                continue;
+        let unaffected = retained_base.iter().filter(move |entry| {
+            let key = (entry.rule, entry.program);
+            while affected_keys
+                .get(affected_index)
+                .is_some_and(|affected| *affected < key)
+            {
+                affected_index += 1;
             }
+            affected_keys.get(affected_index) != Some(&key)
+        });
+        let mut patched_answer = replacement;
+        patched_answer.reserve_exact(unaffected.clone().count());
+        for &entry in unaffected {
             let cascade_order = patch
                 .dispatch
                 .cascade_order_for_entry(entry.rule, entry.program, entry.entry)?;
@@ -3125,10 +3199,15 @@ impl StyleEngine {
                     .binary_search(&RetainedRuleMatch::from_rule_match(*entry))
                     .is_ok()
             });
-        if matches_retained_answer && !patch.orders_shifted {
+        let orders_shifted = patch.orders_shifted_for(&retained)
+            || (patch.orders_shifted
+                && patched_answer
+                    .iter()
+                    .any(|entry| patch.cascade_update_rules.binary_search(&entry.rule).is_ok()));
+        if matches_retained_answer && !orders_shifted {
             self.publish_cascade_input(node, old_cascade_input);
             self.counters.bump(Counter::RetainedMatchAnswerPatches);
-            let emit = patch.always_emit;
+            let emit = patch.always_emit_for(node);
             if !emit {
                 self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
             }
@@ -3149,12 +3228,12 @@ impl StyleEngine {
         }
         self.publish_cascade_input(node, new_cascade_input);
         self.counters.bump(Counter::RetainedMatchAnswerPatches);
-        let emit = patch.always_emit || changed;
+        let emit = patch.always_emit_for(node) || changed || orders_shifted;
         if !emit {
             self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
         }
         Some(RetainedAnswerPatchOutcome {
-            identity_preserved: !changed,
+            identity_preserved: !changed && !orders_shifted,
             emit,
             incremental_cascade_answer: None,
         })
@@ -3522,7 +3601,7 @@ impl StyleEngine {
                     self.counters.bump(Counter::TransitionProofWinnerGap);
                     return false;
                 };
-                if self.winner_groups.continuation(winner.key.continuation).is_some() {
+                if winner.key.continuation != CascadeContinuationID::default() {
                     self.counters.bump(Counter::TransitionProofOperatorOrContinuation);
                     return false;
                 }
@@ -3609,7 +3688,7 @@ impl StyleEngine {
             Lookup::Known((current_generation, current)) if current_generation == previous_generation => current,
             Lookup::Known(_) | Lookup::KnownAbsent | Lookup::Missing(_) => return false,
         };
-        self.winner_groups.semantic_delta(Some(previous), current).is_empty()
+        self.winner_groups.states_are_semantically_equal(previous, current)
     }
 
     /// Consume the complete current answer which the immediately preceding style plan retained.
@@ -3804,7 +3883,7 @@ impl StyleEngine {
                     match winner_groups.token_for(WinnerGroupKey::current_pseudo(node, pseudo, self.program.version()))
                     {
                         Lookup::Known((retained_generation, state)) if retained_generation == computed.0 => {
-                            winner_groups.semantic_delta(Some(computed.1), state).is_empty()
+                            winner_groups.states_are_semantically_equal(computed.1, state)
                         }
                         Lookup::Known(_) | Lookup::KnownAbsent | Lookup::Missing(_) => false,
                     }
@@ -3831,7 +3910,7 @@ impl StyleEngine {
                                 .map(|(_, state)| state)
                                 .is_some_and(|computed| {
                                     computed.0 == generation
-                                        && winner_groups.semantic_delta(Some(computed.1), state).is_empty()
+                                        && winner_groups.states_are_semantically_equal(computed.1, state)
                                 })
                         })
                 })
@@ -3879,11 +3958,11 @@ impl StyleEngine {
             .tree
             .shadow_root_of(node)
             .and_then(|shadow_root| self.scope_by_root.get(shadow_root).filter(|&inner| inner != scope));
-        let slotted_scopes: Vec<_> = self
+        let slotted_scopes: SmallVec<[TreeScopeID; 1]> = self
             .scopes_slotted_into(node)
             .filter(|&slotted| slotted != scope && Some(slotted) != inner_scope)
             .collect();
-        let part_scopes: Vec<_> = self
+        let part_scopes: SmallVec<[TreeScopeID; 1]> = self
             .part_exposure_scopes(node)
             .filter(|&exposed| exposed != scope && Some(exposed) != inner_scope && !slotted_scopes.contains(&exposed))
             .collect();
@@ -3991,7 +4070,7 @@ impl StyleEngine {
         // that tree names it, so that tree's rules are asked of it as well. A slot is itself a
         // slottable, so an element can be re-slotted through several trees, and each of them names
         // it: what stands in the flat tree at the end of the chain is the element, not the slots.
-        let slotted_scopes: Vec<TreeScopeID> = self
+        let slotted_scopes: SmallVec<[TreeScopeID; 1]> = self
             .scopes_slotted_into(node)
             .filter(|&slotted| slotted != scope && Some(slotted) != inner_scope)
             .collect();
@@ -3999,7 +4078,7 @@ impl StyleEngine {
         // scope names it. `exportparts` forwards a name outwards one host at a time, and a rule in
         // every tree along that chain can address the element - under the name that level exposes it
         // by - so each of those scopes is asked, not only the outermost one the exposure names.
-        let part_scopes: Vec<TreeScopeID> = self
+        let part_scopes: SmallVec<[TreeScopeID; 1]> = self
             .part_exposure_scopes(node)
             .filter(|&exposed| exposed != scope && Some(exposed) != inner_scope && !slotted_scopes.contains(&exposed))
             .collect();
@@ -4067,7 +4146,7 @@ impl StyleEngine {
             let all = match (result, deferred_prefix_matches) {
                 (Ok(()), Some(prefix_matches)) => {
                     if retained_match_answer_is_exact {
-                        retained_selector_truth = matches.prepared_selector_truth();
+                        retained_selector_truth = matches.take_prepared_selector_truth(&mut self.memory);
                     }
                     let (scope_program, dispatch) = self.ranked_scope_program(scope);
                     let non_prefix_matches = self.match_answers.intern(matches.as_slice());
@@ -4403,7 +4482,7 @@ impl StyleEngine {
                 (Ok(()), None) => {
                     if retained_match_answer_is_exact {
                         retained_match_answer = Some(prepare_retained_match_answer(matches.as_slice().iter().copied()));
-                        retained_selector_truth = matches.prepared_selector_truth();
+                        retained_selector_truth = matches.take_prepared_selector_truth(&mut self.memory);
                     }
                     if compact_for_cascade {
                         self.compact_matches_for_cascade_with_scratch(
@@ -4585,11 +4664,8 @@ impl StyleEngine {
                     if retained_match_answer_is_exact {
                         self.order_matches_in_cascade(matches.as_mut_vec(), can_have_scope_duplicates);
                         let retained = prepare_retained_match_answer(matches.as_slice().iter().copied());
-                        self.remember_prepared_retained_match_answer_with_truth(
-                            node,
-                            retained,
-                            matches.prepared_selector_truth(),
-                        );
+                        let truth = matches.take_prepared_selector_truth(&mut self.memory);
+                        self.remember_prepared_retained_match_answer_with_truth(node, retained, truth);
                     } else if compact_for_cascade {
                         // A cascade-only shortcut can answer the current style without proving the
                         // complete selector answer. Do not leave an older exact answer resident.

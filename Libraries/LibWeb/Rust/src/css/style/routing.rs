@@ -100,7 +100,6 @@ impl StyleEngine {
         sequences: &mut SequenceChanges,
         regions: &mut ImpactRegions,
     ) {
-        let routing = Rc::clone(&self.routing);
         // A declaration sourced from the element changes what wins on that element and nothing
         // else. There is no selector to transpose: the region is the element itself.
         if let InputKey::ElementDeclaration(node, _) = input.key {
@@ -160,6 +159,10 @@ impl StyleEngine {
             }
             _ => routing_keys_for_input(input),
         };
+        if keys.is_empty() {
+            return;
+        }
+        let routing = Rc::clone(&self.routing);
         let route_liveness = routing.route_liveness(&self.program, &self.programs);
         for key in keys {
             // A maintained relation already accounts for these selectors' complete changes.
@@ -2831,14 +2834,19 @@ impl StyleEngine {
             caches.states.mark_full();
             caches.states.mark_current();
             caches.states.settle_memory(&mut self.memory);
+            // The relation answers for the document tree alone. A route reaching into another tree
+            // scope keeps those regions for its own program to route.
             let mut released_route_bytes = 0;
             pending.retain(|key, routed_regions| {
-                if eligible.binary_search(&key).is_ok() {
-                    released_route_bytes += (routed_regions.capacity() * size_of::<ImpactRegion>()) as u64;
-                    false
-                } else {
-                    true
+                if eligible.binary_search(&key).is_err() {
+                    return true;
                 }
+                routed_regions.retain(|region| region.lies_outside_document_scope(&self.tree));
+                if !routed_regions.is_empty() {
+                    return true;
+                }
+                released_route_bytes += (routed_regions.capacity() * size_of::<ImpactRegion>()) as u64;
+                false
             });
             self.memory.release(MemoryCategory::BatchScratch, released_route_bytes);
             return PrefixConvergenceOutcome {
@@ -4069,18 +4077,69 @@ impl StyleEngine {
                 self.program.rules_in_sheet(sheet),
                 ProgramJoinDeltaKind::ActiveRuleMatch,
             ),
-            InputKey::CascadeTopology(TopologyAxis::SheetOrder(tree_scope)) => (
-                self.program
-                    .sheets_in_scope(tree_scope)
-                    .iter()
-                    .flat_map(|&sheet| self.program.rules_in_sheet(sheet))
-                    .collect(),
-                ProgramJoinDeltaKind::Priority,
-            ),
-            InputKey::CascadeTopology(TopologyAxis::LayerOrder(tree_scope)) => (
-                self.program.rules_in_a_layer_in_scope(tree_scope),
-                ProgramJoinDeltaKind::Priority,
-            ),
+            InputKey::CascadeTopology(TopologyAxis::SheetOrder(tree_scope)) => {
+                let sheets = self
+                    .program_staging
+                    .sheets_in_scope
+                    .pairs()
+                    .find(|(scope, _, _)| *scope == tree_scope)
+                    .map_or_else(
+                        || self.program.sheets_in_scope(tree_scope).to_vec(),
+                        |(_, before, after)| {
+                            let mut positions_by_origin = HashMap::default();
+                            let before_positions: HashMap<_, _> = before
+                                .iter()
+                                .map(|&sheet| {
+                                    let position = positions_by_origin
+                                        .entry(self.program.sheet_origin(sheet) as u8)
+                                        .or_insert(0u64);
+                                    let entry = (sheet, *position);
+                                    *position += 1;
+                                    entry
+                                })
+                                .collect();
+                            positions_by_origin.clear();
+                            after
+                                .iter()
+                                .filter_map(|&sheet| {
+                                    let position = positions_by_origin
+                                        .entry(self.program.sheet_origin(sheet) as u8)
+                                        .or_insert(0u64);
+                                    let changed = before_positions
+                                        .get(&sheet)
+                                        .is_some_and(|previous| previous != position);
+                                    *position += 1;
+                                    changed.then_some(sheet)
+                                })
+                                .collect()
+                        },
+                    );
+                (
+                    sheets
+                        .into_iter()
+                        .flat_map(|sheet| self.program.rules_in_sheet(sheet))
+                        .collect(),
+                    ProgramJoinDeltaKind::Priority,
+                )
+            }
+            InputKey::CascadeTopology(TopologyAxis::LayerOrder(tree_scope)) => {
+                let layer_order = self
+                    .program_staging
+                    .layer_orders
+                    .pairs()
+                    .find(|(scope, _, _)| *scope == tree_scope);
+                (
+                    self.program
+                        .rules_in_a_layer_in_scope(tree_scope)
+                        .into_iter()
+                        .filter(|&rule| {
+                            let layer = self.program.rule_version(rule).layer;
+                            layer_order.is_none_or(|(_, before, after)| before.get(&layer) != after.get(&layer))
+                        })
+                        .collect(),
+                    ProgramJoinDeltaKind::Priority,
+                )
+            }
             _ => return,
         };
 
@@ -4129,21 +4188,26 @@ impl StyleEngine {
 
     /// Route a custom-property registration to the elements whose cascade declares its name and
     /// those whose substitution dependencies could not be named precisely.
+    pub(super) fn custom_property_registration_consumers(
+        &self,
+        name: StyleAtomID,
+    ) -> Result<Vec<StyleNodeID>, PostingKey> {
+        let mut nodes = self.facts.custom_property_candidates(name)?;
+        match self.facts.postings().lookup(DependencyPostingKey::AnyCustomProperty) {
+            Lookup::Known(posting) => posting.append_candidates_to(&mut nodes),
+            Lookup::KnownAbsent => {}
+            Lookup::Missing(gap) => return Err(gap),
+        }
+        Ok(nodes)
+    }
+
     fn route_custom_property_registration(
         &mut self,
         name: StyleAtomID,
         scopes: Option<&[TreeScopeID]>,
         regions: &mut ImpactRegions,
     ) {
-        let consumers = self.facts.custom_property_candidates(name).and_then(|mut nodes| {
-            match self.facts.postings().lookup(DependencyPostingKey::AnyCustomProperty) {
-                Lookup::Known(posting) => nodes.extend(posting.candidates()),
-                Lookup::KnownAbsent => {}
-                Lookup::Missing(gap) => return Err(gap),
-            }
-            Ok(nodes)
-        });
-        let Ok(mut consumers) = consumers else {
+        let Ok(mut consumers) = self.custom_property_registration_consumers(name) else {
             if let Some(scopes) = scopes
                 && let Some(reachable) = self.regions_reachable_for_named_consumers(scopes)
             {
@@ -4391,9 +4455,7 @@ impl StyleEngine {
                             .all(|entry| compiled.dispatch_key(entry).has_selector_posting()))
                     .then(|| {
                         self.winner_groups.winning_nodes(rule).map(|nodes| {
-                            nodes
-                                .filter(|&node| scopes.binary_search(&self.tree.tree_scope(node)).is_ok())
-                                .collect::<Vec<_>>()
+                            nodes.filter(|&node| scopes.binary_search(&self.tree.tree_scope(node)).is_ok())
                         })
                     })
                     .flatten();

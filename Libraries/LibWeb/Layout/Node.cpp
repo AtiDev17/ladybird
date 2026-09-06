@@ -280,6 +280,13 @@ NodeWithStyle const* Node::find_inline_containing_block(Box const& containing_bl
     return nullptr;
 }
 
+RustFFI::NodeSlotId Node::inline_containing_block_lookup_for_arena(void* node_shell, void* containing_block_shell)
+{
+    auto const& node = *static_cast<Node const*>(node_shell);
+    auto const& containing_block = *static_cast<Box const*>(containing_block_shell);
+    return slot_id(node.find_inline_containing_block(containing_block));
+}
+
 GC::Ptr<HTML::LocalNavigable> Node::navigable() const
 {
     return document().navigable();
@@ -868,6 +875,21 @@ void NodeWithStyle::set_overflow(CSS::Overflow overflow_x, CSS::Overflow overflo
     modify_computed_values([&](auto& values) {
         values.set_overflow_x(overflow_x);
         values.set_overflow_y(overflow_y);
+    });
+}
+
+void NodeWithStyle::set_writing_mode_and_direction(CSS::WritingMode writing_mode, CSS::Direction direction)
+{
+    modify_computed_values([&](auto& values) {
+        values.set_writing_mode(writing_mode);
+        values.set_direction(direction);
+    });
+}
+
+void NodeWithStyle::set_scrollbar_width(CSS::ScrollbarWidth scrollbar_width)
+{
+    modify_computed_values([&](auto& values) {
+        values.set_scrollbar_width(scrollbar_width);
     });
 }
 

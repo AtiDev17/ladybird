@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use smallvec::SmallVec;
+
 use super::*;
 
 impl StyleEngine {
@@ -44,6 +46,7 @@ impl StyleEngine {
             counters: Counters::new(),
             computed_record_verification_counters: None,
             computed_record_verification_pins: Vec::new(),
+            deferred_pseudo_element: None,
             tree,
             program: StyleSheetProgram::new(),
             journal: NormalizationJournal::new(),
@@ -1237,8 +1240,8 @@ impl StyleEngine {
     /// A fact is in the store by the time routing runs, so this is what the individual inputs would
     /// have published between them - a class each, the tag, the id, each attribute name.
     #[must_use]
-    pub(super) fn routing_keys_of_arriving_facts(&self, node: StyleNodeID) -> Vec<RoutingKey> {
-        let mut keys = Vec::new();
+    pub(super) fn routing_keys_of_arriving_facts(&self, node: StyleNodeID) -> SmallVec<[RoutingKey; 4]> {
+        let mut keys = SmallVec::new();
 
         let tag = self.facts.tag_of_node(node);
         if !tag.is_none() {
@@ -1397,7 +1400,6 @@ impl StyleEngine {
             return;
         }
         let staged_rows = self.tree_staging.dirty_rows();
-        let staged_first_children = self.tree_staging.dirty_first_children();
         // Depth changes only for arrivals and for nodes whose parent differs from the resident one,
         // read before installation: the frozen before-side parent misses a move that a mid-transaction
         // application already installed, and a sibling-only row must not count as a moved parent.
@@ -1425,8 +1427,8 @@ impl StyleEngine {
             self.tree
                 .set_assigned_slot(node, relations.assigned_slot, &mut self.memory);
         }
-        for (parent, _, child) in &staged_first_children {
-            self.tree.set_first_element_child(*parent, *child);
+        for (parent, _, child) in self.tree_staging.dirty_first_children() {
+            self.tree.set_first_element_child(parent, child);
         }
         for &(node, _, _) in &staged_rows {
             if !depth_recompute_nodes.contains(&node) {
@@ -2084,11 +2086,21 @@ impl StyleEngine {
         let matches = retained
             .iter()
             .copied()
+            .filter(|entry| {
+                !self.program.declarations_are_complete_for(entry.rule)
+                    || self
+                        .program
+                        .declared_properties_of(entry.rule)
+                        .iter()
+                        .any(|declared| properties.binary_search(&declared.property).is_ok())
+            })
             .map(|entry| entry.materialize(node, &self.programs, 0))
             .collect::<Option<Vec<_>>>();
         let Some(matches) = matches else {
             return;
         };
+        self.counters
+            .add(Counter::ElementDeclarationRepairMatches, matches.len() as u64);
         let Some(updates) = self.exact_cascade_winner_updates_for_properties(node, &matches, None, properties) else {
             return;
         };

@@ -282,8 +282,10 @@ impl<'a> SelectorCompiler<'a> {
         // enclosing scope is a constraint of its own. Within one scope the roots are alternatives.
         // An empty level list means one scope holding everything, which is what a caller with a
         // single `@scope` passes.
-        let levels: Vec<(usize, usize, usize, usize)> = if scope_levels.is_empty() {
-            vec![(0, scope_roots.len(), 0, scope_limits.len())]
+        let single_level = [(0, scope_roots.len(), 0, scope_limits.len())];
+        let nested_levels;
+        let levels: &[(usize, usize, usize, usize)] = if scope_levels.is_empty() {
+            &single_level
         } else {
             let mut spans = Vec::with_capacity(scope_levels.len());
             let mut root_start = 0usize;
@@ -295,7 +297,8 @@ impl<'a> SelectorCompiler<'a> {
                 root_start = root_end;
                 limit_start = limit_end;
             }
-            spans
+            nested_levels = spans;
+            &nested_levels
         };
 
         // https://drafts.csswg.org/css-cascade-6/#scoped-rules
@@ -312,11 +315,13 @@ impl<'a> SelectorCompiler<'a> {
 
         let mut inner = self.builder.entry_root(entry.entry);
         let mut innermost_root = None;
+        let mut scope_selectors = Vec::new();
         for (level, &(root_start, root_end, limit_start, limit_end)) in levels.iter().enumerate().rev() {
             let innermost = level + 1 == levels.len();
-            let mut roots = Vec::with_capacity(root_end - root_start + 1);
+            scope_selectors.clear();
+            scope_selectors.reserve(root_end - root_start + 1);
             if let Some(implicit) = implicit_root_of(level) {
-                roots.push(self.push_implicit_scope_root(implicit));
+                scope_selectors.push(self.push_implicit_scope_root(implicit));
             }
             for root_selector in &scope_roots[root_start..root_end] {
                 let compounds = &root_selector.compound_selectors;
@@ -328,21 +333,22 @@ impl<'a> SelectorCompiler<'a> {
                 // the scope enclosing it - which is bound while this level's candidates are tested.
                 // The outermost level has none unless this compile is itself inside a scope.
                 let bound = std::mem::replace(&mut self.scope_root_is_bound, level > 0 || outer_bound);
-                roots.push(self.compile_chain(compounds, compounds.len() - 1, &mut marker));
+                scope_selectors.push(self.compile_chain(compounds, compounds.len() - 1, &mut marker));
                 self.scope_root_is_bound = bound;
             }
             // An explicit `<scope-start>` whose selectors all failed parent substitution matches
             // no roots. An omitted start is represented by an implicit root above.
-            if roots.is_empty() {
+            if scope_selectors.is_empty() {
                 marker.get_or_insert(CompilationMarker::KnownNeverMatches(CompilationMarkerReason::Malformed));
                 inner = self.builder.push_never();
                 break;
             }
-            let root = self.builder.push_any_of(&roots);
+            let root = self.builder.push_any_of(&scope_selectors);
 
             // `:scope` inside a `<scope-end>` names the root of the scope that end belongs to,
             // which is this level's own.
-            let mut limits = Vec::with_capacity(limit_end - limit_start);
+            scope_selectors.clear();
+            scope_selectors.reserve(limit_end - limit_start);
             let bound = std::mem::replace(&mut self.scope_root_is_bound, true);
             for limit_selector in &scope_limits[limit_start..limit_end] {
                 let compounds = &limit_selector.compound_selectors;
@@ -350,10 +356,10 @@ impl<'a> SelectorCompiler<'a> {
                     marker.get_or_insert(CompilationMarker::KnownNeverMatches(CompilationMarkerReason::Malformed));
                     continue;
                 }
-                limits.push(self.compile_chain(compounds, compounds.len() - 1, &mut marker));
+                scope_selectors.push(self.compile_chain(compounds, compounds.len() - 1, &mut marker));
             }
             self.scope_root_is_bound = bound;
-            let limit = (!limits.is_empty()).then(|| self.builder.push_any_of(&limits));
+            let limit = (!scope_selectors.is_empty()).then(|| self.builder.push_any_of(&scope_selectors));
 
             // A scoped selector carries an implied `:scope ` prefix unless it names `:scope`, so
             // the subject is a strict descendant of the innermost root. An enclosing scope is
@@ -646,23 +652,21 @@ impl<'a> SelectorCompiler<'a> {
             };
             // The names go under the host op rather than beside it, so that one level of
             // `exportparts` forwarding has to answer for both halves at once.
-            let names: Vec<SelectorNodeID> = part
-                .identifier_identities
-                .iter()
-                .map(|identity| {
-                    let atom = (self.intern)(identity.raw(), None);
-                    self.builder.push(SelectorOp::Part(atom))
-                })
-                .collect();
-            if names.is_empty() {
+            operands.clear();
+            for identity in &part.identifier_identities {
+                let atom = (self.intern)(identity.raw(), None);
+                operands.push(self.builder.push(SelectorOp::Part(atom)));
+            }
+            if operands.is_empty() {
                 marker.get_or_insert(CompilationMarker::KnownNeverMatches(
                     CompilationMarkerReason::PseudoElement,
                 ));
             }
-            let parts = self.builder.push_compound(&names);
-            let mut exposed = vec![self.builder.push(SelectorOp::ExposedToHost { host, parts })];
-            exposed.extend(on_the_part);
-            return self.builder.push_compound(&exposed);
+            let parts = self.builder.push_compound(&operands);
+            operands.clear();
+            operands.push(self.builder.push(SelectorOp::ExposedToHost { host, parts }));
+            operands.extend(on_the_part);
+            return self.builder.push_compound(&operands);
         }
 
         if operands.is_empty() {
@@ -966,22 +970,16 @@ impl<'a> SelectorCompiler<'a> {
                 // Both are forgiving, so an argument list whose every selector is invalid parses to
                 // an empty one - and an empty list matches nothing. Compiling it to no constraint
                 // left the compound matching every element instead.
-                let branches = self.compile_argument_list(pseudo_class, marker);
-                if branches.is_empty() {
+                let Some(any_of) = self.compile_argument_list(pseudo_class, marker) else {
                     return Some(self.builder.push_never());
-                }
-                let any_of = self.builder.push_any_of(&branches);
+                };
                 if pseudo_class.pseudo_class == Pc::Where {
                     return Some(self.builder.push(SelectorOp::Where(any_of)));
                 }
                 Some(any_of)
             }
             Pc::Not => {
-                let branches = self.compile_argument_list(pseudo_class, marker);
-                if branches.is_empty() {
-                    return None;
-                }
-                let any_of = self.builder.push_any_of(&branches);
+                let any_of = self.compile_argument_list(pseudo_class, marker)?;
                 Some(self.builder.push(SelectorOp::Not(any_of)))
             }
             Pc::Has => self.compile_has(pseudo_class, marker),
@@ -1044,12 +1042,9 @@ impl<'a> SelectorCompiler<'a> {
 
             // Shadow encapsulation. `:host` with an argument constrains the host itself.
             Pc::Host => {
-                let branches = self.compile_argument_list(pseudo_class, marker);
-                let inner = if branches.is_empty() {
-                    self.builder.push_feature(FeatureTest::AnyElement)
-                } else {
-                    self.builder.push_any_of(&branches)
-                };
+                let inner = self
+                    .compile_argument_list(pseudo_class, marker)
+                    .unwrap_or_else(|| self.builder.push_feature(FeatureTest::AnyElement));
                 Some(self.builder.push(SelectorOp::Host(inner)))
             }
 
@@ -1087,12 +1082,9 @@ impl<'a> SelectorCompiler<'a> {
                 match pseudo_class.languages.is_empty() {
                     true => Some(self.builder.push_never()),
                     false => {
-                        let ranges: Vec<&[u16]> = pseudo_class
-                            .languages
-                            .iter()
-                            .map(|range| range.value.as_ref())
-                            .collect();
-                        let (first, count) = self.builder.push_language_ranges(&ranges);
+                        let (first, count) = self
+                            .builder
+                            .push_language_ranges(pseudo_class.languages.iter().map(|range| &range.value));
                         Some(self.builder.push(SelectorOp::Language { first, count }))
                     }
                 }
@@ -1206,27 +1198,33 @@ impl<'a> SelectorCompiler<'a> {
         &mut self,
         pseudo_class: &PseudoClassSelector,
         marker: &mut Option<CompilationMarker>,
-    ) -> Vec<SelectorNodeID> {
+    ) -> Option<SelectorNodeID> {
+        // A branch that targets a pseudo-element cannot match the originating element, so it
+        // contributes nothing to the disjunction. Compiling it anyway would leave a compound
+        // with no feature left in it, and a disjunction with one such branch distinguishes
+        // nothing at all: `:is(button, ::file-selector-button):hover` would then be reachable
+        // from a hover on any element whatsoever.
+        let mut arguments = pseudo_class
+            .argument_selector_list
+            .iter()
+            .filter(|argument| !argument.compound_selectors.is_empty() && argument.target_pseudo_element.is_none());
+        let first = arguments.next()?;
+        let compounds = &first.compound_selectors;
+        let subject_index = compounds.len() - 1;
+        let subject = &raw const compounds[subject_index];
+        let first = self.compile_chain_with_subject(compounds, subject_index, marker, subject);
+        let Some(second) = arguments.next() else {
+            return Some(first);
+        };
         let mut branches = Vec::with_capacity(pseudo_class.argument_selector_list.len());
-        for argument in &pseudo_class.argument_selector_list {
+        branches.push(first);
+        for argument in std::iter::once(second).chain(arguments) {
             let compounds = &argument.compound_selectors;
-            if compounds.is_empty() {
-                continue;
-            }
-            // A branch that targets a pseudo-element cannot match the originating element, so it
-            // contributes nothing to the disjunction. Compiling it anyway would leave a compound
-            // with no feature left in it, and a disjunction with one such branch distinguishes
-            // nothing at all: `:is(button, ::file-selector-button):hover` would then be reachable
-            // from a hover on any element whatsoever.
-            if argument.target_pseudo_element.is_some() {
-                continue;
-            }
             let subject_index = compounds.len() - 1;
             let subject = &raw const compounds[subject_index];
-            let branch = self.compile_chain_with_subject(compounds, subject_index, marker, subject);
-            branches.push(branch);
+            branches.push(self.compile_chain_with_subject(compounds, subject_index, marker, subject));
         }
-        branches
+        Some(self.builder.push_any_of(&branches))
     }
 
     fn compile_nth_of(
@@ -1239,11 +1237,10 @@ impl<'a> SelectorCompiler<'a> {
         }
         // An `of` list whose every selector names nothing counts an empty sequence, which is not
         // the same as counting every sibling - which is what leaving the filter out would do.
-        let branches = self.compile_argument_list(pseudo_class, marker);
-        if branches.is_empty() {
-            return Some(self.builder.push_never());
-        }
-        Some(self.builder.push_any_of(&branches))
+        Some(
+            self.compile_argument_list(pseudo_class, marker)
+                .unwrap_or_else(|| self.builder.push_never()),
+        )
     }
 
     /// `:has()` compiles to a relative query per argument. A selector list holds when any one of its
@@ -1259,14 +1256,15 @@ impl<'a> SelectorCompiler<'a> {
             return Some(self.builder.push_never());
         }
 
+        if let [argument] = pseudo_class.argument_selector_list.as_ref() {
+            return self.compile_has_argument(argument, marker);
+        }
+
         let mut alternatives = Vec::with_capacity(pseudo_class.argument_selector_list.len());
         for argument in &pseudo_class.argument_selector_list {
             // An alternative that cannot be compiled cannot be dropped: the query holds when any one
             // of them does, so leaving one out would answer a narrower question than the rule asks.
             alternatives.push(self.compile_has_argument(argument, marker)?);
-        }
-        if alternatives.len() == 1 {
-            return Some(alternatives[0]);
         }
         Some(self.builder.push_any_of(&alternatives))
     }

@@ -46,7 +46,7 @@ pub(super) struct CascadedCustomProperty {
 pub(super) struct EnvironmentInputs {
     pub(super) parent: u64,
     pub(super) registration_generation: u64,
-    pub(super) cascaded: Vec<CascadedCustomProperty>,
+    pub(super) cascaded: Box<[CascadedCustomProperty]>,
 }
 
 /// An environment the engine resolved: its store, and the environment it was resolved over.
@@ -59,7 +59,7 @@ struct EngineEnvironment {
 /// values alive prevents later declarations from being allocated at the same addresses.
 struct MemoizedEnvironment {
     identity: u64,
-    written_values: Vec<RetainedStyleValueData>,
+    written_values: Box<[RetainedStyleValueData]>,
 }
 
 /// One substituted value and the written value whose identity names it. Keeping the written value
@@ -102,7 +102,7 @@ impl Drop for RetainedCustomPropertyStore {
 /// by the fly string, and a `var()` reference names one by its text.
 pub(super) struct CustomPropertyName {
     pub(super) raw: RetainedUtf16FlyString,
-    pub(super) text: Vec<u16>,
+    pub(super) text: Box<[u16]>,
 }
 
 #[derive(Default)]
@@ -135,8 +135,8 @@ impl CustomPropertyEnvironments {
         let Entry::Vacant(entry) = self.names.entry(name) else {
             return false;
         };
-        let text = text.to_vec();
-        self.nested_capacity_bytes += (text.capacity() * size_of::<u16>()) as u64;
+        let text: Box<[u16]> = text.into();
+        self.nested_capacity_bytes += size_of_val(text.as_ref()) as u64;
         entry.insert(CustomPropertyName {
             raw: unsafe { RetainedUtf16FlyString::from_borrowed_raw(raw) },
             text,
@@ -152,7 +152,7 @@ impl CustomPropertyEnvironments {
     pub(super) fn forget_names(&mut self, names: &[StyleAtomID]) {
         for name in names {
             if let Some(name) = self.names.remove(name) {
-                self.nested_capacity_bytes -= (name.text.capacity() * size_of::<u16>()) as u64;
+                self.nested_capacity_bytes -= size_of_val(name.text.as_ref()) as u64;
             }
         }
     }
@@ -206,19 +206,16 @@ impl CustomPropertyEnvironments {
     ) {
         let environment = MemoizedEnvironment {
             identity,
-            written_values,
+            written_values: written_values.into_boxed_slice(),
         };
-        self.nested_capacity_bytes +=
-            (environment.written_values.capacity() * size_of::<RetainedStyleValueData>()) as u64;
+        self.nested_capacity_bytes += size_of_val(environment.written_values.as_ref()) as u64;
         match self.memo.entry(inputs) {
             Entry::Occupied(mut entry) => {
-                self.nested_capacity_bytes -=
-                    (entry.get().written_values.capacity() * size_of::<RetainedStyleValueData>()) as u64;
+                self.nested_capacity_bytes -= size_of_val(entry.get().written_values.as_ref()) as u64;
                 entry.insert(environment);
             }
             Entry::Vacant(entry) => {
-                self.nested_capacity_bytes +=
-                    (entry.key().cascaded.capacity() * size_of::<CascadedCustomProperty>()) as u64;
+                self.nested_capacity_bytes += size_of_val(entry.key().cascaded.as_ref()) as u64;
                 entry.insert(environment);
             }
         }
@@ -282,9 +279,8 @@ impl CustomPropertyEnvironments {
         self.memo.retain(|inputs, environment| {
             let retain = is_live(environment.identity) && (inputs.parent == 0 || is_live(inputs.parent));
             if !retain {
-                self.nested_capacity_bytes -= (inputs.cascaded.capacity() * size_of::<CascadedCustomProperty>()
-                    + environment.written_values.capacity() * size_of::<RetainedStyleValueData>())
-                    as u64;
+                self.nested_capacity_bytes -=
+                    (size_of_val(inputs.cascaded.as_ref()) + size_of_val(environment.written_values.as_ref())) as u64;
             }
             retain
         });
@@ -310,14 +306,13 @@ mod tests {
         let expected = environments
             .names
             .values()
-            .map(|name| name.text.capacity() * size_of::<u16>())
+            .map(|name| size_of_val(name.text.as_ref()))
             .sum::<usize>()
             + environments
                 .memo
                 .iter()
                 .map(|(inputs, environment)| {
-                    inputs.cascaded.capacity() * size_of::<CascadedCustomProperty>()
-                        + environment.written_values.capacity() * size_of::<RetainedStyleValueData>()
+                    size_of_val(inputs.cascaded.as_ref()) + size_of_val(environment.written_values.as_ref())
                 })
                 .sum::<usize>();
         assert_eq!(environments.nested_capacity_bytes, expected as u64);
@@ -332,15 +327,19 @@ mod tests {
             assert!(!environments.note_name(StyleAtomID(1), 0, &[45, 45, 120]));
         }
         assert_nested_capacity(&environments);
-        let inputs = |capacity| EnvironmentInputs {
+        let inputs = || EnvironmentInputs {
             parent: 0,
             registration_generation: 1,
-            cascaded: Vec::with_capacity(capacity),
+            cascaded: Box::new([CascadedCustomProperty {
+                name: StyleAtomID(1),
+                important: false,
+                written_value: 0,
+            }]),
         };
-        environments.remember(inputs(3), 1, Vec::with_capacity(2));
+        environments.remember(inputs(), 1, Vec::with_capacity(2));
         assert_nested_capacity(&environments);
         // Equal keys retain the original key's allocation when replacing the value.
-        environments.remember(inputs(7), 2, Vec::with_capacity(5));
+        environments.remember(inputs(), 2, Vec::with_capacity(5));
         assert_nested_capacity(&environments);
         environments.forget_names(&[StyleAtomID(1), StyleAtomID(1)]);
         assert_nested_capacity(&environments);

@@ -45,6 +45,7 @@ impl StyleEngine {
                 .computed_group_sets
                 .inherited_groups_for_shared_style(parent_record)?,
             environment,
+            font_environment_generation: self.document_style_computation_inputs?.font_environment_generation,
             shape,
         })
     }
@@ -93,6 +94,8 @@ impl StyleEngine {
     ) -> Option<u64> {
         let context = self.computed_group_sets.take_shared_computation_context(node)?;
         if context.key.environment != environment
+            || context.key.font_environment_generation
+                != self.document_style_computation_inputs?.font_environment_generation
             || context.key.tree_scope != self.tree.tree_scope(node).0
             || context.key.shape[..3] != shape[..3]
             || self.computed_group_sets.assigned_style_record(node)?.raw() != context.record
@@ -232,18 +235,14 @@ impl StyleEngine {
             self.abandon_engine_computed_record(node, scratch);
             return None;
         }
-        let element_uses_substitution = self.nodes_with_substituted_records.contains(&node);
-        let pseudo_states: Vec<_> = self
-            .winner_groups
-            .pseudo_states(node)
-            .filter_map(|(_, version, state, priority_current)| {
-                (version == self.program.version() && priority_current).then_some(state)
-            })
-            .collect();
-        let pseudo_uses_substitution = pseudo_states
-            .into_iter()
-            .any(|state| self.state_has_substitutions(node, state));
-        if element_uses_substitution || pseudo_uses_substitution {
+        let uses_substitution = self.nodes_with_substituted_records.contains(&node)
+            || self
+                .winner_groups
+                .pseudo_states(node)
+                .any(|(_, version, state, priority_current)| {
+                    version == self.program.version() && priority_current && self.state_has_substitutions(node, state)
+                });
+        if uses_substitution {
             self.nodes_with_substituted_records.insert(node);
         } else {
             self.nodes_with_substituted_records.remove(&node);
@@ -822,8 +821,7 @@ impl StyleEngine {
                 environment: parent_environment,
                 font_environment_generation: inputs.font_environment_generation,
             });
-        let delta = self.winner_groups.semantic_delta(None, state);
-        let delta_property_count = delta.properties().len() as u64;
+        let delta_property_count = self.winner_groups.winner_count_in_state(state) as u64;
         if !self.node_declares_custom_properties(node)
             && let Some(delta) = self.assign_cached_cold_record(
                 node,
@@ -843,7 +841,7 @@ impl StyleEngine {
         // full drive resolves the font and rebuilds every group from it. The other font-phase
         // longhands without a group carry feature and variation data the resolution does not
         // pass on yet.
-        for &property in delta.properties() {
+        for property in self.winner_groups.semantic_delta_properties(None, state) {
             if property_starts_animation_or_counter_environment(property)
                 || (computed_group_dependency_mask(property).is_none() && !font_resolution_selects_by(property))
             {
@@ -931,9 +929,8 @@ impl StyleEngine {
                 })
                 .min_by_key(|donor| {
                     self.winner_groups
-                        .semantic_delta(Some(donor.state), state)
-                        .properties()
-                        .len()
+                        .semantic_delta_properties(Some(donor.state), state)
+                        .count()
                 })
         });
         if let Some(donor) = donor {
@@ -1080,7 +1077,7 @@ impl StyleEngine {
             .is_none_or(|view| {
                 !view.animated_overlay.is_null()
                     || (unsafe { view.longhand_table.as_ref() })
-                        .is_none_or(|table| !crate::css::style_compute::active_transition_properties(table).is_empty())
+                        .is_none_or(crate::css::style_compute::has_active_transition_properties)
             })
     }
 
@@ -1296,12 +1293,9 @@ impl StyleEngine {
                     self.counters.bump(Counter::EngineComputedRecordBailRecordParent);
                     return None;
                 };
-                (
-                    parent_view.payloads.to_vec(),
-                    parent_view.dependency_flags & (1 << 2) != 0,
-                )
+                (parent_view.payloads, parent_view.dependency_flags & (1 << 2) != 0)
             }
-            None => (vec![std::ptr::null(); group_index::COUNT], false),
+            None => (&[std::ptr::null(); group_index::COUNT][..], false),
         };
         let Ok(used_color_scheme) = u8::try_from(table.effective_color_scheme()) else {
             self.counters.bump(Counter::EngineComputedRecordBailDrive);
@@ -1312,7 +1306,7 @@ impl StyleEngine {
         table.freeze();
         let swap_eligible = table.property_inheritance_is_standard()
             && !table.display_is_list_item()
-            && crate::css::style_compute::active_transition_properties(&table).is_empty();
+            && !crate::css::style_compute::has_active_transition_properties(&table);
         let table = table.into_raw_shared();
         let release_table = |table: *const ComputedLonghandTable| unsafe {
             crate::css::computed_longhand_table::rust_computed_longhand_table_release(table.cast_mut());
@@ -1426,9 +1420,9 @@ impl StyleEngine {
             && self
                 .computed_group_sets
                 .custom_property_environment_identity(node)
-                .is_some()
-            && self.computed_group_sets.custom_property_environment_identity(node)
-                == self.computed_group_sets.custom_property_environment_identity(parent)
+                .is_some_and(|environment| {
+                    self.computed_group_sets.custom_property_environment_identity(parent) == Some(environment)
+                })
     }
 
     /// The inherited groups a state's winners rebuild for their element: the groups its
@@ -1439,16 +1433,18 @@ impl StyleEngine {
             STYLE_GROUP_INDEX_INHERITED_SVG, STYLE_GROUP_INDEX_INHERITED_TEXT, STYLE_GROUP_INDEX_INHERITED_UI,
         };
         use crate::css::property_metadata::{property_id as prop, property_style_group_index};
-        self.winner_groups.winners_in_state(state).fold(0_u32, |mask, winner| {
-            let mask = mask | property_style_group_index(winner.property).map_or(0, |group| 1 << group);
-            if winner.property == prop::COLOR {
-                mask | (1 << STYLE_GROUP_INDEX_INHERITED_UI)
-                    | (1 << STYLE_GROUP_INDEX_INHERITED_SVG)
-                    | (1 << STYLE_GROUP_INDEX_INHERITED_TEXT)
-            } else {
-                mask
-            }
-        })
+        self.winner_groups
+            .properties_in_state(state)
+            .fold(0_u32, |mask, property| {
+                let mask = mask | property_style_group_index(property).map_or(0, |group| 1 << group);
+                if property == prop::COLOR {
+                    mask | (1 << STYLE_GROUP_INDEX_INHERITED_UI)
+                        | (1 << STYLE_GROUP_INDEX_INHERITED_SVG)
+                        | (1 << STYLE_GROUP_INDEX_INHERITED_TEXT)
+                } else {
+                    mask
+                }
+            })
     }
 
     /// The document element's record settled: the root font metrics the drives after it resolve
@@ -1555,15 +1551,21 @@ impl StyleEngine {
     /// Whether C++ may publish one record as the answer for another element with this winner
     /// state. Values which read per-element or external context are never shared opaquely.
     fn state_is_opaque_record_shareable(&mut self, node: StyleNodeID, state: CascadeStateID) -> bool {
-        let winners = self
+        for winner in self
             .winner_groups
             .winners_in_state(state)
             .filter_map(|winner| self.winner_groups.resolved_winner(winner))
-            .collect::<Vec<_>>();
-        winners.into_iter().all(|winner| {
-            self.written_winner_value(node, &winner)
-                .is_some_and(|(_, value)| value_computes_without_document_context(value.data()))
-        })
+        {
+            match self.written_winner_value(node, &winner) {
+                Ok(Some((_, value))) if value_computes_without_document_context(value.data()) => {}
+                Err(counter) => {
+                    self.counters.bump(counter);
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn remember_state_admission(&mut self, key: (u64, CascadeStateID, u64, u64), admitted: bool) {
@@ -1764,15 +1766,16 @@ impl StyleEngine {
     /// cascade's canonical identity may have rewritten. A rule keeps its written values beside its
     /// declarations, and an element's own declarations keep theirs beside the facts.
     fn written_winner_value(
-        &mut self,
+        &self,
         node: StyleNodeID,
         winner: &PropertyWinner,
-    ) -> Option<(usize, crate::css::style_value::RetainedStyleValueData)> {
+    ) -> Result<Option<(usize, &crate::css::style_value::RetainedStyleValueData)>, Counter> {
         match winner.source {
-            WinnerSource::Rule(rule) => self
-                .program
-                .written_winner_declaration(rule, winner.property, winner.important, winner.key.value)
-                .map(|(index, value)| (index, value.clone_retained())),
+            WinnerSource::Rule(rule) => {
+                Ok(self
+                    .program
+                    .written_winner_declaration(rule, winner.property, winner.important, winner.key.value))
+            }
             WinnerSource::Element(kind) => {
                 let (declared, _) = self.facts.element_declared_properties(node, kind);
                 let complete = self
@@ -1780,22 +1783,18 @@ impl StyleEngine {
                     .element_declarations_are_complete_but_for_custom_properties(node, kind);
                 let written = self.facts.element_written_declared_values(node, kind);
                 if !complete || written.len() != declared.len() {
-                    self.counters.bump(Counter::EngineComputedRecordBailWinnerElement);
-                    return None;
+                    return Err(Counter::EngineComputedRecordBailWinnerElement);
                 }
-                declared
+                Ok(declared
                     .iter()
                     .rposition(|declared| {
                         declared.property == winner.property
                             && declared.important == winner.important
                             && declared.value == winner.key.value
                     })
-                    .map(|index| (index, written[index].clone_retained()))
+                    .map(|index| (index, &written[index])))
             }
-            WinnerSource::ExactCascade => {
-                self.counters.bump(Counter::EngineComputedRecordBailWinnerOperator);
-                None
-            }
+            WinnerSource::ExactCascade => Err(Counter::EngineComputedRecordBailWinnerOperator),
         }
     }
 
@@ -1951,7 +1950,14 @@ impl StyleEngine {
             if winner.property < crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID {
                 continue;
             }
-            let Some((index, value)) = self.written_winner_value(node, &winner) else {
+            let written = match self.written_winner_value(node, &winner) {
+                Ok(written) => written,
+                Err(counter) => {
+                    self.counters.bump(counter);
+                    None
+                }
+            };
+            let Some((index, value)) = written else {
                 self.counters.bump(Counter::EngineComputedRecordBailWinnerSpelling);
                 return None;
             };
@@ -1969,6 +1975,7 @@ impl StyleEngine {
                 // C++ cascade substitutes it; a value invalid at computed-value time is unset.
                 crate::css::style_value::StyleValueData::Unresolved { .. } => {
                     *substituted = true;
+                    let value = value.clone_retained();
                     let value = self.substitute_written_value(environment, winner.property, &value)?;
                     invalid_as_unset(value)
                 }
@@ -1990,7 +1997,7 @@ impl StyleEngine {
                         _ => expanded_longhand_value(shorthand, winner.property, &resolved).unwrap_or_else(unset_value),
                     }
                 }
-                _ => value,
+                _ => value.clone_retained(),
             };
             if !value_computes_without_document_context(value.data())
                 || (pseudo_kind.is_some()
@@ -2032,10 +2039,8 @@ impl StyleEngine {
         // nothing the descendant inherits may move; custom properties inherit unless registered
         // otherwise, and a child's box-type transformation reads its parent's display.
         self.winner_groups
-            .semantic_delta(Some(previous_state), state)
-            .properties()
-            .iter()
-            .all(|&property| {
+            .semantic_delta_properties(Some(previous_state), state)
+            .all(|property| {
                 property != crate::css::property_metadata::property_id::CUSTOM
                     && property != crate::css::property_metadata::property_id::DISPLAY
                     && !crate::css::property_metadata::property_is_inherited(property)
@@ -2854,22 +2859,25 @@ impl StyleEngine {
                 *word |= dependencies;
             }
         }
+        const INHERITED_FONT_GROUP: u8 = 1 << 6;
         let font_group_mask = computed_group_output_mask(crate::css::property_metadata::property_id::FONT_SIZE);
         let font_dependency_mask = font_group_mask.and_then(|font_group_mask| {
-            delta
-                .properties()
-                .iter()
-                .copied()
-                .any(|property| computed_group_output_mask(property) == Some(font_group_mask))
-                .then(|| self.computed_group_sets.font_dependency_mask(dependency_target))
+            (inherited_style_groups & INHERITED_FONT_GROUP != 0
+                || delta
+                    .properties()
+                    .iter()
+                    .copied()
+                    .any(|property| computed_group_output_mask(property) == Some(font_group_mask)))
+            .then(|| self.computed_group_sets.font_dependency_mask(dependency_target))
         });
         let font_dependency_properties = font_group_mask.and_then(|font_group_mask| {
-            delta
-                .properties()
-                .iter()
-                .copied()
-                .any(|property| computed_group_output_mask(property) == Some(font_group_mask))
-                .then(|| self.computed_group_sets.font_dependency_properties(dependency_target))
+            (inherited_style_groups & INHERITED_FONT_GROUP != 0
+                || delta
+                    .properties()
+                    .iter()
+                    .copied()
+                    .any(|property| computed_group_output_mask(property) == Some(font_group_mask)))
+            .then(|| self.computed_group_sets.font_dependency_properties(dependency_target))
         });
         if delta.properties().len() == 1 {
             computed_property_closure_is_exact |=
@@ -2884,7 +2892,7 @@ impl StyleEngine {
         const INHERITED_UI_GROUP: u8 = 1 << 2;
         const INHERITED_TEXT_GROUP: u8 = 1 << 4;
         const INHERITED_GROUPS_WITH_COMPUTED_CLOSURE: u8 =
-            INHERITED_STATIC_GROUPS | INHERITED_UI_GROUP | INHERITED_TEXT_GROUP;
+            INHERITED_STATIC_GROUPS | INHERITED_UI_GROUP | INHERITED_TEXT_GROUP | INHERITED_FONT_GROUP;
         let inherited_property_closure_requested = delta.is_empty()
             && inherited_style_groups != 0
             && inherited_style_groups & !INHERITED_GROUPS_WITH_COMPUTED_CLOSURE == 0;
@@ -2910,7 +2918,9 @@ impl StyleEngine {
             && (inherited_style_groups & INHERITED_TEXT_GROUP == 0
                 || inherited_current_color_dependency_properties.is_some_and(|properties| properties.is_some()))
             && (inherited_style_groups & INHERITED_UI_GROUP == 0
-                || inherited_color_scheme_dependency_properties.is_some_and(|properties| properties.is_some()));
+                || inherited_color_scheme_dependency_properties.is_some_and(|properties| properties.is_some()))
+            && (inherited_style_groups & INHERITED_FONT_GROUP == 0
+                || font_dependency_properties.is_some_and(|properties| properties.is_some()));
         if inherited_property_closure_is_exact {
             for property in crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
                 ..=crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID
@@ -2925,6 +2935,7 @@ impl StyleEngine {
             for dependencies in [
                 inherited_current_color_dependency_properties,
                 inherited_color_scheme_dependency_properties,
+                font_dependency_properties,
             ]
             .into_iter()
             .flatten()
@@ -2940,6 +2951,7 @@ impl StyleEngine {
             [
                 inherited_current_color_dependency_mask,
                 inherited_color_scheme_dependency_mask,
+                font_dependency_mask,
             ]
             .into_iter()
             .flatten()

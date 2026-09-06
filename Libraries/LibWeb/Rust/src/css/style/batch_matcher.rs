@@ -11,6 +11,7 @@
 //! output is exact, but its accelerators make it unsuitable as the correctness reference. That role
 //! belongs to [`super::exact_matcher::ExactMatcher`].
 
+use smallvec::SmallVec;
 use std::mem::size_of;
 
 use super::ScopeDispatchShape;
@@ -157,8 +158,13 @@ impl RuleMatches {
         }
     }
 
-    pub(super) fn prepared_selector_truth(&self) -> Option<Vec<super::SelectorTruth>> {
-        let mut truth = self.selector_truth.clone()?;
+    pub(super) fn take_prepared_selector_truth(
+        &mut self,
+        memory: &mut MemoryController,
+    ) -> Option<Vec<super::SelectorTruth>> {
+        self.settle_memory(memory);
+        let mut truth = self.selector_truth.take()?;
+        self.settle_memory(memory);
         truth.sort_unstable();
         truth.dedup();
         Some(truth)
@@ -244,10 +250,7 @@ pub(super) fn scope_dispatch_shape_and_rules(
             for index in 0..compiled.entries().len() {
                 let metadata = compiled.dispatch_metadata(index);
                 let copies = if metadata.key == DispatchKey::Universal {
-                    let mut branch_keys = metadata.subject_dispatch_keys().to_vec();
-                    branch_keys.sort_unstable();
-                    branch_keys.dedup();
-                    branch_keys.len().max(1)
+                    metadata.subject_dispatch_keys().len().max(1)
                 } else {
                     1
                 };
@@ -327,13 +330,8 @@ pub(super) fn insert_scope_rule(
         // routing relies on, and it comes back empty rather than truncated, so an entry is
         // never unreachable from a key it needs.
         let branch_keys = match key {
-            DispatchKey::Universal if !subject_dispatch.is_empty() => {
-                let mut branch_keys = subject_dispatch.to_vec();
-                branch_keys.sort_unstable();
-                branch_keys.dedup();
-                branch_keys
-            }
-            _ => Vec::new(),
+            DispatchKey::Universal => subject_dispatch,
+            _ => &[],
         };
         if branch_keys.is_empty() {
             let dispatch_entry = dispatch.insert(key, template);
@@ -355,7 +353,7 @@ pub(super) fn insert_scope_rule(
             //     match per registered entry, so registering every copy would report the
             //     same rule once per branch key the element carries; the candidate walk
             //     deduplicates them by the rank the copies share instead.
-            for &branch_key in &branch_keys {
+            for &branch_key in branch_keys {
                 dispatch.insert(
                     branch_key,
                     super::index::DispatchEntry {
@@ -1069,18 +1067,16 @@ impl<'a> BatchMatcher<'a> {
             let compiled = self.programs.get(program);
             for (entry_index, entry) in compiled.entries().iter().enumerate() {
                 let subject_dispatch = compiled.subject_dispatch_keys(entry_index);
-                if !subject_dispatch.is_empty()
-                    && !subject_dispatch
-                        .iter()
-                        .any(|&key| self.facts.carries_dispatch_key(row, key, is_document_root))
-                {
+                let matched_dispatch_key = subject_dispatch
+                    .iter()
+                    .copied()
+                    .find(|&key| self.facts.carries_dispatch_key(row, key, is_document_root));
+                if !subject_dispatch.is_empty() && matched_dispatch_key.is_none() {
                     continue;
                 }
-                if compiled
-                    .subject_required_keys(entry_index)
-                    .iter()
-                    .any(|&key| !self.facts.carries_dispatch_key(row, key, is_document_root))
-                {
+                if compiled.subject_required_keys(entry_index).iter().any(|&key| {
+                    Some(key) != matched_dispatch_key && !self.facts.carries_dispatch_key(row, key, is_document_root)
+                }) {
                     continue;
                 }
                 let entry_index = u32::try_from(entry_index).expect("selector entry space exhausted");
@@ -1356,7 +1352,7 @@ impl<'a> BatchMatcher<'a> {
         // Copies of a multi-key entry share one cascade order; an element carrying two of the
         // entry's branch keys walks past the second copy here. The list stays tiny because only
         // disjunction subjects are multi-key.
-        let mut seen_multi_key_orders: Vec<u32> = Vec::new();
+        let mut seen_multi_key_orders: SmallVec<[u32; 4]> = SmallVec::new();
         let is_document_root = self.tree.parent(node).is_none();
         let parent_facts = match self.tree.parent(node) {
             None => ParentDispatchFacts::NoElementParent,
@@ -1372,7 +1368,7 @@ impl<'a> BatchMatcher<'a> {
             .ancestor_requirements
             .map(|requirements| requirements.dispatch_facts(row));
         let mut cascade_winners = Top1Cascade::with_capacity(0);
-        let mut matched_pseudo_targets = Vec::new();
+        let mut matched_pseudo_targets: SmallVec<[_; 2]> = SmallVec::new();
         if self.cascade_only {
             for matched in out
                 .matches
@@ -1447,12 +1443,13 @@ impl<'a> BatchMatcher<'a> {
                 let pseudo_target_is_known = entry
                     .pseudo_element
                     .is_none_or(|target| matched_pseudo_targets.contains(&target));
-                let every_property_has_a_winner = properties.iter().all(|&property| {
-                    cascade_winners
-                        .winner(&(entry.pseudo_element, property))
-                        .is_some_and(|winner| winner.priority >= candidate.cascade_order)
-                });
-                if pseudo_target_is_known && every_property_has_a_winner {
+                if pseudo_target_is_known
+                    && properties.iter().all(|&property| {
+                        cascade_winners
+                            .winner(&(entry.pseudo_element, property))
+                            .is_some_and(|winner| winner.priority >= candidate.cascade_order)
+                    })
+                {
                     counters.bump(Counter::CascadeCandidatesRejectedByWinner);
                     if let Some(completed) = completed.as_deref_mut() {
                         completed[candidate_index] = true;

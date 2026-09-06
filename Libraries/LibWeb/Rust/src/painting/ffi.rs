@@ -5,6 +5,7 @@
  */
 
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
+use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::used_values::FfiCssPixelPoint;
@@ -13,12 +14,16 @@ use crate::layout::used_values::FfiCssPixelSize;
 use crate::layout::{grid_formatting_context, svg_formatting_context, used_values};
 use crate::painting::display_list::commands::FrameNodeIndex;
 use crate::painting::display_list::commands::SpatialNodeIndex;
+use crate::painting::filter_bytes::filter_functions_graph;
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::FfiRecordedDisplayList;
+use crate::painting::host::visual_context::FfiSvgFilterPrimitive;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_rows::{PaintableRowsRead, with_inline_pieces};
 use crate::painting::rect_to_viewport_transform::RectToViewportTransform;
 use crate::painting::scroll_chain::ViewportWheelOverflow;
+use crate::painting::svg_filter::{SvgFilterGraphBuilder, SvgFilterPrimitive};
+use libgfx_rust::filter::Filter;
 use std::ffi::c_void;
 use std::rc::Rc;
 
@@ -40,30 +45,6 @@ pub enum ScrollDirection {
     #[default]
     Horizontal,
     Vertical,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FilterOperationType {
-    Arithmetic,
-    Compose,
-    Blend,
-    Flood,
-    DisplacementMap,
-    DropShadow,
-    Blur,
-    ColorFilter,
-    ColorMatrix,
-    ColorTable,
-    Saturate,
-    HueRotate,
-    Image,
-    Merge,
-    Offset,
-    Erode,
-    Dilate,
-    Turbulence,
-    ColorSpaceConversion,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -444,15 +425,6 @@ pub unsafe extern "C" fn layout_arena_schedule_scrollable_overflow_recalculation
 pub unsafe extern "C" fn layout_arena_needs_full_scrollable_overflow_recalculation(arena: *mut c_void) -> bool {
     let arena = unsafe { arena_from_handle(arena) };
     arena.needs_full_scrollable_overflow_recalculation.get()
-}
-
-/// # Safety
-///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_needs_full_scrollable_overflow_recalculation(arena: *mut c_void) {
-    let arena = unsafe { arena_from_handle(arena) };
-    arena.needs_full_scrollable_overflow_recalculation.set(true);
 }
 
 /// # Safety
@@ -1250,13 +1222,7 @@ pub unsafe extern "C" fn layout_arena_rebuild_scrollable_overflow_contained_boxe
     root: NodeSlotId,
 ) {
     let arena = unsafe { arena_from_handle(arena) };
-    let paintable_rows = arena.paintable_rows();
-    let mut paint_state = arena.paint_state().borrow_mut();
-    crate::painting::scrollable_overflow::refill_contained_boxes_index(
-        &paintable_rows,
-        root,
-        &mut paint_state.scrollable_overflow_contained_boxes,
-    );
+    arena.rebuild_scrollable_overflow_contained_boxes(root);
 }
 
 /// # Safety
@@ -3887,6 +3853,99 @@ pub unsafe extern "C" fn layout_arena_paint_push_bytes(sink: *mut c_void, bytes:
     if length > 0 {
         vec.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, length) });
     }
+}
+
+/// # Safety
+///
+/// Every pointer in `primitive` must be readable for the length that accompanies it, each UTF-16
+/// view must satisfy [`FfiUtf16View::units`], and each non-null component transfer table must
+/// hold 256 bytes.
+unsafe fn svg_filter_primitive_from_ffi(primitive: &FfiSvgFilterPrimitive) -> SvgFilterPrimitive {
+    let name = |view: FfiUtf16View| unsafe { view.to_utf16() }.unwrap_or_default();
+    SvgFilterPrimitive {
+        values: primitive.values,
+        in1: name(primitive.in1),
+        in2: name(primitive.in2),
+        result: name(primitive.result),
+        merge_inputs: unsafe { ffi_slice(primitive.merge_inputs, primitive.merge_input_count) }
+            .iter()
+            .map(|view| name(*view))
+            .collect(),
+        color_matrix_values: unsafe { ffi_slice(primitive.color_matrix_values, primitive.color_matrix_value_count) }
+            .to_vec(),
+        component_transfer_tables: primitive.component_transfer_tables.map(|table| {
+            (!table.is_null()).then(|| {
+                let table = unsafe { ffi_slice(table, 256) };
+                Box::new(<[u8; 256]>::try_from(table).expect("a component transfer table holds 256 entries"))
+            })
+        }),
+    }
+}
+
+/// Appends one primitive of an SVG `<filter>` to the graph builder a host callback was handed as
+/// its sink.
+///
+/// # Safety
+///
+/// `sink` must be the pointer handed to the callback, used synchronously; `primitive` must be
+/// readable, with every pointer in it readable for the length that accompanies it, each UTF-16
+/// view satisfying [`FfiUtf16View::units`], and each non-null component transfer table holding
+/// 256 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paint_push_svg_filter_primitive(
+    sink: *mut c_void,
+    primitive: *const FfiSvgFilterPrimitive,
+) {
+    let builder = unsafe { &mut *sink.cast::<SvgFilterGraphBuilder>() };
+    builder.push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiFilterFunctionKind {
+    Blur,
+    DropShadow,
+    Color,
+    HueRotate,
+}
+
+/// One function of a CSS filter list with its lengths already in device pixels, for a host that
+/// builds filter graphs outside the style system: compositor animation samples and canvas filters.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiFilterFunction {
+    pub kind: FfiFilterFunctionKind,
+    /// The blur radius, drop shadow radius, color operation amount, or hue rotation in degrees.
+    pub amount: f32,
+    /// Drop shadow only.
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub color: libgfx_rust::Color,
+    /// Color only.
+    pub color_operation: libgfx_rust::ColorFilterType,
+}
+
+/// Serializes the graph a list of filter functions describes and hands the bytes to `append`.
+/// Returns false for an empty list, which appends nothing.
+///
+/// # Safety
+///
+/// `functions` must point to `count` readable functions, and `append` must accept `context` and
+/// the byte range it is handed, synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_filter_functions_serialize(
+    functions: *const FfiFilterFunction,
+    count: usize,
+    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    context: *mut c_void,
+) -> bool {
+    let functions = unsafe { ffi_slice(functions, count) };
+    let Some(graph) = filter_functions_graph(functions.iter().copied().map(Filter::from)) else {
+        return false;
+    };
+    let bytes = graph.serialize();
+    unsafe { append(context, bytes.as_ptr(), bytes.len()) };
+    true
 }
 
 /// # Safety

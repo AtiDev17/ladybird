@@ -17,10 +17,12 @@
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Selection/Selection.h>
 
 namespace Web::CSS {
 
@@ -56,7 +58,7 @@ static void apply_element_style_invalidation_after_style_change(DOM::Element& el
         element.document().schedule_scroll_container_resnap();
 
     if (invalidation.changes_containing_block_establishment)
-        element.document().partial_relayout_invalidation().record_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByStyleChange);
+        element.document().record_partial_relayout_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByStyleChange);
 
     if (invalidation.needs_relayout()) {
         // A relayout-only style change on an absolutely positioned partial relayout boundary
@@ -1028,19 +1030,47 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
 
 namespace Web::DOM {
 
+void Document::update_selection_style_observability()
+{
+    auto selection = get_selection();
+    bool observable = selection && !selection->is_collapsed();
+    if (auto const* text_control = as_if<HTML::FormAssociatedTextControlElement>(focused_area().ptr()))
+        observable |= text_control->selection_start() != text_control->selection_end();
+    if (observable == m_selection_styles_are_observable)
+        return;
+    m_selection_styles_are_observable = observable;
+    style_computer().style_engine().set_pseudo_element_style_deferred(to_underlying(CSS::PseudoElement::Selection), !observable);
+    if (!observable)
+        return;
+    for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        auto* element = as_if<Element>(node);
+        if (!element)
+            return TraversalDecision::Continue;
+        auto style = element->computed_style();
+        if (style) {
+            style_computer().style_engine().record_element_style_input_change(element->style_node_id(),
+                CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle | CSS::StyleEngine::PseudoInputsMayHaveChanged);
+        }
+        return TraversalDecision::Continue;
+    });
+}
+
 void Document::update_style()
 {
+    update_selection_style_observability();
     CSS::update_style(*this);
 }
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element)
 {
+    update_selection_style_observability();
     flush_throttled_animation_style_update_for_node(abstract_element.element());
     return CSS::update_style_for_element(*this, abstract_element, StyleUpdateMode::Normal);
 }
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
+    update_selection_style_observability();
     flush_throttled_animation_style_update_for_node(abstract_element.element());
     return CSS::update_style_for_element(*this, abstract_element, mode);
 }

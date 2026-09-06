@@ -186,8 +186,7 @@ enum class UpdateLayoutReason {
     X(AnchorNamesUnregisteredByElementRemoval)             \
     X(AnchorNamesUnregisteredByStyleChange)                \
     X(ContainingBlockEstablishmentChangedByKeyframeEffect) \
-    X(ContainingBlockEstablishmentChangedByStyleChange)    \
-    X(DirtyDomNodeHasDetachedLayoutNode)
+    X(ContainingBlockEstablishmentChangedByStyleChange)
 
 enum class PartialRelayoutEscapeReason {
 #define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) e,
@@ -196,18 +195,6 @@ enum class PartialRelayoutEscapeReason {
 };
 
 [[nodiscard]] Utf16View to_string(PartialRelayoutEscapeReason);
-
-#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(X) \
-    X(FullLayoutPass)                                      \
-    X(PartialLayoutTreeBuild)
-
-enum class PartialRelayoutEscapeClearReason {
-#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) e,
-    ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
-#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
-};
-
-[[nodiscard]] Utf16View to_string(PartialRelayoutEscapeClearReason);
 
 // https://html.spec.whatwg.org/multipage/dom.html#document-load-timing-info
 struct DocumentLoadTimingInfo {
@@ -290,9 +277,8 @@ public:
     bool has_valid_html_collection_caches() const { return m_html_collection_attribute_invalidation_types != 0; }
     HTMLCollectionAttributeInvalidationTypes html_collection_attribute_invalidation_types_for_attribute(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_) const;
 
-    // Everything a style input record cannot name by an identity of its own: a stylesheet rule's
-    // declarations changing under a block that has not moved, a font finishing loading, the
-    // viewport moving, a registration or counter style arriving. A record taken under one version
+    // Everything a style input record cannot name by an identity of its own: the viewport moving,
+    // a counter style arriving, or another untracked environment input changing. A record taken under one version
     // answers for nothing once it moves.
     u64 style_environment_version() const { return m_style_environment_version; }
     void bump_style_environment_version() { ++m_style_environment_version; }
@@ -308,6 +294,7 @@ public:
     WebIDL::ExceptionOr<void> populate_with_html_head_and_body();
 
     GC::Ptr<Selection::Selection> get_selection() const;
+    bool selection_styles_are_observable() const { return m_selection_styles_are_observable; }
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -470,6 +457,7 @@ public:
     void stop_compositor_animation_timers();
     void arm_compositor_animation_timers_for_testing(Badge<Internals::Internals>);
     void fire_compositor_animation_wakeup_for_testing(Badge<Internals::Internals>, double frame_time_ms);
+    void force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing(Badge<Internals::Internals>);
     void request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const&);
     bool run_empty_animation_style_update_for_testing(Badge<Internals::Internals>);
     bool compositor_animation_wakeup_timer_is_active() const;
@@ -822,7 +810,7 @@ public:
 
     bool has_completed_style_update() const { return m_has_completed_style_update; }
     void set_has_completed_style_update() { m_has_completed_style_update = true; }
-    void mark_style_attribute_dirty() { m_has_dirty_style_attributes = true; }
+    void mark_style_attribute_dirty(Element&);
     void synchronize_dirty_style_attributes();
     void flush_deferred_style_change_event();
     // The style engine resolves substitutions against the Rust registry, whose parse context is
@@ -843,21 +831,9 @@ public:
     Painting::ChromeWidgetRegistry& chrome_widget_registry() { return *m_chrome_widget_registry; }
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
-    // Attribution of pending updates for partial relayout. Invariant: every update recorded
-    // since the last layout pass is either attributed to a boundary in the root set the
-    // layout node arena keeps, or the escape bit is set. The dispatch may only run partial
-    // relayout while the escape bit is clear; a full layout pass re-derives every fact
-    // boundary qualification depends on, so it clears the bit.
-    class PartialRelayoutInvalidation {
-    public:
-        void record_escape(PartialRelayoutEscapeReason);
-        void clear_escape(PartialRelayoutEscapeClearReason);
-        [[nodiscard]] bool escapes() const { return m_escapes; }
-
-    private:
-        bool m_escapes { false };
-    };
-    [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
+    // Records that a pending update cannot be attributed to any boundary in the partial relayout
+    // root set; the layout node arena keeps the escape bit next to those roots.
+    void record_partial_relayout_escape(PartialRelayoutEscapeReason);
 
     void set_needs_to_refresh_scroll_state(bool b);
 
@@ -1726,7 +1702,7 @@ private:
     Vector<GC::Weak<CSS::MediaQueryList>> m_media_query_lists;
 
     bool m_has_completed_style_update { false };
-    bool m_has_dirty_style_attributes { false };
+    GC::WeakHashSet<Element> m_elements_with_dirty_style_attributes;
     bool m_suppresses_attribute_style_invalidation { false };
     HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
     bool m_needs_full_layout_tree_update { false };
@@ -1734,8 +1710,6 @@ private:
     bool m_is_decoded_svg { false };
 
     bool m_is_running_update_layout { false };
-
-    PartialRelayoutInvalidation m_partial_relayout_invalidation;
 
     u64 m_partial_layout_count { 0 };
     u64 m_full_layout_count { 0 };
@@ -1821,6 +1795,8 @@ private:
 
     // https://w3c.github.io/selection-api/#dfn-selection
     GC::Ptr<Selection::Selection> m_selection;
+    bool m_selection_styles_are_observable { false };
+    void update_selection_style_observability();
 
     // NOTE: This is a cache to make finding the first <base href> or <base target> element O(1).
     GC::Ptr<HTML::HTMLBaseElement> m_first_base_element_with_href_in_tree_order;
@@ -1859,6 +1835,7 @@ private:
     RefPtr<Core::Timer> m_compositor_animation_wakeup_timer;
     Optional<MonotonicTime> m_compositor_animation_wakeup_deadline;
     RefPtr<Core::Timer> m_compositor_animation_observation_timer;
+    bool m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing { false };
     Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_effects_layer;
     Vector<WeakPtr<Layout::Node>> m_layout_nodes_with_forced_compositor_background_color_frame;
 

@@ -893,6 +893,10 @@ pub struct FfiLayoutFcCallbacks {
         unsafe extern "C" fn(*mut c_void, *mut c_void, CssPixels, CssPixels) -> svg_formatting_context::FfiFloatRect,
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
     pub node_unique_id: unsafe extern "C" fn(*mut c_void) -> i64,
+    /// The DOM-ancestry half of containing-block recomputation: receives the shells of an
+    /// absolutely positioned node and its containing block, must not mutate the layout tree or
+    /// its styles, and returns the slot of the intervening inline containing block, if any.
+    pub inline_containing_block_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
 }
 
 pub(crate) struct FormattingContextRun<'pass> {
@@ -2055,6 +2059,12 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
     // SAFETY: The host keeps the document's layout inputs alive and unchanged
     // while computing fragments. Nested measurements only mutate side caches.
     let arena = unsafe { LayoutNodeArena::from_handle(host.arena) };
+    // Containing blocks follow style facts a layout invalidation can change without a tree
+    // update, so a full pass re-derives them for the whole tree. That walk re-derives every fact
+    // partial relayout boundary qualification depends on, so pending changes that escaped
+    // classification are accounted for from here on.
+    arena.recompute_containing_blocks_in_subtree(root, host.inline_containing_block_lookup);
+    arena.clear_partial_relayout_escape();
     let callbacks = LayoutPass::new(arena, host);
     let sink = unsafe { &*sink };
     let viewport_inline_size = CssPixels::from_raw(viewport_inline_size_raw);
@@ -2123,16 +2133,11 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
         )
     });
     // SAFETY: Computation has finished and its input borrows are no longer used.
-    // Commit performs no host callbacks while it borrows the arena exclusively.
-    let notifications = commit::commit_replacing(
-        root,
-        unsafe { LayoutNodeArena::from_handle_mut(host.arena) },
-        &pass_fragments,
-    );
-    // SAFETY: The host and shells remain live, and commit's mutable borrow has ended.
-    unsafe { notifications.notify_host(sink) };
-    // SAFETY: Host callbacks have returned; borrow the arena again for cache maintenance.
-    unsafe { LayoutNodeArena::from_handle(host.arena) }.sweep_stale_fc_run_cache_entries();
+    let arena = unsafe { commit_entry_pass(host, root, &pass_fragments, sink) };
+    // The full scrollable overflow update measures eagerly and returns without refilling the
+    // contained-boxes index, so the index is rebuilt here from the freshly committed rows.
+    arena.rebuild_scrollable_overflow_contained_boxes(root);
+    arena.set_needs_full_scrollable_overflow_recalculation();
 }
 
 fn finish_entry_pass(
@@ -2153,6 +2158,48 @@ fn finish_entry_pass(
         "an entry pass always produces the entry root's fragment"
     );
     pass_fragments
+}
+
+/// Commits the finished entry pass rooted at `commit_root` and settles the arena-local
+/// bookkeeping every layout entry owes its caller: host notifications, cache maintenance, and
+/// the reset of the update flags the committed subtree satisfied. Returns the arena re-borrowed
+/// after commit for entry-specific epilogues.
+///
+/// # Safety
+///
+/// `host.arena` must be the live arena the pass computed against, `sink` must remain valid for
+/// the call, and no borrow taken during the pass may still be live.
+unsafe fn commit_entry_pass<'a>(
+    host: &'a FfiLayoutFcCallbacks,
+    commit_root: NodeSlotId,
+    pass_fragments: &fragment_tree::CompletedPassFragments,
+    sink: &commit::FfiCommitSink,
+) -> &'a LayoutNodeArena {
+    // SAFETY: Computation has finished and its input borrows are no longer used.
+    // Commit performs no host callbacks while it borrows the arena exclusively.
+    let notifications = commit::commit_replacing(
+        commit_root,
+        unsafe { LayoutNodeArena::from_handle_mut(host.arena) },
+        pass_fragments,
+    );
+    // SAFETY: The host and shells remain live, and commit's mutable borrow has ended.
+    unsafe { notifications.notify_host(sink) };
+    // SAFETY: Host callbacks have returned; borrow the arena again for the epilogue, which
+    // performs no host callbacks.
+    let arena = unsafe { LayoutNodeArena::from_handle(host.arena) };
+    arena.sweep_stale_fc_run_cache_entries();
+    arena.reset_layout_update_flags_in_subtree(commit_root);
+    arena
+}
+
+/// The subtree commit reset the root's descendant rows, and the subtree's new size may change
+/// ancestor scrollable overflow; scheduling the root covers both.
+fn schedule_scrollable_overflow_recalculation_for_relaid_out_root(arena: &LayoutNodeArena, root: NodeSlotId) {
+    // A partial relayout root is an SVG viewport or an absolutely positioned box, never an SVG
+    // content box, so the host's rule of re-laying out SVG content instead of scheduling does not
+    // apply here.
+    debug_assert!(!node_facts::kind_is_svg_box(arena.data(root).kind.get()));
+    arena.schedule_scrollable_overflow_recalculation(root);
 }
 
 /// # Safety
@@ -2178,6 +2225,10 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
     let arena = unsafe { LayoutNodeArena::from_handle(host.arena) };
     let callbacks = LayoutPass::new(arena, host);
     let sink = unsafe { &*sink };
+    // The boundary can be wider than the rebuilt roots that led to it, and laying it out may
+    // re-enter intrinsic sizing for descendants outside those roots, including anonymous boxes
+    // the incremental tree build created; refresh the containing blocks of the whole subtree.
+    arena.recompute_containing_blocks_in_subtree(root, host.inline_containing_block_lookup);
 
     let pass_fragments = RunRecords::with_unrooted(arena, root, |entry_records| {
         let root_used = used_values::used_values_from_committed_fragment_link(&callbacks, root)
@@ -2250,16 +2301,8 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         finish_entry_pass(entry_records, &entry_fragments, &callbacks, false)
     });
     // SAFETY: Computation has finished and its input borrows are no longer used.
-    // Commit performs no host callbacks while it borrows the arena exclusively.
-    let notifications = commit::commit_replacing(
-        root,
-        unsafe { LayoutNodeArena::from_handle_mut(host.arena) },
-        &pass_fragments,
-    );
-    // SAFETY: The host and shells remain live, and commit's mutable borrow has ended.
-    unsafe { notifications.notify_host(sink) };
-    // SAFETY: Host callbacks have returned; borrow the arena again for cache maintenance.
-    unsafe { LayoutNodeArena::from_handle(host.arena) }.sweep_stale_fc_run_cache_entries();
+    let arena = unsafe { commit_entry_pass(host, root, &pass_fragments, sink) };
+    schedule_scrollable_overflow_recalculation_for_relaid_out_root(arena, root);
 }
 
 /// # Safety
@@ -2282,6 +2325,8 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
     let arena = unsafe { LayoutNodeArena::from_handle(host.arena) };
     let callbacks = LayoutPass::new(arena, host);
     let sink = unsafe { &*sink };
+    // As for a subtree layout: the replayed box's own subtree is what is about to be laid out.
+    arena.recompute_containing_blocks_in_subtree(box_, host.inline_containing_block_lookup);
     let containing_block = callbacks.containing_block(box_);
     assert!(!containing_block.is_invalid());
     let entry_fragments = std::rc::Rc::new(fragment_tree::RunFragmentBuilder::new_entry_accumulator(
@@ -2303,14 +2348,6 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
         finish_entry_pass(entry_records, &entry_fragments, &callbacks, false)
     });
     // SAFETY: Computation has finished and its input borrows are no longer used.
-    // Commit performs no host callbacks while it borrows the arena exclusively.
-    let notifications = commit::commit_replacing(
-        box_,
-        unsafe { LayoutNodeArena::from_handle_mut(host.arena) },
-        &pass_fragments,
-    );
-    // SAFETY: The host and shells remain live, and commit's mutable borrow has ended.
-    unsafe { notifications.notify_host(sink) };
-    // SAFETY: Host callbacks have returned; borrow the arena again for cache maintenance.
-    unsafe { LayoutNodeArena::from_handle(host.arena) }.sweep_stale_fc_run_cache_entries();
+    let arena = unsafe { commit_entry_pass(host, box_, &pass_fragments, sink) };
+    schedule_scrollable_overflow_recalculation_for_relaid_out_root(arena, box_);
 }

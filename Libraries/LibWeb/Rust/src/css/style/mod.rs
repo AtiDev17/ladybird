@@ -624,10 +624,6 @@ impl<K: Copy + Eq + Hash + Ord, V: Clone> StagedField<K, V> {
         self.dirty_count = 0;
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.touched.iter().map(|key| (key, &self.rows.get(key).unwrap().after))
-    }
-
     fn pairs(&self) -> impl Iterator<Item = (K, &V, &V)> {
         self.touched.iter().map(|&key| {
             let row = self.rows.get(&key).unwrap();
@@ -761,6 +757,7 @@ pub struct StyleEngine {
     /// The instrumentation state to restore after C++ materializes a record for verification.
     computed_record_verification_counters: Option<Box<Counters>>,
     computed_record_verification_pins: Vec<u64>,
+    deferred_pseudo_element: Option<tree::PseudoElementKind>,
     tree: StyleNodeTree,
     program: StyleSheetProgram,
     journal: NormalizationJournal,

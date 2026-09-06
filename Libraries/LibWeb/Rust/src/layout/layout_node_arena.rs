@@ -545,6 +545,11 @@ pub(crate) struct LayoutNodeArena {
     paint_state: RefCell<crate::painting::paint_state::PaintState>,
     svg_pattern_referencing_nodes: RefCell<Vec<NodeSlotId>>,
     pub(crate) partial_relayout_boundary_roots: RefCell<Vec<NodeSlotId>>,
+    /// Attribution of pending updates for partial relayout. Invariant: every update recorded
+    /// since the last layout pass is either attributed to a boundary in the root set above, or
+    /// this escape bit is set. Partial relayout may only run while the bit is clear; a full
+    /// layout pass re-derives every fact boundary qualification depends on, so it clears the bit.
+    pub(crate) pending_updates_escape_partial_relayout: Cell<bool>,
     pub(crate) boxes_needing_scrollable_overflow_recalculation: RefCell<Vec<NodeSlotId>>,
     pub(crate) needs_full_scrollable_overflow_recalculation: Cell<bool>,
     text_nodes_enrolled_for_content_sync: RefCell<HashSet<NodeSlotId>>,
@@ -586,6 +591,7 @@ impl LayoutNodeArena {
             paint_state: RefCell::new(crate::painting::paint_state::PaintState::default()),
             svg_pattern_referencing_nodes: RefCell::new(Vec::new()),
             partial_relayout_boundary_roots: RefCell::new(Vec::new()),
+            pending_updates_escape_partial_relayout: Cell::new(false),
             boxes_needing_scrollable_overflow_recalculation: RefCell::new(Vec::new()),
             needs_full_scrollable_overflow_recalculation: Cell::new(false),
             text_nodes_enrolled_for_content_sync: RefCell::new(HashSet::default()),
@@ -1891,6 +1897,9 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn clear_committed_fragment_link(&self, id: NodeSlotId) {
+        // Cached runs may reuse the committed paintable subtree without replaying its fragments.
+        // Once that subtree is cleared, a later layout must rebuild it instead.
+        self.fc_run_cache_store.remove_entry(id.slot_index());
         drop(self.take_committed_fragment_link(self.data(id)));
     }
 
@@ -2741,34 +2750,6 @@ pub unsafe extern "C" fn layout_arena_pre_order_relabel_count(arena: *mut c_void
     // SAFETY: The C++ wrapper keeps the arena alive for this call and
     // serializes all access on the document thread.
     unsafe { &*arena.cast::<LayoutNodeArena>() }.pre_order_relabel_count()
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `root` must
-/// name the root of a live subtree in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_reset_layout_update_flags_in_subtree(arena: *mut c_void, root: NodeSlotId) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.reset_layout_update_flags_in_subtree(root);
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `root` must
-/// name the root of a live subtree in this arena. `inline_cb_lookup` is invoked
-/// for each absolutely positioned node with a resolved containing block; it
-/// receives the two nodes' shell pointers, must not mutate the layout tree or
-/// its styles, and must return the slot of the intervening inline containing
-/// block or the invalid slot id.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_recompute_containing_blocks(
-    arena: *mut c_void,
-    root: NodeSlotId,
-    inline_cb_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
-) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.recompute_containing_blocks_in_subtree(root, inline_cb_lookup);
 }
 
 /// # Safety

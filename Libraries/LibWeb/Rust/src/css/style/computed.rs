@@ -15,6 +15,7 @@
 //! elements use dense columns, while actual pseudo-element kinds use sparse assignments. The
 //! complete tuple is interned as the base `StyleRecordID` published for each style target.
 
+use smallvec::SmallVec;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -63,7 +64,7 @@ pub(super) const ENGINE_INHERITED_GROUP_COUNT: usize = 7;
 pub(super) fn table_inherited_group_swap_eligible(table: &ComputedLonghandTable) -> bool {
     table.property_inheritance_is_standard()
         && !table.display_is_list_item()
-        && crate::css::style_compute::active_transition_properties(table).is_empty()
+        && !crate::css::style_compute::has_active_transition_properties(table)
 }
 
 /// What assembling an engine-computed record produced, for the publication counters.
@@ -679,6 +680,7 @@ pub(super) struct SharedStyleRecordKey {
     pub tree_scope: u32,
     pub inherited_groups: InheritedGroupSetID,
     pub environment: u64,
+    pub font_environment_generation: u64,
     pub shape: [u64; 4],
 }
 
@@ -777,12 +779,14 @@ impl ComputedGroupSets {
             return;
         };
         if self.style_record_generation_is_live(record, final_record.base_generation()) {
-            self.shared_style_records.entry(key).or_insert(SharedStyleRecord {
-                record: raw_record,
-                inherited_group_swap_eligible: node
-                    .element_index()
-                    .is_some_and(|index| self.columns.inherited_group_swap_eligible(index as usize)),
-            });
+            self.shared_style_records
+                .entry(key)
+                .or_insert_with(|| SharedStyleRecord {
+                    record: raw_record,
+                    inherited_group_swap_eligible: node
+                        .element_index()
+                        .is_some_and(|index| self.columns.inherited_group_swap_eligible(index as usize)),
+                });
         }
     }
 
@@ -814,14 +818,13 @@ impl ComputedGroupSets {
             .expect("computed group-set payload names a live group")
     }
 
-    fn group_identities(&self, set: ComputedGroupSetID) -> Vec<ComputedGroupID> {
+    fn group_identities(&self, set: ComputedGroupSetID) -> impl Iterator<Item = ComputedGroupID> {
         self.sets[set]
             .payloads
             .iter()
             .copied()
             .enumerate()
-            .map(|(index, payload)| self.group_identity(index, payload))
-            .collect()
+            .map(move |(index, payload)| self.group_identity(index, payload))
     }
 
     fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
@@ -1151,23 +1154,20 @@ impl ComputedGroupSets {
             || old_record
                 .longhand_table
                 .and_then(|table| self.computed_longhand_tables.get_index(table.index()))
-                .is_none_or(|retained| {
-                    !crate::css::style_compute::active_transition_properties(retained.table()).is_empty()
-                })
+                .is_none_or(|retained| crate::css::style_compute::has_active_transition_properties(retained.table()))
         {
             return None;
         }
         let old_group_set = self.sets.get_index(old_record.groups.0 as usize)?;
-        let old_payloads = old_group_set.payloads.to_vec();
         let parent_inherited = self.columns.inherited_groups(parent_index)?;
-        let parent_groups = self.inherited_sets.get_index(parent_inherited.0 as usize)?.to_vec();
+        let parent_groups = self.inherited_sets.get_index(parent_inherited.0 as usize)?.as_ref();
         if parent_groups.len() != INHERITED_GROUP_COUNT || old_group_set.payloads.len() < INHERITED_GROUP_COUNT {
             return None;
         }
 
         if current_color_dependencies & !INHERITED_GROUP_MASK != 0 {
             let inherited_box = unsafe {
-                &*old_payloads[crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_BOX]
+                &*old_group_set.payloads[crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_BOX]
                     .cast::<crate::css::computed_values::InheritedBoxValues>()
             };
             let dependencies = self.current_color_dependency_properties(target)?;
@@ -1215,8 +1215,7 @@ impl ComputedGroupSets {
             .and_then(|record| self.style_records.get_index(record.index()))
             .and_then(|record| record.longhand_table);
         if parent_table.is_some_and(|table| {
-            !crate::css::style_compute::active_transition_properties(self.computed_longhand_tables[table].table())
-                .is_empty()
+            crate::css::style_compute::has_active_transition_properties(self.computed_longhand_tables[table].table())
         }) {
             return None;
         }
@@ -1231,8 +1230,19 @@ impl ComputedGroupSets {
             _ => return None,
         };
 
-        let mut groups = self.group_identities(old_record.groups);
-        groups[..INHERITED_GROUP_COUNT].copy_from_slice(&parent_groups);
+        let mut groups: SmallVec<[_; crate::css::table_group_builder::group_index::COUNT]> = parent_groups
+            .iter()
+            .copied()
+            .chain(
+                old_group_set
+                    .payloads
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .skip(INHERITED_GROUP_COUNT)
+                    .map(|(index, payload)| self.group_identity(index, payload)),
+            )
+            .collect();
         if let Some(table) = swapped_table
             && current_color_dependencies & !INHERITED_GROUP_MASK != 0
         {
@@ -1246,27 +1256,28 @@ impl ComputedGroupSets {
                     .payload
                     .cast::<crate::css::computed_value_types::InheritedUIValues>()
             };
-            for group in INHERITED_GROUP_COUNT..groups.len() {
+            for (group, group_identity) in groups.iter_mut().enumerate().skip(INHERITED_GROUP_COUNT) {
                 if current_color_dependencies & (1 << group) == 0 {
                     continue;
                 }
+                let old_payload = self.groups[*group_identity].payload;
                 let payload = unsafe {
                     crate::css::table_group_builder::rebuild_group_for_inherited_current_color(
                         &*table,
                         group,
-                        old_payloads[group],
+                        old_payload,
                         inherited_text.color,
                         inherited_ui.color_scheme,
                     )
                 }
                 .expect("a supported currentcolor group rebuilds from its computed table");
-                let identity = if payload == old_payloads[group] {
-                    groups[group]
+                let identity = if payload == old_payload {
+                    *group_identity
                 } else {
                     self.intern_group(group, payload).0
                 };
                 release_group_payload(group, payload);
-                groups[group] = identity;
+                *group_identity = identity;
             }
         }
         let group_set = self.intern_group_set(&groups).0;
@@ -1337,9 +1348,8 @@ impl ComputedGroupSets {
         let old_record = *self.style_records.get_index(base_style_record_identity.index())?;
         let old_table = old_record.longhand_table?;
         let old_group_set = self.sets.get_index(old_record.groups.0 as usize)?;
-        let old_payloads = old_group_set.payloads.to_vec();
-        if groups_to_rebuild >> old_payloads.len() != 0
-            || old_payloads.len() <= crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_UI
+        if groups_to_rebuild >> old_group_set.payloads.len() != 0
+            || old_group_set.payloads.len() <= crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_UI
         {
             return None;
         }
@@ -1357,7 +1367,7 @@ impl ComputedGroupSets {
             let specified = table
                 .retained_inheritance_dependent_values()
                 .find(|(candidate, value)| *candidate == property && retained_value_depends_on_current_color(value))
-                .map(|(_, value)| value.clone_retained());
+                .map(|(_, value)| value);
             let Some(specified) = specified else {
                 continue;
             };
@@ -1406,18 +1416,20 @@ impl ComputedGroupSets {
             crate::css::computed_longhand_table::rust_computed_longhand_table_release(table.cast_mut());
         };
 
-        let mut groups = self.group_identities(old_record.groups);
+        let mut groups: SmallVec<[_; crate::css::table_group_builder::group_index::COUNT]> =
+            self.group_identities(old_record.groups).collect();
         let mut canonicalized_groups = 0_u32;
-        for group in 0..groups.len() {
+        for (group, group_identity) in groups.iter_mut().enumerate() {
             if groups_to_rebuild & (1 << group) == 0 {
                 continue;
             }
+            let old_payload = self.groups[*group_identity].payload;
             let payload = if group == STYLE_GROUP_INDEX_FONT {
                 unsafe {
                     crate::css::table_group_builder::rebuild_font_group_from_table(
                         &*table,
                         font.expect("a font group rebuild carries the resolved font"),
-                        old_payloads[group],
+                        old_payload,
                     )
                 }
             } else {
@@ -1425,7 +1437,7 @@ impl ComputedGroupSets {
                     crate::css::table_group_builder::rebuild_group_from_table(
                         &*table,
                         group,
-                        old_payloads[group],
+                        old_payload,
                         current_color,
                         used_color_scheme,
                         Some(length),
@@ -1438,15 +1450,14 @@ impl ComputedGroupSets {
             };
             // An equal payload keeps the old identity, as a C++ build adopts its parent's and
             // predecessor's identical payloads.
-            let identity =
-                if payload == old_payloads[group] || style_group_payloads_equal(group, old_payloads[group], payload) {
-                    canonicalized_groups += 1;
-                    groups[group]
-                } else {
-                    self.intern_group(group, payload).0
-                };
+            let identity = if payload == old_payload || style_group_payloads_equal(group, old_payload, payload) {
+                canonicalized_groups += 1;
+                *group_identity
+            } else {
+                self.intern_group(group, payload).0
+            };
             release_group_payload(group, payload);
-            groups[group] = identity;
+            *group_identity = identity;
         }
         let group_set = self.intern_group_set(&groups).0;
         let holds_image_values = self
@@ -2266,16 +2277,20 @@ impl ComputedGroupSets {
         {
             return false;
         }
-        let first_groups = &self.sets[first.groups].payloads;
-        let second_groups = &self.sets[second.groups].payloads;
-        if first_groups.len() != second_groups.len()
-            || first_groups
-                .iter()
-                .zip(second_groups)
-                .enumerate()
-                .any(|(index, (&first, &second))| first != second && !style_group_payloads_equal(index, first, second))
-        {
-            return false;
+        if first.groups != second.groups {
+            let first_groups = &self.sets[first.groups].payloads;
+            let second_groups = &self.sets[second.groups].payloads;
+            if first_groups.len() != second_groups.len()
+                || first_groups
+                    .iter()
+                    .zip(second_groups)
+                    .enumerate()
+                    .any(|(index, (&first, &second))| {
+                        first != second && !style_group_payloads_equal(index, first, second)
+                    })
+            {
+                return false;
+            }
         }
         match (first.longhand_table, second.longhand_table) {
             (None, None) => true,
@@ -2384,6 +2399,9 @@ impl ComputedGroupSets {
         else {
             return false;
         };
+        if record.groups == node_set {
+            return true;
+        }
         // Reclamation interns an equal payload under a new identity, so the groups compare by
         // content past their identities.
         let record_groups = &self.sets[record.groups].payloads;
@@ -2947,7 +2965,7 @@ impl ComputedGroupSets {
     pub(super) fn reclaim_unreachable(&mut self) -> ComputedGroupRetention {
         let reachable = self.reachability();
         let retention = ComputedGroupRetention {
-            retained: self.groups.live_identities().count(),
+            retained: self.groups.live_identities().len(),
             reachable: reachable.groups.iter().filter(|&&reachable| reachable).count(),
         };
         if replaying_style_groups() {
@@ -2991,35 +3009,43 @@ impl ComputedGroupSets {
                 .shrink_committed(size_of_val(set.payloads.as_ref()) as u64);
             self.sets.retire_identity(set.identity_hash, identity);
         }
-        for identity in self.inherited_sets.live_identities().collect::<Vec<_>>() {
-            if reachable.inherited_sets[identity.index()] {
-                continue;
-            }
+        for identity in self
+            .inherited_sets
+            .live_identities()
+            .filter(|identity| !reachable.inherited_sets[identity.index()])
+            .collect::<Vec<_>>()
+        {
             let groups = std::mem::take(self.inherited_sets.get_mut(identity));
             self.group_set_nested_memory
                 .shrink_committed(size_of_val(groups.as_ref()) as u64);
             self.inherited_sets.retire_identity(content_hash(&groups), identity);
         }
-        for identity in self.custom_property_environments.live_identities().collect::<Vec<_>>() {
-            if reachable.custom_property_environments[identity.index()] {
-                continue;
-            }
+        for identity in self
+            .custom_property_environments
+            .live_identities()
+            .filter(|identity| !reachable.custom_property_environments[identity.index()])
+            .collect::<Vec<_>>()
+        {
             let environment = *self.custom_property_environments.get(identity);
             self.custom_property_environments
                 .retire_identity(content_hash(environment), identity);
         }
-        for identity in self.computed_fixed_metadata.live_identities().collect::<Vec<_>>() {
-            if reachable.fixed_metadata[identity.index()] {
-                continue;
-            }
+        for identity in self
+            .computed_fixed_metadata
+            .live_identities()
+            .filter(|identity| !reachable.fixed_metadata[identity.index()])
+            .collect::<Vec<_>>()
+        {
             let metadata = *self.computed_fixed_metadata.get(identity);
             self.computed_fixed_metadata
                 .retire_identity(content_hash(metadata), identity);
         }
-        for identity in self.computed_longhand_tables.live_identities().collect::<Vec<_>>() {
-            if reachable.longhand_tables[identity.index()] {
-                continue;
-            }
+        for identity in self
+            .computed_longhand_tables
+            .live_identities()
+            .filter(|identity| !reachable.longhand_tables[identity.index()])
+            .collect::<Vec<_>>()
+        {
             let retained = &self.computed_longhand_tables[identity];
             let hash = longhand_table_hash_with_slot_hash_sum(retained.table(), retained.slot_hash_sum);
             let table = std::mem::replace(
@@ -3033,10 +3059,12 @@ impl ComputedGroupSets {
                 .shrink_committed(size_of_val(table.value_view()) as u64);
             self.computed_longhand_tables.retire_identity(hash, identity);
         }
-        for identity in self.groups.live_identities().collect::<Vec<_>>() {
-            if reachable.groups[identity.index()] {
-                continue;
-            }
+        for identity in self
+            .groups
+            .live_identities()
+            .filter(|identity| !reachable.groups[identity.index()])
+            .collect::<Vec<_>>()
+        {
             let group = std::mem::replace(
                 self.groups.get_mut(identity),
                 ComputedGroup {
@@ -3062,7 +3090,7 @@ impl ComputedGroupSets {
         }
         self.style_records_interned_since_reclamation = 0;
         let retention = self.reclaim_unreachable();
-        self.next_reclamation_after = self.style_records.live_identities().count().max(1024);
+        self.next_reclamation_after = self.style_records.live_identities().len().max(1024);
         Some(retention)
     }
 
@@ -3126,7 +3154,6 @@ impl ComputedGroupSets {
         let record = self.style_records.get_index(base_style_record.index())?;
         Some(
             self.group_identities(record.groups)
-                .into_iter()
                 .map(|identity| identity.0)
                 .collect(),
         )
@@ -3390,13 +3417,15 @@ impl ComputedGroupSets {
                 self.style_record_generation_is_live(style_record, final_style_record.base_generation()),
                 "base style-record is not live"
             );
-            let pin_count = self
-                .base_style_record_pins
-                .get_mut(&style_record)
-                .expect("base style-record is pinned");
+            let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.base_style_record_pins.entry(style_record)
+            else {
+                unreachable!("base style-record is pinned");
+            };
+            let pin_count = entry.get_mut();
             *pin_count = pin_count.checked_sub(1).expect("base style-record is pinned");
             if *pin_count == 0 {
-                self.base_style_record_pins.remove(&style_record);
+                entry.remove();
             }
             return;
         }
@@ -3535,12 +3564,14 @@ fn longhand_table_hash_with_slot_hash_sum(table: &ComputedLonghandTable, slot_ha
     table.pseudo_element_styles().hash(&mut hasher);
     unsafe { crate::css::style_value::style_value_content_hash(table.raw_cascaded_font_size().cast()) }
         .hash(&mut hasher);
-    let mut inheritance_dependent = table.inheritance_dependent_values().collect::<Vec<_>>();
-    inheritance_dependent.sort_unstable_by_key(|(property, _)| *property);
-    for (property, value) in inheritance_dependent {
-        property.hash(&mut hasher);
-        unsafe { crate::css::style_value::style_value_content_hash(value.cast()) }.hash(&mut hasher);
+    // NB: Inheritance-dependent values compare independently of insertion order. Sum the
+    //     property-mixed hashes, as for longhand slots, without copying and sorting the values.
+    let mut inheritance_dependent_hash_sum = 0_u64;
+    for (property, value) in table.inheritance_dependent_values() {
+        inheritance_dependent_hash_sum =
+            inheritance_dependent_hash_sum.wrapping_add(longhand_slot_hash(usize::from(property), value));
     }
+    inheritance_dependent_hash_sum.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3841,6 +3872,7 @@ mod tests {
             tree_scope: 0,
             inherited_groups: sets.inherited_groups_for_shared_style(record).unwrap(),
             environment: 1,
+            font_environment_generation: 1,
             shape: [0; 4],
         };
         sets.remember_shared_style_record(node, key, record);

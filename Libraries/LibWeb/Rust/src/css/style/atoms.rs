@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -132,16 +133,16 @@ impl GlobalAtoms {
     }
 
     fn release_raw(&mut self, raw: usize, expected: StyleAtomID) {
-        let entry = self
-            .raw
-            .get_mut(&raw)
-            .expect("a document must release a live global atom");
+        let Entry::Occupied(mut occupied) = self.raw.entry(raw) else {
+            unreachable!("a document must release a live global atom");
+        };
+        let entry = occupied.get_mut();
         assert_eq!(entry.atom, expected);
         entry.document_references -= 1;
         if entry.document_references != 0 {
             return;
         }
-        let entry = self.raw.remove(&raw).unwrap();
+        let entry = occupied.remove();
         self.available.insert(entry.atom.0);
         if entry.raw_lifetime == Some(RawAtomLifetime::RetainedFlyString) {
             // SAFETY: acquire_raw retained exactly one global reference for this entry.
@@ -153,16 +154,16 @@ impl GlobalAtoms {
     }
 
     fn release_qualified(&mut self, key: (u32, u32), expected: StyleAtomID) {
-        let entry = self
-            .qualified
-            .get_mut(&key)
-            .expect("a document must release a live global qualified atom");
+        let Entry::Occupied(mut occupied) = self.qualified.entry(key) else {
+            unreachable!("a document must release a live global qualified atom");
+        };
+        let entry = occupied.get_mut();
         assert_eq!(entry.atom, expected);
         entry.document_references -= 1;
         if entry.document_references != 0 {
             return;
         }
-        let entry = self.qualified.remove(&key).unwrap();
+        let entry = occupied.remove();
         self.available.insert(entry.atom.0);
     }
 }
@@ -196,7 +197,7 @@ pub(super) struct DocumentAtoms {
 }
 
 pub(super) struct PinnedAtoms {
-    atoms: Vec<StyleAtomID>,
+    atoms: Box<[StyleAtomID]>,
     pins: Rc<AtomPins>,
 }
 
@@ -221,23 +222,27 @@ pub(super) const PIN_RELEASES_PER_SWEEP: u64 = 256;
 
 impl Drop for PinnedAtoms {
     fn drop(&mut self) {
+        if self.atoms.is_empty() {
+            return;
+        }
         let mut pinned = self.pins.counts.borrow_mut();
         for atom in &self.atoms {
-            let count = pinned.get_mut(atom).expect("a pinned atom must have a live count");
+            let Entry::Occupied(mut entry) = pinned.entry(*atom) else {
+                unreachable!("a pinned atom must have a live count");
+            };
+            let count = entry.get_mut();
             *count = count.checked_sub(1).expect("pinned atom count underflow");
             if *count == 0 {
-                pinned.remove(atom);
+                entry.remove();
             }
         }
-        if !self.atoms.is_empty() {
-            self.pins.releases.set(
-                self.pins
-                    .releases
-                    .get()
-                    .checked_add(1)
-                    .expect("atom pin release count overflow"),
-            );
-        }
+        self.pins.releases.set(
+            self.pins
+                .releases
+                .get()
+                .checked_add(1)
+                .expect("atom pin release count overflow"),
+        );
     }
 }
 
@@ -318,7 +323,7 @@ impl DocumentAtoms {
     }
 
     pub(super) fn pin(&self, atoms: impl IntoIterator<Item = StyleAtomID>) -> PinnedAtoms {
-        let atoms = atoms.into_iter().filter(|atom| !atom.is_none()).collect::<Vec<_>>();
+        let atoms = atoms.into_iter().filter(|atom| !atom.is_none()).collect::<Box<[_]>>();
         let mut pinned = self.pins.counts.borrow_mut();
         for &atom in &atoms {
             *pinned.entry(atom).or_default() += 1;
@@ -385,6 +390,12 @@ impl DocumentAtoms {
     }
 
     pub(super) fn finish_sweep(&mut self, reclaimable: &[StyleAtomID]) -> Vec<ReclaimedStyleAtom> {
+        self.pins.releases.set(0);
+        self.reported_pin_releases.set(0);
+        if reclaimable.is_empty() {
+            self.sweep_at = self.raw.len() + self.qualified.len() + 256;
+            return Vec::new();
+        }
         let reclaimable = reclaimable.iter().copied().collect::<HashSet<_>>();
         let mut raw = Vec::new();
         self.raw.retain(|&identity, &mut atom| {
@@ -422,8 +433,6 @@ impl DocumentAtoms {
         }
 
         self.sweep_at = self.raw.len() + self.qualified.len() + 256;
-        self.pins.releases.set(0);
-        self.reported_pin_releases.set(0);
         let mut reclaimed = raw
             .into_iter()
             .map(|(raw, atom)| ReclaimedStyleAtom {

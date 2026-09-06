@@ -21,6 +21,7 @@
 use super::capacity::capacity_bytes;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::fast_hasher;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::mem::size_of;
@@ -445,14 +446,14 @@ impl PrefixAutomaton {
                     local: chain_step.local,
                 },
             };
-            let compound = match self.compound_ids.get(&predicate).copied() {
-                Some(compound) => compound,
-                None => {
+            let compound = match self.compound_ids.entry(predicate) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
                     let compound = PrefixCompoundID(
                         u32::try_from(self.compounds.len()).expect("selector prefix compound space exhausted"),
                     );
                     let dispatch_key = program.prefix_dispatch_key(chain_step.local);
-                    let runtime_predicate = match &predicate {
+                    let runtime_predicate = match entry.key() {
                         PrefixPredicateKey::Features {
                             features,
                             required_positional_bits,
@@ -477,7 +478,7 @@ impl PrefixAutomaton {
                         dispatch_key,
                     });
                     self.buckets.entry(dispatch_key).or_default();
-                    self.compound_ids.insert(predicate, compound);
+                    entry.insert(compound);
                     compound
                 }
             };
@@ -486,9 +487,9 @@ impl PrefixAutomaton {
                 predecessor,
                 axis: chain_step.axis,
             };
-            let step = match self.step_ids.get(&key).copied() {
-                Some(step) => step,
-                None => {
+            let step = match self.step_ids.entry(key) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
                     let step =
                         PrefixStepID(u32::try_from(self.steps.len()).expect("selector prefix step space exhausted"));
                     self.steps.push(PrefixStep {
@@ -498,7 +499,7 @@ impl PrefixAutomaton {
                     });
                     self.step_predecessors.push(predecessor.map_or(u32::MAX, |step| step.0));
                     self.step_output_builders.push(PrefixStepOutputBuilder::default());
-                    self.step_ids.insert(key, step);
+                    entry.insert(step);
                     // Only root steps dispatch through buckets: a continuation step is reachable
                     // exactly when its predecessor put it in the parent state, so transitions find
                     // it by walking the (small) active set and asking whether the row carries its
@@ -571,28 +572,30 @@ impl PrefixAutomaton {
         for (order, &step) in step_by_dispatch_order.iter().enumerate() {
             remap[step.0 as usize] = u32::try_from(order).expect("selector prefix step space exhausted");
         }
-        let old_steps = std::mem::take(&mut self.steps);
-        self.steps = step_by_dispatch_order
-            .iter()
-            .map(|step| old_steps[step.0 as usize].clone())
-            .collect();
-        let mut old_builders = std::mem::take(&mut self.step_output_builders);
-        self.step_output_builders = step_by_dispatch_order
-            .iter()
-            .map(|step| std::mem::take(&mut old_builders[step.0 as usize]))
-            .collect();
-        let old_predecessors = std::mem::take(&mut self.step_predecessors);
-        self.step_predecessors = step_by_dispatch_order
-            .iter()
-            .map(|step| {
-                let predecessor = old_predecessors[step.0 as usize];
-                if predecessor == u32::MAX {
-                    u32::MAX
-                } else {
-                    remap[predecessor as usize]
+        // Apply each permutation cycle to the parallel arrays in place. Replacing a visited
+        // source with its own index makes the cycle a no-op when reached again.
+        for start in 0..step_by_dispatch_order.len() {
+            let mut current = start;
+            loop {
+                let next = step_by_dispatch_order[current].0 as usize;
+                step_by_dispatch_order[current] =
+                    PrefixStepID(u32::try_from(current).expect("selector prefix step space exhausted"));
+                if next == start {
+                    break;
                 }
-            })
-            .collect();
+                self.steps.swap(current, next);
+                self.step_output_builders.swap(current, next);
+                self.step_predecessors.swap(current, next);
+                current = next;
+            }
+        }
+        for predecessor in &mut self.step_predecessors {
+            if *predecessor != u32::MAX {
+                *predecessor = remap[*predecessor as usize];
+            }
+        }
+        self.steps.shrink_to_fit();
+        self.step_predecessors.shrink_to_fit();
         let remap_steps = |steps: &mut Vec<PrefixStepID>| {
             for step in steps {
                 step.0 = remap[step.0 as usize];
@@ -3628,6 +3631,9 @@ impl PrefixStates {
     }
 
     fn intern_output_matches(&mut self) -> PrefixMatchSetID {
+        if self.output_matches.is_empty() {
+            return PrefixMatchSetID(0);
+        }
         let hash = super::intern_table::content_hash(&self.output_matches);
         if let Some(candidate) = self
             .match_sets_by_hash
@@ -3647,6 +3653,9 @@ impl PrefixStates {
     }
 
     fn intern_output_truth(&mut self) -> PrefixTruthSetID {
+        if self.output_matched_steps.is_empty() {
+            return PrefixTruthSetID(0);
+        }
         let hash = super::intern_table::content_hash(&self.output_matched_steps);
         if let Some(candidate) = self.truth_sets_by_hash.find(hash, |candidate, ()| {
             self.truth_in(candidate) == self.output_matched_steps
@@ -3665,6 +3674,9 @@ impl PrefixStates {
     }
 
     fn intern_result(&mut self, matches: PrefixMatchSetID, truth: PrefixTruthSetID) -> PrefixResultID {
+        if matches == PrefixMatchSetID(0) && truth == PrefixTruthSetID(0) {
+            return PrefixResultID(0);
+        }
         let hash = super::intern_table::content_hash((matches, truth));
         if let Some(result) = self.result_ids.find(hash, |_result, candidate| {
             candidate.matches == matches && candidate.truth == truth
@@ -3886,12 +3898,10 @@ impl PrefixStates {
                 self.ancestor_chain,
             ];
             cached [];
-            nested [
-                self.states_by_hash_collision_bytes,
-                self.relation.as_ref().map_or(0, |relation| size_of::<PrefixRelation>() as u64 + relation.capacity_bytes()),
-            ];
+            nested [self.states_by_hash_collision_bytes];
             skip [
                 self.local_fact_interner,
+                self.relation,
                 self.comparison_epoch,
                 self.states_by_hash_collision_bytes,
                 self.new_descendant_hash,
@@ -3916,6 +3926,13 @@ impl PrefixStates {
             nested [self.top_level_capacity_bytes()];
             skip [];
         }
+    }
+
+    #[must_use]
+    pub(super) fn relation_capacity_bytes(&self) -> u64 {
+        self.relation.as_ref().map_or(0, |relation| {
+            size_of::<PrefixRelation>() as u64 + relation.capacity_bytes()
+        })
     }
 }
 
@@ -4190,6 +4207,7 @@ pub(super) struct PrefixStateCache {
     by_program: Column<Option<Box<PrefixStates>>>,
     scratch_memory: MemoryLease,
     residency: MemoryLease,
+    relation_residency: MemoryLease,
     lifecycle: PrefixStateCacheLifecycle,
 }
 
@@ -4232,6 +4250,7 @@ impl Default for PrefixStateCache {
             by_program: Column::default(),
             scratch_memory: MemoryLease::new(MemoryCategory::BatchScratch),
             residency: MemoryLease::new(MemoryCategory::PrefixTransitionCache),
+            relation_residency: MemoryLease::new(MemoryCategory::PrefixRelation),
             lifecycle: PrefixStateCacheLifecycle::Scratch(PrefixStateCacheCoverage::Full),
         }
     }
@@ -4278,17 +4297,25 @@ impl PrefixStateCache {
     }
 
     pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
+        let (transition_bytes, relation_bytes) =
+            self.by_program
+                .iter()
+                .flatten()
+                .fold((0, 0), |(transitions, relations), states| {
+                    (
+                        transitions + size_of::<PrefixStates>() as u64 + states.capacity_bytes(),
+                        relations + states.relation_capacity_bytes(),
+                    )
+                });
         let bytes = capacity_bytes! {
             shallow [self.by_program];
             cached [];
-            nested [self
-                .by_program
-                .iter()
-                .flatten()
-                .map(|states| size_of::<PrefixStates>() as u64 + states.capacity_bytes())
-                .sum::<u64>()];
-            skip [self.scratch_memory, self.residency, self.lifecycle];
+            nested [transition_bytes];
+            skip [self.scratch_memory, self.residency, self.relation_residency, self.lifecycle];
         };
+        if relation_bytes != 0 || self.relation_residency.bytes() != 0 {
+            self.relation_residency.reconcile_committed(memory, relation_bytes);
+        }
         if self.lifecycle.is_retained() {
             self.residency.reconcile_committed(memory, bytes);
             memory.finish_committed_acceleration_growth(MemoryCategory::PrefixTransitionCache);
@@ -4303,8 +4330,35 @@ impl PrefixStateCache {
         } else {
             self.scratch_memory.release();
         }
+        self.relation_residency.release();
         self.by_program = Column::default();
         self.lifecycle = PrefixStateCacheLifecycle::Scratch(self.lifecycle.coverage());
+    }
+
+    pub(super) fn release_transition_states(&mut self) {
+        if !self.has_relation() {
+            self.release();
+            return;
+        }
+        for slot in self.by_program.iter_mut() {
+            // The next installation restores the relation answers from the relation.
+            *slot = slot.as_mut().and_then(|states| states.relation.take()).map(|relation| {
+                let mut states = PrefixStates::new(0);
+                states.relation = Some(relation);
+                Box::new(states)
+            });
+        }
+        if self.lifecycle.is_retained() {
+            self.residency.release();
+        } else {
+            self.scratch_memory.release();
+        }
+        let coverage = self.lifecycle.coverage();
+        self.lifecycle = if self.lifecycle.is_current() {
+            PrefixStateCacheLifecycle::CurrentScratch(coverage)
+        } else {
+            PrefixStateCacheLifecycle::Scratch(coverage)
+        };
     }
 
     pub(super) fn retain(&mut self, memory: &mut MemoryController) -> bool {
@@ -4391,6 +4445,12 @@ impl PrefixStateCache {
             PrefixStateCacheLifecycle::CurrentRetained(coverage) => PrefixStateCacheLifecycle::Retained(coverage),
             previous @ (PrefixStateCacheLifecycle::Scratch(_) | PrefixStateCacheLifecycle::Retained(_)) => previous,
         };
+        for states in self.by_program.iter_mut().flatten() {
+            if let Some(relation) = states.relation.as_mut() {
+                // A key's routes change with the program.
+                relation.handled_routing_keys.clear();
+            }
+        }
     }
 
     pub(super) fn make_scratch(&mut self, memory: &mut MemoryController) {
@@ -4423,12 +4483,12 @@ impl PrefixStateCache {
         if self.by_program.get(index).is_none_or(Option::is_none) {
             return;
         }
-        let released = size_of::<PrefixStates>() as u64
-            + self.by_program[index]
-                .as_ref()
-                .expect("program entry is live")
-                .capacity_bytes();
+        let states = self.by_program[index].as_ref().expect("program entry is live");
+        let relation_released = states.relation_capacity_bytes();
+        let released = size_of::<PrefixStates>() as u64 + states.capacity_bytes();
         self.by_program[index] = None;
+        self.relation_residency
+            .shrink_committed(relation_released.min(self.relation_residency.bytes()));
         let held = if self.lifecycle.is_retained() {
             self.residency.bytes()
         } else {
@@ -4500,17 +4560,28 @@ fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bo
         FeatureTest::Attribute(test) => {
             let folds = !test.fold_in_namespace.is_none() && facts.namespace_of(row) == test.fold_in_namespace;
             facts.attributes_of(row).iter().any(|attribute| {
+                let value_matches = match test.operator {
+                    AttributeOperator::Presence => true,
+                    AttributeOperator::Exact => attribute.value == test.value_atom,
+                    _ => unreachable!("only atom-answerable features are canonicalized"),
+                };
+                if !value_matches {
+                    return false;
+                }
+                if !test.any_namespace {
+                    if attribute.name == test.name {
+                        return true;
+                    }
+                    if !folds {
+                        return false;
+                    }
+                }
                 let forms = facts.attribute_name_forms(attribute.name);
                 let (written, folded) = match test.any_namespace {
                     true => (forms.local, forms.folded_local),
                     false => (attribute.name, forms.folded_name),
                 };
-                (written == test.name || (folds && folded == test.folded))
-                    && match test.operator {
-                        AttributeOperator::Presence => true,
-                        AttributeOperator::Exact => attribute.value == test.value_atom,
-                        _ => unreachable!("only atom-answerable features are canonicalized"),
-                    }
+                written == test.name || (folds && folded == test.folded)
             })
         }
     }

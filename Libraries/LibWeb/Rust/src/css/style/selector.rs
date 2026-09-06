@@ -25,6 +25,7 @@
 //! arrives with the semantics it needs rather than as a placeholder that would have to be guessed
 //! at now.
 
+use super::capacity::ShallowCapacityBytes;
 use super::capacity::capacity_bytes;
 use super::column::BitColumn;
 use super::column::Column;
@@ -40,6 +41,7 @@ use super::index::StyleNodeFacts;
 use super::index::dispatch_bloom_bit;
 use super::instrumentation::Counter;
 use super::instrumentation::Counters;
+use smallvec::SmallVec;
 use std::cell::Cell;
 use std::cell::Ref;
 use std::cell::RefCell;
@@ -605,7 +607,7 @@ pub(super) struct SelectorDispatchMetadata {
 
 /// Derived acceleration is not part of a selector program's semantic identity.
 #[derive(Default)]
-struct CachedDispatchMetadata(Vec<SelectorDispatchMetadata>);
+struct CachedDispatchMetadata(Box<[SelectorDispatchMetadata]>);
 
 impl PartialEq for CachedDispatchMetadata {
     fn eq(&self, _other: &Self) -> bool {
@@ -620,6 +622,7 @@ impl Hash for CachedDispatchMetadata {
 }
 
 impl SelectorDispatchMetadata {
+    /// Sorted, distinct keys through which this entry can be reached.
     #[must_use]
     pub(super) fn subject_dispatch_keys(&self) -> &[DispatchKey] {
         &self.subject_dispatch_keys
@@ -640,7 +643,6 @@ enum DispatchRelation {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DispatchQuery {
-    Single,
     Alternatives,
     Required,
 }
@@ -924,15 +926,15 @@ impl SelectorProgramBuilder {
     }
 
     /// Add the extended language ranges of one `:lang()` and return their range.
-    pub fn push_language_ranges(&mut self, ranges: &[&[u16]]) -> (u32, u32) {
+    pub fn push_language_ranges(&mut self, ranges: impl IntoIterator<Item = impl AsRef<[u16]>>) -> (u32, u32) {
         let first = u32::try_from(self.program.language_ranges.len()).expect("language range space exhausted");
         for range in ranges {
-            let literal = self.push_literal(range);
+            let literal = self.push_literal(range.as_ref());
             self.program.language_ranges.push(literal);
         }
         (
             first,
-            u32::try_from(ranges.len()).expect("language range space exhausted"),
+            u32::try_from(self.program.language_ranges.len() - first as usize).expect("language range space exhausted"),
         )
     }
 
@@ -946,22 +948,22 @@ impl SelectorProgramBuilder {
         // Conjunction is associative, and one compound is one node: routing reads a compound's
         // operands to find what the selector says about the subject's parent, and an operand that
         // is itself a conjunction would hide the rest of the compound from the walk that reads it.
-        let mut flattened: Vec<SelectorNodeID> = Vec::with_capacity(operands.len());
+        let first = self.program.operands.len();
+        self.program.operands.reserve(operands.len());
         for &operand in operands {
             match self.program.node(operand) {
                 SelectorOp::And { first, count } => {
-                    flattened.extend_from_slice(self.program.operands(first, count));
+                    let start = first as usize;
+                    self.program.operands.extend_from_within(start..start + count as usize);
                 }
-                _ => flattened.push(operand),
+                _ => self.program.operands.push(operand),
             }
         }
-        let mut sorted = flattened;
-        sorted.sort_by_key(|&operand| self.program.node(operand).cost_rank());
-        let first = u32::try_from(self.program.operands.len()).expect("selector operand space exhausted");
-        self.program.operands.extend_from_slice(&sorted);
+        let nodes = &self.program.nodes;
+        self.program.operands[first..].sort_by_key(|operand| nodes[operand.0 as usize].cost_rank());
         self.push(SelectorOp::And {
-            first,
-            count: u32::try_from(sorted.len()).expect("selector operand space exhausted"),
+            first: u32::try_from(first).expect("selector operand space exhausted"),
+            count: u32::try_from(self.program.operands.len() - first).expect("selector operand space exhausted"),
         })
     }
 
@@ -1650,10 +1652,6 @@ impl SelectorProgram {
         query: DispatchQuery,
         out: &mut Vec<DispatchKey>,
     ) -> bool {
-        if relation == DispatchRelation::Subject && query == DispatchQuery::Single {
-            out.push(self.single_dispatch_key_of(id));
-            return true;
-        }
         if relation != DispatchRelation::Subject {
             let operands = match self.node(id) {
                 SelectorOp::And { first, count } => self.operands(first, count),
@@ -1717,7 +1715,6 @@ impl SelectorProgram {
             SelectorOp::Feature(test) => {
                 let key = Self::dispatch_key_for_feature(test);
                 match query {
-                    DispatchQuery::Single => out.push(key),
                     DispatchQuery::Alternatives | DispatchQuery::Required if key == DispatchKey::Universal => {
                         return query == DispatchQuery::Required;
                     }
@@ -1730,20 +1727,6 @@ impl SelectorProgram {
                     for &operand in self.operands(first, count) {
                         self.dispatch_analysis(operand, relation, query, out);
                     }
-                    true
-                }
-                DispatchQuery::Single => {
-                    let key = self
-                        .operands(first, count)
-                        .iter()
-                        .map(|&operand| {
-                            let mut candidate = Vec::new();
-                            self.dispatch_analysis(operand, relation, query, &mut candidate);
-                            candidate[0]
-                        })
-                        .min_by_key(|key| dispatch_selectivity(*key))
-                        .unwrap_or(DispatchKey::Universal);
-                    out.push(key);
                     true
                 }
                 DispatchQuery::Alternatives => {
@@ -1772,10 +1755,6 @@ impl SelectorProgram {
                 }
             },
             SelectorOp::Or { first, count } => match query {
-                DispatchQuery::Single => {
-                    out.push(DispatchKey::Universal);
-                    true
-                }
                 DispatchQuery::Alternatives => {
                     let start = out.len();
                     for &operand in self.operands(first, count) {
@@ -1787,9 +1766,14 @@ impl SelectorProgram {
                         }
                     }
                     out[start..].sort_unstable();
-                    let mut tail = out.split_off(start);
-                    tail.dedup();
-                    out.extend_from_slice(&tail);
+                    let mut unique_end = start;
+                    for read_index in start..out.len() {
+                        if unique_end == start || out[read_index] != out[unique_end - 1] {
+                            out[unique_end] = out[read_index];
+                            unique_end += 1;
+                        }
+                    }
+                    out.truncate(unique_end);
                     true
                 }
                 DispatchQuery::Required => {
@@ -1803,15 +1787,7 @@ impl SelectorProgram {
             SelectorOp::Where(inner)
             | SelectorOp::Host(inner)
             | SelectorOp::Slotted(inner)
-            | SelectorOp::ExposedToHost { parts: inner, .. } => {
-                if query == DispatchQuery::Single
-                    && matches!(self.node(id), SelectorOp::Host(_) | SelectorOp::Slotted(_))
-                {
-                    out.push(DispatchKey::Universal);
-                    return true;
-                }
-                self.dispatch_analysis(inner, relation, query, out)
-            }
+            | SelectorOp::ExposedToHost { parts: inner, .. } => self.dispatch_analysis(inner, relation, query, out),
             SelectorOp::InScope { inner, .. } if query != DispatchQuery::Required => {
                 self.dispatch_analysis(inner, relation, query, out)
             }
@@ -1833,42 +1809,22 @@ impl SelectorProgram {
                 out.push(DispatchKey::Directionality(value));
                 true
             }
-            SelectorOp::Root if query == DispatchQuery::Single => {
-                out.push(DispatchKey::Root);
-                true
-            }
-            SelectorOp::State(state) if query == DispatchQuery::Single => {
-                out.push(DispatchKey::State(state));
-                true
-            }
-            SelectorOp::Heading(_) if query == DispatchQuery::Single => {
-                out.push(DispatchKey::Heading);
-                true
-            }
-            _ if query == DispatchQuery::Single => {
-                out.push(DispatchKey::Universal);
-                true
-            }
             _ => query == DispatchQuery::Required,
         }
     }
 
     fn dispatch_key_of(&self, id: SelectorNodeID) -> DispatchKey {
-        self.single_dispatch_key_of(id)
-    }
-
-    fn single_dispatch_key_of(&self, id: SelectorNodeID) -> DispatchKey {
         match self.node(id) {
             SelectorOp::Feature(test) => Self::dispatch_key_for_feature(test),
             SelectorOp::And { first, count } => self
                 .operands(first, count)
                 .iter()
-                .map(|&operand| self.single_dispatch_key_of(operand))
+                .map(|&operand| self.dispatch_key_of(operand))
                 .min_by_key(|&key| dispatch_selectivity(key))
                 .unwrap_or(DispatchKey::Universal),
             SelectorOp::Where(inner)
             | SelectorOp::InScope { inner, .. }
-            | SelectorOp::ExposedToHost { parts: inner, .. } => self.single_dispatch_key_of(inner),
+            | SelectorOp::ExposedToHost { parts: inner, .. } => self.dispatch_key_of(inner),
             SelectorOp::Part(part) => DispatchKey::Part(part),
             SelectorOp::ValueState {
                 kind: ValueStateTestKind::CustomState,
@@ -2463,14 +2419,13 @@ impl Drop for SharedSelectorProgram {
             let Ok(mut shared) = shared.try_borrow_mut() else {
                 return;
             };
-            let remove_bucket = if let Some(bucket) = shared.by_hash.get_mut(&self.hash) {
-                bucket.retain(|candidate| candidate.strong_count() != 0);
-                bucket.is_empty()
-            } else {
-                false
+            let std::collections::hash_map::Entry::Occupied(mut entry) = shared.by_hash.entry(self.hash) else {
+                return;
             };
-            if remove_bucket {
-                shared.by_hash.remove(&self.hash);
+            let bucket = entry.get_mut();
+            bucket.retain(|candidate| candidate.strong_count() != 0);
+            if bucket.is_empty() {
+                entry.remove();
             }
         });
     }
@@ -2525,7 +2480,7 @@ fn share_selector_program(program: SelectorProgram) -> Rc<SharedSelectorProgram>
 }
 
 enum SelectorProgramStorage {
-    Document(SelectorProgram),
+    Document(Box<SelectorProgram>),
     Process(Rc<SharedSelectorProgram>),
 }
 
@@ -2539,7 +2494,7 @@ impl SelectorProgramStorage {
 
     fn document_capacity_bytes(&self) -> u64 {
         match self {
-            Self::Document(program) => program.capacity_bytes(),
+            Self::Document(program) => size_of::<SelectorProgram>() as u64 + program.capacity_bytes(),
             Self::Process(_) => 0,
         }
     }
@@ -2642,12 +2597,10 @@ impl SelectorPrograms {
             SelectorProgramID(u32::try_from(self.programs.len()).expect("selector program space exhausted"))
         });
         let program = match self.scope {
-            SelectorProgramScope::Document => {
-                self.program_memory.grow_committed(program.capacity_bytes());
-                SelectorProgramStorage::Document(program)
-            }
+            SelectorProgramScope::Document => SelectorProgramStorage::Document(Box::new(program)),
             SelectorProgramScope::Process => SelectorProgramStorage::Process(share_selector_program(program)),
         };
+        self.program_memory.grow_committed(program.document_capacity_bytes());
         if id.0 as usize == self.programs.len() {
             self.programs.push(Some(program));
         } else {
@@ -3044,12 +2997,10 @@ impl RouteDirectory {
     }
 
     fn flatten(building: HashMap<RoutingKey, Vec<RouteID>>, after_change: bool) -> Self {
-        let mut entries = building.into_iter().collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-        let route_count = entries.iter().map(|(_, routes)| routes.len()).sum();
-        let mut ranges = HashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        let route_count = building.values().map(Vec::len).sum();
+        let mut ranges = HashMap::with_capacity_and_hasher(building.len(), Default::default());
         let mut flat_routes = Vec::with_capacity(route_count);
-        for (key, routes) in entries {
+        for (key, routes) in building {
             let offset = u32::try_from(flat_routes.len()).expect("routing directory space exhausted");
             flat_routes.extend_from_slice(&routes);
             ranges.insert(
@@ -3261,12 +3212,12 @@ impl SelectorProgram {
             walk.origin_required
                 .sort_unstable_by_key(|&key| dispatch_selectivity(key));
             walk.origin_required.truncate(MAX_REQUIRED_DISPATCH_KEYS);
-            let mut parent_dispatch = Vec::new();
+            walk.parent_dispatch.clear();
             self.dispatch_analysis(
                 enclosing,
                 DispatchRelation::Parent,
                 DispatchQuery::Alternatives,
-                &mut parent_dispatch,
+                &mut walk.parent_dispatch,
             );
             // Steps taken inside a relative argument lead from the anchor to a possible witness,
             // not from the anchor to the entry's subjects. Only the steps already on the stack when
@@ -3308,7 +3259,7 @@ impl SelectorProgram {
                 anchor,
                 origin_dispatch: &walk.origin_dispatch,
                 origin_required: &walk.origin_required,
-                parent_dispatch: &parent_dispatch,
+                parent_dispatch: &walk.parent_dispatch,
                 waypoints: &walk.applied_waypoints,
             });
         };
@@ -3506,11 +3457,12 @@ impl SelectorProgram {
         // The compound being stepped away from is what a subject reached through this step had to
         // satisfy at this point of the selector. A compound whose set is not a single key describes
         // no requirement that a subject's ancestor walk can check one lookup at a time.
-        let mut keys = Vec::new();
-        let waypoint = match self.dispatch_keys_of(enclosing, &mut keys) && keys.len() == 1 {
-            true => Some(keys[0]),
-            false => None,
-        };
+        walk.origin_dispatch.clear();
+        let waypoint =
+            match self.dispatch_keys_of(enclosing, &mut walk.origin_dispatch) && walk.origin_dispatch.len() == 1 {
+                true => Some(walk.origin_dispatch[0]),
+                false => None,
+            };
         walk.path.push(step);
         walk.waypoints.push(waypoint);
         self.walk_transpose(inner, inner, anchor, walk, visit);
@@ -3529,6 +3481,7 @@ struct TransposeWalk {
     applied_waypoints: Vec<DispatchKey>,
     origin_dispatch: Vec<DispatchKey>,
     origin_required: Vec<DispatchKey>,
+    parent_dispatch: Vec<DispatchKey>,
 }
 
 /// One semantic input a selector entry mentions, with everything routing needs to transpose it.
@@ -4827,6 +4780,7 @@ pub struct MatchEvaluationWorkspace {
 #[derive(Default)]
 struct PositionalAnswers {
     by_test: Vec<(NthPosition, HashMap<StyleNodeID, bool>)>,
+    answer_capacity_bytes: u64,
 }
 
 impl PositionalAnswers {
@@ -4842,10 +4796,14 @@ impl PositionalAnswers {
     fn insert(&mut self, position: NthPosition, node: StyleNodeID, answer: bool) {
         match self.by_test.iter_mut().find(|(candidate, _)| *candidate == position) {
             Some((_, answers)) => {
+                let previous_bytes = answers.shallow_capacity_bytes();
                 answers.insert(node, answer);
+                self.answer_capacity_bytes += answers.shallow_capacity_bytes() - previous_bytes;
             }
             None => {
-                self.by_test.push((position, HashMap::from_iter([(node, answer)])));
+                let answers = HashMap::from_iter([(node, answer)]);
+                self.answer_capacity_bytes += answers.shallow_capacity_bytes();
+                self.by_test.push((position, answers));
             }
         }
     }
@@ -4853,15 +4811,8 @@ impl PositionalAnswers {
     fn capacity_bytes(&self) -> usize {
         (capacity_bytes! {
             shallow [self.by_test];
-            cached [];
-            nested [self.by_test.iter().map(|(_, answers)| {
-                capacity_bytes! {
-                    shallow [*answers];
-                    cached [];
-                    nested [];
-                    skip [];
-                }
-            }).sum::<u64>()];
+            cached [self.answer_capacity_bytes];
+            nested [];
             skip [];
         }) as usize
     }
@@ -4922,16 +4873,10 @@ impl MatchRelationCache {
     ) -> (PrecedingSiblingParentID, Option<PrecedingSiblingPrefix>) {
         let parent = {
             let mut parent_ids = self.preceding_sibling_parent_ids.borrow_mut();
-            match parent_ids.get(&parent).copied() {
-                Some(parent) => parent,
-                None => {
-                    let id = PrecedingSiblingParentID(
-                        u32::try_from(parent_ids.len()).expect("preceding sibling parent space exhausted"),
-                    );
-                    parent_ids.insert(parent, id);
-                    id
-                }
-            }
+            let next_id = parent_ids.len();
+            *parent_ids.entry(parent).or_insert_with(|| {
+                PrecedingSiblingParentID(u32::try_from(next_id).expect("preceding sibling parent space exhausted"))
+            })
         };
         (
             parent,
@@ -5023,16 +4968,6 @@ impl MatchEvaluationWorkspace {
                 .borrow()
                 .sibling_positions(node),
         }
-    }
-
-    fn insert_type_position(&self, node: StyleNodeID, side: MatchEvaluationSide, position: SiblingPositions) -> bool {
-        self.type_positions_by_evaluation_side[side as usize]
-            .borrow_mut()
-            .insert(
-                node.element_index().expect("only elements have sibling positions") as usize,
-                position,
-            )
-            .1
     }
 
     /// A workspace for the candidates of one selector query: sibling geometry is shared, final
@@ -5551,18 +5486,14 @@ impl<'a> MatchEvaluator<'a> {
         self.matches_node(program, id, node, counters)
     }
 
-    fn matches_transitive_relation(
+    fn matches_descendant_relation(
         &self,
         program: &SelectorProgram,
         relation: SelectorNodeID,
         inner: SelectorNodeID,
         node: StyleNodeID,
-        preceding_sibling: bool,
         counters: &mut Counters,
     ) -> Result<bool, Incomplete> {
-        if preceding_sibling {
-            return self.matches_preceding_sibling_prefix(program, relation, inner, node, counters);
-        }
         let (workspace, side) = self.match_workspace.unwrap();
         let cache = workspace.relations(side);
         let program_id = self.transitive_relation_program.get().unwrap();
@@ -5573,15 +5504,11 @@ impl<'a> MatchEvaluator<'a> {
         }
 
         let mut current = node;
-        let mut traversed = Vec::new();
+        let mut traversed: SmallVec<[StyleNodeID; 8]> = SmallVec::new();
         let mut incomplete = None;
         let answer = loop {
             traversed.push(current);
-            let adjacent = match preceding_sibling {
-                true => self.previous_sibling_of(current),
-                false => self.parent_of(current),
-            };
-            let Some(adjacent) = adjacent else {
+            let Some(adjacent) = self.parent_of(current) else {
                 break false;
             };
             counters.bump(Counter::CombinatorSteps);
@@ -5626,10 +5553,14 @@ impl<'a> MatchEvaluator<'a> {
         let Some(parent) = self.parent_of(node) else {
             return Ok(false);
         };
-        let first = self.children_of(parent).next();
         let (parent_id, cached_prefix) = cache.preceding_sibling_prefix(program_id, relation, parent);
-        let mut prefix = cached_prefix.unwrap_or(PrecedingSiblingPrefix {
-            next: first,
+        if let Some(prefix) = cached_prefix
+            && prefix.next == Some(node)
+        {
+            return Ok(prefix.answer);
+        }
+        let mut prefix = cached_prefix.unwrap_or_else(|| PrecedingSiblingPrefix {
+            next: self.children_of(parent).next(),
             answer: false,
         });
         let mut retried_from_start = false;
@@ -5652,7 +5583,7 @@ impl<'a> MatchEvaluator<'a> {
                     return Ok(false);
                 }
                 prefix = PrecedingSiblingPrefix {
-                    next: first,
+                    next: self.children_of(parent).next(),
                     answer: false,
                 };
                 incomplete = None;
@@ -5678,12 +5609,12 @@ impl<'a> MatchEvaluator<'a> {
     /// One per level of `exportparts` forwarding. An element that carries a part name and is
     /// forwarded nowhere has no recorded pairing at all, so the host of the tree it stands in is the
     /// only level it has - which is every part in a document using no `exportparts`.
-    fn part_exposure_hosts(&self, node: StyleNodeID) -> Vec<StyleNodeID> {
+    fn part_exposure_hosts(&self, node: StyleNodeID) -> SmallVec<[StyleNodeID; 1]> {
         let pairs = self.tree.part_hosts_of(node);
         if pairs.is_empty() {
             return self.tree.shadow_host_of(node).into_iter().collect();
         }
-        let mut hosts: Vec<StyleNodeID> = Vec::with_capacity(pairs.len());
+        let mut hosts = SmallVec::new();
         for &(_, host) in pairs {
             if !hosts.contains(&host) {
                 hosts.push(host);
@@ -5826,7 +5757,7 @@ impl<'a> MatchEvaluator<'a> {
                     && self.relative_anchor.get().is_none()
                     && self.scope_shadow_root.is_none()
                 {
-                    return self.matches_transitive_relation(program, id, inner, node, false, counters);
+                    return self.matches_descendant_relation(program, id, inner, node, counters);
                 }
                 let mut ancestor = self.parent_of(node);
                 while let Some(current) = ancestor {
@@ -5854,7 +5785,7 @@ impl<'a> MatchEvaluator<'a> {
                     && self.relative_anchor.get().is_none()
                     && self.scope_shadow_root.is_none()
                 {
-                    return self.matches_transitive_relation(program, id, inner, node, true, counters);
+                    return self.matches_preceding_sibling_prefix(program, id, inner, node, counters);
                 }
                 let Some(parent) = self.parent_of(node) else {
                     return Ok(false);
@@ -6230,6 +6161,14 @@ impl<'a> MatchEvaluator<'a> {
             .iter()
             .copied()
             .filter(move |attribute| {
+                if !test.any_namespace {
+                    if attribute.name == test.name {
+                        return true;
+                    }
+                    if !folds {
+                        return false;
+                    }
+                }
                 let forms = row.facts.attribute_name_forms(attribute.name);
                 let (written, folded) = match test.any_namespace {
                     true => (forms.local, forms.folded_local),
@@ -6276,8 +6215,8 @@ impl<'a> MatchEvaluator<'a> {
             AttributeOperator::DashMatch => {
                 equals(value, literal, insensitive)
                     || (value.len() > literal.len()
-                        && starts_with(value, literal, insensitive)
-                        && value[literal.len()] == u16::from(b'-'))
+                        && value[literal.len()] == u16::from(b'-')
+                        && starts_with(value, literal, insensitive))
             }
             AttributeOperator::Prefix => !literal.is_empty() && starts_with(value, literal, insensitive),
             AttributeOperator::Suffix => {
@@ -6433,7 +6372,7 @@ impl<'a> MatchEvaluator<'a> {
         if position.of_type {
             let mut type_ids = HashMap::default();
             let mut sibling_types = Vec::with_capacity(siblings.len());
-            let mut totals = Vec::<u32>::new();
+            let mut type_positions: SmallVec<[SiblingPositions; 1]> = SmallVec::new();
             for &sibling in siblings.iter() {
                 let row = match self.row_of(sibling) {
                     Ok(row) => row,
@@ -6446,27 +6385,26 @@ impl<'a> MatchEvaluator<'a> {
                     Err(incomplete) => return Err(incomplete),
                 };
                 let sibling_type = (row.facts.tag_of(row.row), row.facts.namespace_of(row.row));
-                let next_type_id = u32::try_from(totals.len()).expect("sibling type space exhausted");
+                let next_type_id = u32::try_from(type_positions.len()).expect("sibling type space exhausted");
                 let type_id = *type_ids.entry(sibling_type).or_insert_with(|| {
-                    totals.push(0);
+                    type_positions.push(SiblingPositions {
+                        from_start: 0,
+                        from_end: 0,
+                    });
                     next_type_id
                 });
                 sibling_types.push(type_id);
-                totals[type_id as usize] += 1;
+                type_positions[type_id as usize].from_end += 1;
             }
-            let mut seen = vec![0_u32; totals.len()];
+            let mut positions = workspace.type_positions_by_evaluation_side[side as usize].borrow_mut();
             for (&sibling, type_id) in siblings.iter().zip(sibling_types) {
-                let type_index = type_id as usize;
-                let from_start = &mut seen[type_index];
-                *from_start += 1;
-                workspace.insert_type_position(
-                    sibling,
-                    side,
-                    SiblingPositions {
-                        from_start: *from_start,
-                        from_end: totals[type_index] - *from_start + 1,
-                    },
+                let position = &mut type_positions[type_id as usize];
+                position.from_start += 1;
+                positions.insert(
+                    sibling.element_index().expect("only elements have sibling positions") as usize,
+                    *position,
                 );
+                position.from_end -= 1;
             }
         }
 
@@ -6529,19 +6467,22 @@ fn matches_an_plus_b(step: i32, offset: i32, index: i64) -> bool {
     difference % step == 0 && difference / step >= 0
 }
 
-fn fold(unit: u16, insensitive: bool) -> u16 {
-    if insensitive && (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+fn fold(unit: u16) -> u16 {
+    if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
         return unit + u16::from(b'a' - b'A');
     }
     unit
 }
 
 fn equals(value: &[u16], literal: &[u16], insensitive: bool) -> bool {
+    if !insensitive {
+        return value == literal;
+    }
     value.len() == literal.len()
         && value
             .iter()
             .zip(literal)
-            .all(|(&left, &right)| fold(left, insensitive) == fold(right, insensitive))
+            .all(|(&left, &right)| fold(left) == fold(right))
 }
 
 fn starts_with(value: &[u16], literal: &[u16], insensitive: bool) -> bool {
@@ -6654,9 +6595,13 @@ mod tests {
             2
         );
 
-        cache.insert_type_position(node, MatchEvaluationSide::Current, position);
+        cache.type_positions_by_evaluation_side[MatchEvaluationSide::Current as usize]
+            .borrow_mut()
+            .insert(node.element_index().unwrap() as usize, position);
         assert_eq!(cache.sibling_position(node, MatchEvaluationSide::OldFacts, true), None);
-        cache.insert_type_position(node, MatchEvaluationSide::OldFacts, position);
+        cache.type_positions_by_evaluation_side[MatchEvaluationSide::OldFacts as usize]
+            .borrow_mut()
+            .insert(node.element_index().unwrap() as usize, position);
         cache.retain_current_for_matching();
         assert_eq!(
             cache.sibling_position(node, MatchEvaluationSide::Current, true),

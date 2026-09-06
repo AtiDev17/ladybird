@@ -10,7 +10,6 @@
 #include <LibCore/Environment.h>
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/Filter.h>
-#include <LibGfx/FilterImpl.h>
 #include <LibGfx/GradientInterpolation.h>
 #include <LibGfx/Matrix4x4.h>
 #include <LibGfx/Path.h>
@@ -59,13 +58,13 @@
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/PaintingRustFFI.h>
 #include <LibWeb/Painting/ResizeHandle.h>
-#include <LibWeb/Painting/ResolvedCSSFilter.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Painting/Scrolling.h>
 #include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
+#include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/SVG/SVGImageElement.h>
@@ -76,27 +75,6 @@ namespace Web::Painting {
 static_assert(sizeof(Layout::RustFFI::ScrollDirection) == sizeof(ScrollDirection));
 static_assert(to_underlying(Layout::RustFFI::ScrollDirection::Horizontal) == to_underlying(ScrollDirection::Horizontal));
 static_assert(to_underlying(Layout::RustFFI::ScrollDirection::Vertical) == to_underlying(ScrollDirection::Vertical));
-
-static_assert(sizeof(Layout::RustFFI::FilterOperationType) == sizeof(Gfx::FilterImpl::OperationType));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Arithmetic) == to_underlying(Gfx::FilterImpl::OperationType::Arithmetic));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Compose) == to_underlying(Gfx::FilterImpl::OperationType::Compose));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Blend) == to_underlying(Gfx::FilterImpl::OperationType::Blend));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Flood) == to_underlying(Gfx::FilterImpl::OperationType::Flood));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::DisplacementMap) == to_underlying(Gfx::FilterImpl::OperationType::DisplacementMap));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::DropShadow) == to_underlying(Gfx::FilterImpl::OperationType::DropShadow));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Blur) == to_underlying(Gfx::FilterImpl::OperationType::Blur));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorFilter) == to_underlying(Gfx::FilterImpl::OperationType::ColorFilter));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorMatrix) == to_underlying(Gfx::FilterImpl::OperationType::ColorMatrix));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorTable) == to_underlying(Gfx::FilterImpl::OperationType::ColorTable));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Saturate) == to_underlying(Gfx::FilterImpl::OperationType::Saturate));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::HueRotate) == to_underlying(Gfx::FilterImpl::OperationType::HueRotate));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Image) == to_underlying(Gfx::FilterImpl::OperationType::Image));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Merge) == to_underlying(Gfx::FilterImpl::OperationType::Merge));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Offset) == to_underlying(Gfx::FilterImpl::OperationType::Offset));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Erode) == to_underlying(Gfx::FilterImpl::OperationType::Erode));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Dilate) == to_underlying(Gfx::FilterImpl::OperationType::Dilate));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::Turbulence) == to_underlying(Gfx::FilterImpl::OperationType::Turbulence));
-static_assert(to_underlying(Layout::RustFFI::FilterOperationType::ColorSpaceConversion) == to_underlying(Gfx::FilterImpl::OperationType::ColorSpaceConversion));
 
 static_assert(sizeof(RustFFI::IntPoint) == sizeof(Gfx::IntPoint));
 static_assert(alignof(RustFFI::IntPoint) == alignof(Gfx::IntPoint));
@@ -354,23 +332,28 @@ static DisplayListResourceStorage* visual_context_filter_image_storage(DOM::Docu
     return &navigable->display_list_resource_storage();
 }
 
-static bool push_serialized_css_filter(ResolvedCSSFilter const& resolved_filter, double device_pixels_per_css_pixel, DisplayListResourceStorage* image_storage, void* sink)
+// Resolves one url() reference of a filter list and hands the referenced <filter>'s primitives to
+// the Rust graph builder the callback was handed as its sink. Frames an feImage draws are
+// registered with the display list resource storage under the id the primitives name them by.
+static Layout::RustFFI::FfiResolvedSvgFilter push_svg_filter_reference(void const* url_value, Layout::NodeWithStyle const& layout_node, DisplayListResourceStorage* image_storage, void* sink)
 {
-    auto gfx_filter = to_gfx_filter(resolved_filter, device_pixels_per_css_pixel);
-    if (!gfx_filter.has_value())
-        return false;
-    bool has_unregistered_image = false;
-    auto filter_data = Gfx::serialize_filter(*gfx_filter, [&](Gfx::DecodedImageFrame const& frame) -> u64 {
-        if (!image_storage) {
-            has_unregistered_image = true;
-            return frame.id();
-        }
-        return image_storage->add_image_frame(frame).value();
-    });
-    if (has_unregistered_image)
-        return false;
-    Layout::RustFFI::layout_arena_paint_push_bytes(sink, filter_data.data(), filter_data.size());
-    return true;
+    auto resolved_reference = resolve_svg_filter_reference({ .pointer = url_value }, layout_node);
+    Layout::RustFFI::FfiResolvedSvgFilter result {};
+    result.failed = resolved_reference.failed;
+    if (resolved_reference.failed)
+        return result;
+    result.svg_filter_bounds = resolved_reference.bounds;
+    Vector<Gfx::DecodedImageFrame> image_frames;
+    resolved_reference.filter_element->push_primitives(sink, layout_node, image_frames);
+    // A document without a navigable has nowhere to register the frames an feImage draws, so its
+    // filter list is dropped rather than handed over unresolvable; such documents are not painted.
+    if (!image_storage && !image_frames.is_empty()) {
+        result.failed = true;
+        return result;
+    }
+    for (auto const& image_frame : image_frames)
+        image_storage->add_image_frame(image_frame);
+    return result;
 }
 
 struct LayerImage {
@@ -469,22 +452,29 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
             facts.clip_area = clip_area(layout_node);
             return facts;
         },
-        .resolve_effects_filter = [](void* context, void* layout_node_shell, void* sink) -> Layout::RustFFI::FfiResolvedEffectsFilter {
+        .resolve_svg_filter = [](void* context, void* layout_node_shell, void const* url_value, void* sink) -> Layout::RustFFI::FfiResolvedSvgFilter {
             auto& document = *static_cast<DOM::Document*>(context);
-            auto const& style_source = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiResolvedEffectsFilter result {};
-            ResolvedCSSFilter resolved_filter;
-            if (style_source.filter().has_filters())
-                resolved_filter = resolve_css_filter(style_source.filter(), style_source);
-            result.svg_filter_bounds = resolved_filter.svg_filter_bounds;
-            if (!resolved_filter.has_filters())
-                return result;
-            result.has_filter = push_serialized_css_filter(resolved_filter, document.page().client().device_pixels_per_css_pixel(), visual_context_filter_image_storage(document), sink);
-            return result;
+            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
+            return push_svg_filter_reference(url_value, layout_node, visual_context_filter_image_storage(document), sink);
         },
     };
 }
 
+}
+
+Optional<Gfx::Filter> filter_from_functions(ReadonlySpan<Layout::RustFFI::FfiFilterFunction> functions)
+{
+    ByteBuffer serialized_filter;
+    bool has_filter = Layout::RustFFI::layout_arena_filter_functions_serialize(
+        functions.data(),
+        functions.size(),
+        [](void* context, u8 const* bytes, size_t length) {
+            static_cast<ByteBuffer*>(context)->append(bytes, length);
+        },
+        &serialized_filter);
+    if (!has_filter)
+        return {};
+    return Gfx::Filter { move(serialized_filter) };
 }
 
 static void* layout_arena_handle(DOM::Document const& document)
@@ -1159,13 +1149,10 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                 write_image_paint_facts(*paint, context, facts);
             return facts;
         },
-        .backdrop_filter_bytes = [](void* context_pointer, void* layout_node_shell, void* sink) -> bool {
+        .resolve_svg_filter = [](void* context_pointer, void* layout_node_shell, void const* url_value, void* sink) -> Layout::RustFFI::FfiResolvedSvgFilter {
             auto& context = *static_cast<PaintHostContext*>(context_pointer);
             auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            auto const& backdrop_filter = layout_node.backdrop_filter();
-            if (!backdrop_filter.has_filters())
-                return false;
-            return push_serialized_css_filter(resolve_css_filter(backdrop_filter, layout_node), context.device_pixels_per_css_pixel, &context.resource_storage, sink);
+            return push_svg_filter_reference(url_value, layout_node, &context.resource_storage, sink);
         },
         .svg_image_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiSvgImageFacts {
             auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);

@@ -14,6 +14,10 @@ impl StyleEngine {
         root: StyleNodeID,
         mut emit: impl FnMut(StyleTransactionVersion, ProgramVersion, &[PublishedStyleDeltaRecord]),
     ) -> bool {
+        // The previous transaction's uninstalled records can no longer be consumed. Revert
+        // them before this transaction publishes anything: a later C++ computation can install
+        // the same record, which must not then be mistaken for an unconsumed derivation.
+        self.discard_engine_computed_records();
         self.reclaim_computed_memory_if_needed();
         self.sync_tier3_benefit_observations();
         let tier3_evictions = self.memory.finish_tier3_quota_period();
@@ -122,10 +126,7 @@ impl StyleEngine {
             && transaction.inputs.iter().all(|input| {
                 !matches!(
                     input.key,
-                    InputKey::ElementDeclaration(..)
-                        | InputKey::ElementStyleInput(..)
-                        | InputKey::RuleField(_, RuleField::Declarations | RuleField::Layer)
-                        | InputKey::CascadeTopology(_)
+                    InputKey::RuleField(_, RuleField::Declarations | RuleField::Layer) | InputKey::CascadeTopology(_)
                 )
             });
         let retained_answer_patch_selection = self.rules_for_retained_answer_patch(&transaction);
@@ -342,30 +343,46 @@ impl StyleEngine {
             let _ = self.install_before_sibling_geometry(&mut transaction_fact_view);
         }
         let has_before_sibling_relations = transaction_fact_view.before_sibling_relations_available;
-        self.prefix_caches.borrow_mut().states.mark_previous();
         self.transaction_fact_view = Some(transaction_fact_view);
+        let mut caches = self.prefix_caches.borrow_mut();
+        caches.states.mark_previous();
         // The relation maintains document-scoped prefixes. Incomplete transitions and
         // tag changes, whose of-type effects extend to siblings, require cold reconstruction.
-        if self.prefix_caches.borrow().states.has_relation()
-            && (self
+        if caches.states.has_relation() {
+            let mut reconstruct = self
                 .transaction_fact_view
                 .as_ref()
-                .is_none_or(|view| view.prefix.is_none())
-                || !transaction.inputs.iter().all(|input| {
-                    input
-                        .key
-                        .style_node()
-                        .is_some_and(|node| self.tree.tree_scope(node) == TreeScopeID::DOCUMENT)
-                        && !matches!(
-                            input.key,
-                            InputKey::LocalFeature(_, LocalFeatureKey::TagName | LocalFeatureKey::FoldedTagName)
-                        )
-                }))
-        {
-            let mut caches = self.prefix_caches.borrow_mut();
-            caches.states.release();
-            caches.answers.release(&mut self.match_answers);
+                .is_none_or(|view| view.prefix.is_none());
+            let mut confined_elsewhere = false;
+            for input in &transaction.inputs {
+                if reconstruct {
+                    break;
+                }
+                let (tree_scope, maintained) = match input.key {
+                    InputKey::LocalFeature(node, LocalFeatureKey::TagName | LocalFeatureKey::FoldedTagName) => {
+                        (self.tree.tree_scope(node), false)
+                    }
+                    key => match key.style_node() {
+                        Some(node) => (self.tree.tree_scope(node), true),
+                        None => (key.program_tree_scope().unwrap_or(TreeScopeID::DOCUMENT), false),
+                    },
+                };
+                if tree_scope != TreeScopeID::DOCUMENT {
+                    confined_elsewhere = true;
+                } else if !maintained {
+                    reconstruct = true;
+                }
+            }
+            if reconstruct {
+                caches.states.release();
+                caches.answers.release(&mut self.match_answers);
+            } else if confined_elsewhere {
+                // The other scope's own retained transitions are not maintained.
+                caches.states.release_transition_states();
+                caches.answers.release(&mut self.match_answers);
+            }
         }
+        drop(caches);
         let fact_view_bytes = self
             .transaction_fact_view
             .as_ref()
@@ -688,8 +705,15 @@ impl StyleEngine {
             .inputs
             .iter()
             .any(|input| matches!(input.key, InputKey::RuleField(_, RuleField::Declarations)));
+        let named_rule_context_changed = transaction.program_joins.iter().any(|delta| {
+            matches!(
+                self.program.rule_version(delta.rule).kind,
+                RuleKind::CounterStyle | RuleKind::FontFeatureValues | RuleKind::Function
+            )
+        });
         let pseudo_inputs_may_have_changed = environment_changed
             || rule_declarations_edited
+            || named_rule_context_changed
             || transaction.inputs.iter().any(|input| {
                 matches!(
                     input.key,
@@ -749,12 +773,10 @@ impl StyleEngine {
                 .iter()
                 .any(|region| matches!(region, ImpactRegion::TreeScope(_)) || *region == ImpactRegion::Subtree(root));
         let mut direct_action_nodes = DeltaBatch::default();
-        if !plan_is_broad {
-            for node in transaction.inputs.iter().filter_map(|input| input.key.style_node()) {
-                direct_action_nodes.push(node);
-            }
-            direct_action_nodes.consolidate();
+        for node in transaction.inputs.iter().filter_map(|input| input.key.style_node()) {
+            direct_action_nodes.push(node);
         }
+        direct_action_nodes.consolidate();
         let direct_action_node_bytes = direct_action_nodes.capacity_bytes();
         self.memory
             .reserve_required(MemoryCategory::BatchScratch, direct_action_node_bytes);
@@ -795,14 +817,9 @@ impl StyleEngine {
                 }
             }
         }
-        if plan_is_broad {
-            if !transaction_reaches_no_selector {
-                self.retained_match_answers.evict(&mut self.match_answers);
-            }
-            #[cfg(test)]
-            if let Some(capture) = &mut self.diagnostic_plan_capture {
-                capture.scoped = false;
-            }
+        #[cfg(test)]
+        if plan_is_broad && let Some(capture) = &mut self.diagnostic_plan_capture {
+            capture.scoped = false;
         }
         let mut retained_answer_patch =
             retained_answer_patch_selection.map(|selection| self.prepare_retained_answer_patch(selection));
@@ -882,6 +899,13 @@ impl StyleEngine {
                 .sparse()
                 .ok()
                 .copied();
+            let previous_observable_answer = self.deferred_pseudo_element.and_then(|_| {
+                self.retained_match_answers
+                    .lookup(node)
+                    .sparse()
+                    .ok()
+                    .and_then(|identity| self.match_answers.answer(*identity).cloned())
+            });
             let has_signed_delta = !selector_truth_changes.deltas_for(node).is_empty();
             let mut has_output_change = false;
             let mut has_upquery = false;
@@ -936,7 +960,7 @@ impl StyleEngine {
                             refreshes,
                         }
                     } else if !node_deltas.is_empty()
-                        || (patch.always_emit && patch.rule_keys.is_empty())
+                        || (patch.always_emit_for(node) && patch.rule_keys.is_empty())
                         || !patch.cascade_update_properties.is_empty()
                     {
                         SelectorTruthPatch::Direct(node_deltas)
@@ -975,13 +999,37 @@ impl StyleEngine {
                         }
                     };
                     can_confirm_exact_cascade = transaction_supports_retained_cascade_stops
-                        && !plan_is_broad
                         && !has_direct_action
                         && node_has_safe_exact_cascade_provenance
                         && self.match_answer_is_comparable_across_elements(node);
                     can_stop_at_exact_cascade = transaction_supports_global_exact_cascade_stops;
                     match self.patch_retained_match_answer(node, patch, truth_patch) {
                         Some(outcome) => {
+                            if outcome.emit
+                                && !has_direct_action
+                                && !patch.has_non_selector_inputs
+                                && patch.always_emit_nodes.binary_search(&node).is_err()
+                                && let Some(deferred) = self.deferred_pseudo_element
+                                && let Some(previous) = previous_observable_answer.as_deref()
+                                && let Lookup::Known(current) = self.retained_match_answers.lookup(node)
+                                && let Some(current) = self.match_answers.answer(*current)
+                            {
+                                let is_observable = |entry: &&RetainedRuleMatch| {
+                                    self.programs.get(entry.program).entries()[entry.entry as usize]
+                                        .pseudo_element
+                                        .is_none_or(|target| target.kind != deferred)
+                                };
+                                let previous = previous.iter().filter(is_observable);
+                                let current = current.iter().filter(is_observable);
+                                if previous.clone().eq(current.clone())
+                                    && previous
+                                        .chain(current)
+                                        .all(|entry| patch.cascade_update_rules.binary_search(&entry.rule).is_err())
+                                {
+                                    self.counters.bump(Counter::RetainedMatchAnswerPatchStops);
+                                    return;
+                                }
+                            }
                             has_output_change = outcome.emit;
                             if outcome.emit {
                                 patch_processed_nodes.push(node);
@@ -997,7 +1045,7 @@ impl StyleEngine {
                         None => {
                             self.counters.bump(Counter::RetainedMatchAnswerPatchMisses);
                             repair_match_identity = match_identity_is_complete_output
-                                && !patch.always_emit
+                                && !patch.always_emit_for(node)
                                 && !patch.orders_shifted
                                 && matches!(self.retained_match_answers.cascade_input_lookup(node), Lookup::Known(_));
                             self.retained_match_answers.forget_answer(&mut self.match_answers, node);
@@ -1473,8 +1521,9 @@ impl StyleEngine {
                     // C++ only refreshes the inherited environment for a non-consumer. There
                     // is no element record to recompute or compare against the parent's groups.
                     false
-                } else if !(reaction_is_settleable
-                    || (old_style_record == 0 && reaction & transaction::STYLE_REACTION_PUBLISHED_STYLE != 0))
+                } else if (named_rule_context_changed && old_style_record != 0)
+                    || !(reaction_is_settleable
+                        || (old_style_record == 0 && reaction & transaction::STYLE_REACTION_PUBLISHED_STYLE != 0))
                 {
                     self.counters.bump(Counter::EngineComputedRecordGateReaction);
                     false

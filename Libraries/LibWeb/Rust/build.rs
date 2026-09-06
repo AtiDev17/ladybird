@@ -2627,6 +2627,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("WindingRule", "Gfx::WindingRule"),
         ("MaskKind", "Gfx::MaskKind"),
         ("CompositingAndBlendingOperator", "Gfx::CompositingAndBlendingOperator"),
+        ("ColorFilterType", "Gfx::ColorFilterType"),
         ("ScalingMode", "Gfx::ScalingMode"),
         ("InterpolationColorSpace", "Gfx::InterpolationColorSpace"),
         ("OptionalFloatRect", "Optional<Gfx::FloatRect>"),
@@ -2662,6 +2663,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/Color.h",
             "LibGfx/CompositingAndBlendingOperator.h",
             "LibGfx/CornerRadii.h",
+            "LibGfx/Filter.h",
             "LibGfx/GradientInterpolation.h",
             "LibGfx/InterpolationColorSpace.h",
             "LibGfx/Matrix4x4.h",
@@ -3078,10 +3080,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
-    layout_config.export.include = vec![
-        "FfiFormattingContextType".to_string(),
-        "FilterOperationType".to_string(),
-    ];
+    layout_config.export.include = vec!["FfiFormattingContextType".to_string()];
     generate_ffi_header(
         layout_config,
         &[
@@ -3093,6 +3092,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/computed_value_types.rs"),
             manifest_dir.join("src/css/display.rs"),
             manifest_dir.join("src/layout/formatting_context.rs"),
+            manifest_dir.join("src/layout/viewport_propagation.rs"),
             manifest_dir.join("src/layout/flex_formatting_context.rs"),
             manifest_dir.join("src/layout/grid_formatting_context.rs"),
             manifest_dir.join("src/layout/svg_formatting_context.rs"),

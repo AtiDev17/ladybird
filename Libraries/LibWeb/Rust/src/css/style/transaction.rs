@@ -239,6 +239,18 @@ impl InputKey {
             | Self::CascadeTopology(..) => None,
         }
     }
+
+    /// The tree scope whose program this key changes, for keys that name one.
+    #[must_use]
+    pub fn program_tree_scope(self) -> Option<TreeScopeID> {
+        match self {
+            Self::SheetAttachment(_, tree_scope)
+            | Self::CascadeTopology(TopologyAxis::SheetOrder(tree_scope) | TopologyAxis::LayerOrder(tree_scope)) => {
+                Some(tree_scope)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The value of a journal key on one side of a mutation.
@@ -681,20 +693,16 @@ impl NormalizationJournal {
             .collect();
         if !arriving_nodes.is_empty() {
             inputs.retain(|input| {
-                let Some(node) = input.key.style_node() else {
+                let (InputKey::LocalFeature(node, _) | InputKey::State(node, _)) = input.key else {
                     return true;
                 };
                 if arriving_nodes.binary_search(&node).is_err() {
                     return true;
                 }
-                match input.key {
-                    InputKey::LocalFeature(_, LocalFeatureKey::ArrivingFacts) => false,
-                    InputKey::LocalFeature(..) | InputKey::State(..) => {
-                        counters.bump(Counter::ArrivingNodeFactsFolded);
-                        false
-                    }
-                    _ => true,
+                if !matches!(input.key, InputKey::LocalFeature(_, LocalFeatureKey::ArrivingFacts)) {
+                    counters.bump(Counter::ArrivingNodeFactsFolded);
                 }
+                false
             });
             inputs.extend(arriving_nodes.into_iter().map(|node| NormalizedInput {
                 key: InputKey::LocalFeature(node, LocalFeatureKey::ArrivingFacts),

@@ -19,6 +19,9 @@ impl StyleEngine {
 
         let mut available = 0_u64;
         for (pseudo, version, _, priority_current) in self.winner_groups.pseudo_states(node) {
+            if self.deferred_pseudo_element == Some(pseudo.kind) {
+                continue;
+            }
             let kind = usize::from(pseudo.kind.0);
             if kind >= pseudo_kind::SYNTHETIC_COUNT || kind == usize::from(BACKDROP) {
                 continue;
@@ -29,10 +32,13 @@ impl StyleEngine {
             }
             available |= 1 << kind;
         }
-        let Some(required) = self.pseudo_style_mask(node) else {
+        let Some(mut required) = self.pseudo_style_mask(node) else {
             self.counters.bump(Counter::EngineComputedRecordBailPseudoMask);
             return false;
         };
+        if let Some(deferred) = self.deferred_pseudo_element {
+            required &= !(1_u64 << deferred.0);
+        }
         if required & !available == 0 {
             return true;
         }
@@ -51,8 +57,7 @@ impl StyleEngine {
                 .winner_groups
                 .winner_in_state(state, crate::css::property_metadata::property_id::DISPLAY)
                 .and_then(|winner| self.winner_groups.resolved_winner(winner))
-            && let Lookup::Known(value) = self.specified_values.retained_value(winner.key.value)
-            && let StyleValueData::Display { raw } = value.data()
+            && let Lookup::Known(StyleValueData::Display { raw }) = self.specified_values.value(winner.key.value)
             && crate::css::display::FfiDisplay::from_raw(*raw).is_list_item()
         {
             explicit_kinds |= 1 << MARKER;
@@ -112,6 +117,9 @@ impl StyleEngine {
         let program_version = self.program.version();
         let mut states: [Option<CascadeStateID>; pseudo_kind::SYNTHETIC_COUNT] = [None; pseudo_kind::SYNTHETIC_COUNT];
         for (pseudo, version, state, priority_current) in self.winner_groups.pseudo_states(node) {
+            if self.deferred_pseudo_element == Some(pseudo.kind) {
+                continue;
+            }
             let Ok(kind) = u8::try_from(pseudo.kind.0) else {
                 continue;
             };
@@ -216,6 +224,9 @@ impl StyleEngine {
         };
         let mut pseudo_uses_substitution = false;
         for kind in [BEFORE, AFTER, FIRST_LETTER, SELECTION, MARKER] {
+            if self.deferred_pseudo_element == Some(tree::PseudoElementKind(u16::from(kind))) {
+                continue;
+            }
             let target = computed::ComputedStyleTarget::new(node, kind);
             let old = self.computed_group_sets.pseudo_style_record(node, kind);
             if let Some(old) = old {
@@ -224,7 +235,7 @@ impl StyleEngine {
                     return None;
                 };
                 let transitioning = (unsafe { view.longhand_table.as_ref() })
-                    .is_some_and(|table| !crate::css::style_compute::active_transition_properties(table).is_empty());
+                    .is_some_and(crate::css::style_compute::has_active_transition_properties);
                 if !view.animated_overlay.is_null() || transitioning {
                     self.counters.bump(Counter::EngineComputedRecordBailRecordOverlay);
                     return None;
@@ -291,7 +302,7 @@ impl StyleEngine {
                 let unchanged = match (state, bound) {
                     (Some(state), Some((bound_generation, bound_state))) => {
                         bound_generation == generation
-                            && self.winner_groups.semantic_delta(Some(bound_state), state).is_empty()
+                            && self.winner_groups.states_are_semantically_equal(bound_state, state)
                     }
                     (None, None) => true,
                     _ => false,
