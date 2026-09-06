@@ -201,6 +201,9 @@ pub enum InputKey {
 pub const STYLE_REACTION_PUBLISHED_STYLE: u8 = 1 << 0;
 pub const STYLE_REACTION_RECOMPUTE_STYLE: u8 = 1 << 1;
 pub const STYLE_REACTION_INHERITED_STYLE: u8 = 1 << 2;
+pub const STYLE_REACTION_INHERITED_CUSTOM_PROPERTIES: u8 = 1 << 3;
+pub const STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES: u8 = 1 << 4;
+pub const STYLE_REACTION_ANCESTOR_BECAME_VISIBLE: u8 = 1 << 5;
 pub const STYLE_REACTION_PSEUDO_INPUTS_MAY_HAVE_CHANGED: u8 = 1 << 6;
 
 impl InputKey {
@@ -338,6 +341,8 @@ pub struct RuleDeclarationChange {
     pub rule: RuleID,
     pub old_properties: Vec<u16>,
     pub new_properties: Vec<u16>,
+    /// Whether the custom properties the rule declares moved, which no winner shows.
+    pub custom_declarations_changed: bool,
 }
 
 /// The normalized result of one transaction boundary, in deterministic key order.

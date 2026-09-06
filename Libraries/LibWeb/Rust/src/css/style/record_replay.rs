@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 const MAGIC: [u8; 8] = *b"SGREPLAY";
-const FORMAT_VERSION: u64 = 12;
+const FORMAT_VERSION: u64 = 16;
 const EVENT_HEADER_SIZE: usize = 3 * size_of::<u64>();
 const PAYLOAD_ALIGNMENT: usize = 8;
 
@@ -142,6 +142,7 @@ impl<W: Write> LogWriter<W> {
 
 pub struct LogReader<R> {
     input: R,
+    version: u64,
     #[cfg(test)]
     payload: Vec<u8>,
     verify_checksums: bool,
@@ -157,7 +158,7 @@ impl<R: Read> LogReader<R> {
         let mut version_bytes = [0; size_of::<u64>()];
         input.read_exact(&mut version_bytes)?;
         let version = u64::from_le_bytes(version_bytes);
-        if version != FORMAT_VERSION {
+        if !(11..=FORMAT_VERSION).contains(&version) {
             // NB: Format 1 wrote its version as a u32, so this u64 read swallows part of the first
             //     event header; masking recovers the real number for the error message.
             let reported = if version >> 32 != 0 {
@@ -169,6 +170,7 @@ impl<R: Read> LogReader<R> {
         }
         Ok(Self {
             input,
+            version,
             #[cfg(test)]
             payload: Vec::new(),
             verify_checksums: true,
@@ -179,6 +181,10 @@ impl<R: Read> LogReader<R> {
     /// timing-focused replays skip it; correctness-focused replays keep the default.
     pub fn set_verify_checksums(&mut self, verify: bool) {
         self.verify_checksums = verify;
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Reads the next event. The returned event's payload borrows this reader's scratch buffer,
@@ -347,6 +353,13 @@ impl PayloadWriter {
         self.write_length(values.len());
         for value in values {
             self.write_u32(*value);
+        }
+    }
+
+    pub fn write_u64_slice(&mut self, values: &[u64]) {
+        self.write_length(values.len());
+        for value in values {
+            self.write_u64(*value);
         }
     }
 
@@ -680,6 +693,16 @@ impl<'a> PayloadReader<'a> {
             .collect())
     }
 
+    pub fn read_u64_vec(&mut self) -> Result<Vec<u64>, Error> {
+        let bytes = self.read_fixed_width_slice(size_of::<u64>())?;
+        Ok(bytes
+            .as_chunks::<{ size_of::<u64>() }>()
+            .0
+            .iter()
+            .map(|&chunk| u64::from_le_bytes(chunk))
+            .collect())
+    }
+
     /// Reads a raw row array in place, without copying. The rows are only aligned when this
     /// payload sits in a page-aligned mapping of the log, which the alignment check enforces.
     pub fn read_raw_slice<T: RawRecord>(&mut self) -> Result<&'a [T], Error> {
@@ -755,6 +778,7 @@ mod tests {
         payload.write_bytes(b"StyleEngine");
         payload.write_u16_slice(&[1, 2, 3]);
         payload.write_u32_slice(&[4, 5, 6]);
+        payload.write_u64_slice(&[0, 0x1234_5678_9abc_def0, u64::MAX]);
         payload.write_length(2);
         payload.write_u64(0x0102_0304_0506_0708);
         payload.write_u64(0x1112_1314_1516_1718);
@@ -774,6 +798,10 @@ mod tests {
         assert_eq!(event.payload.read_u16_vec().unwrap(), [1, 2, 3]);
         assert_eq!(event.payload.read_u32_vec().unwrap(), [4, 5, 6]);
         assert_eq!(
+            event.payload.read_u64_vec().unwrap(),
+            [0, 0x1234_5678_9abc_def0, u64::MAX]
+        );
+        assert_eq!(
             event.payload.read_fixed_width_slice(size_of::<u64>()).unwrap(),
             [
                 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
@@ -781,6 +809,17 @@ mod tests {
         );
         event.payload.finish().unwrap();
         assert!(reader.read_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn previous_format_version_remains_readable() {
+        let mut output = Vec::new();
+        let mut writer = LogWriter::new(&mut output).unwrap();
+        writer.flush().unwrap();
+        output[MAGIC.len()..MAGIC.len() + size_of::<u64>()].copy_from_slice(&11_u64.to_le_bytes());
+
+        let reader = LogReader::new(Cursor::new(output)).unwrap();
+        assert_eq!(reader.version(), 11);
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub struct ComputedLonghandTable {
     evaluated_bits: [u8; LONGHAND_BITMAP_BYTES],
     /// The recorded inheritance-dependent specified values, sparse.
     inheritance_dependent: Vec<(u16, RetainedStyleValueData)>,
+    /// Whether `inheritance_dependent` was seeded from another table, so that a drive over this
+    /// one must replace or drop the record of every row it evaluates.
+    inheritance_dependent_is_seeded: bool,
     /// The winning cascaded font-size retained for monospace recascades.
     raw_cascaded_font_size: Option<RetainedStyleValueData>,
     /// The borrowed view over `inheritance_dependent` handed to C++.
@@ -134,6 +137,7 @@ impl ComputedLonghandTable {
             inherited_bits: [0; LONGHAND_BITMAP_BYTES],
             evaluated_bits: [0; LONGHAND_BITMAP_BYTES],
             inheritance_dependent: Vec::new(),
+            inheritance_dependent_is_seeded: false,
             inheritance_dependent_view: Vec::new(),
             raw_cascaded_font_size: None,
             metadata: FfiComputedStyleMetadata {
@@ -294,6 +298,25 @@ impl ComputedLonghandTable {
         self.post_compute_restore_values = None;
     }
 
+    /// Take one slot back from `source`: its value, provenance and flags, exactly as stored there.
+    pub(crate) fn copy_slot_from(&mut self, source: &ComputedLonghandTable, property_id: u16) {
+        assert!(
+            !self.frozen,
+            "the computed longhand table is immutable once its style is created"
+        );
+        let slot = Self::slot_index(property_id);
+        self.slots[slot].clone_from(&source.slots[slot]);
+        self.value_view[slot] = source.value_view[slot];
+        self.source_slots[slot] = source.source_slots[slot];
+        set_bitmap_bit(&mut self.important_bits, slot, bitmap_bit(&source.important_bits, slot));
+        set_bitmap_bit(&mut self.inherited_bits, slot, bitmap_bit(&source.inherited_bits, slot));
+        set_bitmap_bit(&mut self.evaluated_bits, slot, bitmap_bit(&source.evaluated_bits, slot));
+    }
+
+    pub(crate) fn effective_color_scheme(&self) -> i16 {
+        self.metadata.effective_color_scheme
+    }
+
     pub(crate) fn copied_for_drive(source: &ComputedLonghandTable) -> Self {
         let mut table = Self::new();
         table.copy_from(source);
@@ -304,6 +327,7 @@ impl ComputedLonghandTable {
     pub(crate) fn copied_for_partial_drive(source: &ComputedLonghandTable) -> Self {
         let mut table = Self::copied_for_drive(source);
         table.inheritance_dependent.clone_from(&source.inheritance_dependent);
+        table.inheritance_dependent_is_seeded = true;
         table.rebuild_inheritance_dependent_view();
         table.set_in_display_none_subtree(false);
         table
@@ -334,45 +358,12 @@ impl ComputedLonghandTable {
             table.set(property_id, value, -1);
         }
         table.metadata.effective_color_scheme = inherited_source.metadata.effective_color_scheme;
-        let inherited_color = inherited_source
-            .get(property_id::COLOR)
-            .map(RetainedStyleValueData::data);
-        let color_input = crate::css::color_resolution::ColorResolutionInput {
-            scheme: u8::try_from(inherited_source.metadata.effective_color_scheme).ok(),
-            current_color: inherited_color.and_then(|color| {
-                crate::css::color_resolution::to_color(
-                    color,
-                    &crate::css::color_resolution::ColorResolutionInput {
-                        scheme: u8::try_from(inherited_source.metadata.effective_color_scheme).ok(),
-                        current_color: None,
-                        current_color_value: None,
-                        length: None,
-                        channels: None,
-                    },
-                )
-            }),
-            current_color_value: inherited_color,
-            length: None,
-            channels: None,
-        };
-        for index in 0..table.inheritance_dependent.len() {
-            let (property_id, depends_on_current_color) = {
-                let (property_id, value) = &table.inheritance_dependent[index];
-                (*property_id, retained_value_depends_on_current_color(value))
-            };
-            if !property_is_inherited(property_id) && depends_on_current_color {
-                let value = table.inheritance_dependent[index].1.clone();
-                let slot = Self::slot_index(property_id);
-                let resolved = crate::css::color_resolution::to_color(value.data(), &color_input).map(|color| unsafe {
-                    RetainedStyleValueData::from_retained_pointer(Arc::into_raw(Arc::new(
-                        crate::css::color_resolution::resolved_srgb_style_value(color),
-                    )))
-                });
-                let is_resolved = resolved.is_some();
-                let replacement = resolved.unwrap_or(value);
-                table.value_view[slot] = replacement.pointer().cast();
-                table.slots[slot] = Some(replacement);
-                set_bitmap_bit(&mut table.evaluated_bits, slot, is_resolved);
+        // A value reading `currentcolor` - the keyword itself, or a color function of it - is
+        // what a fresh computation leaves in the table too: the color resolves when the groups
+        // are built, never in the computed value.
+        for (property, value) in &table.inheritance_dependent {
+            if retained_value_depends_on_current_color(value) {
+                set_bitmap_bit(&mut table.evaluated_bits, Self::slot_index(*property), false);
             }
         }
         table.load_flag_bitmaps(importance, inheritance);
@@ -428,6 +419,7 @@ impl ComputedLonghandTable {
         );
         self.evaluated_bits = [0; LONGHAND_BITMAP_BYTES];
         self.inheritance_dependent.clear();
+        self.inheritance_dependent_is_seeded = false;
         self.inheritance_dependent_view.clear();
         self.post_compute_restore_values = None;
     }
@@ -448,18 +440,48 @@ impl ComputedLonghandTable {
         self.rebuild_inheritance_dependent_view();
     }
 
+    #[cfg(test)]
     pub(crate) fn append_drive_inheritance_dependent_value(&mut self, property_id: u16, value: RetainedStyleValueData) {
+        self.set_drive_inheritance_dependent_value(property_id, Some(value));
+    }
+
+    /// Record what a drive found for one row: its inheritance-dependent specified value, or that
+    /// it has none. A table seeded with another table's records replaces or drops the row's old
+    /// record, so a row the drive leaves alone keeps its record and an evaluated row keeps no
+    /// stale one.
+    pub(crate) fn set_drive_inheritance_dependent_value(
+        &mut self,
+        property_id: u16,
+        value: Option<RetainedStyleValueData>,
+    ) {
         assert!(
             !self.frozen,
             "the computed longhand table is immutable once its style is created"
         );
+        if self.inheritance_dependent_is_seeded {
+            let existing = self
+                .inheritance_dependent
+                .iter()
+                .position(|(property, _)| *property == property_id);
+            match (existing, value) {
+                (Some(index), Some(value)) => self.inheritance_dependent[index].1 = value,
+                (Some(index), None) => {
+                    self.inheritance_dependent.swap_remove(index);
+                }
+                (None, Some(value)) => self.inheritance_dependent.push((property_id, value)),
+                (None, None) => {}
+            }
+            return;
+        }
         debug_assert!(
             self.inheritance_dependent
                 .iter()
                 .all(|(property, _)| *property != property_id),
             "a longhand drive must visit each property once"
         );
-        self.inheritance_dependent.push((property_id, value));
+        if let Some(value) = value {
+            self.inheritance_dependent.push((property_id, value));
+        }
     }
 
     pub(crate) fn finish_drive_inheritance_dependent_values(&mut self) {
@@ -513,6 +535,10 @@ impl ComputedLonghandTable {
         &self.inherited_bits
     }
 
+    pub(crate) fn evaluated_bits(&self) -> &[u8] {
+        &self.evaluated_bits
+    }
+
     pub(crate) fn load_flag_bitmaps(&mut self, importance: &[u8], inheritance: &[u8]) {
         assert!(!self.frozen);
         assert_eq!(importance.len(), LONGHAND_BITMAP_BYTES);
@@ -537,6 +563,7 @@ impl ComputedLonghandTable {
             .iter()
             .zip(&other.value_view)
             .all(|(&first, &second)| values_equal(first, second))
+            && self.evaluated_bits == other.evaluated_bits
             && self.important_bits == other.important_bits
             && self.inherited_bits == other.inherited_bits
             && self.publication_sidecars() == other.publication_sidecars()

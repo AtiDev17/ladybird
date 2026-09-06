@@ -400,9 +400,13 @@ impl MatchAnswerCatalog {
     }
 }
 
+type PseudoWinnerGroups = Rc<[(super::tree::PseudoElementTarget, CascadeStateID)]>;
+
 pub(super) struct PrefixAnswer {
     pub(super) matches: MatchAnswerID,
     pub(super) winner_group: Option<(u64, CascadeStateID)>,
+    /// The pseudo-element winner states published beside the answer, and their generation.
+    pub(super) pseudo_winner_groups: Option<(u64, PseudoWinnerGroups)>,
     pub(super) cascade_input: MatchAnswerID,
     pub(super) cascade_winner_inventory_is_complete: bool,
 }
@@ -587,12 +591,14 @@ impl PrefixAnswerCache {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn remember(
         &mut self,
         catalog: &mut MatchAnswerCatalog,
         key: PrefixAnswerKey,
         answer: &[RuleMatch],
         winner_group: Option<(u64, CascadeStateID)>,
+        pseudo_winner_groups: Option<(u64, PseudoWinnerGroups)>,
         cascade_input: MatchAnswerID,
         cascade_winner_inventory_is_complete: bool,
     ) {
@@ -604,6 +610,7 @@ impl PrefixAnswerCache {
                 PrefixAnswer {
                     matches,
                     winner_group,
+                    pseudo_winner_groups,
                     cascade_input,
                     cascade_winner_inventory_is_complete,
                 },
@@ -937,6 +944,9 @@ pub(super) struct RetainedAnswerPatch {
     pub(super) requires_full_match: bool,
     pub(super) cascade_update_properties: Vec<u16>,
     pub(super) cascade_update_rules: Vec<RuleID>,
+    /// Edited rules whose custom declarations moved, sorted: a node matching one reacts even
+    /// when the patch moves none of its winners.
+    pub(super) custom_changed_rules: Vec<RuleID>,
     pub(super) cascade_candidates: Vec<OrderedCascadeCandidate>,
     pub(super) cascade_compaction_workspace: ordering::CascadeCompactionWorkspace,
     pub(super) program_base_version: Option<ProgramVersion>,
@@ -967,7 +977,7 @@ impl RetainedAnswerDeltaMemoEntry {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct RetainedAnswerDeltaTransition {
     pub(super) new_answer: MatchAnswerID,
     /// The compact identity after the transition. Equal to the asker's old identity exactly when
@@ -976,6 +986,9 @@ pub(super) struct RetainedAnswerDeltaTransition {
     /// The winner state the cohort's first member settled after applying the same deltas, with
     /// its program version, when one was retained. Emitting replays assign it by column store.
     pub(super) winner_state: Option<(CascadeStateID, ProgramVersion)>,
+    /// The pseudo-element winner states the first member settled beside its winner state, of
+    /// the same program version.
+    pub(super) pseudo_winner_states: Rc<[(super::tree::PseudoElementTarget, CascadeStateID)]>,
     /// Whether the first member's winner application reported an update, which decides whether
     /// replays hand the traversal an incremental cascade answer.
     pub(super) winners_updated: bool,
@@ -1004,6 +1017,7 @@ impl RetainedAnswerPatch {
                 self.rules,
                 self.cascade_update_properties,
                 self.cascade_update_rules,
+                self.custom_changed_rules,
                 self.cascade_candidates,
                 self.delta_memo,
             ];
@@ -1029,6 +1043,7 @@ pub(super) struct RetainedAnswerPatchSelection {
     pub(super) requires_full_match: bool,
     pub(super) cascade_update_properties: Vec<u16>,
     pub(super) cascade_update_rules: Vec<RuleID>,
+    pub(super) custom_changed_rules: Vec<RuleID>,
     pub(super) program_base_version: Option<ProgramVersion>,
 }
 
@@ -1543,11 +1558,17 @@ pub(super) struct PendingRuleDeclarationChange {
     pub(super) rule: RuleID,
     pub(super) old_properties: Vec<u16>,
     pub(super) new_properties: Vec<u16>,
+    /// Whether the custom properties the rule declares moved. No winner column holds them, so
+    /// no winner delta can show the edit; every node the rule matches reacts to it.
+    pub(super) custom_declarations_changed: bool,
 }
 
 #[derive(Clone)]
 pub(super) struct PendingRuleDeclarations {
     pub(super) declared: Vec<DeclaredProperty>,
+    pub(super) written_values: Vec<crate::css::style_value::RetainedStyleValueData>,
+    pub(super) custom_declarations: Vec<super::program::CustomDeclaration>,
+    pub(super) custom_written_values: Vec<crate::css::style_value::RetainedStyleValueData>,
     pub(super) complete: bool,
 }
 

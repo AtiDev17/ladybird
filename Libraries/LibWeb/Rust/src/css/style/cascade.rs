@@ -221,6 +221,7 @@ pub struct SpecifiedWinnerKey {
     pub continuation: CascadeContinuationID,
     /// Animation and transition relevance for this property.
     pub animation_relevance: u32,
+    /// Whether the declaration overrides an animation at this cascade level.
     pub important: bool,
 }
 
@@ -245,6 +246,12 @@ pub struct PropertyWinner {
     pub source: WinnerSource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CascadeAttachment {
+    StyleSheet,
+    InlineStyle,
+}
+
 /// The priority stratum removed by a CSS-wide continuation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CascadeContinuationCeiling {
@@ -258,6 +265,7 @@ pub enum CascadeContinuationCeiling {
         context: u32,
         layer: CascadeLayerID,
         layer_rank: (u64, u64),
+        attachment: CascadeAttachment,
     },
 }
 
@@ -268,7 +276,7 @@ pub struct CascadeContinuation {
     pub winner: Option<PropertyWinner>,
 }
 
-/// The origin, importance, encapsulation context, and layer occupied by one contender.
+/// The origin, importance, encapsulation context, attachment, and layer occupied by one contender.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CascadeStratum {
     origin: u8,
@@ -277,6 +285,7 @@ pub struct CascadeStratum {
     context: u32,
     layer: CascadeLayerID,
     layer_rank: (u64, u64),
+    attachment: CascadeAttachment,
 }
 
 impl CascadeStratum {
@@ -287,6 +296,7 @@ impl CascadeStratum {
         context: u32,
         layer: CascadeLayerID,
         layer_rank: (u64, u64),
+        attachment: CascadeAttachment,
     ) -> Self {
         let origin_group = match origin {
             CascadeOrigin::UserAgent => 0,
@@ -302,10 +312,11 @@ impl CascadeStratum {
             context,
             layer,
             layer_rank,
+            attachment,
         }
     }
 
-    fn ceiling(self, operator: CascadeOperator) -> Option<CascadeContinuationCeiling> {
+    pub(crate) fn ceiling(self, operator: CascadeOperator) -> Option<CascadeContinuationCeiling> {
         match operator {
             CascadeOperator::Revert => Some(CascadeContinuationCeiling::Origin {
                 origin_group: self.origin_group,
@@ -317,12 +328,13 @@ impl CascadeStratum {
                 context: self.context,
                 layer: self.layer,
                 layer_rank: self.layer_rank,
+                attachment: self.attachment,
             }),
             _ => None,
         }
     }
 
-    fn is_below(self, ceiling: CascadeContinuationCeiling) -> bool {
+    pub(crate) fn is_below(self, ceiling: CascadeContinuationCeiling) -> bool {
         match ceiling {
             CascadeContinuationCeiling::Origin {
                 origin_group,
@@ -334,9 +346,15 @@ impl CascadeStratum {
                 context,
                 layer: _,
                 layer_rank,
+                attachment,
             } => {
                 if self.origin != origin || self.context != context {
                     return true;
+                }
+                if attachment == CascadeAttachment::InlineStyle {
+                    // NB: Inline styles occupy a separate cascade step, even though they share
+                    //     the implicit outer layer's rank with unlayered style rules.
+                    return self.attachment != CascadeAttachment::InlineStyle;
                 }
 
                 // https://drafts.csswg.org/css-cascade-5/#revert-layer
@@ -835,6 +853,10 @@ pub struct WinnerGroups {
     winner_entry_count: usize,
     winner_rule_references: WinnerRuleReferences,
     column: Column<Option<(CascadeStateID, ProgramVersion)>>,
+    /// The flush that published each node's row: a row published in the current flush holds the
+    /// cascade of the node's current answer.
+    stamps: Column<u64>,
+    stamp: u64,
     pseudo_rows_by_node: Column<Vec<PseudoWinnerRow>>,
     pseudo_row_capacity_bytes: u64,
     priority_current: BitColumn,
@@ -855,6 +877,8 @@ struct PseudoWinnerRow {
     pseudo: PseudoElementTarget,
     state: (CascadeStateID, ProgramVersion),
     priority_current: bool,
+    /// The flush that published the row's state.
+    stamp: u64,
 }
 
 #[derive(Clone)]
@@ -895,6 +919,8 @@ impl Default for WinnerGroups {
             winner_entry_count: 0,
             winner_rule_references: WinnerRuleReferences::default(),
             column: Column::default(),
+            stamps: Column::default(),
+            stamp: 0,
             pseudo_rows_by_node: Column::default(),
             pseudo_row_capacity_bytes: 0,
             priority_current: BitColumn::default(),
@@ -935,6 +961,8 @@ impl WinnerGroups {
             winner_entry_count: self.winner_entry_count,
             winner_rule_references: self.winner_rule_references.clone(),
             column: self.column.clone(),
+            stamps: self.stamps.clone(),
+            stamp: self.stamp,
             pseudo_rows_by_node,
             pseudo_row_capacity_bytes,
             priority_current: self.priority_current.clone(),
@@ -1323,6 +1351,28 @@ impl WinnerGroups {
             / WINNER_GROUP_PROPERTY_COUNT
     }
 
+    /// Name the flush whose publications the rows record from now on.
+    pub fn begin_flush(&mut self, stamp: u64) {
+        self.stamp = stamp;
+    }
+
+    /// The flush that published the node's row, when it has one.
+    #[must_use]
+    pub fn row_stamp(&self, node: StyleNodeID) -> Option<u64> {
+        let index = node.element_index()? as usize;
+        self.column.get(index)?.as_ref()?;
+        Some(self.stamps.get(index).copied().unwrap_or(0))
+    }
+
+    /// The flush that published the node's row for a pseudo-element, when it has one.
+    #[must_use]
+    pub fn pseudo_row_stamp(&self, node: StyleNodeID, pseudo: PseudoElementTarget) -> Option<u64> {
+        node.element_index()
+            .and_then(|index| self.pseudo_rows_by_node.get(index as usize))
+            .and_then(|rows| rows.iter().find(|row| row.pseudo == pseudo))
+            .map(|row| row.stamp)
+    }
+
     #[must_use]
     pub fn winner_in_state(&self, state: CascadeStateID, property: PropertyID) -> Option<PropertyWinner> {
         let groups = &self.states[state];
@@ -1385,6 +1435,23 @@ impl WinnerGroups {
         CascadeWinnerDelta { properties }
     }
 
+    /// Hash the set of properties represented by a state, deliberately leaving their values out.
+    /// This identifies candidates which can seed a first computation and then be corrected by the
+    /// exact semantic delta.
+    pub(super) fn property_shape_hash(&self, state: CascadeStateID) -> u64 {
+        let mut hasher = fast_hasher();
+        for winner in self.winners_in_state(state) {
+            winner.property.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    pub(super) fn property_shapes_are_equal(&self, left: CascadeStateID, right: CascadeStateID) -> bool {
+        self.winners_in_state(left)
+            .map(|winner| winner.property)
+            .eq(self.winners_in_state(right).map(|winner| winner.property))
+    }
+
     fn append_group_semantic_delta(
         &self,
         previous: Option<WinnerGroupID>,
@@ -1439,6 +1506,8 @@ impl WinnerGroups {
             return false;
         }
         self.column.ensure(index);
+        self.stamps.ensure(index);
+        self.stamps[index] = self.stamp;
         if self.column[index] == Some((state, program_version)) {
             self.set_priority_current(index, true);
             return true;
@@ -1487,6 +1556,7 @@ impl WinnerGroups {
         self.pseudo_rows_by_node.ensure(index);
         if let Some(existing) = existing {
             let row = &mut self.pseudo_rows_by_node[index][existing];
+            row.stamp = self.stamp;
             if row.state == (state, program_version) {
                 row.priority_current = true;
                 return true;
@@ -1496,6 +1566,7 @@ impl WinnerGroups {
                 pseudo,
                 state: (state, program_version),
                 priority_current: true,
+                stamp: self.stamp,
             };
             self.update_winner_rule_node_references(previous, node, false);
             self.release_state(previous);
@@ -1505,6 +1576,7 @@ impl WinnerGroups {
                 pseudo,
                 state: (state, program_version),
                 priority_current: true,
+                stamp: self.stamp,
             });
             self.pseudo_row_capacity_bytes +=
                 ((self.pseudo_rows_by_node[index].capacity() - capacity_before) * size_of::<PseudoWinnerRow>()) as u64;
@@ -1814,6 +1886,7 @@ impl WinnerGroups {
         self.winner_entry_count = 0;
         self.winner_rule_references = WinnerRuleReferences::default();
         self.column = Column::default();
+        self.stamps = Column::default();
         self.pseudo_rows_by_node = Column::default();
         self.pseudo_row_capacity_bytes = 0;
         self.priority_current = BitColumn::default();
@@ -1838,6 +1911,7 @@ impl WinnerGroups {
                 self.state_reference_counts,
                 self.state_winning_rules,
                 self.winner_rule_references,
+                self.stamps,
             ];
             cached [self.nested_residency.bytes()];
             nested [self.pseudo_row_capacity_bytes];
@@ -2100,7 +2174,14 @@ mod tests {
         CascadeCandidate {
             winner,
             priority,
-            stratum: CascadeStratum::new(origin, important, 0, layer, (layer_rank, 0)),
+            stratum: CascadeStratum::new(
+                origin,
+                important,
+                0,
+                layer,
+                (layer_rank, 0),
+                CascadeAttachment::StyleSheet,
+            ),
         }
     }
 

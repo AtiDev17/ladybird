@@ -2232,7 +2232,7 @@ bool Document::needs_style_update_after_layout()
 {
     return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
         || m_needs_animated_style_update
-        || style_computer().style_engine().has_recorded_input();
+        || style_computer().style_engine().has_pending_transaction();
 }
 
 // Attempts to satisfy the pending layout update by re-laying out only the registered partial
@@ -2830,9 +2830,16 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
 
     // The update reads each box's scroll-offset flag in place of the offset it mirrors.
     static bool const verify_scroll_offset_flags = getenv("LIBWEB_VERIFY_SCROLL_OFFSET_FLAGS") != nullptr;
-    if (verify_scroll_offset_flags && m_layout_root) {
-        m_layout_root->for_each_in_inclusive_subtree([](Layout::Node const& node) {
-            node.verify_has_scroll_offset_flag();
+    if (verify_scroll_offset_flags) {
+        for_each_shadow_including_inclusive_descendant([](DOM::Node& node) {
+            if (auto const* layout_node = node.unsafe_layout_node())
+                layout_node->verify_has_scroll_offset_flag();
+            if (auto const* element = as_if<DOM::Element>(node)) {
+                element->for_each_synthetic_pseudo_element([](CSS::PseudoElement, DOM::SyntheticPseudoElement const& pseudo_element) {
+                    if (auto const* layout_node = pseudo_element.unsafe_layout_node())
+                        layout_node->verify_has_scroll_offset_flag();
+                });
+            }
             return TraversalDecision::Continue;
         });
     }
@@ -11131,6 +11138,7 @@ void Document::did_change_custom_property_registrations(Optional<Utf16FlyString>
 
 void Document::sync_custom_property_registrations_to_rust()
 {
+    m_rust_custom_property_registry_synced = true;
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration const*> effective_registrations;
     effective_registrations.ensure_capacity(m_registered_property_set.size() + m_cached_registered_properties_from_css_property_rules.size());
     for (auto const& [name, registration] : m_cached_registered_properties_from_css_property_rules)

@@ -41,14 +41,18 @@ impl StyleEngine {
             #[cfg(feature = "style-recording")]
             recording_id: None,
             memory,
-            parsed_substitution_memory: MemoryLease::new(MemoryCategory::ParsedSubstitutionCache),
             counters: Counters::new(),
+            computed_record_verification_counters: None,
+            computed_record_verification_pins: Vec::new(),
             tree,
             program: StyleSheetProgram::new(),
             journal: NormalizationJournal::new(),
             deferred_geometry_journal: NormalizationJournal::new(),
             flushing_deferred_geometry_journal: false,
             deferred_element_style_inputs: Vec::new(),
+            deferred_element_style_inputs_are_pending: false,
+            externally_recorded_style_input_nodes: HashSet::default(),
+            last_transaction_only_derived_child_reactions: false,
             deferred_element_style_input_memory: MemoryLease::new(MemoryCategory::NormalizationJournal),
             initial_tree_batch_applied: false,
             initial_tree_bulk_load_is_pending: false,
@@ -76,8 +80,19 @@ impl StyleEngine {
             specified_values: SpecifiedValues::new(),
             winner_groups: WinnerGroups::new(),
             computed_group_sets: ComputedGroupSets::default(),
+            custom_property_environments: Default::default(),
+            nodes_with_substituted_records: HashSet::default(),
+            custom_property_registrations_changed: false,
             pending_element_style_computation_selections: HashMap::default(),
             pending_pseudo_style_computation_selections: HashMap::default(),
+            engine_computed_records_pending: HashMap::default(),
+            flush_stamp: 0,
+            style_input_nodes_for_cpp: HashSet::default(),
+            parent_inputs_moved_nodes: HashSet::default(),
+            engine_pseudo_record_cache: HashMap::default(),
+            engine_cold_record_cache: HashMap::default(),
+            engine_cold_record_donors: HashMap::default(),
+            engine_computable_states: HashMap::default(),
             computed_group_set_memory: MemoryLease::new(MemoryCategory::ComputedGroupSet),
             custom_property_environment_memory: MemoryLease::new(MemoryCategory::CustomPropertyEnvironment),
             computed_fixed_metadata_memory: MemoryLease::new(MemoryCategory::ComputedFixedMetadata),
@@ -326,6 +341,16 @@ impl StyleEngine {
     /// its local name, and the selector that names a namespace tests only this one.
     pub fn intern_qualified_atom(&mut self, namespace: StyleAtomID, name: StyleAtomID) -> StyleAtomID {
         self.atoms.intern_qualified(namespace, name)
+    }
+
+    /// Record what a custom property's name atom spells, and the fly string it is.
+    ///
+    /// # Safety
+    /// `raw` must be zero or a live `AK::Utf16FlyString` raw representation.
+    pub unsafe fn note_custom_property_name(&mut self, name: StyleAtomID, raw: usize, text: &[u16]) {
+        if unsafe { self.custom_property_environments.note_name(name, raw, text) } {
+            self.counters.bump(Counter::CustomPropertyNamesPublished);
+        }
     }
 
     /// Add a style rule that only applies inside a scope, naming the scope's root selectors.
@@ -608,22 +633,6 @@ impl StyleEngine {
         &self.memory
     }
 
-    pub(crate) fn resize_parsed_substitution_cache(&mut self, bytes: u64) -> bool {
-        let category = MemoryCategory::ParsedSubstitutionCache;
-        if self.memory.external_tier3_drop_is_pending(category) {
-            if bytes != 0 {
-                return false;
-            }
-            self.parsed_substitution_memory.reconcile_committed(&mut self.memory, 0);
-            self.memory.complete_external_tier3_drop(category);
-            return true;
-        }
-        self.parsed_substitution_memory
-            .reconcile_committed(&mut self.memory, bytes);
-        self.memory.finish_committed_acceleration_growth(category);
-        true
-    }
-
     /// Mint `out.len()` element identities in one call. Identity allocation is batched because a
     /// call per element is exactly the boundary shape this design rules out.
     pub fn allocate_style_nodes(&mut self, out: &mut [u32]) {
@@ -711,7 +720,8 @@ impl StyleEngine {
 
     #[must_use]
     pub fn has_pending_transaction(&self) -> bool {
-        !self.journal.is_empty()
+        (self.deferred_element_style_inputs_are_pending && !self.deferred_element_style_inputs.is_empty())
+            || !self.journal.is_empty()
             || (!self.flushing_deferred_geometry_journal && !self.deferred_geometry_journal.is_empty())
             || !self.tree_staging.is_empty()
             || self.program_staging.is_dirty()
@@ -729,6 +739,108 @@ impl StyleEngine {
     #[must_use]
     pub fn has_deferred_element_style_inputs(&self) -> bool {
         !self.deferred_element_style_inputs.is_empty()
+    }
+
+    /// Record an exact style reaction for one element, merged with what the element already owes.
+    /// It joins the next transaction.
+    pub fn record_element_style_input(&mut self, node: StyleNodeID, reaction: u8, inherited_style_groups: u8) {
+        if reaction == 0 {
+            return;
+        }
+        // A recorded input asks for the C++ computation, whatever the engine derived for the
+        // element beside it. For the style pass accounting, a transaction stays one of derived
+        // child reactions when the recorded inputs join reactions the engine derived.
+        let derived_already = self.has_deferred_element_style_input(node);
+        let externally_recorded_already = self.externally_recorded_style_input_nodes.contains(&node);
+        self.record_derived_element_style_input(node, reaction, inherited_style_groups);
+        if !derived_already || externally_recorded_already {
+            self.externally_recorded_style_input_nodes.insert(node);
+        }
+        self.style_input_nodes_for_cpp.insert(node);
+    }
+
+    /// Record a style reaction the engine derived itself for one element.
+    pub(crate) fn record_derived_element_style_input(
+        &mut self,
+        node: StyleNodeID,
+        reaction: u8,
+        inherited_style_groups: u8,
+    ) {
+        if reaction == 0 {
+            return;
+        }
+        self.defer_element_style_input(node, reaction, inherited_style_groups);
+        self.deferred_element_style_inputs_are_pending = true;
+        self.externally_recorded_style_input_nodes.remove(&node);
+    }
+
+    /// Whether the last transaction planned nothing but derived child reactions, read once.
+    pub fn take_only_derived_child_reactions(&mut self) -> bool {
+        std::mem::take(&mut self.last_transaction_only_derived_child_reactions)
+    }
+
+    /// Record an exact style reaction for every flat-tree descendant of a node.
+    pub fn record_flat_tree_descendant_style_inputs(
+        &mut self,
+        root: StyleNodeID,
+        reaction: u8,
+        inherited_style_groups: u8,
+    ) {
+        if reaction == 0 {
+            return;
+        }
+        let mut descendants = Vec::new();
+        self.for_each_flat_tree_descendant(root, |node| descendants.push(node));
+        for node in descendants {
+            self.record_element_style_input(node, reaction, inherited_style_groups);
+        }
+    }
+
+    /// Fold the style input an element owes into the reaction C++ is about to apply to it, when
+    /// that reaction covers it: a materialization covers anything, while a record delta covers
+    /// only what it already carries. The folded input is consumed; one not covered stays owed to
+    /// the next transaction. Returns the merged reaction in the low byte and the merged inherited
+    /// style groups in the next, or zero when nothing was folded.
+    pub fn absorb_element_style_input(
+        &mut self,
+        node: StyleNodeID,
+        reaction: u8,
+        inherited_style_groups: u8,
+        absorbs_any: bool,
+    ) -> u32 {
+        let Ok(index) = self
+            .deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+        else {
+            return 0;
+        };
+        let InputValue::ElementStyleInput {
+            reaction: pending_reaction,
+            inherited_style_groups: pending_inherited_style_groups,
+        } = self.deferred_element_style_inputs[index].new
+        else {
+            unreachable!();
+        };
+        if !absorbs_any
+            && (pending_reaction & !reaction != 0 || pending_inherited_style_groups & !inherited_style_groups != 0)
+        {
+            return 0;
+        }
+        self.deferred_element_style_inputs.remove(index);
+        self.externally_recorded_style_input_nodes.remove(&node);
+        u32::from(reaction | pending_reaction)
+            | (u32::from(inherited_style_groups | pending_inherited_style_groups) << 8)
+    }
+
+    /// Drop the style input an element owes: C++ computed the element's style, which answers it.
+    pub fn consume_element_style_input(&mut self, node: StyleNodeID) {
+        if let Ok(index) = self
+            .deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+        {
+            self.deferred_element_style_inputs.remove(index);
+        }
+        self.externally_recorded_style_input_nodes.remove(&node);
     }
 
     /// Whether one element still owes a deferred style input, asked per node the way the recorded
@@ -969,6 +1081,8 @@ impl StyleEngine {
                 FeatureValue::Number(u32::from(arrival.heading_level)),
             );
         }
+        self.computed_group_sets
+            .set_adjustment_facts(node, arrival.adjustment_facts);
         for &state in custom_states {
             self.record_batched_input(
                 InputKey::LocalFeature(node, LocalFeatureKey::CustomState(state)),
@@ -1335,6 +1449,7 @@ impl StyleEngine {
             self.computed_group_sets.remove(node);
             self.pending_element_style_computation_selections.remove(&node);
             self.pending_pseudo_style_computation_selections.remove(&node);
+            self.nodes_with_substituted_records.remove(&node);
             let live_animation_overlays_after = self.computed_group_sets.live_animation_overlay_records();
             self.settle_computed_memory();
             self.counters.add(
@@ -1453,6 +1568,11 @@ impl StyleEngine {
     /// Record that an element is a `<slot>`, which decides whether `::slotted()` can name it.
     pub fn set_element_is_slot(&mut self, node: StyleNodeID, is_slot: bool) {
         self.facts.set_is_slot(node, is_slot);
+    }
+
+    /// Replace the element facts the style computation's adjustments read.
+    pub fn set_element_adjustment_facts(&mut self, node: StyleNodeID, facts: u32) {
+        self.computed_group_sets.set_adjustment_facts(node, facts);
     }
 
     pub fn set_element_heading_level(&mut self, node: StyleNodeID, level: u8) {
@@ -1874,13 +1994,18 @@ impl StyleEngine {
     ///
     /// An element-attached declaration is a cascade component above layers: a style attribute beats
     /// every layered and unlayered rule in its context, whatever layer they are in.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_element_declared_properties(
         &mut self,
         node: StyleNodeID,
         kind: ElementDeclarationKind,
         declared: &[DeclaredProperty],
+        written_values: Vec<RetainedStyleValueData>,
+        custom_declarations: Vec<CustomDeclaration>,
+        custom_written_values: Vec<RetainedStyleValueData>,
         declarations_are_complete: bool,
     ) {
+        debug_assert!(custom_declarations.is_empty() || kind == ElementDeclarationKind::InlineStyle);
         if matches!(
             kind,
             ElementDeclarationKind::PresentationalHint | ElementDeclarationKind::SvgPresentationAttribute
@@ -1895,7 +2020,11 @@ impl StyleEngine {
             });
         }
         let (current_declared, current_declarations_are_complete) = self.facts.element_declared_properties(node, kind);
-        if current_declarations_are_complete == declarations_are_complete && current_declared == declared {
+        if current_declarations_are_complete == declarations_are_complete
+            && current_declared == declared
+            && (kind != ElementDeclarationKind::InlineStyle
+                || self.facts.element_custom_declarations(node) == custom_declarations.as_slice())
+        {
             return;
         }
         let repair_inputs = declarations_are_complete
@@ -1914,8 +2043,17 @@ impl StyleEngine {
             let (declared, complete) = self.facts.element_declared_properties(node, kind);
             complete.then(|| declared.to_vec())
         });
-        self.facts
-            .set_element_declared_properties(node, kind, declared.to_vec(), declarations_are_complete);
+        self.facts.set_element_declared_properties(
+            node,
+            kind,
+            declared.to_vec(),
+            written_values,
+            declarations_are_complete,
+        );
+        if kind == ElementDeclarationKind::InlineStyle {
+            self.facts
+                .set_element_custom_declarations(node, custom_declarations, custom_written_values);
+        }
         let Some(((previous, retained), previous_declared)) = repair_inputs.zip(previous_declared) else {
             return;
         };

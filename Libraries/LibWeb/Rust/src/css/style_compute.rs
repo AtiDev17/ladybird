@@ -1358,6 +1358,8 @@ pub(crate) struct ExternalValueDependencies {
     pub uses_tree_counting_function: bool,
     pub container_relative_length_unit_mask: u8,
     pub has_unfixed_random_sharing: bool,
+    /// The value draws a `random()` result, which the document's random base values decide.
+    pub uses_random_function: bool,
     pub needs_document_base_url: bool,
     pub may_need_style_sheet_resource_context: bool,
     pub inheritance_dependent: bool,
@@ -1375,7 +1377,7 @@ fn container_relative_length_unit_bit(unit: u8) -> u8 {
     }
 }
 
-pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
+fn collect_external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
     fn collect_optional(value: &RetainedStyleValueData, dependencies: &mut ExternalValueDependencies) {
         if let Some(value) = value.optional_data() {
             collect(value, dependencies);
@@ -1413,8 +1415,11 @@ pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalVal
             crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Length { unit, .. }) => {
                 dependencies.container_relative_length_unit_mask |= container_relative_length_unit_bit(*unit);
             }
-            crate::css::calc::CalcNode::Random { sharing, .. }
-            | crate::css::calc::CalcNode::NonMathFunction { value: sharing, .. } => {
+            crate::css::calc::CalcNode::Random { sharing, .. } => {
+                dependencies.uses_random_function = true;
+                collect(sharing.data(), dependencies);
+            }
+            crate::css::calc::CalcNode::NonMathFunction { value: sharing, .. } => {
                 collect(sharing.data(), dependencies);
             }
             _ => {}
@@ -1499,6 +1504,7 @@ pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalVal
             }
             StyleValueData::Counter { counter_style, .. } => collect(counter_style.data(), dependencies),
             StyleValueData::RandomValueSharing { fixed_value, .. } => {
+                dependencies.uses_random_function = true;
                 if fixed_value.optional_data().is_some() {
                     collect_optional(fixed_value, dependencies);
                 } else {
@@ -1650,6 +1656,15 @@ pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalVal
 
     let mut dependencies = ExternalValueDependencies::default();
     collect(value, &mut dependencies);
+    dependencies
+}
+
+pub(crate) fn value_may_need_style_sheet_resource_context(value: &StyleValueData) -> bool {
+    collect_external_value_dependencies(value).may_need_style_sheet_resource_context
+}
+
+pub(crate) fn external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
+    let mut dependencies = collect_external_value_dependencies(value);
     dependencies.inheritance_dependent = crate::css::style_value::value_depends_on_current_color(value)
         || !value_is_computationally_independent(value)
             .expect("computational independence requested for an unsupported value");
@@ -2976,7 +2991,7 @@ fn compute_transform_origin(value: &StyleValueData) -> Option<Arc<StyleValueData
     }))
 }
 
-struct ParentSnapshot<'a> {
+pub(crate) struct ParentSnapshot<'a> {
     table: &'a ComputedLonghandTable,
     inherited_value_overlay: Option<&'a AnimatedOverlay>,
     stored_animated_overlay: Option<&'a AnimatedOverlay>,
@@ -2984,7 +2999,22 @@ struct ParentSnapshot<'a> {
     in_display_none_subtree: bool,
 }
 
-impl ParentSnapshot<'_> {
+impl<'a> ParentSnapshot<'a> {
+    /// A snapshot over a record's parts, for a caller holding the record view itself.
+    pub(crate) fn new(
+        table: &'a ComputedLonghandTable,
+        stored_animated_overlay: Option<&'a AnimatedOverlay>,
+        font_metrics_depend_on_viewport_metrics: bool,
+        in_display_none_subtree: bool,
+    ) -> Self {
+        Self {
+            table,
+            inherited_value_overlay: None,
+            stored_animated_overlay,
+            font_metrics_depend_on_viewport_metrics,
+            in_display_none_subtree,
+        }
+    }
     fn is_important(&self, property_id: u16) -> bool {
         self.table.is_important(property_id)
     }
@@ -3035,7 +3065,7 @@ impl ParentSnapshot<'_> {
     }
 }
 
-fn parent_snapshot_for_style_record<'a>(
+pub(crate) fn parent_snapshot_for_style_record<'a>(
     style_engine: &'a crate::css::style::StyleEngine,
     style_record: u64,
     animated_overlay: Option<&'a AnimatedOverlay>,
@@ -3092,7 +3122,7 @@ struct PostComputeAdjustment {
     element_style_adjustment: FfiElementStyleAdjustment,
 }
 
-fn empty_longhand_driver_results() -> FfiLonghandDriverResults {
+pub(crate) fn empty_longhand_driver_results() -> FfiLonghandDriverResults {
     FfiLonghandDriverResults {
         longhand_evaluations: 0,
         depends_on_viewport_metrics: false,
@@ -3116,7 +3146,7 @@ pub const LONGHAND_DRIVE_PHASE_REMAINING: u8 = 3;
 pub const LONGHAND_PHASE_CONTEXT_AFTER_FONT: u8 = 0;
 pub const LONGHAND_PHASE_CONTEXT_AFTER_LINE_HEIGHT: u8 = 1;
 
-fn property_computation_order_for_phase(phase: u8) -> &'static [u16] {
+pub(crate) fn property_computation_order_for_phase(phase: u8) -> &'static [u16] {
     use crate::css::property_metadata::{property_computation_order, property_id as prop};
 
     static PHASE_BOUNDARIES: OnceLock<(usize, usize)> = OnceLock::new();
@@ -3142,10 +3172,10 @@ fn property_computation_order_for_phase(phase: u8) -> &'static [u16] {
     }
 }
 
-const LOGICAL_ALIAS_BIT: u8 = 1;
-const PHYSICAL_TO_LOGICAL_BIT: u8 = 2;
+pub(crate) const LOGICAL_ALIAS_BIT: u8 = 1;
+pub(crate) const PHYSICAL_TO_LOGICAL_BIT: u8 = 2;
 
-fn table_row_bits(property_id: u16) -> u8 {
+pub(crate) fn table_row_bits(property_id: u16) -> u8 {
     use crate::css::property_metadata::{
         FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, longhand_is_logical_alias, property_is_in_logical_group,
     };
@@ -3189,14 +3219,10 @@ fn retained_new(value: StyleValueData) -> RetainedStyleValueData {
 }
 
 fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &ComputedStoreEntry) {
-    if entry.inheritance_dependent {
-        let specified_value = unsafe {
-            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
-                entry.data.cast(),
-            ))
-        };
-        longhand_table.append_drive_inheritance_dependent_value(entry.property_id, specified_value);
-    }
+    let specified_value = entry.inheritance_dependent.then(|| unsafe {
+        RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(entry.data.cast()))
+    });
+    longhand_table.set_drive_inheritance_dependent_value(entry.property_id, specified_value);
     let retained = match entry.computed_kind {
         COMPUTED_KIND_UNCHANGED => unsafe {
             RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(
@@ -3256,7 +3282,7 @@ fn store_computed_value(longhand_table: &mut ComputedLonghandTable, entry: &Comp
 /// `line_height_before_adjustments` at its effective value for that stage or
 /// null with the metrics, and `results` at a valid results block.
 #[allow(clippy::too_many_arguments)]
-unsafe fn drive_property_computation(
+pub(crate) unsafe fn drive_property_computation(
     longhand_table: *mut ComputedLonghandTable,
     animated_overlay: *mut AnimatedOverlay,
     store: *const CascadedPropertyStore,
@@ -4508,7 +4534,7 @@ unsafe fn drive_property_computation(
     });
 }
 
-fn is_required_driver_input(property_id: u16) -> bool {
+pub(crate) fn is_required_driver_input(property_id: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
     matches!(
         property_id,
@@ -4690,7 +4716,7 @@ fn computed_writing_mode_and_direction(table: &ComputedLonghandTable) -> (u8, u8
     (writing_mode, direction)
 }
 
-fn active_transition_properties(table: &ComputedLonghandTable) -> Vec<u16> {
+pub(crate) fn active_transition_properties(table: &ComputedLonghandTable) -> Vec<u16> {
     use crate::css::property_metadata::property_id as prop;
 
     let property_values = computed_value_list(table, prop::TRANSITION_PROPERTY);
@@ -4907,7 +4933,7 @@ fn keyword_from_style_value(value: &StyleValueData) -> u16 {
     *keyword
 }
 
-fn effective_display(table: &ComputedLonghandTable, overlay: Option<&AnimatedOverlay>) -> FfiDisplay {
+pub(crate) fn effective_display(table: &ComputedLonghandTable, overlay: Option<&AnimatedOverlay>) -> FfiDisplay {
     let StyleValueData::Display { raw } = effective_longhand_data(table, overlay, property_id::DISPLAY) else {
         unreachable!("display must have a display value")
     };
@@ -5738,6 +5764,53 @@ pub struct FfiBoxTypeTransformationInput {
     pub force_position_static: bool,
     pub force_symbol_display_inline: bool,
     pub webkit_box_layout_transformation_applies: bool,
+}
+
+/// Whether element-specific adjustments apply to the subject being computed.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FfiStyleAdjustmentTarget {
+    Element,
+    PseudoElement,
+}
+
+/// Build the shared adjustment inputs from element facts. The caller supplies the first
+/// non-`display: contents` ancestor's display, using live styles on the C++ path.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_box_type_transformation_input(
+    facts: u32,
+    target: FfiStyleAdjustmentTarget,
+    has_parent_display: bool,
+    parent_display: FfiDisplay,
+) -> FfiBoxTypeTransformationInput {
+    use crate::css::style::bridge::element_adjustment_fact as fact;
+
+    let has = |bit| facts & bit != 0;
+    let adjust_element = target == FfiStyleAdjustmentTarget::Element;
+    FfiBoxTypeTransformationInput {
+        display: crate::css::display::FfiDisplay::inline(),
+        position: keyword::STATIC,
+        float_value: keyword::NONE,
+        is_br_element: adjust_element && has(fact::IS_BR),
+        is_document_element: has(fact::IS_DOCUMENT_ELEMENT),
+        is_mathml_element: has(fact::IS_MATHML),
+        is_mathml_mtable: has(fact::IS_MATHML_MTABLE),
+        is_mathml_mtr: has(fact::IS_MATHML_MTR),
+        is_mathml_mtd: has(fact::IS_MATHML_MTD),
+        has_parent_display,
+        parent_display,
+        is_wbr_element: adjust_element && has(fact::IS_WBR),
+        disallow_display_contents: adjust_element && has(fact::DISALLOW_DISPLAY_CONTENTS),
+        rewrite_inline_flow: adjust_element && has(fact::REWRITE_INLINE_FLOW),
+        is_button_element: adjust_element && has(fact::IS_BUTTON),
+        force_line_height_normal: adjust_element && has(fact::FORCE_LINE_HEIGHT_NORMAL),
+        check_input_line_height: adjust_element && has(fact::CHECK_INPUT_LINE_HEIGHT),
+        hide_audio_without_controls: adjust_element && has(fact::HIDE_AUDIO_WITHOUT_CONTROLS),
+        is_table_element: adjust_element && has(fact::IS_TABLE),
+        force_position_static: adjust_element && has(fact::FORCE_POSITION_STATIC),
+        force_symbol_display_inline: adjust_element && has(fact::FORCE_SYMBOL_DISPLAY_INLINE),
+        webkit_box_layout_transformation_applies: false,
+    }
 }
 
 /// Result of the box type transformation: whether float must be reset to none,
@@ -6600,6 +6673,8 @@ pub unsafe extern "C" fn rust_compute_font_weight(
 // stubbed out here.
 #[cfg(test)]
 mod ffi_test_stubs {
+    use std::ffi::c_void;
+
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
     #[unsafe(no_mangle)]
@@ -6610,6 +6685,21 @@ mod ffi_test_stubs {
     extern "C" fn ladybird_gfx_font_cascade_list_unref(_raw: *const std::ffi::c_void) {}
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_font_unref(_raw: *const std::ffi::c_void) {}
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn unicode_rust_idna_to_ascii(
+        domain: *const u8,
+        domain_length: usize,
+        _options: *const c_void,
+        context: *mut c_void,
+        on_success: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    ) {
+        // The style tests only need ASCII URL hosts. The production build uses LibUnicode's C++
+        // implementation for the full IDNA algorithm.
+        let domain = unsafe { std::slice::from_raw_parts(domain, domain_length) };
+        if domain.is_ascii() {
+            unsafe { on_success(context, domain.as_ptr(), domain.len()) };
+        }
+    }
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_gfx_path_destroy(path: *mut std::ffi::c_void) {
         if !path.is_null() {
@@ -6663,6 +6753,36 @@ mod ffi_test_stubs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calculated_random_values_record_their_document_dependency() {
+        let number = || {
+            Arc::new(crate::css::calc::CalcNode::Numeric(
+                crate::css::calc::CalcNumericValue::Number {
+                    value: 1.0,
+                    number_type: 0,
+                },
+            ))
+        };
+        let calculation = crate::css::calc::CalcNode::Random {
+            min: number(),
+            max: number(),
+            step: None,
+            sharing: RetainedStyleValueData::from_owned(StyleValueData::Keyword { keyword: keyword::AUTO }),
+        };
+        let value = StyleValueData::Calculated {
+            rust_calculation: crate::css::calc::CalcNodeHandle::from_arc(Arc::new(calculation)),
+            resolve_as_is_number: true,
+            resolve_as_base: 0,
+            resolved_type: crate::css::calc::FfiNumericType::from_calc(None),
+            has_percentages_resolve_as: false,
+            percentages_resolve_as: 0,
+            resolve_numbers_as_integers: false,
+            accepted_ranges: crate::css::style_value::RetainedNumericRangeList::empty(),
+        };
+
+        assert!(external_value_dependencies(&value).uses_random_function);
+    }
 
     #[test]
     fn effective_overflow_keywords_compute_together() {

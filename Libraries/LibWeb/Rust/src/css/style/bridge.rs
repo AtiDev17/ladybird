@@ -27,8 +27,11 @@
 use std::ffi::c_void;
 
 use crate::abort_on_panic as abort_on_boundary_panic;
+use crate::css::custom_properties::CustomPropertyRegistry;
 use crate::css::selector::CompiledSelector;
 use crate::css::selector::RustSelector;
+use crate::css::style_value::RetainedStyleValueData;
+use crate::css::style_value::retain_style_value;
 
 use super::HashSet;
 use super::PinnedAtoms;
@@ -53,6 +56,7 @@ use super::memory::MemoryLease;
 use super::memory::TIER3_REFUSAL_CATEGORIES;
 use super::program::CascadeLayerID;
 use super::program::CascadeOrigin;
+use super::program::CustomDeclaration;
 use super::program::DeclarationBlockID;
 use super::program::DeclaredProperty;
 use super::program::RuleID;
@@ -107,6 +111,11 @@ pub struct FfiAnimationInvalidation {
 pub enum FfiStyleDeltaGap {
     None,
     Materialize,
+    /// The engine computed the new record itself from the moved cascade winners; C++ applies it
+    /// without running a style computation.
+    Computed,
+    /// Retry a cold drive while applying the preorder batch, after its parent is authoritative.
+    RetryAfterAncestor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,12 +141,23 @@ pub struct FfiStyleDelta {
     pub inherited_style_groups: u8,
     pub pseudo_kind: u8,
     pub gap: FfiStyleDeltaGap,
+    /// Substitution usage for an engine-computed element, including its pseudo-elements.
+    pub uses_substitution: bool,
+}
+
+/// A retried engine record and the metadata needed to install it.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct FfiEngineComputedRecord {
+    pub style_record: u64,
+    pub uses_substitution: bool,
 }
 
 #[derive(Default)]
 pub(super) struct FfiStyleTransactionOutput {
     scoped: bool,
     style_atoms_swept: bool,
+    only_derived_child_reactions: bool,
     transaction_version: u64,
     program_version: u64,
     answers: Vec<FfiStyleDelta>,
@@ -162,12 +182,16 @@ pub struct FfiStyleTransactionView {
     pub reclaimed_style_atom_count: usize,
     pub scoped: bool,
     pub style_atoms_swept: bool,
+    /// The transaction planned nothing but the child reactions the engine derived from the
+    /// reactions C++ applied last: one more generation of the same style change, not a new one.
+    pub only_derived_child_reactions: bool,
 }
 
 /// Document-wide scalar computation inputs captured at a style transaction boundary.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FfiDocumentStyleComputationInputs {
+    pub in_quirks_mode: bool,
     pub viewport_width: f64,
     pub viewport_height: f64,
     pub root_font_size: f64,
@@ -176,10 +200,56 @@ pub struct FfiDocumentStyleComputationInputs {
     pub root_font_zero_advance: f64,
     pub root_line_height: f64,
     pub root_font_metrics_depend_on_viewport_metrics: bool,
+    /// The metrics of the document's initial font, which the document element's own font
+    /// resolves against.
+    pub initial_font_size: f64,
+    pub initial_font_x_height: f64,
+    pub initial_font_cap_height: f64,
+    pub initial_font_zero_advance: f64,
     pub initial_font_size_raw: i32,
     pub default_font_size_raw: i32,
     pub device_pixels_per_css_pixel: f64,
     pub font_environment_generation: u64,
+    /// The page's preferred color scheme and the document's supported schemes, as
+    /// PreferredColorScheme codes; up to four supported schemes are carried.
+    pub preferred_color_scheme: u8,
+    pub has_document_supported_schemes: bool,
+    pub document_supported_scheme_count: u8,
+    pub document_supported_scheme_codes: [u8; 4],
+    /// The document's custom-property registry, and the generation its registrations are at:
+    /// what an engine-computed environment resolves registered names against.
+    pub custom_property_registry: *const c_void,
+    pub custom_property_registration_generation: u64,
+}
+
+impl Default for FfiDocumentStyleComputationInputs {
+    fn default() -> Self {
+        Self {
+            in_quirks_mode: false,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
+            root_font_size: 0.0,
+            root_font_x_height: 0.0,
+            root_font_cap_height: 0.0,
+            root_font_zero_advance: 0.0,
+            root_line_height: 0.0,
+            root_font_metrics_depend_on_viewport_metrics: false,
+            initial_font_size: 0.0,
+            initial_font_x_height: 0.0,
+            initial_font_cap_height: 0.0,
+            initial_font_zero_advance: 0.0,
+            initial_font_size_raw: 0,
+            default_font_size_raw: 0,
+            device_pixels_per_css_pixel: 0.0,
+            font_environment_generation: 0,
+            preferred_color_scheme: 0,
+            has_document_supported_schemes: false,
+            document_supported_scheme_count: 0,
+            document_supported_scheme_codes: [0; 4],
+            custom_property_registry: std::ptr::null(),
+            custom_property_registration_generation: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -203,6 +273,7 @@ pub struct FfiResolvedFont {
     pub ascent: f32,
     pub descent: f32,
     pub x_height: f32,
+    pub zero_advance: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -247,6 +318,7 @@ impl Default for FfiStyleTransactionView {
             reclaimed_style_atoms: std::ptr::null(),
             reclaimed_style_atom_count: 0,
             scoped: false,
+            only_derived_child_reactions: false,
             style_atoms_swept: false,
         }
     }
@@ -273,6 +345,7 @@ fn write_style_transaction_outputs(
             payload.write_u8(answer.inherited_style_groups);
             payload.write_u8(answer.pseudo_kind);
             payload.write_u8(answer.gap as u8);
+            payload.write_bool(answer.uses_substitution);
         }
     }
     payload.write_bool(output.style_atoms_swept);
@@ -436,6 +509,63 @@ pub struct FfiElementArrival {
     pub heading_level: u8,
     pub is_slot: bool,
     pub reserved: u16,
+    /// The element's `ElementStyleAdjustmentFact` bits: what the box-type transformation and the
+    /// element style adjustments read of the DOM. Mirrors the C++ enum.
+    pub adjustment_facts: u32,
+}
+
+/// The last pseudo-element kind C++ materializes as a synthetic pseudo-element; the kinds up to
+/// it are the bits a style record's pseudo-element mask carries. Mirrors the C++
+/// `last_synthetic_pseudo_element`.
+pub const LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND: u16 = 7;
+
+/// What C++ reports about a style reaction it applied, for the engine to derive the reactions of
+/// the element's children. Mirrors C++ `StyleReactionAppliedFact`.
+pub mod style_reaction_applied_fact {
+    pub const DID_CHANGE_CUSTOM_PROPERTIES: u32 = 1 << 0;
+    pub const INVALIDATION_IS_NONE: u32 = 1 << 1;
+    pub const NEEDS_LAYOUT_TREE_REBUILD: u32 = 1 << 2;
+    pub const RECOMPUTE_DESCENDANT_STYLES: u32 = 1 << 3;
+    pub const CHILDREN_EXPLICITLY_INHERIT: u32 = 1 << 4;
+    pub const SHADOW_CHILDREN_EXPLICITLY_INHERIT: u32 = 1 << 5;
+    pub const WAS_UNSTYLED: u32 = 1 << 6;
+    pub const WAS_DISPLAY_NONE: u32 = 1 << 7;
+    pub const IS_DISPLAY_NONE: u32 = 1 << 8;
+    pub const IN_DISPLAY_NONE_SUBTREE: u32 = 1 << 9;
+    pub const HAS_STYLE: u32 = 1 << 10;
+    /// The applied reaction moved the element's computed display, which its children's box-type
+    /// transformation reads.
+    pub const DISPLAY_CHANGED: u32 = 1 << 11;
+}
+
+/// The element facts the style computation's box-type transformation and element style
+/// adjustments read. Mirrors C++ `ElementStyleAdjustmentFact`.
+pub mod element_adjustment_fact {
+    pub const IS_BR: u32 = 1 << 0;
+    pub const IS_WBR: u32 = 1 << 1;
+    pub const DISALLOW_DISPLAY_CONTENTS: u32 = 1 << 2;
+    pub const REWRITE_INLINE_FLOW: u32 = 1 << 3;
+    pub const IS_BUTTON: u32 = 1 << 4;
+    pub const FORCE_LINE_HEIGHT_NORMAL: u32 = 1 << 5;
+    pub const CHECK_INPUT_LINE_HEIGHT: u32 = 1 << 6;
+    pub const HIDE_AUDIO_WITHOUT_CONTROLS: u32 = 1 << 7;
+    pub const IS_TABLE: u32 = 1 << 8;
+    pub const FORCE_POSITION_STATIC: u32 = 1 << 9;
+    pub const FORCE_SYMBOL_DISPLAY_INLINE: u32 = 1 << 10;
+    pub const IS_MATHML: u32 = 1 << 11;
+    pub const IS_MATHML_MTABLE: u32 = 1 << 12;
+    pub const IS_MATHML_MTR: u32 = 1 << 13;
+    pub const IS_MATHML_MTD: u32 = 1 << 14;
+    pub const IS_TH: u32 = 1 << 15;
+    pub const IS_DOCUMENT_ELEMENT: u32 = 1 << 16;
+    pub const HAS_ANIMATIONS: u32 = 1 << 17;
+    pub const HAS_PRESENTATIONAL_HINTS: u32 = 1 << 18;
+    /// The element stands for an element-reference pseudo-element of its shadow host, whose
+    /// style C++ computes and installs on it.
+    pub const IS_SHADOW_HOST_PSEUDO_ELEMENT: u32 = 1 << 19;
+    /// The element's presentational hints are mapped from another element's attributes, and
+    /// move without any of its own moving.
+    pub const HAS_DERIVED_PRESENTATIONAL_HINTS: u32 = 1 << 20;
 }
 
 /// Which local fact a feature delta describes.
@@ -698,6 +828,68 @@ fn write_declared_properties(declared: &[DeclaredProperty], payload: &mut super:
         });
         payload.write_u64(property.value.0);
     }
+}
+
+fn write_custom_declarations(declared: &[CustomDeclaration], payload: &mut super::record_replay::PayloadWriter) {
+    payload.write_length(declared.len());
+    for property in declared {
+        payload.write_u32(property.name.0);
+        payload.write_bool(property.important);
+        payload.write_u8(match property.operator {
+            CascadeOperator::Declared => 0,
+            CascadeOperator::Inherit => 1,
+            CascadeOperator::Initial => 2,
+            CascadeOperator::Unset => 3,
+            CascadeOperator::Revert => 4,
+            CascadeOperator::RevertLayer => 5,
+        });
+        payload.write_u64(property.value.0);
+    }
+}
+
+/// The custom properties one declaration block carries across the boundary as parallel columns:
+/// the engine's atom for each name, its importance, its cascade operator, and its canonical and
+/// written values. Returns nothing when a non-empty span has no storage.
+///
+/// # Safety
+/// Every non-null column must name `count` entries, and the values must be live style values.
+unsafe fn collect_custom_declarations(
+    engine: &mut StyleEngine,
+    names: *const u32,
+    important: *const bool,
+    operators: *const FfiCascadeOperator,
+    values: *const *const c_void,
+    original_values: *const *const c_void,
+    count: usize,
+) -> Option<(Vec<CustomDeclaration>, Vec<RetainedStyleValueData>)> {
+    if count == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
+    if names.is_null() || important.is_null() || operators.is_null() || values.is_null() || original_values.is_null() {
+        return None;
+    }
+    let names = unsafe { std::slice::from_raw_parts(names, count) };
+    let important = unsafe { std::slice::from_raw_parts(important, count) };
+    let operators = unsafe { std::slice::from_raw_parts(operators, count) };
+    let values = unsafe { std::slice::from_raw_parts(values, count) };
+    let original_values = unsafe { std::slice::from_raw_parts(original_values, count) };
+    let mut written = Vec::with_capacity(count);
+    let declared = (0..count)
+        .map(|index| {
+            let value = unsafe { engine.intern_specified_value(values[index].cast()) };
+            unsafe { engine.alias_specified_value(original_values[index].cast(), value) };
+            written.push(unsafe {
+                RetainedStyleValueData::from_retained_pointer(retain_style_value(original_values[index].cast()))
+            });
+            CustomDeclaration {
+                name: StyleAtomID(names[index]),
+                important: important[index],
+                operator: operators[index].decode(),
+                value,
+            }
+        })
+        .collect();
+    Some((declared, written))
 }
 
 fn write_exact_cascade_publication(
@@ -979,16 +1171,6 @@ pub fn style_engine_create_for_replay(device_class: FfiDeviceClass) -> *mut c_vo
 pub unsafe extern "C" fn style_engine_use_recording_memory_policy(engine: *mut c_void) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
     engine.memory.enable_recording_policy();
-}
-
-/// Accounts C++ substitution-cache capacity against this document's acceleration budget.
-///
-/// # Safety
-/// `engine` must be live.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_resize_parsed_substitution_cache(engine: *mut c_void, bytes: u64) -> bool {
-    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    engine.resize_parsed_substitution_cache(bytes)
 }
 
 #[unsafe(no_mangle)]
@@ -1301,6 +1483,7 @@ pub unsafe fn replay_set_element_declared_properties(
     node: u32,
     kind: FfiElementDeclarationKind,
     declared: &[DeclaredProperty],
+    custom_declarations: &[CustomDeclaration],
     declarations_are_complete: bool,
 ) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
@@ -1309,6 +1492,9 @@ pub unsafe fn replay_set_element_declared_properties(
         node,
         decode_element_declaration_kind(kind),
         declared,
+        Vec::new(),
+        custom_declarations.to_vec(),
+        Vec::new(),
         declarations_are_complete,
     );
 }
@@ -1322,10 +1508,18 @@ pub unsafe fn replay_set_rule_declared_properties(
     engine: *mut c_void,
     rule: u32,
     declared: &[DeclaredProperty],
+    custom_declarations: &[CustomDeclaration],
     declarations_are_complete: bool,
 ) {
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
-    engine.set_rule_declared_properties_with_operators(RuleID(rule - 1), declared, declarations_are_complete);
+    engine.set_rule_declared_properties_with_written_values(
+        RuleID(rule - 1),
+        declared,
+        Vec::new(),
+        custom_declarations.to_vec(),
+        Vec::new(),
+        declarations_are_complete,
+    );
 }
 
 /// Gives an existing style rule a new selector list, keeping its identity and its position.
@@ -1761,7 +1955,11 @@ unsafe fn write_rule_matches(
             *out.add(index) = FfiRuleMatch {
                 node: entry.node.raw(),
                 rule: entry.rule.0 + 1,
-                semantic_declaration: engine.program.ensure_semantic_declaration(entry.rule).0,
+                semantic_declaration: if engine.program.declarations_are_complete_for(entry.rule) {
+                    engine.program.ensure_semantic_declaration(entry.rule).0
+                } else {
+                    0
+                },
                 pseudo_element: entry.pseudo_element.map_or(u32::MAX, |target| u32::from(target.kind.0)),
                 scope_host: engine.cascade_context_host(entry.rule, entry.tree_scope),
                 scope_proximity: entry.scope_proximity,
@@ -1892,12 +2090,19 @@ pub unsafe extern "C" fn style_engine_set_element_declared_properties(
     values: *const *const c_void,
     original_values: *const *const c_void,
     count: usize,
+    custom_names: *const u32,
+    custom_important: *const bool,
+    custom_operators: *const FfiCascadeOperator,
+    custom_values: *const *const c_void,
+    custom_original_values: *const *const c_void,
+    custom_count: usize,
     declarations_are_complete: bool,
 ) {
     let Some(node) = StyleNodeID::from_raw(node) else {
         return;
     };
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    let mut written_values = Vec::with_capacity(count);
     let declared: Vec<DeclaredProperty> = match count == 0 {
         true => Vec::new(),
         false => {
@@ -1923,6 +2128,9 @@ pub unsafe extern "C" fn style_engine_set_element_declared_properties(
                 .map(|(((property, important), operator), (value, original_value))| {
                     let specified_value = unsafe { engine.intern_specified_value(value.cast()) };
                     unsafe { engine.alias_specified_value(original_value.cast(), specified_value) };
+                    written_values.push(unsafe {
+                        RetainedStyleValueData::from_retained_pointer(retain_style_value(original_value.cast()))
+                    });
                     DeclaredProperty {
                         property,
                         important,
@@ -1933,10 +2141,26 @@ pub unsafe extern "C" fn style_engine_set_element_declared_properties(
                 .collect()
         }
     };
+    let Some((custom_declarations, custom_written_values)) = (unsafe {
+        collect_custom_declarations(
+            engine,
+            custom_names,
+            custom_important,
+            custom_operators,
+            custom_values,
+            custom_original_values,
+            custom_count,
+        )
+    }) else {
+        return;
+    };
     engine.set_element_declared_properties(
         node,
         decode_element_declaration_kind(kind),
         &declared,
+        written_values,
+        custom_declarations.clone(),
+        custom_written_values,
         declarations_are_complete,
     );
     engine.record_boundary_call(EventKind::SetElementDeclaredProperties, |payload| {
@@ -1944,6 +2168,7 @@ pub unsafe extern "C" fn style_engine_set_element_declared_properties(
         payload.write_u8(kind as u8);
         payload.write_bool(declarations_are_complete);
         write_declared_properties(&declared, payload);
+        write_custom_declarations(&custom_declarations, payload);
     });
 }
 
@@ -2175,6 +2400,7 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     animation_overlay_payloads: *const *const c_void,
     animation_overlay_payload_count: usize,
     longhand_table: *const c_void,
+    custom_property_store: *const c_void,
 ) -> FfiStyleRecordDelta {
     if count != 0 && payloads.is_null() {
         return FfiStyleRecordDelta::default();
@@ -2210,16 +2436,33 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     if animation_overlay_identity != 0 && animated_overlay.is_null() {
         return FfiStyleRecordDelta::default();
     }
+    let verifying_computed_record = engine.computed_record_verification_counters.is_some();
     let metadata_input = super::computed::ComputedMetadataInput {
         pseudo_element_styles,
         dependency_flags,
         counter_style_environment_identity,
-        animation_overlay_identity,
-        animated_overlay: animated_overlay.cast(),
-        animation_overlay_payloads,
+        animation_overlay_identity: if verifying_computed_record {
+            0
+        } else {
+            animation_overlay_identity
+        },
+        animated_overlay: if verifying_computed_record {
+            std::ptr::null()
+        } else {
+            animated_overlay.cast()
+        },
+        animation_overlay_payloads: if verifying_computed_record {
+            &[]
+        } else {
+            animation_overlay_payloads
+        },
         longhand_table: longhand_table.map_or(std::ptr::null(), std::ptr::from_ref),
     };
-    let publication = if let Some(node) = StyleNodeID::from_raw(node) {
+    // A C++ verification computation interns a comparable record without replacing the engine's
+    // authoritative assignment for the node it is checking.
+    let publication = if engine.computed_record_verification_counters.is_none()
+        && let Some(node) = StyleNodeID::from_raw(node)
+    {
         engine.publish_computed_groups(
             super::computed::ComputedStyleTarget::new(node, pseudo_kind),
             payloads,
@@ -2229,18 +2472,41 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
         )
     } else {
         engine.intern_computed_groups(
-            payloads,
+            if animation_overlay_identity != 0 {
+                animation_overlay_payloads
+            } else {
+                payloads
+            },
             inherited_group_count,
             custom_property_environment,
             metadata_input,
         )
     };
+    // The store is what the environment resolves to; an engine-computed environment builds on it,
+    // and an element alike in its custom declarations takes the environment itself.
+    unsafe {
+        engine
+            .custom_property_environments
+            .retain(custom_property_environment, custom_property_store);
+    }
+    if engine.computed_record_verification_counters.is_none()
+        && pseudo_kind == u8::MAX
+        && let Some(node) = StyleNodeID::from_raw(node)
+    {
+        engine.remember_cpp_custom_property_environment(node, custom_property_environment);
+    }
     let result = FfiStyleRecordDelta {
         old_style_record: publication
             .previous_style_record_identity
             .map_or(0, super::computed::FinalStyleRecordID::raw),
         new_style_record: publication.style_record_identity.raw(),
     };
+    if engine.computed_record_verification_counters.is_some() {
+        // C++ can retain a verification record on a pseudo-element the authoritative reaction
+        // leaves unchanged. With no target assignment to own it, keep it live with the engine.
+        engine.pin_style_record(result.new_style_record);
+        engine.computed_record_verification_pins.push(result.new_style_record);
+    }
     engine.record_boundary_call(EventKind::PublishComputedGroups, |payload| {
         let pointer_token = |pointer: *const c_void| match pointer.is_null() {
             true => 0,
@@ -2317,6 +2583,34 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     result
 }
 
+/// Enter a C++ computed-record verification scope.
+///
+/// # Safety
+/// `engine` must be live, and verification scopes must not nest.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_begin_computed_record_verification(engine: *mut c_void) {
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    assert!(engine.computed_record_verification_counters.is_none());
+    assert!(engine.computed_record_verification_pins.is_empty());
+    engine.computed_record_verification_counters = Some(Box::new(engine.counters.clone()));
+}
+
+/// Leave a C++ computed-record verification scope without exposing its instrumentation work.
+///
+/// # Safety
+/// `engine` must be live and inside a verification scope.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_end_computed_record_verification(engine: *mut c_void) {
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    for style_record in std::mem::take(&mut engine.computed_record_verification_pins) {
+        engine.unpin_style_record(style_record);
+    }
+    engine.counters = *engine
+        .computed_record_verification_counters
+        .take()
+        .expect("computed-record verification scope must be active");
+}
+
 /// Replaces only the animation overlay on an already-published target. Recording falls back to
 /// `style_engine_publish_computed_groups`, which captures the complete base-style input.
 ///
@@ -2388,6 +2682,19 @@ pub unsafe extern "C" fn style_engine_assign_shared_style_record(
         StyleNodeID::from_raw(node).expect("a nonzero node must be a style node"),
         pseudo_kind,
     );
+    if engine.computed_record_verification_counters.is_some() {
+        let style_record = engine
+            .computed_group_sets
+            .style_record_for_shared_assignment(target, style_record)
+            .expect("a shared style record must name a live base record")
+            .raw();
+        engine.pin_style_record(style_record);
+        engine.computed_record_verification_pins.push(style_record);
+        return FfiStyleRecordDelta {
+            old_style_record: 0,
+            new_style_record: style_record,
+        };
+    }
     let publication = engine.assign_shared_style_record(
         target,
         style_record,
@@ -2457,6 +2764,22 @@ pub unsafe extern "C" fn style_engine_style_record_dependency_flags(engine: *con
     engine.style_record_dependency_flags(style_record).unwrap_or(0)
 }
 
+/// The raw custom-property environment identity a style record was published with.
+///
+/// # Safety
+/// `engine` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_style_record_custom_property_environment(
+    engine: *const c_void,
+    style_record: u64,
+) -> u64 {
+    let engine = unsafe { &*engine.cast::<StyleEngine>() };
+    engine
+        .computed_group_sets
+        .style_record_custom_property_environment(style_record)
+        .unwrap_or(0)
+}
+
 /// Computes the property-dependent damage between two final style records.
 ///
 /// # Safety
@@ -2475,6 +2798,30 @@ pub unsafe extern "C" fn style_engine_compare_style_records(
         new_style_record,
         font_lists_equal,
         element_folds_transform_into_layout,
+    )
+}
+
+/// Returns whether two final style records agree where the legacy verification drive is authoritative.
+///
+/// # Safety
+/// `engine` must be live, `node` and `pseudo_kind` must name the target, and both style records must
+/// remain pinned or assigned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_style_records_match_for_verification(
+    engine: *const c_void,
+    node: u32,
+    pseudo_kind: u8,
+    first_style_record: u64,
+    second_style_record: u64,
+) -> bool {
+    let engine = unsafe { &*engine.cast::<StyleEngine>() };
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return false;
+    };
+    engine.computed_group_sets.style_records_match_for_verification(
+        super::computed::ComputedStyleTarget::new(node, pseudo_kind),
+        first_style_record,
+        second_style_record,
     )
 }
 
@@ -2657,12 +3004,19 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
     values: *const *const c_void,
     original_values: *const *const c_void,
     count: usize,
+    custom_names: *const u32,
+    custom_important: *const bool,
+    custom_operators: *const FfiCascadeOperator,
+    custom_values: *const *const c_void,
+    custom_original_values: *const *const c_void,
+    custom_count: usize,
     declarations_are_complete: bool,
 ) {
     if rule == 0 {
         return;
     }
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    let mut written_values = Vec::with_capacity(count);
     let declared: Vec<DeclaredProperty> = match count == 0 {
         true => Vec::new(),
         false => {
@@ -2688,6 +3042,9 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
                 .map(|(((property, important), operator), (value, original_value))| {
                     let value = unsafe { engine.intern_specified_value(value.cast()) };
                     unsafe { engine.alias_specified_value(original_value.cast(), value) };
+                    written_values.push(unsafe {
+                        RetainedStyleValueData::from_retained_pointer(retain_style_value(original_value.cast()))
+                    });
                     DeclaredProperty {
                         property,
                         important,
@@ -2698,13 +3055,161 @@ pub unsafe extern "C" fn style_engine_set_rule_declared_properties(
                 .collect()
         }
     };
-    engine.set_rule_declared_properties_with_operators(RuleID(rule - 1), &declared, declarations_are_complete);
+    let Some((custom_declarations, custom_written_values)) = (unsafe {
+        collect_custom_declarations(
+            engine,
+            custom_names,
+            custom_important,
+            custom_operators,
+            custom_values,
+            custom_original_values,
+            custom_count,
+        )
+    }) else {
+        return;
+    };
+    engine.set_rule_declared_properties_with_written_values(
+        RuleID(rule - 1),
+        &declared,
+        written_values,
+        custom_declarations.clone(),
+        custom_written_values,
+        declarations_are_complete,
+    );
     engine.record_boundary_call(EventKind::SetRuleDeclaredProperties, |payload| {
         payload.write_u32(rule);
         payload.write_bool(declarations_are_complete);
         write_declared_properties(&declared, payload);
+        write_custom_declarations(&custom_declarations, payload);
     });
 }
+/// Moves a node's record to the custom-property environment C++ refreshed it to, keeping the
+/// store behind the environment, and returns the new record's identity; zero when the node holds
+/// no base record to move.
+///
+/// # Safety
+/// `engine` must be live, and `store` must be null or a live raw `Arc` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_republish_record_environment(
+    engine: *mut c_void,
+    node: u32,
+    environment: u64,
+    store: *const c_void,
+) -> u64 {
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return 0;
+    };
+    unsafe { engine.custom_property_environments.retain(environment, store) };
+    let result = engine.republish_record_environment(node, environment).unwrap_or(0);
+    engine.record_boundary_call(EventKind::RepublishRecordEnvironment, |payload| {
+        payload.write_u32(node.raw());
+        payload.write_u64(environment);
+        payload.write_u64(result);
+    });
+    result
+}
+
+/// Replays a record moved to a refreshed environment.
+///
+/// # Safety
+/// `engine` must be live.
+pub unsafe fn replay_republish_record_environment(engine: *mut c_void, node: u32, environment: u64) -> u64 {
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    StyleNodeID::from_raw(node)
+        .and_then(|node| engine.republish_record_environment(node, environment))
+        .unwrap_or(0)
+}
+
+/// Retry after the ancestor's style was installed, returning installation metadata together
+/// with the record instead of requiring a later query of the node.
+///
+/// # Safety
+/// `engine` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_retry_engine_record_after_ancestor(
+    engine: *mut c_void,
+    node: u32,
+) -> FfiEngineComputedRecord {
+    abort_on_panic(|| {
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        let Some(style_node) = StyleNodeID::from_raw(node) else {
+            return FfiEngineComputedRecord::default();
+        };
+        let style_record = engine.retry_engine_record_after_ancestor(style_node);
+        let result = FfiEngineComputedRecord {
+            style_record,
+            uses_substitution: style_record != 0 && engine.nodes_with_substituted_records.contains(&style_node),
+        };
+        engine.record_boundary_call(EventKind::RetryEngineRecordAfterAncestor, |payload| {
+            payload.write_u32(node);
+            payload.write_u64(result.style_record);
+            payload.write_bool(result.uses_substitution);
+        });
+        result
+    })
+}
+
+/// The store of an environment the engine resolved, with one strong reference transferred to the
+/// caller, and the environment it was resolved over; null for an environment C++ published.
+///
+/// # Safety
+/// `engine` must be live and `parent` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_borrow_engine_custom_property_environment(
+    engine: *const c_void,
+    identity: u64,
+    parent: *mut u64,
+) -> *const c_void {
+    let engine = unsafe { &*engine.cast::<StyleEngine>() };
+    let Some((store, parent_identity)) = engine.custom_property_environments.engine_environment(identity) else {
+        return std::ptr::null();
+    };
+    unsafe {
+        std::sync::Arc::increment_strong_count(store.cast::<crate::css::custom_properties::CustomPropertyStore>());
+        *parent = parent_identity;
+    }
+    store
+}
+
+/// Records what a custom property's name atom spells, and the fly string it is. The fly string is
+/// retained and never recorded: a replay has no strings, and names its entries by atom alone.
+///
+/// # Safety
+/// `engine` must be live, `raw` must be a live `AK::Utf16FlyString` raw representation, and `text`
+/// must name `length` code units.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_note_custom_property_name(
+    engine: *mut c_void,
+    name: u32,
+    raw: usize,
+    text: *const u16,
+    length: usize,
+) {
+    if name == 0 || (length != 0 && text.is_null()) {
+        return;
+    }
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    let text = match length {
+        0 => &[],
+        _ => unsafe { std::slice::from_raw_parts(text, length) },
+    };
+    unsafe { engine.note_custom_property_name(StyleAtomID(name), raw, text) };
+    engine.record_boundary_call(EventKind::NoteCustomPropertyName, |payload| {
+        payload.write_u32(name);
+        payload.write_u16_slice(text);
+    });
+}
+
+/// Replays a recorded custom-property name without a fly string behind it.
+///
+/// # Safety
+/// `engine` must be live.
+pub unsafe fn replay_note_custom_property_name(engine: *mut c_void, name: u32, text: &[u16]) {
+    let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    unsafe { engine.note_custom_property_name(StyleAtomID(name), 0, text) };
+}
+
 /// Interns one name identity and returns its document-local atom.
 ///
 /// The caller passes the one-word identity of an interned string it holds a reference to, so the
@@ -2739,6 +3244,16 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         return FfiStyleTransactionView::default();
     };
     let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+    engine.custom_property_registrations_changed = engine.document_style_computation_inputs.is_some_and(|previous| {
+        previous.custom_property_registration_generation != computation_inputs.custom_property_registration_generation
+    });
+    if engine.document_style_computation_inputs != Some(computation_inputs) {
+        // Persistent records are derived from every document computation input, not only the
+        // font generation carried in their keys.
+        engine.engine_cold_record_cache.clear();
+        engine.engine_cold_record_donors.clear();
+        engine.engine_pseudo_record_cache.clear();
+    }
     engine.document_style_computation_inputs = Some(computation_inputs);
     engine.clear_ffi_style_transaction_output();
     let mut output = FfiStyleTransactionOutput::default();
@@ -2759,6 +3274,7 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         })
         .collect();
     output.style_atoms_swept = std::mem::take(&mut engine.style_atoms_swept);
+    output.only_derived_child_reactions = engine.take_only_derived_child_reactions();
     if engine.recording_id().is_some() {
         engine.record_boundary_call(EventKind::StyleDeltaBatch, |payload| {
             payload.write_u32(root.raw());
@@ -2770,10 +3286,30 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
             payload.write_u64(computation_inputs.root_font_zero_advance.to_bits());
             payload.write_u64(computation_inputs.root_line_height.to_bits());
             payload.write_bool(computation_inputs.root_font_metrics_depend_on_viewport_metrics);
+            payload.write_u64(computation_inputs.initial_font_size.to_bits());
+            payload.write_u64(computation_inputs.initial_font_x_height.to_bits());
+            payload.write_u64(computation_inputs.initial_font_cap_height.to_bits());
+            payload.write_u64(computation_inputs.initial_font_zero_advance.to_bits());
             payload.write_i32(computation_inputs.initial_font_size_raw);
             payload.write_i32(computation_inputs.default_font_size_raw);
             payload.write_u64(computation_inputs.device_pixels_per_css_pixel.to_bits());
             payload.write_u64(computation_inputs.font_environment_generation);
+            payload.write_u8(computation_inputs.preferred_color_scheme);
+            payload.write_bool(computation_inputs.has_document_supported_schemes);
+            payload.write_u8(computation_inputs.document_supported_scheme_count);
+            for code in computation_inputs.document_supported_scheme_codes {
+                payload.write_u8(code);
+            }
+            let custom_property_registry_is_engine_usable = !computation_inputs.custom_property_registry.is_null()
+                && !unsafe {
+                    &*computation_inputs
+                        .custom_property_registry
+                        .cast::<CustomPropertyRegistry>()
+                }
+                .has_registrations();
+            payload.write_bool(custom_property_registry_is_engine_usable);
+            payload.write_u64(computation_inputs.custom_property_registration_generation);
+            payload.write_bool(computation_inputs.in_quirks_mode);
             let mut outputs = super::record_replay::PayloadWriter::default();
             write_style_transaction_outputs(&output, &mut outputs);
             payload.write_bytes(outputs.as_bytes());
@@ -2791,6 +3327,7 @@ pub unsafe extern "C" fn style_engine_take_style_transaction(
         reclaimed_style_atoms: output.reclaimed_style_atoms.as_ptr(),
         reclaimed_style_atom_count: output.reclaimed_style_atoms.len(),
         scoped: output.scoped,
+        only_derived_child_reactions: output.only_derived_child_reactions,
         style_atoms_swept: output.style_atoms_swept,
     }
 }
@@ -2811,10 +3348,21 @@ pub unsafe extern "C" fn style_engine_sort_style_deltas_for_direct_application(
     assert!(!deltas.is_null(), "a non-empty delta span must have storage");
     let engine = unsafe { &*engine.cast::<StyleEngine>() };
     let deltas = unsafe { std::slice::from_raw_parts_mut(deltas, count) };
+    // An element's own delta leads the pseudo-element deltas settled beside it.
+    let pseudo_rank = |delta: &FfiStyleDelta| {
+        if delta.pseudo_kind == u8::MAX {
+            0
+        } else {
+            1 + u16::from(delta.pseudo_kind)
+        }
+    };
     deltas.sort_unstable_by(|first, second| {
-        let first = StyleNodeID::from_raw(first.style_node).expect("a style delta must name an element");
-        let second = StyleNodeID::from_raw(second.style_node).expect("a style delta must name an element");
-        engine.tree.compare_style_reaction_order(first, second)
+        let first_node = StyleNodeID::from_raw(first.style_node).expect("a style delta must name an element");
+        let second_node = StyleNodeID::from_raw(second.style_node).expect("a style delta must name an element");
+        engine
+            .tree
+            .compare_style_reaction_order(first_node, second_node)
+            .then_with(|| pseudo_rank(first).cmp(&pseudo_rank(second)))
     });
 }
 
@@ -3161,7 +3709,7 @@ mod tests {
 
     #[test]
     fn element_arrival_rows_install_intrinsic_facts() {
-        assert_eq!(size_of::<FfiElementArrival>(), 28);
+        assert_eq!(size_of::<FfiElementArrival>(), 32);
         let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
         let mut nodes = [0_u32; 2];
         engine.allocate_style_nodes(&mut nodes);
@@ -3190,6 +3738,7 @@ mod tests {
                 namespace_atom: 11,
                 language_atom: 12,
                 directionality_atom: 13,
+                adjustment_facts: 0,
                 custom_state_offset: 0,
                 custom_state_count: 2,
                 heading_level: 4,
@@ -3201,6 +3750,7 @@ mod tests {
                 namespace_atom: 21,
                 language_atom: 22,
                 directionality_atom: 23,
+                adjustment_facts: 0,
                 custom_state_offset: 2,
                 custom_state_count: 1,
                 heading_level: 0,
@@ -3230,6 +3780,7 @@ mod tests {
             namespace_atom: 1,
             language_atom: 2,
             directionality_atom: 3,
+            adjustment_facts: 0,
             custom_state_offset,
             custom_state_count,
             heading_level: 0,
@@ -3325,8 +3876,15 @@ mod tests {
                 && delta.old_style_record == 0
                 && delta.new_style_record == 0
                 && delta.damage == FfiStyleDeltaDamage::None
-                && delta.gap == FfiStyleDeltaGap::Materialize
         }));
+        assert_eq!(
+            published.iter().map(|delta| delta.gap).collect::<Vec<_>>(),
+            [
+                FfiStyleDeltaGap::Materialize,
+                FfiStyleDeltaGap::RetryAfterAncestor,
+                FfiStyleDeltaGap::RetryAfterAncestor,
+            ]
+        );
         assert_eq!(engine.counters().get(Counter::InitialBulkMatchLoads), 1);
         assert_eq!(engine.counters().get(Counter::InitialBulkMatchRows), 3);
         assert_eq!(engine.counters().get(Counter::PublishedMatchAnswerRecords), 3);

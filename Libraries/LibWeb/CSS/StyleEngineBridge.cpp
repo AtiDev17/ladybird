@@ -40,7 +40,8 @@ static StyleEngineFFI::FfiResolvedFont resolve_font(void* context, StyleEngineFF
         {},
         {});
     font_computer.pin_font_list_for_style_record(font_list);
-    auto const& first_available_font = font_list->font_for_code_point(' ');
+    // The metric probe must not load a face: the first available font answers without one.
+    auto const& first_available_font = font_list->first_available_font();
     auto const metrics = first_available_font.pixel_metrics();
     auto* handle = &font_list.leak_ref();
     return {
@@ -50,6 +51,7 @@ static StyleEngineFFI::FfiResolvedFont resolve_font(void* context, StyleEngineFF
         .ascent = metrics.ascent,
         .descent = metrics.descent,
         .x_height = metrics.x_height,
+        .zero_advance = metrics.advance_of_ascii_zero,
     };
 }
 
@@ -63,19 +65,11 @@ static void release_resolved_font(void const* handle)
     static_cast<Gfx::FontCascadeList const*>(handle)->unref();
 }
 
+static_assert(StyleEngineFFI::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND == to_underlying(last_synthetic_pseudo_element));
 static_assert(!IsMoveConstructible<StyleEngine>);
 static_assert(!IsMoveAssignable<StyleEngine>);
 
 #include <LibWeb/StyleEngineBridgeGenerated.inc>
-
-bool StyleEngine::published_style_delta_can_absorb_reaction(PublishedStyleDelta const& delta, u8 reaction, u8 inherited_style_groups)
-{
-    if (delta.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize)
-        return true;
-    bool const has_additional_reaction = (reaction & ~delta.reaction) != 0;
-    bool const has_additional_inherited_style_groups = (inherited_style_groups & ~delta.inherited_style_groups) != 0;
-    return !has_additional_reaction && !has_additional_inherited_style_groups;
-}
 
 StyleEngine::StyleEngine(DeviceClass device_class, StyleComputer* style_computer)
     : m_impl(StyleEngineFFI::style_engine_create(device_class))
@@ -127,11 +121,6 @@ HashTable<StyleNodeID> StyleEngine::take_deferred_element_initial_features()
 HashTable<StyleNodeID> StyleEngine::take_elements_awaiting_first_style_computation()
 {
     return move(m_nodes_awaiting_first_style_computation);
-}
-
-bool StyleEngine::resize_parsed_substitution_cache(u64 bytes)
-{
-    return StyleEngineFFI::style_engine_resize_parsed_substitution_cache(m_impl, bytes);
 }
 
 void StyleEngine::set_element_parts(StyleNodeID node, ReadonlySpan<StyleAtomID> names, ReadonlySpan<StyleNodeID> hosts)
@@ -194,22 +183,30 @@ void StyleEngine::finish_sheet_rules_replacement(SheetID sheet)
     StyleEngineFFI::style_engine_finish_sheet_rules_replacement(m_impl, sheet.value(), next_declaration_block_version());
 }
 
-void StyleEngine::set_rule_declared_properties(StyleEngineRuleID rule, ReadonlySpan<u16> properties, ReadonlySpan<bool> important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> operators, ReadonlySpan<void const*> values, ReadonlySpan<void const*> original_values, bool declarations_are_complete)
+void StyleEngine::set_rule_declared_properties(StyleEngineRuleID rule, ReadonlySpan<u16> properties, ReadonlySpan<bool> important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> operators, ReadonlySpan<void const*> values, ReadonlySpan<void const*> original_values, ReadonlySpan<StyleAtomID> custom_names, ReadonlySpan<bool> custom_important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> custom_operators, ReadonlySpan<void const*> custom_values, ReadonlySpan<void const*> custom_original_values, bool declarations_are_complete)
 {
     VERIFY(properties.size() == important.size());
     VERIFY(properties.size() == operators.size());
     VERIFY(properties.size() == values.size());
     VERIFY(properties.size() == original_values.size());
-    StyleEngineFFI::style_engine_set_rule_declared_properties(m_impl, rule.value(), properties.data(), important.data(), operators.data(), values.data(), original_values.data(), properties.size(), declarations_are_complete);
+    VERIFY(custom_names.size() == custom_important.size());
+    VERIFY(custom_names.size() == custom_operators.size());
+    VERIFY(custom_names.size() == custom_values.size());
+    VERIFY(custom_names.size() == custom_original_values.size());
+    StyleEngineFFI::style_engine_set_rule_declared_properties(m_impl, rule.value(), properties.data(), important.data(), operators.data(), values.data(), original_values.data(), properties.size(), reinterpret_cast<u32 const*>(custom_names.data()), custom_important.data(), custom_operators.data(), custom_values.data(), custom_original_values.data(), custom_names.size(), declarations_are_complete);
 }
 
-void StyleEngine::set_element_declared_properties(StyleNodeID node, StyleEngineFFI::FfiElementDeclarationKind kind, ReadonlySpan<u16> properties, ReadonlySpan<bool> important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> operators, ReadonlySpan<void const*> values, ReadonlySpan<void const*> original_values, bool declarations_are_complete)
+void StyleEngine::set_element_declared_properties(StyleNodeID node, StyleEngineFFI::FfiElementDeclarationKind kind, ReadonlySpan<u16> properties, ReadonlySpan<bool> important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> operators, ReadonlySpan<void const*> values, ReadonlySpan<void const*> original_values, ReadonlySpan<StyleAtomID> custom_names, ReadonlySpan<bool> custom_important, ReadonlySpan<StyleEngineFFI::FfiCascadeOperator> custom_operators, ReadonlySpan<void const*> custom_values, ReadonlySpan<void const*> custom_original_values, bool declarations_are_complete)
 {
     VERIFY(properties.size() == important.size());
     VERIFY(properties.size() == operators.size());
     VERIFY(properties.size() == values.size());
     VERIFY(properties.size() == original_values.size());
-    StyleEngineFFI::style_engine_set_element_declared_properties(m_impl, node.value(), kind, properties.data(), important.data(), operators.data(), values.data(), original_values.data(), properties.size(), declarations_are_complete);
+    VERIFY(custom_names.size() == custom_important.size());
+    VERIFY(custom_names.size() == custom_operators.size());
+    VERIFY(custom_names.size() == custom_values.size());
+    VERIFY(custom_names.size() == custom_original_values.size());
+    StyleEngineFFI::style_engine_set_element_declared_properties(m_impl, node.value(), kind, properties.data(), important.data(), operators.data(), values.data(), original_values.data(), properties.size(), reinterpret_cast<u32 const*>(custom_names.data()), custom_important.data(), custom_operators.data(), custom_values.data(), custom_original_values.data(), custom_names.size(), declarations_are_complete);
 }
 
 StyleEngine::ExactCascadePublication StyleEngine::publish_exact_cascade_state(StyleNodeID node, u8 pseudo_kind, ComputedValuesFFI::CascadedPropertyStore const* store, u8 inherited_style_groups, StyleNodeID donor_node, StyleRecordID donor_style_record)
@@ -228,10 +225,10 @@ void StyleEngine::discard_retained_cascade_assignments()
     StyleEngineFFI::style_engine_discard_retained_cascade_assignments(m_impl);
 }
 
-StyleEngine::StyleRecordDelta StyleEngine::publish_computed_groups(StyleNodeID node, u8 pseudo_kind, ReadonlySpan<void const*> payloads, size_t inherited_group_count, u64 custom_property_environment, bool inherited_group_swap_candidate, u64 counter_style_environment_identity, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> animation_overlay_payloads, void const* computed_longhand_table)
+StyleEngine::StyleRecordDelta StyleEngine::publish_computed_groups(StyleNodeID node, u8 pseudo_kind, ReadonlySpan<void const*> payloads, size_t inherited_group_count, u64 custom_property_environment, bool inherited_group_swap_candidate, u64 counter_style_environment_identity, u64 animation_overlay_identity, void const* animated_overlay, ReadonlySpan<void const*> animation_overlay_payloads, void const* computed_longhand_table, void const* custom_property_store)
 {
     VERIFY(inherited_group_count <= payloads.size());
-    auto delta = StyleEngineFFI::style_engine_publish_computed_groups(m_impl, node.value(), pseudo_kind, payloads.data(), payloads.size(), inherited_group_count, custom_property_environment, inherited_group_swap_candidate, counter_style_environment_identity, animation_overlay_identity, animated_overlay, animation_overlay_payloads.data(), animation_overlay_payloads.size(), computed_longhand_table);
+    auto delta = StyleEngineFFI::style_engine_publish_computed_groups(m_impl, node.value(), pseudo_kind, payloads.data(), payloads.size(), inherited_group_count, custom_property_environment, inherited_group_swap_candidate, counter_style_environment_identity, animation_overlay_identity, animated_overlay, animation_overlay_payloads.data(), animation_overlay_payloads.size(), computed_longhand_table, custom_property_store);
     return { StyleRecordID { delta.old_style_record }, StyleRecordID { delta.new_style_record } };
 }
 
@@ -257,6 +254,26 @@ void const* StyleEngine::style_record_payloads(StyleRecordID style_record) const
 u8 StyleEngine::style_record_dependency_flags(StyleRecordID style_record) const
 {
     return StyleEngineFFI::style_engine_style_record_dependency_flags(m_impl, style_record.value());
+}
+
+u64 StyleEngine::style_record_custom_property_environment(StyleRecordID style_record) const
+{
+    return StyleEngineFFI::style_engine_style_record_custom_property_environment(m_impl, style_record.value());
+}
+
+void StyleEngine::begin_computed_record_verification()
+{
+    StyleEngineFFI::style_engine_begin_computed_record_verification(m_impl);
+}
+
+void StyleEngine::end_computed_record_verification()
+{
+    StyleEngineFFI::style_engine_end_computed_record_verification(m_impl);
+}
+
+bool StyleEngine::style_records_match_for_verification(StyleNodeID node, u8 pseudo_kind, StyleRecordID first, StyleRecordID second) const
+{
+    return StyleEngineFFI::style_engine_style_records_match_for_verification(m_impl, node.value(), pseudo_kind, first.value(), second.value());
 }
 
 u32 StyleEngine::compare_style_records(StyleRecordID old_style_record, StyleRecordID new_style_record, bool font_lists_equal, bool element_folds_transform_into_layout) const
@@ -306,6 +323,37 @@ StyleAtomID StyleEngine::intern_atom(Utf16FlyString const& name)
     auto atom = StyleAtomID { StyleEngineFFI::style_engine_intern_atom(m_impl, raw) };
     m_atoms.set(raw, atom);
     return atom;
+}
+
+void StyleEngine::note_custom_property_name(StyleAtomID atom, Utf16FlyString const& name)
+{
+    if (m_published_custom_property_names.contains(atom))
+        return;
+    m_published_custom_property_names.set(atom);
+    auto const view = name.view();
+    Vector<u16> code_units;
+    code_units.ensure_capacity(view.length_in_code_units());
+    for (size_t i = 0; i < view.length_in_code_units(); ++i)
+        code_units.unchecked_append(view.code_unit_at(i));
+    // The engine retains the fly string itself; this reference only carries it across.
+    auto raw = name.to_raw_leaked();
+    StyleEngineFFI::style_engine_note_custom_property_name(m_impl, atom.value(), raw, code_units.data(), code_units.size());
+    Utf16FlyString::unref_raw(raw);
+}
+
+StyleRecordID StyleEngine::republish_record_environment(StyleNodeID node, u64 environment, void const* store)
+{
+    return StyleRecordID { StyleEngineFFI::style_engine_republish_record_environment(m_impl, node.value(), environment, store) };
+}
+
+StyleEngineFFI::FfiEngineComputedRecord StyleEngine::retry_engine_record_after_ancestor(StyleNodeID node)
+{
+    return StyleEngineFFI::style_engine_retry_engine_record_after_ancestor(m_impl, node.value());
+}
+
+void const* StyleEngine::borrow_engine_custom_property_environment(u64 identity, u64& parent_identity) const
+{
+    return StyleEngineFFI::style_engine_borrow_engine_custom_property_environment(m_impl, identity, &parent_identity);
 }
 
 StyleAtomID StyleEngine::intern_text_atom(Utf16View text)
@@ -493,25 +541,12 @@ void StyleEngine::record_element_declaration_delta(StyleEngineFFI::FfiElementDec
     m_element_declaration_deltas.append(delta);
 }
 
-void StyleEngine::append_or_merge_element_style_input(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
-{
-    if (auto existing = m_element_style_input_indices.find(style_node); existing != m_element_style_input_indices.end()) {
-        auto& input = m_element_style_inputs[existing->value];
-        input.reaction |= reaction;
-        input.inherited_style_groups |= inherited_style_groups;
-        return;
-    }
-
-    m_element_style_input_indices.set(style_node, m_element_style_inputs.size());
-    m_element_style_inputs.append({ style_node.value(), reaction, inherited_style_groups });
-}
-
 void StyleEngine::record_element_style_input_change(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
 {
     if (style_node != 0 && reaction != 0) {
         flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
         request_frame_for_first_recorded_input(*this, m_style_computer);
-        append_or_merge_element_style_input(style_node, reaction, inherited_style_groups);
+        record_element_style_input(style_node, reaction, inherited_style_groups);
     }
 }
 
@@ -521,15 +556,10 @@ void StyleEngine::record_flat_tree_descendant_style_input_changes(StyleNodeID st
         return;
 
     flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
-    // The relation columns must include every tree delta recorded before this derived action. The
-    // descendants themselves stay in the C++ batch so the next transaction normalizes them with
-    // every other feedback action from this stabilization pass.
+    // The relation columns must include every tree delta recorded before this derived action.
     submit_recorded_input();
     request_frame_for_first_recorded_input(*this, m_style_computer);
-    auto descendants = StyleEngineFFI::style_engine_flat_tree_descendants(m_impl, style_node.value());
-    for (auto descendant : ReadonlySpan<u32> { descendants.nodes, descendants.count })
-        append_or_merge_element_style_input(StyleNodeID { descendant }, reaction, inherited_style_groups);
-    StyleEngineFFI::style_engine_discard_flat_tree_descendants(m_impl);
+    record_flat_tree_descendant_style_inputs(style_node, reaction, inherited_style_groups);
 }
 
 Vector<StyleNodeID> StyleEngine::viewport_dependent_style_nodes()
@@ -543,25 +573,9 @@ Vector<StyleNodeID> StyleEngine::viewport_dependent_style_nodes()
     return nodes;
 }
 
-void StyleEngine::consume_recorded_element_style_input_change(StyleNodeID style_node)
-{
-    auto existing = m_element_style_input_indices.find(style_node);
-    if (existing == m_element_style_input_indices.end())
-        return;
-
-    auto index = existing->value;
-    VERIFY(index < m_element_style_inputs.size());
-    m_element_style_input_indices.remove(style_node);
-    auto last_input = m_element_style_inputs.take_last();
-    if (index < m_element_style_inputs.size()) {
-        m_element_style_inputs[index] = last_input;
-        m_element_style_input_indices.set(StyleNodeID { last_input.style_node }, index);
-    }
-}
-
 bool StyleEngine::has_recorded_element_style_input_change(StyleNodeID style_node) const
 {
-    return m_element_style_input_indices.contains(style_node);
+    return has_deferred_element_style_input(style_node);
 }
 void StyleEngine::record_benchmark_marker(Utf16View name)
 {
@@ -577,8 +591,7 @@ bool StyleEngine::has_recorded_input() const
         || !m_element_arrivals.is_empty()
         || !m_local_feature_deltas.is_empty()
         || !m_state_deltas.is_empty()
-        || !m_element_declaration_deltas.is_empty()
-        || !m_element_style_inputs.is_empty();
+        || !m_element_declaration_deltas.is_empty();
 }
 
 void StyleEngine::submit_recorded_input()
@@ -604,8 +617,8 @@ void StyleEngine::submit_recorded_input()
         .state_delta_count = m_state_deltas.size(),
         .element_declaration_deltas = m_element_declaration_deltas.data(),
         .element_declaration_delta_count = m_element_declaration_deltas.size(),
-        .element_style_inputs = m_element_style_inputs.data(),
-        .element_style_input_count = m_element_style_inputs.size(),
+        .element_style_inputs = nullptr,
+        .element_style_input_count = 0,
     };
     apply_transaction(transaction);
 
@@ -615,8 +628,6 @@ void StyleEngine::submit_recorded_input()
     m_local_feature_deltas.clear_with_capacity();
     m_state_deltas.clear_with_capacity();
     m_element_declaration_deltas.clear_with_capacity();
-    m_element_style_inputs.clear_with_capacity();
-    m_element_style_input_indices.clear_with_capacity();
 
     // Selector demand can arrive while the program change and element facts are still staged.
     // Refresh after applying the fact batch, then backfill values before matching observes it.
@@ -639,8 +650,12 @@ bool StyleEngine::take_diagnostic_style_transaction(StyleNodeID root, Function<v
 {
     Vector<StyleNodeID> reaction_nodes;
     auto transaction = take_style_transaction(root);
-    for (auto const& reaction : transaction.reactions)
+    for (auto const& reaction : transaction.reactions) {
+        // A pseudo-element record is part of its element's reaction.
+        if (reaction.pseudo_kind != NumericLimits<u8>::max())
+            continue;
         reaction_nodes.append(StyleNodeID { reaction.style_node });
+    }
     discard_style_transaction_outputs();
     if (!transaction.is_scoped)
         return false;
@@ -660,7 +675,10 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
     if (m_style_computer) {
         auto const viewport_rect = m_style_computer->viewport_rect_for_style_environment();
         auto const& root_font_metrics = m_style_computer->root_element_font_metrics();
+        auto const& initial_font = m_style_computer->document().font_computer().initial_font();
+        Length::FontMetrics const initial_font_metrics { CSSPixels { initial_font.pixel_size() }, initial_font.pixel_metrics(), InitialValues::line_height() };
         computation_inputs = {
+            .in_quirks_mode = m_style_computer->document().in_quirks_mode(),
             .viewport_width = viewport_rect.width().to_double(),
             .viewport_height = viewport_rect.height().to_double(),
             .root_font_size = root_font_metrics.font_size.to_double(),
@@ -669,11 +687,35 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
             .root_font_zero_advance = root_font_metrics.zero_advance.to_double(),
             .root_line_height = root_font_metrics.line_height.to_double(),
             .root_font_metrics_depend_on_viewport_metrics = m_style_computer->root_element_font_metrics_depend_on_viewport_metrics(),
+            .initial_font_size = initial_font_metrics.font_size.to_double(),
+            .initial_font_x_height = initial_font_metrics.x_height.to_double(),
+            .initial_font_cap_height = initial_font_metrics.cap_height.to_double(),
+            .initial_font_zero_advance = initial_font_metrics.zero_advance.to_double(),
             .initial_font_size_raw = InitialValues::font_size().raw_value(),
             .default_font_size_raw = StyleComputer::default_user_font_size().raw_value(),
             .device_pixels_per_css_pixel = m_style_computer->document().page().client().device_pixels_per_css_pixel(),
             .font_environment_generation = m_style_computer->document().font_computer().environment_generation(),
+            .preferred_color_scheme = static_cast<u8>(to_underlying(m_style_computer->document().page().preferred_color_scheme())),
+            .has_document_supported_schemes = false,
+            .document_supported_scheme_count = 0,
+            .document_supported_scheme_codes = {},
+            .custom_property_registry = m_style_computer->document().rust_custom_property_registry(),
+            .custom_property_registration_generation = m_style_computer->document().custom_property_registration_generation(),
         };
+        if (auto supported = m_style_computer->document().supported_color_schemes(); supported.has_value()) {
+            computation_inputs.has_document_supported_schemes = true;
+            for (auto const& scheme : *supported) {
+                auto preferred_scheme = preferred_color_scheme_from_string(scheme);
+                if (preferred_scheme == PreferredColorScheme::Auto)
+                    continue;
+                auto code = static_cast<u8>(to_underlying(preferred_scheme));
+                auto supported_codes = Span<u8> { computation_inputs.document_supported_scheme_codes };
+                if (supported_codes.trim(computation_inputs.document_supported_scheme_count).contains_slow(code))
+                    continue;
+                VERIFY(computation_inputs.document_supported_scheme_count < supported_codes.size());
+                supported_codes[computation_inputs.document_supported_scheme_count++] = code;
+            }
+        }
     }
     auto view = StyleEngineFFI::style_engine_take_style_transaction(m_impl, root.value(), computation_inputs);
     if (view.reclaimed_style_atom_count != 0) {
@@ -683,6 +725,7 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
             auto atom_id = StyleAtomID { reclaimed.atom };
             reclaimed_atoms.set(atom_id);
             m_published_language_atoms.remove(atom_id);
+            m_published_custom_property_names.remove(atom_id);
             m_attribute_names_requiring_value_text.remove(atom_id);
             if (reclaimed.raw == 0)
                 continue;
@@ -705,6 +748,7 @@ StyleEngine::PublishedStyleTransaction StyleEngine::take_style_transaction(Style
         .version = { view.transaction_version, view.program_version },
         .reactions = { view.answers, view.count },
         .is_scoped = view.scoped,
+        .only_derived_child_reactions = view.only_derived_child_reactions,
     };
 }
 
