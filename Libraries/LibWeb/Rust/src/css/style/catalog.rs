@@ -6,7 +6,7 @@
 
 use super::capacity::capacity_bytes;
 use super::column::Column;
-use super::fast_hash::fast_hasher;
+use super::intern_table::content_hash;
 use super::*;
 
 define_id! { default pub(super) struct MatchAnswerID(pub(super)); }
@@ -35,23 +35,23 @@ pub(super) struct SelectorTruth {
 pub(super) struct SelectorTruthSetCatalog {
     sets: super::intern_table::InternTable<SelectorTruthSetID, Rc<[SelectorTruth]>>,
     verified_derived_answers: HashMap<(SelectorTruthSetID, TreeScopeID, u64), Rc<[RetainedRuleMatch]>>,
-    last_identity: u32,
 }
 
 impl SelectorTruthSetCatalog {
     pub(super) fn intern_prepared(&mut self, truth: Vec<SelectorTruth>) -> (SelectorTruthSetID, bool) {
-        let hash = super::intern_table::content_hash(&truth);
+        let hash = content_hash(&truth);
         if let Some(identity) = self
             .sets
             .find(hash, |_identity, candidate| candidate.as_ref() == truth.as_slice())
         {
             return (identity, true);
         }
-        self.last_identity = self
-            .last_identity
-            .checked_add(1)
-            .expect("selector truth-set identity space exhausted");
-        let identity = SelectorTruthSetID(self.last_identity);
+        let identity = SelectorTruthSetID(
+            u32::try_from(self.sets.len())
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .expect("selector truth-set identity space exhausted"),
+        );
         self.sets.insert(hash, identity, truth.into());
         (identity, false)
     }
@@ -94,7 +94,6 @@ pub(super) struct MatchAnswerCatalogEntry {
 #[derive(Default)]
 pub(super) struct MatchAnswerCatalog {
     pub(super) answers: super::intern_table::InternTable<MatchAnswerID, Option<MatchAnswerCatalogEntry>>,
-    pub(super) last_identity: u32,
     pub(super) prefix_payload_bytes: usize,
     pub(super) cascade_payload_bytes: u64,
     pub(super) retained_payload_bytes: u64,
@@ -123,14 +122,6 @@ impl MatchAnswerCatalog {
         }
     }
 
-    pub(super) fn new_identity(&mut self) -> MatchAnswerID {
-        self.last_identity = self
-            .last_identity
-            .checked_add(1)
-            .expect("match answer catalog identity space exhausted");
-        MatchAnswerID(self.last_identity)
-    }
-
     pub(super) fn intern(&mut self, answer: &[RuleMatch]) -> MatchAnswerID {
         const INLINE_ANSWER_LENGTH: usize = 16;
         if let Some(first) = answer.first().copied()
@@ -143,7 +134,7 @@ impl MatchAnswerCatalog {
             }
             let prepared = &mut prepared[..answer.len()];
             prepared.sort_unstable();
-            let hash = hash_retained_rule_matches(prepared);
+            let hash = content_hash(&*prepared);
             if let Some(identity) = self.identity(prepared, hash) {
                 return identity;
             }
@@ -156,7 +147,7 @@ impl MatchAnswerCatalog {
     }
 
     pub(super) fn intern_prepared(&mut self, answer: Vec<RetainedRuleMatch>) -> MatchAnswerID {
-        let hash = hash_retained_rule_matches(&answer);
+        let hash = content_hash(&answer);
         if let Some(identity) = self.identity(&answer, hash) {
             return identity;
         }
@@ -164,7 +155,12 @@ impl MatchAnswerCatalog {
     }
 
     pub(super) fn insert_new(&mut self, answer: Vec<RetainedRuleMatch>, hash: u64) -> MatchAnswerID {
-        let identity = self.new_identity();
+        let identity = MatchAnswerID(
+            u32::try_from(self.answers.len())
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .expect("match answer catalog identity space exhausted"),
+        );
         self.answers.insert(
             hash,
             identity,
@@ -260,20 +256,16 @@ impl MatchAnswerCatalog {
     }
 
     pub(super) fn sweep_unreferenced(&mut self) -> u64 {
-        let unreferenced = self
-            .answers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let entry = entry.as_ref()?;
-                (entry.prefix_references == 0 && entry.cascade_references == 0 && entry.retained_references == 0)
-                    .then_some(MatchAnswerID(index as u32 + 1))
-            })
-            .collect::<Vec<_>>();
-        unreferenced
-            .into_iter()
-            .map(|identity| self.remove_unreferenced(identity))
-            .sum()
+        let mut released_bytes = 0;
+        for index in 0..self.answers.len() {
+            let Some(entry) = self.answers[index].as_ref() else {
+                continue;
+            };
+            if entry.prefix_references == 0 && entry.cascade_references == 0 && entry.retained_references == 0 {
+                released_bytes += self.remove_unreferenced(MatchAnswerID(index as u32 + 1));
+            }
+        }
+        released_bytes
     }
 
     pub(super) fn remove_unreferenced(&mut self, identity: MatchAnswerID) -> u64 {
@@ -288,7 +280,7 @@ impl MatchAnswerCatalog {
         } else {
             0
         };
-        let hash = hash_retained_rule_matches(&entry.answer);
+        let hash = content_hash(&entry.answer);
         self.answers.remove_identity(hash, identity);
         self.needs_compaction = true;
         released_cascade_payload_bytes
@@ -369,7 +361,6 @@ impl MatchAnswerCatalog {
             ];
             skip [
                 self.answers,
-                self.last_identity,
                 self.prefix_payload_bytes,
                 self.cascade_payload_bytes,
                 self.needs_compaction,
@@ -378,22 +369,17 @@ impl MatchAnswerCatalog {
     }
 
     pub(super) fn evict_retained(&mut self) {
-        let retained = self
-            .answers
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let entry = entry.as_mut()?;
-                if entry.retained_references == 0 {
-                    return None;
-                }
-                entry.retained_references = 0;
-                (entry.prefix_references == 0 && entry.cascade_references == 0)
-                    .then_some(MatchAnswerID(index as u32 + 1))
-            })
-            .collect::<Vec<_>>();
-        for identity in retained {
-            self.remove_unreferenced(identity);
+        for index in 0..self.answers.len() {
+            let Some(entry) = self.answers[index].as_mut() else {
+                continue;
+            };
+            if entry.retained_references == 0 {
+                continue;
+            }
+            entry.retained_references = 0;
+            if entry.prefix_references == 0 && entry.cascade_references == 0 {
+                self.remove_unreferenced(MatchAnswerID(index as u32 + 1));
+            }
         }
         self.retained_payload_bytes = 0;
         self.retained_answer_count = 0;
@@ -444,10 +430,6 @@ impl Default for PrefixAnswerCache {
 }
 
 impl PrefixAnswerCache {
-    pub(super) fn non_prefix_identity(catalog: &mut MatchAnswerCatalog, matches: &[RuleMatch]) -> MatchAnswerID {
-        catalog.intern(matches)
-    }
-
     /// Wraps a catalog mutation so the prefix payload bytes it added or released are mirrored in
     /// this cache's nested footprint.
     pub(super) fn with_payload_accounting<R>(
@@ -495,9 +477,7 @@ impl PrefixAnswerCache {
         matches: PrefixMatchSetID,
         identity: MatchAnswerID,
     ) {
-        let program_index = program.0 as usize;
-        lane.ensure(program_index);
-        let by_match_set = &mut lane[program_index];
+        let by_match_set = lane.entry(program.0 as usize);
         let match_set_index = matches.index();
         nested_footprint.grow_committed(by_match_set.ensure(match_set_index));
         let previous = by_match_set[match_set_index];
@@ -622,9 +602,9 @@ impl PrefixAnswerCache {
         });
     }
 
-    pub(super) fn settle_memory(&mut self, catalog: &MatchAnswerCatalog, memory: &mut MemoryController) {
+    pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
         debug_assert!(!self.retained);
-        let current = self.capacity_bytes(catalog);
+        let current = self.capacity_bytes();
         self.scratch_memory.resize_required_to(memory, current);
     }
 
@@ -701,7 +681,7 @@ impl PrefixAnswerCache {
         }
     }
 
-    pub(super) fn capacity_bytes(&self, _catalog: &MatchAnswerCatalog) -> u64 {
+    pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [
                 self.prefix_contribution_by_match_set,
@@ -723,12 +703,6 @@ impl PrefixAnswerCache {
             None => Lookup::Missing(key),
         }
     }
-}
-
-pub(super) fn hash_retained_rule_matches(matches: &[RetainedRuleMatch]) -> u64 {
-    let mut hasher = fast_hasher();
-    matches.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Exact selector answers retained as the old side of a later plan.
@@ -804,7 +778,6 @@ pub(super) fn prepare_selector_truth_set(
 pub(super) fn merge_retained_match_answers(answer: &mut Vec<RetainedRuleMatch>, suffix: &[RetainedRuleMatch]) {
     let mut answer_index = answer.len();
     let mut suffix_index = suffix.len();
-    answer.reserve(suffix_index);
     answer.extend_from_slice(suffix);
     let mut destination = answer.len();
     while answer_index != 0 && suffix_index != 0 {
@@ -856,11 +829,8 @@ impl Default for RetainedSelectorIncidences {
 }
 
 impl RetainedSelectorIncidences {
-    pub(super) fn lookup(&self, program: SelectorProgramID) -> Option<Rc<[RetainedSelectorIncidence]>> {
-        self.by_program
-            .get(program.0 as usize)
-            .and_then(Option::as_ref)
-            .cloned()
+    pub(super) fn lookup(&self, program: SelectorProgramID) -> Option<&Rc<[RetainedSelectorIncidence]>> {
+        self.by_program.get(program.0 as usize).and_then(Option::as_ref)
     }
 
     pub(super) fn capacity_bytes(&self) -> u64 {
@@ -917,18 +887,12 @@ impl Default for RetainedMatchAnswers {
     }
 }
 
-pub(super) struct RetainedAnswerPatchRule {
-    pub(super) rule: RuleID,
-    pub(super) program: SelectorProgramID,
-}
-
 pub(super) struct RetainedAnswerPatch {
-    pub(super) rules: Vec<RetainedAnswerPatchRule>,
     /// Whether this transaction can reorder rules relative to each other (layer or sheet order).
     /// An unchanged match set can then still compact to a different winner, so the unchanged
     /// fast path must not conclude anything from set equality.
     pub(super) orders_shifted: bool,
-    /// The (rule, program) identities of `rules`, sorted, as the batch matcher's rule filter.
+    /// The affected (rule, program) identities, sorted, as the batch matcher's rule filter.
     pub(super) rule_keys: Vec<(RuleID, SelectorProgramID)>,
     pub(super) scope_program: ScopeProgramID,
     pub(super) dispatch: Rc<RuleDispatch>,
@@ -1014,7 +978,7 @@ impl RetainedAnswerPatch {
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [
-                self.rules,
+                self.rule_keys,
                 self.cascade_update_properties,
                 self.cascade_update_rules,
                 self.custom_changed_rules,
@@ -1085,7 +1049,7 @@ impl RetainedMatchAnswers {
         let Some(index) = node.element_index().map(|index| index as usize) else {
             return Err(answer);
         };
-        let answer_hash = hash_retained_rule_matches(&answer);
+        let answer_hash = content_hash(&answer);
         let held_identity = catalog.identity(&answer, answer_hash);
         let identity_is_retained = held_identity.is_some_and(|identity| catalog.identity_is_retained(identity));
         let previous_identity = self

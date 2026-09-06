@@ -25,6 +25,7 @@
 #include <LibWeb/HTML/ApplyHistoryStep.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
+#include <LibWeb/HTML/HistoryOperation.h>
 #include <LibWeb/HTML/InitialInsertion.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigateParams.h>
@@ -79,6 +80,8 @@ public:
 
     virtual bool is_traversable() const { return false; }
 
+    bool is_local_root() const;
+
     bool is_closing() const { return m_closing; }
     void set_closing(bool value) { m_closing = value; }
     bool is_script_closable();
@@ -102,8 +105,20 @@ public:
     }
     Optional<CrossProcessId> child_navigable_history_reconstruction_id(size_t index) const;
     void consume_child_navigable_history_reconstruction_id(size_t index);
+    bool adopt_canonical_id_for_child_created_during_history_reconstruction(LocalNavigable& child);
+    void prepare_child_navigable_history_reconstruction(SessionHistoryDocumentStateDescriptor const&);
+
+    enum class PrepareChildHistoryReconstruction {
+        No,
+        Yes,
+    };
+    NonnullRefPtr<SessionHistoryEntry> resolve_local_session_history_entry(SessionHistoryEntryDescriptor, PrepareChildHistoryReconstruction);
+    Vector<NonnullRefPtr<SessionHistoryEntry>> session_history_entries_for_navigation_api_from_ui_process(Vector<SessionHistoryEntryDescriptor>);
 
     void activate_history_entry(RefPtr<SessionHistoryEntry>, GC::Ref<DOM::Document>, VisibilityState system_visibility_state);
+    void update_nonchanging_navigable_history_step_state(HistoryObjectLengthAndIndex, GC::Ref<GC::Function<void()>> on_complete);
+    void queue_navigation_api_state_clear_task();
+    void run_ui_descendant_unload_task(GC::Ref<GC::Function<void()>> on_complete);
     void notify_navigation_observers_navigation_complete();
 
     GC::Ptr<DOM::Document> active_document() const;
@@ -153,10 +168,13 @@ public:
     Variant<Empty, Traversal, Utf16String> ongoing_navigation() const { return m_ongoing_navigation; }
     void set_ongoing_navigation(Variant<Empty, Traversal, Utf16String> ongoing_navigation);
     void set_ongoing_navigation_without_informing_navigation_api(Variant<Empty, Traversal, Utf16String> ongoing_navigation);
+    void clear_ongoing_history_traversal();
 
     bool resume_navigation_params_creation(Utf16String const& navigation_id, Optional<NavigationPopulationRequest>);
     void run_navigation_unload_check(Utf16String const& navigation_id, GC::Ref<GC::Function<void(bool)>> completion_steps);
     void request_population_for_reconstructed_history_entry(NavigationPopulationRequest);
+    void route_child_created_during_history_reconstruction(Web::ReconstructedChildNavigation);
+    void continue_navigation_at_population(NavigationPopulationRequest, NavigationPopulationResult);
 
     void populate_session_history_entry_document(
         URL::URL url,
@@ -202,10 +220,12 @@ public:
     [[nodiscard]] bool has_been_destroyed() const { return m_has_been_destroyed; }
     void set_has_been_destroyed();
     void report_child_frame_destroyed();
+    void unload_child_navigable_before_destruction(GC::Ref<GC::Function<void()>> after_all_unloads);
+    void continue_child_navigable_destruction(UnloadDisplayedDocument);
     void remove_from_all_local_navigables();
 
-    CSSPixelPoint to_top_level_position(CSSPixelPoint);
-    CSSPixelRect to_top_level_rect(CSSPixelRect const&);
+    CSSPixelPoint to_page_position(CSSPixelPoint);
+    CSSPixelRect to_page_rect(CSSPixelRect const&);
 
     CSSPixelPoint viewport_scroll_offset() const { return m_viewport_scroll_offset; }
     CSSPixelRect viewport_rect() const { return { m_viewport_scroll_offset, m_viewport_size }; }
@@ -512,6 +532,9 @@ private:
     bool m_has_been_destroyed { false };
     bool m_child_frame_destruction_reported { false };
 
+    // The destroy-a-child-navigable continuation parked while the UI process unloads this navigable's document tree.
+    GC::Ptr<GC::Function<void()>> m_pending_child_navigable_unload;
+
     CSSPixelSize m_viewport_size;
     CSSPixelPoint m_viewport_scroll_offset;
     struct PendingPersistedStateRestoration {
@@ -634,6 +657,14 @@ WEB_API GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId);
 
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
 void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
+
+enum class CheckIfUnloadingIsCanceledResult {
+    CanceledByBeforeUnload,
+    CanceledByNavigate,
+    Continue,
+};
+WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
+WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
 
 }

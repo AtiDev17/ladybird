@@ -411,7 +411,7 @@ impl StyleEngine {
         let previous_program = self
             .replacement_rule(rule)
             .and_then(|replacement| replacement.version.selector_program);
-        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        let program = self.programs.add(selector_program);
         self.selector_programs_need_sweep |= previous_program.is_some();
         self.programs.settle_memory(&mut self.memory);
         if previous_program != Some(program) {
@@ -426,7 +426,7 @@ impl StyleEngine {
 
     #[cfg(feature = "style-recording")]
     pub(crate) fn replace_replayed_style_rule_selectors(&mut self, rule: RuleID, selector_program: SelectorProgram) {
-        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        let program = self.programs.add(selector_program);
         self.selector_programs_need_sweep = true;
         self.programs.settle_memory(&mut self.memory);
         self.add_routing_rule(rule, program);
@@ -574,7 +574,7 @@ impl StyleEngine {
         {
             return reusable;
         }
-        let (program, _) = self.programs.add_with_status(compiled, &mut self.memory);
+        let program = self.programs.add(compiled);
         self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
         program
@@ -1684,13 +1684,12 @@ impl StyleEngine {
         if !self.sheets_excluded_from_routing.set(sheet.0 as usize, false).0 {
             return;
         }
-        let rules: Vec<(RuleID, SelectorProgramID)> = self
+        let rules = self
             .program
             .rules_in_sheet(sheet)
             .into_iter()
             .filter(|&rule| self.program.rule_is_live(rule))
-            .filter_map(|rule| Some((rule, self.program.rule_version(rule).selector_program?)))
-            .collect();
+            .filter_map(|rule| Some((rule, self.program.rule_version(rule).selector_program?)));
         let programs = &self.programs;
         let routing = Rc::get_mut(&mut self.routing).expect("routing program is shared outside a planning epoch");
         for (rule, program) in rules {
@@ -1702,12 +1701,12 @@ impl StyleEngine {
     /// Attach a compiled program at the end of a scope's sheet order.
     pub(super) fn attach_sheet(&mut self, sheet: SheetID, tree_scope: TreeScopeID) {
         self.restore_routing_for_reattached_sheet(sheet);
-        let mut sheets = self.current_sheets_in_scope(tree_scope);
-        let previous_sheets = sheets.clone();
-        let was_attached = sheets.contains(&sheet);
+        let mut sheets = self.current_sheets_in_scope(tree_scope).to_vec();
+        let previous_position = sheets.iter().position(|&candidate| candidate == sheet);
+        let was_attached = previous_position.is_some();
         sheets.retain(|&candidate| candidate != sheet);
         sheets.push(sheet);
-        let order_changed = was_attached && sheets != previous_sheets;
+        let order_changed = previous_position.is_some_and(|previous| previous != sheets.len() - 1);
         self.stage_sheets_in_scope(tree_scope, sheets);
         self.record_attachment(sheet, tree_scope, was_attached, true);
         if order_changed {
@@ -1719,16 +1718,16 @@ impl StyleEngine {
     /// does not determine cascade order.
     pub(super) fn attach_sheet_before(&mut self, sheet: SheetID, before: SheetID, tree_scope: TreeScopeID) {
         self.restore_routing_for_reattached_sheet(sheet);
-        let mut sheets = self.current_sheets_in_scope(tree_scope);
-        let previous_sheets = sheets.clone();
-        let was_attached = sheets.contains(&sheet);
+        let mut sheets = self.current_sheets_in_scope(tree_scope).to_vec();
+        let previous_position = sheets.iter().position(|&candidate| candidate == sheet);
+        let was_attached = previous_position.is_some();
         sheets.retain(|&candidate| candidate != sheet);
         let position = sheets
             .iter()
             .position(|&candidate| candidate == before)
             .unwrap_or(sheets.len());
         sheets.insert(position, sheet);
-        let order_changed = was_attached && sheets != previous_sheets;
+        let order_changed = previous_position.is_some_and(|previous| previous != position);
         self.stage_sheets_in_scope(tree_scope, sheets);
         // A sheet arriving in the middle is not the scope's order changing. Order is kept as tokens
         // precisely so an insertion writes one label and renumbers nothing, so every sheet already
@@ -1755,10 +1754,11 @@ impl StyleEngine {
     }
 
     pub fn detach_sheet(&mut self, sheet: SheetID, tree_scope: TreeScopeID) {
-        let mut sheets = self.current_sheets_in_scope(tree_scope);
+        let sheets = self.current_sheets_in_scope(tree_scope);
         let Some(position) = sheets.iter().position(|&candidate| candidate == sheet) else {
             return;
         };
+        let mut sheets = sheets.to_vec();
         sheets.remove(position);
         self.stage_sheets_in_scope(tree_scope, sheets);
         self.record_attachment(sheet, tree_scope, true, false);
@@ -1803,7 +1803,7 @@ impl StyleEngine {
         }
         self.program_staging.scopes_using_document_sheets.stage(
             tree_scope,
-            self.program.scope_uses_document_sheets(tree_scope),
+            || self.program.scope_uses_document_sheets(tree_scope),
             true,
         );
         self.program_staging.base_version.get_or_insert(self.program.version());
@@ -2027,7 +2027,7 @@ impl StyleEngine {
         {
             return;
         }
-        let repair_inputs = declarations_are_complete
+        let repair_inputs = (declarations_are_complete && current_declarations_are_complete)
             .then(|| {
                 let previous = self
                     .winner_groups
@@ -2036,13 +2036,9 @@ impl StyleEngine {
                     .ok()
                     .map(|(_, state)| state)?;
                 let retained = Rc::clone(self.retained_match_answer(node).sparse().ok()?);
-                Some((previous, retained))
+                Some((previous, retained, current_declared.to_vec()))
             })
             .flatten();
-        let previous_declared = repair_inputs.as_ref().and_then(|_| {
-            let (declared, complete) = self.facts.element_declared_properties(node, kind);
-            complete.then(|| declared.to_vec())
-        });
         self.facts.set_element_declared_properties(
             node,
             kind,
@@ -2054,7 +2050,7 @@ impl StyleEngine {
             self.facts
                 .set_element_custom_declarations(node, custom_declarations, custom_written_values);
         }
-        let Some(((previous, retained), previous_declared)) = repair_inputs.zip(previous_declared) else {
+        let Some((previous, retained, previous_declared)) = repair_inputs else {
             return;
         };
         let mut changed_properties: Vec<u16> = previous_declared

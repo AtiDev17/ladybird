@@ -555,12 +555,7 @@ impl StyleEngine {
     }
 
     pub(super) fn retain_prefix_states(&mut self) {
-        if !self
-            .prefix_caches
-            .borrow_mut()
-            .states
-            .retain(&mut self.memory, &mut self.counters)
-        {
+        if !self.prefix_caches.borrow_mut().states.retain(&mut self.memory) {
             self.prefix_caches.borrow_mut().states.release();
         }
     }
@@ -647,7 +642,7 @@ impl StyleEngine {
                             .build_relation(&evaluation, root, &mut self.counters),
                     )
                 });
-                relation.install_answers(states, &mut self.counters);
+                relation.install_answers(states);
                 states.relation = Some(relation);
                 caches.states.settle_memory(&mut self.memory);
             }
@@ -682,7 +677,7 @@ impl StyleEngine {
         {
             let mut caches = self.prefix_caches.borrow_mut();
             caches.states.mark_sparse();
-            if caches.states.retain(&mut self.memory, &mut self.counters) {
+            if caches.states.retain(&mut self.memory) {
                 caches.states.mark_current();
                 if !caches.answers.retain(&mut self.memory) {
                     caches.answers.release(&mut self.match_answers);
@@ -1152,24 +1147,23 @@ impl StyleEngine {
         } else {
             DocumentSheetMode::NonAuthor
         };
-        let mut sheets = self.program.sheets_in_scope(scope);
-        if scope != TreeScopeID::DOCUMENT {
-            sheets.extend(
-                self.program
-                    .sheets_in_scope(TreeScopeID::DOCUMENT)
-                    .into_iter()
-                    .filter(|&sheet| {
-                        document_sheet_mode == DocumentSheetMode::All
-                            || self.program.sheet_origin(sheet) != CascadeOrigin::Author
-                    }),
-            );
-        }
+        let document_sheets = if scope == TreeScopeID::DOCUMENT {
+            &[]
+        } else {
+            self.program.sheets_in_scope(TreeScopeID::DOCUMENT)
+        };
+        let document_sheets = document_sheets.iter().filter(|&&sheet| {
+            document_sheet_mode == DocumentSheetMode::All || self.program.sheet_origin(sheet) != CascadeOrigin::Author
+        });
         ScopeDispatchKey {
             depth: self.tree_scope_depth(scope),
             document_sheet_mode,
-            sheets: sheets
-                .into_iter()
-                .map(|sheet| (sheet, self.program.sheet_dispatch_version(sheet)))
+            sheets: self
+                .program
+                .sheets_in_scope(scope)
+                .iter()
+                .chain(document_sheets)
+                .map(|&sheet| (sheet, self.program.sheet_dispatch_version(sheet)))
                 .collect(),
             layer_order: self.program.layer_order_key(scope),
         }
@@ -1777,7 +1771,7 @@ impl StyleEngine {
         document_root: StyleNodeID,
     ) -> Option<Rc<[RetainedSelectorIncidence]>> {
         if let Some(incidences) = self.retained_selector_incidences.lookup(program) {
-            return Some(incidences);
+            return Some(Rc::clone(incidences));
         }
         let mut incidences = Vec::new();
         for node in self.tree.preorder(document_root) {
@@ -1847,7 +1841,7 @@ impl StyleEngine {
         program: SelectorProgramID,
     ) -> Option<Rc<[RetainedSelectorIncidence]>> {
         if let Some(incidences) = self.retained_selector_incidences.lookup(program) {
-            return Some(incidences);
+            return Some(Rc::clone(incidences));
         }
         let (scope_program, dispatch) = self.ranked_scope_program(TreeScopeID::DOCUMENT);
         let compiled = self.programs.get(program);
@@ -1860,8 +1854,8 @@ impl StyleEngine {
             if !posting_key.has_selector_posting() {
                 return None;
             }
-            let candidates: Vec<_> = match self.facts.postings().lookup(posting_key) {
-                Lookup::Known(posting) => posting.candidates().collect(),
+            let candidates = match self.facts.postings().lookup(posting_key) {
+                Lookup::Known(posting) => posting.candidates(),
                 Lookup::KnownAbsent => continue,
                 Lookup::Missing(_) => return None,
             };
@@ -2287,8 +2281,8 @@ impl StyleEngine {
             affected.extend(
                 self.program
                     .sheets_in_scope(TreeScopeID::DOCUMENT)
-                    .into_iter()
-                    .flat_map(|sheet| self.program.rules_in_sheet(sheet))
+                    .iter()
+                    .flat_map(|&sheet| self.program.rules_in_sheet(sheet))
                     .filter_map(|current_rule| {
                         (self.program.rule_version(current_rule).selector_program == Some(program)).then_some(
                             RetainedAnswerPatchSelectionRule {
@@ -2301,16 +2295,13 @@ impl StyleEngine {
             );
         }
         affected.sort_unstable_by_key(|affected| (affected.rule, affected.program));
-        let mut merged: Vec<RetainedAnswerPatchSelectionRule> = Vec::with_capacity(affected.len());
-        for affected in affected {
-            if let Some(previous) = merged.last_mut()
-                && (previous.rule, previous.program) == (affected.rule, affected.program)
-            {
-                previous.evaluate |= affected.evaluate;
-            } else {
-                merged.push(affected);
+        affected.dedup_by(|next, previous| {
+            if (previous.rule, previous.program) != (next.rule, next.program) {
+                return false;
             }
-        }
+            previous.evaluate |= next.evaluate;
+            true
+        });
         cascade_update_properties.extend(
             transaction
                 .rule_declaration_changes
@@ -2325,7 +2316,7 @@ impl StyleEngine {
             .map(|change| change.rule)
             .collect();
         Some(RetainedAnswerPatchSelection {
-            affected: merged,
+            affected,
             always_emit,
             orders_shifted,
             requires_full_match,
@@ -2341,17 +2332,12 @@ impl StyleEngine {
         selection: RetainedAnswerPatchSelection,
     ) -> RetainedAnswerPatch {
         let (scope_program, dispatch) = self.ranked_scope_program(TreeScopeID::DOCUMENT);
-        let rules: Vec<RetainedAnswerPatchRule> = selection
+        let rule_keys = selection
             .affected
             .into_iter()
-            .map(|affected| RetainedAnswerPatchRule {
-                rule: affected.rule,
-                program: affected.program,
-            })
+            .map(|affected| (affected.rule, affected.program))
             .collect();
         let dispatch_workspace = DispatchCandidateWorkspace::with_entry_capacity(dispatch.entry_count());
-        let rule_keys: Vec<(RuleID, SelectorProgramID)> =
-            rules.iter().map(|affected| (affected.rule, affected.program)).collect();
         {
             let mut caches = self.prefix_caches.borrow_mut();
             caches.states.make_scratch(&mut self.memory);
@@ -2367,7 +2353,6 @@ impl StyleEngine {
         custom_changed_rules.sort_unstable();
         custom_changed_rules.dedup();
         RetainedAnswerPatch {
-            rules,
             rule_keys,
             scope_program,
             dispatch,
@@ -4085,8 +4070,7 @@ impl StyleEngine {
                         retained_selector_truth = matches.prepared_selector_truth();
                     }
                     let (scope_program, dispatch) = self.ranked_scope_program(scope);
-                    let non_prefix_matches =
-                        PrefixAnswerCache::non_prefix_identity(&mut self.match_answers, matches.as_slice());
+                    let non_prefix_matches = self.match_answers.intern(matches.as_slice());
                     let contribution_key = PrefixContributionKey {
                         program: scope_program,
                         matches: prefix_matches,
@@ -4413,10 +4397,7 @@ impl StyleEngine {
                             }
                         }
                     };
-                    prefix_caches
-                        .borrow_mut()
-                        .answers
-                        .settle_memory(&self.match_answers, &mut self.memory);
+                    prefix_caches.borrow_mut().answers.settle_memory(&mut self.memory);
                     Ok(answer)
                 }
                 (Ok(()), None) => {
@@ -4474,10 +4455,7 @@ impl StyleEngine {
                             key,
                             identity,
                         );
-                        prefix_caches
-                            .borrow_mut()
-                            .answers
-                            .settle_memory(&self.match_answers, &mut self.memory);
+                        prefix_caches.borrow_mut().answers.settle_memory(&mut self.memory);
                     }
                 } else if compact_for_cascade && !retained_match_answer_reused {
                     // A cascade-only shortcut can answer the current style without proving the

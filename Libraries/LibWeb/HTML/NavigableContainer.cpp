@@ -16,6 +16,7 @@
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -109,8 +110,7 @@ void NavigableContainer::create_new_child_navigable()
 
     set_needs_repaint();
 
-    auto traversable = parent_navigable->traversable_navigable();
-    (void)traversable->adopt_canonical_id_for_child_created_during_history_reconstruction(*parent_navigable, navigable);
+    (void)parent_navigable->adopt_canonical_id_for_child_created_during_history_reconstruction(navigable);
 
     page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->replicated_state());
 
@@ -118,7 +118,7 @@ void NavigableContainer::create_new_child_navigable()
     auto history_entry = navigable->active_session_history_entry();
 
     // 12. Append the following session history traversal steps to traversable:
-    traversable->request_history_operation(
+    page.history_executor().request_history_operation(
         NavigableCreationHistoryOperationParameters {
             .parent_navigable_id = parent_navigable->id(),
             .navigable_id = navigable->id(),
@@ -127,7 +127,7 @@ void NavigableContainer::create_new_child_navigable()
         {
             .local_target_navigable_id = navigable->id(),
             .local_target_entry = history_entry,
-            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](Optional<Web::ReconstructedChildNavigation> reconstructed_child_navigation, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
+            .pre_steps = GC::create_function(heap(), [navigable, parent_navigable, history_entry](Optional<Web::ReconstructedChildNavigation> reconstructed_child_navigation, GC::Ref<HistoryExecutor::OnHistoryOperationReady> ready) mutable {
                 if (navigable->has_been_destroyed() || parent_navigable->has_been_destroyed()) {
                     ready->function()(HistoryStepResult::Applied);
                     return;
@@ -135,8 +135,7 @@ void NavigableContainer::create_new_child_navigable()
 
                 // 1-6. Append nestedHistory to parentDocState's nested histories.
                 if (reconstructed_child_navigation.has_value()) {
-                    VERIFY(navigable->traversable_navigable()->route_child_created_during_history_reconstruction(
-                        *parent_navigable, *navigable, reconstructed_child_navigation.release_value()));
+                    navigable->route_child_created_during_history_reconstruction(reconstructed_child_navigation.release_value());
                     ready->function()(HistoryStepResult::Applied);
                     return;
                 }
@@ -364,11 +363,9 @@ void NavigableContainer::destroy_the_child_navigable()
         // NB: The UI process performs this step in canonical session history.
 
         // 8. Let traversable be container's node navigable's traversable navigable.
-        auto traversable = parent_navigable->traversable_navigable();
-
         // 9. Append the following session history traversal steps to traversable:
         // 1. Update for navigable creation/destruction given traversable.
-        traversable->request_history_operation(NavigableDestructionHistoryOperationParameters {
+        parent_navigable->page().history_executor().request_history_operation(NavigableDestructionHistoryOperationParameters {
             .parent_navigable_id = parent_navigable->id(),
             .parent_document_state_id = parent_doc_state->cross_process_id(),
             .navigable_id = navigable->id(),
@@ -390,7 +387,7 @@ void NavigableContainer::destroy_the_child_navigable()
     //         treat the unload step as a no-op in that case and proceed with the remaining
     //         post-destruction cleanup.
     if (local_navigable.active_document())
-        local_navigable.traversable_navigable()->unload_child_navigable_before_destruction(local_navigable, after_document_destruction);
+        local_navigable.unload_child_navigable_before_destruction(after_document_destruction);
     else
         after_document_destruction->function()();
 }

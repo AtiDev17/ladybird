@@ -1678,10 +1678,10 @@ impl PrefixStates {
             .flatten()
     }
 
-    fn install_relation_answer(&mut self, node: StyleNodeID, entries: &[EntryID], counters: &mut Counters) {
+    fn install_relation_answer(&mut self, node: StyleNodeID, entries: &[EntryID]) {
         self.output_matches.clear();
         self.output_matches.extend_from_slice(entries);
-        let matches = self.intern_output_matches(counters);
+        let matches = self.intern_output_matches();
         self.relation_answers
             .insert(node.element_index().unwrap() as usize, Some(matches));
     }
@@ -2341,7 +2341,6 @@ impl PrefixStates {
         old_result: PrefixResultID,
         delta: PrefixMatchDelta,
         arena: &PrefixDeltaArena,
-        counters: &mut Counters,
     ) -> PrefixResultID {
         if delta.additions.len == 0 && delta.removals.len == 0 {
             return old_result;
@@ -2356,7 +2355,7 @@ impl PrefixStates {
         matches.sort_unstable();
         matches.dedup();
         self.output_matches = matches;
-        let matches = self.intern_output_matches(counters);
+        let matches = self.intern_output_matches();
         self.intern_result(matches, old_result_value.truth)
     }
 
@@ -2413,7 +2412,7 @@ impl PrefixStates {
             )
         };
         let result = match local_output_deltas.result_changed {
-            true => self.apply_local_match_delta(old.result, local_output_deltas.matches, delta_arena, counters),
+            true => self.apply_local_match_delta(old.result, local_output_deltas.matches, delta_arena),
             false => old.result,
         };
         let transition = PrefixTransition { state, right, result };
@@ -3087,17 +3086,15 @@ impl PrefixStates {
         if self.match_offsets.len() > 2 && self.match_sets_by_hash.is_empty() {
             for matches in 1..self.match_offsets.len() - 1 {
                 let identity = PrefixMatchSetID(matches as u32);
-                let mut hasher = fast_hasher();
-                self.matches_in(identity).hash(&mut hasher);
-                self.match_sets_by_hash.insert_identity(hasher.finish(), identity);
+                let hash = super::intern_table::content_hash(self.matches_in(identity));
+                self.match_sets_by_hash.insert_identity(hash, identity);
             }
         }
         if self.truth_offsets.len() > 2 && self.truth_sets_by_hash.is_empty() {
             for truth in 1..self.truth_offsets.len() - 1 {
                 let identity = PrefixTruthSetID(truth as u32);
-                let mut hasher = fast_hasher();
-                self.truth_in(identity).hash(&mut hasher);
-                self.truth_sets_by_hash.insert_identity(hasher.finish(), identity);
+                let hash = super::intern_table::content_hash(self.truth_in(identity));
+                self.truth_sets_by_hash.insert_identity(hash, identity);
             }
         }
     }
@@ -3131,7 +3128,7 @@ impl PrefixStates {
         self.enter_states(entering);
 
         row.facts.for_each_dispatch_probe(row.row, is_document_root, |key, _| {
-            self.offer_key(automaton, entering, key, evaluation.selection, counters);
+            self.offer_key(automaton, entering, key, evaluation.selection);
         });
 
         for candidate_index in 0..self.candidates.len() {
@@ -3221,7 +3218,7 @@ impl PrefixStates {
         }
         let state = self.intern_transition_state(automaton, entering.parent, counters);
         let right = self.intern_right_transition_state(automaton, entering.previous, counters);
-        let matches = self.intern_output_matches(counters);
+        let matches = self.intern_output_matches();
         let truth = self.intern_output_truth();
         let result = self.intern_result(matches, truth);
         PrefixTransitionLookup::Known(PrefixTransition { state, right, result })
@@ -3300,7 +3297,6 @@ impl PrefixStates {
         entering: EnteringStates,
         key: DispatchKey,
         selection: Option<&PrefixSelection>,
-        _counters: &mut Counters,
     ) {
         let Some(bucket) = automaton.bucket(key) else {
             return;
@@ -3631,10 +3627,8 @@ impl PrefixStates {
         interned
     }
 
-    fn intern_output_matches(&mut self, _counters: &mut Counters) -> PrefixMatchSetID {
-        let mut hasher = fast_hasher();
-        self.output_matches.hash(&mut hasher);
-        let hash = hasher.finish();
+    fn intern_output_matches(&mut self) -> PrefixMatchSetID {
+        let hash = super::intern_table::content_hash(&self.output_matches);
         if let Some(candidate) = self
             .match_sets_by_hash
             .find(hash, |candidate, ()| self.matches_in(candidate) == self.output_matches)
@@ -3653,9 +3647,7 @@ impl PrefixStates {
     }
 
     fn intern_output_truth(&mut self) -> PrefixTruthSetID {
-        let mut hasher = fast_hasher();
-        self.output_matched_steps.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = super::intern_table::content_hash(&self.output_matched_steps);
         if let Some(candidate) = self.truth_sets_by_hash.find(hash, |candidate, ()| {
             self.truth_in(candidate) == self.output_matched_steps
         }) {
@@ -4268,15 +4260,14 @@ impl PrefixStateCache {
         generation: u64,
         row_count: usize,
     ) -> &mut PrefixStates {
-        let index = program.0 as usize;
-        self.by_program.ensure(index);
-        if self.by_program[index].is_none() {
-            self.by_program[index] = Some(Box::new(PrefixStates::new(row_count)));
-        } else {
-            let states = self.by_program[index].as_mut().expect("program entry just checked");
-            states.prepare_rows(generation, row_count);
+        let entry = self.by_program.entry(program.0 as usize);
+        match entry {
+            Some(states) => {
+                states.prepare_rows(generation, row_count);
+                states
+            }
+            None => entry.insert(Box::new(PrefixStates::new(row_count))),
         }
-        self.by_program[index].as_mut().expect("program entry just inserted")
     }
 
     pub(super) fn lookup_mut(&mut self, program: ScopeProgramID) -> Lookup<&mut PrefixStates, PrefixStateCacheGap> {
@@ -4316,7 +4307,7 @@ impl PrefixStateCache {
         self.lifecycle = PrefixStateCacheLifecycle::Scratch(self.lifecycle.coverage());
     }
 
-    pub(super) fn retain(&mut self, memory: &mut MemoryController, _counters: &mut Counters) -> bool {
+    pub(super) fn retain(&mut self, memory: &mut MemoryController) -> bool {
         if self.lifecycle.is_retained() {
             return true;
         }
@@ -4908,19 +4899,18 @@ mod tests {
     #[test]
     fn sparse_match_delta_applies_additions_and_removals() {
         let mut states = PrefixStates::new(0);
-        let mut counters = Counters::new();
         let removed = EntryID(0);
         let retained = EntryID(1);
         let added = EntryID(2);
         states.output_matches.extend([removed, retained]);
-        let matches = states.intern_output_matches(&mut counters);
+        let matches = states.intern_output_matches();
         let old_result = states.intern_result(matches, PrefixTruthSetID::default());
         let mut arena = PrefixDeltaArena::default();
         arena.match_scratch[0].push(added);
         arena.match_scratch[1].push(removed);
         let delta = arena.append_match_delta();
 
-        let result = states.apply_local_match_delta(old_result, delta, &arena, &mut counters);
+        let result = states.apply_local_match_delta(old_result, delta, &arena);
 
         assert_eq!(
             states.matches_in(states.results[result.0 as usize].matches),
@@ -5067,7 +5057,7 @@ mod tests {
             states.local_fact_interner.intern(&facts, 0, &mut counters);
         }
         cache.settle_memory(&mut memory);
-        assert!(cache.retain(&mut memory, &mut counters));
+        assert!(cache.retain(&mut memory));
         assert!(memory.bytes_in_category(MemoryCategory::PrefixTransitionCache) > 0);
 
         // A generation change clears the entry's local-fact interner, shrinking its capacity. On a

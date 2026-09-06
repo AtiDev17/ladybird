@@ -34,7 +34,6 @@ use super::column::Column;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::FastSet as HashSet;
 use super::index::StyleAtomID;
-use super::instrumentation::Counters;
 use super::memory::MemoryCategory;
 use super::memory::MemoryController;
 use super::order::OrderMaintenance;
@@ -576,8 +575,8 @@ impl StyleSheetProgram {
     #[must_use]
     pub fn rules_in_a_layer_in_scope(&self, scope: TreeScopeID) -> Vec<RuleID> {
         self.sheets_in_scope(scope)
-            .into_iter()
-            .flat_map(|sheet| self.rules_in_sheet(sheet))
+            .iter()
+            .flat_map(|&sheet| self.rules_in_sheet(sheet))
             .filter(|rule| self.rules[rule.0 as usize].in_a_layer)
             .collect()
     }
@@ -608,11 +607,10 @@ impl StyleSheetProgram {
 
     /// Sheets attached to `tree_scope`, in cascade order.
     #[must_use]
-    pub fn sheets_in_scope(&self, tree_scope: TreeScopeID) -> Vec<SheetID> {
+    pub fn sheets_in_scope(&self, tree_scope: TreeScopeID) -> &[SheetID] {
         self.sheets_by_scope
             .get(tree_scope.0 as usize)
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     pub(crate) fn set_sheets_in_scope(&mut self, tree_scope: TreeScopeID, sheets: &[SheetID]) {
@@ -841,37 +839,15 @@ impl StyleSheetProgram {
             .iter()
             .filter_map(|&(rule, live)| (!live).then_some(rule))
             .collect();
-        let roots: Vec<RuleID> = departing
-            .iter()
-            .copied()
-            .filter(|&rule| {
-                self.rules[rule.0 as usize]
-                    .parent
-                    .is_none_or(|parent| !departing.contains(&parent))
-            })
-            .collect();
-        for root in roots {
-            let sheet = self.rules[root.0 as usize].sheet;
-            let parent = self.rules[root.0 as usize].parent;
-            let siblings = match parent {
-                Some(parent) => &mut self.rules[parent.0 as usize].children,
-                None => &mut self.sheets[sheet.0 as usize].rules,
-            };
-            if let Some(position) = siblings.iter().position(|&sibling| sibling == root) {
-                siblings.remove(position);
+        for &root in &departing {
+            if self.rules[root.0 as usize]
+                .parent
+                .is_some_and(|parent| departing.contains(&parent))
+            {
+                continue;
             }
-
-            let mut removed = Vec::new();
-            self.collect_subtree(root, &mut removed);
-            for rule in removed {
-                changed |= self.set_rule_live(rule, false);
-                let order = self.rules[rule.0 as usize].nested_order;
-                let order_axis = &mut self.sheets[sheet.0 as usize].rule_order;
-                let previous_capacity = order_axis.capacity_bytes();
-                order_axis.remove(order);
-                let current_capacity = order_axis.capacity_bytes();
-                self.record_capacity_change(previous_capacity, current_capacity);
-            }
+            let (_, subtree_changed) = self.detach_rule_subtree(root);
+            changed |= subtree_changed;
         }
         if changed {
             let sheets: HashSet<SheetID> = changes
@@ -907,6 +883,15 @@ impl StyleSheetProgram {
     /// time.
     pub fn remove_rule(&mut self, rule: RuleID) -> Vec<RuleID> {
         let sheet = self.rules[rule.0 as usize].sheet;
+        let (removed, _) = self.detach_rule_subtree(rule);
+        self.bump_sheet_dispatch_version(sheet);
+        self.bump_routing_liveness_version();
+        self.bump_version();
+        removed
+    }
+
+    fn detach_rule_subtree(&mut self, rule: RuleID) -> (Vec<RuleID>, bool) {
+        let sheet = self.rules[rule.0 as usize].sheet;
         let parent = self.rules[rule.0 as usize].parent;
         let siblings = match parent {
             Some(parent) => &mut self.rules[parent.0 as usize].children,
@@ -916,10 +901,10 @@ impl StyleSheetProgram {
             siblings.remove(position);
         }
 
-        let mut removed = Vec::new();
-        self.collect_subtree(rule, &mut removed);
+        let removed = self.rule_subtree(rule);
+        let mut changed = false;
         for &id in &removed {
-            self.set_rule_live(id, false);
+            changed |= self.set_rule_live(id, false);
             let order = self.rules[id.0 as usize].nested_order;
             let order_axis = &mut self.sheets[sheet.0 as usize].rule_order;
             let previous_capacity = order_axis.capacity_bytes();
@@ -927,10 +912,7 @@ impl StyleSheetProgram {
             let current_capacity = order_axis.capacity_bytes();
             self.record_capacity_change(previous_capacity, current_capacity);
         }
-        self.bump_sheet_dispatch_version(sheet);
-        self.bump_routing_liveness_version();
-        self.bump_version();
-        removed
+        (removed, changed)
     }
 
     fn collect_subtree(&self, rule: RuleID, out: &mut Vec<RuleID>) {
@@ -958,11 +940,10 @@ impl StyleSheetProgram {
         for &top_level in &self.sheets[sheet.0 as usize].rules {
             self.collect_subtree(top_level, &mut rules);
         }
-        rules.sort_by(|first, second| {
-            self.sheets[sheet.0 as usize].rule_order.compare(
-                self.rules[first.0 as usize].nested_order,
-                self.rules[second.0 as usize].nested_order,
-            )
+        rules.sort_by_key(|rule| {
+            self.sheets[sheet.0 as usize]
+                .rule_order
+                .rank(self.rules[rule.0 as usize].nested_order)
         });
         rules
     }
@@ -986,11 +967,10 @@ impl StyleSheetProgram {
         for &top_level in top_level_rules {
             self.collect_live_subtree(top_level, &mut rules);
         }
-        rules.sort_by(|first, second| {
-            self.sheets[sheet.0 as usize].rule_order.compare(
-                self.rules[first.0 as usize].nested_order,
-                self.rules[second.0 as usize].nested_order,
-            )
+        rules.sort_by_key(|rule| {
+            self.sheets[sheet.0 as usize]
+                .rule_order
+                .rank(self.rules[rule.0 as usize].nested_order)
         });
         rules
     }
@@ -1010,24 +990,23 @@ impl StyleSheetProgram {
     pub(crate) fn layer_ranks_in_order(layers: &[CascadeLayerID]) -> HashMap<CascadeLayerID, u32> {
         let mut ranks = HashMap::with_capacity_and_hasher(layers.len(), Default::default());
         for &layer in layers {
-            if layer == CascadeLayerID::UNLAYERED || ranks.contains_key(&layer) {
+            if layer == CascadeLayerID::UNLAYERED {
                 continue;
             }
-            ranks.insert(
-                layer,
-                u32::try_from(ranks.len()).expect("cascade layer count exhausted"),
-            );
+            let next_rank = ranks.len();
+            ranks
+                .entry(layer)
+                .or_insert_with(|| u32::try_from(next_rank).expect("cascade layer count exhausted"));
         }
         ranks
     }
 
     #[must_use]
-    pub fn layer_order_matches(&self, scope: TreeScopeID, layers: &[CascadeLayerID]) -> bool {
-        let ranks = Self::layer_ranks_in_order(layers);
+    pub fn layer_ranks_match(&self, scope: TreeScopeID, ranks: &HashMap<CascadeLayerID, u32>) -> bool {
         self.layer_ranks
             .get(scope.0 as usize)
             .and_then(Option::as_ref)
-            .map_or(ranks.is_empty(), |current| current == &ranks)
+            .map_or(ranks.is_empty(), |current| current == ranks)
     }
 
     /// Put the named layers of `scope` in declaration order, ahead of its implicit outer layer.
@@ -1082,8 +1061,8 @@ impl StyleSheetProgram {
     /// The comparable rank of a layer. A topology change rewrites these ranks without touching any
     /// rule that references the layer.
     #[must_use]
-    pub fn layer_rank(&self, scope: TreeScopeID, layer: CascadeLayerID) -> (u64, u64) {
-        (u64::from(self.layer_index(scope, layer)), 0)
+    pub fn layer_rank(&self, scope: TreeScopeID, layer: CascadeLayerID) -> u64 {
+        u64::from(self.layer_index(scope, layer))
     }
 
     /// The dense rank C++ cascade consumers use. The implicit outer layer and an as-yet undeclared
@@ -1203,17 +1182,12 @@ impl StyleSheetProgram {
         }
         let hash = super::intern_table::content_hash(&self.rules[rule.0 as usize].declared_properties);
         let previous_map_capacity = self.semantic_declarations.shallow_capacity_bytes();
-        let previous_bucket_capacity = self
-            .semantic_declarations
-            .get(&hash)
-            .map_or(0, semantic_declaration_bucket_capacity_bytes);
-        let existing = self.semantic_declarations.get(&hash).and_then(|bucket| {
-            bucket.iter().find_map(|entry| {
-                let representative = entry.representative;
-                (self.rules[representative.0 as usize].declared_properties
-                    == self.rules[rule.0 as usize].declared_properties)
-                    .then_some(entry.id)
-            })
+        let bucket = self.semantic_declarations.entry(hash).or_default();
+        let previous_bucket_capacity = semantic_declaration_bucket_capacity_bytes(bucket);
+        let existing = bucket.iter().find_map(|entry| {
+            let representative = entry.representative;
+            (self.rules[representative.0 as usize].declared_properties == self.rules[rule_index].declared_properties)
+                .then_some(entry.id)
         });
         let id = match existing {
             Some(id) => id,
@@ -1223,18 +1197,14 @@ impl StyleSheetProgram {
                     .next_semantic_declaration_id
                     .checked_add(1)
                     .expect("semantic declaration identity space exhausted");
-                self.semantic_declarations
-                    .entry(hash)
-                    .or_default()
-                    .push(SemanticDeclarationEntry {
-                        id,
-                        representative: rule,
-                    });
+                bucket.push(SemanticDeclarationEntry {
+                    id,
+                    representative: rule,
+                });
                 id
             }
         };
-        let current_bucket_capacity =
-            semantic_declaration_bucket_capacity_bytes(self.semantic_declarations.get(&hash).unwrap());
+        let current_bucket_capacity = semantic_declaration_bucket_capacity_bytes(bucket);
         self.record_capacity_change(previous_bucket_capacity, current_bucket_capacity);
         self.record_capacity_change(
             previous_map_capacity,
@@ -1354,7 +1324,7 @@ impl StyleSheetProgram {
 
     /// The comparable rank of a sheet within a tree scope.
     #[must_use]
-    pub fn sheet_rank(&self, attachment: Attachment) -> (u64, u64) {
+    pub fn sheet_rank(&self, attachment: Attachment) -> u64 {
         self.sheet_order
             .get(attachment.tree_scope.0 as usize)
             .and_then(Option::as_ref)
@@ -1364,7 +1334,7 @@ impl StyleSheetProgram {
 
     /// The comparable rank of a rule within its sheet.
     #[must_use]
-    pub fn rule_rank(&self, rule: RuleID) -> (u64, u64) {
+    pub fn rule_rank(&self, rule: RuleID) -> u64 {
         let sheet = self.rules[rule.0 as usize].sheet;
         self.sheets[sheet.0 as usize]
             .rule_order
@@ -1470,7 +1440,7 @@ impl StyleSheetProgram {
     }
 
     /// Reconcile the program's Tier-2 charge after a batch of edits.
-    pub fn settle_memory(&mut self, memory: &mut MemoryController, _counters: &mut Counters) {
+    pub fn settle_memory(&mut self, memory: &mut MemoryController) {
         let current = self.capacity_bytes();
         if current > self.charged_bytes {
             memory.reserve_required(MemoryCategory::RuleProgram, current - self.charged_bytes);
@@ -1792,12 +1762,11 @@ mod tests {
         use super::super::memory::DeviceClass;
 
         let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut counters = Counters::new();
         let (mut program, sheet) = program_with_sheet();
         for _ in 0..100 {
             program.append_rule(sheet, None, RuleKind::Style);
         }
-        program.settle_memory(&mut memory, &mut counters);
+        program.settle_memory(&mut memory);
         assert_eq!(
             memory.bytes_in_category(MemoryCategory::RuleProgram),
             program.capacity_bytes()

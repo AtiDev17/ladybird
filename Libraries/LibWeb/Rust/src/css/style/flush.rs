@@ -270,7 +270,7 @@ impl StyleEngine {
         // Establish that envelope before preparing prefix transitions, so wide transactions can
         // classify local changes through the same preorder intervals used by routing.
         for &arrival in &outer_arrivals {
-            regions.add(ImpactRegion::Subtree(arrival), &mut self.counters);
+            regions.add(ImpactRegion::Subtree(arrival));
         }
         // An arriving subtree's own retained answers date from before it detached, and facts can
         // have moved off the journal's books while it was out; they must match cold rather than
@@ -936,7 +936,7 @@ impl StyleEngine {
                             refreshes,
                         }
                     } else if !node_deltas.is_empty()
-                        || (patch.always_emit && patch.rules.is_empty())
+                        || (patch.always_emit && patch.rule_keys.is_empty())
                         || !patch.cascade_update_properties.is_empty()
                     {
                         SelectorTruthPatch::Direct(node_deltas)
@@ -1794,7 +1794,7 @@ impl StyleEngine {
     #[must_use]
     /// Materialize old child sequences directly from the tree family's frozen before rows.
     pub(super) fn install_before_sibling_geometry(&self, view: &mut TransactionFactView) -> bool {
-        let staged_rows = self.tree_staging.rows();
+        let staged_rows: Vec<_> = self.tree_staging.rows().collect();
         if staged_rows.is_empty() {
             view.finish_before_sibling_relations();
             return true;
@@ -1809,12 +1809,7 @@ impl StyleEngine {
                 parents.extend(relations.parent);
             }
         }
-        parents.extend(
-            self.tree_staging
-                .first_children()
-                .into_iter()
-                .map(|(parent, _, _)| parent),
-        );
+        parents.extend(self.tree_staging.first_children().map(|(parent, _, _)| parent));
         parents.sort_unstable();
         parents.dedup();
 

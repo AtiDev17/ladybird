@@ -13,7 +13,7 @@ impl StyleEngine {
         let ranks = StyleSheetProgram::layer_ranks_in_order(layers);
         let pending_order = self.program_staging.layer_orders.after(scope);
         if pending_order.map_or_else(
-            || self.program.layer_order_matches(scope, layers),
+            || self.program.layer_ranks_match(scope, &ranks),
             |pending| pending == &ranks,
         ) {
             return;
@@ -23,7 +23,7 @@ impl StyleEngine {
         self.invalidate_scope_program(scope);
         self.program_staging
             .layer_orders
-            .stage(scope, self.program.layer_ranks(scope), ranks);
+            .stage(scope, || self.program.layer_ranks(scope), ranks);
         if initialized {
             self.record_layer_topology_change(scope);
         }
@@ -162,7 +162,7 @@ impl StyleEngine {
         }
         self.program_staging.rule_declarations.stage(
             rule,
-            PendingRuleDeclarations {
+            || PendingRuleDeclarations {
                 declared: self.program.declared_properties_of(rule).to_vec(),
                 written_values: self.program.written_values_of(rule).to_vec(),
                 custom_declarations: self.program.custom_declarations_of(rule).to_vec(),
@@ -210,17 +210,10 @@ impl StyleEngine {
         declared: &[DeclaredProperty],
         custom_declarations: &[CustomDeclaration],
     ) {
-        let replacement = self.replacement_rule(rule);
-        if replacement.is_none() && self.current_rule_version(rule).declaration_block.is_none() {
+        if self.replacement_rule(rule).is_none() && self.current_rule_version(rule).declaration_block.is_none() {
             return;
         }
         let custom_declarations_changed = self.current_custom_declarations_of(rule) != custom_declarations;
-        let previous = replacement
-            .map(|replacement| replacement.declared.as_slice())
-            .unwrap_or_else(|| self.current_declared_properties_of(rule));
-        let mut old_properties: Vec<u16> = previous.iter().map(|declared| declared.property).collect();
-        old_properties.sort_unstable();
-        old_properties.dedup();
         let mut new_properties: Vec<u16> = declared.iter().map(|declared| declared.property).collect();
         new_properties.sort_unstable();
         new_properties.dedup();
@@ -234,6 +227,13 @@ impl StyleEngine {
             change.custom_declarations_changed |= custom_declarations_changed;
             return;
         }
+        let previous = self
+            .replacement_rule(rule)
+            .map(|replacement| replacement.declared.as_slice())
+            .unwrap_or_else(|| self.current_declared_properties_of(rule));
+        let mut old_properties: Vec<u16> = previous.iter().map(|declared| declared.property).collect();
+        old_properties.sort_unstable();
+        old_properties.dedup();
         // An incomplete inventory can hold custom properties, and those never reach the winner
         // columns, so nothing downstream can prove such an edit inert. Capture that on the old
         // side only: the first edit in a transaction reads the state every proof compares against.
@@ -305,7 +305,7 @@ impl StyleEngine {
         self.stage_program_activation();
         self.program_staging
             .rule_conditions
-            .stage(rule, self.program.rule_conditions_hold(rule), conditions_hold);
+            .stage(rule, || self.program.rule_conditions_hold(rule), conditions_hold);
         // While the rule's sheet is still arriving, whether its condition holds is part of what
         // arrives rather than something that moved: routing the attachment reads the activation the
         // rule ends the transaction with, and skips it if it decides nothing.
@@ -329,9 +329,11 @@ impl StyleEngine {
             return;
         }
         self.stage_program_activation();
-        self.program_staging
-            .sheet_conditions
-            .stage(sheet, self.program.sheet_conditions_hold(sheet), conditions_hold);
+        self.program_staging.sheet_conditions.stage(
+            sheet,
+            || self.program.sheet_conditions_hold(sheet),
+            conditions_hold,
+        );
         self.record_input(
             InputKey::SheetActivation(sheet),
             InputValue::Flag(previous),
@@ -351,7 +353,7 @@ impl StyleEngine {
         self.stage_program_activation();
         self.program_staging
             .sheet_enabled
-            .stage(sheet, self.program.sheet_is_enabled(sheet), enabled);
+            .stage(sheet, || self.program.sheet_is_enabled(sheet), enabled);
         self.record_input(
             InputKey::SheetActivation(sheet),
             InputValue::Flag(previous),
@@ -587,7 +589,7 @@ impl StyleEngine {
         }
         self.program_staging
             .rule_versions
-            .stage(rule, self.program.rule_version(rule), contents);
+            .stage(rule, || self.program.rule_version(rule), contents);
     }
 
     pub(super) fn current_rule_is_gated_by_container_query(&self, rule: RuleID) -> bool {
@@ -603,7 +605,7 @@ impl StyleEngine {
         }
         self.program_staging.rule_gated_by_container_query.stage(
             rule,
-            self.program.rule_is_gated_by_container_query(rule),
+            || self.program.rule_is_gated_by_container_query(rule),
             gated,
         );
     }
@@ -615,7 +617,7 @@ impl StyleEngine {
         }
         self.program_staging
             .rule_in_a_layer
-            .stage(rule, self.program.rule_is_in_a_layer(rule), in_a_layer);
+            .stage(rule, || self.program.rule_is_in_a_layer(rule), in_a_layer);
     }
 
     /// A structural program edit cannot be applied while an epoch is reading the program, and it
@@ -760,13 +762,14 @@ impl StyleEngine {
         }
         self.program_staging
             .rule_liveness
-            .stage(rule, self.program.rule_is_live(rule), live);
+            .stage(rule, || self.program.rule_is_live(rule), live);
     }
 
-    pub(super) fn current_sheets_in_scope(&self, tree_scope: TreeScopeID) -> Vec<SheetID> {
+    pub(super) fn current_sheets_in_scope(&self, tree_scope: TreeScopeID) -> &[SheetID] {
         self.program_staging
             .sheets_in_scope
-            .current(tree_scope, || self.program.sheets_in_scope(tree_scope))
+            .after(tree_scope)
+            .map_or_else(|| self.program.sheets_in_scope(tree_scope), Vec::as_slice)
     }
 
     pub(super) fn stage_sheets_in_scope(&mut self, tree_scope: TreeScopeID, sheets: Vec<SheetID>) {
@@ -778,36 +781,34 @@ impl StyleEngine {
             // that explicitly consume document author sheets still follow every document change.
             let non_author_changed = self
                 .current_sheets_in_scope(tree_scope)
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&sheet| self.program.sheet_origin(sheet) != CascadeOrigin::Author)
                 .ne(sheets
                     .iter()
                     .copied()
                     .filter(|&sheet| self.program.sheet_origin(sheet) != CascadeOrigin::Author));
-            let scopes: Vec<_> = self
-                .scope_program_by_scope
-                .iter()
-                .enumerate()
-                .filter_map(|(index, retained)| {
-                    let (_, program) = retained.as_ref()?;
-                    let invalidate = index == TreeScopeID::DOCUMENT.0 as usize
-                        || self.scope_program(*program).key.document_sheet_mode == DocumentSheetMode::All
-                        || (non_author_changed
-                            && self.scope_program(*program).key.document_sheet_mode == DocumentSheetMode::NonAuthor);
-                    invalidate.then_some(TreeScopeID(
-                        u32::try_from(index).expect("tree scope identity space exhausted"),
-                    ))
-                })
-                .collect();
-            for scope in scopes {
-                self.invalidate_concrete_scope_program(scope);
+            for index in 0..self.scope_program_by_scope.len() {
+                let Some((_, program)) = self.scope_program_by_scope[index] else {
+                    continue;
+                };
+                let invalidate = index == TreeScopeID::DOCUMENT.0 as usize
+                    || self.scope_program(program).key.document_sheet_mode == DocumentSheetMode::All
+                    || (non_author_changed
+                        && self.scope_program(program).key.document_sheet_mode == DocumentSheetMode::NonAuthor);
+                if invalidate {
+                    let scope = TreeScopeID(u32::try_from(index).expect("tree scope identity space exhausted"));
+                    self.invalidate_concrete_scope_program(scope);
+                }
             }
         } else {
             self.invalidate_concrete_scope_program(tree_scope);
         }
-        self.program_staging
-            .sheets_in_scope
-            .stage(tree_scope, self.program.sheets_in_scope(tree_scope), sheets);
+        self.program_staging.sheets_in_scope.stage(
+            tree_scope,
+            || self.program.sheets_in_scope(tree_scope).to_vec(),
+            sheets,
+        );
     }
 
     pub(super) fn record_attachment(&mut self, sheet: SheetID, tree_scope: TreeScopeID, previous: bool, current: bool) {
@@ -830,20 +831,14 @@ impl StyleEngine {
     /// dependencies are unchanged remain interned for one invalidation generation, preserving the
     /// dispatch and prefix work shared by unaffected scopes.
     pub(super) fn invalidate_scope_programs(&mut self) {
-        let inactive: Vec<_> = self
-            .scope_programs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, program)| {
-                program
-                    .as_ref()
-                    .is_some_and(|program| program.scope_count == 0)
-                    .then_some(ScopeProgramID(
-                        u32::try_from(index).expect("scope program identity space exhausted"),
-                    ))
-            })
-            .collect();
-        for id in inactive {
+        for index in 0..self.scope_programs.len() {
+            if !self.scope_programs[index]
+                .as_ref()
+                .is_some_and(|program| program.scope_count == 0)
+            {
+                continue;
+            }
+            let id = ScopeProgramID(u32::try_from(index).expect("scope program identity space exhausted"));
             let mut caches = self.prefix_caches.borrow_mut();
             caches.states.remove(id);
             caches.answers.remove_program(&mut self.match_answers, id);
@@ -889,24 +884,20 @@ impl StyleEngine {
     /// document sheets as well as locally attached sheets, so this also reaches shadow scopes that
     /// inherit a changed document sheet without scanning the DOM's attachment topology again.
     pub(super) fn invalidate_scope_programs_for_sheet(&mut self, sheet: SheetID) {
-        let scopes: Vec<_> = self
-            .scope_program_by_scope
-            .iter()
-            .enumerate()
-            .filter_map(|(index, retained)| {
-                let (_, program) = retained.as_ref()?;
-                self.scope_program(*program)
-                    .key
-                    .sheets
-                    .iter()
-                    .any(|&(candidate, _)| candidate == sheet)
-                    .then_some(TreeScopeID(
-                        u32::try_from(index).expect("tree scope identity space exhausted"),
-                    ))
-            })
-            .collect();
-        for scope in scopes {
-            self.invalidate_concrete_scope_program(scope);
+        for index in 0..self.scope_program_by_scope.len() {
+            let Some((_, program)) = self.scope_program_by_scope[index] else {
+                continue;
+            };
+            if self
+                .scope_program(program)
+                .key
+                .sheets
+                .iter()
+                .any(|&(candidate, _)| candidate == sheet)
+            {
+                let scope = TreeScopeID(u32::try_from(index).expect("tree scope identity space exhausted"));
+                self.invalidate_concrete_scope_program(scope);
+            }
         }
     }
 
@@ -939,23 +930,22 @@ impl StyleEngine {
         if let Some(&carried) = self.program_staging.rule_change_is_carried_by_sheet.get(&sheet) {
             return carried;
         }
-        let mut scopes = self.program.sheet_scopes(sheet);
-        scopes.extend(
+        let committed_scopes = self.program.sheet_attachments(sheet).iter().filter_map(|attachment| {
+            let scope = attachment.tree_scope;
             self.program_staging
                 .sheets_in_scope
-                .iter()
-                .filter_map(|(&scope, sheets)| sheets.contains(&sheet).then_some(scope)),
-        );
-        scopes.sort_unstable();
-        scopes.dedup();
-        scopes.retain(|&scope| self.current_sheets_in_scope(scope).contains(&sheet));
-        if scopes.is_empty() {
-            self.program_staging.rule_change_is_carried_by_sheet.insert(sheet, true);
-            return true;
-        }
+                .after(scope)
+                .is_none_or(|sheets| sheets.contains(&sheet))
+                .then_some(scope)
+        });
+        let staged_scopes = self
+            .program_staging
+            .sheets_in_scope
+            .iter()
+            .filter_map(|(&scope, sheets)| sheets.contains(&sheet).then_some(scope));
         // Every scope it decides in has to be arriving. A sheet adopted somewhere long ago and
         // attached somewhere new this transaction still has to answer for the old scope.
-        let carried = scopes.iter().all(|&tree_scope| {
+        let carried = committed_scopes.chain(staged_scopes).all(|tree_scope| {
             self.journal.pending_old(InputKey::SheetAttachment(sheet, tree_scope)) == Some(InputValue::Flag(false))
         });
         self.program_staging
@@ -994,7 +984,7 @@ impl StyleEngine {
     }
 
     pub(super) fn settle_program(&mut self) {
-        self.program.settle_memory(&mut self.memory, &mut self.counters);
+        self.program.settle_memory(&mut self.memory);
     }
 
     #[must_use]

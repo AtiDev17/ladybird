@@ -516,9 +516,9 @@ impl NormalizationJournal {
                 continue;
             }
             self.entries.insert(key, (old, new));
-            self.settle(memory, counters);
+            self.settle(memory);
         }
-        self.settle(memory, counters);
+        self.settle(memory);
     }
 
     #[must_use]
@@ -634,7 +634,7 @@ impl NormalizationJournal {
             return;
         }
         self.entries.insert(key, (old, new));
-        self.settle(memory, counters);
+        self.settle(memory);
     }
 
     /// Record one input action whose semantic scope is already the complete document.
@@ -648,7 +648,7 @@ impl NormalizationJournal {
         if let Some(counter) = kind.counter() {
             counters.bump(counter);
         }
-        self.install_marker(kind, memory, counters);
+        self.install_marker(kind, memory);
     }
 
     /// Normalize and drain. The result is sorted by key so that downstream planning is
@@ -667,23 +667,18 @@ impl NormalizationJournal {
         // fold both orders to the same arriving-facts key: the tree delta already puts the subtree
         // in the plan, while that one key routes the final facts to relational and sibling
         // selectors outside it.
-        let mut arriving_nodes: Vec<StyleNodeID> = inputs
+        // Tree-relation keys are unique and already sorted by node in the normalized inputs.
+        let arriving_nodes: Vec<StyleNodeID> = inputs
             .iter()
-            .filter_map(|input| {
-                matches!(
-                    (input.key, input.old, input.new),
-                    (
-                        InputKey::TreeRelations(_),
-                        InputValue::TreeRelations(None),
-                        InputValue::TreeRelations(Some(_))
-                    )
-                )
-                .then(|| input.key.style_node())
-                .flatten()
+            .filter_map(|input| match (input.key, input.old, input.new) {
+                (
+                    InputKey::TreeRelations(node),
+                    InputValue::TreeRelations(None),
+                    InputValue::TreeRelations(Some(_)),
+                ) => Some(node),
+                _ => None,
             })
             .collect();
-        arriving_nodes.sort_unstable();
-        arriving_nodes.dedup();
         if !arriving_nodes.is_empty() {
             inputs.retain(|input| {
                 let Some(node) = input.key.style_node() else {
@@ -722,7 +717,7 @@ impl NormalizationJournal {
         let charged_bytes = (inputs.capacity() * size_of::<NormalizedInput>()
             + markers.capacity() * size_of::<CompleteScopeMarker>()) as u64;
         memory.reserve_required(MemoryCategory::NormalizationJournal, charged_bytes);
-        self.settle(memory, counters);
+        self.settle(memory);
 
         StyleTransaction {
             inputs,
@@ -771,7 +766,7 @@ impl NormalizationJournal {
                     return true;
                 }
                 // Nothing left to coarsen: mark this kind's scope rather than journalling it.
-                if self.install_marker(kind, memory, counters) {
+                if self.install_marker(kind, memory) {
                     counters.bump(Counter::CoarsenedScopeMarkers);
                 }
                 return false;
@@ -801,13 +796,13 @@ impl NormalizationJournal {
         else {
             return false;
         };
-        if self.install_marker(INPUT_KIND_VALUES[index], memory, counters) {
+        if self.install_marker(INPUT_KIND_VALUES[index], memory) {
             counters.bump(Counter::CoarsenedScopeMarkers);
         }
         true
     }
 
-    fn install_marker(&mut self, kind: InputKind, memory: &mut MemoryController, counters: &mut Counters) -> bool {
+    fn install_marker(&mut self, kind: InputKind, memory: &mut MemoryController) -> bool {
         if self.covered[kind.index()] {
             return false;
         }
@@ -815,14 +810,14 @@ impl NormalizationJournal {
         self.entries.retain(|key, _| key.kind() != kind);
         self.entries.shrink_to_fit();
         self.markers.push(CompleteScopeMarker { kind });
-        self.settle(memory, counters);
+        self.settle(memory);
         true
     }
 
     /// Reconcile the charge with the containers' actual capacity. Growth is already committed by
     /// the time it can be measured, so Tier 4 reports it rather than refusing it. Capacity growth
     /// is checked against the document-shaped cap before insertion.
-    fn settle(&mut self, memory: &mut MemoryController, _counters: &mut Counters) {
+    fn settle(&mut self, memory: &mut MemoryController) {
         let current = self.capacity_bytes();
         let charged_bytes = u64::from(self.charged_bytes);
         if current > charged_bytes {

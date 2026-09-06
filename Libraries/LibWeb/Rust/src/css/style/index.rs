@@ -1678,18 +1678,17 @@ impl FeaturePostings {
         if self.missing.contains(&key) || self.cardinality_limited.contains(&key) {
             return false;
         }
-        if !self.postings.contains_key(&key) && !memory.is_tier3_admitting(MemoryCategory::FeaturePosting) {
+        if !memory.is_tier3_admitting(MemoryCategory::FeaturePosting) && !self.postings.contains_key(&key) {
             self.remember_missing(key);
             return false;
         }
         let postings_capacity_before = self.postings_capacity_bytes();
-        self.postings.entry(key).or_default();
-        let postings_growth = self.postings_capacity_bytes() - postings_capacity_before;
-        let posting = self.postings.get_mut(&key).expect("a posting entry was just ensured");
+        let posting = self.postings.entry(key).or_default();
         let Some(posting_growth) = posting.insert(node) else {
             return true;
         };
         let posting_length = posting.length;
+        let postings_growth = self.postings_capacity_bytes() - postings_capacity_before;
         let growth = posting_growth + postings_growth;
         if growth != 0 {
             self.residency
@@ -1835,10 +1834,10 @@ impl FeaturePostings {
 
     /// Discard every posting. Memory pressure reduces retained acceleration, never correctness.
     pub fn evict_all(&mut self) {
-        let keys: Vec<PostingKey> = self.postings.keys().copied().collect();
-        for key in keys {
-            self.remember_missing(key);
-        }
+        let missing_before = self.missing_capacity_bytes();
+        self.missing.extend(self.postings.keys().copied());
+        self.residency
+            .grow_committed(self.missing_capacity_bytes() - missing_before);
         let released =
             self.postings.values().map(Posting::capacity_bytes).sum::<u64>() + self.postings_capacity_bytes();
         self.residency.shrink_to(self.residency.bytes() - released);
@@ -1912,15 +1911,19 @@ impl FeaturePostings {
     }
 
     fn forget_atoms(&mut self, atoms: &HashSet<StyleAtomID>) {
-        let posting_keys = self
-            .postings
-            .keys()
-            .copied()
-            .filter(|key| key.atom().is_some_and(|atom| atoms.contains(&atom)))
-            .collect::<Vec<_>>();
-        for key in posting_keys {
-            self.remove_posting(key);
+        let mut released = 0;
+        self.postings.retain(|key, posting| {
+            let keep = !key.atom().is_some_and(|atom| atoms.contains(&atom));
+            if !keep {
+                released += posting.capacity_bytes();
+            }
+            keep
+        });
+        if self.postings.is_empty() {
+            released += self.postings_capacity_bytes();
+            self.postings = HashMap::default();
         }
+        self.residency.shrink_to(self.residency.bytes() - released);
         self.missing
             .retain(|key| !key.atom().is_some_and(|atom| atoms.contains(&atom)));
         self.cardinality_limited
@@ -2197,8 +2200,8 @@ struct DispatchBucketDirectory {
 }
 
 impl DispatchBucketDirectory {
-    fn build(mut buckets: HashMap<DispatchKey, Vec<DispatchRow>>) -> Self {
-        let mut entries: Vec<_> = buckets.drain().collect();
+    fn build(buckets: HashMap<DispatchKey, Vec<DispatchRow>>) -> Self {
+        let mut entries: Vec<_> = buckets.into_iter().collect();
         entries.sort_unstable_by_key(|&(key, _)| key);
         let row_count = entries.iter().map(|(_, rows)| rows.len()).sum();
         let mut directory = Self {
@@ -2560,15 +2563,12 @@ impl RuleDispatch {
     }
 
     pub(super) fn ancestor_dispatch_shape(&self) -> AncestorDispatchShape {
-        let mut keys: Vec<_> = self
-            .topology
-            .ancestors
-            .key_indices
-            .iter()
-            .map(|(&key, &index)| (index, key))
-            .collect();
-        keys.sort_unstable_by_key(|&(index, _)| index);
-        AncestorDispatchShape(keys.into_iter().map(|(_, key)| key).collect())
+        let key_indices = &self.topology.ancestors.key_indices;
+        let mut keys = vec![DispatchKey::Universal; key_indices.len()];
+        for (&key, &index) in key_indices {
+            keys[index as usize] = key;
+        }
+        AncestorDispatchShape(keys)
     }
 
     pub(super) fn share_ancestor_topology_with(&mut self, template: &Self) {
@@ -2699,25 +2699,25 @@ impl RuleDispatch {
     }
 
     fn rebuild_non_prefix_index(&mut self) {
-        let non_prefix_entries: Vec<_> = self.entries.rows.iter().map(|entry| !entry.prefix_matched).collect();
+        let entries = Rc::clone(&self.entries);
         let topology = self.topology_mut();
         topology.non_prefix_bucket_directory = topology
             .bucket_directory
-            .filtered(|row| non_prefix_entries[row.index()]);
+            .filtered(|row| !entries.rows[row.index()].prefix_matched);
         topology.non_prefix_universal_parent_directory = topology
             .universal_parent_directory
-            .filtered(|row| non_prefix_entries[row.index()]);
+            .filtered(|row| !entries.rows[row.index()].prefix_matched);
         topology.non_prefix_universal_without_parent_filter = topology
             .universal_without_parent_filter
             .iter()
             .copied()
-            .filter(|row| non_prefix_entries[row.index()])
+            .filter(|row| !entries.rows[row.index()].prefix_matched)
             .collect();
         topology.non_prefix_universal_with_parent_filter = topology
             .universal_with_parent_filter
             .iter()
             .copied()
-            .filter(|row| non_prefix_entries[row.index()])
+            .filter(|row| !entries.rows[row.index()].prefix_matched)
             .collect();
     }
 
@@ -2746,22 +2746,15 @@ impl RuleDispatch {
         ordered.sort_unstable();
 
         let mut cascade_orders_by_row = vec![0; self.entry_count()];
-        let mut group_start = 0;
-        while group_start < ordered.len() {
-            let mut group_end = group_start + 1;
-            while group_end < ordered.len()
-                && ordered[group_end].0 == ordered[group_start].0
-                && ordered[group_end].1 == ordered[group_start].1
-                && ordered[group_end].2 == ordered[group_start].2
-                && ordered[group_end].3 == ordered[group_start].3
-            {
-                group_end += 1;
-            }
+        let mut group_end = 0;
+        for group in ordered
+            .chunk_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2 && left.3 == right.3)
+        {
+            group_end += group.len();
             let cascade_order = u32::try_from(group_end - 1).expect("dispatch entry space exhausted");
-            for ordered_entry in &ordered[group_start..group_end] {
+            for ordered_entry in group {
                 cascade_orders_by_row[ordered_entry.4.index()] = cascade_order;
             }
-            group_start = group_end;
         }
 
         self.rebuild_cascade_order_projection(&cascade_orders_by_row);
@@ -5831,7 +5824,7 @@ mod tests {
                 Some(name_forms)
             );
             assert!(facts.rows.attribute_catalogs.value_texts.iter().all(Option::is_none));
-            assert!(facts.custom_property_name_sets.index_is_empty());
+            assert!(facts.custom_property_name_sets.live_is_empty());
             assert!(facts.custom_property_set_ids_by_name.iter().all(Vec::is_empty));
         }
 

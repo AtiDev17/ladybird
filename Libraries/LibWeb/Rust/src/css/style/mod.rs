@@ -575,28 +575,32 @@ impl<K: Copy + Eq + Hash + Ord, V: Clone> StagedField<K, V> {
         }
     }
 
-    fn stage(&mut self, key: K, before: V, after: V) {
-        if let Some(row) = self.rows.get_mut(&key) {
-            row.after = after;
-            if !row.dirty {
-                row.dirty = true;
+    fn stage(&mut self, key: K, before: impl FnOnce() -> V, after: V) {
+        match self.rows.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let row = entry.get_mut();
+                row.after = after;
+                if !row.dirty {
+                    row.dirty = true;
+                    self.dirty_count += 1;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(StagedFieldRow {
+                    before: before(),
+                    after,
+                    dirty: true,
+                });
+                self.touched.push(key);
                 self.dirty_count += 1;
             }
-            return;
         }
-        self.rows.insert(
-            key,
-            StagedFieldRow {
-                before,
-                after,
-                dirty: true,
-            },
-        );
-        self.touched.push(key);
-        self.dirty_count += 1;
     }
 
     fn take_dirty(&mut self) -> Vec<(K, V)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
         let mut dirty = Vec::with_capacity(self.dirty_count);
         for &key in &self.touched {
             let row = self.rows.get_mut(&key).unwrap();
@@ -708,20 +712,13 @@ impl ProgramStaging {
             .sheets
             .extend(self.sheet_enabled.pairs().map(|(sheet, _, _)| sheet));
         for (scope, before, after) in self.sheets_in_scope.pairs() {
-            delta.sheets.extend(
-                before
-                    .iter()
-                    .chain(after)
-                    .copied()
-                    .filter(|sheet| before.contains(sheet) != after.contains(sheet)),
-            );
-            delta.departed_scopes.extend(
-                before
-                    .iter()
-                    .copied()
-                    .filter(|sheet| !after.contains(sheet))
-                    .map(|sheet| (sheet, scope)),
-            );
+            for &sheet in before.iter().filter(|sheet| !after.contains(sheet)) {
+                delta.sheets.push(sheet);
+                delta.departed_scopes.push((sheet, scope));
+            }
+            delta
+                .sheets
+                .extend(after.iter().copied().filter(|sheet| !before.contains(sheet)));
         }
         delta.sheets.sort_unstable();
         delta.sheets.dedup();

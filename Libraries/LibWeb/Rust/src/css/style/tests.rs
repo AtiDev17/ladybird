@@ -62,8 +62,8 @@ fn substitution_memo_retains_its_written_value_key() {
 fn sparse_program_staging_freezes_before_until_release() {
     let rule = RuleID(7);
     let mut staged = StagedField::default();
-    staged.stage(rule, 10_u32, 20);
-    staged.stage(rule, 99, 30);
+    staged.stage(rule, || 10_u32, 20);
+    staged.stage(rule, || panic!("the before value is already frozen"), 30);
 
     assert_eq!(staged.side(rule, TransactionFactSide::Before, || 0), 10);
     assert_eq!(staged.current(rule, || 0), 30);
@@ -72,7 +72,7 @@ fn sparse_program_staging_freezes_before_until_release() {
     assert_eq!(staged.side(rule, TransactionFactSide::Before, || 0), 10);
     assert_eq!(staged.current(rule, || 35), 30);
 
-    staged.stage(rule, 99, 40);
+    staged.stage(rule, || panic!("the before value is already frozen"), 40);
     assert_eq!(staged.side(rule, TransactionFactSide::Before, || 0), 10);
     assert_eq!(staged.take_dirty(), [(rule, 40)]);
     assert_eq!(staged.current(rule, || 50), 40);
@@ -838,7 +838,7 @@ fn an_evicted_prefix_answer_is_a_typed_missing_key() {
     ));
     let contribution =
         answers.remember_prefix_contribution(&mut catalog, contribution_key.program, contribution_key.matches, &[]);
-    let non_prefix = PrefixAnswerCache::non_prefix_identity(&mut catalog, &[]);
+    let non_prefix = catalog.intern(&[]);
     assert_eq!(contribution, non_prefix, "equal factors share one answer identity");
     assert!(matches!(
         answers.prefix_contribution(&catalog, contribution_key),
@@ -849,7 +849,7 @@ fn an_evicted_prefix_answer_is_a_typed_missing_key() {
         non_prefix_matches: non_prefix,
     };
     answers.remember(&mut catalog, key, &[], None, None, MatchAnswerID(1), true);
-    answers.settle_memory(&catalog, &mut memory);
+    answers.settle_memory(&mut memory);
     assert!(answers.retain(&mut memory));
     assert!(matches!(
         answers.lookup(key),
@@ -1439,9 +1439,8 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
     for node in nodes {
         assert!(postings.insert(key, node, &mut memory));
     }
-    let mut counters = Counters::new();
     let mut plan = ImpactRegions::new();
-    plan.add(ImpactRegion::Node(nodes[1]), &mut counters);
+    plan.add(ImpactRegion::Node(nodes[1]));
     let mut workspace = ImpactPlanningWorkspace::default();
     let mut candidates = Vec::new();
 
@@ -1454,7 +1453,7 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
     assert_eq!(pruned, 1);
     assert_eq!(candidates, [nodes[0], nodes[2]]);
 
-    plan.add(ImpactRegion::Node(nodes[0]), &mut counters);
+    plan.add(ImpactRegion::Node(nodes[0]));
     candidates.clear();
     let (_, reused, copied, inspected, pruned) = workspace
         .extend_remaining_posting(key, &postings, &plan, &mut candidates, None)
@@ -1476,7 +1475,7 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
     assert_eq!(candidates, [nodes[2]]);
 
     let outside = StyleNodeID::element(4);
-    plan.add(ImpactRegion::Node(outside), &mut counters);
+    plan.add(ImpactRegion::Node(outside));
     candidates.clear();
     let (_, reused, copied, inspected, pruned) = workspace
         .extend_remaining_posting(key, &postings, &plan, &mut candidates, None)
@@ -1487,8 +1486,8 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
     assert_eq!(pruned, 0);
     assert_eq!(candidates, [nodes[2]]);
 
-    plan.add(ImpactRegion::Node(nodes[2]), &mut counters);
-    plan.add(ImpactRegion::Node(StyleNodeID::element(5)), &mut counters);
+    plan.add(ImpactRegion::Node(nodes[2]));
+    plan.add(ImpactRegion::Node(StyleNodeID::element(5)));
     candidates.clear();
     let (_, reused, copied, inspected, pruned) = workspace
         .extend_remaining_posting(key, &postings, &plan, &mut candidates, None)
@@ -1505,12 +1504,9 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
     fallback_workspace
         .extend_remaining_posting(key, &postings, &fallback_plan, &mut candidates, None)
         .unwrap();
-    fallback_plan.add(ImpactRegion::Node(nodes[1]), &mut counters);
+    fallback_plan.add(ImpactRegion::Node(nodes[1]));
     for index in 0..MAX_POINT_REMOVED_EXACT_NODES - 1 {
-        fallback_plan.add(
-            ImpactRegion::Node(StyleNodeID::element(100 + index as u32)),
-            &mut counters,
-        );
+        fallback_plan.add(ImpactRegion::Node(StyleNodeID::element(100 + index as u32)));
     }
     candidates.clear();
     let (_, reused, copied, inspected, pruned) = fallback_workspace
@@ -1524,14 +1520,14 @@ fn a_planned_node_never_returns_to_a_remaining_posting() {
 
     let mut reordered_plan = ImpactRegions::new();
     for index in (20..20 + impact::MAX_PAIRWISE_COALESCE as u32).rev() {
-        reordered_plan.add(ImpactRegion::Node(StyleNodeID::element(index)), &mut counters);
+        reordered_plan.add(ImpactRegion::Node(StyleNodeID::element(index)));
     }
     let mut reordered_workspace = ImpactPlanningWorkspace::default();
     candidates.clear();
     reordered_workspace
         .extend_remaining_posting(key, &postings, &reordered_plan, &mut candidates, None)
         .unwrap();
-    reordered_plan.add(ImpactRegion::Node(nodes[1]), &mut counters);
+    reordered_plan.add(ImpactRegion::Node(nodes[1]));
     let tree = StyleNodeTree::new(&mut memory);
     reordered_plan.normalize(&tree);
     candidates.clear();
@@ -3870,10 +3866,10 @@ fn patch_attributions_preserve_the_same_coverage_without_preorder_coordinates() 
         } else {
             ImpactRegions::new()
         };
-        regions.add_attributed(ImpactRegion::Subtree(nodes[1]), first, &mut engine.counters);
-        regions.add_attributed(ImpactRegion::Children(nodes[1]), second, &mut engine.counters);
-        regions.add_attributed(ImpactRegion::Node(nodes[3]), second, &mut engine.counters);
-        regions.attribute_extent(ImpactRegion::Node(nodes[3]), first, &mut engine.counters);
+        regions.add_attributed(ImpactRegion::Subtree(nodes[1]), first);
+        regions.add_attributed(ImpactRegion::Children(nodes[1]), second);
+        regions.add_attributed(ImpactRegion::Node(nodes[3]), second);
+        regions.attribute_extent(ImpactRegion::Node(nodes[3]), first);
         let cover = regions.compile_patch_cover(&engine.tree, Some(nodes[0]));
         let mut sweep = AttributionSweep::default();
         let mut covering = Vec::new();
@@ -3910,7 +3906,7 @@ fn already_planned_routes_attribute_their_extent() {
     remove_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
     let mut transaction = engine.take_transaction();
     let mut regions = ImpactRegions::with_topology(&engine.tree, nodes[0]);
-    regions.add(ImpactRegion::Node(nodes[3]), &mut engine.counters);
+    regions.add(ImpactRegion::Node(nodes[3]));
     engine.transaction_fact_view = Some(engine.transaction_fact_view_for(&mut transaction, nodes[0], &regions));
     engine.selector_truth_changes_active = true;
     let program = engine.program.rule_version(rule).selector_program.unwrap();
@@ -3944,7 +3940,7 @@ fn already_planned_routes_attribute_their_extent() {
     engine.selector_truth_changes = SelectorTruthChanges::default();
     engine.record_already_planned_selector_truth(nodes[3], &site);
     let mut coarse_regions = ImpactRegions::new();
-    coarse_regions.add(ImpactRegion::Subtree(nodes[0]), &mut engine.counters);
+    coarse_regions.add(ImpactRegion::Subtree(nodes[0]));
     let coarse_cover = coarse_regions.compile_union(coarse_regions.regions(), &engine.tree, Some(nodes[0]));
     engine.resolve_already_planned_selector_truth(&coarse_regions, Some(&coarse_cover));
     assert!(engine.selector_truth_changes.deltas.as_slice().is_empty());
@@ -3965,7 +3961,6 @@ fn routes_covered_by_an_attributed_subtree_still_attribute_their_extent() {
     regions.add_attributed(
         ImpactRegion::Subtree(nodes[0]),
         (rule_a, engine.programs.entry_id(program_a, 0)),
-        &mut engine.counters,
     );
     engine.selector_truth_changes_active = true;
 
@@ -4025,7 +4020,7 @@ fn routes_covered_by_an_attributed_subtree_still_attribute_their_extent() {
     // Coverage by an unattributed subtree already forces full re-derivation, so a route
     // dropped for that coverage stays silent: no attribution and no poison.
     let mut full_regions = ImpactRegions::with_topology(&engine.tree, nodes[0]);
-    full_regions.add(ImpactRegion::Subtree(nodes[0]), &mut engine.counters);
+    full_regions.add(ImpactRegion::Subtree(nodes[0]));
     let refreshes_before = engine.selector_truth_changes.refreshes.as_slice().len();
     let mut silent_region = vec![ImpactRegion::Node(nodes[3])];
     engine.discard_regions_covered_by_subtree(&mut silent_region, &unnamed, &mut full_regions);
@@ -5092,6 +5087,172 @@ fn update_test_prefix_relation(
 }
 
 #[test]
+fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let mut raw = [0; 65];
+    engine.allocate_style_nodes(&mut raw);
+    let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
+    let class = StyleAtomID(200);
+    engine.record_tree_delta(nodes[0], None, Some(relations(None, None, None)));
+    for index in 1..nodes.len() {
+        engine.record_tree_delta(
+            nodes[index],
+            None,
+            Some(relations(
+                Some(nodes[0].raw()),
+                (index > 1).then(|| nodes[index - 1].raw()),
+                None,
+            )),
+        );
+    }
+    for &node in &nodes {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+    }
+
+    // The root has the same local facts as its children, but :root and nth-child
+    // still distinguish their positions. :not(:root) uses a program predicate.
+    let mut builder = selector::SelectorProgramBuilder::new();
+    let feature = builder.push_feature(selector::FeatureTest::Class(class));
+    let root = builder.push(selector::SelectorOp::Root);
+    let not_root = builder.push(selector::SelectorOp::Not(root));
+    let compound = builder.push_compound(&[feature, not_root]);
+    builder.push_entry_for_pseudo(compound, None);
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    for selector in [
+        builder.finish(),
+        test_selector_program(".same:nth-child(2n)", &[("same", class)]),
+    ] {
+        let program = engine.programs.add(selector);
+        let rule = engine.append_rule(sheet, None, RuleKind::Style);
+        engine.add_routing_rule(rule, program);
+        let mut version = engine.program.rule_version(rule);
+        version.selector_program = Some(program);
+        version.declaration_block = Some(DeclarationBlockID(1));
+        engine.replace_rule_version(rule, version);
+    }
+    discard_transaction(&mut engine);
+    let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
+    let (_, relation) = test_prefix_relation(&mut engine, nodes[0]);
+    let evaluations = engine.counters.get(Counter::PrefixCompoundsEvaluated) - before;
+    assert!(
+        evaluations < 16,
+        "repeated local facts required {evaluations} evaluations"
+    );
+    let mut states = PrefixStates::new(0);
+    relation.install_answers(&mut states);
+    assert!(states.retained_matches_for(nodes[0]).unwrap().is_empty());
+    for (index, &node) in nodes.iter().enumerate().skip(1) {
+        assert_eq!(
+            states.retained_matches_for(node).unwrap().len(),
+            1 + usize::from(index % 2 == 0)
+        );
+    }
+}
+
+#[test]
+fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
+    for negate in [false, true] {
+        let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+        let mut raw = [0; 65];
+        engine.allocate_style_nodes(&mut raw);
+        let nodes: Vec<_> = raw.into_iter().map(|raw| StyleNodeID::from_raw(raw).unwrap()).collect();
+        let same = StyleAtomID(200);
+        let selected = StyleAtomID(201);
+        engine.record_tree_delta(nodes[0], None, Some(relations(None, None, None)));
+        for index in 1..nodes.len() {
+            engine.record_tree_delta(
+                nodes[index],
+                None,
+                Some(relations(
+                    Some(nodes[0].raw()),
+                    (index > 1).then(|| nodes[index - 1].raw()),
+                    None,
+                )),
+            );
+        }
+        for (index, &node) in nodes.iter().enumerate() {
+            add_feature(&mut engine, node, LocalFeatureKey::Class(same));
+            if index % 2 == 0 {
+                add_feature(&mut engine, node, LocalFeatureKey::Class(selected));
+            }
+        }
+        let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+        engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+        // Both compounds dispatch on .same, but have different answers. Negation
+        // exercises program predicates, including shared false results.
+        for require_selected in [false, true] {
+            let mut builder = selector::SelectorProgramBuilder::new();
+            let same = builder.push_feature(selector::FeatureTest::Class(same));
+            let mut operands = vec![same];
+            if require_selected {
+                let selected = builder.push_feature(selector::FeatureTest::Class(selected));
+                operands.push(if negate {
+                    builder.push(selector::SelectorOp::Not(selected))
+                } else {
+                    selected
+                });
+            }
+            let compound = builder.push_compound(&operands);
+            builder.push_entry_for_pseudo(compound, None);
+            let program = engine.programs.add(builder.finish());
+            let rule = engine.append_rule(sheet, None, RuleKind::Style);
+            engine.add_routing_rule(rule, program);
+            let mut version = engine.program.rule_version(rule);
+            version.selector_program = Some(program);
+            version.declaration_block = Some(DeclarationBlockID(1));
+            engine.replace_rule_version(rule, version);
+        }
+        discard_transaction(&mut engine);
+        let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
+        let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
+        let evaluations = engine.counters.get(Counter::PrefixCompoundsEvaluated) - before;
+        assert!(
+            evaluations < 16,
+            "repeated local facts required {evaluations} evaluations"
+        );
+        let mut states = PrefixStates::new(0);
+        relation.install_answers(&mut states);
+        for (index, &node) in nodes.iter().enumerate() {
+            assert_eq!(
+                states.retained_matches_for(node).unwrap().len(),
+                1 + usize::from((index % 2 == 0) != negate)
+            );
+        }
+
+        // Move one element between fact groups in each direction. Other members
+        // must keep their answers, and rebuilding must agree with the update.
+        let old_facts = engine.facts.primary().clone();
+        add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(selected));
+        remove_feature(&mut engine, nodes[2], LocalFeatureKey::Class(selected));
+        discard_transaction(&mut engine);
+        update_test_prefix_relation(
+            &engine,
+            &dispatch,
+            &mut relation,
+            &old_facts,
+            &[nodes[1], nodes[2]],
+            None,
+        );
+        assert_eq!(relation.changed_answers.len(), 2);
+        relation.install_answers(&mut states);
+        let (_, rebuilt) = test_prefix_relation(&mut engine, nodes[0]);
+        let mut rebuilt_states = PrefixStates::new(0);
+        rebuilt.install_answers(&mut rebuilt_states);
+        for (index, &node) in nodes.iter().enumerate() {
+            let selected = match index {
+                1 => true,
+                2 => false,
+                _ => index % 2 == 0,
+            };
+            let matches = states.retained_matches_for(node).unwrap();
+            assert_eq!(matches.len(), 1 + usize::from(selected != negate));
+            assert_eq!(matches, rebuilt_states.retained_matches_for(node).unwrap());
+        }
+    }
+}
+
+#[test]
 fn prefix_relations_propagate_local_changes_over_every_axis() {
     for (selector, nested, guard_index, target_index) in [
         (".guard > .target", true, 2, 3),
@@ -5118,7 +5279,7 @@ fn prefix_relations_propagate_local_changes_over_every_axis() {
         discard_transaction(&mut engine);
         let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
         let mut states = PrefixStates::new(0);
-        relation.install_answers(&mut states, &mut engine.counters);
+        relation.install_answers(&mut states);
         assert_eq!(
             states.retained_matches_for(nodes[target_index]).unwrap().len(),
             1,
@@ -5140,7 +5301,7 @@ fn prefix_relations_propagate_local_changes_over_every_axis() {
         assert_eq!(relation.changed_answers[0].0, nodes[target_index]);
         assert_eq!(relation.changed_answers[0].1.len(), 1);
         assert!(relation.changed_answers[0].2.is_empty());
-        relation.install_answers(&mut states, &mut engine.counters);
+        relation.install_answers(&mut states);
         assert!(states.retained_matches_for(nodes[target_index]).unwrap().is_empty());
 
         let old_facts = engine.facts.primary().clone();
@@ -5370,7 +5531,7 @@ fn prefix_relations_update_adjacency_and_positions_after_sibling_removal() {
     discard_transaction(&mut engine);
     let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
     let mut states = PrefixStates::new(0);
-    relation.install_answers(&mut states, &mut engine.counters);
+    relation.install_answers(&mut states);
     assert!(states.retained_matches_for(nodes[3]).unwrap().is_empty());
 
     let old_facts = engine.facts.primary().clone();
@@ -5503,7 +5664,7 @@ fn covered_prefix_changes_forget_only_the_covered_subtree() {
     engine
         .memory
         .reserve_required(MemoryCategory::BatchScratch, fact_view_bytes);
-    regions.add(ImpactRegion::Subtree(nodes[1]), &mut engine.counters);
+    regions.add(ImpactRegion::Subtree(nodes[1]));
 
     let route = engine.routing.routes_for(RoutingKey::Class(guard))[0];
     let mut pending = PendingRoutes::new();
@@ -6264,7 +6425,7 @@ fn prefix_transition_uses_arrival_region_coverage() {
 
     let transaction = engine.take_transaction();
     let mut regions = ImpactRegions::with_topology(&engine.tree, nodes[0]);
-    regions.add(ImpactRegion::Subtree(arrival), &mut Counters::default());
+    regions.add(ImpactRegion::Subtree(arrival));
     let transition = engine
         .classify_transaction_facts(&transaction, &regions)
         .prefix
@@ -8832,10 +8993,9 @@ fn repeated_selector_replacement_reuses_program_and_route_storage() {
     let mut retained_bytes = None;
 
     for index in 0..128_u32 {
-        let (program, inserted) = engine.programs.add_with_status(
-            test_selector_program(".target", &[("target", StyleAtomID(index + 1))]),
-            &mut engine.memory,
-        );
+        let (program, inserted) = engine
+            .programs
+            .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
         engine.programs.settle_memory(&mut engine.memory);
         engine.add_routing_rule(rule, program);
@@ -8862,10 +9022,9 @@ fn adding_a_live_selector_program_keeps_existing_routing() {
 
     for index in 0..2_u32 {
         let rule = engine.append_rule(sheet, None, RuleKind::Style);
-        let (program, inserted) = engine.programs.add_with_status(
-            test_selector_program(".target", &[("target", StyleAtomID(index + 1))]),
-            &mut engine.memory,
-        );
+        let (program, inserted) = engine
+            .programs
+            .add_with_status(test_selector_program(".target", &[("target", StyleAtomID(index + 1))]));
         engine.selector_programs_need_sweep |= inserted;
         engine.programs.settle_memory(&mut engine.memory);
         engine.add_routing_rule(rule, program);

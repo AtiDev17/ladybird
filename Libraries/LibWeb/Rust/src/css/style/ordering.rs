@@ -1149,11 +1149,10 @@ impl StyleEngine {
             important,
             context_depth: self.tree_scope_depth(context_scope),
             element_attachment: ElementAttachment::Rule,
-            layer: version.layer,
             layer_rank: self.program.layer_rank(context_scope, version.layer),
             specificity,
             scope_proximity,
-            sheet_rank: attachment.map_or((0, 0), |attachment| self.program.sheet_rank(attachment)),
+            sheet_rank: attachment.map_or(0, |attachment| self.program.sheet_rank(attachment)),
             rule_rank: self.program.rule_rank(rule),
         })
     }
@@ -1177,12 +1176,11 @@ impl StyleEngine {
             important,
             context_depth: self.tree_scope_depth(tree_scope),
             element_attachment,
-            layer: CascadeLayerID::UNLAYERED,
             layer_rank: self.program.layer_rank(tree_scope, CascadeLayerID::UNLAYERED),
             specificity: Specificity::default(),
             scope_proximity: u32::MAX,
-            sheet_rank: (u64::MAX, u64::MAX),
-            rule_rank: (u64::MAX, u64::MAX),
+            sheet_rank: u64::MAX,
+            rule_rank: u64::MAX,
         })
     }
 
@@ -1529,13 +1527,12 @@ impl StyleEngine {
     /// left behind here would be read as the next occupant's. Dropping it at the transaction
     /// boundary keeps the row alive for exactly as long as routing needs it.
     pub(super) fn forget_departed_elements(&mut self) {
-        let departed: Vec<_> = self
+        let mut departed = self
             .tree_staging
             .rows()
-            .into_iter()
             .filter_map(|(node, _, after)| after.is_none().then_some(node))
-            .collect();
-        if departed.is_empty() {
+            .peekable();
+        if departed.peek().is_none() {
             return;
         }
         for node in departed {

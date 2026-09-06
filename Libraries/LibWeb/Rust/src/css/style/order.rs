@@ -14,8 +14,6 @@
 //! only reads the order labels imply. Relabeling is therefore invisible to selector truth, cascade
 //! winners, and computed values.
 
-use std::cmp::Ordering;
-
 use super::capacity::capacity_bytes;
 
 define_id! {
@@ -31,33 +29,19 @@ impl OrderToken {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Entry {
-    label: u64,
-}
-
 /// One totally ordered axis: stylesheet order within a tree context, nested rule order within a
 /// sheet, or layer order within an origin.
+#[derive(Default)]
 pub struct OrderMaintenance {
-    entries: Vec<Entry>,
+    labels: Vec<u64>,
     free_entries: Vec<u32>,
     order: Vec<OrderToken>,
-}
-
-impl Default for OrderMaintenance {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl OrderMaintenance {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            free_entries: Vec::new(),
-            order: Vec::new(),
-        }
+        Self::default()
     }
 
     #[must_use]
@@ -70,18 +54,10 @@ impl OrderMaintenance {
         self.order.is_empty()
     }
 
+    /// The comparable rank of a position.
     #[must_use]
-    pub fn compare(&self, first: OrderToken, second: OrderToken) -> Ordering {
-        self.entries[first.0 as usize]
-            .label
-            .cmp(&self.entries[second.0 as usize].label)
-    }
-
-    /// The comparable rank of a position. Keep the second component until cascade priority changes
-    /// its representation independently of this order-maintenance implementation.
-    #[must_use]
-    pub fn rank(&self, token: OrderToken) -> (u64, u64) {
-        (self.entries[token.0 as usize].label, 0)
+    pub fn rank(&self, token: OrderToken) -> u64 {
+        self.labels[token.0 as usize]
     }
 
     /// Insert at the end of the order.
@@ -115,7 +91,7 @@ impl OrderMaintenance {
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
-            shallow [self.entries, self.free_entries, self.order];
+            shallow [self.labels, self.free_entries, self.order];
             cached [];
             nested [];
             skip [];
@@ -145,11 +121,11 @@ impl OrderMaintenance {
     fn bounds(&self, position: usize) -> (u64, u64) {
         let lower = position
             .checked_sub(1)
-            .map_or(0, |index| self.entries[self.order[index].0 as usize].label);
+            .map_or(0, |index| self.labels[self.order[index].0 as usize]);
         let upper = self
             .order
             .get(position)
-            .map_or(u64::MAX, |token| self.entries[token.0 as usize].label);
+            .map_or(u64::MAX, |token| self.labels[token.0 as usize]);
         (lower, upper)
     }
 
@@ -158,20 +134,19 @@ impl OrderMaintenance {
         let step = u64::MAX / (length + 1);
         assert!(step >= 2, "order label space exhausted");
         for (index, token) in self.order.iter().enumerate() {
-            self.entries[token.0 as usize].label = step * (index as u64 + 1);
+            self.labels[token.0 as usize] = step * (index as u64 + 1);
         }
     }
 
     fn allocate_entry(&mut self, label: u64) -> OrderToken {
-        let entry = Entry { label };
         match self.free_entries.pop() {
             Some(index) => {
-                self.entries[index as usize] = entry;
+                self.labels[index as usize] = label;
                 OrderToken(index)
             }
             None => {
-                self.entries.push(entry);
-                OrderToken(u32::try_from(self.entries.len() - 1).expect("order token space exhausted"))
+                self.labels.push(label);
+                OrderToken(u32::try_from(self.labels.len() - 1).expect("order token space exhausted"))
             }
         }
     }
@@ -189,9 +164,7 @@ mod tests {
     use super::*;
 
     fn is_sorted(order: &OrderMaintenance, tokens: &[OrderToken]) -> bool {
-        tokens
-            .windows(2)
-            .all(|pair| order.compare(pair[0], pair[1]) == Ordering::Less)
+        tokens.windows(2).all(|pair| order.rank(pair[0]) < order.rank(pair[1]))
     }
 
     #[test]
@@ -247,7 +220,7 @@ mod tests {
 
         for index in (0..tokens.len()).step_by(2) {
             let inserted = order.insert_before(tokens[index]);
-            assert_eq!(order.compare(inserted, tokens[index]), Ordering::Less);
+            assert!(order.rank(inserted) < order.rank(tokens[index]));
         }
         assert_eq!(order.iter().count(), order.len());
     }

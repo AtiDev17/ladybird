@@ -54,13 +54,16 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLParagraphElement.h>
 #include <LibWeb/HTML/History.h>
+#include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigation.h>
+#include <LibWeb/HTML/NavigationHistoryEntry.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
+#include <LibWeb/HTML/NavigationParamsDescriptor.h>
 #include <LibWeb/HTML/NavigationPopulationRequest.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -84,6 +87,7 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/ScrollSnap.h>
+#include <LibWeb/Platform/Timer.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/CompositionEvent.h>
 #include <LibWeb/UIEvents/EventNames.h>
@@ -692,6 +696,37 @@ void LocalNavigable::report_child_frame_destroyed()
     page().client().page_did_destroy_child_frame(id());
 }
 
+// AD-HOC: Child removal unloads documents before running the remaining destroy-a-child-navigable steps.
+void LocalNavigable::unload_child_navigable_before_destruction(GC::Ref<GC::Function<void()>> after_all_unloads)
+{
+    m_pending_child_navigable_unload = after_all_unloads;
+    page().client().page_did_request_child_navigable_unload(id());
+}
+
+void LocalNavigable::continue_child_navigable_destruction(UnloadDisplayedDocument unload_displayed_document)
+{
+    auto after_all_unloads = m_pending_child_navigable_unload;
+    if (!after_all_unloads)
+        return;
+    m_pending_child_navigable_unload = nullptr;
+
+    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr,
+        GC::create_function(heap(), [navigable = GC::Ref { *this }, unload_displayed_document, after_all_unloads = GC::Ref { *after_all_unloads }] {
+            if (unload_displayed_document == UnloadDisplayedDocument::Yes) {
+                // 2. Unload document, passing along newDocument if it is not null.
+                if (auto active_document = navigable->active_document())
+                    active_document->unload();
+            } else if (auto active_document = navigable->active_document()) {
+                // AD-HOC: The displayed document was unloaded in its remote host. Destroy the process-local
+                //         placeholder without firing its lifecycle events.
+                active_document->destroy();
+            }
+
+            // 3. If afterAllUnloads was given, then run it.
+            after_all_unloads->function()();
+        }));
+}
+
 void LocalNavigable::remove_from_all_local_navigables()
 {
     cancel_hover_update_after_async_scroll();
@@ -720,6 +755,7 @@ void LocalNavigable::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_active_document);
     visitor.visit(m_input_method_composition_node);
     visitor.visit(m_container);
+    visitor.visit(m_pending_child_navigable_unload);
     m_event_handler.visit_edges(visitor);
 
     for (auto& pending_navigation : m_pending_navigations) {
@@ -801,6 +837,241 @@ void LocalNavigable::consume_child_navigable_history_reconstruction_id(size_t in
 {
     VERIFY(index < m_child_navigable_history_reconstruction_ids.size());
     m_child_navigable_history_reconstruction_ids[index].clear();
+}
+
+bool LocalNavigable::adopt_canonical_id_for_child_created_during_history_reconstruction(LocalNavigable& child)
+{
+    VERIFY(child.parent().ptr() == this);
+
+    auto parent_document = active_document();
+    VERIFY(parent_document);
+    if (parent_document->is_completely_loaded())
+        return false;
+
+    // The UI-selected entry supplies child identities before a reconstructed document creates its child navigables. Consume the
+    // identity at the child's position instead of retaining the nested history entries.
+    auto child_navigables = parent_document->document_tree_child_navigables();
+    auto child_index = child_navigables.find_first_index(child);
+    if (!child_index.has_value())
+        return false;
+
+    auto child_id = child_navigable_history_reconstruction_id(*child_index);
+    if (!child_id.has_value())
+        return false;
+    if (local_navigable_with_id(*child_id))
+        return false;
+
+    child.set_id_for_session_history_reconstruction(*child_id);
+    consume_child_navigable_history_reconstruction_id(*child_index);
+    return true;
+}
+
+void LocalNavigable::route_child_created_during_history_reconstruction(Web::ReconstructedChildNavigation navigation)
+{
+    prepare_to_populate_reconstructed_history_entry(navigation.target_entry.navigation_api_key);
+    prepare_child_navigable_history_reconstruction(navigation.target_entry.document_state);
+
+    auto source_snapshot_params = snapshot_source_snapshot_params(nullptr);
+    auto request = NavigationPopulationRequest {
+        .navigable_id = id(),
+        .history_entry = create_pending_session_history_entry_descriptor(move(navigation.target_entry)),
+        .source_snapshot_params = create_navigation_source_snapshot(source_snapshot_params),
+        .target_snapshot_params = snapshot_target_snapshot_params(*this),
+        .csp_navigation_type = ContentSecurityPolicy::Directives::Directive::NavigationType::Other,
+        .history_handling = Bindings::NavigationHistoryBehavior::Replace,
+        .user_involvement = UserNavigationInvolvement::BrowserUI,
+        .navigation_id = move(navigation.navigation_id),
+    };
+    request_population_for_reconstructed_history_entry(move(request));
+}
+
+// AD-HOC: The UI process ran steps 1-4 of attempting to populate the history entry's document. Continue at the
+//         algorithm's queued-global-task boundary instead of restarting the algorithm in this process.
+void LocalNavigable::continue_navigation_at_population(NavigationPopulationRequest request, NavigationPopulationResult result)
+{
+    if (!active_document() || !active_window()) {
+        page().client().navigation_population_failed(request.navigable_id, request.navigation_id);
+        return;
+    }
+    auto navigable = GC::Ref { *this };
+
+    SessionHistoryEntryReconstructionState reconstruction_state;
+    auto history_entry = create_session_history_entry_from_ui_process(create_session_history_entry_descriptor(move(request.history_entry), 0), reconstruction_state);
+    history_entry->set_step(SessionHistoryEntry::Pending::Tag);
+
+    navigable->set_ongoing_navigation(request.navigation_id);
+
+    auto& realm = navigable->active_window()->principal_realm();
+    TemporaryExecutionContext execution_context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
+    auto navigation_params_or_error = create_navigation_params_from_descriptor(realm, *navigable, move(result.navigation_params));
+    if (navigation_params_or_error.is_error()) {
+        navigable->set_ongoing_navigation({});
+        navigable->set_delaying_load_events(false);
+        page().client().navigation_population_failed(request.navigable_id, request.navigation_id);
+        return;
+    }
+    auto navigation_params = navigation_params_or_error.release_value();
+
+    auto output = navigable->heap().allocate<PopulateSessionHistoryEntryDocumentOutput>();
+    output->redirected_url = move(result.redirected_url);
+    output->classic_history_api_state = move(result.classic_history_api_state);
+    output->resource_cleared = result.resource_cleared;
+
+    // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
+    //    these steps:
+    auto fetch_client_origin = request.source_snapshot_params.fetch_client.has_value()
+        ? Optional<URL::Origin> { request.source_snapshot_params.fetch_client->origin }
+        : Optional<URL::Origin> {};
+
+    navigable->queue_navigation_and_traversal_task_for_session_history_entry_population(
+        history_entry->url(),
+        request.source_snapshot_params.allows_downloading,
+        move(fetch_client_origin),
+        request.user_involvement,
+        request.navigation_id,
+        move(navigation_params),
+        request.csp_navigation_type,
+        Bindings::NavigationTimingType::Navigate,
+        output,
+        GC::create_function(navigable->heap(), [navigable, history_entry, history_handling = request.history_handling, navigation_id = request.navigation_id, user_involvement = request.user_involvement](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
+            if (output && output->download_handled) {
+                // NB: The UI process ended the recorded load and its transaction when the download adopted this
+                //     population's response body.
+                navigable->set_ongoing_navigation({});
+                navigable->set_delaying_load_events(false);
+                return;
+            }
+
+            if (output)
+                output->apply_to(*history_entry);
+            auto pending_document = output ? output->document : GC::Ptr<DOM::Document> {};
+            finalize_a_cross_document_navigation(navigable, to_history_handling_behavior(history_handling), user_involvement, history_entry, pending_document, navigation_id, GC::create_function(navigable->heap(), [](HistoryStepResult) { }));
+        }));
+}
+
+void LocalNavigable::prepare_child_navigable_history_reconstruction(SessionHistoryDocumentStateDescriptor const& document_state_descriptor)
+{
+    Vector<Optional<CrossProcessId>> child_navigable_ids;
+    child_navigable_ids.ensure_capacity(document_state_descriptor.nested_histories.size());
+    for (auto const& nested_history : document_state_descriptor.nested_histories)
+        child_navigable_ids.unchecked_append(nested_history.id);
+
+    auto active_entry = active_session_history_entry();
+    auto active_document = this->active_document();
+    if (active_entry && active_document
+        && active_entry->document_state()->cross_process_id() == document_state_descriptor.id) {
+        auto child_navigables = active_document->document_tree_child_navigables();
+        if (child_navigables.size() == child_navigable_ids.size()) {
+            // FIXME: This is temporary glue for the current load-then-seed ordering.
+            //        A replacement WebContent process can create live child navigables
+            //        before the UI process sends its canonical session-history tree.
+            //        Now that nested history ids are canonical CrossProcessIds, the UI id
+            //        must win; retarget the already-created child to match it. The
+            //        longer-term model should avoid creating a distinct temporary id
+            //        for a child the UI process already knows about.
+            for (size_t i = 0; i < child_navigables.size(); ++i) {
+                auto canonical_id = *child_navigable_ids[i];
+                child_navigables[i]->set_id_for_session_history_reconstruction(canonical_id);
+                child_navigable_ids[i].clear();
+            }
+        }
+    }
+
+    set_child_navigable_history_reconstruction_ids(move(child_navigable_ids));
+}
+
+// The local session history entries a navigable can still be asked to activate or update.
+static Vector<NonnullRefPtr<SessionHistoryEntry>> retained_session_history_entries(LocalNavigable& navigable)
+{
+    Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
+    auto append = [&](RefPtr<SessionHistoryEntry> entry) {
+        if (!entry)
+            return;
+        if (entries.find_if([&](auto const& candidate) {
+                return candidate.ptr() == entry.ptr();
+            })
+            != entries.end()) {
+            return;
+        }
+        entries.append(entry.release_nonnull());
+    };
+
+    append(navigable.current_session_history_entry());
+    append(navigable.active_session_history_entry());
+
+    if (auto window = navigable.active_window()) {
+        for (auto const& navigation_entry : window->navigation()->entries())
+            append(navigation_entry->session_history_entry());
+    }
+
+    return entries;
+}
+
+NonnullRefPtr<SessionHistoryEntry> LocalNavigable::resolve_local_session_history_entry(SessionHistoryEntryDescriptor entry_descriptor, PrepareChildHistoryReconstruction prepare_child_history_reconstruction)
+{
+    auto retained_entries = retained_session_history_entries(*this);
+    auto target_identity = session_history_entry_identity(entry_descriptor);
+    for (auto& retained_entry : retained_entries) {
+        if (session_history_entry_identity(*retained_entry) == target_identity) {
+            apply_session_history_entry_descriptor_from_ui_process(*retained_entry, entry_descriptor);
+            apply_session_history_document_state_descriptor_from_ui_process(*retained_entry->document_state(), entry_descriptor.document_state);
+            if (prepare_child_history_reconstruction == PrepareChildHistoryReconstruction::Yes) {
+                prepare_child_navigable_history_reconstruction(entry_descriptor.document_state);
+            }
+            return retained_entry;
+        }
+    }
+
+    SessionHistoryEntryReconstructionState reconstruction_state;
+    for (auto const& retained_entry : retained_entries) {
+        auto document_state = retained_entry->document_state();
+        if (document_state)
+            reconstruction_state.document_states.set(document_state->cross_process_id(), document_state);
+    }
+
+    if (prepare_child_history_reconstruction == PrepareChildHistoryReconstruction::Yes) {
+        prepare_child_navigable_history_reconstruction(entry_descriptor.document_state);
+    }
+    return create_session_history_entry_from_ui_process(move(entry_descriptor), reconstruction_state);
+}
+
+Vector<NonnullRefPtr<SessionHistoryEntry>> LocalNavigable::session_history_entries_for_navigation_api_from_ui_process(Vector<SessionHistoryEntryDescriptor> entry_descriptors)
+{
+    auto retained_entries = retained_session_history_entries(*this);
+    SessionHistoryEntryReconstructionState reconstruction_state;
+    for (auto const& retained_entry : retained_entries) {
+        auto document_state = retained_entry->document_state();
+        if (document_state)
+            reconstruction_state.document_states.set(document_state->cross_process_id(), document_state);
+    }
+
+    Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
+    entries.ensure_capacity(entry_descriptors.size());
+
+    for (auto& entry_descriptor : entry_descriptors) {
+        RefPtr<SessionHistoryEntry> local_entry;
+        auto entry_identity = session_history_entry_identity(entry_descriptor);
+        for (auto const& retained_entry : retained_entries) {
+            if (session_history_entry_identity(*retained_entry) == entry_identity) {
+                local_entry = retained_entry;
+                break;
+            }
+        }
+
+        if (local_entry) {
+            apply_session_history_entry_descriptor_from_ui_process(*local_entry, entry_descriptor);
+            apply_session_history_document_state_descriptor_from_ui_process(*local_entry->document_state(), entry_descriptor.document_state);
+            entries.append(local_entry.release_nonnull());
+            continue;
+        }
+
+        auto entry = SessionHistoryEntry::create();
+        apply_session_history_entry_descriptor_from_ui_process(*entry, entry_descriptor);
+        entry->set_document_state(get_or_create_document_state_from_ui_process(entry_descriptor.document_state, reconstruction_state));
+        entries.append(move(entry));
+    }
+
+    return entries;
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#initialize-the-navigable
@@ -899,6 +1170,76 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
         new_document->completely_finish_loading();
 
     notify_navigation_observers_navigation_complete();
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step
+// The steps queued for one navigable of nonchangingNavigablesThatStillNeedUpdates.
+void LocalNavigable::update_nonchanging_navigable_history_step_state(HistoryObjectLengthAndIndex history_object_length_and_index, GC::Ref<GC::Function<void()>> on_complete)
+{
+    // AD-HOC: The navigable may have been destroyed while the UI process dispatched this job.
+    if (has_been_destroyed() || !active_document()) {
+        on_complete->function()();
+        return;
+    }
+
+    // AD-HOC: Queue with null document instead of using queue_global_task. A document-associated task can become
+    //         unrunnable while the UI process waits for completion, so validate the document when the task runs.
+    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [navigable = GC::Ref { *this }, history_object_length_and_index, on_complete] {
+        // 1. Let document be navigable's active document.
+        auto document = navigable->active_document();
+        if (navigable->has_been_destroyed() || !document || !document->is_fully_active()) {
+            on_complete->function()();
+            return;
+        }
+
+        // 2. Set document's history object's index to scriptHistoryIndex.
+        document->history()->m_index = history_object_length_and_index.script_history_index;
+
+        // 3. Set document's history object's length to scriptHistoryLength.
+        document->history()->m_length = history_object_length_and_index.script_history_length;
+
+        // 4. Increment completedNonchangingJobs.
+        on_complete->function()();
+    }));
+}
+
+// AD-HOC: This implements https://github.com/whatwg/html/pull/12838.
+void LocalNavigable::queue_navigation_api_state_clear_task()
+{
+    if (has_been_destroyed() || !active_window())
+        return;
+
+    queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*active_window()), GC::create_function(heap(), [navigable = GC::Ref { *this }] {
+        if (navigable->has_been_destroyed() || !navigable->active_window())
+            return;
+
+        // 1. Let navigation be navigable's active window's navigation API.
+        auto navigation = navigable->active_window()->navigation();
+
+        // 2. Set navigation's ongoing navigate event to null.
+        navigation->set_ongoing_navigate_event(nullptr);
+
+        // 3. Set navigation's ongoing API method tracker to null.
+        navigation->set_ongoing_api_method_tracker(nullptr);
+    }));
+}
+
+// https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
+void LocalNavigable::run_ui_descendant_unload_task(GC::Ref<GC::Function<void()>> on_complete)
+{
+    // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
+    if (has_been_destroyed()) {
+        on_complete->function()();
+        return;
+    }
+
+    // The UI process has already unloaded this document's descendants.
+    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr,
+        GC::create_function(heap(), [navigable = GC::Ref { *this }, on_complete] {
+            if (auto active_document = navigable->active_document())
+                active_document->unload();
+            on_complete->function()();
+        }));
 }
 
 void LocalNavigable::notify_navigation_observers_navigation_complete()
@@ -1165,6 +1506,16 @@ void LocalNavigable::set_ongoing_navigation_without_informing_navigation_api(Var
         process_pending_navigations();
 }
 
+void LocalNavigable::clear_ongoing_history_traversal()
+{
+    if (has_been_destroyed())
+        return;
+
+    // AD-HOC: Only clear the process-local traversal projection. A newer navigation can already own the navigable.
+    if (m_ongoing_navigation.has<Traversal>())
+        set_ongoing_navigation_without_informing_navigation_api({});
+}
+
 void LocalNavigable::queue_pending_navigation(PreparedNavigation navigation, PendingNavigationBehavior behavior)
 {
     if (behavior == PendingNavigationBehavior::Replace)
@@ -1339,7 +1690,7 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
 
             auto create_new_traversable = [&](GC::Ptr<BrowsingContext> opener) -> GC::Ref<LocalTraversableNavigable> {
                 auto traversable = LocalTraversableNavigable::create_a_new_top_level_traversable(*new_web_view.page, opener, target_name, {}, new_web_view.system_visibility_state);
-                new_web_view.page->set_top_level_traversable(traversable);
+                new_web_view.page->set_local_root_navigable(traversable);
                 traversable->set_window_handle(Utf16String::from_ascii_without_validation(new_web_view.window_handle.bytes()));
                 return traversable;
             };
@@ -2703,7 +3054,7 @@ void LocalNavigable::continue_navigation_after_population_dispatch(PreparedNavig
         return;
     }
 
-    if (!is_top_level_traversable()) {
+    if (!is_local_root()) {
         if (auto parent = this->parent(); parent && has_compositor_context()) {
             auto& local_parent = as<LocalNavigable>(*parent);
             if (local_parent.has_compositor_context())
@@ -3055,8 +3406,8 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
     }
 
     // 1. Let unloadPromptCanceled be the result of checking if unloading is user-canceled for navigable's active document's inclusive descendant navigables.
-    traversable_navigable()->check_if_unloading_is_canceled(active_document()->inclusive_descendant_navigables(),
-        GC::create_function(heap(), [this, navigation_id, completion_steps](LocalTraversableNavigable::CheckIfUnloadingIsCanceledResult unload_prompt_canceled) {
+    check_if_unloading_is_canceled(active_document()->inclusive_descendant_navigables(),
+        GC::create_function(heap(), [this, navigation_id, completion_steps](CheckIfUnloadingIsCanceledResult unload_prompt_canceled) {
             if (has_been_destroyed() || !active_window()) {
                 completion_steps->function()(false);
                 return;
@@ -3065,7 +3416,7 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
             // 2. If unloadPromptCanceled is not "continue", or navigable's ongoing navigation is no longer navigationId:
             // NB: The UI process learns of the canceled check from the population-failure report and ends the
             //     recorded load itself.
-            if (unload_prompt_canceled != LocalTraversableNavigable::CheckIfUnloadingIsCanceledResult::Continue) {
+            if (unload_prompt_canceled != CheckIfUnloadingIsCanceledResult::Continue) {
                 set_delaying_load_events(false);
                 completion_steps->function()(false);
                 return;
@@ -3191,12 +3542,10 @@ void LocalNavigable::navigate_to_a_fragment(URL::URL const& url, HistoryHandling
     active_document()->scroll_to_the_fragment();
 
     // 16. Let traversable be navigable's traversable navigable.
-    auto traversable = traversable_navigable();
-
     // 17. Append the following session history synchronous navigation steps involving navigable to traversable:
     // 1. Finalize a same-document navigation given traversable, navigable, historyEntry, entryToReplace,
     //    historyHandling, and userInvolvement.
-    traversable->finalize_same_document_navigation(*this, history_entry, entry_to_replace, history_handling, user_involvement, move(previous_entry_persisted_state));
+    page().history_executor().finalize_same_document_navigation(*this, history_entry, entry_to_replace, history_handling, user_involvement, move(previous_entry_persisted_state));
 
     // FIXME: Invoke WebDriver BiDi fragment navigated with navigable and a new WebDriver BiDi navigation status whose
     //        id is navigationId, url is url, and status is "complete".
@@ -3453,20 +3802,33 @@ void LocalNavigable::reload(Optional<StorageSerializationRecord> navigation_api_
         active_session_history_entry()->set_navigation_api_state(navigation_api_state.release_value());
 
     // 2. Set navigable's active session history entry's document state's reload pending to true.
-    active_session_history_entry()->document_state()->set_reload_pending(true);
+    auto reloading_entry = active_session_history_entry();
+    reloading_entry->document_state()->set_reload_pending(true);
+
+    page().client().page_did_set_session_history_entry_document_state_reload_pending(
+        id(), reloading_entry->navigation_api_key(), true);
 
     // 3. Let traversable be navigable's traversable navigable.
-    auto traversable = traversable_navigable();
-
-    traversable->page().client().page_did_set_session_history_entry_document_state_reload_pending(
-        id(), active_session_history_entry()->navigation_api_key(), true);
-
     // 4. Append the following session history traversal steps to traversable:
     // 1. Apply the reload history step to traversable given userInvolvement.
-    traversable->request_history_operation(ReloadHistoryOperationParameters {
-        .navigable_id = id(),
-        .user_involvement = user_involvement,
-    });
+    page().history_executor().request_history_operation(
+        ReloadHistoryOperationParameters {
+            .navigable_id = id(),
+            .user_involvement = user_involvement,
+        },
+        {
+            .on_apply_complete = GC::create_function(heap(), [this, reloading_entry](HistoryStepResult result) {
+                if (result == HistoryStepResult::Applied)
+                    return;
+
+                // NB: A reload that did not apply leaves no navigation behind to clear the pending flag.
+                if (reloading_entry->document_state()->reload_pending()) {
+                    reloading_entry->document_state()->set_reload_pending(false);
+                    page().client().page_did_set_session_history_entry_document_state_reload_pending(
+                        id(), reloading_entry->navigation_api_key(), false);
+                }
+            }),
+        });
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-navigation-must-be-a-replace
@@ -3528,11 +3890,251 @@ static Optional<Web::CrossDocumentNavigationFinalizationHostState> prepare_to_fi
     };
 }
 
+class CheckUnloadingCanceledState : public GC::Cell {
+    GC_CELL(CheckUnloadingCanceledState, GC::Cell);
+    GC_DECLARE_ALLOCATOR(CheckUnloadingCanceledState);
+
+public:
+    using Result = CheckIfUnloadingIsCanceledResult;
+    static constexpr int TIMEOUT_MS = 15000;
+
+    CheckUnloadingCanceledState(
+        GC::Ptr<LocalTraversableNavigable> traversable,
+        Optional<UserNavigationInvolvement> user_involvement,
+        UnloadPromptShown unload_prompt_shown,
+        GC::Ref<GC::Function<void(Result, UnloadPromptShown)>> callback)
+        : m_unload_prompt_shown(unload_prompt_shown)
+        , m_traversable(traversable)
+        , m_user_involvement(user_involvement)
+        , m_callback(callback)
+        , m_timeout(Platform::Timer::create_single_shot(heap(), TIMEOUT_MS, GC::create_function(heap(), [this] {
+            if (!m_completed) {
+                dbgln("FIXME: check_if_unloading_is_canceled timed out");
+                finish(Result::Continue);
+            }
+        })))
+    {
+        m_timeout->start();
+    }
+
+    virtual void visit_edges(Visitor& visitor) override
+    {
+        Base::visit_edges(visitor);
+        for (auto& doc : m_phase2_documents)
+            visitor.visit(doc);
+        visitor.visit(m_traversable);
+        visitor.visit(m_callback);
+        visitor.visit(m_timeout);
+    }
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
+    void start(Vector<GC::Root<LocalNavigable>> const& navigables_that_need_before_unload, RefPtr<SessionHistoryEntry> target_entry)
+    {
+        // 1. Let documentsToFireBeforeunload be the active document of each item in navigablesThatNeedBeforeUnload.
+        for (auto& navigable : navigables_that_need_before_unload)
+            m_phase2_documents.append(*navigable->active_document());
+
+        // 2. Let unloadPromptShown be false.
+
+        // 3. Let finalStatus be "continue".
+
+        // 4. If traversable was given, then:
+        if (m_traversable) {
+            // 1. Assert: targetStep and userInvolvementForNavigateEvent were given.
+            VERIFY(target_entry);
+            VERIFY(m_user_involvement.has_value());
+
+            // 2. Let targetEntry be the result of getting the target history entry given traversable and targetStep.
+            m_target_entry = move(target_entry);
+
+            // 3. If targetEntry is not traversable's current session history entry, and targetEntry's document state's origin is the same as
+            //    traversable's current session history entry's document state's origin:
+            if (m_target_entry != m_traversable->current_session_history_entry() && m_target_entry->document_state()->origin() == m_traversable->current_session_history_entry()->document_state()->origin()) {
+
+                // 1. Let eventsFired be false.
+
+                // 2. Let needsBeforeunload be true if navigablesThatNeedBeforeUnload contains traversable; otherwise false.
+                m_needs_beforeunload = navigables_that_need_before_unload.find_if([this](auto const& navigable) {
+                    return navigable.ptr() == m_traversable.ptr();
+                }) != navigables_that_need_before_unload.end();
+
+                // 3. If needsBeforeunload is true, then remove traversable's active document from documentsToFireBeforeunload.
+                if (m_needs_beforeunload) {
+                    m_phase2_documents.remove_first_matching([this](auto& document) {
+                        return document.ptr() == m_traversable->active_document().ptr();
+                    });
+                }
+
+                start_phase1();
+                return;
+            }
+        }
+
+        start_phase2();
+    }
+
+private:
+    void start_phase1()
+    {
+        // 4. Queue a global task on the navigation and traversal task source given traversable's active window to perform the following steps:
+        VERIFY(m_traversable->active_window());
+        queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*m_traversable->active_window()), GC::create_function(GC::Heap::the(), [this] {
+            // 1. if needsBeforeunload is true, then:
+            if (m_needs_beforeunload) {
+                // 1. Let (unloadPromptShownForThisDocument, unloadPromptCanceledByThisDocument) be the result of running the steps to fire beforeunload given traversable's active document and false.
+                auto [unload_prompt_shown_for_this_document, unload_prompt_canceled_by_this_document] = m_traversable->active_document()->steps_to_fire_beforeunload(false);
+
+                // 2. If unloadPromptShownForThisDocument is true, then set unloadPromptShown to true.
+                if (unload_prompt_shown_for_this_document)
+                    m_unload_prompt_shown = UnloadPromptShown::Yes;
+
+                // 3. If unloadPromptCanceledByThisDocument is true, then set finalStatus to "canceled-by-beforeunload".
+                if (unload_prompt_canceled_by_this_document)
+                    m_final_status = Result::CanceledByBeforeUnload;
+            }
+
+            // 2. If finalStatus is "canceled-by-beforeunload", then abort these steps.
+            if (m_final_status == Result::CanceledByBeforeUnload) {
+                finish(m_final_status);
+                return;
+            }
+
+            // 3. Let navigation be traversable's active window's navigation API.
+            VERIFY(m_traversable->active_window());
+            auto navigation = m_traversable->active_window()->navigation();
+
+            // 4. Let navigateEventResult be the result of firing a traverse navigate event at navigation given targetEntry and userInvolvementForNavigateEvent.
+            VERIFY(m_target_entry);
+            auto navigate_event_result = navigation->fire_a_traverse_navigate_event(*m_target_entry, *m_user_involvement);
+
+            // 5. If navigateEventResult is false, then set finalStatus to "canceled-by-navigate".
+            if (!navigate_event_result)
+                m_final_status = Result::CanceledByNavigate;
+
+            // 6. Set eventsFired to true.
+
+            phase1_completed();
+        }));
+    }
+
+    void phase1_completed()
+    {
+        // 5. Wait for eventsFired to be true.
+
+        // 6. If finalStatus is not "continue", then return finalStatus.
+        if (m_final_status != Result::Continue) {
+            finish(m_final_status);
+            return;
+        }
+        start_phase2();
+    }
+
+    void start_phase2()
+    {
+        if (m_phase2_documents.is_empty()) {
+            finish(m_final_status);
+            return;
+        }
+
+        // 5. Let totalTasks be the size of documentsToFireBeforeunload.
+
+        // 6. Let completedTasks be 0.
+        m_remaining_phase2_tasks = m_phase2_documents.size();
+
+        // 7. For each document of documentsToFireBeforeunload, queue a global task on the navigation and traversal task source given document's relevant global object to run the steps:
+        for (auto& document : m_phase2_documents) {
+            // AD-HOC: Queue with a null document instead of using queue_global_task. Tasks associated with a document
+            //         are only runnable when fully active. In the async state machine, documents can become non
+            //         fully-active between queue and execution time, causing the task to be permanently stuck.
+            //         A null-document task is always runnable; we check validity inside.
+            queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [this, document] {
+                if (document->has_been_destroyed() || !document->is_fully_active()) {
+                    did_complete_phase2_task();
+                    return;
+                }
+
+                // 1. Let (unloadPromptShownForThisDocument, unloadPromptCanceledByThisDocument) be the result of running the steps to fire beforeunload given document and unloadPromptShown.
+                auto [unload_prompt_shown_for_this_document, unload_prompt_canceled_by_this_document] = document->steps_to_fire_beforeunload(m_unload_prompt_shown == UnloadPromptShown::Yes);
+
+                // 2. If unloadPromptShownForThisDocument is true, then set unloadPromptShown to true.
+                if (unload_prompt_shown_for_this_document)
+                    m_unload_prompt_shown = UnloadPromptShown::Yes;
+
+                // 3. If unloadPromptCanceledByThisDocument is true, then set finalStatus to "canceled-by-beforeunload".
+                if (unload_prompt_canceled_by_this_document)
+                    m_final_status = Result::CanceledByBeforeUnload;
+
+                // 4. Increment completedTasks.
+                did_complete_phase2_task();
+            }));
+        }
+    }
+
+    void did_complete_phase2_task()
+    {
+        VERIFY(m_remaining_phase2_tasks > 0);
+        if (--m_remaining_phase2_tasks > 0)
+            return;
+
+        // 8. Wait for completedTasks to be totalTasks.
+
+        // 9. Return finalStatus.
+        finish(m_final_status);
+    }
+
+    void finish(Result final_result)
+    {
+        if (m_completed)
+            return;
+        m_completed = true;
+        m_timeout->stop();
+        m_callback->function()(final_result, m_unload_prompt_shown);
+    }
+
+    Result m_final_status { Result::Continue };
+    UnloadPromptShown m_unload_prompt_shown { UnloadPromptShown::No };
+    bool m_completed { false };
+    bool m_needs_beforeunload { false };
+    size_t m_remaining_phase2_tasks { 0 };
+    Vector<GC::Ref<DOM::Document>> m_phase2_documents;
+    GC::Ptr<LocalTraversableNavigable> m_traversable;
+    RefPtr<SessionHistoryEntry> m_target_entry;
+    Optional<UserNavigationInvolvement> m_user_involvement;
+    GC::Ref<GC::Function<void(Result, UnloadPromptShown)>> m_callback;
+    GC::Ref<Platform::Timer> m_timeout;
+};
+
+GC_DEFINE_ALLOCATOR(CheckUnloadingCanceledState);
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
+void check_if_unloading_is_canceled(
+    Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload,
+    GC::Ptr<LocalTraversableNavigable> traversable,
+    RefPtr<SessionHistoryEntry> target_entry,
+    Optional<UserNavigationInvolvement> user_involvement_for_navigate_events,
+    UnloadPromptShown unload_prompt_shown,
+    GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback)
+{
+    auto state = GC::Heap::the().allocate<CheckUnloadingCanceledState>(
+        traversable,
+        user_involvement_for_navigate_events,
+        unload_prompt_shown,
+        callback);
+    state->start(navigables_that_need_before_unload, move(target_entry));
+}
+
+void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult)>> callback)
+{
+    check_if_unloading_is_canceled(move(navigables_that_need_before_unload), {}, {}, {}, UnloadPromptShown::No,
+        GC::create_function(GC::Heap::the(), [callback](CheckIfUnloadingIsCanceledResult result, UnloadPromptShown) {
+            callback->function()(result);
+        }));
+}
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
 void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, HistoryHandlingBehavior history_handling, UserNavigationInvolvement user_involvement, NonnullRefPtr<SessionHistoryEntry> history_entry, GC::Ptr<DOM::Document> pending_document, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete)
 {
-    auto traversable = navigable->traversable_navigable();
-    traversable->request_history_operation(
+    navigable->page().history_executor().request_history_operation(
         FinalizeCrossDocumentNavigationHistoryOperationParameters {
             .navigable_id = navigable->id(),
             .history_entry = create_pending_session_history_entry_descriptor(*history_entry),
@@ -3546,7 +4148,7 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
             .expected_ongoing_navigation_id = expected_ongoing_navigation_id,
             .local_target_navigable_id = navigable->id(),
             .local_target_entry = history_entry,
-            .pre_steps = GC::create_function(navigable->heap(), [navigable, pending_document, expected_ongoing_navigation_id](Optional<Web::ReconstructedChildNavigation>, GC::Ref<LocalTraversableNavigable::OnHistoryOperationReady> ready) mutable {
+            .pre_steps = GC::create_function(navigable->heap(), [navigable, pending_document, expected_ongoing_navigation_id](Optional<Web::ReconstructedChildNavigation>, GC::Ref<HistoryExecutor::OnHistoryOperationReady> ready) mutable {
                 auto host_state = prepare_to_finalize_a_cross_document_navigation(navigable, pending_document, expected_ongoing_navigation_id);
                 if (!host_state.has_value()) {
                     ready->function()(HistoryStepResult::Applied);
@@ -3626,12 +4228,10 @@ void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_
     relevant_global_object.navigation()->update_the_navigation_api_entries_for_a_same_document_navigation(new_entry, navigation_type);
 
     // 12. Let traversable be navigable's traversable navigable.
-    auto traversable = navigable->traversable_navigable();
-
     // 13. Append the following session history synchronous navigation steps involving navigable to traversable:
     // 1. Finalize a same-document navigation given traversable, navigable, newEntry, entryToReplace,
     //    historyHandling, and "none".
-    traversable->finalize_same_document_navigation(*navigable, new_entry, entry_to_replace, history_handling, UserNavigationInvolvement::None, move(previous_entry_persisted_state));
+    navigable->page().history_executor().finalize_same_document_navigation(*navigable, new_entry, entry_to_replace, history_handling, UserNavigationInvolvement::None, move(previous_entry_persisted_state));
 
     // FIXME: Invoke WebDriver BiDi history updated with navigable.
 }
@@ -3655,18 +4255,24 @@ void LocalNavigable::scroll_offset_did_change()
     doc->append_pending_scroll_event({ *doc, EventNames::scroll });
 }
 
-CSSPixelRect LocalNavigable::to_top_level_rect(CSSPixelRect const& a_rect)
+bool LocalNavigable::is_local_root() const
+{
+    HTML::LocalNavigable& local_root = page().local_root_navigable();
+    return &local_root == this;
+}
+
+CSSPixelRect LocalNavigable::to_page_rect(CSSPixelRect const& a_rect)
 {
     auto rect = a_rect;
-    rect.set_location(to_top_level_position(a_rect.location()));
+    rect.set_location(to_page_position(a_rect.location()));
     return rect;
 }
 
-CSSPixelPoint LocalNavigable::to_top_level_position(CSSPixelPoint a_position)
+CSSPixelPoint LocalNavigable::to_page_position(CSSPixelPoint a_position)
 {
     auto position = a_position;
     for (GC::Ptr<LocalNavigable> ancestor = this; ancestor;) {
-        if (is<LocalTraversableNavigable>(*ancestor))
+        if (ancestor->is_local_root())
             break;
         if (!ancestor->container())
             return {};
@@ -4722,8 +5328,8 @@ bool LocalNavigable::is_focused() const
     if (!m_page->client().has_focus())
         return false;
 
-    // A top-level traversable retains system focus while the focus chain descends into a child navigable.
-    if (is_traversable())
+    // The local root retains the page's system focus while the focus chain descends into a child navigable.
+    if (is_local_root())
         return true;
     return &m_page->focused_navigable() == this;
 }
@@ -5324,9 +5930,9 @@ void LocalNavigable::set_force_dark_enabled(bool value)
     m_force_dark_enabled = value;
     set_needs_repaint();
 
-    // The page presents a dark preferred color scheme while the top-level traversable has force-dark on, so flipping
+    // The page presents a dark preferred color scheme while its local root has force-dark on, so flipping
     // it here changes what every media query and system color in the page resolves to.
-    if (is_top_level_traversable())
+    if (is_local_root())
         page().invalidate_style_for_preference_change();
 
     for (auto const& child_navigable : child_navigables())
@@ -5531,7 +6137,7 @@ void LocalNavigable::paint_next_frame()
 
     auto viewport_rect = page().css_to_device_rect(this->viewport_rect()).to_type<int>();
     PaintConfig paint_config { .paint_overlay = true, .should_show_caret_hit_test_debug_overlay = m_should_show_caret_hit_test_debug_overlay };
-    if (is_top_level_traversable()) {
+    if (is_local_root()) {
         paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_rect.size() };
     } else {
         // Nested navigables paint transparent bitmaps for their parent compositor context.

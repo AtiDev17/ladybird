@@ -32,20 +32,8 @@ impl super::intern_table::InternIdentity for SpecifiedValueEntryIndex {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpecifiedValueCoverage {
-    Complete,
-    Partial { eviction_generation: u64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SpecifiedValueGap {
     RetiredPayloads { eviction_generation: u64 },
-}
-
-#[derive(Clone, Copy)]
-struct SpecifiedValueProbe<'a> {
-    pointer: *const StyleValueData,
-    value: &'a StyleValueData,
 }
 
 /// An identity is never reused, so evicting the values only makes future equality checks
@@ -55,7 +43,7 @@ pub(super) struct SpecifiedValues {
     entries: super::intern_table::InternTable<SpecifiedValueEntryIndex, SpecifiedValueEntry>,
     entries_by_pointer: HashMap<usize, SpecifiedValueID>,
     entries_by_id: HashMap<SpecifiedValueID, u32>,
-    coverage: SpecifiedValueCoverage,
+    gap: Option<SpecifiedValueGap>,
     next_id: u64,
     residency: MemoryLease,
 }
@@ -66,49 +54,34 @@ impl SpecifiedValues {
             entries: super::intern_table::InternTable::default(),
             entries_by_pointer: HashMap::default(),
             entries_by_id: HashMap::default(),
-            coverage: SpecifiedValueCoverage::Complete,
+            gap: None,
             next_id: 1,
             residency: MemoryLease::new(MemoryCategory::SpecifiedValueTable),
         }
     }
 
     #[must_use]
-    fn lookup(&self, probe: SpecifiedValueProbe<'_>) -> Lookup<SpecifiedValueID, SpecifiedValueGap> {
-        if let Some(id) = self.entries_by_pointer.get(&(probe.pointer as usize)) {
+    fn lookup(&self, value: &StyleValueData) -> Lookup<SpecifiedValueID, SpecifiedValueGap> {
+        if let Some(id) = self.entries_by_pointer.get(&(std::ptr::from_ref(value) as usize)) {
             return Lookup::Known(*id);
         }
         // Equal URL text can refer to different resources in different declarations. The native
         // image keeps its stylesheet context outside StyleValueData, so only an existing pointer
         // identity can prove equality for values containing resource-dependent images.
-        if !crate::css::style_compute::value_may_need_style_sheet_resource_context(probe.value)
-            && let Some(index) = self.entries.find(probe.value.content_hash(), |_index, entry| {
-                entry.value.data() == probe.value
-            })
+        if !crate::css::style_compute::value_may_need_style_sheet_resource_context(value)
+            && let Some(index) = self
+                .entries
+                .find(value.content_hash(), |_index, entry| entry.value.data() == value)
         {
             return Lookup::Known(self.entries[index].id);
         }
-        match self.coverage() {
-            SpecifiedValueCoverage::Complete => Lookup::KnownAbsent,
-            SpecifiedValueCoverage::Partial { eviction_generation } => {
-                Lookup::Missing(SpecifiedValueGap::RetiredPayloads {
-                    eviction_generation: *eviction_generation,
-                })
-            }
-        }
-    }
-
-    #[must_use]
-    fn coverage(&self) -> &SpecifiedValueCoverage {
-        &self.coverage
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
     }
 
     fn mark_partial(&mut self) -> SpecifiedValueGap {
-        let eviction_generation = match self.coverage {
-            SpecifiedValueCoverage::Complete => 1,
-            SpecifiedValueCoverage::Partial { eviction_generation } => eviction_generation,
-        };
-        self.coverage = SpecifiedValueCoverage::Partial { eviction_generation };
-        SpecifiedValueGap::RetiredPayloads { eviction_generation }
+        *self
+            .gap
+            .get_or_insert(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
     }
 
     /// Return the retained payload behind one maintained declaration identity.
@@ -117,14 +90,7 @@ impl SpecifiedValues {
         if let Some(index) = self.entries_by_id.get(&id) {
             return Lookup::Known(self.entries[*index as usize].value.data());
         }
-        match self.coverage() {
-            SpecifiedValueCoverage::Complete => Lookup::KnownAbsent,
-            SpecifiedValueCoverage::Partial { eviction_generation } => {
-                Lookup::Missing(SpecifiedValueGap::RetiredPayloads {
-                    eviction_generation: *eviction_generation,
-                })
-            }
-        }
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
     }
 
     /// Return an owned reference to one maintained declaration payload.
@@ -134,14 +100,7 @@ impl SpecifiedValues {
         if let Some(index) = self.entries_by_id.get(&id) {
             return Lookup::Known(self.entries[*index as usize].value.clone_retained());
         }
-        match self.coverage() {
-            SpecifiedValueCoverage::Complete => Lookup::KnownAbsent,
-            SpecifiedValueCoverage::Partial { eviction_generation } => {
-                Lookup::Missing(SpecifiedValueGap::RetiredPayloads {
-                    eviction_generation: *eviction_generation,
-                })
-            }
-        }
+        self.gap.map_or(Lookup::KnownAbsent, Lookup::Missing)
     }
 
     /// # Safety
@@ -151,11 +110,7 @@ impl SpecifiedValues {
         value: *const StyleValueData,
         memory: &mut MemoryController,
     ) -> (SpecifiedValueID, Lookup<(), SpecifiedValueGap>) {
-        let probe = SpecifiedValueProbe {
-            pointer: value,
-            value: unsafe { &*value },
-        };
-        let lookup = match self.lookup(probe) {
+        let lookup = match self.lookup(unsafe { &*value }) {
             Lookup::Known(id) => return (id, Lookup::Known(())),
             Lookup::KnownAbsent => Lookup::KnownAbsent,
             Lookup::Missing(gap) => Lookup::Missing(gap),
@@ -170,7 +125,7 @@ impl SpecifiedValues {
             return (id, Lookup::Missing(self.mark_partial()));
         }
         let retained = unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) };
-        self.push_entry(id, retained, value as usize);
+        self.push_entry(id, retained);
         self.settle_memory(memory);
         (id, lookup)
     }
@@ -188,23 +143,19 @@ impl SpecifiedValues {
         if self.entries_by_pointer.get(&(value as usize)) == Some(&id) {
             return true;
         }
-        let probe = SpecifiedValueProbe {
-            pointer: value,
-            value: unsafe { &*value },
-        };
         if let Some(index) = self.entries_by_id.get(&id) {
-            return matches!(self.lookup(probe), Lookup::Known(existing) if self.entries_by_id.get(&existing) == Some(index));
+            return matches!(self.lookup(unsafe { &*value }), Lookup::Known(existing) if self.entries_by_id.get(&existing) == Some(index));
         }
         if !memory.is_tier3_admitting(MemoryCategory::SpecifiedValueTable) {
             self.mark_partial();
             return false;
         }
-        if let Lookup::Known(existing) = self.lookup(probe) {
+        if let Lookup::Known(existing) = self.lookup(unsafe { &*value }) {
             let index = self.entries_by_id[&existing];
             self.entries_by_id.insert(id, index);
         } else {
             let retained = unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) };
-            self.push_entry(id, retained, value as usize);
+            self.push_entry(id, retained);
         }
         self.settle_memory(memory);
         true
@@ -220,11 +171,7 @@ impl SpecifiedValues {
         id: SpecifiedValueID,
         memory: &mut MemoryController,
     ) {
-        let probe = SpecifiedValueProbe {
-            pointer: value,
-            value: unsafe { &*value },
-        };
-        if let Lookup::Known(existing) = self.lookup(probe) {
+        if let Lookup::Known(existing) = self.lookup(unsafe { &*value }) {
             debug_assert_eq!(existing, id);
             return;
         }
@@ -232,11 +179,12 @@ impl SpecifiedValues {
             return;
         }
         let retained = unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) };
-        self.push_entry(id, retained, value as usize);
+        self.push_entry(id, retained);
         self.settle_memory(memory);
     }
 
-    fn push_entry(&mut self, id: SpecifiedValueID, value: RetainedStyleValueData, pointer: usize) {
+    fn push_entry(&mut self, id: SpecifiedValueID, value: RetainedStyleValueData) {
+        let pointer = value.pointer() as usize;
         let index = SpecifiedValueEntryIndex(
             u32::try_from(self.entries.len()).expect("specified value table exceeds u32 indexing"),
         );
@@ -252,7 +200,7 @@ impl SpecifiedValues {
             shallow [self.entries, self.entries_by_pointer, self.entries_by_id];
             cached [];
             nested [];
-            skip [self.coverage, self.next_id, self.residency];
+            skip [self.gap, self.next_id, self.residency];
         }
     }
 
@@ -265,13 +213,13 @@ impl SpecifiedValues {
     pub(super) fn evict(&mut self) {
         self.residency.release();
         if !self.entries.is_empty() {
-            let eviction_generation = match self.coverage {
-                SpecifiedValueCoverage::Complete => 1,
-                SpecifiedValueCoverage::Partial { eviction_generation } => eviction_generation
+            let eviction_generation = match self.gap {
+                None => 1,
+                Some(SpecifiedValueGap::RetiredPayloads { eviction_generation }) => eviction_generation
                     .checked_add(1)
                     .expect("specified value eviction generation exhausted"),
             };
-            self.coverage = SpecifiedValueCoverage::Partial { eviction_generation };
+            self.gap = Some(SpecifiedValueGap::RetiredPayloads { eviction_generation });
         }
         self.entries = super::intern_table::InternTable::default();
         self.entries_by_pointer = HashMap::default();
@@ -287,16 +235,12 @@ mod tests {
 
     #[test]
     fn evicted_specified_values_are_missing_instead_of_absent() {
-        fn probe(value: &StyleValueData) -> SpecifiedValueProbe<'_> {
-            SpecifiedValueProbe { pointer: value, value }
-        }
-
         let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
         let mut values = SpecifiedValues::new();
         let value = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
         let equal_value = std::sync::Arc::new(StyleValueData::Number { value: 42.0 });
 
-        assert!(matches!(values.lookup(probe(&value)), Lookup::KnownAbsent));
+        assert!(matches!(values.lookup(&value), Lookup::KnownAbsent));
         let (first, first_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&value), &mut memory) };
         assert!(matches!(first_lookup, Lookup::KnownAbsent));
         assert_eq!(values.entries_by_pointer.len(), 1);
@@ -304,7 +248,7 @@ mod tests {
             memory.bytes_in_category(MemoryCategory::SpecifiedValueTable),
             values.capacity_bytes()
         );
-        assert!(matches!(values.lookup(probe(&value)), Lookup::Known(id) if id == first));
+        assert!(matches!(values.lookup(&value), Lookup::Known(id) if id == first));
         assert!(matches!(values.value(first), Lookup::Known(retained) if retained == value.as_ref()));
         let (reused, reused_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&equal_value), &mut memory) };
         assert_eq!(reused, first);
@@ -312,7 +256,7 @@ mod tests {
         // A content hit does not retain a one-use duplicate spelling. Looking it up again repeats
         // the collision-safe content lookup against the canonical table.
         assert_eq!(values.entries_by_pointer.len(), 1);
-        assert!(matches!(values.lookup(probe(&equal_value)), Lookup::Known(id) if id == first));
+        assert!(matches!(values.lookup(&equal_value), Lookup::Known(id) if id == first));
 
         values.evict();
         assert!(matches!(
@@ -320,7 +264,7 @@ mod tests {
             Lookup::Missing(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
         ));
         assert!(matches!(
-            values.lookup(probe(&value)),
+            values.lookup(&value),
             Lookup::Missing(SpecifiedValueGap::RetiredPayloads { eviction_generation: 1 })
         ));
         let (second, second_lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&value), &mut memory) };
@@ -405,10 +349,7 @@ mod tests {
         unsafe { values.alias(std::sync::Arc::as_ptr(&authored), canonical_id, &mut memory) };
         assert_eq!(values.entries_by_pointer.len(), 2);
         assert!(matches!(
-            values.lookup(SpecifiedValueProbe {
-                pointer: std::sync::Arc::as_ptr(&authored),
-                value: &authored,
-            }),
+            values.lookup(&authored),
             Lookup::Known(id) if id == canonical_id
         ));
         let (authored_id, lookup) = unsafe { values.intern(std::sync::Arc::as_ptr(&authored), &mut memory) };

@@ -45,10 +45,10 @@ pub(super) struct RemainingPostingDirectory {
 
 impl RemainingPostingDirectory {
     fn entry(&mut self, key: PostingKey) -> Option<&mut RemainingPosting> {
-        if let Some(index) = self.entries.iter().position(|(candidate, _)| *candidate == key) {
-            return Some(&mut self.entries[index].1);
-        }
-        None
+        self.entries
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, posting)| posting)
     }
 
     fn capacity_bytes(&self) -> u64 {
@@ -613,22 +613,22 @@ impl ImpactPlanningWorkspace {
             Lookup::KnownAbsent => return Ok((0, false, 0, 0, 0)),
             Lookup::Missing(gap) => return Err(gap),
         };
-        let was_present = self.remaining_postings.entry(key).is_some();
-        let copied = if !was_present { posting.len() } else { 0 };
-        let remaining = if was_present {
-            self.remaining_postings.entry(key).unwrap()
-        } else {
-            let candidates: Vec<StyleNodeID> = posting.candidates().collect();
-            self.nested_memory
-                .grow_committed((candidates.capacity() * size_of::<StyleNodeID>()) as u64);
-            self.remaining_postings.insert(
-                key,
-                RemainingPosting {
-                    nodes: candidates,
-                    plan_generation: u64::MAX,
-                    pruned_nodes: Vec::new(),
-                },
-            )
+        let (remaining, was_present, copied) = match self.remaining_postings.entry(key) {
+            Some(remaining) => (remaining, true, 0),
+            None => {
+                let candidates: Vec<StyleNodeID> = posting.candidates().collect();
+                self.nested_memory
+                    .grow_committed((candidates.capacity() * size_of::<StyleNodeID>()) as u64);
+                let remaining = self.remaining_postings.insert(
+                    key,
+                    RemainingPosting {
+                        nodes: candidates,
+                        plan_generation: u64::MAX,
+                        pruned_nodes: Vec::new(),
+                    },
+                );
+                (remaining, false, posting.len())
+            }
         };
         let posting = &mut remaining.nodes;
         let mut inspected = 0;
@@ -1003,19 +1003,17 @@ impl SequenceChange {
     /// the common shape and a scan reaches exactly as far as its place; from the second record on
     /// the sequence is indexed once so a batch of k changes costs O(n + k) rather than O(k * n).
     pub(super) fn position_of(&mut self, child: StyleNodeID) -> Option<usize> {
-        if self.positions.is_none() {
-            if self.located_records <= 1 {
-                return self.children.iter().position(|&candidate| candidate == child);
-            }
-            self.positions = Some(
-                self.children
-                    .iter()
-                    .enumerate()
-                    .map(|(at, &candidate)| (candidate, at as u32))
-                    .collect(),
-            );
+        if self.located_records <= 1 && self.positions.is_none() {
+            return self.children.iter().position(|&candidate| candidate == child);
         }
-        self.positions.as_ref().unwrap().get(&child).map(|&at| at as usize)
+        let positions = self.positions.get_or_insert_with(|| {
+            self.children
+                .iter()
+                .enumerate()
+                .map(|(at, &candidate)| (candidate, at as u32))
+                .collect()
+        });
+        positions.get(&child).map(|&at| at as usize)
     }
 
     pub(super) fn auxiliary_capacity_bytes(&self) -> u64 {
@@ -1037,8 +1035,6 @@ impl SequenceChange {
 /// which happens only for a change between two elements that both left. It widens every candidate
 /// range derived from positions to the whole sequence.
 pub(super) const RELATIONAL_RECORD_UNLOCATED: u32 = u32::MAX;
-
-pub(super) const NO_SEQUENCE_CHANGE: u32 = u32::MAX;
 
 /// What one transaction did to the child sequences it touched, keyed by dense parent identity.
 ///
@@ -1084,9 +1080,6 @@ impl SequenceChanges {
             change.arriving_nodes.dedup();
         }
         self.entries.sort_unstable_by_key(|&(parent, _)| parent);
-        for page in self.pages.pages_mut() {
-            page.entries.fill(NO_SEQUENCE_CHANGE);
-        }
         for (entry, &(parent, _)) in self.entries.iter().enumerate() {
             let element_index = parent.element_index().unwrap() as usize;
             self.pages.insert(
@@ -1179,18 +1172,10 @@ impl SiblingEntry {
         routing: &'a RoutingRegistry,
         exact_tree_evaluation: Option<ExactTreeEvaluation>,
     ) -> RoutingSite<'a> {
-        let point = routing.route(self.route);
-        RoutingSite {
-            subject: routing.subject_dispatch_of(self.route),
-            subject_required: routing.subject_required_of(self.route),
-            position: routing.subject_position_of(self.route),
-            path: routing.path_of(self.route),
-            waypoints: routing.waypoints_of(self.route),
-            in_flux: None,
-            exact_entry: exact_tree_evaluation.map(|_| (routing.rule_of(self.route), point.entry)),
-            exact_tree_evaluation,
-            refresh_rule: Some((routing.rule_of(self.route), point.entry)),
-        }
+        let mut site = route_site(routing, self.route);
+        site.exact_entry = exact_tree_evaluation.and(site.refresh_rule);
+        site.exact_tree_evaluation = exact_tree_evaluation;
+        site
     }
 
     /// The same site for a walk that starts where the sibling step already landed.
@@ -1204,24 +1189,13 @@ impl SiblingEntry {
         routing: &'a RoutingRegistry,
         exact_tree_evaluation: Option<ExactTreeEvaluation>,
     ) -> RoutingSite<'a> {
-        let point = routing.route(self.route);
-        let path = routing.path_of(self.route);
-        let all_waypoints = routing.waypoints_of(self.route);
-        let waypoints = match all_waypoints.len() == path.len() {
-            true => &all_waypoints[1..],
-            false => all_waypoints,
-        };
-        RoutingSite {
-            subject: routing.subject_dispatch_of(self.route),
-            subject_required: routing.subject_required_of(self.route),
-            position: routing.subject_position_of(self.route),
-            path: &path[1..],
-            waypoints,
-            in_flux: None,
-            exact_entry: Some((routing.rule_of(self.route), point.entry)),
-            exact_tree_evaluation,
-            refresh_rule: Some((routing.rule_of(self.route), point.entry)),
+        let mut site = self.site(routing, exact_tree_evaluation);
+        if site.waypoints.len() == site.path.len() {
+            site.waypoints = &site.waypoints[1..];
         }
+        site.path = &site.path[1..];
+        site.exact_entry = site.refresh_rule;
+        site
     }
 }
 
@@ -1362,27 +1336,17 @@ impl SequenceEntryIndex {
 
 impl SequenceEntry {
     pub(super) fn site<'a>(&self, routing: &'a RoutingRegistry) -> RoutingSite<'a> {
-        let point = routing.route(self.route);
-        RoutingSite {
-            subject: routing.subject_dispatch_of(self.route),
-            subject_required: routing.subject_required_of(self.route),
-            position: routing.subject_position_of(self.route),
-            path: routing.path_of(self.route),
-            waypoints: routing.waypoints_of(self.route),
-            in_flux: None,
-            exact_entry: self
-                .can_compare_exactly
-                .then_some((routing.rule_of(self.route), point.entry)),
-            refresh_rule: Some((routing.rule_of(self.route), point.entry)),
-            exact_tree_evaluation: self
-                .can_compare_exactly
-                .then_some(ExactTreeEvaluation::BeforeSiblingRelations),
+        let mut site = route_site(routing, self.route);
+        if self.can_compare_exactly {
+            site.exact_entry = site.refresh_rule;
+            site.exact_tree_evaluation = Some(ExactTreeEvaluation::BeforeSiblingRelations);
         }
+        site
     }
 }
 
-/// The routing site of one relational route, which is how its regions are narrowed.
-pub(super) fn relational_route_site(routing: &RoutingRegistry, route: RouteID) -> RoutingSite<'_> {
+/// The routing site of one route, which is how its regions are narrowed.
+pub(super) fn route_site(routing: &RoutingRegistry, route: RouteID) -> RoutingSite<'_> {
     let point = routing.route(route);
     RoutingSite {
         subject: routing.subject_dispatch_of(route),

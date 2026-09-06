@@ -1059,31 +1059,24 @@ impl SelectorProgramBuilder {
     #[must_use]
     pub fn finish(mut self) -> SelectorProgram {
         self.program.cache_dispatch_metadata();
-        let properties: Vec<SelectorEntryProperties> = self
-            .program
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let unified_chain = self.program.dispatch_metadata(index).prefix_chain();
-                SelectorEntryProperties {
-                    monotone_under_arrivals: self.program.entry_is_monotone_under_arrivals(entry.root),
-                    can_use_before_sibling_relations: self.program.entry_can_use_before_sibling_relations(entry.root),
-                    observes_sibling_relation: self.program.entry_observes_sibling_relation(entry.root),
-                    has_prefix_chain: unified_chain.is_some(),
-                    prefix_chain_has_only_local_facts: unified_chain.is_some_and(|chain| {
-                        // A canonical positional step counts as local here: its truth rides the
-                        // positional bits of every transition and completion key, so the retained
-                        // walk answers it exactly like an interned fact.
-                        chain
-                            .iter()
-                            .all(|step| self.program.prefix_local_has_canonical_form(step.local))
-                    }),
-                }
-            })
-            .collect();
-        for (entry, properties) in self.program.entries.iter_mut().zip(properties) {
-            entry.properties = properties;
+        for index in 0..self.program.entries.len() {
+            let entry = &self.program.entries[index];
+            let unified_chain = self.program.dispatch_metadata(index).prefix_chain();
+            let properties = SelectorEntryProperties {
+                monotone_under_arrivals: self.program.entry_is_monotone_under_arrivals(entry.root),
+                can_use_before_sibling_relations: self.program.entry_can_use_before_sibling_relations(entry.root),
+                observes_sibling_relation: self.program.entry_observes_sibling_relation(entry.root),
+                has_prefix_chain: unified_chain.is_some(),
+                prefix_chain_has_only_local_facts: unified_chain.is_some_and(|chain| {
+                    // A canonical positional step counts as local here: its truth rides the
+                    // positional bits of every transition and completion key, so the retained
+                    // walk answers it exactly like an interned fact.
+                    chain
+                        .iter()
+                        .all(|step| self.program.prefix_local_has_canonical_form(step.local))
+                }),
+            };
+            self.program.entries[index].properties = properties;
         }
         self.program.can_leave_scope = self
             .program
@@ -2627,22 +2620,10 @@ impl SelectorPrograms {
     }
 
     pub fn add(&mut self, program: SelectorProgram) -> SelectorProgramID {
-        self.add_with_scope(program, None).0
+        self.add_with_status(program).0
     }
 
-    pub(super) fn add_with_status(
-        &mut self,
-        program: SelectorProgram,
-        memory: &mut MemoryController,
-    ) -> (SelectorProgramID, bool) {
-        self.add_with_scope(program, Some(memory))
-    }
-
-    fn add_with_scope(
-        &mut self,
-        program: SelectorProgram,
-        _memory: Option<&mut MemoryController>,
-    ) -> (SelectorProgramID, bool) {
+    pub(super) fn add_with_status(&mut self, program: SelectorProgram) -> (SelectorProgramID, bool) {
         let live_program_count = self.programs.len() - self.vacant_programs.len();
         if self.program_index.is_empty() || (live_program_count + 1) * 2 > self.program_index.len() {
             self.rebuild_program_index();
@@ -6322,7 +6303,7 @@ impl<'a> MatchEvaluator<'a> {
     ) -> Result<bool, Incomplete> {
         if position.of_selector.is_none()
             && (position.step != 0 || self.positional_index_policy == PositionalIndexPolicy::All)
-            && let Some(index) = self.indexed_sibling_position(position, node, counters)?
+            && let Some(index) = self.indexed_sibling_position(position, node)?
         {
             return Ok(matches_an_plus_b(position.step, position.offset, index));
         }
@@ -6404,7 +6385,6 @@ impl<'a> MatchEvaluator<'a> {
         &self,
         position: NthPosition,
         node: StyleNodeID,
-        _counters: &mut Counters,
     ) -> Result<Option<i64>, Incomplete> {
         let Some((workspace, side)) = self.match_workspace else {
             return Ok(None);
@@ -7917,12 +7897,10 @@ mod tests {
         let make_program = || single_entry(|builder| builder.push_feature(FeatureTest::Class(StyleAtomID(91))));
         let expected_bytes = make_program().capacity_bytes();
         let program_hash = SelectorPrograms::program_hash(&make_program());
-        let mut first_memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut second_memory = MemoryController::new(DeviceClass::ForegroundDesktop);
         let mut first = SelectorPrograms::for_replay();
         let mut second = SelectorPrograms::for_replay();
-        let (first_id, _) = first.add_with_status(make_program(), &mut first_memory);
-        let (second_id, _) = second.add_with_status(make_program(), &mut second_memory);
+        let first_id = first.add(make_program());
+        let second_id = second.add(make_program());
 
         let (SelectorProgramStorage::Process(first_program), SelectorProgramStorage::Process(second_program)) = (
             first.programs[first_id.0 as usize].as_ref().unwrap(),
@@ -7931,8 +7909,6 @@ mod tests {
             panic!("replay selector programs must have process storage");
         };
         assert!(Rc::ptr_eq(first_program, second_program));
-        assert_eq!(first_memory.bytes_in_category(MemoryCategory::RuleProgram), 0);
-        assert_eq!(second_memory.bytes_in_category(MemoryCategory::RuleProgram), 0);
         SHARED_SELECTOR_PROGRAMS.with_borrow(|shared| {
             assert_eq!(
                 shared.memory.bytes_in_category(MemoryCategory::RuleProgram),

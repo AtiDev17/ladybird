@@ -839,46 +839,34 @@ impl ComputedGroupSets {
     }
 
     fn ensure_pseudo_row(&mut self, node: StyleNodeID, kind: u8) -> &mut PseudoComputedRow {
-        let row_index = self
-            .pseudo_rows_by_node
-            .get(&node)
-            .and_then(|rows| rows.iter().position(|row| row.kind == kind));
-        let row_index = row_index.unwrap_or_else(|| {
-            let mut rows = self
-                .pseudo_rows_by_node
-                .remove(&node)
-                .map_or_else(Vec::new, |rows| rows.into_vec());
-            rows.push(PseudoComputedRow::new(kind));
+        let rows = self.pseudo_rows_by_node.entry(node).or_default();
+        let row_index = rows.iter().position(|row| row.kind == kind).unwrap_or_else(|| {
+            let mut extended = std::mem::take(rows).into_vec();
+            let row_index = extended.len();
+            extended.push(PseudoComputedRow::new(kind));
+            *rows = extended.into_boxed_slice();
             self.pseudo_assignment_nested_memory
                 .grow_committed(size_of::<PseudoComputedRow>() as u64);
-            let row_index = rows.len() - 1;
-            self.pseudo_rows_by_node.insert(node, rows.into_boxed_slice());
             row_index
         });
-        &mut self
-            .pseudo_rows_by_node
-            .get_mut(&node)
-            .expect("pseudo row entry is live")[row_index]
+        &mut rows[row_index]
     }
 
     fn remove_empty_pseudo_row(&mut self, node: StyleNodeID, kind: u8) {
-        let Some(row_index) = self
-            .pseudo_rows_by_node
-            .get(&node)
-            .and_then(|rows| rows.iter().position(|row| row.kind == kind && row.is_empty()))
-        else {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.pseudo_rows_by_node.entry(node) else {
             return;
         };
-        let mut rows = self
-            .pseudo_rows_by_node
-            .remove(&node)
-            .expect("pseudo row entry is live")
-            .into_vec();
+        let Some(row_index) = entry.get().iter().position(|row| row.kind == kind && row.is_empty()) else {
+            return;
+        };
+        let mut rows = std::mem::take(entry.get_mut()).into_vec();
         rows.remove(row_index);
         self.pseudo_assignment_nested_memory
             .shrink_committed(size_of::<PseudoComputedRow>() as u64);
-        if !rows.is_empty() {
-            self.pseudo_rows_by_node.insert(node, rows.into_boxed_slice());
+        if rows.is_empty() {
+            entry.remove();
+        } else {
+            entry.insert(rows.into_boxed_slice());
         }
     }
 
@@ -909,6 +897,23 @@ impl ComputedGroupSets {
         nodes.sort_unstable();
         nodes.dedup();
         nodes
+    }
+
+    fn intern_group(&mut self, index: usize, payload: *const c_void) -> (ComputedGroupID, bool) {
+        let hash = content_hash((index, payload as usize));
+        if let Some(identity) = self.groups.find(hash, |_identity, group| {
+            group.index == index && group.payload == payload
+        }) {
+            return (identity, false);
+        }
+        retain_group_payload(index, payload);
+        let identity = self.groups.take_free_identity().unwrap_or_else(|| {
+            ComputedGroupID(u32::try_from(self.groups.len()).expect("computed group identity space exhausted"))
+        });
+        self.groups.insert(hash, identity, ComputedGroup { index, payload });
+        self.group_set_nested_memory
+            .grow_committed(retained_group_payload_bytes(index, payload) as u64);
+        (identity, true)
     }
 
     fn intern_group_set(&mut self, groups: &[ComputedGroupID]) -> (ComputedGroupSetID, bool) {
@@ -1257,28 +1262,8 @@ impl ComputedGroupSets {
                 .expect("a supported currentcolor group rebuilds from its computed table");
                 let identity = if payload == old_payloads[group] {
                     groups[group]
-                } else if let Some(identity) = self
-                    .groups
-                    .find(content_hash((group, payload as usize)), |_identity, candidate| {
-                        candidate.index == group && candidate.payload == payload
-                    })
-                {
-                    identity
                 } else {
-                    retain_group_payload(group, payload);
-                    let identity = self.groups.take_free_identity().unwrap_or_else(|| {
-                        ComputedGroupID(
-                            u32::try_from(self.groups.len()).expect("computed group identity space exhausted"),
-                        )
-                    });
-                    self.groups.insert(
-                        content_hash((group, payload as usize)),
-                        identity,
-                        ComputedGroup { index: group, payload },
-                    );
-                    self.group_set_nested_memory
-                        .grow_committed(retained_group_payload_bytes(group, payload) as u64);
-                    identity
+                    self.intern_group(group, payload).0
                 };
                 release_group_payload(group, payload);
                 groups[group] = identity;
@@ -1453,32 +1438,13 @@ impl ComputedGroupSets {
             };
             // An equal payload keeps the old identity, as a C++ build adopts its parent's and
             // predecessor's identical payloads.
-            let identity = if payload == old_payloads[group]
-                || style_group_payloads_equal(group, old_payloads[group], payload)
-            {
-                canonicalized_groups += 1;
-                groups[group]
-            } else if let Some(identity) = self
-                .groups
-                .find(content_hash((group, payload as usize)), |_identity, candidate| {
-                    candidate.index == group && candidate.payload == payload
-                })
-            {
-                identity
-            } else {
-                retain_group_payload(group, payload);
-                let identity = self.groups.take_free_identity().unwrap_or_else(|| {
-                    ComputedGroupID(u32::try_from(self.groups.len()).expect("computed group identity space exhausted"))
-                });
-                self.groups.insert(
-                    content_hash((group, payload as usize)),
-                    identity,
-                    ComputedGroup { index: group, payload },
-                );
-                self.group_set_nested_memory
-                    .grow_committed(retained_group_payload_bytes(group, payload) as u64);
-                identity
-            };
+            let identity =
+                if payload == old_payloads[group] || style_group_payloads_equal(group, old_payloads[group], payload) {
+                    canonicalized_groups += 1;
+                    groups[group]
+                } else {
+                    self.intern_group(group, payload).0
+                };
             release_group_payload(group, payload);
             groups[group] = identity;
         }
@@ -1498,6 +1464,7 @@ impl ComputedGroupSets {
                 dependency_flags,
                 ..old_metadata
             })
+            .0
         };
         let longhand_table = self.intern_longhand_table_with_slot_hash_sum(unsafe { &*table }, slot_hash_sum);
         release_table(table);
@@ -1570,22 +1537,20 @@ impl ComputedGroupSets {
         let Some(record) = self.style_records.get_index(previous_base.index()).copied() else {
             return;
         };
-        let groups = self.group_identities(record.groups);
-        let inherited_identity = self
-            .intern_inherited_group_set(&groups[..ENGINE_INHERITED_GROUP_COUNT])
-            .0;
+        let inherited_identity = record.inherited_groups;
         self.columns.groups[index] = record.groups.0;
         self.columns.inherited_groups[index] = inherited_identity.0;
         self.columns.custom_properties[index] = record.custom_properties.0;
         self.style_record_column[index] = Some(previous_base);
     }
 
-    fn intern_fixed_metadata(&mut self, metadata: ComputedFixedMetadata) -> ComputedFixedMetadataID {
+    fn intern_fixed_metadata(&mut self, metadata: ComputedFixedMetadata) -> (ComputedFixedMetadataID, bool) {
+        let hash = content_hash(metadata);
         if let Some(identity) = self
             .computed_fixed_metadata
-            .find(content_hash(metadata), |_identity, candidate| *candidate == metadata)
+            .find(hash, |_identity, candidate| *candidate == metadata)
         {
-            return identity;
+            return (identity, false);
         }
         let identity = self.computed_fixed_metadata.take_free_identity().unwrap_or_else(|| {
             ComputedFixedMetadataID(
@@ -1593,9 +1558,8 @@ impl ComputedGroupSets {
                     .expect("computed fixed-metadata identity space exhausted"),
             )
         });
-        self.computed_fixed_metadata
-            .insert(content_hash(metadata), identity, metadata);
-        identity
+        self.computed_fixed_metadata.insert(hash, identity, metadata);
+        (identity, true)
     }
 
     /// Assign a node the record another node of its cohort already derived this flush: the same
@@ -1621,10 +1585,7 @@ impl ComputedGroupSets {
             .longhand_table
             .and_then(|table| self.computed_longhand_tables.get_index(table.index()))
             .is_some_and(|retained| table_inherited_group_swap_eligible(retained.table()));
-        let groups = self.group_identities(new_record.groups);
-        let inherited_identity = self
-            .intern_inherited_group_set(&groups[..ENGINE_INHERITED_GROUP_COUNT])
-            .0;
+        let inherited_identity = new_record.inherited_groups;
         self.columns.groups[index] = new_record.groups.0;
         self.columns.inherited_groups[index] = inherited_identity.0;
         self.columns.custom_properties[index] = new_record.custom_properties.0;
@@ -1634,15 +1595,10 @@ impl ComputedGroupSets {
     }
 
     /// The identity of a record's inherited groups, the way a node assigned it would hold them.
-    pub(super) fn style_record_inherited_groups_identity(&mut self, style_record: FinalStyleRecordID) -> Option<u32> {
+    pub(super) fn style_record_inherited_groups_identity(&self, style_record: FinalStyleRecordID) -> Option<u32> {
         let base_record = style_record.base_record()?;
         let record = *self.style_records.get_index(base_record.index())?;
-        let groups = self.group_identities(record.groups);
-        Some(
-            self.intern_inherited_group_set(&groups[..ENGINE_INHERITED_GROUP_COUNT])
-                .0
-                .0,
-        )
+        Some(record.inherited_groups.0)
     }
 
     fn next_animation_overlay_record(&mut self) -> FinalStyleRecordID {
@@ -1946,7 +1902,6 @@ impl ComputedGroupSets {
                 groups.push(identity);
                 continue;
             }
-            let key = (index, payload as usize);
             let previous_identity = previous_group_set
                 .and_then(|set| self.sets[set].payloads.get(index).copied())
                 .map(|payload| self.group_identity(index, payload));
@@ -1959,25 +1914,11 @@ impl ComputedGroupSets {
                     }
                     identity
                 }
-                None => match self.groups.find(content_hash(key), |_identity, group| {
-                    (group.index, group.payload as usize) == key
-                }) {
-                    Some(identity) => identity,
-                    None => {
-                        retain_group_payload(index, payload);
-                        let identity = self.groups.take_free_identity().unwrap_or_else(|| {
-                            ComputedGroupID(
-                                u32::try_from(self.groups.len()).expect("computed group identity space exhausted"),
-                            )
-                        });
-                        self.groups
-                            .insert(content_hash(key), identity, ComputedGroup { index, payload });
-                        self.group_set_nested_memory
-                            .grow_committed(retained_group_payload_bytes(index, payload) as u64);
-                        new_groups += 1;
-                        identity
-                    }
-                },
+                None => {
+                    let (identity, inserted) = self.intern_group(index, payload);
+                    new_groups += usize::from(inserted);
+                    identity
+                }
             };
             groups.push(identity);
         }
@@ -1990,28 +1931,12 @@ impl ComputedGroupSets {
         let (custom_property_environment_identity, new_custom_property_environment) =
             self.intern_custom_property_environment(custom_property_environment);
 
-        let metadata = ComputedFixedMetadata {
-            pseudo_element_styles,
-            dependency_flags,
-            counter_style_environment_identity,
-        };
-        let (computed_fixed_metadata_identity, new_computed_fixed_metadata) = match self
-            .computed_fixed_metadata
-            .find(content_hash(metadata), |_identity, candidate| *candidate == metadata)
-        {
-            Some(identity) => (identity, false),
-            None => {
-                let identity = self.computed_fixed_metadata.take_free_identity().unwrap_or_else(|| {
-                    ComputedFixedMetadataID(
-                        u32::try_from(self.computed_fixed_metadata.len())
-                            .expect("computed fixed-metadata identity space exhausted"),
-                    )
-                });
-                self.computed_fixed_metadata
-                    .insert(content_hash(metadata), identity, metadata);
-                (identity, true)
-            }
-        };
+        let (computed_fixed_metadata_identity, new_computed_fixed_metadata) =
+            self.intern_fixed_metadata(ComputedFixedMetadata {
+                pseudo_element_styles,
+                dependency_flags,
+                counter_style_environment_identity,
+            });
 
         // NB: A recompute allocates fresh value data for many longhands even when nothing changed,
         //     so interning by pointer content alone would mint a new table identity - and a new
@@ -2426,16 +2351,16 @@ impl ComputedGroupSets {
         if node_set == parent_set {
             return Some(true);
         }
-        let node_groups = self.group_identities(node_set);
-        let parent_groups = self.group_identities(parent_set);
+        let node_groups = &self.sets[node_set].payloads;
+        let parent_groups = &self.sets[parent_set].payloads;
         // C++ and Rust can intern equal payloads under different group identities. Inheritance
         // follows the parent's value in that case just as it does after group reclamation.
         Some((0..ENGINE_INHERITED_GROUP_COUNT).all(|group| {
-            if own_groups & (1 << group) != 0 || node_groups[group] == parent_groups[group] {
+            if own_groups & (1 << group) != 0 {
                 return true;
             }
-            let node_payload = self.groups[node_groups[group]].payload;
-            let parent_payload = self.groups[parent_groups[group]].payload;
+            let node_payload = node_groups[group];
+            let parent_payload = parent_groups[group];
             node_payload == parent_payload
                 || crate::css::computed_values::style_group_payloads_equal(group, node_payload, parent_payload)
         }))
@@ -2461,14 +2386,14 @@ impl ComputedGroupSets {
         };
         // Reclamation interns an equal payload under a new identity, so the groups compare by
         // content past their identities.
-        let record_groups = self.group_identities(record.groups);
-        let node_groups = self.group_identities(node_set);
+        let record_groups = &self.sets[record.groups].payloads;
+        let node_groups = &self.sets[node_set].payloads;
         (0..ENGINE_INHERITED_GROUP_COUNT).all(|group| {
             if own_groups & (1 << group) != 0 {
                 return true;
             }
-            let record_payload = self.groups[record_groups[group]].payload;
-            let node_payload = self.groups[node_groups[group]].payload;
+            let record_payload = record_groups[group];
+            let node_payload = node_groups[group];
             record_payload == node_payload
                 || crate::css::computed_values::style_group_payloads_equal(group, record_payload, node_payload)
         })
