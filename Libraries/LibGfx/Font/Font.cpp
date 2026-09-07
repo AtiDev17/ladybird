@@ -14,6 +14,7 @@
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/TypefaceSkia.h>
 #include <LibGfx/TextLayout.h>
+#include <RustFFI.h>
 
 #if defined(USE_FONTCONFIG)
 #    include <LibGfx/Font/GlobalFontConfig.h>
@@ -27,14 +28,10 @@
 #include <harfbuzz/hb.h>
 
 extern "C" {
-u64 ladybird_gfx_font_id(void const*);
-float ladybird_gfx_font_glyph_width(void const*, u32);
+void ladybird_gfx_font_snapshot(void const*, Gfx::FFI::FfiFontSnapshot*);
 u32 ladybird_gfx_font_glyph_id(void const*, u32);
 bool ladybird_gfx_font_contains_glyph(void const*, u32);
 bool ladybird_gfx_font_is_emoji_font(void const*);
-void ladybird_gfx_font_pixel_metrics(void const*, float* ascent, float* descent);
-float ladybird_gfx_font_pixel_size(void const*);
-float ladybird_gfx_font_x_height(void const*);
 void ladybird_gfx_font_ref(void const*);
 void ladybird_gfx_font_unref(void const*);
 }
@@ -69,12 +66,6 @@ Font::Font(NonnullRefPtr<Typeface const> typeface, float point_width, float poin
 }
 
 float Font::width(Utf16View const& view) const { return measure_text_width(view, *this); }
-
-float Font::glyph_width(u32 code_point) const
-{
-    auto string = Utf16String::from_code_point(code_point);
-    return measure_text_width(string.utf16_view(), *this);
-}
 
 NonnullRefPtr<Font> Font::with_size(float point_size) const
 {
@@ -248,16 +239,21 @@ bool Font::is_emoji_font() const
 
 }
 
-extern "C" u64 ladybird_gfx_font_id(void const* font)
+extern "C" void ladybird_gfx_font_snapshot(void const* font, Gfx::FFI::FfiFontSnapshot* out_snapshot)
 {
     VERIFY(font);
-    return static_cast<Gfx::Font const*>(font)->id();
-}
-
-extern "C" float ladybird_gfx_font_glyph_width(void const* font, u32 code_point)
-{
-    VERIFY(font);
-    return static_cast<Gfx::Font const*>(font)->glyph_width(code_point);
+    VERIFY(out_snapshot);
+    auto const& typed_font = *static_cast<Gfx::Font const*>(font);
+    auto const& metrics = typed_font.pixel_metrics();
+    *out_snapshot = {
+        .id = typed_font.id(),
+        .ascent = metrics.ascent,
+        .descent = metrics.descent,
+        .x_height = metrics.x_height,
+        .zero_advance = metrics.advance_of_ascii_zero,
+        .pixel_size = typed_font.pixel_size(),
+        .point_size = typed_font.point_size(),
+    };
 }
 
 extern "C" u32 ladybird_gfx_font_glyph_id(void const* font, u32 code_point)
@@ -276,26 +272,6 @@ extern "C" bool ladybird_gfx_font_is_emoji_font(void const* font)
 {
     VERIFY(font);
     return static_cast<Gfx::Font const*>(font)->is_emoji_font();
-}
-
-extern "C" void ladybird_gfx_font_pixel_metrics(void const* font, float* ascent, float* descent)
-{
-    VERIFY(font);
-    auto const& metrics = static_cast<Gfx::Font const*>(font)->pixel_metrics();
-    *ascent = metrics.ascent;
-    *descent = metrics.descent;
-}
-
-extern "C" float ladybird_gfx_font_pixel_size(void const* font)
-{
-    VERIFY(font);
-    return static_cast<Gfx::Font const*>(font)->pixel_size();
-}
-
-extern "C" float ladybird_gfx_font_x_height(void const* font)
-{
-    VERIFY(font);
-    return static_cast<Gfx::Font const*>(font)->x_height();
 }
 
 extern "C" void ladybird_gfx_font_ref(void const* font)

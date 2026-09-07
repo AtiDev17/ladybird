@@ -41,12 +41,12 @@ pub use crate::css::computed_value_types::{
     ComputedOverflowClipMarginSide, ComputedPositionTryFallback, ComputedResolvedTransform, ComputedSize,
     ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint, ComputedTextIndent,
     ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ComputedVerticalAlign, ContentValues, EffectsValues,
-    FontLayoutFacts, FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues,
-    InheritedTextLayoutFacts, InheritedTextValues, InheritedUIValues, MaskValues, MiscResetValues,
-    RetainedComputedCursorList, RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList,
-    RetainedComputedShadowList, RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList,
-    RetainedGridTrackEntryList, RetainedPositionAreaList, RetainedPositionTryFallbackList,
-    RetainedTextDecorationLineList, SVGResetValues, SizingValues, SurroundValues, TextResetValues, TransformValues,
+    FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextLayoutFacts,
+    InheritedTextValues, InheritedUIValues, MaskValues, MiscResetValues, RetainedComputedCursorList,
+    RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList, RetainedComputedShadowList,
+    RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList,
+    RetainedPositionAreaList, RetainedPositionTryFallbackList, RetainedTextDecorationLineList, SVGResetValues,
+    SizingValues, SurroundValues, TextResetValues, TransformValues,
 };
 use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
 use crate::css::style_value::StyleValueData;
@@ -3093,7 +3093,7 @@ impl FontValues {
             font_x_height: 0.0,
             font_zero_advance: 0.0,
             first_available_font: std::ptr::null(),
-            font_cascade_list: std::ptr::null(),
+            font_cascade_list: libgfx_rust::font::FontCascadeListHandle::null(),
             font_weight: 400.0,
             font_width: 100.0,
             math_shift: 0,
