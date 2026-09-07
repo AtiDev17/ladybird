@@ -1,7 +1,7 @@
 {
   "app-id": "org.ladybird.Ladybird",
   "runtime": "org.kde.Platform",
-  "runtime-version": "6.9",
+  "runtime-version": "6.10",
   "sdk": "org.kde.Sdk",
   "sdk-extensions": [
     "org.freedesktop.Sdk.Extension.llvm20",
@@ -168,6 +168,11 @@
           "type": "patch",
           "path": "angle/build-arm64.patch",
           "dest": "angle/build"
+        },
+        {
+          "type": "patch",
+          "path": "angle/vulkan-descriptor-allocator-instantiation.patch",
+          "dest": "angle"
         },
         {
           "type": "file",
@@ -357,13 +362,18 @@
           "url": "https://github.com/google/woff2.git",
           "tag": "v1.0.2",
           "disable-submodules": true
+        },
+        {
+          "type": "patch",
+          "path": "woff2/output-h-add-missing-stdint-include.patch"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
         "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DCANONICAL_PREFIXES=ON"
+        "-DCANONICAL_PREFIXES=ON",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       ]
     },
     {
@@ -397,7 +407,8 @@
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app"
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       ],
       "cleanup": [
         "/bin"
@@ -623,7 +634,7 @@
       "name": "ffmpeg",
       "buildsystem": "simple",
       "build-commands": [
-        "./configure --prefix=/app --libdir=lib --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --enable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --enable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --enable-libtheora --enable-libvorbis --enable-libvpx --disable-vulkan --enable-libwebp --disable-libx265 --disable-libxml2 --enable-zlib --disable-libsrt --disable-libmfx --disable-vaapi --disable-optimizations",
+        "./configure --prefix=/app --libdir=lib --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --disable-alsa --disable-amf --disable-libaom --disable-libass --disable-avisynth --enable-libdav1d --disable-libfdk-aac --disable-libfontconfig --disable-libharfbuzz --disable-libfreetype --disable-libfribidi --disable-iconv --disable-libilbc --disable-lzma --disable-libmp3lame --disable-libmodplug --disable-cuda --disable-nvenc --disable-nvdec  --disable-cuvid --disable-ffnvcodec --disable-opencl --disable-opengl --disable-libopenh264 --disable-libopenjpeg --disable-libopenmpt --disable-openssl --enable-libopus --disable-sdl2 --disable-libsnappy --disable-libsoxr --disable-libspeex --disable-libssh --disable-libtensorflow --disable-libtesseract --enable-libtheora --enable-libvorbis --enable-libvpx --disable-vulkan --enable-libwebp --disable-libx265 --disable-libxml2 --enable-zlib --disable-libsrt --disable-libmfx --disable-vaapi --disable-optimizations",
         "make -j$(nproc) V=1",
         "make install"
       ],

@@ -86,9 +86,9 @@ void CompositorContextHandle::cancel_smooth_scroll(AsyncScrollNodeStableID stabl
     m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
 }
 
-PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates()
+PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(AsyncScrollUpdateFreshness freshness)
 {
-    return m_host.take_pending_async_scroll_updates(m_context_id);
+    return m_host.take_pending_async_scroll_updates(m_context_id, freshness);
 }
 
 void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, WindowResizingInProgress window_resize_in_progress)
@@ -99,6 +99,11 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
 bool CompositorContextHandle::request_rendering_opportunity(double maximum_frames_per_second)
 {
     return m_host.request_rendering_opportunity(m_context_id, maximum_frames_per_second);
+}
+
+void CompositorContextHandle::hurry_rendering_opportunity()
+{
+    m_host.hurry_rendering_opportunity(m_context_id);
 }
 
 void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)

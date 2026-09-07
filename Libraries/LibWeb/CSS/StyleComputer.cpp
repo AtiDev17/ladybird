@@ -173,8 +173,26 @@ struct SubstitutionData {
     {
         auto& document = element.document();
         if (collect_attributes) {
-            document_url = document.url().serialize();
-            document_base_url = document.base_url().serialize();
+            // The document's URLs serialize the same way for every element computed under them;
+            // they are serialized again only when one of them is another URL.
+            struct SerializedDocumentURLs {
+                FlatPtr document { 0 };
+                ::URL::URL url;
+                ::URL::URL base_url;
+                String serialized_url;
+                String serialized_base_url;
+            };
+            static NeverDestroyed<SerializedDocumentURLs> serialized_document_urls;
+            auto& cache = *serialized_document_urls;
+            if (cache.document != bit_cast<FlatPtr>(&document) || cache.url != document.url() || cache.base_url != document.base_url()) {
+                cache.document = bit_cast<FlatPtr>(&document);
+                cache.url = document.url();
+                cache.base_url = document.base_url();
+                cache.serialized_url = cache.url.serialize();
+                cache.serialized_base_url = cache.base_url.serialize();
+            }
+            document_url = cache.serialized_url;
+            document_base_url = cache.serialized_base_url;
         }
         parse_context = {
             .in_quirks_mode = document.in_quirks_mode(),
@@ -3568,11 +3586,44 @@ static void report_custom_property_change(DOM::AbstractElement abstract_element,
     auto new_custom_property_data = abstract_element.custom_property_data();
     if (old_custom_property_data.ptr() == new_custom_property_data.ptr())
         return;
+    // The environment an element hands its descendants is its own declarations over the one it
+    // inherits: when the inherited one moved, the descendants' moved too, whatever the element's
+    // own declarations did. Inherited environments are interned, so one that did not move is the
+    // same object.
+    auto inherited_environment_of = [](CustomPropertyData const* data) -> CustomPropertyData const* {
+        if (data && data->is_animation_overlay())
+            data = data->parent().ptr();
+        return data ? data->parent().ptr() : nullptr;
+    };
+    if (inherited_environment_of(old_custom_property_data.ptr()) != inherited_environment_of(new_custom_property_data.ptr())) {
+        *did_change_custom_properties = true;
+        return;
+    }
     static NeverDestroyed<OrderedHashMap<Utf16FlyString, StyleProperty>> empty_own_values;
     auto const& old_own = old_custom_property_data ? old_custom_property_data->own_values() : *empty_own_values;
     auto const& new_own = new_custom_property_data ? new_custom_property_data->own_values() : *empty_own_values;
-    if (old_own != new_own)
+    if (old_own.size() != new_own.size()) {
         *did_change_custom_properties = true;
+        return;
+    }
+    // A cascade hands out the very value objects the declarations hold, so two environments built
+    // from the same declarations share their values: compare by identity before comparing text.
+    auto old_iterator = old_own.begin();
+    auto new_iterator = new_own.begin();
+    for (; old_iterator != old_own.end(); ++old_iterator, ++new_iterator) {
+        if (old_iterator->key != new_iterator->key || old_iterator->value.important != new_iterator->value.important) {
+            *did_change_custom_properties = true;
+            return;
+        }
+        auto const& old_value = *old_iterator->value.value;
+        auto const& new_value = *new_iterator->value.value;
+        if (&old_value == &new_value || old_value.rust_style_value_data() == new_value.rust_style_value_data())
+            continue;
+        if (!old_value.equals(new_value)) {
+            *did_change_custom_properties = true;
+            return;
+        }
+    }
 }
 
 // A shared style installs the current inheritance parent's environment directly. Unlike a normal
@@ -3689,6 +3740,7 @@ StyleEngine::StyleRecordDelta StyleComputer::record_computed_style_inputs(Option
 
 NonnullRefPtr<ComputedValues const> StyleComputer::materialize_style_record(DOM::AbstractElement abstract_element, Optional<bool&> did_change_custom_properties, StyleEngineMatchResult* reusable_matches, Optional<StyleEngine::StyleRecordDelta&> style_record_delta, StyleSharingMode style_sharing_mode) const
 {
+    m_last_materialization_kept_pseudo_element_styles = false;
     auto was_materializing_for_targeted_style_update = m_materializing_for_targeted_style_update;
     m_materializing_for_targeted_style_update = true;
     ScopeGuard restore_materialization_mode = [&] {
@@ -4176,11 +4228,12 @@ static Optional<SharedStyleRecordContext> shared_style_record_context(StyleCompu
 
 StyleRecordID StyleComputer::try_share_computed_style_record(DOM::Element& element) const
 {
+    m_last_materialization_kept_pseudo_element_styles = false;
     auto context = shared_style_record_context(*this, element);
     if (!context.has_value() || !collect_presentational_hint_properties({ element }).is_empty())
         return {};
     auto record = StyleRecordID { const_cast<StyleComputer&>(*this).style_engine().lookup_shared_style_record(
-        element.style_node_id(), context->parent_record, document().style_environment_version(), context->shape) };
+        element.style_node_id(), context->parent_record, style_environment_version_for_sharing(), context->shape) };
     if (record.value() != 0) {
         static bool const verify_reuse = getenv("LIBWEB_VERIFY_STYLE_INPUT_REUSE") != nullptr;
         if (verify_reuse) {
@@ -4227,7 +4280,7 @@ void StyleComputer::remember_shared_computed_style_record(DOM::Element& element,
     if (!context.has_value())
         return;
     const_cast<StyleComputer&>(*this).style_engine().remember_shared_style_record(
-        element.style_node_id(), context->parent_record, document().style_environment_version(), context->shape, style_record);
+        element.style_node_id(), context->parent_record, style_environment_version_for_sharing(), context->shape, style_record);
 }
 
 static StyleInputRecord::Difference compare_style_input_records(StyleInputRecord const& previous, StyleInputRecord const& current, size_t first_word = 0)
@@ -4261,6 +4314,28 @@ static StyleInputRecord::Difference compare_style_input_records(StyleInputRecord
     if (*differing_index < style_input_record_block_index)
         return StyleInputRecord::Difference::Element;
     return StyleInputRecord::Difference::Declarations;
+}
+
+u64 StyleComputer::style_environment_version_for_sharing() const
+{
+    return document().style_environment_version() ^ (m_viewport_environment_version << 32);
+}
+
+// Whether a custom property holds a different value under two inherited environments. A var()
+// whose property holds the same value under both substitutes to the same thing. A registered
+// property that does not inherit still reaches a descendant that declares it `inherit`, so a move
+// of it counts like any other.
+bool custom_property_value_moved(Utf16FlyString const& name, CustomPropertyData const* old_data, CustomPropertyData const* new_data)
+{
+    auto const* old_property = old_data ? old_data->get(name) : nullptr;
+    auto const* new_property = new_data ? new_data->get(name) : nullptr;
+    if (!old_property && !new_property)
+        return false;
+    if (!old_property || !new_property)
+        return true;
+    if (old_property->value->rust_style_value_data() == new_property->value->rust_style_value_data())
+        return false;
+    return !old_property->value->equals(*new_property->value);
 }
 
 RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractElement abstract_element, ComputeStyleMode mode, Optional<bool&> did_change_custom_properties, StyleScope const& style_scope, IncludeInlineStyle include_inline_style, StyleEngineMatchResult* reusable_matches, StyleSharingCandidate* sharing) const
@@ -4386,7 +4461,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             sharing->key.computation_inputs.append(0);
         }
         sharing->key.computation_inputs.append(0);
-        sharing->key.computation_inputs.append(document().style_environment_version());
+        sharing->key.computation_inputs.append(style_environment_version_for_sharing());
         sharing->key.computation_inputs.append(abstract_element.pseudo_element().has_value() ? to_underlying(*abstract_element.pseudo_element()) + 1 : 0);
         sharing->key.computation_inputs.append(cascade_input.matching_pseudo_element_styles);
         sharing->parent_style_record_identity = inheritance_parent->style_record_identity();
@@ -4402,6 +4477,11 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     StyleInputRecord* new_style_input_record = nullptr;
     bool style_input_is_unchanged = false;
     bool only_declarations_changed = false;
+    // The environment the element inherits moved, but no value its cascade reads moved with it.
+    bool parent_custom_property_environment_moved = false;
+    RefPtr<CustomPropertyData const> old_parent_custom_property_data;
+    if (!abstract_element.pseudo_element().has_value())
+        m_last_materialization_kept_pseudo_element_styles = false;
     bool font_environment_changed = false;
     bool only_font_environment_changed = false;
     u8 font_input_style_groups = 0;
@@ -4481,6 +4561,58 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         // than with the blocks, so that a version that moved is never reported as a change of
         // declarations - a reuse admitted on the declarations alone must not be admitted by it.
         record->words.append(document().style_environment_version());
+        record->viewport_environment_version = m_viewport_environment_version;
+        record->custom_property_reads.clear_with_capacity();
+        record->custom_property_reads_are_complete = true;
+        auto collect_custom_property_reads = [&](CascadeInput const& input) {
+            auto add_block = [&](CSSStyleProperties const& declaration) {
+                auto const& references = declaration.custom_property_references();
+                if (!references.all_references_visible)
+                    record->custom_property_reads_are_complete = false;
+                record->custom_property_reads.extend(references.names);
+            };
+            for (auto const& contribution : input.contributions) {
+                if (contribution.declaration)
+                    add_block(*contribution.declaration);
+            }
+            if (include_inline_style == IncludeInlineStyle::Yes && input.inline_style_context_index.has_value()) {
+                if (auto inline_style = abstract_element.inline_style())
+                    add_block(*inline_style);
+            }
+        };
+        collect_custom_property_reads(cascade_input);
+        // Presentation attributes cascade beside the declarations and read the environment the same
+        // way (an SVG `fill="var(--x)"`).
+        for (auto const& hint : presentational_hint_properties) {
+            if (!hint.value->is_unresolved() || !hint.value->as_unresolved().includes_var_function())
+                continue;
+            auto visit = [](void* context, u16 const* name, size_t name_length) {
+                static_cast<Vector<Utf16FlyString>*>(context)->append(Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(name), name_length }));
+            };
+            if (!StyleValueFFI::rust_unresolved_style_value_visit_custom_property_references(hint.value->rust_style_value_data(), &record->custom_property_reads, visit))
+                record->custom_property_reads_are_complete = false;
+        }
+        // A pseudo-element's cascade reads the environment through its originating element. One
+        // that some rule decides for counts before it has a record: this computation materializes it.
+        for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
+            auto pseudo_element = static_cast<PseudoElement>(kind);
+            bool const has_matching_rules = (cascade_input.matching_pseudo_element_styles & pseudo_element_style_bit(pseudo_element)) != 0;
+            if (!has_matching_rules && !abstract_element.element().style_record_identity(pseudo_element))
+                continue;
+            auto pseudo_cascade_input = style_engine_cascade_input(DOM::AbstractElement { abstract_element.element(), pseudo_element }, reusable_matches);
+            if (!pseudo_cascade_input) {
+                record->custom_property_reads_are_complete = false;
+                continue;
+            }
+            collect_custom_property_reads(*pseudo_cascade_input);
+        }
+        quick_sort(record->custom_property_reads);
+        size_t unique_reads = 0;
+        for (size_t index = 0; index < record->custom_property_reads.size(); ++index) {
+            if (index == 0 || record->custom_property_reads[index] != record->custom_property_reads[unique_reads - 1])
+                record->custom_property_reads[unique_reads++] = record->custom_property_reads[index];
+        }
+        record->custom_property_reads.shrink(unique_reads);
         VERIFY(record->words.size() == style_input_record_block_index);
 
         if (shared_entry) {
@@ -4512,7 +4644,23 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 }
                 previous_computation = capture_previous_computation(*previous);
             }
-            switch (compare_style_input_records(*previous, *record)) {
+            // Whether a moved environment reaches what the element's cascades compute, pseudo-elements
+            // included: it does only through a custom property the record names as read, whose value
+            // differs between the two environments.
+            auto environment_move_reaches_cascades = [&](CustomPropertyData const* old_data, CustomPropertyData const* new_data) {
+                if (!record->custom_property_reads_are_complete)
+                    return true;
+                return any_of(record->custom_property_reads, [&](Utf16FlyString const& name) {
+                    return custom_property_value_moved(name, old_data, new_data);
+                });
+            };
+            auto difference = compare_style_input_records(*previous, *record);
+            // A computation that read a viewport metric read what the viewport environment names.
+            auto const viewport_environment_moved = previous->style_depends_on_viewport_metrics
+                && previous->viewport_environment_version != record->viewport_environment_version;
+            if (difference == StyleInputRecord::Difference::None && viewport_environment_moved)
+                difference = StyleInputRecord::Difference::Element;
+            switch (difference) {
             case StyleInputRecord::Difference::None:
                 style_input_is_unchanged = !font_environment_changed;
                 // A computation that is skipped leaves no marks, so the record keeps the ones the
@@ -4532,9 +4680,39 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             case StyleInputRecord::Difference::ParentStyle:
                 counters.element_style_input_changed_by_parent_style++;
                 break;
-            case StyleInputRecord::Difference::ParentCustomProperties:
-                counters.element_style_input_changed_by_parent_custom_properties++;
+            case StyleInputRecord::Difference::ParentCustomProperties: {
+                auto existing_data = abstract_element.custom_property_data();
+                auto const* old_parent_data = previous->pinned_parent_custom_property_data.ptr();
+                auto const* new_parent_data = record->pinned_parent_custom_property_data.ptr();
+                // An if(), inherit() or custom function reads past the names the values name.
+                bool const move_is_invisible = !font_environment_changed
+                    && !viewport_environment_moved
+                    && compare_style_input_records(*previous, *record, style_input_record_parent_custom_properties_index + 1) == StyleInputRecord::Difference::None
+                    && !previous->style_uses_if_css_function
+                    && !previous->style_uses_inherit_css_function
+                    && !previous->style_uses_custom_function
+                    && !(existing_data && existing_data->is_animation_overlay())
+                    && !environment_move_reaches_cascades(old_parent_data, new_parent_data);
+                if (!move_is_invisible) {
+                    counters.element_style_input_changed_by_parent_custom_properties++;
+                    break;
+                }
+                parent_custom_property_environment_moved = true;
+                old_parent_custom_property_data = previous->pinned_parent_custom_property_data;
+                style_input_is_unchanged = true;
+                record->read_beyond_the_record = previous->read_beyond_the_record;
+                record->style_uses_attr_css_function = previous->style_uses_attr_css_function;
+                record->style_uses_var_css_function = previous->style_uses_var_css_function;
+                record->style_uses_if_css_function = previous->style_uses_if_css_function;
+                record->style_uses_custom_function = previous->style_uses_custom_function;
+                record->style_uses_inherit_css_function = previous->style_uses_inherit_css_function;
+                record->style_uses_tree_counting_function = previous->style_uses_tree_counting_function;
+                record->style_depends_on_viewport_metrics = previous->style_depends_on_viewport_metrics;
+                record->style_depends_on_size_container_query = previous->style_depends_on_size_container_query;
+                record->style_depends_on_style_container_query = previous->style_depends_on_style_container_query;
+                record->explicitly_inherited_non_inherited_style_groups = previous->explicitly_inherited_non_inherited_style_groups;
                 break;
+            }
             case StyleInputRecord::Difference::Element:
                 break;
             case StyleInputRecord::Difference::Declarations:
@@ -4542,12 +4720,30 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 previous_computation = capture_previous_computation(*previous);
                 break;
             }
+            // A cascade that reads no custom property names no environment in its record, yet the
+            // element holds the one it inherits, and its pseudo-elements may read it. A derived
+            // reaction that moved that environment has the element take the moved one, provided no
+            // pseudo-element cascade reads a name that moved.
+            if (style_input_is_unchanged && m_materializing_for_derived_reaction && !parent_custom_property_environment_moved
+                && !record->cascade_reads_custom_properties && inheritance_parent.has_value()) {
+                auto existing_data = abstract_element.custom_property_data();
+                auto new_parent_data = inheritable_custom_property_data(*inheritance_parent);
+                if (existing_data.ptr() != new_parent_data.ptr()) {
+                    if ((existing_data && existing_data->is_animation_overlay())
+                        || environment_move_reaches_cascades(existing_data.ptr(), new_parent_data.ptr())) {
+                        style_input_is_unchanged = false;
+                    } else {
+                        parent_custom_property_environment_moved = true;
+                        old_parent_custom_property_data = existing_data;
+                    }
+                }
+            }
         }
         if (sharing->may_reuse_or_publish_shared_style && !element.style_input_record() && previous_style_record.present) {
             auto const& shape = *element_shape_key;
             Array<u64, 4> context_shape { shape[0], shape[1], shape[2], 0 };
             auto context_record = StyleRecordID { const_cast<StyleComputer&>(*this).style_engine().take_shared_computation_context(
-                element.style_node_id(), inheritance_parent_style_record_identity, document().style_environment_version(),
+                element.style_node_id(), inheritance_parent_style_record_identity, style_environment_version_for_sharing(),
                 context_shape, cascade_input.matching_pseudo_element_styles) };
             if (context_record.value() != 0 && context_record == previous_style_record_identity) {
                 only_declarations_changed = true;
@@ -4575,11 +4771,22 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             || previous_style_record.animation_overlay_identity != 0)
             return false;
         // What the record does not name is everything that reaches the element some other way: a
-        // font finishing loading, the viewport moving, or a registration arriving. An environment
-        // or targeted update may include one of those inputs, so only descendant propagation can
-        // reuse the record's parent half here.
-        if (m_materializing_for_targeted_style_update)
+        // font finishing loading or a registration arriving. An environment or targeted update may
+        // include one of those inputs, so only descendant propagation and a reaction the engine
+        // derived from an ancestor's application can reuse the record's parent half here.
+        if (m_materializing_for_targeted_style_update && !m_materializing_for_derived_reaction)
             return false;
+        if (m_materializing_for_derived_reaction) {
+            // A derived reaction can carry the parent's non-inherited half moving, which the record
+            // names for no computation that read it through `inherit`.
+            if (new_style_input_record->explicitly_inherited_non_inherited_style_groups != 0 || new_style_input_record->style_uses_inherit_css_function)
+                return false;
+            // The winner state the last cascade bound has to be the one the engine holds for the
+            // element now; a reused style carries it into the next publication.
+            auto node = abstract_element.element().style_node_id();
+            if (node == 0 || !style_engine().exact_cascade_state_is_current(node))
+                return false;
+        }
         return true;
     };
 
@@ -4615,6 +4822,67 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         sharing->reused_values = ComputedValues::Builder { *existing }.build();
     };
 
+    // The element's last computation stands while the environment it inherits moved under it: the
+    // element takes the moved environment the way that computation would have resolved it, which
+    // is the parent's inheritable environment with the element's own declarations over it.
+    auto install_moved_custom_property_environment = [&]() -> bool {
+        if (!inheritance_parent.has_value())
+            return false;
+        auto existing = abstract_element.custom_property_data();
+        auto declares_custom_properties = any_of(cascade_input.contributions, [](auto const& contribution) {
+            return contribution.cascade_origin == CascadeOrigin::Author && contribution.declaration && !contribution.declaration->custom_properties().is_empty();
+        });
+        if (include_inline_style == IncludeInlineStyle::Yes && cascade_input.inline_style_context_index.has_value()) {
+            if (auto inline_style = abstract_element.inline_style(); inline_style && !inline_style->custom_properties().is_empty())
+                declares_custom_properties = true;
+        }
+        // A cascade whose custom declarations resolved to nothing of its own holds the environment it
+        // inherited, and takes the moved one the same way.
+        if (declares_custom_properties && old_parent_custom_property_data && existing.ptr() == old_parent_custom_property_data->inheritable(document()).ptr())
+            declares_custom_properties = false;
+        RefPtr<CustomPropertyData const> moved = inheritable_custom_property_data(*inheritance_parent);
+        if (declares_custom_properties) {
+            if (!existing || existing->declared_count() == 0)
+                return false;
+            OrderedHashMap<Utf16FlyString, StyleProperty> own_values;
+            size_t declared = 0;
+            for (auto const& [name, property] : existing->own_values()) {
+                if (declared++ >= existing->declared_count())
+                    break;
+                own_values.set(name, property);
+            }
+            moved = intern_custom_property_data(CustomPropertyData::create(move(own_values), moved));
+        }
+        // A pseudo-element declaring custom properties of its own resolved them over the old
+        // environment; its computation decides them again. One holding its originating element's
+        // environment takes the moved one with it.
+        auto& element = abstract_element.element();
+        auto existing_inheritable = existing ? existing->inheritable(document()) : nullptr;
+        auto moved_inheritable = moved ? moved->inheritable(document()) : nullptr;
+        for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
+            auto pseudo_element = static_cast<PseudoElement>(kind);
+            auto pseudo_data = element.custom_property_data(pseudo_element);
+            if (!pseudo_data)
+                continue;
+            if (pseudo_data.ptr() != existing.ptr() && pseudo_data.ptr() != existing_inheritable.ptr())
+                return false;
+        }
+        for (auto kind = 0; kind < to_underlying(PseudoElement::KnownPseudoElementCount); ++kind) {
+            auto pseudo_element = static_cast<PseudoElement>(kind);
+            auto pseudo_data = element.custom_property_data(pseudo_element);
+            if (!pseudo_data)
+                continue;
+            element.set_custom_property_data(pseudo_element, pseudo_data.ptr() == existing.ptr() ? moved : moved_inheritable);
+        }
+        if (moved.ptr() != existing.ptr()) {
+            abstract_element.set_custom_property_data(moved);
+            if (did_change_custom_properties.has_value())
+                *did_change_custom_properties = true;
+        }
+        m_last_materialization_kept_pseudo_element_styles = true;
+        return true;
+    };
+
     auto reuse_computed_style = [&]() -> bool {
         if (!sharing || !sharing->may_reuse_or_publish_shared_style)
             return false;
@@ -4622,6 +4890,13 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             return false;
         if (auto data = abstract_element.custom_property_data(); data && data->is_animation_overlay())
             return false;
+        if (parent_custom_property_environment_moved && !install_moved_custom_property_environment())
+            return false;
+        // A derived reaction published no match answer, so the pseudo-elements' cascades are as
+        // they were; what they inherit is the style that stands, and what they read of the
+        // environment was checked with the element's own reads.
+        if (m_materializing_for_derived_reaction)
+            m_last_materialization_kept_pseudo_element_styles = true;
         reuse_last_computed_style();
         return true;
     };
@@ -4683,7 +4958,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         return false;
     };
 
-    if (!m_materializing_for_targeted_style_update)
+    if (!m_materializing_for_targeted_style_update || m_materializing_for_derived_reaction)
         record_style_input();
 
     // The element's own last answer comes before another element's: it needs no lookup, and it is

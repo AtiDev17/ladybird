@@ -2332,9 +2332,10 @@ bool Document::layout_is_up_to_date() const
 
 void Document::update_style_computer_viewport_rect()
 {
-    // A viewport unit is resolved against this and named by no word of a style input record.
+    // A viewport unit is resolved against this. A style input record names the viewport environment
+    // apart from the rest, so only a computation that read a viewport metric moves with it.
     if (style_computer().viewport_rect_for_style_environment() != viewport_rect())
-        bump_style_environment_version();
+        style_computer().bump_viewport_environment_version();
     style_computer().set_viewport_rect({}, viewport_rect());
 }
 
@@ -4767,6 +4768,19 @@ bool Document::hidden() const
     return m_visibility_state == HTML::VisibilityState::Hidden;
 }
 
+bool Document::is_playing_audio() const
+{
+    return page().has_media_element_playing_audio(*this);
+}
+
+// A hidden document playing audio keeps its timers on their own deadlines (see
+// WindowOrWorkerGlobalScopeMixin::timers_are_throttled()), so the Window has to hear when that starts or stops.
+void Document::media_element_audio_play_state_changed(Badge<HTML::HTMLMediaElement>)
+{
+    if (auto window = this->window(); window && &window->associated_document() == this)
+        window->document_audio_play_state_changed({});
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#update-the-visibility-state
 void Document::update_the_visibility_state(HTML::VisibilityState visibility_state)
 {
@@ -4791,6 +4805,9 @@ void Document::update_the_visibility_state(HTML::VisibilityState visibility_stat
         return document_observer.document_visibility_state_observer();
     },
         m_visibility_state);
+    // The page visibility change steps for timers (see WindowOrWorkerGlobalScopeMixin::document_visibility_state_changed()).
+    if (auto window = this->window(); window && &window->associated_document() == this)
+        window->document_visibility_state_changed({});
 
     // 7. Fire an event named visibilitychange at document, with its bubbles attribute initialized to true.
     auto event = DOM::Event::create(
@@ -6208,6 +6225,10 @@ void Document::set_initial_visibility_state(HTML::VisibilityState visibility_sta
 {
     // 1. Set document's visibility state to visibility state.
     m_visibility_state = visibility_state;
+    // The Window's timers follow the document's visibility from here on (see
+    // WindowOrWorkerGlobalScopeMixin::document_visibility_state_changed()).
+    if (auto window = this->window(); window && &window->associated_document() == this)
+        window->document_visibility_state_changed({});
 
     // TODO: 2. Queue a new VisibilityStateEntry whose visibility state is document's visibility state and whose timestamp is 0.
 
@@ -7578,7 +7599,7 @@ static Optional<Compositor::VisualAnimation> build_compositor_animation(Animatio
         auto reference_width = target_kind == Compositor::VisualAnimation::TargetKind::Transform ? reference_box_size.width().to_float() : 0;
         auto reference_height = target_kind == Compositor::VisualAnimation::TargetKind::Transform ? reference_box_size.height().to_float() : 0;
         auto target_style_generation = target->element().animation_style_generation();
-        auto style_environment_version = target->document().style_environment_version();
+        auto style_environment_version = target->document().style_computer().style_environment_version_for_sharing();
         if (cached_values.has_value()
             && cached_values->key_frame_set == key_frame_set
             && cached_values->target_style_generation == target_style_generation

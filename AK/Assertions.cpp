@@ -4,12 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AssertionFailure.h>
 #include <AK/Assertions.h>
 #include <AK/Backtrace.h>
 #include <AK/Format.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Platform.h>
 #include <AK/StringView.h>
+#include <stdio.h>
 
 #ifdef AK_OS_WINDOWS
 #    include <Windows.h>
@@ -20,7 +22,6 @@
 #    define EXECINFO_BACKTRACE
 #    define PRINT_ERROR(s) __android_log_write(ANDROID_LOG_WARN, "AK", (s))
 #else
-#    include <stdio.h>
 #    define PRINT_ERROR(s) (void)::fputs((s), stderr)
 #endif
 
@@ -41,6 +42,71 @@
 #    define ERRORLN warnln
 #endif
 
+static AK::AssertionFailureCallback s_assertion_failure_callback;
+static AK::AssertionBacktraceCallback s_assertion_backtrace_callback;
+
+static thread_local Array<char, 8193> s_rust_panic_message;
+static thread_local bool (*s_rust_is_panicking)();
+
+void ladybird_rust_panic(char const* message, size_t message_length, char const* filename, size_t filename_length, u32 line, u32 column, bool (*is_panicking)())
+{
+    __atomic_store_n(&s_rust_is_panicking, nullptr, __ATOMIC_RELEASE);
+    size_t length = 0;
+    auto append = [&](StringView text) {
+        for (auto ch : text) {
+            if (length == s_rust_panic_message.size() - 1)
+                break;
+            s_rust_panic_message[length++] = ch ? ch : '?';
+        }
+    };
+    append({ message, min(message_length, 4096uz) });
+    if (message_length > 4096)
+        append(" [truncated]"sv);
+    if (filename_length) {
+        append(" at "sv);
+        if (filename_length > 4096) {
+            append("[location unavailable]"sv);
+        } else {
+            append({ filename, filename_length });
+            Array<char, 24> location;
+            auto count = snprintf(location.data(), location.size(), ":%u:%u", line, column);
+            if (count > 0)
+                append({ location.data(), min(static_cast<size_t>(count), location.size() - 1) });
+        }
+    }
+    s_rust_panic_message[length] = '\0';
+    // Resolve the Rust panic-counter read before the signal handler can need it.
+    (void)is_panicking();
+    __atomic_store_n(&s_rust_is_panicking, is_panicking, __ATOMIC_RELEASE);
+}
+
+char const* AK::current_rust_panic_message()
+{
+    auto is_panicking = __atomic_load_n(&s_rust_is_panicking, __ATOMIC_ACQUIRE);
+    if (is_panicking && is_panicking())
+        return s_rust_panic_message.data();
+    return nullptr;
+}
+
+void ladybird_rust_panic_will_abort()
+{
+    if (__atomic_load_n(&s_rust_is_panicking, __ATOMIC_ACQUIRE)) {
+        if (auto callback = __atomic_load_n(&s_assertion_failure_callback, __ATOMIC_ACQUIRE))
+            callback(AK::AssertionFailureKind::RustPanic, s_rust_panic_message.data());
+        dump_backtrace(1, 100);
+    }
+}
+
+void AK::set_assertion_failure_callback(AssertionFailureCallback callback)
+{
+    __atomic_store_n(&s_assertion_failure_callback, callback, __ATOMIC_RELEASE);
+}
+
+void AK::set_assertion_backtrace_callback(AssertionBacktraceCallback callback)
+{
+    __atomic_store_n(&s_assertion_backtrace_callback, callback, __ATOMIC_RELEASE);
+}
+
 extern "C" {
 
 #if defined(AK_HAS_CPPTRACE)
@@ -48,6 +114,26 @@ void dump_backtrace(unsigned frames_to_skip, unsigned max_depth)
 {
     // We should be using cpptrace for everything but android.
     auto stacktrace = cpptrace::generate_trace(frames_to_skip, max_depth);
+    if (auto callback = __atomic_load_n(&s_assertion_backtrace_callback, __ATOMIC_ACQUIRE)) {
+        Array<AK::AssertionBacktraceFrame, AK::maximum_assertion_backtrace_frames> frames;
+        auto count = min(frames.size(), stacktrace.frames.size());
+        FlatPtr address = 0;
+        for (size_t i = count; i-- > 0;) {
+            auto const& frame = stacktrace.frames[i];
+            // Inline entries precede their enclosing physical frame and have no raw address.
+            if (!frame.is_inline)
+                address = frame.raw_address;
+            frames[i] = {
+                address,
+                { frame.symbol.data(), frame.symbol.size() },
+                { frame.filename.data(), frame.filename.size() },
+                frame.line.value_or(0),
+                frame.column.value_or(0),
+                frame.is_inline,
+            };
+        }
+        callback(frames.span().trim(count));
+    }
     auto* var = getenv("LADYBIRD_BACKTRACE_SNIPPETS");
     bool print_snippets = var && strnlen(var, 1) > 0;
     static NeverDestroyed<cpptrace::formatter> formatter { cpptrace::formatter {}.snippets(print_snippets) };
@@ -167,6 +253,8 @@ void ak_verification_failed(char const* message)
     if (auto assertion_handler = get_custom_assertion_handler()) {
         assertion_handler(message);
     }
+    if (auto callback = __atomic_load_n(&s_assertion_failure_callback, __ATOMIC_ACQUIRE))
+        callback(AK::AssertionFailureKind::Verification, message);
     if (ak_colorize_output())
         ERRORLN("\033[31;1mVERIFICATION FAILED\033[0m: {}", message);
     else
@@ -180,6 +268,8 @@ void ak_assertion_failed(char const* message)
     if (auto assertion_handler = get_custom_assertion_handler()) {
         assertion_handler(message);
     }
+    if (auto callback = __atomic_load_n(&s_assertion_failure_callback, __ATOMIC_ACQUIRE))
+        callback(AK::AssertionFailureKind::Assertion, message);
     if (ak_colorize_output())
         ERRORLN("\033[31;1mASSERTION FAILED\033[0m: {}", message);
     else

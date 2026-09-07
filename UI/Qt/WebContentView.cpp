@@ -24,6 +24,7 @@
 #include <LibWeb/UIEvents/KeyCode.h>
 #include <LibWeb/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/PlatformColors.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
@@ -32,6 +33,7 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/InputMethodUtils.h>
+#include <UI/Qt/SelectDropdown.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WebContentView.h>
 
@@ -42,6 +44,7 @@
 #include <QInputDevice>
 #include <QKeySequence>
 #include <QLabel>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QNativeGestureEvent>
@@ -51,6 +54,7 @@
 #include <QPainterPathStroker>
 #include <QPalette>
 #include <QPixmap>
+#include <QPointer>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QShortcut>
@@ -206,50 +210,13 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
         finish_handling_drag_event(event);
     };
 
-    m_select_dropdown = new QMenu("Select Dropdown", this);
-    QObject::connect(m_select_dropdown, &QMenu::aboutToHide, this, [this]() {
-        if (exchange(m_suppress_select_dropdown_close, false))
-            return;
-        if (!m_select_dropdown->activeAction())
-            select_dropdown_closed({});
-    });
+    m_select_dropdown = new SelectDropdown(this);
+    m_select_dropdown->on_closed = [this](Optional<u32> const& selected_item_id) {
+        select_dropdown_closed(selected_item_id);
+    };
 
     on_request_select_dropdown = [this](Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) {
-        m_suppress_select_dropdown_close = false;
-        m_select_dropdown->clear();
-        m_select_dropdown->setMinimumWidth(minimum_width);
-
-        auto add_menu_item = [this](Web::HTML::SelectItemOption const& item_option, bool in_option_group) {
-            auto label = in_option_group ? qformatted("    {}", item_option.label) : qstring_from_utf16_string(item_option.label);
-
-            QAction* action = new QAction(label, this);
-            action->setCheckable(true);
-            action->setChecked(item_option.selected);
-            action->setDisabled(item_option.disabled);
-            action->setData(QVariant(static_cast<uint>(item_option.id)));
-            QObject::connect(action, &QAction::triggered, this, &WebContentView::select_dropdown_action);
-            m_select_dropdown->addAction(action);
-        };
-
-        for (auto const& item : items) {
-            if (item.has<Web::HTML::SelectItemOptionGroup>()) {
-                auto const& item_option_group = item.get<Web::HTML::SelectItemOptionGroup>();
-                QAction* subtitle = new QAction(qstring_from_utf16_string(item_option_group.label), this);
-                subtitle->setDisabled(true);
-                m_select_dropdown->addAction(subtitle);
-
-                for (auto const& item_option : item_option_group.items)
-                    add_menu_item(item_option, true);
-            }
-
-            if (item.has<Web::HTML::SelectItemOption>())
-                add_menu_item(item.get<Web::HTML::SelectItemOption>(), false);
-
-            if (item.has<Web::HTML::SelectItemSeparator>())
-                m_select_dropdown->addSeparator();
-        }
-
-        m_select_dropdown->exec(map_point_to_global_position(content_position));
+        m_select_dropdown->open(map_point_to_global_position(content_position), minimum_width, items);
     };
 }
 
@@ -280,12 +247,6 @@ void WebContentView::finish_window_move()
     create();
     show();
 #endif
-}
-
-void WebContentView::select_dropdown_action()
-{
-    QAction* action = qobject_cast<QAction*>(sender());
-    select_dropdown_closed(action->data().value<uint>());
 }
 
 static Web::UIEvents::MouseButton get_button_from_qt_mouse_button(Qt::MouseButton button)
@@ -1044,10 +1005,7 @@ private:
 
 void WebContentView::close_select_dropdown_after_crash()
 {
-    if (!m_select_dropdown->isVisible())
-        return;
-    m_suppress_select_dropdown_close = true;
-    m_select_dropdown->close();
+    m_select_dropdown->close_without_reporting();
 }
 
 void WebContentView::set_crash_overlay_visible(bool visible)
@@ -1107,6 +1065,14 @@ void WebContentView::set_crash_overlay_visible(bool visible)
         layout->addWidget(message);
         layout->addSpacing(12);
         layout->addWidget(m_crash_overlay_reload_button, 0, Qt::AlignHCenter);
+        if (WebView::CrashReport::is_supported()) {
+            auto* reports_button = new QPushButton(tr("View crash reports"), m_crash_overlay);
+            QObject::connect(reports_button, &QPushButton::clicked, this, [this] {
+                if (WebView::CrashReport::show_directory().is_error())
+                    QMessageBox::warning(this, tr("Crash reports"), tr("Could not open the crash reports folder."));
+            });
+            layout->addWidget(reports_button, 0, Qt::AlignHCenter);
+        }
         layout->addStretch();
     }
 
@@ -1133,8 +1099,20 @@ void WebContentView::resizeEvent(QResizeEvent* event)
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
     update_vulkan_window_geometry();
 #endif
-    update_viewport_size();
-    handle_resize();
+    // One window resize reaches the view as several resize events in one turn of the event loop
+    // (the chrome around it settles after it). The page gets one viewport size per turn: the size
+    // the view has when the turn ends, pushed once.
+    if (m_viewport_push_pending)
+        return;
+    m_viewport_push_pending = true;
+    Core::deferred_invoke([self = QPointer<WebContentView>(this)] {
+        if (!self)
+            return;
+        self->m_viewport_push_pending = false;
+        if (!self->m_client_state.client)
+            return;
+        self->update_viewport_size();
+    });
 }
 
 void WebContentView::set_viewport_rect(Gfx::IntRect rect)
@@ -1156,7 +1134,6 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
 {
     m_device_pixel_ratio = device_pixel_ratio;
     update_viewport_size();
-    handle_resize();
 }
 
 void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, [[maybe_unused]] int right)

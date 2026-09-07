@@ -276,10 +276,10 @@ void CompositorHostBase::cancel_smooth_scroll(Web::Compositor::CompositorContext
         connection->cancel_smooth_scroll(context_id, stable_node_id);
 }
 
-Web::Compositor::PendingAsyncScrollUpdates CompositorHostBase::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id)
+Web::Compositor::PendingAsyncScrollUpdates CompositorHostBase::take_pending_async_scroll_updates(Web::Compositor::CompositorContextId context_id, Web::Compositor::AsyncScrollUpdateFreshness freshness)
 {
     if (auto* connection = compositor_connection())
-        return connection->take_pending_async_scroll_updates(context_id);
+        return connection->take_pending_async_scroll_updates(context_id, freshness);
     return {};
 }
 
@@ -294,6 +294,12 @@ bool CompositorHostBase::request_rendering_opportunity(Web::Compositor::Composit
     if (auto* connection = compositor_connection())
         return connection->request_rendering_opportunity(context_id, maximum_frames_per_second);
     return false;
+}
+
+void CompositorHostBase::hurry_rendering_opportunity(Web::Compositor::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->hurry_rendering_opportunity(context_id);
 }
 
 void CompositorHostBase::present_frame(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect)

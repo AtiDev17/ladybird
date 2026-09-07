@@ -2069,6 +2069,16 @@ void Element::publish_custom_property_names()
         : published_pseudo_element_data.is_empty() && published_references.is_empty();
     if (published_names == m_published_custom_property_names && published_extra_names_match)
         return;
+    // An environment that declares the same names as the published one, with other values, is the
+    // same index entry: a root whose declarations moved value hands out its names again otherwise.
+    if (published_extra_names_match
+        && published_names.data && m_published_custom_property_names.data
+        && published_names.uses_var_css_function == m_published_custom_property_names.uses_var_css_function
+        && published_names.uses_custom_function == m_published_custom_property_names.uses_custom_function
+        && published_names.data->declares_same_names(*m_published_custom_property_names.data)) {
+        m_published_custom_property_names = move(published_names);
+        return;
+    }
     CSS::record_element_custom_property_names(*this, published_names.data.ptr(), published_pseudo_element_data, published_references, m_style_uses_var_css_function, m_style_uses_custom_function);
     m_published_custom_property_names = move(published_names);
     if (!published_pseudo_element_data.is_empty() || !published_references.is_empty()) {
@@ -2211,9 +2221,9 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_engine_computed_style_r
                 element.play_or_cancel_animations_after_display_property_change();
                 return TraversalDecision::Continue;
             });
-            // NB: Elements inside a display:none subtree are not recomputed, so discard their materialized
-            //     styles. This makes a CSSOM read rematerialize the requested inheritance path, and the
-            //     caller's typed reactions rematerialize all descendants when the subtree becomes visible again.
+            // NB: Clear hidden descendant styles so they cannot become transition before-change styles.
+            //     Descendants needed by SVG resources are scheduled for recomputation; other descendants
+            //     rematerialize on a CSSOM read or when the subtree becomes visible again.
             if (new_display_is_none)
                 clear_computed_styles_from_display_none_descendants();
         }
@@ -2345,6 +2355,20 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
     // already holds. Nothing derived from the originating style needs to be compared or published
     // again in that case. Pseudo-element declarations are a separate cascade projected from the
     // originating element's matches, so they still have to consume that shared match result.
+    // Only the inherited custom-property environment moved, and no cascade of the element or its
+    // pseudo-elements read a name it moved: every style stands, and the descendants react to the
+    // environment.
+    if (old_computed_values && style_record_is_unchanged(style_record_delta) && !root_font_metrics_changed
+        && pseudo_element_inputs == PseudoElementInputs::Unchanged
+        && !(m_rendered_in_top_layer && !computed_style(CSS::PseudoElement::Backdrop))
+        && mode == StyleRecomputeMode::Normal && style_computer.last_materialization_kept_pseudo_element_styles()) {
+        counters.element_style_noop_recomputations++;
+        publish_custom_property_names();
+        if (did_change_custom_properties)
+            invalidate_descendant_styles_depending_on_style_container_query();
+        return {};
+    }
+
     if (old_computed_values && style_record_is_unchanged(style_record_delta) && !did_change_custom_properties && !root_font_metrics_changed) {
         if (pseudo_styles_are_unchanged) {
             counters.element_style_noop_recomputations++;
@@ -2464,9 +2488,9 @@ CSS::RequiredInvalidationAfterStyleChange Element::apply_style_engine_reaction(b
         });
     }
 
-    // NB: Elements inside a display:none subtree are not recomputed, so discard their materialized styles. This
-    //     makes a CSSOM read rematerialize the requested inheritance path, and the caller's typed reactions
-    //     rematerialize all descendants when the subtree becomes visible again.
+    // NB: Clear hidden descendant styles so they cannot become transition before-change styles.
+    //     Descendants needed by SVG resources are scheduled for recomputation; other descendants
+    //     rematerialize on a CSSOM read or when the subtree becomes visible again.
     auto current_computed_values = computed_style();
     VERIFY(current_computed_values);
     if (old_computed_values && old_computed_values->display().is_none() != current_computed_values->display().is_none()) {
@@ -2520,6 +2544,13 @@ void Element::clear_computed_styles_from_display_none_descendants()
         if (auto* layout_node = element->unsafe_layout_node())
             layout_node->pin_style_record_for_detachment();
         element->m_style_record_identity = 0;
+
+        // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
+        //     Recompute their styles in this style update, including any missing inheritance
+        //     ancestors, so painting never needs to materialize styles for referenced resources.
+        if (element->is_svg_element())
+            element->document().style_computer().style_engine().record_element_style_input_change(element->style_node_id());
+
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
             pseudo_element.clear_computed_style();
         });

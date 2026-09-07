@@ -47,9 +47,10 @@ public:
         Gfx::IntRect viewport_rect, SnapContainerHandling, AsyncScrollOperationTracking = AsyncScrollOperationTracking::No);
     AsyncScrollEnqueueResult smooth_scroll_to(AsyncScrollNodeStableID, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, ScrollAnimationKind);
     void cancel_smooth_scroll(AsyncScrollNodeStableID);
-    PendingAsyncScrollUpdates take_pending_async_scroll_updates();
+    PendingAsyncScrollUpdates take_pending_async_scroll_updates(AsyncScrollUpdateFreshness);
     void viewport_size_updated(Gfx::IntSize, WindowResizingInProgress);
     bool request_rendering_opportunity(double maximum_frames_per_second);
+    void hurry_rendering_opportunity();
     void present_frame(Gfx::IntRect viewport_rect);
     void request_screenshot(NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback);
 
@@ -94,9 +95,10 @@ public:
         = 0;
     virtual AsyncScrollEnqueueResult smooth_scroll_to(CompositorContextId, AsyncScrollNodeStableID, Gfx::FloatPoint offset_in_device_pixels, Gfx::FloatPoint main_thread_offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, ScrollAnimationKind) = 0;
     virtual void cancel_smooth_scroll(CompositorContextId, AsyncScrollNodeStableID) = 0;
-    virtual PendingAsyncScrollUpdates take_pending_async_scroll_updates(CompositorContextId) = 0;
+    virtual PendingAsyncScrollUpdates take_pending_async_scroll_updates(CompositorContextId, AsyncScrollUpdateFreshness) = 0;
     virtual void viewport_size_updated(CompositorContextId, Gfx::IntSize, WindowResizingInProgress) = 0;
     virtual bool request_rendering_opportunity(CompositorContextId, double maximum_frames_per_second) = 0;
+    virtual void hurry_rendering_opportunity(CompositorContextId) = 0;
     virtual void present_frame(CompositorContextId, Gfx::IntRect viewport_rect) = 0;
     virtual void request_screenshot(CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback) = 0;
 

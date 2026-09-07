@@ -211,8 +211,8 @@ impl StyleEngine {
     }
 
     /// Whether the node's style reads custom properties: its cascade declares some, or a winner
-    /// of its state was written with a substitution.
-    pub(super) fn node_style_reads_custom_properties(&mut self, node: StyleNodeID) -> bool {
+    /// of its state was written with a substitution. A node whose reads are unknown reads.
+    pub fn node_style_reads_custom_properties(&mut self, node: StyleNodeID) -> bool {
         // Published substitution usage also includes the pseudo styles C++ computes, whose
         // reads are not represented by the element's own winner state.
         if self.facts.uses_unnamed_custom_properties(node) || self.node_declares_custom_properties(node) {
@@ -573,7 +573,7 @@ impl StyleEngine {
             return None;
         };
         let registry = inputs.custom_property_registry;
-        if registry.is_null() || unsafe { &*registry.cast::<CustomPropertyRegistry>() }.has_registrations() {
+        if registry.is_null() {
             self.counters.bump(Counter::EngineComputedRecordBailSubstitution);
             return None;
         }
