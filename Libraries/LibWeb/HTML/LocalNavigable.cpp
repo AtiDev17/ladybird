@@ -785,15 +785,47 @@ bool LocalNavigable::is_script_closable()
         || as<LocalTraversableNavigable>(this)->session_history_entry_count() == 1;
 }
 
+// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#potentially-delays-the-load-event
+bool LocalNavigable::delays_the_load_event_of_its_container() const
+{
+    // AD-HOC: A destroyed document leaves its navigable without an active document until the next one is activated
+    //         or the navigable itself goes away, which the specification has no state for. A document that does not
+    //         exist is not ready for post-load tasks.
+    auto document = active_document();
+    if (!document)
+        return true;
+
+    // - element's content navigable's active document is not ready for post-load tasks;
+    if (!document->ready_for_post_load_tasks())
+        return true;
+
+    // - element's content navigable's is delaying load events is true; or
+    if (is_delaying_load_events())
+        return true;
+
+    // - anything is delaying the load event of element's content navigable's active document.
+    if (document->anything_is_delaying_the_load_event())
+        return true;
+
+    return false;
+}
+
 void LocalNavigable::set_delaying_load_events(bool value)
 {
-    if (value) {
-        auto document = container_document();
-        VERIFY(document);
-        m_delaying_the_load_event.emplace(*document);
-    } else {
-        m_delaying_the_load_event.clear();
+    m_is_delaying_load_events = value;
+
+    // The container document's load event waits on this flag where that document lives.
+    // FIXME: A container document hosted in another process does not wait yet. Its process needs the loading state
+    //        replicated for the remote navigable that stands in for this one.
+    if (!value) {
+        m_container_document_load_event_delayer.clear();
+        return;
     }
+    if (auto document = container_document()) {
+        m_container_document_load_event_delayer.emplace(*document);
+        return;
+    }
+    VERIFY(parent() && !is<LocalNavigable>(*parent()));
 }
 
 void LocalNavigable::set_navigation_load_event_guard(DOM::Document& parent_doc)
@@ -1075,7 +1107,7 @@ Vector<NonnullRefPtr<SessionHistoryEntry>> LocalNavigable::session_history_entri
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#initialize-the-navigable
-void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state)
+void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<Navigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state)
 {
     set_id(page().client().allocate_navigable_id());
 
@@ -1100,19 +1132,23 @@ void LocalNavigable::initialize_navigable(NonnullRefPtr<DocumentState> document_
 
     // 5. Set navigable's parent to parent.
     set_parent(parent);
-    if (parent) {
-        m_should_show_line_box_borders = parent->m_should_show_line_box_borders;
-        m_force_dark_enabled = parent->m_force_dark_enabled;
-        m_force_dark_foreground_threshold = parent->m_force_dark_foreground_threshold;
-        m_force_dark_background_threshold = parent->m_force_dark_background_threshold;
-        m_should_show_caret_hit_test_debug_overlay = parent->m_should_show_caret_hit_test_debug_overlay;
-    }
-    if (parent && !m_is_svg_page && has_compositor_context() && parent->has_compositor_context()) {
-        compositor_context().set_parent_context(parent->compositor_context().id());
-    }
 
     // 6. Set the initial visibility state of documentState's document to navigable's traversable navigable's system visibility state.
     document->set_initial_visibility_state(system_visibility_state);
+}
+
+// AD-HOC: The debug settings and the compositor tree are per page, so a child navigable starts from its parent's. A
+//         navigable that roots a page receives both from the page host instead.
+void LocalNavigable::inherit_page_state_from(LocalNavigable const& parent)
+{
+    m_should_show_line_box_borders = parent.m_should_show_line_box_borders;
+    m_force_dark_enabled = parent.m_force_dark_enabled;
+    m_force_dark_foreground_threshold = parent.m_force_dark_foreground_threshold;
+    m_force_dark_background_threshold = parent.m_force_dark_background_threshold;
+    m_should_show_caret_hit_test_debug_overlay = parent.m_should_show_caret_hit_test_debug_overlay;
+
+    if (!m_is_svg_page && has_compositor_context() && parent.has_compositor_context())
+        compositor_context().set_parent_context(parent.compositor_context().id());
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
@@ -1356,6 +1392,11 @@ Optional<URL::Origin> LocalNavigable::active_document_origin() const
     return m_active_document->origin();
 }
 
+bool LocalNavigable::active_document_is_fully_active() const
+{
+    return m_active_document && m_active_document->is_fully_active();
+}
+
 ReplicatedNavigableState LocalNavigable::replicated_state() const
 {
     VERIFY(m_active_document);
@@ -1449,20 +1490,6 @@ GC::Ptr<DOM::Document> LocalNavigable::container_document() const
 
     // 2. Return navigable's container's node document.
     return container->document();
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-traversable
-GC::Ptr<LocalTraversableNavigable> LocalNavigable::traversable_navigable() const
-{
-    // 1. Let navigable be inputNavigable.
-    GC::Ptr<Navigable> navigable = const_cast<LocalNavigable*>(this);
-
-    // 2. While navigable is not a traversable navigable, set navigable to navigable's parent.
-    while (navigable && !is<LocalTraversableNavigable>(*navigable))
-        navigable = navigable->parent();
-
-    // 3. Return navigable.
-    return navigable ? &as<LocalTraversableNavigable>(*navigable) : nullptr;
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#set-the-ongoing-navigation
@@ -1672,19 +1699,19 @@ LocalNavigable::ChosenNavigable LocalNavigable::choose_a_navigable(Utf16View nam
 
         auto request_new_web_view = [&] {
             TokenizedFeature::Map empty_window_features;
-            auto hints = WebViewHints::from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, traversable_navigable()->page());
+            auto hints = WebViewHints::from_tokenised_features(window_features.has_value() ? *window_features : empty_window_features, page());
             Optional<CrossProcessId> opener_navigable_id;
             Optional<URL::URL> opener_base_url;
             if (new_no_opener == TokenizedFeature::NoOpener::No) {
                 opener_navigable_id = id();
                 opener_base_url = active_document()->base_url();
             }
-            return traversable_navigable()->page().client().page_did_request_new_web_view(activate_tab, hints, opener_navigable_id, move(opener_base_url), new_target_name);
+            return page().client().page_did_request_new_web_view(activate_tab, hints, opener_navigable_id, move(opener_base_url), new_target_name);
         };
 
         // --> If currentNavigable's active window does not have transient activation and the user agent has been configured to
         //     not show popups (i.e., the user agent has a "popup blocker" enabled)
-        if (active_window() && !active_window()->has_transient_activation() && traversable_navigable()->page().should_block_pop_ups()) {
+        if (active_window() && !active_window()->has_transient_activation() && page().should_block_pop_ups()) {
             // FIXME: The user agent may inform the user that a popup has been blocked.
             dbgln("Pop-up blocked!");
         }
@@ -5913,7 +5940,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
     m_adopted_async_scroll_sequence = 0;
 
     if (has_compositor_context()) {
-        if (auto parent = this->parent()) {
+        if (auto parent = this->parent(); parent && !is_local_root()) {
             auto& local_parent = as<LocalNavigable>(*parent);
             if (local_parent.has_compositor_context())
                 compositor_context().set_parent_context(local_parent.compositor_context().id());

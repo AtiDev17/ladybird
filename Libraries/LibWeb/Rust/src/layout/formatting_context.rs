@@ -571,6 +571,12 @@ pub(crate) fn box_baseline_with_content_baselines(
     if display.is_inline_outside() && is_flex_or_grid_container {
         baseline_set = BaselineSet::First;
     }
+    // https://www.w3.org/TR/CSS22/tables.html#height-layout
+    // "The baseline of an 'inline-table' is the baseline of the first row of the table." The table wrapper box of an
+    // inline-table is displayed like an inline-block, but is not one.
+    if display.is_inline_outside() && facts.is_table_wrapper() {
+        baseline_set = BaselineSet::First;
+    }
 
     // https://drafts.csswg.org/css2/#propdef-vertical-align
     // The baseline of an 'inline-block' is the baseline of its last line box in the normal flow, unless it has either
@@ -583,13 +589,12 @@ pub(crate) fn box_baseline_with_content_baselines(
     // baseline sets always derive from content; so do flex and grid containers, which are not block containers.
     // FIXME: Per CSS Align, a scroll container's content-derived baseline position should be clamped to its border
     //        edge.
-    let has_visible_overflow = style.overflow_x() == overflow::VISIBLE && style.overflow_y() == overflow::VISIBLE;
     let derive_baseline_from_content =
-        baseline_set == BaselineSet::First || is_flex_or_grid_container || has_visible_overflow;
+        baseline_set == BaselineSet::First || is_flex_or_grid_container || !facts.is_scroll_container();
 
-    // AD-HOC: We also use the content-derived baseline for <input> elements with block children. Per the HTML spec,
-    //         inputs have `overflow: clip !important`, so CSS2 says to use bottom margin edge. However, the internal
-    //         shadow tree baseline should determine the control's baseline for proper alignment with adjacent text.
+    // AD-HOC: We also use the content-derived baseline for <input> elements with block children, even when their
+    //         overflow makes them scroll containers. The internal shadow tree baseline should determine the control's
+    //         baseline for proper alignment with adjacent text.
     //         https://html.spec.whatwg.org/multipage/rendering.html#form-controls
     let input_derives_from_children = facts.is_html_input_element() && !facts.children_are_inline();
 
@@ -700,6 +705,12 @@ pub(crate) fn derive_baselines(
                 continue;
             }
             if !table_formatting_context::child_participates_in_table_run(container_display, &child_facts) {
+                continue;
+            }
+            // A table wrapper box has the baselines of its table box, not of a caption above it: "The baseline of an
+            // 'inline-table' is the baseline of the first row of the table."
+            // https://www.w3.org/TR/CSS22/tables.html#height-layout
+            if facts.is_table_wrapper() && !child_facts.display().is_table_inside() {
                 continue;
             }
             if container_skips_anonymous_whitespace_runs && callbacks.can_skip_is_anonymous_text_run(child) {
@@ -981,6 +992,13 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         });
     }
     let display = style.map(|style| style.display());
+    // NB: A flex fieldset lays out its legend and anonymous content box in a block formatting context.
+    //     Flex layout applies only to the anonymous content box.
+    if data.kind.get() == crate::layout::node_data::NodeKind::FieldSetBox
+        && display.is_some_and(|display| display.is_flex_inside())
+    {
+        return Some(FfiFormattingContextType::Block);
+    }
     if display.is_some_and(|display| display.is_flex_inside()) {
         return Some(FfiFormattingContextType::Flex);
     }

@@ -70,15 +70,14 @@ public:
     using NullOrError = NavigationParamsNullOrError;
     using NavigationParamsVariant = HTML::NavigationParamsVariant;
 
-    void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state);
+    void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<Navigable> parent, GC::Ref<DOM::Document> document, VisibilityState system_visibility_state);
+    void inherit_page_state_from(LocalNavigable const& parent);
     void set_id_for_session_history_reconstruction(CrossProcessId id) { set_id(id); }
 
     void register_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
     void unregister_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
 
     Vector<GC::Root<LocalNavigable>> child_navigables() const;
-
-    virtual bool is_traversable() const { return false; }
 
     bool is_local_root() const;
 
@@ -89,7 +88,7 @@ public:
     void stop_loading();
 
     void set_delaying_load_events(bool value);
-    bool is_delaying_load_events() const { return m_delaying_the_load_event.has_value(); }
+    bool is_delaying_load_events() const { return m_is_delaying_load_events; }
 
     void set_navigation_load_event_guard(DOM::Document& parent_doc);
     void clear_navigation_load_event_guard();
@@ -130,6 +129,7 @@ public:
 
     virtual Optional<URL::URL> active_document_url() const override;
     virtual Optional<URL::Origin> active_document_origin() const override;
+    virtual bool active_document_is_fully_active() const override;
     ReplicatedNavigableState replicated_state() const;
 
     void save_persisted_state_to_active_session_history_entry();
@@ -143,8 +143,6 @@ public:
     GC::Ptr<NavigableContainer> container() const;
     void set_container(Badge<NavigableContainer>, GC::Ptr<NavigableContainer> container) { m_container = container; }
     GC::Ptr<DOM::Document> container_document() const;
-
-    GC::Ptr<LocalTraversableNavigable> traversable_navigable() const;
 
     [[nodiscard]] bool is_focused() const;
 
@@ -263,8 +261,9 @@ public:
     // https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-size
     CSSPixelSize snapshot_containing_block_size();
 
-    bool has_session_history_entry_and_ready_for_navigation() const { return m_has_session_history_entry_and_ready_for_navigation; }
+    virtual bool has_session_history_entry_and_ready_for_navigation() const override { return m_has_session_history_entry_and_ready_for_navigation; }
     void set_has_session_history_entry_and_ready_for_navigation();
+    virtual bool delays_the_load_event_of_its_container() const override;
 
     void inform_the_navigation_api_about_child_navigable_destruction();
 
@@ -517,7 +516,8 @@ private:
     bool m_closing { false };
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#delaying-load-events-mode
-    Optional<DOM::DocumentLoadEventDelayer> m_delaying_the_load_event;
+    bool m_is_delaying_load_events { false };
+    Optional<DOM::DocumentLoadEventDelayer> m_container_document_load_event_delayer;
 
     // AD-HOC: Guards the parent document's load event delay count during cross-document navigation.
     Optional<DOM::DocumentLoadEventDelayer> m_navigation_load_event_guard;

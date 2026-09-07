@@ -2666,9 +2666,42 @@ impl TreeBuilderHost<'_> {
         for &node in nodes {
             self.move_child(node, wrapper_slot, NodeSlotId::INVALID);
         }
-        let parent_children_are_inline = node_has_flag(self.data(parent), NodeFlag::ChildrenAreInline);
-        self.set_children_are_inline(wrapper_slot, parent_children_are_inline);
+        // An anonymous table-cell takes over the run of content it is generated around, so it has inline children
+        // exactly when that run is inline-level. Anonymous table-row, table and inline-table boxes only ever own
+        // table-internal boxes (their wrapped children are, or become through the remaining fixup steps, table-internal
+        // boxes), so they never have inline children, not even when they are generated inside an inline box. An
+        // inline-table with inline children would also not derive its baseline from its first row.
+        let children_are_inline = match kind {
+            FfiAnonymousTableBoxKind::TableCell => nodes.iter().any(|&node| node_is_inline_outside(self, node)),
+            FfiAnonymousTableBoxKind::TableRow
+            | FfiAnonymousTableBoxKind::Table
+            | FfiAnonymousTableBoxKind::InlineTable => false,
+        };
+        self.set_children_are_inline(wrapper_slot, children_are_inline);
         self.attach_child(parent, wrapper, nearest_sibling);
+        // The wrapper takes the place of the run in its parent. A table-row, table-cell or table box is block-level,
+        // so a parent whose inline content it replaced entirely (a table-row-group or table around text, a table-row
+        // around text or inline boxes) no longer has inline children. A stale flag would make derive_baselines() look
+        // for line boxes the parent does not have, leaving it and every box that derives its baseline from it (a cell
+        // around a nested table, an inline-table in a line) without a baseline. A parent that keeps inline-level
+        // children next to the wrapper (text around an anonymous table generated for out-of-flow row groups, which
+        // the fixup treats as inline-level boxes of zero size) still lays its children out in a line, and inline
+        // boxes keep their inline children: the table-row generated around their cells is wrapped in an inline-level
+        // inline-table next.
+        if !matches!(kind, FfiAnonymousTableBoxKind::InlineTable) && node_kind_is_box(self.data(parent).kind.get()) {
+            let mut has_inline_child = false;
+            let mut child = self.first_child(parent);
+            while !child.is_invalid() {
+                if child != wrapper_slot && node_is_inline_outside(self, child) {
+                    has_inline_child = true;
+                    break;
+                }
+                child = self.next_sibling(child);
+            }
+            if !has_inline_child {
+                self.set_children_are_inline(parent, false);
+            }
+        }
     }
 }
 
@@ -2828,7 +2861,15 @@ fn insertion_parent_for_block_node(
 
     // Inline is fine for in-flow block children (interrupting blocks) and for out-of-flow children;
     // the inline formatting context emits items for both.
-    if !node_has_flag(layout.data(node), NodeFlag::Anonymous)
+    // Block-level pseudo-element boxes climb out of inline ancestors instead (see below). A table-internal
+    // pseudo-element box has to stay a child of its originating inline box though: table fixup generates one anonymous
+    // inline-table around the consecutive table-internal children of the inline, so e.g. a `display: table-cell`
+    // ::after joins the table of the table-cell siblings in the inline instead of starting a separate block-level
+    // table outside of it.
+    // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+    let is_table_internal_pseudo_element_box = node_has_flag(layout.data(node), NodeFlag::Anonymous)
+        && is_table_non_root_box_with_display(display_for_table_fixup(&layout, node));
+    if (!node_has_flag(layout.data(node), NodeFlag::Anonymous) || is_table_internal_pseudo_element_box)
         && node_is_inline_outside(&layout, parent)
         && layout
             .style(parent)
@@ -3342,7 +3383,7 @@ fn wrap_fieldset_contents_if_needed(host: &TreeBuilderHost<'_>, layout_node: Lay
     // rendered legend, if there is one.
     if host.data(layout_node).kind.get() == NodeKind::FieldSetBox {
         let legend = rendered_legend(host, layout_node);
-        if legend.is_invalid() {
+        if legend.is_invalid() && !host.display(layout_node).is_flex_inside() {
             return;
         }
 
@@ -3415,6 +3456,11 @@ fn is_table_non_root_box_with_display(display: FfiDisplay) -> bool {
 
 fn is_table_non_root_box(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
     is_table_non_root_box_with_display(host.display(node))
+}
+
+fn is_table_non_root_box_sibling(host: &TreeBuilderHost<'_>, sibling: LayoutNode) -> bool {
+    // Text nodes carry their parent's style, so only boxes can be table-non-root boxes.
+    !sibling.is_invalid() && node_kind_is_box(host.data(sibling).kind.get()) && is_table_non_root_box(host, sibling)
 }
 
 fn is_tabular_container(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
@@ -3491,21 +3537,31 @@ fn for_each_sequence_of_consecutive_children_matching(
     matcher: impl Fn(LayoutNode) -> bool,
     mut callback: impl FnMut(&[LayoutNode], LayoutNode),
 ) {
-    let mut sequence = Vec::new();
+    let mut sequence: Vec<LayoutNode> = Vec::new();
+    let mut end_sequence = |sequence: &mut Vec<LayoutNode>, mut nearest_sibling: LayoutNode| {
+        // Whitespace that follows the last matching child is not part of the sequence. The fixup algorithm only
+        // discards whitespace-only boxes that lie between two table-non-root boxes (step 1), so whitespace after the
+        // last box of the sequence stays outside the anonymous wrapper: in "a <cell>b</cell><cell>c</cell> d" the
+        // space before "d" is ordinary inline content next to the generated inline-table.
+        while sequence.last().is_some_and(|&last| !matcher(last)) {
+            nearest_sibling = sequence.pop().expect("a trailing whitespace node");
+        }
+        if !sequence.iter().all(|&node| is_ignorable_whitespace(host, node)) {
+            callback(sequence, nearest_sibling);
+        }
+        sequence.clear();
+    };
     let mut child = host.first_child(parent);
     while !child.is_invalid() {
         if matcher(child) || (!sequence.is_empty() && is_ignorable_whitespace(host, child)) {
             sequence.push(child);
         } else if !sequence.is_empty() {
-            if !sequence.iter().all(|&node| is_ignorable_whitespace(host, node)) {
-                callback(&sequence, child);
-            }
-            sequence.clear();
+            end_sequence(&mut sequence, child);
         }
         child = host.next_sibling(child);
     }
-    if !sequence.is_empty() && !sequence.iter().all(|&node| is_ignorable_whitespace(host, node)) {
-        callback(&sequence, NodeSlotId::INVALID);
+    if !sequence.is_empty() {
+        end_sequence(&mut sequence, NodeSlotId::INVALID);
     }
 }
 
@@ -3515,10 +3571,11 @@ fn remove_irrelevant_boxes(host: &TreeBuilderHost<'_>, root: LayoutNode) {
     // The following boxes are discarded as if they were display:none:
     let mut to_remove = Vec::new();
     host.for_each_in_inclusive_subtree(root, |node| {
-        let data = host.data(node);
+        // Whitespace checks below can refresh rendered text, so read the node data before them and not after.
+        let is_box = node_kind_is_box(host.data(node).kind.get());
 
         // 1. Children of a table-column.
-        if node_kind_is_box(data.kind.get()) && host.display(node).is_table_column() {
+        if is_box && host.display(node).is_table_column() {
             host.set_children_are_inline(node, false);
             let mut child = host.first_child(node);
             while !child.is_invalid() {
@@ -3528,7 +3585,7 @@ fn remove_irrelevant_boxes(host: &TreeBuilderHost<'_>, root: LayoutNode) {
         }
 
         // 2. Children of a table-column-group which are not a table-column.
-        if node_kind_is_box(data.kind.get()) && host.display(node).is_table_column_group() {
+        if is_box && host.display(node).is_table_column_group() {
             host.set_children_are_inline(node, false);
             let mut child = host.first_child(node);
             while !child.is_invalid() {
@@ -3539,15 +3596,38 @@ fn remove_irrelevant_boxes(host: &TreeBuilderHost<'_>, root: LayoutNode) {
             }
         }
 
-        // FIXME: 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each
-        //           of which is a table-non-root box.
+        // Steps 1 and 2 already scheduled the children of table-column boxes and the non-column children of
+        // table-column-group boxes when visiting their parent; their whole subtree goes away with them.
+        let parent = host.parent(node);
+        if !parent.is_invalid() && node_kind_is_box(host.data(parent).kind.get()) {
+            let parent_display = host.display(parent);
+            if parent_display.is_table_column()
+                || (parent_display.is_table_column_group() && !host.display(node).is_table_column())
+            {
+                return TraversalDecision::SkipChildrenAndContinue;
+            }
+        }
+
+        // 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of
+        //    which is a table-non-root box.
+        // This is what keeps "<cell>b</cell> <cell>c</cell>" a single table with adjacent cells, regardless of whether
+        // the siblings live in a table, in a block (where the whitespace sits in an anonymous block wrapper) or in an
+        // inline box. The whitespace before the first and after the last table-non-root box of such a run is not
+        // discarded and remains ordinary inline content.
+        if !parent.is_invalid()
+            && is_table_non_root_box_sibling(host, host.previous_sibling(node))
+            && is_table_non_root_box_sibling(host, host.next_sibling(node))
+            && is_ignorable_whitespace(host, node)
+        {
+            to_remove.push(node);
+            return TraversalDecision::SkipChildrenAndContinue;
+        }
 
         // 4. Anonymous inline boxes which meet all of the following criteria:
         //    - they contain only white space
         //    - they are the first and/or last child of a tabular container
         //    - whose immediate sibling, if any, is a table-non-root box
-        let parent = host.parent(node);
-        if node_kind_is_box(data.kind.get())
+        if is_box
             && !parent.is_invalid()
             && is_tabular_container(host, parent)
             && !node_has_flag(host.data(parent), NodeFlag::Anonymous)
@@ -3659,42 +3739,28 @@ fn generate_missing_parents(host: &TreeBuilderHost<'_>, root: LayoutNode) -> Vec
             FfiAnonymousTableBoxKind::Table
         };
 
-        let is_table_row_group = current_display.is_table_row_group()
-            || current_display.is_table_header_group()
-            || current_display.is_table_footer_group();
         // A table-row is misparented if its parent is neither a table-row-group nor a table-root box.
-        if !node_is_svg_content && !is_table_row_group && !current_display.is_table_inside() {
-            for_each_sequence_of_consecutive_children_matching(
-                host,
-                parent,
-                |child| node_has_flag(host.data(child), NodeFlag::HasStyle) && host.display(child).is_table_row(),
-                |sequence, nearest_sibling| {
-                    host.wrap_in_anonymous(sequence, nearest_sibling, anonymous_table_kind);
-                },
-            );
-        }
-
         // A table-column box is misparented if its parent is neither a table-column-group box nor a table-root box.
-        if !node_is_svg_content && !current_display.is_table_column_group() && !current_display.is_table_inside() {
-            for_each_sequence_of_consecutive_children_matching(
-                host,
-                parent,
-                |child| node_has_flag(host.data(child), NodeFlag::HasStyle) && host.display(child).is_table_column(),
-                |sequence, nearest_sibling| {
-                    host.wrap_in_anonymous(sequence, nearest_sibling, anonymous_table_kind);
-                },
-            );
-        }
-
         // A table-row-group, table-column-group, or table-caption box is misparented if its parent is not a table-root
         // box.
+        // The sequence spans misparented proper table children of every kind: the anonymous table-row generated
+        // around loose cells by step 1 and the table-row-group next to it belong to the same anonymous table.
         if !node_is_svg_content && !current_display.is_table_inside() {
+            let is_table_row_group = current_display.is_table_row_group_kind();
+            let is_table_column_group = current_display.is_table_column_group();
             for_each_sequence_of_consecutive_children_matching(
                 host,
                 parent,
                 |child| {
                     if !node_has_flag(host.data(child), NodeFlag::HasStyle) {
                         return false;
+                    }
+                    let display = host.display(child);
+                    if display.is_table_row() {
+                        return !is_table_row_group;
+                    }
+                    if display.is_table_column() {
+                        return !is_table_column_group;
                     }
                     let display = display_for_table_fixup(host, child);
                     is_table_track_group(display) || display.is_table_caption()

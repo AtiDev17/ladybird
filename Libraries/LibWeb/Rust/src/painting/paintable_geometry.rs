@@ -84,9 +84,27 @@ pub(crate) fn committed_inset(arena: &LayoutNodeArena, slot: NodeSlotId) -> FfiP
     })
 }
 
-pub(crate) fn committed_uses_collapsing_borders_model(arena: &LayoutNodeArena, slot: NodeSlotId) -> bool {
+pub(crate) fn committed_uses_collapsing_borders_model(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> bool {
     arena.with_committed_fragment_link(slot, |link| {
         link.is_some_and(|link| link.fragment.uses_collapsing_borders_model)
+    })
+}
+
+/// For a table cell: whether every column it spans has 'visibility: collapse', which removes the cell from the display
+/// along with the columns (CSS 2.2 §17.5.5).
+pub(crate) fn committed_hidden_by_collapsed_columns(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> bool {
+    arena.with_committed_fragment_link(slot, |link| {
+        link.is_some_and(|link| link.fragment.hidden_by_collapsed_columns)
+    })
+}
+
+/// For a table cell or a table-column(-group) box: the first grid column it occupies and the number of grid columns
+/// it spans.
+pub(crate) fn committed_table_column_range(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> (u32, u32) {
+    arena.with_committed_fragment_link(slot, |link| {
+        link.map_or((0, 0), |link| {
+            (link.fragment.table_column_index, link.fragment.table_column_span)
+        })
     })
 }
 
@@ -234,29 +252,40 @@ pub(crate) fn absolute_padding_box_rect(arena: &impl PaintableRowsRead, slot: No
     )
 }
 
+/// The border widths that lie within the box's border box. In the collapsing borders model, a collapsed border is
+/// centered on the grid line between two boxes, so only a part of it belongs to each: "the border-box of the table
+/// includes half of the table border" and, for cells, "half the width of the collapsed border on each side".
+/// https://www.w3.org/TR/CSS22/tables.html#collapsing-borders
+/// The border is split the same way layout splits it when placing the boxes (`UsedValues::border_left_collapsed`):
+/// the part before the grid line goes to the box before the line, the part after it to the box after the line.
+pub(crate) fn committed_border_box_edges(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> FfiPixelBox {
+    let border = committed_border(arena, slot);
+    let Some(is_table_box) = arena.with_committed_fragment_link(slot, |link| {
+        link.filter(|link| link.fragment.uses_collapsing_borders_model)
+            .map(|link| link.fragment.is_collapsed_borders_table_box)
+    }) else {
+        return border;
+    };
+    FfiPixelBox {
+        top: used_values::collapsed_border_share(border.top, true, is_table_box),
+        right: used_values::collapsed_border_share(border.right, false, is_table_box),
+        bottom: used_values::collapsed_border_share(border.bottom, false, is_table_box),
+        left: used_values::collapsed_border_share(border.left, true, is_table_box),
+    }
+}
+
 pub(crate) fn absolute_border_box_rect(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> CssPixelRect {
     let data = arena.paintable_data(slot);
     if node_painting::is_inline(arena, slot) {
         return CssPixelRect::from(data.local_border_box_union).translated_by(absolute_rect(arena, slot).location());
     }
     let padded = absolute_padding_box_rect(arena, slot);
-    let border = committed_border(arena, slot);
-    let mut border_top = border.top;
-    let mut border_bottom = border.bottom;
-    let mut border_left = border.left;
-    let mut border_right = border.right;
-    if committed_uses_collapsing_borders_model(arena, slot) {
-        let two = CssPixels::from_integer(2);
-        border_top = border_top.div_as_fraction(two).round();
-        border_bottom = border_bottom.div_as_fraction(two).round();
-        border_left = border_left.div_as_fraction(two).round();
-        border_right = border_right.div_as_fraction(two).round();
-    }
+    let border = committed_border_box_edges(arena, slot);
     CssPixelRect::new(
-        padded.x - border_left,
-        padded.y - border_top,
-        padded.width + border_left + border_right,
-        padded.height + border_top + border_bottom,
+        padded.x - border.left,
+        padded.y - border.top,
+        padded.width + border.left + border.right,
+        padded.height + border.top + border.bottom,
     )
 }
 

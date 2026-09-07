@@ -24,6 +24,10 @@ pub(crate) struct Fragment {
     pub(crate) padding_top: CssPixels,
     pub(crate) padding_bottom: CssPixels,
     pub(crate) uses_collapsing_borders_model: bool,
+    pub(crate) is_collapsed_borders_table_box: bool,
+    pub(crate) table_column_index: u32,
+    pub(crate) table_column_span: u32,
+    pub(crate) hidden_by_collapsed_columns: bool,
     pub(crate) collapsed_table_borders: Option<std::rc::Rc<table_formatting_context::OwnedCollapsedTableBorders>>,
     pub(crate) line_data: Option<std::rc::Rc<inline_content::InlineContent>>,
     pub(crate) grid_layout_data: Option<std::rc::Rc<grid_formatting_context::GridLayoutData>>,
@@ -77,6 +81,10 @@ impl Fragment {
             && self.padding_top == previous.padding_top
             && self.padding_bottom == previous.padding_bottom
             && self.uses_collapsing_borders_model == previous.uses_collapsing_borders_model
+            && self.is_collapsed_borders_table_box == previous.is_collapsed_borders_table_box
+            && self.table_column_index == previous.table_column_index
+            && self.table_column_span == previous.table_column_span
+            && self.hidden_by_collapsed_columns == previous.hidden_by_collapsed_columns
             && same_allocation(
                 self.collapsed_table_borders.as_ref(),
                 previous.collapsed_table_borders.as_ref(),
@@ -289,6 +297,10 @@ fn snapshot_fragment(
         padding_top: used.padding_top.get(),
         padding_bottom: used.padding_bottom.get(),
         uses_collapsing_borders_model: used.uses_collapsing_borders_model.get(),
+        is_collapsed_borders_table_box: used.is_collapsed_borders_table_box.get(),
+        table_column_index: used.table_column_index.get(),
+        table_column_span: used.table_column_span.get(),
+        hidden_by_collapsed_columns: used.hidden_by_collapsed_columns.get(),
         collapsed_table_borders,
         line_data,
         grid_layout_data,

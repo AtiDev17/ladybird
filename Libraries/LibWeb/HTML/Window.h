@@ -159,6 +159,7 @@ public:
     WebIDL::ExceptionOr<GC::Ref<Storage>> session_storage();
 
     void start_an_idle_period();
+    bool has_idle_callbacks() const { return !m_idle_request_callbacks.is_empty() || !m_runnable_idle_callbacks.is_empty(); }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
     bool has_sticky_activation() const;
@@ -299,6 +300,7 @@ public:
 
     [[nodiscard]] Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCollection>> named_item(Utf16FlyString const&) const;
     [[nodiscard]] Vector<Utf16FlyString> supported_property_names() const override;
+    [[nodiscard]] virtual bool is_supported_property_name(Utf16FlyString const&) const override;
 
     bool find(Utf16View string);
 

@@ -212,6 +212,7 @@ pub(crate) struct IntrinsicInlineMeasurementLayout {
     pub(crate) content_block_size: CssPixels,
     pub(crate) automatic_content_block_size: CssPixels,
     pub(crate) uses_collapsing_borders_model: bool,
+    pub(crate) is_collapsed_borders_table_box: bool,
     pub(crate) has_first_baseline: bool,
     pub(crate) first_baseline: CssPixels,
     pub(crate) has_last_baseline: bool,
@@ -1521,9 +1522,13 @@ impl LayoutNodeArena {
             return true;
         }
         let step = (upper - lower) / (descendant_count + 1);
-        if step < 2 {
+        // NB: Merely restoring strict order can leave the subtree dense enough to need another
+        //     relabel on the next insertion. Restore the normal insertion spacing, or try a larger
+        //     ancestor. The root already uses all available label space, so it cannot expand further.
+        if step < MAXIMUM_PRE_ORDER_LABEL_STRIDE && !self.data(subtree_root).parent.get().is_invalid() {
             return false;
         }
+        assert!(step >= 2, "pre-order label space exhausted");
         let mut position_in_subtree = 0u64;
         self.for_each_node_in_layout_subtree_in_pre_order(subtree_root, |node| {
             if node == subtree_root {
@@ -3234,6 +3239,10 @@ mod tests {
                 padding_top: CssPixels::default(),
                 padding_bottom: CssPixels::default(),
                 uses_collapsing_borders_model: false,
+                is_collapsed_borders_table_box: false,
+                table_column_index: 0,
+                table_column_span: 0,
+                hidden_by_collapsed_columns: false,
                 collapsed_table_borders: None,
                 line_data: None,
                 grid_layout_data: None,
@@ -3470,6 +3479,7 @@ mod tests {
                 content_block_size: CssPixels::from_raw(256),
                 automatic_content_block_size: CssPixels::from_raw(320),
                 uses_collapsing_borders_model: true,
+                is_collapsed_borders_table_box: true,
                 has_first_baseline: true,
                 first_baseline: CssPixels::from_raw(64),
                 has_last_baseline: true,

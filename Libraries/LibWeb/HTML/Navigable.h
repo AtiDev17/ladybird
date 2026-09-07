@@ -35,10 +35,16 @@ public:
 
     virtual GC::Ptr<WindowProxy> active_window_proxy() = 0;
     virtual Utf16String const& target_name() const = 0;
+    virtual bool is_traversable() const { return false; }
+    GC::Ref<Navigable> traversable_navigable();
     GC::Ref<Navigable> top_level_traversable();
     virtual bool is_top_level_traversable() const { return false; }
     virtual Optional<URL::URL> active_document_url() const = 0;
     virtual Optional<URL::Origin> active_document_origin() const = 0;
+    virtual bool active_document_is_fully_active() const = 0;
+
+    virtual bool has_session_history_entry_and_ready_for_navigation() const = 0;
+    virtual bool delays_the_load_event_of_its_container() const = 0;
 
     WebIDL::ExceptionOr<void> navigate(NavigateParams);
 

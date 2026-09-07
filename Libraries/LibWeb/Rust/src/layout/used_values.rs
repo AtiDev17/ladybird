@@ -437,8 +437,21 @@ pub(crate) struct UsedValues {
     pub has_definite_inline_size: Cell<bool>,
     pub has_definite_block_size: Cell<bool>,
     pub uses_collapsing_borders_model: Cell<bool>,
+    /// In the collapsing borders model, whether this is the table box rather than a cell. Both store the full widths
+    /// of the collapsed borders at their edges, of which only a part lies inside the box (see border_left_collapsed()
+    /// and friends): the table's border area lies outside the grid, so it owns the part of an outer border on the far
+    /// side of the first or last grid line, while a cell owns the part on the inner side of its grid lines.
+    pub is_collapsed_borders_table_box: Cell<bool>,
     pub has_line_clamp_point: Cell<bool>,
     pub is_invisible_for_line_clamp: Cell<bool>,
+
+    // For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
+    // columns it spans, so painting can find the cells that originate in a column (CSS 2.2 §17.5.1).
+    pub table_column_index: Cell<u32>,
+    pub table_column_span: Cell<u32>,
+    // For table cells: whether every column the cell spans has 'visibility: collapse', which removes the cell from
+    // the display along with the columns (CSS 2.2 §17.5.5).
+    pub hidden_by_collapsed_columns: Cell<bool>,
 
     pub inline_size_constraint: Cell<SizeConstraint>,
     pub block_size_constraint: Cell<SizeConstraint>,
@@ -488,8 +501,12 @@ impl Default for UsedValues {
             has_definite_inline_size: Cell::new(false),
             has_definite_block_size: Cell::new(false),
             uses_collapsing_borders_model: Cell::new(false),
+            is_collapsed_borders_table_box: Cell::new(false),
             has_line_clamp_point: Cell::new(false),
             is_invisible_for_line_clamp: Cell::new(false),
+            table_column_index: Cell::new(0),
+            table_column_span: Cell::new(0),
+            hidden_by_collapsed_columns: Cell::new(false),
             inline_size_constraint: Cell::new(SizeConstraint::None),
             block_size_constraint: Cell::new(SizeConstraint::None),
             has_content_offset: SealableCell::new(false),
@@ -638,8 +655,12 @@ used_values_cell_state! {
     has_definite_inline_size: bool,
     has_definite_block_size: bool,
     uses_collapsing_borders_model: bool,
+    is_collapsed_borders_table_box: bool,
     has_line_clamp_point: bool,
     is_invisible_for_line_clamp: bool,
+    table_column_index: u32,
+    table_column_span: u32,
+    hidden_by_collapsed_columns: bool,
     inline_size_constraint: SizeConstraint,
     block_size_constraint: SizeConstraint,
     has_content_offset: bool,
@@ -704,24 +725,13 @@ impl UsedValues {
             .set(clamp_to_max_dimension_value(value.max(CssPixels::default())));
     }
 
-    fn rounded_half_border(value: CssPixels) -> CssPixels {
-        let value = CssPixels::from_raw(value.raw_value() / 2);
-        let raw = value.raw_value();
-        let rounded = if raw > 0 {
-            (raw.saturating_add(32) & !63).min(i32::MAX & !63)
-        } else if raw < 0 {
-            let adjusted = raw.saturating_sub(32);
-            let floor = adjusted & !63;
-            floor.saturating_add(if adjusted & 63 != 0 { 64 } else { 0 })
-        } else {
-            0
-        };
-        CssPixels::from_raw(rounded)
+    fn collapsed_border_share(&self, width: CssPixels, start_edge: bool) -> CssPixels {
+        collapsed_border_share(width, start_edge, self.is_collapsed_borders_table_box.get())
     }
 
     pub(crate) fn border_left_collapsed(&self, collapsed: bool) -> CssPixels {
         if collapsed {
-            Self::rounded_half_border(self.border_left.get())
+            self.collapsed_border_share(self.border_left.get(), true)
         } else {
             self.border_left.get()
         }
@@ -729,7 +739,7 @@ impl UsedValues {
 
     pub(crate) fn border_right_collapsed(&self, collapsed: bool) -> CssPixels {
         if collapsed {
-            Self::rounded_half_border(self.border_right.get())
+            self.collapsed_border_share(self.border_right.get(), false)
         } else {
             self.border_right.get()
         }
@@ -737,7 +747,7 @@ impl UsedValues {
 
     pub(crate) fn border_top_collapsed(&self, collapsed: bool) -> CssPixels {
         if collapsed {
-            Self::rounded_half_border(self.border_top.get())
+            self.collapsed_border_share(self.border_top.get(), true)
         } else {
             self.border_top.get()
         }
@@ -745,7 +755,7 @@ impl UsedValues {
 
     pub(crate) fn border_bottom_collapsed(&self, collapsed: bool) -> CssPixels {
         if collapsed {
-            Self::rounded_half_border(self.border_bottom.get())
+            self.collapsed_border_share(self.border_bottom.get(), false)
         } else {
             self.border_bottom.get()
         }
@@ -840,6 +850,39 @@ impl UsedValues {
             inline_size,
             block_size,
         }
+    }
+}
+
+/// The part of a collapsed border that lies after its grid line (below or right of it), the rest lying before it.
+/// A collapsed border "is centered on the grid line" (CSS 2.2 §17.6.2), but layout keeps box edges on whole CSS
+/// pixels, so the border is split on whole pixels, an odd width giving its extra pixel to the part before the line.
+/// Every box on a grid line splits the border the same way, so the shares of the boxes on both sides of the line add
+/// up to the border width: a 1px border takes 1px of layout space, not a rounded-up half on each side.
+/// https://www.w3.org/TR/CSS22/tables.html#collapsing-borders
+pub(crate) fn collapsed_border_part_after_line(width: CssPixels) -> CssPixels {
+    if width <= CssPixels::default() {
+        return CssPixels::default();
+    }
+    (width / 2usize).floor()
+}
+
+/// The part of a collapsed border that lies before its grid line, see collapsed_border_part_after_line().
+pub(crate) fn collapsed_border_part_before_line(width: CssPixels) -> CssPixels {
+    if width <= CssPixels::default() {
+        return CssPixels::default();
+    }
+    width - collapsed_border_part_after_line(width)
+}
+
+/// The part of a collapsed border of the given width that lies inside a box on the border's grid line; `start_edge`
+/// says whether the line is at the box's top or left edge rather than its bottom or right one. A cell lies inside its
+/// grid lines, so it owns the part after the line at its start edges and the part before the line at its end edges;
+/// the table box lies around the grid and owns the opposite parts of its outer borders.
+pub(crate) fn collapsed_border_share(width: CssPixels, start_edge: bool, is_table_box: bool) -> CssPixels {
+    if start_edge != is_table_box {
+        collapsed_border_part_after_line(width)
+    } else {
+        collapsed_border_part_before_line(width)
     }
 }
 
@@ -1017,6 +1060,10 @@ pub(crate) fn used_values_from_committed_fragment_link(
     used.padding_right.set(fragment.padding_right);
     used.padding_top.set(fragment.padding_top);
     used.padding_bottom.set(fragment.padding_bottom);
+    used.table_column_index.set(fragment.table_column_index);
+    used.table_column_span.set(fragment.table_column_span);
+    used.hidden_by_collapsed_columns
+        .set(fragment.hidden_by_collapsed_columns);
     used.inset_left.set(link.inset_left);
     used.inset_right.set(link.inset_right);
     used.inset_top.set(link.inset_top);
