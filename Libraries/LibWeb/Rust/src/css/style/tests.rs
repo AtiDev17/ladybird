@@ -5156,7 +5156,7 @@ fn update_test_prefix_relation(
     old_facts: &StyleNodeFacts,
     changed: &[StyleNodeID],
     geometry_root: Option<StyleNodeID>,
-) {
+) -> Counters {
     let workspace = MatchEvaluationWorkspace::default();
     let facts = engine.facts.primary();
     let evaluator =
@@ -5204,10 +5204,179 @@ fn update_test_prefix_relation(
         &changed,
         &mut counters,
     );
+    counters
 }
 
 #[test]
-fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
+fn prefix_relation_copies_only_dispatch_complete_predicates() {
+    let (mut engine, nodes) = linear_document();
+    let first_class = StyleAtomID(200);
+    let second_class = StyleAtomID(201);
+    let id = StyleAtomID(202);
+    for &node in &nodes {
+        add_feature(&mut engine, node, LocalFeatureKey::Class(first_class));
+    }
+    add_feature(&mut engine, nodes[2], LocalFeatureKey::Class(second_class));
+    set_atom_feature(&mut engine, nodes[3], LocalFeatureKey::Id, id);
+    let mut builder = selector::SelectorProgramBuilder::new();
+    let feature = builder.push_feature(selector::FeatureTest::Id(id));
+    builder.push_entry(feature);
+    let atoms = [("first", first_class), ("second", second_class)];
+    let mut selectors = vec![
+        test_selector_program("*", &[]),
+        test_selector_program(".first", &atoms),
+        builder.finish(),
+    ];
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    for additional_tests in [false, true] {
+        for selector in selectors.drain(..) {
+            let program = engine.programs.add(selector);
+            let rule = engine.append_rule(sheet, None, RuleKind::Style);
+            engine.add_routing_rule(rule, program);
+            let mut version = engine.program.rule_version(rule);
+            version.selector_program = Some(program);
+            version.declaration_block = Some(DeclarationBlockID(1));
+            engine.replace_rule_version(rule, version);
+        }
+        discard_transaction(&mut engine);
+        let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
+        let (_, relation) = test_prefix_relation(&mut engine, nodes[0]);
+        let evaluated = engine.counters.get(Counter::PrefixCompoundsEvaluated) - before;
+        if additional_tests {
+            assert!(evaluated > 0);
+        } else {
+            assert_eq!(evaluated, 0);
+        }
+        let mut states = PrefixStates::new(0);
+        relation.install_answers(&mut states);
+        let expected = if additional_tests { [2, 2, 4, 3] } else { [2, 2, 2, 3] };
+        for (&node, count) in nodes.iter().zip(expected) {
+            assert_eq!(states.retained_matches_for(node).unwrap().len(), count);
+        }
+        selectors = vec![
+            test_selector_program(".first.second", &atoms),
+            test_selector_program(".first:nth-child(2n)", &atoms),
+        ];
+    }
+}
+
+#[test]
+fn prefix_completion_reuses_positive_and_negative_relation_answers() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    add_guard_target_rule(&mut engine, guard, target);
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(guard));
+    add_feature(&mut engine, nodes[3], LocalFeatureKey::Class(target));
+    discard_transaction(&mut engine);
+    let (dispatch, relation) = test_prefix_relation(&mut engine, nodes[0]);
+    let facts = engine.facts.primary();
+    let evaluator = MatchEvaluator::new(&engine.tree, facts);
+    let evaluation = PrefixEvaluation::new(
+        dispatch.prefixes(),
+        &engine.tree,
+        facts,
+        &engine.programs,
+        &evaluator,
+        None,
+        None,
+    );
+    let mut counters = Counters::default();
+    let mut states = PrefixStates::new(facts.row_count());
+    assert!(!states.complete_nodes_with_budget(&evaluation, nodes.iter().copied(), 0, &mut counters));
+    relation.install_answers(&mut states);
+    states.relation = Some(Box::new(relation));
+    assert!(states.retained_matches_for(nodes[0]).unwrap().is_empty());
+    assert_eq!(states.retained_matches_for(nodes[3]).unwrap().len(), 1);
+    for budget in [0, usize::MAX] {
+        assert!(states.complete_nodes_with_budget(&evaluation, nodes.iter().copied(), budget, &mut counters));
+        assert_eq!(counters.get(Counter::PrefixCompoundsEvaluated), 0);
+        assert_eq!(counters.get(Counter::PrefixTransitionMemoMisses), 0);
+    }
+}
+
+#[test]
+fn prefix_relations_share_program_predicates_without_merging_their_paths() {
+    let (mut engine, nodes) = nested_document();
+    let attribute_name = StyleAtomID(200);
+    let disabled = StyleAtomID(201);
+    let target = StyleAtomID(202);
+    let ready = StyleAtomID(203);
+    let other = StyleAtomID(204);
+    let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
+    for index in 0..33 {
+        let scope = StyleAtomID(300 + if index == 32 { 0 } else { index });
+        let literal: Vec<u16> = if index == 32 { "other" } else { "ready" }.encode_utf16().collect();
+        let mut builder = selector::SelectorProgramBuilder::new();
+        // Equal predicates deliberately have different program-relative text offsets.
+        builder.push_literal(&vec![0; index as usize]);
+        let (value_offset, value_length) = builder.push_literal(&literal);
+        let scope = builder.push_feature(selector::FeatureTest::Class(scope));
+        let ancestor_scope = builder.push_ancestor(scope);
+        let attribute = builder.push_feature(selector::FeatureTest::Attribute(selector::AttributeTest {
+            name: attribute_name,
+            any_namespace: false,
+            folded: attribute_name,
+            fold_in_namespace: StyleAtomID::NONE,
+            operator: selector::AttributeOperator::Substring,
+            value_atom: StyleAtomID::NONE,
+            value_offset,
+            value_length,
+            case: selector::AttributeCase::Sensitive,
+        }));
+        let disabled = builder.push_feature(selector::FeatureTest::Class(disabled));
+        let not_disabled = builder.push(selector::SelectorOp::Not(disabled));
+        let middle = builder.push_compound(&[attribute, not_disabled, ancestor_scope]);
+        let ancestor_middle = builder.push_ancestor(middle);
+        let subject = builder.push_feature(selector::FeatureTest::Class(target));
+        let subject = builder.push_compound(&[subject, ancestor_middle]);
+        builder.push_entry(subject);
+        let program = engine.programs.add(builder.finish());
+        let rule = engine.append_rule(sheet, None, RuleKind::Style);
+        engine.add_routing_rule(rule, program);
+        let mut version = engine.program.rule_version(rule);
+        version.selector_program = Some(program);
+        version.declaration_block = Some(DeclarationBlockID(1));
+        engine.replace_rule_version(rule, version);
+    }
+    add_feature(&mut engine, nodes[0], LocalFeatureKey::Class(StyleAtomID(300)));
+    add_feature(&mut engine, nodes[3], LocalFeatureKey::Class(target));
+    engine.set_attribute_value_text(ready, &"ready".encode_utf16().collect::<Vec<_>>());
+    engine.set_attribute_value_text(other, &"other".encode_utf16().collect::<Vec<_>>());
+    engine.record_input(
+        InputKey::LocalFeature(nodes[1], LocalFeatureKey::Attribute(attribute_name)),
+        InputValue::Feature(FeatureValue::Absent),
+        InputValue::Feature(FeatureValue::Atom(ready)),
+    );
+    discard_transaction(&mut engine);
+    let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
+    let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
+    assert_eq!(engine.counters.get(Counter::PrefixCompoundsEvaluated) - before, 2);
+    let mut states = PrefixStates::new(0);
+    relation.install_answers(&mut states);
+    let original = states.retained_matches_for(nodes[3]).unwrap().to_vec();
+    assert_eq!(original.len(), 1);
+
+    let old_facts = engine.facts.primary().clone();
+    engine.record_input(
+        InputKey::LocalFeature(nodes[1], LocalFeatureKey::Attribute(attribute_name)),
+        InputValue::Feature(FeatureValue::Atom(ready)),
+        InputValue::Feature(FeatureValue::Atom(other)),
+    );
+    discard_transaction(&mut engine);
+    let counters = update_test_prefix_relation(&engine, &dispatch, &mut relation, &old_facts, &[nodes[1]], None);
+    assert_eq!(counters.get(Counter::PrefixCompoundsEvaluated), 2);
+    assert_eq!(relation.changed_answers.len(), 1);
+    assert_eq!(relation.changed_answers[0].0, nodes[3]);
+    assert_eq!(relation.changed_answers[0].1, original);
+    assert_eq!(relation.changed_answers[0].2.len(), 1);
+    assert_ne!(relation.changed_answers[0].1, relation.changed_answers[0].2);
+}
+
+#[test]
+fn prefix_relation_reuses_local_facts_without_sharing_position() {
     let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
     let mut raw = [0; 65];
     engine.allocate_style_nodes(&mut raw);
@@ -5225,8 +5394,20 @@ fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
             )),
         );
     }
-    for &node in &nodes {
+    let unused_attribute = StyleAtomID(202);
+    let observed_attribute = StyleAtomID(203);
+    for (index, &node) in nodes.iter().enumerate() {
         add_feature(&mut engine, node, LocalFeatureKey::Class(class));
+        engine.record_input(
+            InputKey::LocalFeature(node, LocalFeatureKey::Id),
+            InputValue::Feature(FeatureValue::Absent),
+            InputValue::Feature(FeatureValue::Atom(StyleAtomID(500 + index as u32))),
+        );
+        engine.record_input(
+            InputKey::LocalFeature(node, LocalFeatureKey::Attribute(unused_attribute)),
+            InputValue::Feature(FeatureValue::Absent),
+            InputValue::Feature(FeatureValue::Atom(StyleAtomID(600 + index as u32))),
+        );
     }
 
     // The root has the same local facts as its children, but :root and nth-child
@@ -5235,7 +5416,19 @@ fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
     let feature = builder.push_feature(selector::FeatureTest::Class(class));
     let root = builder.push(selector::SelectorOp::Root);
     let not_root = builder.push(selector::SelectorOp::Not(root));
-    let compound = builder.push_compound(&[feature, not_root]);
+    let attribute = builder.push_feature(selector::FeatureTest::Attribute(selector::AttributeTest {
+        name: observed_attribute,
+        any_namespace: false,
+        folded: observed_attribute,
+        fold_in_namespace: StyleAtomID::NONE,
+        operator: selector::AttributeOperator::Presence,
+        value_atom: StyleAtomID::NONE,
+        value_offset: 0,
+        value_length: 0,
+        case: selector::AttributeCase::Sensitive,
+    }));
+    let not_attribute = builder.push(selector::SelectorOp::Not(attribute));
+    let compound = builder.push_compound(&[feature, not_root, not_attribute]);
     builder.push_entry_for_pseudo(compound, None);
     let sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
     engine.attach_sheet(sheet, TreeScopeID::DOCUMENT);
@@ -5253,11 +5446,18 @@ fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
     }
     discard_transaction(&mut engine);
     let before = engine.counters.get(Counter::PrefixCompoundsEvaluated);
-    let (_, relation) = test_prefix_relation(&mut engine, nodes[0]);
+    let (dispatch, mut relation) = test_prefix_relation(&mut engine, nodes[0]);
     let evaluations = engine.counters.get(Counter::PrefixCompoundsEvaluated) - before;
     assert!(
         evaluations < 16,
         "repeated local facts required {evaluations} evaluations"
+    );
+    let old_facts = engine.facts.primary().clone();
+    let counters = update_test_prefix_relation(&engine, &dispatch, &mut relation, &old_facts, &nodes, None);
+    let evaluations = counters.get(Counter::PrefixCompoundsEvaluated);
+    assert_eq!(
+        evaluations, 0,
+        "unchanged local facts must retain their predicate answers"
     );
     let mut states = PrefixStates::new(0);
     relation.install_answers(&mut states);
@@ -5268,6 +5468,27 @@ fn prefix_relation_construction_reuses_local_facts_without_sharing_position() {
             1 + usize::from(index % 2 == 0)
         );
     }
+    let old_facts = engine.facts.primary().clone();
+    for (index, &node) in nodes.iter().enumerate() {
+        engine.record_input(
+            InputKey::LocalFeature(node, LocalFeatureKey::Attribute(unused_attribute)),
+            InputValue::Feature(FeatureValue::Atom(StyleAtomID(600 + index as u32))),
+            InputValue::Feature(FeatureValue::Atom(StyleAtomID(1000 + index as u32))),
+        );
+    }
+    discard_transaction(&mut engine);
+    let counters = update_test_prefix_relation(&engine, &dispatch, &mut relation, &old_facts, &nodes, None);
+    assert_eq!(counters.get(Counter::PrefixCompoundsEvaluated), 0);
+    assert!(relation.changed_answers.is_empty());
+
+    // A dependency nested inside :not() must still invalidate the predicate.
+    let old_facts = engine.facts.primary().clone();
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Attribute(observed_attribute));
+    discard_transaction(&mut engine);
+    update_test_prefix_relation(&engine, &dispatch, &mut relation, &old_facts, &[nodes[1]], None);
+    assert_eq!(relation.changed_answers.len(), 1);
+    assert_eq!(relation.changed_answers[0].0, nodes[1]);
+    assert!(relation.changed_answers[0].2.is_empty());
 }
 
 #[test]
@@ -5340,31 +5561,30 @@ fn prefix_relation_local_fact_cache_separates_predicates_and_tracks_changes() {
             );
         }
 
-        // Move one element between fact groups in each direction. Other members
-        // must keep their answers, and rebuilding must agree with the update.
+        // Move every element between fact groups. Shared positive and negative
+        // answers must change, and rebuilding must agree with the update.
         let old_facts = engine.facts.primary().clone();
-        add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(selected));
-        remove_feature(&mut engine, nodes[2], LocalFeatureKey::Class(selected));
+        for (index, &node) in nodes.iter().enumerate() {
+            if index % 2 == 0 {
+                remove_feature(&mut engine, node, LocalFeatureKey::Class(selected));
+            } else {
+                add_feature(&mut engine, node, LocalFeatureKey::Class(selected));
+            }
+        }
         discard_transaction(&mut engine);
-        update_test_prefix_relation(
-            &engine,
-            &dispatch,
-            &mut relation,
-            &old_facts,
-            &[nodes[1], nodes[2]],
-            None,
+        let counters = update_test_prefix_relation(&engine, &dispatch, &mut relation, &old_facts, &nodes, None);
+        let evaluations = counters.get(Counter::PrefixCompoundsEvaluated);
+        assert!(
+            evaluations < 16,
+            "repeated local facts required {evaluations} update evaluations"
         );
-        assert_eq!(relation.changed_answers.len(), 2);
+        assert_eq!(relation.changed_answers.len(), nodes.len());
         relation.install_answers(&mut states);
         let (_, rebuilt) = test_prefix_relation(&mut engine, nodes[0]);
         let mut rebuilt_states = PrefixStates::new(0);
         rebuilt.install_answers(&mut rebuilt_states);
         for (index, &node) in nodes.iter().enumerate() {
-            let selected = match index {
-                1 => true,
-                2 => false,
-                _ => index % 2 == 0,
-            };
+            let selected = index % 2 != 0;
             let matches = states.retained_matches_for(node).unwrap();
             assert_eq!(matches.len(), 1 + usize::from(selected != negate));
             assert_eq!(matches, rebuilt_states.retained_matches_for(node).unwrap());

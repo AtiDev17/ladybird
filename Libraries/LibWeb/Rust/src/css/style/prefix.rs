@@ -21,17 +21,22 @@
 use super::capacity::capacity_bytes;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::fast_hasher;
+use super::selector::SelectorPrefixPredicate;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::mem::size_of;
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
 use super::ScopeProgramID;
 use super::column::Column;
 use super::column::EpochColumn;
 use super::column::advance_epoch;
+use super::fast_hash::FastSet as HashSet;
+use super::index::AttributeFact;
 use super::index::DispatchKey;
+use super::index::StyleAtomID;
 use super::index::StyleNodeFacts;
 use super::instrumentation::Counter;
 use super::instrumentation::Counters;
@@ -159,10 +164,7 @@ enum PrefixPredicateKey {
         features: Box<[FeatureTest]>,
         required_positional_bits: u32,
     },
-    Program {
-        program: SelectorProgramID,
-        local: SelectorPrefixLocal,
-    },
+    Program(Rc<SelectorPrefixPredicate>),
 }
 
 #[derive(Clone)]
@@ -175,6 +177,7 @@ enum PrefixPredicate {
     Program {
         program: SelectorProgramID,
         local: SelectorPrefixLocal,
+        identity: Rc<SelectorPrefixPredicate>,
     },
 }
 
@@ -264,6 +267,7 @@ pub(super) struct PrefixAutomaton {
     /// The deduplicated structural tests carried by registered chains, in registration order.
     /// Their per-node answers form the positional bits of every transition and completion key.
     positional_tests: Vec<(SelectorProgramID, PrefixStructuralTest)>,
+    local_fact_dependencies: PrefixFactDependencies,
 }
 
 /// The part of an immutable prefix automaton that one transaction can change.
@@ -297,10 +301,7 @@ impl PrefixAutomaton {
                             required_positional_bits: *required_positional_bits,
                         }
                     }
-                    PrefixPredicate::Program { program, local } => PrefixPredicateKey::Program {
-                        program: *program,
-                        local: *local,
-                    },
+                    PrefixPredicate::Program { identity, .. } => PrefixPredicateKey::Program(Rc::clone(identity)),
                 };
                 (
                     key,
@@ -423,6 +424,9 @@ impl PrefixAutomaton {
         let mut predecessor = None;
         let mut path = Vec::with_capacity(chain.len());
         for (&chain_step, canonical) in chain.iter().zip(canonical_steps) {
+            program.visit_prefix_local_features(chain_step.local, &mut |feature| {
+                self.local_fact_dependencies.add(feature);
+            });
             let predicate = match canonical {
                 Some((features, tests)) => {
                     let mut required_positional_bits = 0_u32;
@@ -441,10 +445,7 @@ impl PrefixAutomaton {
                         required_positional_bits,
                     }
                 }
-                None => PrefixPredicateKey::Program {
-                    program: program_id,
-                    local: chain_step.local,
-                },
+                None => PrefixPredicateKey::Program(Rc::new(program.prefix_local_predicate(chain_step.local))),
             };
             let compound = match self.compound_ids.entry(predicate) {
                 Entry::Occupied(entry) => *entry.get(),
@@ -468,9 +469,10 @@ impl PrefixAutomaton {
                                 required_positional_bits: *required_positional_bits,
                             }
                         }
-                        PrefixPredicateKey::Program { program, local } => PrefixPredicate::Program {
-                            program: *program,
-                            local: *local,
+                        PrefixPredicateKey::Program(identity) => PrefixPredicate::Program {
+                            program: program_id,
+                            local: chain_step.local,
+                            identity: Rc::clone(identity),
                         },
                     };
                     self.compounds.push(PrefixCompound {
@@ -786,6 +788,11 @@ impl PrefixAutomaton {
     pub(super) fn capacity_bytes(&self) -> u64 {
         capacity_bytes! {
             shallow [
+                self.local_fact_dependencies.ids,
+                self.local_fact_dependencies.classes,
+                self.local_fact_dependencies.attribute_names,
+                self.local_fact_dependencies.attribute_values,
+                self.local_fact_dependencies.attribute_text_names,
                 self.compounds,
                 self.compound_ids,
                 self.features,
@@ -800,12 +807,16 @@ impl PrefixAutomaton {
             ];
             cached [];
             nested [
+                self.compounds.iter().map(|compound| match &compound.predicate {
+                    PrefixPredicate::Program { identity, .. } => size_of::<SelectorPrefixPredicate>() + 2 * size_of::<usize>() + identity.capacity_bytes(),
+                    _ => 0,
+                }).sum::<usize>(),
                 self
                 .compound_ids
                 .keys()
                 .map(|predicate| match predicate {
                     PrefixPredicateKey::Features { features, .. } => features.len() * size_of::<FeatureTest>(),
-                    PrefixPredicateKey::Program { .. } => 0,
+                    PrefixPredicateKey::Program(_) => 0,
                 })
                 .sum::<usize>(),
                 self
@@ -983,6 +994,86 @@ impl super::intern_table::InternIdentity for LocalFactSlot {
     }
 }
 
+// Prefix answers depend on the selector's observations, not every fact stored on a node.
+// Keep names read by any local predicate, and collapse values no exact test distinguishes.
+// Text comparisons retain their complete inputs, including namespace and case-folded names.
+#[derive(Clone, Default)]
+struct PrefixFactDependencies {
+    ids: HashSet<StyleAtomID>,
+    classes: HashSet<StyleAtomID>,
+    attribute_names: HashSet<StyleAtomID>,
+    attribute_values: HashSet<StyleAtomID>,
+    attribute_text_names: HashSet<StyleAtomID>,
+}
+
+impl PrefixFactDependencies {
+    fn add(&mut self, feature: FeatureTest) {
+        match feature {
+            FeatureTest::Id(id) => {
+                self.ids.insert(id);
+            }
+            FeatureTest::Class(class) => {
+                self.classes.insert(class);
+            }
+            FeatureTest::Attribute(test) => {
+                self.attribute_names.insert(test.name);
+                self.attribute_names.insert(test.folded);
+                match test.operator {
+                    AttributeOperator::Presence => {}
+                    AttributeOperator::Exact
+                        if test.case == super::selector::AttributeCase::Sensitive && !test.value_atom.is_none() =>
+                    {
+                        self.attribute_values.insert(test.value_atom);
+                    }
+                    _ => {
+                        self.attribute_text_names.insert(test.name);
+                        self.attribute_text_names.insert(test.folded);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn id_of(&self, facts: &StyleNodeFacts, row: u32) -> StyleAtomID {
+        let id = facts.id_of(row);
+        if self.ids.contains(&id) { id } else { StyleAtomID::NONE }
+    }
+
+    fn reads_attribute(&self, facts: &StyleNodeFacts, attribute: &AttributeFact) -> bool {
+        Self::name_is_read(&self.attribute_names, facts, attribute)
+    }
+
+    fn name_is_read(names: &HashSet<StyleAtomID>, facts: &StyleNodeFacts, attribute: &AttributeFact) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        if names.contains(&attribute.name) {
+            return true;
+        }
+        let forms = facts.attribute_name_forms(attribute.name);
+        [forms.local, forms.folded_name, forms.folded_local]
+            .iter()
+            .any(|name| names.contains(name))
+    }
+
+    fn attribute_value<'a>(
+        &self,
+        facts: &'a StyleNodeFacts,
+        attribute: AttributeFact,
+    ) -> (StyleAtomID, Option<&'a [u16]>) {
+        if Self::name_is_read(&self.attribute_text_names, facts, &attribute) {
+            return (attribute.value, facts.text_of(attribute));
+        }
+        let value = if self.attribute_values.contains(&attribute.value) {
+            attribute.value
+        } else {
+            StyleAtomID::NONE
+        };
+        (value, None)
+    }
+}
+
 struct LocalFactInterner {
     identities: super::intern_table::InternTable<LocalFactSlot, (u32, u32)>,
     next_identity: u32,
@@ -996,10 +1087,16 @@ impl LocalFactInterner {
         }
     }
 
-    fn intern(&mut self, facts: &StyleNodeFacts, row: u32, counters: &mut Counters) -> u32 {
-        let hash = hash_local_facts(facts, row);
+    fn intern(
+        &mut self,
+        facts: &StyleNodeFacts,
+        row: u32,
+        dependencies: &PrefixFactDependencies,
+        counters: &mut Counters,
+    ) -> u32 {
+        let hash = hash_local_facts(facts, row, dependencies);
         if let Some(slot) = self.identities.find(hash, |_slot, &(_identity, representative)| {
-            rows_have_equal_local_facts(facts, row, representative)
+            rows_have_equal_local_facts_between(facts, row, facts, representative, dependencies)
         }) {
             counters.bump(Counter::PrefixLocalFactIdentityHits);
             return self.identities[slot].0;
@@ -1495,7 +1592,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                     .iter()
                     .all(|&feature| matches_feature(row.facts, row.row, feature)))
             }
-            PrefixPredicate::Program { program, local } => {
+            PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
                     .matches_prefix_local(*program, self.programs.get(*program), *local, node, counters)
             }
@@ -1524,7 +1621,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                         .iter()
                         .all(|&feature| matches_feature(row.facts, row.row, feature)),
             ),
-            PrefixPredicate::Program { program, local } => {
+            PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
                     .matches_prefix_local(*program, self.programs.get(*program), *local, node, counters)
             }
@@ -2527,7 +2624,12 @@ impl PrefixStates {
                     counters.bump(Counter::PrefixLocalFactIdentityMisses);
                     self.local_fact_interner.mint_identity()
                 }
-                false => self.local_fact_interner.intern(row.facts, row.row, counters),
+                false => self.local_fact_interner.intern(
+                    row.facts,
+                    row.row,
+                    &evaluation.automaton.local_fact_dependencies,
+                    counters,
+                ),
             };
             self.set_local_facts(node, identity);
             identity
@@ -3036,7 +3138,9 @@ impl PrefixStates {
     ) -> bool {
         let mut completions = 0;
         for node in nodes {
-            if matches!(self.transition_of(node), PrefixTransitionLookup::Known(_)) {
+            // A relation answer already provides the complete prefix result. Building a
+            // scalar transition for the same node duplicates work and retained state.
+            if self.retained_matches_for(node).is_some() {
                 continue;
             }
             if completions == completion_budget {
@@ -3142,31 +3246,29 @@ impl PrefixStates {
                 self.compound_answer[compound_index]
             } else {
                 let compound = &automaton.compounds[compound_index];
-                let matches = match &compound.predicate {
-                    PrefixPredicate::Features {
-                        feature_start,
-                        feature_len,
-                        required_positional_bits,
-                    } => {
-                        (positional_bits & required_positional_bits) == *required_positional_bits
-                            && automaton
-                                .features_for(*feature_start, *feature_len)
-                                .iter()
-                                .all(|&feature| matches_feature(row.facts, row.row, feature))
-                    }
-                    PrefixPredicate::Program { program, local } => match evaluation.evaluator.matches_prefix_local(
-                        *program,
-                        evaluation.programs.get(*program),
-                        *local,
-                        node,
-                        counters,
-                    ) {
-                        Ok(matches) => matches,
-                        Err(incomplete) => {
-                            return PrefixTransitionLookup::Missing(PrefixTransitionGap::Incomplete(incomplete));
+                let matches =
+                    match &compound.predicate {
+                        PrefixPredicate::Features {
+                            feature_start,
+                            feature_len,
+                            required_positional_bits,
+                        } => {
+                            (positional_bits & required_positional_bits) == *required_positional_bits
+                                && automaton
+                                    .features_for(*feature_start, *feature_len)
+                                    .iter()
+                                    .all(|&feature| matches_feature(row.facts, row.row, feature))
                         }
-                    },
-                };
+                        PrefixPredicate::Program { program, local, .. } => match evaluation
+                            .evaluator
+                            .matches_prefix_local(*program, evaluation.programs.get(*program), *local, node, counters)
+                        {
+                            Ok(matches) => matches,
+                            Err(incomplete) => {
+                                return PrefixTransitionLookup::Missing(PrefixTransitionGap::Incomplete(incomplete));
+                            }
+                        },
+                    };
                 self.compound_epoch[compound_index] = self.epoch;
                 self.compound_answer[compound_index] = matches;
                 counters.bump(Counter::PrefixCompoundsEvaluated);
@@ -3995,7 +4097,12 @@ impl PrefixTransitionSurface<'_> {
                             counters.bump(Counter::PrefixLocalFactIdentityMisses);
                             states.local_fact_interner.mint_identity()
                         }
-                        false => states.local_fact_interner.intern(row.facts, row.row, counters),
+                        false => states.local_fact_interner.intern(
+                            row.facts,
+                            row.row,
+                            &evaluation.automaton.local_fact_dependencies,
+                            counters,
+                        ),
                     };
                     states.set_local_facts(node, identity);
                     identity
@@ -4503,11 +4610,11 @@ impl PrefixStateCache {
     }
 }
 
-fn hash_local_facts(facts: &StyleNodeFacts, row: u32) -> u64 {
+fn hash_local_facts(facts: &StyleNodeFacts, row: u32, dependencies: &PrefixFactDependencies) -> u64 {
     let mut hasher = fast_hasher();
     facts.tag_of(row).hash(&mut hasher);
     facts.folded_tag_of(row).hash(&mut hasher);
-    facts.id_of(row).hash(&mut hasher);
+    dependencies.id_of(facts, row).hash(&mut hasher);
     facts.states_of(row).hash(&mut hasher);
     facts.directionality_of(row).hash(&mut hasher);
     facts.language_of(row).hash(&mut hasher);
@@ -4516,37 +4623,74 @@ fn hash_local_facts(facts: &StyleNodeFacts, row: u32) -> u64 {
     facts.heading_level_of(row).hash(&mut hasher);
     facts.custom_states_of(row).hash(&mut hasher);
     facts.parts_of(row).hash(&mut hasher);
-    facts.classes_of(row).hash(&mut hasher);
-    for &attribute in facts.attributes_of(row) {
+    for class in facts
+        .classes_of(row)
+        .iter()
+        .filter(|class| dependencies.classes.contains(class))
+    {
+        class.hash(&mut hasher);
+    }
+    for &attribute in facts
+        .attributes_of(row)
+        .iter()
+        .filter(|attribute| dependencies.reads_attribute(facts, attribute))
+    {
         attribute.name.hash(&mut hasher);
-        attribute.value.hash(&mut hasher);
-        facts.text_of(attribute).hash(&mut hasher);
+        dependencies.attribute_value(facts, attribute).hash(&mut hasher);
     }
     hasher.finish()
 }
 
-fn rows_have_equal_local_facts(facts: &StyleNodeFacts, left: u32, right: u32) -> bool {
-    if facts.tag_of(left) != facts.tag_of(right)
-        || facts.folded_tag_of(left) != facts.folded_tag_of(right)
-        || facts.id_of(left) != facts.id_of(right)
-        || facts.states_of(left) != facts.states_of(right)
-        || facts.directionality_of(left) != facts.directionality_of(right)
-        || facts.language_of(left) != facts.language_of(right)
-        || facts.language_tag_of(left) != facts.language_tag_of(right)
-        || facts.namespace_of(left) != facts.namespace_of(right)
-        || facts.heading_level_of(left) != facts.heading_level_of(right)
-        || facts.custom_states_of(left) != facts.custom_states_of(right)
-        || facts.parts_of(left) != facts.parts_of(right)
-        || facts.classes_of(left) != facts.classes_of(right)
+fn rows_have_equal_local_facts_between(
+    left_facts: &StyleNodeFacts,
+    left: u32,
+    right_facts: &StyleNodeFacts,
+    right: u32,
+    dependencies: &PrefixFactDependencies,
+) -> bool {
+    if std::ptr::eq(left_facts, right_facts) && left == right {
+        return true;
+    }
+    if left_facts.tag_of(left) != right_facts.tag_of(right)
+        || left_facts.folded_tag_of(left) != right_facts.folded_tag_of(right)
+        || dependencies.id_of(left_facts, left) != dependencies.id_of(right_facts, right)
+        || left_facts.states_of(left) != right_facts.states_of(right)
+        || left_facts.directionality_of(left) != right_facts.directionality_of(right)
+        || left_facts.language_of(left) != right_facts.language_of(right)
+        || left_facts.language_tag_of(left) != right_facts.language_tag_of(right)
+        || left_facts.namespace_of(left) != right_facts.namespace_of(right)
+        || left_facts.heading_level_of(left) != right_facts.heading_level_of(right)
+        || left_facts.custom_states_of(left) != right_facts.custom_states_of(right)
+        || left_facts.parts_of(left) != right_facts.parts_of(right)
+        || !left_facts
+            .classes_of(left)
+            .iter()
+            .filter(|class| dependencies.classes.contains(class))
+            .eq(right_facts
+                .classes_of(right)
+                .iter()
+                .filter(|class| dependencies.classes.contains(class)))
     {
         return false;
     }
-    let left_attributes = facts.attributes_of(left);
-    let right_attributes = facts.attributes_of(right);
-    left_attributes.len() == right_attributes.len()
-        && left_attributes.iter().zip(right_attributes).all(|(&left, &right)| {
-            left.name == right.name && left.value == right.value && facts.text_of(left) == facts.text_of(right)
-        })
+    let mut left_attributes = left_facts
+        .attributes_of(left)
+        .iter()
+        .filter(|attribute| dependencies.reads_attribute(left_facts, attribute));
+    let mut right_attributes = right_facts
+        .attributes_of(right)
+        .iter()
+        .filter(|attribute| dependencies.reads_attribute(right_facts, attribute));
+    loop {
+        match (left_attributes.next(), right_attributes.next()) {
+            (None, None) => return true,
+            (Some(&left), Some(&right))
+                if left.name == right.name
+                    && dependencies.attribute_value(left_facts, left)
+                        == dependencies.attribute_value(right_facts, right) => {}
+            _ => return false,
+        }
+    }
 }
 
 fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bool {
@@ -4591,6 +4735,59 @@ fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bo
 mod tests {
     use super::super::index::StyleAtomID;
     use super::*;
+
+    #[test]
+    fn local_fact_identity_distinguishes_only_observed_attribute_values() {
+        use super::super::index::StateSet;
+        use super::super::selector::{AttributeCase, AttributeTest};
+
+        let name = StyleAtomID(20);
+        let mut facts = StyleNodeFacts::new();
+        for index in 0..3 {
+            facts.push_row(
+                StyleNodeID::element(index + 1),
+                StyleAtomID(1),
+                StyleAtomID::NONE,
+                StateSet(0),
+                &[],
+                &[AttributeFact {
+                    name,
+                    value: StyleAtomID(30 + index),
+                    text_offset: 0,
+                    text_length: 0,
+                }],
+            );
+        }
+        for operator in [
+            AttributeOperator::Presence,
+            AttributeOperator::Exact,
+            AttributeOperator::Substring,
+        ] {
+            let mut dependencies = PrefixFactDependencies::default();
+            dependencies.add(FeatureTest::Attribute(AttributeTest {
+                name,
+                any_namespace: false,
+                folded: name,
+                fold_in_namespace: StyleAtomID::NONE,
+                operator,
+                value_atom: StyleAtomID(31),
+                value_offset: 0,
+                value_length: 0,
+                case: AttributeCase::Sensitive,
+            }));
+            let mut interner = LocalFactInterner::new();
+            let mut counters = Counters::default();
+            let identities: Vec<_> = (0..3)
+                .map(|row| interner.intern(&facts, row, &dependencies, &mut counters))
+                .collect();
+            match operator {
+                AttributeOperator::Presence => assert_eq!(identities, [1, 1, 1]),
+                AttributeOperator::Exact => assert_eq!(identities, [1, 2, 1]),
+                AttributeOperator::Substring => assert_eq!(identities, [1, 2, 3]),
+                _ => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn begin_transition_sizes_every_scratch_column_independently() {
@@ -5125,7 +5322,9 @@ mod tests {
         );
         {
             let states = cache.get_or_insert(ScopeProgramID(0), facts.generation(), 1);
-            states.local_fact_interner.intern(&facts, 0, &mut counters);
+            states
+                .local_fact_interner
+                .intern(&facts, 0, &PrefixFactDependencies::default(), &mut counters);
         }
         cache.settle_memory(&mut memory);
         assert!(cache.retain(&mut memory));

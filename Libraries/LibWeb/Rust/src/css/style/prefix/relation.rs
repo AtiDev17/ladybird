@@ -296,7 +296,6 @@ impl PrefixRelation {
                 let bits = evaluation.positional_bits(node, counters).unwrap();
                 if bits != self.positional[position] {
                     extra.push(node);
-                    self.positional[position] = bits;
                 }
             }
         }
@@ -434,6 +433,12 @@ impl PrefixRelation {
                 }
             }
         }
+        // Transaction rows can come from several fact stores. Intern within each store so
+        // representative row indices are never interpreted in another store's columns.
+        let mut local_facts = HashMap::default();
+        let mut local_matches = HashMap::default();
+        self.geometry_targets[0].sort_unstable();
+        self.geometry_targets[0].dedup();
         for &node in changed_nodes {
             let Some(&position) = node
                 .element_index()
@@ -448,6 +453,24 @@ impl PrefixRelation {
             let previous_row = old_evaluation.row_of(node);
             let row = row.or(previous_row).unwrap();
             let previous_row = previous_row.unwrap_or(row);
+            let positional = evaluation.positional_bits(node, counters).unwrap();
+            let positional_changes = self.positional[position] ^ positional;
+            self.positional[position] = positional;
+            // Geometry frontiers include retained nodes whose local facts did not change.
+            // Preserve their predicate memberships, revisiting only changed positional tests.
+            // A changed parent conservatively requires checking :root again.
+            let local_changed = self.arrivals.binary_search(&position).is_ok()
+                || self.geometry_targets[0].binary_search(&position).is_ok()
+                || !super::rows_have_equal_local_facts_between(
+                    row.facts,
+                    row.row,
+                    previous_row.facts,
+                    previous_row.row,
+                    &automaton.local_fact_dependencies,
+                );
+            if !local_changed && positional_changes == 0 {
+                continue;
+            }
             keys.clear();
             for row in [row, previous_row] {
                 row.facts
@@ -455,43 +478,63 @@ impl PrefixRelation {
             }
             keys.sort_unstable();
             keys.dedup();
-            let positional = if self.live[position] {
-                evaluation.positional_bits(node, counters).unwrap()
-            } else {
-                0
-            };
-            self.positional[position] = positional;
+            let store = std::ptr::from_ref(row.facts);
+            let identity = local_facts
+                .entry(store)
+                .or_insert_with(super::LocalFactInterner::new)
+                .intern(row.facts, row.row, &automaton.local_fact_dependencies, counters);
+            let is_root = evaluation.tree.parent(node).is_none();
             for key in &keys {
                 let Some(compounds) = self.compounds_by_key.get(key) else {
                     continue;
                 };
                 for &index in compounds {
                     let compound = &automaton.compounds[index];
-                    counters.bump(Counter::PrefixCompoundsEvaluated);
-                    let matched = self.live[position]
-                        && match &compound.predicate {
+                    if !local_changed {
+                        match &compound.predicate {
                             PrefixPredicate::Features {
-                                feature_start,
-                                feature_len,
                                 required_positional_bits,
-                            } => {
-                                positional & required_positional_bits == *required_positional_bits
-                                    && automaton
+                                ..
+                            } if required_positional_bits & positional_changes != 0 => {}
+                            _ => continue,
+                        }
+                    }
+
+                    // Positional truth is checked per node; it does not change the local
+                    // predicate result shared by nodes with identical facts.
+                    let positional_matches = match &compound.predicate {
+                        PrefixPredicate::Features {
+                            required_positional_bits,
+                            ..
+                        } => positional & required_positional_bits == *required_positional_bits,
+                        PrefixPredicate::Program { .. } => true,
+                    };
+                    let matched = positional_matches
+                        && *local_matches
+                            .entry((store, identity, is_root, index))
+                            .or_insert_with(|| {
+                                counters.bump(Counter::PrefixCompoundsEvaluated);
+                                match &compound.predicate {
+                                    PrefixPredicate::Features {
+                                        feature_start,
+                                        feature_len,
+                                        ..
+                                    } => automaton
                                         .features_for(*feature_start, *feature_len)
                                         .iter()
-                                        .all(|&feature| matches_feature(row.facts, row.row, feature))
-                            }
-                            PrefixPredicate::Program { program, local } => evaluation
-                                .evaluator
-                                .matches_prefix_local(
-                                    *program,
-                                    evaluation.programs.get(*program),
-                                    *local,
-                                    node,
-                                    counters,
-                                )
-                                .unwrap(),
-                        };
+                                        .all(|&feature| matches_feature(row.facts, row.row, feature)),
+                                    PrefixPredicate::Program { program, local, .. } => evaluation
+                                        .evaluator
+                                        .matches_prefix_local(
+                                            *program,
+                                            evaluation.programs.get(*program),
+                                            *local,
+                                            node,
+                                            counters,
+                                        )
+                                        .unwrap(),
+                                }
+                            });
                     if self.compound_matches[index].binary_search(&position).is_ok() != matched {
                         changed_compounds.entry(index).or_default().push(position);
                     }
@@ -892,22 +935,46 @@ impl PrefixAutomaton {
         // Local predicates read the same facts for every member of a fact cohort. Reuse their
         // answers while building memberships, as scalar prefix transitions already do. Keep
         // document-root identity in the key and check positional truth separately per node.
-        let mut local_facts = super::LocalFactInterner::new();
+        let mut local_facts = HashMap::default();
+        let mut identities = HashMap::default();
         let local_fact_keys: Vec<_> = rows
             .iter()
             .enumerate()
             .map(|(position, row)| {
-                let identity = if evaluation.facts_are_composite() {
-                    local_facts.mint_identity()
-                } else {
-                    local_facts.intern(row.facts, row.row, counters)
-                };
-                identity as usize * 2 + usize::from(parents[position] == usize::MAX)
+                let store = std::ptr::from_ref(row.facts);
+                let identity = local_facts
+                    .entry(store)
+                    .or_insert_with(super::LocalFactInterner::new)
+                    .intern(row.facts, row.row, &self.local_fact_dependencies, counters);
+                let next = identities.len();
+                *identities
+                    .entry((store, identity, parents[position] == usize::MAX))
+                    .or_insert(next)
             })
             .collect();
-        let mut local_matches = vec![None; local_facts.next_identity as usize * 2];
+        let mut local_matches = vec![None; identities.len()];
         let mut compound_matches = Vec::with_capacity(self.compounds.len());
         for compound in &self.compounds {
+            // Dispatch postings already prove universal, ID, and class predicates. With
+            // no additional local or positional test, the posting is the membership set.
+            if let PrefixPredicate::Features {
+                feature_start,
+                feature_len,
+                required_positional_bits: 0,
+            } = &compound.predicate
+                && self
+                    .features_for(*feature_start, *feature_len)
+                    .iter()
+                    .all(|feature| match feature {
+                        super::FeatureTest::AnyElement => true,
+                        super::FeatureTest::Id(id) => compound.dispatch_key == DispatchKey::Id(*id),
+                        super::FeatureTest::Class(class) => compound.dispatch_key == DispatchKey::Class(*class),
+                        _ => false,
+                    })
+            {
+                compound_matches.push(candidates[&compound.dispatch_key].clone());
+                continue;
+            }
             local_matches.fill(None);
             let matched: Vec<_> = candidates[&compound.dispatch_key]
                 .iter()
@@ -933,7 +1000,7 @@ impl PrefixAutomaton {
                                 .features_for(*feature_start, *feature_len)
                                 .iter()
                                 .all(|&feature| matches_feature(row.facts, row.row, feature)),
-                            PrefixPredicate::Program { program, local } => evaluation
+                            PrefixPredicate::Program { program, local, .. } => evaluation
                                 .evaluator
                                 .matches_prefix_local(
                                     *program,
