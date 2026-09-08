@@ -80,18 +80,17 @@ class FontLoader final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(FontLoader);
 
 public:
-    FontLoader(FontComputer&, RuleOrDeclaration, Utf16FlyString family_name, Vector<Gfx::UnicodeRange> unicode_ranges, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
+    FontLoader(FontComputer&, RuleOrDeclaration, Vector<URL> urls, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
 
     virtual ~FontLoader();
 
-    Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
-
-    RefPtr<Gfx::Font const> font_with_point_size(float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features);
     void start_loading_next_url();
 
     bool is_loading() const;
-
-    Utf16FlyString family_name() const { return m_family_name; }
+    void did_request_for_rendering();
+    bool may_finish_from_cache() const;
+    bool has_started_request() const;
+    bool has_received_font_data() const { return m_has_received_font_data; }
 
     void subscribe(GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>);
 
@@ -104,14 +103,13 @@ private:
 
     GC::Ref<FontComputer> m_font_computer;
     RuleOrDeclaration m_rule_or_declaration;
-    Utf16FlyString m_family_name;
-    Vector<Gfx::UnicodeRange> m_unicode_ranges;
     RefPtr<Gfx::Typeface const> m_typeface;
     Vector<URL> m_urls;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
     Vector<GC::Ref<GC::Function<void(RefPtr<Gfx::Typeface const>)>>> m_subscribers;
     Optional<DOM::DocumentLoadEventDelayer> m_document_load_event_delayer;
     bool m_has_completed { false };
+    bool m_has_received_font_data { false };
 };
 
 class WEB_API FontComputer final : public GC::Cell {
@@ -130,6 +128,9 @@ public:
     DOM::Document const& document() const { return m_document; }
 
     Gfx::Font const& initial_font() const;
+    bool should_defer_initial_paint();
+    bool has_completed_initial_paint() const { return m_has_completed_initial_paint; }
+    bool initial_paint_had_pending_fonts() const { return m_initial_paint_had_pending_fonts; }
 
     void clear_computed_font_cache(Utf16FlyString const& family_name);
     void clear_font_feature_values_cache(Utf16FlyString const& family_name);
@@ -172,6 +173,8 @@ private:
     mutable HashMap<ComputedFontCacheKey, NonnullRefPtr<Gfx::FontCascadeList const>> m_computed_font_cache;
     mutable HashMap<Utf16FlyString, HashMap<FontFeatureValueKey, Vector<u32>>> m_font_feature_values_cache;
 
+    bool m_has_completed_initial_paint { false };
+    bool m_initial_paint_had_pending_fonts { false };
     u32 m_font_face_change_batch_depth { 0 };
     u64 m_environment_generation { 1 };
     Vector<Utf16FlyString> m_batched_font_face_change_families;
