@@ -107,7 +107,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         context: &'builder inline_formatting_context::InlineFormattingContext<'context>,
     ) -> Self {
         assert!(!context.line_data().line_boxes.is_empty());
-        let current_block_offset = context.line_data().line_boxes.last().unwrap().physical_vertical_end();
+        let current_block_offset = context.line_data().line_boxes.last().unwrap().next_line_block_offset;
         let mut builder = Self::initialized(context);
         builder.current_block_offset = current_block_offset;
         context
@@ -869,7 +869,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 )
             };
             self.line_mut(line_index).fragments[fragment_index].baseline = fragment_baseline;
-            if self.line_relative_aligned_subtree_root(style_source).is_some() {
+            if has_line_relative_aligned_subtree && self.line_relative_aligned_subtree_root(style_source).is_some() {
                 continue;
             }
             let alignment_style = self.alignment_style(style_source, style);
@@ -941,7 +941,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             let containing_block = self.context().containing_block;
             let new_inline_offset = inline_offset + snapshot.inline_offset;
             let own_alignment_is_line_relative = line_relative_alignment(style).is_some();
-            let aligned_subtree = self.line_relative_aligned_subtree_root(snapshot.style_source);
+            let aligned_subtree = has_line_relative_aligned_subtree
+                .then(|| self.line_relative_aligned_subtree_root(snapshot.style_source))
+                .flatten();
             let alignment_style = if aligned_subtree.is_some_and(|(root, _)| root == snapshot.style_source) {
                 style.with_vertical_align_keyword(vertical_align::BASELINE)
             } else {
@@ -1190,6 +1192,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             line.block_length = latest - earliest;
             line.block_start = current_block_offset;
             line.block_end = current_block_offset + line.block_length;
+            // The painted extent can differ from the advance used by begin_new_line.
+            // Retain that exact advance so a reused prefix resumes at the same position.
+            line.next_line_block_offset = if should_align_strut_to_line_box_baseline {
+                line.block_end
+            } else {
+                current_block_offset + self.max_block_size_on_current_line.max(containing_style.line_height())
+            };
             // Fragment block offsets include the reversed-writing-mode shim, so the alignment
             // baseline fallback must include it as well to share their coordinate space.
             line.baseline =

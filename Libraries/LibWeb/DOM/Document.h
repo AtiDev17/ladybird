@@ -76,6 +76,8 @@ class ImageStyleValueResource;
 
 namespace Web::DOM {
 
+struct MutationObserverOptions;
+
 enum class TemporaryDocumentForFragmentParsing : u8 {
     No,
     Yes,
@@ -276,6 +278,10 @@ public:
     void unregister_valid_html_collection_cache(HTMLCollectionAttributeInvalidationType) const;
     bool has_valid_html_collection_caches() const { return m_html_collection_attribute_invalidation_types != 0; }
     HTMLCollectionAttributeInvalidationTypes html_collection_attribute_invalidation_types_for_attribute(Utf16FlyString const& local_name, Optional<Utf16FlyString> const& namespace_) const;
+
+    // The record types any observer registered in this document has ever asked for. A type stays set.
+    void add_mutation_observer_types(MutationObserverOptions const&);
+    bool has_mutation_observers_of_type(Utf16FlyString const& type) const;
 
     // Everything a style input record cannot name by an identity of its own: the viewport moving,
     // a counter style arriving, or another untracked environment input changing. A record taken under one version
@@ -605,6 +611,13 @@ public:
 
     bool needs_mathml_and_svg_user_agent_style_sheets() const { return m_needs_mathml_and_svg_user_agent_style_sheets; }
     void set_needs_mathml_and_svg_user_agent_style_sheets();
+
+    // Whether an element of the kind has ever connected. Neither is cleared, so a document that never
+    // held one can skip the removal-time bookkeeping that only such an element makes necessary.
+    bool has_element_with_auto_directionality() const { return m_has_element_with_auto_directionality; }
+    void set_has_element_with_auto_directionality() { m_has_element_with_auto_directionality = true; }
+    bool has_form_or_fieldset_element() const { return m_has_form_or_fieldset_element; }
+    void set_has_form_or_fieldset_element() { m_has_form_or_fieldset_element = true; }
 
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
@@ -1619,6 +1632,8 @@ private:
     Optional<CSS::PreferredColorScheme> m_svg_image_color_scheme;
 
     bool m_needs_mathml_and_svg_user_agent_style_sheets { false };
+    bool m_has_element_with_auto_directionality { false };
+    bool m_has_form_or_fieldset_element { false };
 
     bool m_parser_cannot_change_the_mode { false };
 
@@ -1928,6 +1943,13 @@ private:
     u64 m_option_selectedness_version { 0 };
     mutable Array<u64, to_underlying(HTMLCollectionAttributeInvalidationType::Count)> m_html_collection_attribute_invalidation_type_counts {};
     mutable HTMLCollectionAttributeInvalidationTypes m_html_collection_attribute_invalidation_types { 0 };
+
+    enum class MutationObserverType : u8 {
+        ChildList = 1 << 0,
+        Attributes = 1 << 1,
+        CharacterData = 1 << 2,
+    };
+    u8 m_mutation_observer_types { 0 };
     u64 m_style_environment_version { 0 };
     u64 m_next_counter_style_environment_identity { 1 };
 

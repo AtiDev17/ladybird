@@ -2455,8 +2455,16 @@ void Node::moved_from(IsSubtreeRoot, GC::Ptr<Node>)
 
 static bool is_root_wheel_event_target(Node const& node)
 {
+    if (node.is_document())
+        return true;
+    if (!node.is_element())
+        return false;
     auto& document = node.document();
-    return &node == &document || &node == document.document_element() || &node == document.body();
+    if (&node == document.document_element())
+        return true;
+    if (!node.is_html_body_element() && !node.is_html_frameset_element())
+        return false;
+    return &node == document.body();
 }
 
 bool Node::update_inside_blocking_wheel_event_handler_state()
@@ -2526,11 +2534,8 @@ Element* Node::parent_or_shadow_host_element()
 ParentNode* Node::flat_tree_parent()
 {
     // If we're assigned to a slot, that slot is our flat tree parent.
-    if (is_slottable()) {
-        auto& slottable = as_slottable().visit([](auto& node) -> SlottableMixin& { return *node; });
-        if (auto slot = slottable.assigned_slot())
-            return slot.ptr();
-    }
+    if (auto slot = assigned_slot_for_node(*this))
+        return slot.ptr();
 
     // Otherwise, this is the parent or shadow host.
     return parent_or_shadow_host();
@@ -3444,6 +3449,10 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
     auto& document = this->document();
     auto& page = document.page();
 
+    // OPTIMIZATION: Without an observer of this type in the document, interestedObservers stays empty.
+    if (!document.has_mutation_observers_of_type(type) && !page.listen_for_dom_mutations())
+        return;
+
     // NOTE: We defer garbage collection until the end of the scope, since we can't safely use MutationObserver* as a hashmap key otherwise.
     // FIXME: This is a total hack.
     GC::DeferGC defer_gc(heap());
@@ -4130,6 +4139,7 @@ void Node::add_registered_observer(RegisteredObserver& registered_observer)
     if (!registered_observer_list)
         registered_observer_list = make<Vector<GC::Ref<RegisteredObserver>>>();
     registered_observer_list->append(registered_observer);
+    document().add_mutation_observer_types(registered_observer.options());
 }
 
 Vector<GC::Ref<RegisteredObserver>>* Node::registered_observer_list()

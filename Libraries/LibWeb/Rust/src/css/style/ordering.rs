@@ -704,6 +704,130 @@ impl StyleEngine {
         self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
     }
 
+    /// Reuse a complete, freshly updated element winner state instead of reducing declarations
+    /// again. Cascade continuations retain the general compaction path.
+    pub(super) fn compact_matches_from_updated_winners(&mut self, node: StyleNodeID, all: &mut Vec<RuleMatch>) -> bool {
+        let mut has_author_pseudo_rules = false;
+        if self.node_has_element_declaration_input(node)
+            || all.iter().any(|entry| {
+                has_author_pseudo_rules |= entry.pseudo_element.is_some()
+                    && self.program.sheet_origin(self.program.rule_sheet(entry.rule)) == CascadeOrigin::Author;
+                self.program.declared_properties_of(entry.rule).iter().any(|declared| {
+                    matches!(
+                        declared.operator,
+                        CascadeOperator::Revert | CascadeOperator::RevertLayer
+                    )
+                })
+            })
+        {
+            return false;
+        }
+        if has_author_pseudo_rules {
+            return self.compact_pseudo_matches_from_updated_winners(node, all);
+        }
+        let Some((_, state)) = self
+            .winner_groups
+            .token_for(WinnerGroupKey::current(node, self.program.version()))
+            .sparse()
+            .ok()
+        else {
+            return false;
+        };
+        let Some(rules) = self.winner_groups.rules_for_compaction(state) else {
+            return false;
+        };
+        self.counters
+            .add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
+        all.retain(|entry| {
+            self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
+                || rules.binary_search(&entry.rule).is_ok()
+        });
+        verify_style_answer_patch(self, |verifier| {
+            verifier.verify_cascade_answer(all, node, "compaction from updated winners");
+        });
+        true
+    }
+
+    fn compact_pseudo_matches_from_updated_winners(&mut self, node: StyleNodeID, all: &mut Vec<RuleMatch>) -> bool {
+        let Some((_, state)) = self
+            .winner_groups
+            .token_for(WinnerGroupKey::current(node, self.program.version()))
+            .sparse()
+            .ok()
+        else {
+            return false;
+        };
+        let Some(element_rules) = self.winner_groups.rules_for_compaction(state) else {
+            return false;
+        };
+        type PseudoCompactionEntry<'a> = (tree::PseudoElementTarget, &'a [RuleID], Option<usize>);
+        let mut pseudo_rules: SmallVec<[PseudoCompactionEntry<'_>; 4]> = SmallVec::new();
+        for entry in all.iter() {
+            let Some(pseudo) = entry.pseudo_element else {
+                continue;
+            };
+            if self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
+                || pseudo_rules.iter().any(|(target, _, _)| *target == pseudo)
+            {
+                continue;
+            }
+            let Some((_, state)) = self
+                .winner_groups
+                .token_for(WinnerGroupKey::current_pseudo(node, pseudo, self.program.version()))
+                .sparse()
+                .ok()
+            else {
+                return false;
+            };
+            let Some(rules) = self.winner_groups.rules_for_compaction(state) else {
+                return false;
+            };
+            // A target with no winning declarations still needs one match to preserve its
+            // presence. A non-author match already retained verbatim serves that purpose.
+            let marker = if rules.is_empty()
+                && !all.iter().any(|entry| {
+                    entry.pseudo_element == Some(pseudo)
+                        && self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
+                }) {
+                all.iter().position(|entry| entry.pseudo_element == Some(pseudo))
+            } else {
+                None
+            };
+            pseudo_rules.push((pseudo, rules, marker));
+        }
+        let scratch_bytes = if pseudo_rules.spilled() {
+            (pseudo_rules.capacity() * size_of::<PseudoCompactionEntry<'_>>()) as u64
+        } else {
+            0
+        };
+        self.memory
+            .reserve_required(MemoryCategory::BatchScratch, scratch_bytes);
+        self.counters
+            .add(Counter::CascadeMatchesBeforeCompaction, all.len() as u64);
+        let mut index = 0;
+        all.retain(|entry| {
+            let retained = self.program.sheet_origin(self.program.rule_sheet(entry.rule)) != CascadeOrigin::Author
+                || match entry.pseudo_element {
+                    None => element_rules.binary_search(&entry.rule).is_ok(),
+                    Some(pseudo) => {
+                        let (_, rules, marker) = pseudo_rules
+                            .iter()
+                            .find(|(target, _, _)| *target == pseudo)
+                            .expect("every author pseudo target has a winner set");
+                        *marker == Some(index) || rules.binary_search(&entry.rule).is_ok()
+                    }
+                };
+            index += 1;
+            retained
+        });
+        self.memory.release(MemoryCategory::BatchScratch, scratch_bytes);
+        drop(pseudo_rules);
+        verify_style_answer_patch(self, |verifier| {
+            verifier.verify_cascade_answer(all, node, "pseudo compaction from updated winners");
+        });
+        true
+    }
+
     pub(super) fn matches_for_cascade(
         &mut self,
         mut all: Vec<RuleMatch>,
@@ -969,11 +1093,17 @@ impl StyleEngine {
         matches: &[RuleMatch],
         node: Option<StyleNodeID>,
     ) -> bool {
-        self.cascade_winner_inventory_is_complete_for_target(matches, node, None)
-            && matches
+        // Checking every target covers every match. Check each inventory once instead
+        // of scanning the answer again for every rule matching the same pseudo target.
+        !matches.iter().any(|entry| {
+            self.program.rule_is_gated_by_container_query(entry.rule)
+                || !self.program.declarations_are_complete_for(entry.rule)
+                || entry.tree_scope != TreeScopeID::DOCUMENT
+        }) && !node.is_some_and(|node| {
+            ElementDeclarationKind::ALL
                 .iter()
-                .filter_map(|entry| entry.pseudo_element)
-                .all(|pseudo| self.cascade_winner_inventory_is_complete_for_target(matches, node, Some(pseudo)))
+                .any(|&kind| !self.facts.element_declared_properties(node, kind).1)
+        })
     }
 
     /// Exactly match every style node in the document scope against the attached program.

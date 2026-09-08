@@ -85,6 +85,7 @@ impl SelectorTruthSetCatalog {
 
 pub(super) struct MatchAnswerCatalogEntry {
     pub(super) answer: Rc<[RetainedRuleMatch]>,
+    synthetic_pseudo_mask: std::cell::OnceCell<u64>,
     pub(super) prefix_references: u32,
     pub(super) cascade_references: u32,
     pub(super) cascade_payload_accounted: bool,
@@ -166,6 +167,7 @@ impl MatchAnswerCatalog {
             identity,
             Some(MatchAnswerCatalogEntry {
                 answer,
+                synthetic_pseudo_mask: std::cell::OnceCell::new(),
                 prefix_references: 0,
                 cascade_references: 0,
                 cascade_payload_accounted: false,
@@ -177,6 +179,24 @@ impl MatchAnswerCatalog {
 
     pub(super) fn answer(&self, identity: MatchAnswerID) -> Option<&Rc<[RetainedRuleMatch]>> {
         self.answers[identity].as_ref().map(|entry| &entry.answer)
+    }
+
+    pub(super) fn synthetic_pseudo_mask(&self, identity: MatchAnswerID, programs: &SelectorPrograms) -> Option<u64> {
+        let answer = self.answers[identity].as_ref()?;
+        // Selector programs are immutable and remain referenced by their catalog answers.
+        // Every element holding this answer therefore has the same set of pseudo kinds.
+        Some(*answer.synthetic_pseudo_mask.get_or_init(|| {
+            answer.answer.iter().fold(0, |mask, matched| {
+                let entry = &programs.get(matched.program).entries()[matched.entry as usize];
+                mask | entry.pseudo_element.map_or(0, |pseudo| {
+                    if pseudo.kind.0 <= bridge::LAST_SYNTHETIC_PSEUDO_ELEMENT_KIND {
+                        1_u64 << pseudo.kind.0
+                    } else {
+                        0
+                    }
+                })
+            })
+        }))
     }
 
     pub(super) fn has_cascade_reference(&self, identity: MatchAnswerID) -> bool {
@@ -290,7 +310,7 @@ impl MatchAnswerCatalog {
         if !self.needs_compaction {
             return;
         }
-        self.answers.shrink_to_fit();
+        self.answers.shrink_excess_capacity();
         self.needs_compaction = false;
     }
 
@@ -1225,12 +1245,15 @@ impl RetainedMatchAnswers {
         mut visit: impl FnMut(StyleNodeID),
     ) {
         debug_assert!(rules.is_sorted());
+        let mut contains_rule = HashMap::default();
         self.for_each_answer_node(|node| {
             let index = node.element_index().unwrap() as usize;
-            if catalog
-                .retained_answer(self.column[index])
-                .is_some_and(|answer| answer.iter().any(|matched| rules.binary_search(&matched.rule).is_ok()))
-            {
+            let answer = self.column[index];
+            if *contains_rule.entry(answer).or_insert_with(|| {
+                catalog
+                    .retained_answer(answer)
+                    .is_some_and(|answer| answer.iter().any(|matched| rules.binary_search(&matched.rule).is_ok()))
+            }) {
                 visit(node);
             }
         });
