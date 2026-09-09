@@ -301,6 +301,7 @@ public:
 
     GC::Ptr<Selection::Selection> get_selection() const;
     bool selection_styles_are_observable() const { return m_selection_styles_are_observable; }
+    void set_needs_selection_style_update() { m_needs_selection_style_update = true; }
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -1816,6 +1817,7 @@ private:
     // https://w3c.github.io/selection-api/#dfn-selection
     GC::Ptr<Selection::Selection> m_selection;
     bool m_selection_styles_are_observable { false };
+    bool m_needs_selection_style_update { true };
     void update_selection_style_observability();
 
     // NOTE: This is a cache to make finding the first <base href> or <base target> element O(1).
@@ -2001,6 +2003,7 @@ private:
     GC::Ptr<Editing::EditingHistory> m_editing_history;
 
     bool m_inside_exec_command { false };
+    bool m_running_editing_command_action { false };
     bool m_preserve_selection_offsets_during_identical_character_data_replacement { false };
 
     // https://w3c.github.io/editing/docs/execCommand/#default-single-line-container-name

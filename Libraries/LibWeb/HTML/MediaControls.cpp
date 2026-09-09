@@ -5,6 +5,7 @@
  */
 
 #include <AK/NumberFormat.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
@@ -169,6 +170,8 @@ void MediaControls::set_up_event_listeners()
     });
     add_event_listener(realm, media_element, HTML::EventNames::seeked, [this] {
         update_placeholder_visibility();
+        if (m_scrubbing_timeline != Scrubbing::No)
+            submit_pending_scrub_seek();
         return true;
     });
     add_event_listener(realm, media_element, HTML::EventNames::timeupdate, [this] {
@@ -194,7 +197,11 @@ void MediaControls::set_up_event_listeners()
         update_volume_and_mute_indicator();
         return true;
     });
-    add_event_listener(realm, media_element, HTML::EventNames::addtrack, [this] {
+    add_event_listener(realm, *media_element.audio_tracks(), HTML::EventNames::addtrack, [this] {
+        update_volume_and_mute_indicator();
+        return true;
+    });
+    add_event_listener(realm, *media_element.audio_tracks(), HTML::EventNames::removetrack, [this] {
         update_volume_and_mute_indicator();
         return true;
     });
@@ -202,6 +209,7 @@ void MediaControls::set_up_event_listeners()
         update_placeholder_visibility();
         update_timeline();
         update_timestamp();
+        update_volume_and_mute_indicator();
         return true;
     });
 
@@ -227,9 +235,7 @@ void MediaControls::set_up_event_listeners()
     }
 
     // Timeline scrubbing
-    static constexpr auto compute_timeline_progress = [](UIEvents::MouseEvent const& event, DOM::Element& timeline_element, double duration) -> Optional<double> {
-        if (isnan(duration) || duration == 0.0)
-            return {};
+    static constexpr auto compute_timeline_progress = [](UIEvents::MouseEvent const& event, DOM::Element& timeline_element) -> double {
         auto rect = timeline_element.get_bounding_client_rect();
         return clamp((event.client_x() - rect.left().to_double()) / rect.width().to_double(), 0.0, 1.0);
     };
@@ -238,10 +244,11 @@ void MediaControls::set_up_event_listeners()
         VERIFY(m_media_element);
         VERIFY(m_dom->timeline_element);
 
-        auto duration = m_media_element->duration();
-        auto progress = compute_timeline_progress(event, *m_dom->timeline_element, duration);
-        if (!progress.has_value())
+        auto range = timeline_range();
+        if (!range.has_value())
             return false;
+
+        auto progress = compute_timeline_progress(event, *m_dom->timeline_element);
 
         m_scrubbing_timeline = Scrubbing::WhilePaused;
         if (!m_media_element->paused()) {
@@ -249,9 +256,10 @@ void MediaControls::set_up_event_listeners()
             m_scrubbing_timeline = Scrubbing::WhilePlaying;
         }
 
-        set_current_time(*progress * duration);
-        set_timeline_progress(*progress);
-        set_timestamp(*progress * duration, duration);
+        m_pending_scrub_seek_time = range->time_at(progress);
+        submit_pending_scrub_seek();
+        set_timeline_progress(progress);
+        set_timestamp(range->time_at(progress), m_media_element->duration());
 
         auto& realm = HTML::relevant_realm(*m_media_element);
         auto& window = relevant_window(realm.global_object());
@@ -260,14 +268,15 @@ void MediaControls::set_up_event_listeners()
             VERIFY(m_media_element);
             VERIFY(m_dom->timeline_element);
 
-            auto duration = m_media_element->duration();
-            auto progress = compute_timeline_progress(event, *m_dom->timeline_element, duration);
-            if (!progress.has_value())
+            auto range = timeline_range();
+            if (!range.has_value())
                 return false;
 
-            set_current_time(*progress * duration);
-            set_timeline_progress(*progress);
-            set_timestamp(*progress * duration, duration);
+            auto progress = compute_timeline_progress(event, *m_dom->timeline_element);
+
+            seek_while_scrubbing(range->time_at(progress));
+            set_timeline_progress(progress);
+            set_timestamp(range->time_at(progress), m_media_element->duration());
             return true;
         });
 
@@ -277,11 +286,11 @@ void MediaControls::set_up_event_listeners()
 
             auto was_playing = m_scrubbing_timeline == Scrubbing::WhilePlaying;
             m_scrubbing_timeline = Scrubbing::No;
+            m_pending_scrub_seek_time.clear();
+            m_scrub_seek_preemption_timer.clear();
 
-            auto duration = m_media_element->duration();
-            auto progress = compute_timeline_progress(event, *m_dom->timeline_element, duration);
-            if (progress.has_value())
-                set_current_time(*progress * duration);
+            if (auto range = timeline_range(); range.has_value())
+                set_current_time(range->time_at(compute_timeline_progress(event, *m_dom->timeline_element)));
 
             if (was_playing) {
                 if (m_media_element->ended()) {
@@ -415,9 +424,13 @@ void MediaControls::set_up_event_listeners()
         case UIEvents::KeyCode::Key_Home:
             set_current_time(0);
             break;
-        case UIEvents::KeyCode::Key_End:
-            set_current_time(m_media_element->duration());
+        case UIEvents::KeyCode::Key_End: {
+            auto range = timeline_range();
+            if (!range.has_value())
+                return false;
+            set_current_time(range->end);
             break;
+        }
         case UIEvents::KeyCode::Key_Right:
             set_current_time(m_media_element->current_time() + arrow_time_step);
             break;
@@ -433,6 +446,9 @@ void MediaControls::set_up_event_listeners()
         case UIEvents::KeyCode::Key_M:
             toggle_mute();
             break;
+        case UIEvents::KeyCode::Key_F:
+            toggle_fullscreen();
+            break;
         default:
             return false;
         }
@@ -441,11 +457,6 @@ void MediaControls::set_up_event_listeners()
     });
 
     request_timeline_update();
-}
-
-void MediaControls::play()
-{
-    m_media_element->play_from_user_interaction();
 }
 
 void MediaControls::toggle_playback()
@@ -465,6 +476,33 @@ void MediaControls::set_current_time(double time)
     update_timeline();
     update_timestamp();
     show_controls();
+}
+
+void MediaControls::seek_while_scrubbing(double time)
+{
+    m_pending_scrub_seek_time = time;
+    if (m_media_element->seeking())
+        return;
+    submit_pending_scrub_seek();
+}
+
+void MediaControls::submit_pending_scrub_seek()
+{
+    if (!m_pending_scrub_seek_time.has_value())
+        return;
+    auto time = m_pending_scrub_seek_time.release_value();
+
+    if (!m_scrub_seek_preemption_timer) {
+        constexpr int scrub_seek_preemption_timeout_ms = 500;
+        m_scrub_seek_preemption_timer = Core::Timer::create_single_shot(scrub_seek_preemption_timeout_ms, [this] {
+            submit_pending_scrub_seek();
+        });
+        m_scrub_seek_preemption_timer->start();
+    } else {
+        m_scrub_seek_preemption_timer->restart();
+    }
+
+    set_current_time(time);
 }
 
 void MediaControls::set_volume(double volume)
@@ -506,23 +544,39 @@ static Utf16String format_percent(double value)
     return Utf16String::formatted("{}%", value * 100);
 }
 
+Optional<MediaControls::TimelineRange> MediaControls::timeline_range() const
+{
+    VERIFY(m_media_element);
+
+    auto seekable = m_media_element->seekable();
+    if (seekable->length() == 0)
+        return {};
+
+    auto index = seekable->length() - 1;
+    TimelineRange range { MUST(seekable->start(index)), MUST(seekable->end(index)) };
+
+    if (!isfinite(range.start) || !isfinite(range.end) || range.span() <= 0.0)
+        return {};
+    return range;
+}
+
 void MediaControls::update_timeline()
 {
     VERIFY(m_media_element);
     VERIFY(m_dom->timeline_track);
     VERIFY(m_dom->timeline_fill);
 
-    auto duration = m_media_element->duration();
+    auto range = timeline_range();
     if (m_scrubbing_timeline == Scrubbing::No) {
         double progress = 0.0;
-        if (!isnan(duration) && duration > 0.0)
-            progress = m_media_element->current_time() / duration;
+        if (range.has_value())
+            progress = clamp(range->progress_at(m_media_element->current_time()), 0.0, 1.0);
         set_timeline_progress(progress);
     }
 
     auto buffered = m_media_element->buffered();
     auto range_count = buffered->length();
-    if (isnan(duration) || duration <= 0.0)
+    if (!range.has_value())
         range_count = 0;
 
     while (m_buffered_ranges.size() > range_count) {
@@ -532,25 +586,25 @@ void MediaControls::update_timeline()
     }
 
     while (m_buffered_ranges.size() < range_count) {
-        auto range = MUST(DOM::create_element(m_media_element->document(), HTML::TagNames::div, Namespace::HTML));
-        MUST(range->class_list()->toggle("timeline-buffered"_utf16, true));
-        MUST(range->style()->set_property(CSS::PropertyID::Display, "block"_utf16));
-        m_dom->timeline_track->insert_before(range, nullptr);
-        m_buffered_ranges.empend(*range);
+        auto element = MUST(DOM::create_element(m_media_element->document(), HTML::TagNames::div, Namespace::HTML));
+        MUST(element->class_list()->toggle("timeline-buffered"_utf16, true));
+        MUST(element->style()->set_property(CSS::PropertyID::Display, "block"_utf16));
+        m_dom->timeline_track->insert_before(element, nullptr);
+        m_buffered_ranges.empend(*element);
     }
 
     for (size_t i = 0; i < range_count; i++) {
-        auto& range = m_buffered_ranges[i];
+        auto& buffered_range = m_buffered_ranges[i];
         auto range_start = MUST(buffered->start(i));
         auto range_duration = MUST(buffered->end(i)) - range_start;
-        auto left = range_start / duration;
-        auto width = range_duration / duration;
-        if (left == range.left && width == range.width)
+        auto left = range->progress_at(range_start);
+        auto width = range_duration / range->span();
+        if (left == buffered_range.left && width == buffered_range.width)
             continue;
-        range.left = left;
-        range.width = width;
+        buffered_range.left = left;
+        buffered_range.width = width;
 
-        auto style = range.element->style();
+        auto style = buffered_range.element->style();
         auto left_text = format_percent(left);
         auto width_text = format_percent(width);
         MUST(style->set_property(CSS::PropertyID::Left, left_text.utf16_view()));
@@ -600,14 +654,22 @@ void MediaControls::set_timestamp(double time, double duration)
     VERIFY(m_dom->timestamp_element);
 
     auto rounded_time = round_to<i64>(time);
-    auto rounded_duration = isnan(duration) ? 0 : round_to<i64>(duration);
+
+    Optional<i64> rounded_duration;
+    if (!isinf(duration))
+        rounded_duration = isnan(duration) ? 0 : round_to<i64>(duration);
 
     if (rounded_time == m_last_timestamp_time && rounded_duration == m_last_timestamp_duration)
         return;
     m_last_timestamp_time = rounded_time;
     m_last_timestamp_duration = rounded_duration;
 
-    MUST(m_dom->timestamp_element->set_text_content(Utf16String::formatted("{} / {}", human_readable_digital_time(rounded_time), human_readable_digital_time(rounded_duration))));
+    auto timestamp_builder = Utf16StringBuilder();
+    timestamp_builder.appendff("{}", human_readable_digital_time(rounded_time));
+    if (rounded_duration.has_value())
+        timestamp_builder.appendff(" / {}", human_readable_digital_time(*rounded_duration));
+
+    MUST(m_dom->timestamp_element->set_text_content(timestamp_builder.to_string()));
 }
 
 void MediaControls::update_volume_and_mute_indicator()
