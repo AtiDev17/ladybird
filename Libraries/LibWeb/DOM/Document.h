@@ -214,14 +214,16 @@ struct DocumentLoadTimingInfo {
     HighResolutionTime::DOMHighResTimeStamp load_event_start_time { 0 };
     // https://html.spec.whatwg.org/multipage/dom.html#load-event-end-time
     HighResolutionTime::DOMHighResTimeStamp load_event_end_time { 0 };
+    // AD-HOC: When the current document readiness first became "loading", for PerformanceTiming's domLoading.
+    HighResolutionTime::DOMHighResTimeStamp dom_loading_time { 0 };
 };
 
 // https://html.spec.whatwg.org/multipage/dom.html#document-unload-timing-info
 struct DocumentUnloadTimingInfo {
     // https://html.spec.whatwg.org/multipage/dom.html#unload-event-start-time
-    double unload_event_start_time { 0 };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_start_time { 0 };
     // https://html.spec.whatwg.org/multipage/dom.html#unload-event-end-time
-    double unload_event_end_time { 0 };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
 };
 
 enum class PolicyControlledFeature : u8 {
@@ -712,6 +714,7 @@ public:
 
     void completely_finish_loading();
     bool completely_loaded_deferred() const { return m_completely_loaded_deferred; }
+    void queue_navigation_timing_entry();
 
     DOMImplementation* implementation();
 
@@ -915,7 +918,7 @@ public:
     void unload(GC::Ptr<Document> new_document = nullptr);
 
     // https://html.spec.whatwg.org/multipage/dom.html#active-parser
-    GC::Ptr<HTML::HTMLParser> active_parser();
+    GC::Ptr<HTML::HTMLParser> active_parser() const;
 
     // https://html.spec.whatwg.org/multipage/dom.html#load-timing-info
     DocumentLoadTimingInfo& load_timing_info() { return m_load_timing_info; }
@@ -927,6 +930,7 @@ public:
     DocumentUnloadTimingInfo const& previous_document_unload_timing() const { return m_previous_document_unload_timing; }
     void set_previous_document_unload_timing(DocumentUnloadTimingInfo const& previous_document_unload_timing) { m_previous_document_unload_timing = previous_document_unload_timing; }
 
+    GC::Ptr<NavigationTiming::PerformanceNavigationTiming> navigation_timing_entry() const { return m_navigation_timing_entry; }
     void set_navigation_timing_entry(GC::Ref<NavigationTiming::PerformanceNavigationTiming> entry) { m_navigation_timing_entry = entry; }
 
     // https://w3c.github.io/editing/docs/execCommand/
@@ -1810,6 +1814,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#previous-document-unload-timing
     DocumentUnloadTimingInfo m_previous_document_unload_timing;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#was-created-via-cross-origin-redirects
+    bool m_was_created_via_cross_origin_redirects { false };
 
     // https://w3c.github.io/navigation-timing/#dfn-navigation-timing-entry
     GC::Ptr<NavigationTiming::PerformanceNavigationTiming> m_navigation_timing_entry;

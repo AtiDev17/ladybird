@@ -60,9 +60,10 @@ private:
 
     void push_clip(ReplayClip const&) override;
     void push_clip_path(Gfx::Path const&, Gfx::WindingRule) override;
+    void push_transform(Gfx::AffineTransform const&) override;
     void push_layer(ReplayLayer const&) override;
     void push_mask(ReplayMask const&) override;
-    void pop_mask(ReplayMask const&, Optional<DisplayListResourceId> mask_content) override;
+    void pop_mask(ReplayMask const&, EffectNodeIndex) override;
     void pop() override;
     void push_device_space_plane_clip(Gfx::Path const&) override;
 
@@ -71,7 +72,9 @@ private:
     SkPaint paint_style_to_skia_paint(DisplayListPaintStyle const&, Gfx::FloatRect const& bounding_rect);
     sk_sp<SkImageFilter> layer_image_filter(ReplayLayer const&);
     sk_sp<SkImageFilter> backdrop_image_filter(ReplayLayer const&, bool limited_to_region);
+    sk_sp<SkImageFilter> image_filter_from_bytes(ReadonlyBytes);
     Gfx::Path path_from_data(DisplayListDataSpan) const;
+    sk_sp<SkImage> rasterize_records_into_tile(ReadonlyBytes tile_records, Gfx::IntRect tile_rect);
     ReadonlySpan<Color> gradient_colors(DisplayListGradientColorStops) const;
     ReadonlySpan<float> gradient_positions(DisplayListGradientColorStops) const;
 

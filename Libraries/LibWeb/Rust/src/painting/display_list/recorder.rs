@@ -5,7 +5,7 @@
  */
 
 use super::builder::{
-    CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE, PendingInlineClip, RecordedDisplayList,
+    CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE, OpenGroup, PendingInlineClip, RecordedDisplayList,
 };
 use super::commands::*;
 use crate::painting::display_list::ffi_bytes::FfiBytes;
@@ -134,7 +134,7 @@ pub enum PaintStyle {
         end_radius: f32,
     },
     Pattern {
-        tile_display_list_id: DisplayListResourceId,
+        tile_records: std::rc::Rc<Vec<u8>>,
         tile_rect: FloatRect,
         content_scale: FloatSize,
         pattern_transform: OptionalAffineTransform,
@@ -186,13 +186,13 @@ impl PaintStyle {
                 style.radial_gradient_end_radius = *end_radius;
             }
             PaintStyle::Pattern {
-                tile_display_list_id,
+                tile_records,
                 tile_rect,
                 content_scale,
                 pattern_transform,
             } => {
                 style.paint_style_type = DisplayListPaintStyleType::Pattern;
-                style.pattern_tile_display_list_id = *tile_display_list_id;
+                style.pattern_tile = payload.append_data(tile_records, super::builder::COMMAND_ALIGNMENT);
                 style.pattern_tile_rect = *tile_rect;
                 style.pattern_content_scale = *content_scale;
                 style.pattern_transform = *pattern_transform;
@@ -237,6 +237,26 @@ pub struct GlyphRunForRecording<'a> {
     pub glyphs: &'a [DisplayListGlyph],
 }
 
+pub struct IsolatedGroupEffects {
+    pub clip_rect: Option<FloatRect>,
+    pub opacity: f32,
+    pub filter: Option<std::rc::Rc<Vec<u8>>>,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub mask_kind: MaskKind,
+}
+
+pub struct DetachedRecords {
+    outer_builder: DisplayListBuilder,
+    outer_ambient_inline_clips: Vec<PendingInlineClip>,
+    outer_ambient_inline_transform: Option<AffineTransform>,
+}
+
+pub struct OpenRecorderGroup {
+    group: OpenGroup,
+    context: ContextRef,
+    suspended_ambient_inline_clips: Vec<PendingInlineClip>,
+}
+
 #[derive(Default)]
 pub struct DisplayListRecorder {
     builder: DisplayListBuilder,
@@ -246,8 +266,8 @@ pub struct DisplayListRecorder {
     // the draws whose force-dark result is judged against it (borders and selections). None outside those scopes.
     contrast_backdrop: Option<Color>,
     context: ContextRef,
-    mask_display_lists: Vec<(EffectNodeIndex, DisplayListResourceId)>,
     ambient_inline_clips: Vec<PendingInlineClip>,
+    ambient_inline_transform: Option<AffineTransform>,
 }
 
 impl DisplayListRecorder {
@@ -271,6 +291,14 @@ impl DisplayListRecorder {
 
     pub fn ambient_inline_clip_depth(&self) -> usize {
         self.ambient_inline_clips.len()
+    }
+
+    pub fn ambient_inline_transform(&self) -> Option<AffineTransform> {
+        self.ambient_inline_transform
+    }
+
+    pub fn set_ambient_inline_transform(&mut self, transform: Option<AffineTransform>) -> Option<AffineTransform> {
+        std::mem::replace(&mut self.ambient_inline_transform, transform)
     }
 
     pub fn push_ambient_inline_clips(&mut self, inline_clips: &[PendingInlineClip]) {
@@ -316,7 +344,7 @@ impl DisplayListRecorder {
     }
 
     /// A gradient paint style resolves stop by stop, like a gradient-painted rectangle; a pattern's colors live in
-    /// its nested display list, which a nested recorder already filters.
+    /// its tile records, which were already filtered when they were recorded.
     fn resolve_paint_style(&mut self, style: &PaintStyle, force_dark_role: ForceDarkRole) -> Option<PaintStyle> {
         match style {
             PaintStyle::LinearGradient {
@@ -369,26 +397,8 @@ impl DisplayListRecorder {
         })
     }
 
-    /// What a nested recorder (a mask, an isolated group) must be built with, so content inside it is filtered the
-    /// same way as content outside it.
-    pub fn force_dark_settings(&self) -> Option<ForceDarkSettings> {
-        self.force_dark.as_ref().map(ForceDarkResolver::settings)
-    }
-
-    pub fn register_mask_display_list(&mut self, effect: EffectNodeIndex, display_list_id: DisplayListResourceId) {
-        self.mask_display_lists.push((effect, display_list_id));
-    }
-
-    pub fn take_mask_display_lists(&mut self) -> Vec<(EffectNodeIndex, DisplayListResourceId)> {
-        std::mem::take(&mut self.mask_display_lists)
-    }
-
     pub fn builder(&self) -> &DisplayListBuilder {
         &self.builder
-    }
-
-    pub fn mask_display_lists(&self) -> &[(EffectNodeIndex, DisplayListResourceId)] {
-        &self.mask_display_lists
     }
 
     pub fn into_builder(self) -> DisplayListBuilder {
@@ -413,8 +423,14 @@ impl DisplayListRecorder {
     }
 
     fn append_command<C: DisplayListCommand>(&mut self, command: &C, inline_data: &[u8]) {
-        self.builder
-            .append_with_inline_clips(command, inline_data, self.context, &self.ambient_inline_clips);
+        self.builder.append_with_inline_state(
+            command,
+            inline_data,
+            self.context,
+            &self.ambient_inline_clips,
+            self.ambient_inline_transform
+                .filter(|transform| !transform.is_identity()),
+        );
     }
 
     pub fn append_cached_command_range(
@@ -837,31 +853,133 @@ impl DisplayListRecorder {
         );
     }
 
-    pub fn draw_repeated_display_list(
+    pub fn begin_isolated_group(&mut self) -> OpenRecorderGroup {
+        self.begin_group::<DrawIsolatedGroup>()
+    }
+
+    pub fn begin_mask_content(&mut self) -> OpenRecorderGroup {
+        self.begin_group::<DeclareMaskContent>()
+    }
+
+    pub fn finish_mask_content(&mut self, group: OpenRecorderGroup, effect: EffectNodeIndex, rect: IntRect) {
+        debug_assert_eq!(self.context, group.context);
+        let command = DeclareMaskContent {
+            rect,
+            effect,
+            content: self.builder.group_content_span(&group.group),
+        };
+        self.builder.finish_group(group.group, &command, group.context);
+        self.ambient_inline_clips = group.suspended_ambient_inline_clips;
+    }
+
+    pub fn begin_detached_records(&mut self) -> DetachedRecords {
+        DetachedRecords {
+            outer_builder: std::mem::take(&mut self.builder),
+            outer_ambient_inline_clips: std::mem::take(&mut self.ambient_inline_clips),
+            outer_ambient_inline_transform: self.ambient_inline_transform.take(),
+        }
+    }
+
+    pub fn finish_detached_records(&mut self, detached: DetachedRecords) -> Vec<u8> {
+        debug_assert!(self.ambient_inline_clips.is_empty());
+        self.ambient_inline_transform = detached.outer_ambient_inline_transform;
+        self.ambient_inline_clips = detached.outer_ambient_inline_clips;
+        std::mem::replace(&mut self.builder, detached.outer_builder)
+            .finish()
+            .bytes
+    }
+
+    pub fn suspend_force_dark(&mut self) -> Option<ForceDarkResolver> {
+        self.force_dark.take()
+    }
+
+    pub fn restore_force_dark(&mut self, resolver: Option<ForceDarkResolver>) {
+        self.force_dark = resolver;
+    }
+
+    pub fn begin_repeated_tile(&mut self) -> OpenRecorderGroup {
+        self.begin_group::<DrawRepeatedTile>()
+    }
+
+    fn begin_group<C: DisplayListCommand>(&mut self) -> OpenRecorderGroup {
+        let suspended_ambient_inline_clips = std::mem::take(&mut self.ambient_inline_clips);
+        OpenRecorderGroup {
+            group: self.builder.begin_group::<C>(suspended_ambient_inline_clips.clone()),
+            context: self.context,
+            suspended_ambient_inline_clips,
+        }
+    }
+
+    pub fn begin_group_mask(&mut self, group: &mut OpenRecorderGroup) {
+        self.builder.begin_group_mask(&mut group.group);
+    }
+
+    pub fn is_recording_inside_group(&self) -> bool {
+        self.builder.open_group_depth() > 0
+    }
+
+    pub fn finish_isolated_group(
         &mut self,
+        group: OpenRecorderGroup,
+        clip_rect: FloatRect,
+        compositing_and_blending_operator: CompositingAndBlendingOperator,
+        mask_kind: MaskKind,
+    ) {
+        self.finish_group_with_effects(
+            group,
+            IsolatedGroupEffects {
+                clip_rect: Some(clip_rect),
+                opacity: 1.0,
+                filter: None,
+                compositing_and_blending_operator,
+                mask_kind,
+            },
+        );
+    }
+
+    pub fn finish_group_with_effects(&mut self, mut group: OpenRecorderGroup, effects: IsolatedGroupEffects) {
+        debug_assert_eq!(self.context, group.context);
+        let content = self.builder.group_content_span(&group.group);
+        let mask = self.builder.group_mask_span(&group.group);
+        let filter = match &effects.filter {
+            Some(filter_bytes) => self.builder.append_group_inline_data(&mut group.group, filter_bytes),
+            None => DisplayListDataSpan::default(),
+        };
+        let command = DrawIsolatedGroup {
+            clip_rect: effects.clip_rect.into(),
+            content,
+            mask,
+            filter,
+            opacity: effects.opacity,
+            compositing_and_blending_operator: effects.compositing_and_blending_operator,
+            mask_kind: effects.mask_kind,
+        };
+        self.builder.finish_group(group.group, &command, group.context);
+        self.ambient_inline_clips = group.suspended_ambient_inline_clips;
+    }
+
+    pub fn finish_repeated_tile(
+        &mut self,
+        group: OpenRecorderGroup,
         dst_rect: IntRect,
         clip_rect: IntRect,
-        display_list_id: DisplayListResourceId,
         scaling_mode: ScalingMode,
         compositing_and_blending_operator: CompositingAndBlendingOperator,
         repeat: Repeat,
     ) {
-        if dst_rect.is_empty() || clip_rect.is_empty() {
-            return;
-        }
-        self.record_clipped_to(clip_rect, |recorder| {
-            recorder.append_command(
-                &DrawRepeatedDisplayList {
-                    dst_rect,
-                    clip_rect,
-                    display_list_id,
-                    scaling_mode,
-                    compositing_and_blending_operator,
-                    repeat,
-                },
-                &[],
-            );
-        });
+        debug_assert_eq!(self.context, group.context);
+        debug_assert!(!dst_rect.is_empty() && !clip_rect.is_empty());
+        let command = DrawRepeatedTile {
+            dst_rect,
+            clip_rect,
+            tile: self.builder.group_content_span(&group.group),
+            scaling_mode,
+            compositing_and_blending_operator,
+            repeat,
+        };
+        self.builder
+            .finish_group_clipped_to(group.group, &command, group.context, clip_rect);
+        self.ambient_inline_clips = group.suspended_ambient_inline_clips;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1104,28 +1222,6 @@ impl DisplayListRecorder {
                 thumb_color,
                 track_color,
                 vertical,
-            },
-            &[],
-        );
-    }
-
-    pub fn draw_isolated_display_list(
-        &mut self,
-        display_list_id: DisplayListResourceId,
-        mask_display_list_id: DisplayListResourceId,
-        rect: FloatRect,
-        list_size: IntSize,
-        compositing_and_blending_operator: CompositingAndBlendingOperator,
-        mask_kind: MaskKind,
-    ) {
-        self.append_command(
-            &DrawIsolatedDisplayList {
-                display_list_id,
-                mask_display_list_id,
-                rect,
-                list_size,
-                compositing_and_blending_operator,
-                mask_kind,
             },
             &[],
         );

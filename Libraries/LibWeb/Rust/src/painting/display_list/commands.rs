@@ -17,7 +17,7 @@ pub enum DisplayListCommandType {
     PaintCaret,
     DrawScaledDecodedImageFrame,
     DrawRepeatedDecodedImageFrame,
-    DrawRepeatedDisplayList,
+    DrawRepeatedTile,
     DrawTiledDecodedImageFrame,
     DrawCompositedContext,
     DrawCanvas,
@@ -36,7 +36,8 @@ pub enum DisplayListCommandType {
     BackdropFilterRegion,
     DrawRect,
     PaintNestedDisplayList,
-    DrawIsolatedDisplayList,
+    DrawIsolatedGroup,
+    DeclareMaskContent,
     CompositorScrollNode,
     CompositorWheelHitTestTarget,
     CompositorWheelHitTestTargetWithCornerRadii,
@@ -78,7 +79,7 @@ impl DisplayListCommandType {
             Self::PaintCaret => "PaintCaret",
             Self::DrawScaledDecodedImageFrame => "DrawScaledDecodedImageFrame",
             Self::DrawRepeatedDecodedImageFrame => "DrawRepeatedDecodedImageFrame",
-            Self::DrawRepeatedDisplayList => "DrawRepeatedDisplayList",
+            Self::DrawRepeatedTile => "DrawRepeatedTile",
             Self::DrawTiledDecodedImageFrame => "DrawTiledDecodedImageFrame",
             Self::DrawCompositedContext => "DrawCompositedContext",
             Self::DrawCanvas => "DrawCanvas",
@@ -97,7 +98,8 @@ impl DisplayListCommandType {
             Self::BackdropFilterRegion => "BackdropFilterRegion",
             Self::DrawRect => "DrawRect",
             Self::PaintNestedDisplayList => "PaintNestedDisplayList",
-            Self::DrawIsolatedDisplayList => "DrawIsolatedDisplayList",
+            Self::DrawIsolatedGroup => "DrawIsolatedGroup",
+            Self::DeclareMaskContent => "DeclareMaskContent",
             Self::CompositorScrollNode => "CompositorScrollNode",
             Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
             Self::CompositorWheelHitTestTargetWithCornerRadii => "CompositorWheelHitTestTargetWithCornerRadii",
@@ -487,6 +489,7 @@ pub struct DisplayListCommandHeader {
     pub command_type: DisplayListCommandType,
     pub has_bounding_rect: bool,
     pub inline_clip_count: u8,
+    pub has_inline_transform: bool,
     pub payload_size: u32,
     pub context: ContextRef,
     pub bounding_rect: IntRect,
@@ -495,6 +498,7 @@ ffi_bytes_fields!(DisplayListCommandHeader {
     command_type,
     has_bounding_rect,
     inline_clip_count,
+    has_inline_transform,
     payload_size,
     context,
     bounding_rect
@@ -534,6 +538,16 @@ ffi_bytes_fields!(DisplayListInlineClip {
 });
 pub const INLINE_CLIP_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineClip>();
 const _: () = assert!(INLINE_CLIP_ENTRY_SIZE == 64);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DisplayListInlineTransform {
+    pub transform: AffineTransform,
+    pub padding: [u32; 2],
+}
+ffi_bytes_fields!(DisplayListInlineTransform { transform, padding });
+pub const INLINE_TRANSFORM_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineTransform>();
+const _: () = assert!(INLINE_TRANSFORM_ENTRY_SIZE == 32);
 
 // A maximal sequence of consecutive commands sharing one visual context, summarized as the tape is
 // built so that replay can enter a context, cull, and depth-sort per run instead of rediscovering
@@ -625,7 +639,7 @@ pub struct DisplayListPaintStyle {
     pub radial_gradient_start_radius: f32,
     pub radial_gradient_end_center: FloatPoint,
     pub radial_gradient_end_radius: f32,
-    pub pattern_tile_display_list_id: DisplayListResourceId,
+    pub pattern_tile: DisplayListDataSpan,
     pub pattern_tile_rect: FloatRect,
     pub pattern_content_scale: FloatSize,
     pub pattern_transform: OptionalAffineTransform,
@@ -639,7 +653,7 @@ ffi_bytes_fields!(DisplayListPaintStyle {
     radial_gradient_start_radius,
     radial_gradient_end_center,
     radial_gradient_end_radius,
-    pattern_tile_display_list_id,
+    pattern_tile,
     pattern_tile_rect,
     pattern_content_scale,
     pattern_transform
@@ -656,7 +670,7 @@ impl Default for DisplayListPaintStyle {
             radial_gradient_start_radius: 0.0,
             radial_gradient_end_center: FloatPoint::default(),
             radial_gradient_end_radius: 0.0,
-            pattern_tile_display_list_id: DisplayListResourceId(0),
+            pattern_tile: DisplayListDataSpan::default(),
             pattern_tile_rect: FloatRect::default(),
             pattern_content_scale: FloatSize {
                 width: 1.0,
@@ -818,25 +832,25 @@ impl DisplayListCommand for DrawRepeatedDecodedImageFrame {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct DrawRepeatedDisplayList {
+pub struct DrawRepeatedTile {
     pub dst_rect: IntRect,
     pub clip_rect: IntRect,
-    pub display_list_id: DisplayListResourceId,
+    pub tile: DisplayListDataSpan,
     pub scaling_mode: ScalingMode,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub repeat: Repeat,
 }
-ffi_bytes_fields!(DrawRepeatedDisplayList {
+ffi_bytes_fields!(DrawRepeatedTile {
     dst_rect,
     clip_rect,
-    display_list_id,
+    tile,
     scaling_mode,
     compositing_and_blending_operator,
     repeat
 });
 
-impl DisplayListCommand for DrawRepeatedDisplayList {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRepeatedDisplayList;
+impl DisplayListCommand for DrawRepeatedTile {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawRepeatedTile;
     fn bounding_rect(&self) -> Option<IntRect> {
         Some(self.clip_rect)
     }
@@ -1303,35 +1317,52 @@ impl DisplayListCommand for PaintNestedDisplayList {
     }
 }
 
-pub const NO_MASK_DISPLAY_LIST: DisplayListResourceId = DisplayListResourceId(0);
-
-// Plays its content list inside an internally scoped saveLayer, optionally
-// masked by a second list composited with DestinationIn, so a group that
-// must not blend with the canvas needs no clips or effects.
+// Plays the content records inside an internally scoped saveLayer that carries
+// the group's opacity, blend and filter, optionally masked by a second run of
+// records composited with DestinationIn, so a group that must not blend with
+// the canvas needs no clips or effects. Both runs are recorded in place inside
+// this command's payload under its context.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct DrawIsolatedDisplayList {
-    pub display_list_id: DisplayListResourceId,
-    pub mask_display_list_id: DisplayListResourceId,
-    pub rect: FloatRect,
-    pub list_size: IntSize,
+pub struct DrawIsolatedGroup {
+    pub clip_rect: OptionalFloatRect,
+    pub content: DisplayListDataSpan,
+    pub mask: DisplayListDataSpan,
+    pub filter: DisplayListDataSpan,
+    pub opacity: f32,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub mask_kind: MaskKind,
 }
-ffi_bytes_fields!(DrawIsolatedDisplayList {
-    display_list_id,
-    mask_display_list_id,
-    rect,
-    list_size,
+ffi_bytes_fields!(DrawIsolatedGroup {
+    clip_rect,
+    content,
+    mask,
+    filter,
+    opacity,
     compositing_and_blending_operator,
     mask_kind
 });
-const _: () = assert!(std::mem::size_of::<DrawIsolatedDisplayList>() == 48);
 
-impl DisplayListCommand for DrawIsolatedDisplayList {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedDisplayList;
+impl DisplayListCommand for DrawIsolatedGroup {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedGroup;
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(enclosing_int_rect(self.rect))
+        self.clip_rect.get().map(enclosing_int_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct DeclareMaskContent {
+    pub rect: IntRect,
+    pub effect: EffectNodeIndex,
+    pub content: DisplayListDataSpan,
+}
+ffi_bytes_fields!(DeclareMaskContent { rect, effect, content });
+
+impl DisplayListCommand for DeclareMaskContent {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DeclareMaskContent;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        Some(self.rect)
     }
 }
 

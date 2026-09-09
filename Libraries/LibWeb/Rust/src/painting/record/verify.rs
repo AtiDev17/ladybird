@@ -6,7 +6,7 @@
 
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::painting::display_list::builder::{HEADER_SIZE, for_each_command};
+use crate::painting::display_list::builder::{HEADER_SIZE, for_each_command, read_command, read_header};
 use crate::painting::display_list::commands::*;
 use crate::painting::record::RecordingOutput;
 use crate::painting::record::cache::CaptureKind;
@@ -76,6 +76,22 @@ fn zero_field(payload: &mut [u8], offset: usize, size: usize) {
     }
 }
 
+fn zero_resource_ids_inside_span(payload: &mut [u8], span: DisplayListDataSpan, enclosing_capture_is_video: bool) {
+    let records = &mut payload[span.offset as usize..(span.offset + span.size) as usize];
+    let mut offset = 0;
+    while offset < records.len() {
+        let header = read_header(&records[offset..]);
+        let payload_start = offset + HEADER_SIZE;
+        let payload_end = payload_start + header.payload_size as usize;
+        zero_resource_ids_minted_per_recording(
+            header.command_type,
+            enclosing_capture_is_video,
+            &mut records[payload_start..payload_end],
+        );
+        offset = payload_end;
+    }
+}
+
 fn zero_resource_ids_minted_per_recording(
     command_type: DisplayListCommandType,
     enclosing_capture_is_video: bool,
@@ -90,40 +106,30 @@ fn zero_resource_ids_minted_per_recording(
                 id_size,
             );
         }
-        DisplayListCommandType::DrawIsolatedDisplayList => {
-            zero_field(
-                payload,
-                std::mem::offset_of!(DrawIsolatedDisplayList, display_list_id),
-                id_size,
-            );
-            zero_field(
-                payload,
-                std::mem::offset_of!(DrawIsolatedDisplayList, mask_display_list_id),
-                id_size,
-            );
+        DisplayListCommandType::DrawIsolatedGroup => {
+            let command = read_command::<DrawIsolatedGroup>(payload);
+            zero_resource_ids_inside_span(payload, command.content, enclosing_capture_is_video);
+            zero_resource_ids_inside_span(payload, command.mask, enclosing_capture_is_video);
         }
-        DisplayListCommandType::DrawRepeatedDisplayList => {
-            zero_field(
-                payload,
-                std::mem::offset_of!(DrawRepeatedDisplayList, display_list_id),
-                id_size,
-            );
+        DisplayListCommandType::DrawRepeatedTile => {
+            let command = read_command::<DrawRepeatedTile>(payload);
+            zero_resource_ids_inside_span(payload, command.tile, enclosing_capture_is_video);
+        }
+        DisplayListCommandType::DeclareMaskContent => {
+            let command = read_command::<DeclareMaskContent>(payload);
+            zero_resource_ids_inside_span(payload, command.content, enclosing_capture_is_video);
         }
         DisplayListCommandType::FillPath => {
-            zero_field(
-                payload,
-                std::mem::offset_of!(FillPath, paint_style)
-                    + std::mem::offset_of!(DisplayListPaintStyle, pattern_tile_display_list_id),
-                id_size,
-            );
+            let command = read_command::<FillPath>(payload);
+            if command.paint_style.paint_style_type == DisplayListPaintStyleType::Pattern {
+                zero_resource_ids_inside_span(payload, command.paint_style.pattern_tile, enclosing_capture_is_video);
+            }
         }
         DisplayListCommandType::StrokePath => {
-            zero_field(
-                payload,
-                std::mem::offset_of!(StrokePath, paint_style)
-                    + std::mem::offset_of!(DisplayListPaintStyle, pattern_tile_display_list_id),
-                id_size,
-            );
+            let command = read_command::<StrokePath>(payload);
+            if command.paint_style.paint_style_type == DisplayListPaintStyleType::Pattern {
+                zero_resource_ids_inside_span(payload, command.paint_style.pattern_tile, enclosing_capture_is_video);
+            }
         }
         DisplayListCommandType::DrawScaledDecodedImageFrame if enclosing_capture_is_video => {
             zero_field(
@@ -253,20 +259,6 @@ pub(crate) fn verify_spliced_recording_matches_fresh(
         "paint cache verification failed: hit-test item counts differ"
     );
 
-    let with_splices_mask_effects: Vec<EffectNodeIndex> = recording_with_splices
-        .mask_display_lists
-        .iter()
-        .map(|registration| registration.effect)
-        .collect();
-    let from_scratch_mask_effects: Vec<EffectNodeIndex> = recording_from_scratch
-        .mask_display_lists
-        .iter()
-        .map(|registration| registration.effect)
-        .collect();
-    assert_eq!(
-        with_splices_mask_effects, from_scratch_mask_effects,
-        "paint cache verification failed: mask display list registrations differ"
-    );
     let region_count = |commands: &[DecodedCommand]| {
         commands
             .iter()

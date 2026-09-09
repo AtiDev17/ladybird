@@ -6,6 +6,7 @@
  */
 
 #include <AK/NeverDestroyed.h>
+#include <AK/StringHash.h>
 #include <AK/TemporaryChange.h>
 #include <AK/Time.h>
 #include <core/SkBitmap.h>
@@ -34,7 +35,6 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/PainterSkia.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibGfx/SkiaUtils.h>
 #include <LibWeb/Painting/CanvasSurfaceRegistry.h>
@@ -572,29 +572,40 @@ void DisplayListPlayerSkia::play_command(DrawTiledDecodedImageFrame const& comma
     canvas.drawRect(to_skia_rect(pattern_rect), paint);
 }
 
-void DisplayListPlayerSkia::play_command(DrawRepeatedDisplayList const& command)
+static u64 repeated_tile_raster_key(ReadonlyBytes tile_records, Gfx::IntSize tile_size)
+{
+    auto const* characters = reinterpret_cast<char const*>(tile_records.data());
+    u64 high = string_hash(characters, tile_records.size(), 0x9e3779b9u);
+    u64 low = string_hash(characters, tile_records.size(), static_cast<u32>(tile_size.width() * 31 + tile_size.height()));
+    return (high << 32) | low;
+}
+
+void DisplayListPlayerSkia::play_command(DrawRepeatedTile const& command)
 {
     auto tile_size = command.dst_rect.size();
     if (tile_size.is_empty())
         return;
 
-    if (auto image = resource_storage().cached_skia_image_for_display_list(command.display_list_id, tile_size, m_skia_backend_context)) {
-        paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.compositing_and_blending_operator, command.repeat.x, command.repeat.y);
-        return;
+    auto tile_records = inline_data(command.tile);
+    auto raster_key = repeated_tile_raster_key(tile_records, tile_size);
+    auto image = resource_storage().cached_repeated_tile_raster(raster_key, tile_size, m_skia_backend_context);
+    if (!image) {
+        image = rasterize_records_into_tile(tile_records, command.dst_rect);
+        if (!image)
+            return;
+        resource_storage().add_cached_repeated_tile_raster(raster_key, tile_size, m_skia_backend_context, image);
     }
-
-    auto tile_surface = Gfx::PaintingSurface::create_with_size(tile_size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
-    Gfx::PainterSkia painter { tile_surface };
-    painter.clear_rect(tile_surface->rect().to_type<float>(), Gfx::Color::Transparent);
-    auto const& tile_display_list = resource_storage().display_list_resource(command.display_list_id);
-    execute_display_list_into_surface(*tile_display_list.display_list, tile_display_list.visual_context_tree, *tile_surface);
-    auto image = tile_surface->sk_surface().makeImageSnapshot();
-    if (!image)
-        return;
-
-    resource_storage().set_cached_skia_image_for_display_list(command.display_list_id, tile_size, m_skia_backend_context, image);
-
     paint_repeated_image(surface().canvas(), *image, command.dst_rect, command.scaling_mode, command.compositing_and_blending_operator, command.repeat.x, command.repeat.y);
+}
+
+sk_sp<SkImage> DisplayListPlayerSkia::rasterize_records_into_tile(ReadonlyBytes tile_records, Gfx::IntRect tile_rect)
+{
+    auto tile_surface = Gfx::PaintingSurface::create_with_size(tile_rect.size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
+    tile_surface->canvas().clear(SK_ColorTRANSPARENT);
+    tile_surface->canvas().translate(-tile_rect.x(), -tile_rect.y());
+    execute_command_bytes_into_surface(tile_records, *tile_surface);
+    tile_surface->canvas().resetMatrix();
+    return tile_surface->sk_surface().makeImageSnapshot();
 }
 
 static SkGradient::Interpolation to_skia_interpolation(Gfx::GradientInterpolationMethod interpolation_method)
@@ -891,12 +902,9 @@ SkPaint DisplayListPlayerSkia::paint_style_to_skia_paint(DisplayListPaintStyle c
         if (tile_size.is_empty())
             return {};
 
-        auto tile_surface = Gfx::PaintingSurface::create_with_size(tile_size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
-
-        auto const& tile_display_list = resource_storage().display_list_resource(paint_style.pattern_tile_display_list_id);
-        execute_display_list_into_surface(*tile_display_list.display_list, tile_display_list.visual_context_tree, *tile_surface);
-
-        auto image = tile_surface->sk_surface().makeImageSnapshot();
+        auto image = rasterize_records_into_tile(inline_data(paint_style.pattern_tile), Gfx::IntRect { {}, tile_size });
+        if (!image)
+            return {};
 
         SkMatrix matrix;
         matrix.setTranslate(tile_rect.x(), tile_rect.y());
@@ -1096,27 +1104,37 @@ void DisplayListPlayerSkia::play_command(PaintConicGradient const& command)
     surface().canvas().drawRect(to_skia_rect(rect), paint);
 }
 
-void DisplayListPlayerSkia::play_command(DrawIsolatedDisplayList const& command)
+void DisplayListPlayerSkia::play_command(DrawIsolatedGroup const& command)
 {
     auto& canvas = surface().canvas();
     canvas.save();
-    canvas.clipRect(to_skia_rect(command.rect), true);
+    if (command.clip_rect.has_value())
+        canvas.clipRect(to_skia_rect(*command.clip_rect), true);
     SkPaint group_paint;
+    if (command.opacity < 1.0f)
+        group_paint.setAlphaf(command.opacity);
     if (command.compositing_and_blending_operator != Gfx::CompositingAndBlendingOperator::Normal)
         group_paint.setBlender(Gfx::to_skia_blender(command.compositing_and_blending_operator));
+    if (command.filter.size != 0)
+        group_paint.setImageFilter(image_filter_from_bytes(inline_data(command.filter)));
     canvas.saveLayer(nullptr, &group_paint);
-    play_command(PaintNestedDisplayList { command.display_list_id, command.rect, command.list_size });
-    if (command.mask_display_list_id.value() != 0) {
+    execute_command_bytes(inline_data(command.content), active_scroll_state());
+    if (command.mask.size != 0) {
         SkPaint mask_paint;
         mask_paint.setBlender(Gfx::to_skia_blender(Gfx::CompositingAndBlendingOperator::DestinationIn));
         if (command.mask_kind == Gfx::MaskKind::Luminance)
             mask_paint.setColorFilter(SkLumaColorFilter::Make());
         canvas.saveLayer(nullptr, &mask_paint);
-        play_command(PaintNestedDisplayList { command.mask_display_list_id, command.rect, command.list_size });
+        execute_command_bytes(inline_data(command.mask), active_scroll_state());
         canvas.restore();
     }
     canvas.restore();
     canvas.restore();
+}
+
+void DisplayListPlayerSkia::play_command(DeclareMaskContent const& command)
+{
+    declare_mask_content(command.effect, inline_data(command.content));
 }
 
 void DisplayListPlayerSkia::play_command(PaintNestedDisplayList const& command)
@@ -1271,6 +1289,13 @@ void DisplayListPlayerSkia::push_clip_path(Gfx::Path const& path, Gfx::WindingRu
     clip_path(path, winding_rule, true);
 }
 
+void DisplayListPlayerSkia::push_transform(Gfx::AffineTransform const& transform)
+{
+    auto& canvas = surface().canvas();
+    canvas.save();
+    canvas.concat(to_skia_matrix(transform));
+}
+
 // https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty
 // Skia reads a layer's backdrop from the layer's parent, so the filtered backdrop has to become the
 // layer's initial content here, where the layer is opened. The canvas clip is not narrowed to the
@@ -1331,9 +1356,7 @@ sk_sp<SkImageFilter> DisplayListPlayerSkia::backdrop_image_filter(ReplayLayer co
         && cached->limited_to_region == limited_to_region)
         return cached->image_filter;
 
-    auto image_filter = Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& {
-        return resource_storage().image_frame(ImageFrameResourceId { image_id });
-    });
+    auto image_filter = image_filter_from_bytes(filter_bytes);
     if (limited_to_region) {
         auto region = to_skia_rect(layer.backdrop_region);
         image_filter = SkImageFilters::Crop(region, SkTileMode::kDecal, move(image_filter));
@@ -1357,11 +1380,16 @@ sk_sp<SkImageFilter> DisplayListPlayerSkia::layer_image_filter(ReplayLayer const
     auto& entries_by_effect = m_layer_image_filter_cache->entries_by_tree_structural_epoch_and_effect.ensure(active_visual_context_tree().structural_epoch());
     if (auto cached = entries_by_effect.get(layer.effect.value()); cached.has_value() && cached->filter_bytes.bytes() == filter_bytes)
         return cached->image_filter;
-    auto image_filter = Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& {
-        return resource_storage().image_frame(ImageFrameResourceId { image_id });
-    });
+    auto image_filter = image_filter_from_bytes(filter_bytes);
     entries_by_effect.set(layer.effect.value(), LayerImageFilterCache::Entry { MUST(ByteBuffer::copy(filter_bytes)), image_filter });
     return image_filter;
+}
+
+sk_sp<SkImageFilter> DisplayListPlayerSkia::image_filter_from_bytes(ReadonlyBytes filter_bytes)
+{
+    return Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& {
+        return resource_storage().image_frame(ImageFrameResourceId { image_id });
+    });
 }
 
 void DisplayListPlayerSkia::push_mask(ReplayMask const& mask)
@@ -1372,7 +1400,7 @@ void DisplayListPlayerSkia::push_mask(ReplayMask const& mask)
     canvas.saveLayer(nullptr, nullptr);
 }
 
-void DisplayListPlayerSkia::pop_mask(ReplayMask const& mask, Optional<DisplayListResourceId> mask_content)
+void DisplayListPlayerSkia::pop_mask(ReplayMask const& mask, EffectNodeIndex effect)
 {
     auto& canvas = surface().canvas();
     SkPaint paint;
@@ -1380,12 +1408,11 @@ void DisplayListPlayerSkia::pop_mask(ReplayMask const& mask, Optional<DisplayLis
     if (mask.kind == Gfx::MaskKind::Luminance)
         paint.setColorFilter(SkLumaColorFilter::Make());
     canvas.saveLayer(nullptr, &paint);
-    if (mask_content.has_value()) {
-        play_command(PaintNestedDisplayList {
-            .display_list_id = *mask_content,
-            .rect = mask.rect.to_type<float>(),
-            .list_size = mask.rect.size(),
-        });
+    if (auto content = declared_mask_content(effect); content.has_value()) {
+        canvas.save();
+        canvas.clipRect(to_skia_rect(mask.rect.to_type<float>()));
+        execute_command_bytes(*content, active_scroll_state());
+        canvas.restore();
     }
     canvas.restore();
     canvas.restore();
