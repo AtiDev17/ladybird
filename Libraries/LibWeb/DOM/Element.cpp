@@ -2868,7 +2868,7 @@ void Element::set_shadow_root(GC::Ptr<ShadowRoot> shadow_root)
 GC::Ref<CSS::CSSStyleProperties> Element::style()
 {
     if (!m_inline_style)
-        m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
+        m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this });
     return *m_inline_style;
 }
 
@@ -6191,7 +6191,7 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         // which a deferred geometry-read boundary can commit its before-change style.
         document().flush_deferred_style_change_event();
         if (!m_inline_style)
-            m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
+            m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this });
         m_inline_style->set_declarations_from_text(value_or_empty);
         prefetch_inline_style_image_resources(*m_inline_style, document());
     } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
@@ -6325,13 +6325,13 @@ void Element::set_is_value(Optional<Utf16FlyString> const& is)
         rare_data->is_value.clear();
 }
 
-CSS::StyleSheetList& Element::document_or_shadow_root_style_sheets()
+CSS::StyleScope& Element::document_or_shadow_root_style_scope()
 {
     auto& root_node = root();
     if (is<DOM::ShadowRoot>(root_node))
-        return static_cast<DOM::ShadowRoot&>(root_node).style_sheets();
+        return static_cast<DOM::ShadowRoot&>(root_node).style_scope();
 
-    return document().style_sheets();
+    return document().style_scope();
 }
 
 ElementByIdMap& Element::document_or_shadow_root_element_by_id_map()

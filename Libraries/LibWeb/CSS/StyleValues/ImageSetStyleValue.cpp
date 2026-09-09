@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Resolution.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ResolutionStyleValue.h>
@@ -23,14 +23,14 @@ StyleValueFFI::StyleValueData const* ImageSetStyleValue::make_image_set_data(Vec
 {
     // The Rust allocation takes ownership of one strong reference to each value and one leaked
     // reference to each type string.
-    Vector<StyleValueFFI::RetainedImageSetOption> ffi_options;
+    Vector<StyleValueFFI::FfiImageSetOption> ffi_options;
     ffi_options.ensure_capacity(options.size());
     for (auto const& option : options) {
         ffi_options.unchecked_append({
             { StyleValueFFI::rust_style_value_retain(option.image->rust_style_value_data()) },
             { StyleValueFFI::rust_style_value_retain(option.resolution->rust_style_value_data()) },
             option.type.has_value(),
-            { option.type.has_value() ? option.type->to_raw_leaked() : 0 },
+            option.type.has_value() ? option.type->to_raw_leaked() : 0,
         });
     }
     return StyleValueFFI::rust_style_value_create_image_set(ffi_options.data(), ffi_options.size());
@@ -123,7 +123,7 @@ bool ImageSetStyleValue::is_paintable(GC::Ptr<HTML::DecodedImageData> decoded_im
     return false;
 }
 
-void ImageSetStyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
+void ImageSetStyleValue::set_style_sheet(StyleSheetState* style_sheet)
 {
 
     // Propagate the style sheet to candidate images whose type() filter does not exclude them. This ensures the

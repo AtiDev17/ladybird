@@ -545,6 +545,14 @@ impl Compiler {
     pub fn lower(&self, prepared: &PreparedProgram) -> Result<LowProgram, CompileError> {
         let mut program = LowProgram::new();
         program.runtime = low_ir::RuntimeConstants::from_layout(&prepared.constants);
+        for (handler, layout) in prepared.handlers.iter().zip(&prepared.bytecode.handler_layouts) {
+            if let Some(layout) = &layout.slow_path {
+                program
+                    .runtime
+                    .slow_paths
+                    .insert(handler.name().to_string(), layout.clone());
+            }
+        }
         program.dispatch_handlers = prepared.bytecode.dispatch_handlers.clone();
 
         for template in &prepared.handlers {
@@ -640,6 +648,7 @@ const EXECUTION_CONTEXT_PROGRAM_COUNTER = 56
 const SIZEOF_EXECUTION_CONTEXT = 120
 const VM_RUNNING_EXECUTION_CONTEXT = 15288
 const VM_BREAKPOINT_CONTROLLER = 16664
+const SLOW_PATH_CONTINUATION_BIT = 32
 const EXECUTABLE_BYTECODE_DATA = 104
 const INT32_TAG = 0x7FFA
 const BOOLEAN_TAG = 0x7FF9
@@ -1037,7 +1046,7 @@ specialize Clear(dst: Undefined);
         assert!(
             emission_error
                 .message
-                .contains("required runtime constant 'VM_RUNNING_EXECUTION_CONTEXT'")
+                .contains("required runtime constant 'SLOW_PATH_CONTINUATION_BIT'")
         );
     }
 

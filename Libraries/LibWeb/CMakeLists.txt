@@ -96,7 +96,8 @@ set(SOURCES
     CSS/Clip.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
-    CSS/RustStyleBridge.cpp
+    CSS/RustDeclarationBlock.cpp
+    CSS/RustDescriptorBlock.cpp
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
     CSS/CounterStyle.cpp
@@ -179,8 +180,6 @@ set(SOURCES
     CSS/FontFaceSetLoadEvent.cpp
     CSS/FontFeatureData.cpp
     CSS/Frequency.cpp
-    CSS/GridTrackPlacement.cpp
-    CSS/GridTrackSize.cpp
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
@@ -203,7 +202,6 @@ set(SOURCES
     CSS/MediaQueryListEvent.cpp
     CSS/Number.cpp
     CSS/NumericType.cpp
-    CSS/PageSelector.cpp
     CSS/ParsedFontFace.cpp
     CSS/Parser/ErrorReporter.cpp
     CSS/Parser/Helpers.cpp
@@ -212,7 +210,6 @@ set(SOURCES
     CSS/Parser/RustValueParsing.cpp
     CSS/Parser/RustSyntaxParsing.cpp
     CSS/Parser/RuleContext.cpp
-    CSS/Parser/RuleParsing.cpp
     CSS/Parser/SelectorParsing.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
@@ -235,13 +232,14 @@ set(SOURCES
     CSS/StyleScope.cpp
     CSS/StyleSheet.cpp
     CSS/StyleSheetIdentifier.cpp
+    CSS/StyleSheetImport.cpp
     CSS/StyleSheetInvalidation.cpp
     CSS/StyleSheetList.cpp
+    CSS/StyleSheetState.cpp
     CSS/StyleValues/AbstractImageStyleValue.cpp
     CSS/StyleValues/AnchorStyleValue.cpp
     CSS/StyleValues/AngleStyleValue.cpp
     CSS/StyleValues/BackgroundSizeStyleValue.cpp
-    CSS/StyleValues/BasicShapeStyleValue.cpp
     CSS/StyleValues/BorderImageSliceStyleValue.cpp
     CSS/StyleValues/BorderRadiusStyleValue.cpp
     CSS/StyleValues/BorderRadiusRectStyleValue.cpp
@@ -262,16 +260,12 @@ set(SOURCES
     CSS/StyleValues/CustomIdentStyleValue.cpp
     CSS/StyleValues/DimensionStyleValue.cpp
     CSS/StyleValues/DisplayStyleValue.cpp
-    CSS/StyleValues/EasingStyleValue.cpp
     CSS/StyleValues/EdgeStyleValue.cpp
     CSS/StyleValues/FilterStyleValue.cpp
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
     CSS/StyleValues/FontStyleStyleValue.cpp
     CSS/StyleValues/FrequencyStyleValue.cpp
-    CSS/StyleValues/GridTemplateAreaStyleValue.cpp
-    CSS/StyleValues/GridTrackPlacementStyleValue.cpp
-    CSS/StyleValues/GridTrackSizeListStyleValue.cpp
     CSS/StyleValues/ImageSetStyleValue.cpp
     CSS/StyleValues/ImageStyleValue.cpp
     CSS/StyleValues/IntegerStyleValue.cpp
@@ -301,7 +295,6 @@ set(SOURCES
     CSS/StyleValues/TimeStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
     CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
-    CSS/StyleValues/TupleStyleValue.cpp
     CSS/StyleValues/UnresolvedStyleValue.cpp
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -921,7 +914,6 @@ set(SOURCES
     StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
     StorageAPI/StorageManager.cpp
-    StorageAPI/StorageShed.cpp
     StorageAPI/StorageShelf.cpp
     Streams/AbstractOperations.cpp
     Streams/ByteLengthQueuingStrategy.cpp
@@ -1281,6 +1273,7 @@ build_rust_binary(
     FEATURES style-replay
 )
 target_link_libraries(libweb_rust INTERFACE LibGfx)
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 
 set(content_blocker_rust_features "")
 if (NOT BUILD_SHARED_LIBS)

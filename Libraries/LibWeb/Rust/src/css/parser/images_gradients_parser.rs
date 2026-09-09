@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
+use crate::css::css_string::CssString;
 use crate::css::css_tokenizer::ParserTokenKind;
 use crate::css::parser::color_parser::{color_syntax, parse_color_interpolation_method, parse_color_value};
 use crate::css::parser::component_value::{ComponentKind, ComponentValue};
 use crate::css::parser::positions_shapes_parser::{center_position, parse_position_from_stream, parse_radial_size};
 use crate::css::parser::token_stream::TokenStream;
 use crate::css::property_metadata::property_id;
-use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::style_value::{
     ImageResourceContext, RetainedColorStop, RetainedColorStopList, RetainedImageSetOption, RetainedImageSetOptionList,
     RetainedRequestUrlModifierList, RetainedString, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
@@ -25,7 +25,7 @@ use crate::css::style_value::{
 use super::value_parser::{
     NumericRange, ParseContext, ParseOutcome, equals_ascii_case_insensitive, parse_angle_from_stream,
     parse_angle_percentage_from_stream, parse_length_percentage_from_stream, parse_resolution_from_stream,
-    parse_url_value, retain_fly_string,
+    parse_url_value,
 };
 
 fn retained(value: StyleValueData) -> RetainedStyleValueData {
@@ -50,7 +50,7 @@ fn context_bytes(pointer: *const u8, length: usize) -> Option<&'static [u8]> {
 fn image_resource_context(context: &ParseContext) -> Option<ImageResourceContext> {
     let base_url = context_bytes(context.document_base_url, context.document_base_url_length)?;
     Some(ImageResourceContext {
-        base_url: RetainedString::from_utf8(std::str::from_utf8(base_url).ok()?.to_owned()),
+        base_url: RetainedString::from_ascii(std::str::from_utf8(base_url).ok()?.to_owned()),
         has_base_url: !base_url.is_empty(),
         has_parent_style_sheet_origin_clean: false,
         parent_style_sheet_origin_clean: false,
@@ -84,7 +84,7 @@ fn image_from_string(context: &ParseContext, string: &[u16]) -> Option<StyleValu
     })
 }
 
-fn parse_type(context: &ParseContext, value: &ComponentValue) -> Option<RetainedUtf16FlyString> {
+fn parse_type(_context: &ParseContext, value: &ComponentValue) -> Option<CssString> {
     let (name, arguments) = value.function()?;
     if !equals_ascii_case_insensitive(name, b"type") {
         return None;
@@ -94,7 +94,7 @@ fn parse_type(context: &ParseContext, value: &ComponentValue) -> Option<Retained
     if arguments.next().is_some() {
         return None;
     }
-    retain_fly_string(context, string)
+    Some(CssString::from_utf16(string))
 }
 
 fn parse_image_set(context: &ParseContext, property: u16, arguments: &[ComponentValue]) -> Option<StyleValueData> {
@@ -632,7 +632,7 @@ pub(crate) fn parse_image_value(
 ) -> Option<StyleValueData> {
     tokens.discard_whitespace();
     if let Some(url) = parse_url_value(context, tokens.next_token()) {
-        let is_fragment = matches!(&url, StyleValueData::Url { url, .. } if url.as_bytes().starts_with(b"#"));
+        let is_fragment = matches!(&url, StyleValueData::Url { url, .. } if url.is_fragment());
         if !is_fragment {
             tokens.discard_a_token();
             return image_from_url(context, url);
@@ -738,12 +738,10 @@ mod tests {
             value_contexts: std::ptr::null(),
             value_context_count: 0,
             declared_namespaces: std::ptr::null(),
-            declared_namespace_count: 0,
             document_url: std::ptr::null(),
             document_url_length: 0,
             document_base_url: std::ptr::null(),
             document_base_url_length: 0,
-            intern_utf16_fly_string: None,
             length_resolution_context: std::ptr::null(),
             random_function_index: std::ptr::null_mut(),
         }

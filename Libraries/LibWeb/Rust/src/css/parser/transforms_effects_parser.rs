@@ -821,10 +821,6 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    unsafe extern "C" fn discard_interned_string(_: *const u16, _: usize) -> usize {
-        0
-    }
-
     fn context() -> ParseContext {
         ParseContext {
             in_quirks_mode: false,
@@ -835,12 +831,10 @@ mod tests {
             value_contexts: std::ptr::null(),
             value_context_count: 0,
             declared_namespaces: std::ptr::null(),
-            declared_namespace_count: 0,
             document_url: std::ptr::null(),
             document_url_length: 0,
             document_base_url: std::ptr::null(),
             document_base_url_length: 0,
-            intern_utf16_fly_string: Some(discard_interned_string),
             length_resolution_context: std::ptr::null(),
             random_function_index: std::ptr::null_mut(),
         }

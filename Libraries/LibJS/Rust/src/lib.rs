@@ -52,6 +52,7 @@
 //! - `bytecode/` — Bytecode generator, instruction types, and FFI
 //! - `scope_collector.rs` — Scope analysis
 
+/// cbindgen:ignore
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
 
@@ -332,6 +333,7 @@ fn compile_program_body_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
     generator.capture_saved_lexical_environment();
 
     let result = bytecode::codegen::generate_statement(program, generator, None);
@@ -2649,6 +2651,7 @@ fn compile_module_as_async_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(Instruction::Enter {});
 
     // Async function start: emit initial Yield before GetLexicalEnvironment.
     let start_block = generator.make_block();
@@ -3295,6 +3298,7 @@ fn compile_function_payload_to_bytecode(
 
     let entry_block = generator.make_block();
     generator.switch_to_basic_block(entry_block);
+    generator.emit(bytecode::instruction::Instruction::Enter {});
 
     // https://tc39.es/ecma262/#sec-async-functions-abstract-operations-async-function-start
     // For async (non-generator) functions, emit the initial Yield BEFORE

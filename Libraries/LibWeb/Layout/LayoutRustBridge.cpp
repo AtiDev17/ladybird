@@ -17,8 +17,6 @@
 #include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
-#include <LibWeb/CSS/GridTrackPlacement.h>
-#include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/LengthBox.h>
 #include <LibWeb/CSS/StyleValues/AnchorStyleValue.h>
@@ -66,27 +64,6 @@ static_assert(to_underlying(CSS::StyleGroupIndex::AlignmentValues) == RustFFI::S
 static_assert(to_underlying(CSS::StyleGroupIndex::SizingValues) == RustFFI::STYLE_GROUP_INDEX_SIZING);
 static_assert(to_underlying(CSS::StyleGroupIndex::SurroundValues) == RustFFI::STYLE_GROUP_INDEX_SURROUND);
 static_assert(to_underlying(CSS::StyleGroupIndex::BoxValues) == RustFFI::STYLE_GROUP_INDEX_BOX);
-
-Painting::UsedGridTrackList build_used_grid_track_list(RustFFI::FfiUsedGridTrackList const& list)
-{
-    VERIFY(list.is_subgrid ? list.track_count == 0 : list.track_count + 1 == list.line_count);
-
-    Painting::UsedGridTrackList result;
-    result.is_subgrid = list.is_subgrid;
-    result.lines.ensure_capacity(list.line_count);
-    result.track_sizes.ensure_capacity(list.track_count);
-    for (size_t line_index = 0; line_index < list.line_count; ++line_index) {
-        CSS::GridLineNames line_names;
-        auto const& line = list.lines[line_index];
-        for (size_t name_index = 0; name_index < line.name_count; ++name_index)
-            line_names.append(Utf16FlyString::from_raw(line.names[name_index]));
-        result.lines.unchecked_append(move(line_names));
-
-        if (line_index < list.track_count)
-            result.track_sizes.unchecked_append(list.track_sizes[line_index]);
-    }
-    return result;
-}
 
 static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform const& transform)
 {
@@ -389,42 +366,6 @@ static RustFFI::FfiSvgPathResult compute_svg_path(NodeWithStyle const& node, Rus
     };
 }
 
-Optional<RustFFI::FfiFormattingContextType> formatting_context_type_created_by_box(Box const& box)
-{
-    auto type = RustFFI::rust_layout_formatting_context_type_for_box({
-        .arena = box.arena_handle(),
-        .node = Node::slot_id(&box),
-    });
-    if (type == NumericLimits<u8>::max())
-        return {};
-    return static_cast<RustFFI::FfiFormattingContextType>(type);
-}
-
-StringView formatting_context_type_name(RustFFI::FfiFormattingContextType type)
-{
-    switch (type) {
-    case RustFFI::FfiFormattingContextType::Block:
-        return "BFC"sv;
-    case RustFFI::FfiFormattingContextType::Inline:
-        return "IFC"sv;
-    case RustFFI::FfiFormattingContextType::Flex:
-        return "FFC"sv;
-    case RustFFI::FfiFormattingContextType::Grid:
-        return "GFC"sv;
-    case RustFFI::FfiFormattingContextType::Table:
-        return "TFC"sv;
-    case RustFFI::FfiFormattingContextType::Svg:
-        return "SVG"sv;
-    case RustFFI::FfiFormattingContextType::ReplacedWithChildren:
-        return "Replaced, with children"sv;
-    case RustFFI::FfiFormattingContextType::InternalReplaced:
-        return "Replaced"sv;
-    case RustFFI::FfiFormattingContextType::InternalDummy:
-        return "Dummy"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 static size_t s_active_layout_pass_count { 0 };
 
 bool layout_pass_currently_running()
@@ -597,9 +538,6 @@ static Optional<DOM::AbstractElement> abstract_element_for_abspos_box(Box const&
 
 RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
 {
-    static_assert(to_underlying(CSS::GridRepeatType::AutoFit) == 0);
-    static_assert(to_underlying(CSS::GridRepeatType::AutoFill) == 1);
-    static_assert(to_underlying(CSS::GridRepeatType::Fixed) == 2);
     static_assert(to_underlying(SVG::PreserveAspectRatio::Align::None) == 0);
     static_assert(to_underlying(SVG::PreserveAspectRatio::Align::xMinYMin) == 1);
     static_assert(to_underlying(SVG::PreserveAspectRatio::Align::xMidYMin) == 2);

@@ -99,16 +99,18 @@
 #include <LibWeb/Layout/Node.h>
 
 extern "C" void ladybird_utf16_fly_string_unref(size_t);
-extern "C" void ladybird_string_unref(size_t);
 
-static_assert(sizeof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
-static_assert(alignof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
-static_assert(offsetof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString, raw) == 0);
 static_assert(sizeof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
 static_assert(alignof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
 static_assert(offsetof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString, raw) == 0);
 
 namespace Web::CSS {
+
+Utf16FlyString css_string_from_rust(void const* string)
+{
+    auto view = StyleValueFFI::rust_css_string_view(string);
+    return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(view.data), view.length });
+}
 
 ColorResolutionContext ColorResolutionContext::for_element(DOM::AbstractElement const& element)
 {
@@ -326,7 +328,7 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::adopt_rust_style_value
     }
 }
 
-void StyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
+void StyleValue::set_style_sheet(StyleSheetState* style_sheet)
 {
     m_has_style_sheet_context = !!style_sheet;
 
@@ -354,27 +356,11 @@ bool StyleValue::is_computationally_independent() const
 
 void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
 {
-    // The Rust serializer covers the ported types; everything else falls back to the
-    // per-class C++ serializers until the port is complete.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
-        auto string = Utf16String::adopt_raw(text.raw);
-        if (string.has_ascii_storage())
-            builder.append(string.ascii_view());
-        else
-            builder.append(string.utf16_view());
-        return;
-    }
-
-    switch (type()) {
-#define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) \
-    case Type::title_case:                                                               \
-        return static_cast<style_value_class_name const&>(*this).serialize(builder, mode);
-        ENUMERATE_CSS_STYLE_VALUE_TYPES_WITH_CPP_SERIALIZATION
-#undef __ENUMERATE_CSS_STYLE_VALUE_TYPE
-    default:
-        // A type whose C++ serializer has been deleted was declined by the Rust serializer.
-        VERIFY_NOT_REACHED();
-    }
+    auto string = to_utf16_string(mode);
+    if (string.has_ascii_storage())
+        builder.append(string.ascii_view());
+    else
+        builder.append(string.utf16_view());
 }
 
 bool StyleValue::equals(StyleValue const& other) const
@@ -440,24 +426,14 @@ String StyleValue::to_string(SerializationMode mode) const
 
 Utf16String StyleValue::to_utf16_string(SerializationMode mode) const
 {
-    Utf16StringBuilder builder;
-    serialize(builder, mode);
-    return builder.to_string();
+    auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode));
+    VERIFY(text.has_value);
+    return Utf16String::adopt_raw(text.raw);
 }
 
 void StyleValue::serialize(Utf16StringBuilder& builder, SerializationMode mode) const
 {
-    // Rust serializes natively into ASCII-or-UTF-16, so ported types never round-trip
-    // through UTF-8 here.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
-        auto string = Utf16String::adopt_raw(text.raw);
-        builder.append(string.utf16_view());
-        return;
-    }
-
-    auto serialized = to_string(mode);
-    auto serialized_utf16 = Utf16String::from_utf8_without_validation(serialized);
-    builder.append(serialized_utf16.utf16_view());
+    builder.append(to_utf16_string(mode));
 }
 
 AbstractImageStyleValue const& StyleValue::as_abstract_image() const
@@ -499,6 +475,16 @@ ValueComparingNonnullRefPtr<StyleValue const> StyleValue::absolutized(Computatio
     }
 
     switch (type()) {
+    case Type::BasicShape:
+    case Type::Easing:
+    case Type::GridTrackPlacement:
+    case Type::GridTrackSizeList:
+        return adopt_rust_style_value_data(StyleValueFFI::rust_composite_style_value_absolutize(
+            m_value.operator->(), &context, [](void const* opaque_context, StyleValueFFI::StyleValueData const* child) {
+                auto value = adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(child));
+                auto resolved = value->absolutized(*static_cast<ComputationContext const*>(opaque_context));
+                return StyleValueFFI::rust_style_value_retain(resolved->rust_style_value_data());
+            }));
 #define __ENUMERATE_CSS_STYLE_VALUE_TYPE(title_case, snake_case, style_value_class_name) \
     case Type::title_case:                                                               \
         return static_cast<style_value_class_name const&>(*this).absolutized(context);
@@ -641,10 +627,4 @@ Keyword StyleValue::to_keyword() const
 extern "C" void ladybird_utf16_fly_string_unref(size_t raw)
 {
     Utf16FlyString::unref_raw(raw);
-}
-
-// Called when Rust-owned style value data drops a retained String.
-extern "C" void ladybird_string_unref(size_t raw)
-{
-    String::unref_raw(raw);
 }

@@ -703,11 +703,7 @@ WebIDL::ExceptionOr<GC::Ref<Storage>> Window::local_storage()
         return GC::Ref { *storage };
 
     // 2. Let map be the result of running obtain a local storage bottle map with this's relevant settings object and "localStorage".
-    GC::Ptr<StorageAPI::LocalStorageBottle> map;
-    auto storage_key = StorageAPI::obtain_a_storage_key(this->relevant_settings_object());
-    if (storage_key.has_value()) {
-        map = StorageAPI::LocalStorageBottle::create(page(), storage_key.value(), StorageAPI::StorageEndpoint::LOCAL_STORAGE_QUOTA);
-    }
+    auto map = StorageAPI::obtain_a_local_storage_bottle_map(this->relevant_settings_object(), StorageAPI::StorageEndpointType::LocalStorage);
 
     // 3. If map is failure, then throw a "SecurityError" DOMException.
     if (!map)
@@ -1662,7 +1658,7 @@ GC::Ref<CSS::CSSStyleProperties> Window::get_computed_style(DOM::Element& elemen
 WebIDL::ExceptionOr<GC::Ref<CSS::MediaQueryList>> Window::match_media(Utf16View query)
 {
     // 1. Let parsed media query list be the result of parsing query.
-    auto parsed_media_query_list = parse_media_query_list(CSS::Parser::ParsingParams(associated_document()), query);
+    auto parsed_media_query_list = parse_media_query_list(query);
 
     // 2. Return a new MediaQueryList object, with this's associated Document as the document, with parsed media query list as its associated media query list.
     auto media_query_list = CSS::MediaQueryList::create(associated_document(), move(parsed_media_query_list));

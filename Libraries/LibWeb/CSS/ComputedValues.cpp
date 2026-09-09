@@ -10,9 +10,8 @@
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CountersSet.h>
-#include <LibWeb/CSS/GridTrackPlacement.h>
-#include <LibWeb/CSS/GridTrackSize.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleGroupPayloadPins.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
@@ -57,6 +56,29 @@
 #include <LibWeb/Page/Page.h>
 
 namespace Web::CSS {
+
+StyleGroupPayloadPins::~StyleGroupPayloadPins()
+{
+    clear();
+}
+
+void StyleGroupPayloadPins::set(ReadonlySpan<void const*> payloads)
+{
+    clear();
+    if (payloads.is_empty())
+        return;
+    m_payloads.ensure_capacity(payloads.size());
+    ComputedValuesFFI::rust_style_groups_retain(payloads.data(), payloads.size());
+    for (auto const* payload : payloads)
+        m_payloads.unchecked_append(payload);
+}
+
+void StyleGroupPayloadPins::clear()
+{
+    if (!m_payloads.is_empty())
+        ComputedValuesFFI::rust_style_groups_release(m_payloads.data(), m_payloads.size());
+    m_payloads.clear_with_capacity();
+}
 
 template<typename T>
 static consteval ComputedValuesFFI::StyleGroupLifecycle style_group_lifecycle_of()
@@ -936,7 +958,7 @@ Optional<Utf16FlyString> ComputedValues::MiscResetValues::view_transition_name_v
     VERIFY(value);
     if (value->tag != StyleValueFFI::StyleValueData::Tag::CustomIdent)
         return {};
-    return Utf16FlyString::from_raw(value->custom_ident.custom_ident.raw);
+    return css_string_from_rust(&value->custom_ident.custom_ident);
 }
 
 TouchActionData ComputedValues::MiscResetValues::touch_action_value() const
@@ -986,7 +1008,7 @@ WillChange ComputedValues::MiscResetValues::will_change_value() const
         } else if (item->tag == StyleValueFFI::StyleValueData::Tag::Keyword && static_cast<Keyword>(item->keyword.keyword) == Keyword::ScrollPosition) {
             entries.append(WillChange::Type::ScrollPosition);
         } else if (item->tag == StyleValueFFI::StyleValueData::Tag::CustomIdent) {
-            auto custom_ident = Utf16FlyString::from_raw(item->custom_ident.custom_ident.raw);
+            auto custom_ident = css_string_from_rust(&item->custom_ident.custom_ident);
             if (auto property_id = property_id_from_string(custom_ident); property_id.has_value())
                 entries.append(property_id.release_value());
         }

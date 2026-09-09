@@ -27,7 +27,7 @@ class StorageBottle : public GC::Cell {
     GC_CELL(StorageBottle, GC::Cell);
 
 public:
-    static GC::Ref<StorageBottle> create(GC::Ref<Page> page, StorageType type, StorageKey key, Optional<u64> quota);
+    static GC::Ref<StorageBottle> create(GC::Ref<Page> page, StorageEndpoint const& endpoint, StorageKey key);
 
     virtual ~StorageBottle() = default;
 
@@ -57,9 +57,9 @@ class LocalStorageBottle final : public StorageBottle {
     GC_DECLARE_ALLOCATOR(LocalStorageBottle);
 
 public:
-    static GC::Ref<LocalStorageBottle> create(GC::Ref<Page> page, StorageKey key, Optional<u64> quota)
+    static GC::Ref<LocalStorageBottle> create(GC::Ref<Page> page, StorageEndpointType endpoint_type, StorageKey key, Optional<u64> quota)
     {
-        return GC::Heap::the().allocate<LocalStorageBottle>(page, StorageEndpointType::LocalStorage, key, quota);
+        return GC::Heap::the().allocate<LocalStorageBottle>(page, endpoint_type, move(key), quota);
     }
 
     virtual size_t size() const override;
@@ -90,9 +90,9 @@ class SessionStorageBottle final : public StorageBottle {
     GC_DECLARE_ALLOCATOR(SessionStorageBottle);
 
 public:
-    static GC::Ref<SessionStorageBottle> create(GC::Ref<Page> page, StorageKey key, Optional<u64> quota)
+    static GC::Ref<SessionStorageBottle> create(GC::Ref<Page> page, StorageEndpointType endpoint_type, StorageKey key, Optional<u64> quota)
     {
-        return GC::Heap::the().allocate<SessionStorageBottle>(page, StorageEndpointType::SessionStorage, move(key), quota);
+        return GC::Heap::the().allocate<SessionStorageBottle>(page, endpoint_type, move(key), quota);
     }
 
     virtual size_t size() const override;
@@ -101,8 +101,6 @@ public:
     virtual StorageSetResult set(Utf16View key, Utf16View value) override;
     virtual void clear() override;
     virtual void remove(Utf16View) override;
-
-    void copy_map_from(SessionStorageBottle const&);
 
     virtual void visit_edges(GC::Cell::Visitor& visitor) override;
 
@@ -143,6 +141,7 @@ private:
     BottleMap m_bottle_map;
 };
 
+GC::Ptr<StorageBottle> obtain_a_local_storage_bottle_map(HTML::EnvironmentSettingsObject&, StorageEndpointType endpoint_type);
 GC::Ptr<StorageBottle> obtain_a_session_storage_bottle_map(HTML::EnvironmentSettingsObject&, StorageEndpointType endpoint_type);
 GC::Ptr<StorageBottle> obtain_a_storage_bottle_map(StorageType, HTML::EnvironmentSettingsObject&, StorageEndpointType endpoint_type);
 

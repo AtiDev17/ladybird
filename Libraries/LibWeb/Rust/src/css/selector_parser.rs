@@ -6,7 +6,7 @@
 
 //! CSS selector parsing.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::css_tokenizer::{CssNumberType, ParserTokenKind, TokenizerInput, tokenize_for_parser};
 use super::ffi_support::FfiUtf16View;
@@ -14,11 +14,14 @@ use super::ffi_support::ascii_lowercase;
 use super::parser::component_value::{ComponentKind, ComponentValue, consume_a_list_of_component_values};
 use super::parser::token_stream::TokenStream as Stream;
 use super::retained_fly_string::RetainedUtf16FlyString;
+use super::selector as bound;
+use super::selector::parsed::{
+    AttributeSelector, CompiledSelector, CompoundSelector, NameSelector, PseudoClassSelector, PseudoElementSelector,
+    PseudoElementValue, QualifiedName, SelectorList, SimpleSelector,
+};
 use super::selector::{
-    AnPlusBPattern, AttributeCaseType, AttributeMatchType, AttributeSelector, Combinator, CompiledSelector,
-    CompoundSelector, Direction, LanguageRange, NameSelector, NamespaceType, PseudoClassParameterType,
-    PseudoClassSelector, PseudoClassType, PseudoElementParameterType, PseudoElementSelector, PseudoElementType,
-    PseudoElementValue, QualifiedName, SelectorList, SelectorString, SimpleSelector,
+    AnPlusBPattern, AttributeCaseType, AttributeMatchType, Combinator, Direction, LanguageRange, NamespaceType,
+    PseudoClassParameterType, PseudoClassType, PseudoElementParameterType, PseudoElementType, SelectorString,
 };
 use super::selector::{FfiStringView, RustSelector};
 
@@ -29,6 +32,8 @@ pub(crate) enum SelectorType {
     Standalone,
     Relative,
 }
+
+pub use super::ffi_support::StyleNestingParent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectorParsingMode {
@@ -383,7 +388,7 @@ impl<'a> SelectorParser<'a> {
         &mut self,
         values: &[ComponentValue],
         selector_type: SelectorType,
-    ) -> Result<Rc<CompiledSelector>, ()> {
+    ) -> Result<Arc<CompiledSelector>, ()> {
         let mut stream = Stream::new(values);
         let mut first_combinator = self.parse_combinator(&mut stream);
         match selector_type {
@@ -1080,7 +1085,7 @@ pub(crate) fn parse_selector_list_from_component_values(
     Ok(RustParsedSelectorList::new(selectors))
 }
 
-fn parse_pseudo_element_selector(input: TokenizerInput<'_>) -> Result<(Rc<CompiledSelector>, PseudoElementType), ()> {
+fn parse_pseudo_element_selector(input: TokenizerInput<'_>) -> Result<(Arc<CompiledSelector>, PseudoElementType), ()> {
     let tokens = tokenize_for_parser(input);
     let values = consume_a_list_of_component_values(tokens.as_slice())?;
     let mut stream = Stream::new(&values);
@@ -1170,74 +1175,204 @@ fn identity_for(
 }
 
 fn bind_qualified_name(
-    qualified_name: &mut QualifiedName,
+    qualified_name: &QualifiedName,
     names: &[SelectorString],
     identities: &[RetainedUtf16FlyString],
-) {
-    qualified_name.interned_name = identity_for(names, identities, &qualified_name.name);
-    qualified_name.interned_lowercase_name = identity_for(names, identities, &qualified_name.lowercase_name);
-    qualified_name.interned_namespace = (qualified_name.namespace_type == NamespaceType::Named)
-        .then(|| identity_for(names, identities, &qualified_name.namespace))
-        .flatten();
+) -> bound::QualifiedName {
+    bound::QualifiedName {
+        namespace_type: qualified_name.namespace_type,
+        namespace: qualified_name.namespace.clone(),
+        name: qualified_name.name.clone(),
+        lowercase_name: qualified_name.lowercase_name.clone(),
+        interned_name: identity_for(names, identities, &qualified_name.name),
+        interned_lowercase_name: identity_for(names, identities, &qualified_name.lowercase_name),
+        interned_namespace: (qualified_name.namespace_type == NamespaceType::Named)
+            .then(|| identity_for(names, identities, &qualified_name.namespace))
+            .flatten(),
+    }
 }
 
 fn bind_interned_names_in_selector(
-    selector: &mut Rc<CompiledSelector>,
+    selector: &CompiledSelector,
     names: &[SelectorString],
     identities: &[RetainedUtf16FlyString],
-) {
-    let selector = Rc::get_mut(selector).expect("parsed selector must not be shared before atom binding");
-    for compound in &mut selector.compound_selectors {
-        for simple in &mut compound.simple_selectors {
-            match simple {
-                SimpleSelector::Universal(qualified_name) | SimpleSelector::TagName(qualified_name) => {
-                    bind_qualified_name(qualified_name, names, identities);
-                }
-                SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
-                    name.interned_name = identity_for(names, identities, &name.name);
-                    name.interned_lowercase_name = identity_for(names, identities, &lowercase(&name.name));
-                }
-                SimpleSelector::Attribute(attribute) => {
-                    bind_qualified_name(&mut attribute.qualified_name, names, identities);
-                    attribute.value_identity = identity_for(names, identities, &attribute.value);
-                }
-                SimpleSelector::PseudoClass(pseudo_class) => {
-                    if let Some(identifier) = &pseudo_class.identifier {
-                        pseudo_class.identifier_identity = identity_for(names, identities, identifier);
-                        pseudo_class.identifier_lowercase_identity =
-                            identity_for(names, identities, &lowercase(identifier));
+) -> Arc<bound::CompiledSelector> {
+    let compound_selectors = selector
+        .compound_selectors
+        .iter()
+        .map(|compound| bound::CompoundSelector {
+            combinator: compound.combinator,
+            is_implicit_universal_anchor: compound.is_implicit_universal_anchor,
+            simple_selectors: compound
+                .simple_selectors
+                .iter()
+                .map(|simple| {
+                    match simple {
+                        SimpleSelector::Universal(name) => {
+                            bound::SimpleSelector::Universal(bind_qualified_name(name, names, identities))
+                        }
+                        SimpleSelector::TagName(name) => {
+                            bound::SimpleSelector::TagName(bind_qualified_name(name, names, identities))
+                        }
+                        SimpleSelector::Id(name) | SimpleSelector::Class(name) => {
+                            let name = bound::NameSelector {
+                                name: name.name.clone(),
+                                interned_name: identity_for(names, identities, &name.name),
+                                interned_lowercase_name: identity_for(names, identities, &lowercase(&name.name)),
+                            };
+                            if matches!(simple, SimpleSelector::Id(_)) {
+                                bound::SimpleSelector::Id(name)
+                            } else {
+                                bound::SimpleSelector::Class(name)
+                            }
+                        }
+                        SimpleSelector::Attribute(attribute) => {
+                            bound::SimpleSelector::Attribute(bound::AttributeSelector {
+                                match_type: attribute.match_type,
+                                qualified_name: bind_qualified_name(&attribute.qualified_name, names, identities),
+                                value: attribute.value.clone(),
+                                value_identity: identity_for(names, identities, &attribute.value),
+                                case_type: attribute.case_type,
+                            })
+                        }
+                        SimpleSelector::PseudoClass(pseudo_class) => {
+                            bound::SimpleSelector::PseudoClass(bound::PseudoClassSelector {
+                                pseudo_class: pseudo_class.pseudo_class,
+                                an_plus_b_pattern: pseudo_class.an_plus_b_pattern,
+                                argument_selector_list: pseudo_class
+                                    .argument_selector_list
+                                    .iter()
+                                    .map(|selector| bind_interned_names_in_selector(selector, names, identities))
+                                    .collect(),
+                                languages: pseudo_class.languages.clone(),
+                                direction: pseudo_class.direction,
+                                identifier: pseudo_class.identifier.clone(),
+                                identifier_identity: pseudo_class
+                                    .identifier
+                                    .as_ref()
+                                    .and_then(|identifier| identity_for(names, identities, identifier)),
+                                identifier_lowercase_identity: pseudo_class
+                                    .identifier
+                                    .as_ref()
+                                    .and_then(|identifier| identity_for(names, identities, &lowercase(identifier))),
+                                levels: pseudo_class.levels.clone(),
+                                is_forgiving: pseudo_class.is_forgiving,
+                            })
+                        }
+                        SimpleSelector::PseudoElement(pseudo_element) => {
+                            let mut identifier_identities = Box::default();
+                            let value = match &pseudo_element.value {
+                                PseudoElementValue::CompoundSelector(selector) => {
+                                    bound::PseudoElementValue::CompoundSelector(bind_interned_names_in_selector(
+                                        selector, names, identities,
+                                    ))
+                                }
+                                PseudoElementValue::Identifiers(identifiers) => {
+                                    // NB: Restricted pseudo-element parsing has no atom bindings.
+                                    if !names.is_empty() {
+                                        identifier_identities = identifiers
+                                            .iter()
+                                            .map(|identifier| identity_for(names, identities, identifier).unwrap())
+                                            .collect();
+                                    }
+                                    bound::PseudoElementValue::Identifiers(identifiers.clone())
+                                }
+                                PseudoElementValue::None => bound::PseudoElementValue::None,
+                                PseudoElementValue::TransitionName { is_universal, value } => {
+                                    bound::PseudoElementValue::TransitionName {
+                                        is_universal: *is_universal,
+                                        value: value.clone(),
+                                    }
+                                }
+                            };
+                            bound::SimpleSelector::PseudoElement(bound::PseudoElementSelector {
+                                pseudo_element: pseudo_element.pseudo_element,
+                                serialized_name: pseudo_element.serialized_name.clone(),
+                                value,
+                                identifier_identities,
+                            })
+                        }
+                        SimpleSelector::Nesting => bound::SimpleSelector::Nesting,
+                        SimpleSelector::Invalid(source) => bound::SimpleSelector::Invalid(source.clone()),
                     }
-                    for selector in &mut pseudo_class.argument_selector_list {
-                        bind_interned_names_in_selector(selector, names, identities);
-                    }
-                }
-                SimpleSelector::PseudoElement(pseudo_element) => match &mut pseudo_element.value {
-                    PseudoElementValue::CompoundSelector(selector) => {
-                        bind_interned_names_in_selector(selector, names, identities);
-                    }
-                    PseudoElementValue::Identifiers(identifiers) => {
-                        pseudo_element.identifier_identities = identifiers
-                            .iter()
-                            .map(|identifier| identity_for(names, identities, identifier).unwrap())
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice();
-                    }
-                    PseudoElementValue::None | PseudoElementValue::TransitionName { .. } => {}
-                },
-                SimpleSelector::Nesting | SimpleSelector::Invalid(_) => {}
-            }
-        }
-    }
+                })
+                .collect(),
+        })
+        .collect();
+    bound::CompiledSelector::new(compound_selectors)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RustParsedSelectorList {
     selectors: SelectorList,
-    interned_names: Box<[SelectorString]>,
+    pub(crate) interned_names: Box<[SelectorString]>,
+}
+
+// Keep worker-parsed selectors free of document-thread atoms, including nested selectors.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<RustParsedSelectorList>();
+};
+
+/// Document-thread selectors with interned names, owned independently of the parsed list.
+pub struct RustBoundSelectorList {
+    pub(crate) selectors: bound::SelectorList,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_bound_selector_list_length(list: &RustBoundSelectorList) -> usize {
+    list.selectors.len()
 }
 
 impl RustParsedSelectorList {
-    fn new(selectors: SelectorList) -> Self {
+    /// Bind immutable parsed names to the document's atom table without a host-side list.
+    ///
+    /// # Safety
+    /// Call only on the document thread: AK's Utf16FlyString table is not thread-safe.
+    pub(crate) unsafe fn bind(&self) -> RustBoundSelectorList {
+        let names = self
+            .interned_names
+            .iter()
+            .map(|name| {
+                crate::css::ffi_stats::bump_cpp_callback(crate::css::ffi_stats::FfiOp::InternUtf16FlyStringCallback);
+                let name = ak::Utf16FlyString::from_utf16(name);
+                unsafe { RetainedUtf16FlyString::from_leaked_raw(name.into_raw()) }
+            })
+            .collect::<Vec<_>>();
+        RustBoundSelectorList {
+            selectors: self
+                .selectors
+                .iter()
+                .map(|selector| bind_interned_names_in_selector(selector, &self.interned_names, &names))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn adapt_for_nesting(mut self, parent: StyleNestingParent) -> Self {
+        if parent == StyleNestingParent::None {
+            return self;
+        }
+        for selector in &mut self.selectors {
+            let first = selector
+                .compound_selectors
+                .first()
+                .map_or(Combinator::None, |compound| compound.combinator);
+            let insert_nesting = parent == StyleNestingParent::Style
+                && (!matches!(first, Combinator::None | Combinator::Descendant)
+                    || !super::selector_operations::contains_nesting(selector));
+            if insert_nesting {
+                *selector = super::selector_operations::relative_to(selector, SimpleSelector::Nesting);
+            } else if first == Combinator::Descendant {
+                let mut compounds = selector.compound_selectors.clone();
+                compounds[0].combinator = Combinator::None;
+                *selector = CompiledSelector::new(compounds);
+            }
+        }
+        // Adding an implicit nesting selector does not introduce any names to bind.
+        self
+    }
+
+    pub(crate) fn new(selectors: SelectorList) -> Self {
         let mut interned_names = Vec::new();
         for selector in &selectors {
             collect_interned_names_from_selector(&mut interned_names, selector);
@@ -1273,11 +1408,68 @@ pub unsafe extern "C" fn rust_selector_parse(
     namespace_count: usize,
     is_relative: bool,
     is_forgiving: bool,
+    nesting_parent: StyleNestingParent,
 ) -> *mut RustParsedSelectorList {
     unsafe {
-        let Some(input) = input.units() else {
-            return std::ptr::null_mut();
-        };
+        parse_selector_list_from_ffi(
+            input,
+            namespaces,
+            namespace_count,
+            is_relative,
+            is_forgiving,
+            nesting_parent,
+        )
+    }
+    .map_or(std::ptr::null_mut(), |selectors| Box::into_raw(Box::new(selectors)))
+}
+
+/// # Safety
+/// Input and the optional immutable namespace context must be readable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_selector_parse_with_namespace_context(
+    input: FfiUtf16View,
+    namespaces: *const std::ffi::c_void,
+    is_relative: bool,
+    is_forgiving: bool,
+) -> *mut RustParsedSelectorList {
+    let Some(input) = (unsafe { input.units() }) else {
+        return std::ptr::null_mut();
+    };
+    let namespaces = unsafe { namespaces.cast::<crate::css::rule::NativeNamespaceContext>().as_ref() };
+    let namespaces: Vec<_> = namespaces
+        .into_iter()
+        .flat_map(|namespaces| namespaces.prefixes.iter())
+        .map(|namespace| TokenizerInput::Utf16(namespace.units()))
+        .collect();
+    parse_selector_list(
+        input,
+        &namespaces,
+        if is_relative {
+            SelectorType::Relative
+        } else {
+            SelectorType::Standalone
+        },
+        if is_forgiving {
+            SelectorParsingMode::Forgiving
+        } else {
+            SelectorParsingMode::Standard
+        },
+    )
+    .map_or(std::ptr::null_mut(), |selectors| {
+        Box::into_raw(Box::new(RustParsedSelectorList::new(selectors)))
+    })
+}
+
+pub(crate) unsafe fn parse_selector_list_from_ffi(
+    input: FfiUtf16View,
+    namespaces: *const FfiStringView,
+    namespace_count: usize,
+    is_relative: bool,
+    is_forgiving: bool,
+    nesting_parent: StyleNestingParent,
+) -> Option<RustParsedSelectorList> {
+    unsafe {
+        let input = input.units()?;
         let namespace_views = if namespace_count == 0 {
             &[]
         } else {
@@ -1309,9 +1501,9 @@ pub unsafe extern "C" fn rust_selector_parse(
                 SelectorParsingMode::Standard
             },
         ) else {
-            return std::ptr::null_mut();
+            return None;
         };
-        Box::into_raw(Box::new(RustParsedSelectorList::new(selectors)))
+        Some(RustParsedSelectorList::new(selectors).adapt_for_nesting(nesting_parent))
     }
 }
 
@@ -1341,7 +1533,9 @@ pub unsafe extern "C" fn rust_selector_parse_pseudo_element(input: FfiUtf16View)
             };
         };
         FfiParsedPseudoElement {
-            selector: Box::into_raw(Box::new(RustSelector { selector })),
+            selector: Box::into_raw(Box::new(RustSelector {
+                selector: bind_interned_names_in_selector(&selector, &[], &[]),
+            })),
             pseudo_element: pseudo_element as u8,
         }
     }
@@ -1366,11 +1560,10 @@ pub unsafe extern "C" fn rust_parsed_selector_list_length(list: *const RustParse
 }
 
 /// # Safety
-/// `list` must point to a live parsed selector list and `index` must be in bounds. Interned names
-/// must be bound with `rust_parsed_selector_list_bind_interned_names` before extracting selectors.
+/// `list` must point to a live bound selector list and `index` must be in bounds.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_selector(
-    list: *const RustParsedSelectorList,
+pub unsafe extern "C" fn rust_bound_selector_list_selector(
+    list: *const RustBoundSelectorList,
     index: usize,
 ) -> *mut RustSelector {
     unsafe {
@@ -1381,54 +1574,120 @@ pub unsafe extern "C" fn rust_parsed_selector_list_selector(
 }
 
 /// # Safety
-/// `list` must point to a live parsed selector list.
+/// `list` must be null or an undestroyed pointer returned by `rust_parsed_selector_list_bind`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_interned_name_count(list: *const RustParsedSelectorList) -> usize {
-    unsafe { (&*list).interned_names.len() }
-}
-
-/// # Safety
-/// `list` must point to a live parsed selector list and `index` must be in bounds.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_interned_name(
-    list: *const RustParsedSelectorList,
-    index: usize,
-) -> FfiStringView {
-    unsafe {
-        let name = &(&(*list).interned_names)[index];
-        FfiStringView {
-            data: name.as_ptr(),
-            length: name.len(),
-        }
+pub unsafe extern "C" fn rust_bound_selector_list_destroy(list: *mut RustBoundSelectorList) {
+    if !list.is_null() {
+        unsafe { drop(Box::from_raw(list)) };
     }
 }
 
 /// # Safety
-/// `list` must point to a live parsed selector list. `leaked_name_raws` must contain one leaked
-/// `Utf16FlyString` raw value for every name returned by
-/// `rust_parsed_selector_list_interned_name`. This function assumes ownership of those references.
-/// It must be called before extracting any selector with `rust_parsed_selector_list_selector`.
+/// `list` must be live. Call only on the document thread, and destroy the returned list there.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_bind_interned_names(
-    list: *mut RustParsedSelectorList,
-    leaked_name_raws: *const usize,
-    name_count: usize,
-) {
-    unsafe {
-        let list = &mut *list;
-        assert_eq!(name_count, list.interned_names.len());
-        let leaked_name_raws = if name_count == 0 {
-            &[]
-        } else {
-            assert!(!leaked_name_raws.is_null());
-            std::slice::from_raw_parts(leaked_name_raws, name_count)
+pub unsafe extern "C" fn rust_parsed_selector_list_bind(list: &RustParsedSelectorList) -> *mut RustBoundSelectorList {
+    Box::into_raw(Box::new(unsafe { list.bind() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> Box<RustParsedSelectorList> {
+        let units: Vec<_> = source.encode_utf16().collect();
+        let prefix: Vec<_> = "é".encode_utf16().collect();
+        let prefix = FfiStringView {
+            data: prefix.as_ptr(),
+            length: prefix.len(),
         };
-        let retained_names = leaked_name_raws
-            .iter()
-            .map(|&raw| RetainedUtf16FlyString::from_leaked_raw(raw))
-            .collect::<Vec<_>>();
-        for selector in &mut list.selectors {
-            bind_interned_names_in_selector(selector, &list.interned_names, &retained_names);
+        unsafe {
+            let parsed = rust_selector_parse(
+                FfiUtf16View {
+                    utf16: units.as_ptr(),
+                    length: units.len(),
+                    ..Default::default()
+                },
+                &prefix,
+                1,
+                false,
+                false,
+                StyleNestingParent::None,
+            );
+            assert!(!parsed.is_null());
+            Box::from_raw(parsed)
         }
+    }
+
+    fn serialize(selector: &Arc<bound::CompiledSelector>) -> Vec<u16> {
+        use crate::css::selector_serialization::{rust_selector_serialize, rust_selector_serialized_text_release};
+        unsafe {
+            let text = rust_selector_serialize(
+                &RustSelector {
+                    selector: selector.clone(),
+                },
+                false,
+                std::ptr::null(),
+                0,
+            );
+            let units = std::slice::from_raw_parts(text.data, text.length).to_vec();
+            rust_selector_serialized_text_release(text.storage);
+            units
+        }
+    }
+
+    #[test]
+    fn independent_bindings_outlive_the_parsed_list_and_each_other() {
+        for source in [
+            "DIV#test.item[data-name=\"value\"]",
+            ":is(.first, :not(#second))",
+            ":nth-child(2n+1 of .item)",
+            "::slotted(.item)",
+            "::part(label)",
+        ] {
+            let parsed = parse(source);
+            let first = unsafe { parsed.bind() };
+            let second = unsafe { parsed.bind() };
+            drop(parsed);
+            let expected = serialize(&first.selectors[0]);
+            assert_eq!(serialize(&second.selectors[0]), expected);
+            assert_eq!(first.selectors[0].specificity(), second.selectors[0].specificity());
+            drop(first);
+            assert_eq!(serialize(&second.selectors[0]), expected);
+        }
+    }
+
+    #[test]
+    fn worker_parsing_reading_and_release_do_not_touch_the_interner() {
+        use crate::css::ffi_stats::CPP_CALLBACK_COUNT;
+        let parsed = std::thread::spawn(|| {
+            let parsed = parse("é|DIV#😀:is(.é, :not([data-name='😀'])):nth-child(2n+1 of .item)::part(label)");
+            assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+            parsed
+        })
+        .join()
+        .unwrap();
+        let bound = std::thread::scope(|scope| {
+            let parsed = &parsed;
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    assert_eq!(parsed.selectors.len(), 1);
+                    assert!(parsed.interned_names.iter().all(|name| !name.is_empty()));
+                }
+                assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+            });
+            unsafe { parsed.bind() }
+        });
+        std::thread::spawn(move || {
+            drop(parsed);
+            assert_eq!(CPP_CALLBACK_COUNT.get(), 0);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            serialize(&bound.selectors[0]),
+            "é|DIV#😀:is(.é, :not([data-name=\"😀\"])):nth-child(2n+1 of .item)::part(label)"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        );
     }
 }

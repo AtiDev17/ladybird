@@ -271,17 +271,44 @@ impl<O: ControlFlowOperand, C: ControlFlowOpcode> ControlFlowGraph<O, C> {
                 ));
             }
         }
+        if !cold.is_empty() {
+            // Blocks reached only after crossing a cold annotation belong in
+            // the cold section too. Keep whole fallthrough chains together so
+            // moving a block cannot change its implicit successor.
+            let mut states = vec![0u8; self.blocks.len()];
+            let mut pending = vec![(BlockId(0), 1u8)];
+            while let Some((block_id, mut state)) = pending.pop() {
+                let block = &self.blocks[block_id.0];
+                if block.is_cold {
+                    state = 2;
+                }
+                if states[block_id.0] & state != 0 {
+                    continue;
+                }
+                states[block_id.0] |= state;
+                pending.extend(block.successors.iter().map(|edge| (edge.target, state)));
+            }
+            let mut cold_blocks = self.blocks.iter().map(|block| block.is_cold).collect::<Vec<_>>();
+            let mut start = 0;
+            for (index, block) in self.blocks.iter().enumerate() {
+                if block.instructions.last().unwrap().opcode.description().terminal || index + 1 == self.blocks.len() {
+                    if states[start..=index].iter().all(|&state| state == 2) {
+                        cold_blocks[start..=index].fill(true);
+                    }
+                    start = index + 1;
+                }
+            }
+            hot.clear();
+            cold.clear();
+            for (index, is_cold) in cold_blocks.into_iter().enumerate() {
+                if is_cold {
+                    cold.push(BlockId(index));
+                } else {
+                    hot.push(BlockId(index));
+                }
+            }
+        }
         Ok(BlockLayout { hot, cold })
-    }
-
-    pub(crate) fn single_instruction(&self) -> Option<&Instruction<O, C>> {
-        let [block] = self.blocks.as_slice() else {
-            return None;
-        };
-        let [instruction] = block.instructions.as_slice() else {
-            return None;
-        };
-        Some(instruction)
     }
 
     /// Tidy the graph after an edit: thread branches through jump-only blocks,
@@ -856,7 +883,8 @@ mod tests {
         }])
         .unwrap();
 
-        assert!(graph.single_instruction().is_some());
+        assert_eq!(graph.blocks.len(), 1);
+        assert_eq!(graph.blocks[0].instructions.len(), 1);
     }
 
     #[test]
@@ -946,6 +974,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Operation::Label, Operation::Call(CallKind::SlowPath)]
         );
+    }
+
+    #[test]
+    fn propagates_coldness_without_separating_fallthrough_joins() {
+        for explicit_join in [false, true] {
+            let mut instructions = vec![
+                instruction(
+                    Operation::branch_zero(IntegerWidth::U64, ZeroCondition::Zero),
+                    vec![Operand::VirtualRegister("value".into()), label(".slow")],
+                ),
+                instruction(Operation::Control(ControlOperation::JumpLabel), vec![label(".join")]),
+                instruction(Operation::Label, vec![label(".rare")]),
+            ];
+            if explicit_join {
+                instructions.push(instruction(
+                    Operation::Control(ControlOperation::JumpLabel),
+                    vec![label(".join")],
+                ));
+            }
+            instructions.extend([
+                instruction(Operation::Label, vec![label(".join")]),
+                instruction(Operation::Control(ControlOperation::DispatchNext), vec![]),
+                instruction(Operation::Cold, vec![label(".slow")]),
+                instruction(Operation::Label, vec![label(".slow")]),
+                instruction(Operation::Control(ControlOperation::JumpLabel), vec![label(".rare")]),
+            ]);
+            let graph = ControlFlowGraph::from_instructions(instructions).unwrap();
+            let layout = graph.layout_hot_and_cold().unwrap();
+            assert!(
+                layout.hot.contains(&BlockId(3)),
+                "a join reachable from hot code stays hot"
+            );
+            assert_eq!(layout.cold.contains(&BlockId(2)), explicit_join);
+            assert!(layout.cold.contains(&BlockId(4)));
+        }
     }
 
     #[test]

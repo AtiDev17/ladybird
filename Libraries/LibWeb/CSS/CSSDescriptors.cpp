@@ -4,18 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Utf16StringBuilder.h>
+#include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/CSS/CSSDescriptors.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/ShorthandStyleValue.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
-CSSDescriptors::CSSDescriptors(AtRuleID at_rule_id, Vector<Descriptor> descriptors)
+CSSDescriptors::CSSDescriptors(AtRuleID at_rule_id, RustDescriptorBlock descriptors)
     : CSSStyleDeclaration(Computed::No, Readonly::No)
     , m_at_rule_id(at_rule_id)
     , m_descriptors(move(descriptors))
@@ -23,6 +24,11 @@ CSSDescriptors::CSSDescriptors(AtRuleID at_rule_id, Vector<Descriptor> descripto
 }
 
 CSSDescriptors::~CSSDescriptors() = default;
+
+size_t CSSDescriptors::external_memory_size() const
+{
+    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_descriptors.external_memory_size());
+}
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-length
 size_t CSSDescriptors::length() const
@@ -36,10 +42,7 @@ Utf16String CSSDescriptors::item(size_t index) const
 {
     // The item(index) method must return the property name of the CSS declaration at position index.
     // If there is no indexth object in the collection, then the method must return the empty string.
-    if (index >= length())
-        return {};
-
-    return m_descriptors[index].descriptor_name_and_id.name().to_utf16_string();
+    return m_descriptors.item(index);
 }
 
 // https://drafts.csswg.org/cssom/#set-a-css-declaration
@@ -47,20 +50,8 @@ bool CSSDescriptors::set_a_css_declaration(DescriptorNameAndID const& descriptor
 {
     VERIFY(!is_computed());
 
-    for (auto& descriptor : m_descriptors) {
-        if (descriptor.descriptor_name_and_id == descriptor_name_and_id) {
-            if (*descriptor.value == *value)
-                return false;
-            descriptor.value = move(value);
-            return true;
-        }
-    }
-
-    m_descriptors.append(Descriptor {
-        .descriptor_name_and_id = descriptor_name_and_id,
-        .value = move(value),
-    });
-    return true;
+    prepare_to_update_style_attribute();
+    return m_descriptors.set(descriptor_name_and_id, *value);
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty
@@ -130,8 +121,10 @@ WebIDL::ExceptionOr<void> CSSDescriptors::set_property_internal(Utf16FlyString c
     }
 
     // 10. If updated is true, update style attribute for the CSS declaration block.
-    if (updated)
+    if (updated) {
         update_style_attribute();
+        invalidate_owners();
+    }
 
     return {};
 }
@@ -155,13 +148,14 @@ WebIDL::ExceptionOr<Utf16String> CSSDescriptors::remove_property(Utf16FlyString 
     // 4. Let removed be false.
     bool removed = false;
     auto descriptor_name_and_id = DescriptorNameAndID::from_name(m_at_rule_id, property);
+    prepare_to_update_style_attribute();
 
     // 5. If property is a shorthand property, for each longhand property longhand that property maps to:
     if (descriptor_name_and_id.has_value() && is_shorthand(m_at_rule_id, *descriptor_name_and_id)) {
         for_each_expanded_longhand(m_at_rule_id, *descriptor_name_and_id, nullptr, [this, &removed](DescriptorNameAndID const& longhand_name_and_id, auto const&) {
             // 1. If longhand is not a property name of a CSS declaration in the declarations, continue.
             // 2. Remove that CSS declaration and let removed be true.
-            if (m_descriptors.remove_first_matching([longhand_name_and_id](Descriptor const& entry) { return entry.descriptor_name_and_id == longhand_name_and_id; })) {
+            if (m_descriptors.remove(longhand_name_and_id)) {
                 removed = true;
             }
         });
@@ -169,12 +163,14 @@ WebIDL::ExceptionOr<Utf16String> CSSDescriptors::remove_property(Utf16FlyString 
     // 6. Otherwise, if property is a case-sensitive match for a property name of a CSS declaration in the
     //    declarations, remove that CSS declaration and let removed be true.
     else if (descriptor_name_and_id.has_value()) {
-        removed = m_descriptors.remove_first_matching([descriptor_name_and_id](Descriptor const& entry) { return entry.descriptor_name_and_id == descriptor_name_and_id; });
+        removed = m_descriptors.remove(*descriptor_name_and_id);
     }
 
     // 7. If removed is true, Update style attribute for the CSS declaration block.
-    if (removed)
+    if (removed) {
         update_style_attribute();
+        invalidate_owners();
+    }
 
     // 8. Return value.
     return value;
@@ -189,11 +185,8 @@ Utf16String CSSDescriptors::get_property_value(Utf16FlyString const& property) c
     // 2. If property is a case-sensitive match for a property name of a CSS declaration in the declarations, then
     //    return the result of invoking serialize a CSS value of that declaration.
     auto descriptor_name_and_id = DescriptorNameAndID::from_name(m_at_rule_id, property);
-    if (descriptor_name_and_id.has_value()) {
-        auto match = m_descriptors.first_matching([descriptor_name_and_id](Descriptor const& entry) { return entry.descriptor_name_and_id == descriptor_name_and_id; });
-        if (match.has_value())
-            return match->value->to_utf16_string(SerializationMode::Normal);
-    }
+    if (descriptor_name_and_id.has_value())
+        return m_descriptors.property_value(*descriptor_name_and_id);
 
     // 3. Return the empty string.
     return {};
@@ -209,46 +202,7 @@ Utf16String CSSDescriptors::get_property_priority(Utf16FlyString const&) const
 // https://drafts.csswg.org/cssom/#serialize-a-css-declaration-block
 Utf16String CSSDescriptors::serialized() const
 {
-    // 1. Let list be an empty array.
-    Vector<Utf16String> list;
-    list.ensure_capacity(m_descriptors.size());
-
-    // 2. Let already serialized be an empty array.
-    // AD-HOC: Not needed as we don't have shorthands.
-
-    // 3. Declaration loop: For each CSS declaration declaration in declaration block’s declarations, follow these substeps:
-    for (auto const& descriptor : m_descriptors) {
-        // 1. Let property be declaration’s property name.
-        auto property = descriptor.descriptor_name_and_id.name();
-
-        // 2. If property is in already serialized, continue with the steps labeled declaration loop.
-        // AD-HOC: Not needed as we don't have shorthands.
-
-        // 3. If property maps to one or more shorthand properties, let shorthands be an array of those shorthand properties, in preferred order.
-        // 4. Shorthand loop: For each shorthand in shorthands, follow these substeps: ...
-        // NB: Descriptors can't be shorthands.
-
-        // 5. Let value be the result of invoking serialize a CSS value of declaration.
-        auto value = descriptor.value->to_utf16_string(SerializationMode::Normal);
-
-        // 6. Let serialized declaration be the result of invoking serialize a CSS declaration with property name property, value value, and the important flag set if declaration has its important flag set.
-        auto serialized_declaration = serialize_a_css_declaration_to_utf16(property, value, Important::No);
-
-        // 7. Append serialized declaration to list.
-        list.append(move(serialized_declaration));
-
-        // 8. Append property to already serialized.
-        // AD-HOC: Not needed as we don't have shorthands.
-    }
-
-    // 4. Return list joined with " " (U+0020).
-    Utf16StringBuilder builder;
-    for (size_t i = 0; i < list.size(); ++i) {
-        if (i != 0)
-            builder.append_ascii(' ');
-        builder.append(list[i]);
-    }
-    return builder.to_string();
+    return m_descriptors.serialized();
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-csstext
@@ -259,36 +213,41 @@ WebIDL::ExceptionOr<void> CSSDescriptors::set_css_text(Utf16View value)
         return WebIDL::NoModificationAllowedError::create("Cannot modify properties of readonly CSSStyleDeclaration"_utf16);
 
     // 2. Empty the declarations.
-    m_descriptors.clear();
+    prepare_to_update_style_attribute();
+    m_descriptors.replace(RustDescriptorBlock { Vector<Descriptor> {} });
 
     // 3. Parse the given value and, if the return value is not the empty list, insert the items in the list into the
     //    declarations, in specified order.
     auto descriptors = parse_css_descriptor_declaration_block(Parser::ParsingParams {}, m_at_rule_id, value);
-    if (!descriptors.is_empty())
-        m_descriptors = move(descriptors);
+    if (descriptors.size() > 0)
+        m_descriptors.replace(descriptors);
 
     // 4. Update style attribute for the CSS declaration block.
     update_style_attribute();
+    invalidate_owners();
 
     return {};
 }
 
 RefPtr<StyleValue const> CSSDescriptors::descriptor(DescriptorNameAndID const& descriptor_name_and_id) const
 {
-    auto match = m_descriptors.first_matching([descriptor_name_and_id](Descriptor const& descriptor) {
-        return descriptor.descriptor_name_and_id == descriptor_name_and_id;
-    });
-    if (match.has_value())
-        return match->value;
-    return nullptr;
+    return m_descriptors.descriptor(descriptor_name_and_id);
+}
+
+void CSSDescriptors::invalidate_owners()
+{
+    auto rule = parent_rule();
+    if (!rule || rule->type() != CSSRule::Type::FunctionDeclarations)
+        return;
+    if (auto* sheet = rule->parent_style_sheet()) {
+        record_style_rule_declarations_changed(*rule);
+        sheet->invalidate_owners();
+    }
 }
 
 RefPtr<StyleValue const> CSSDescriptors::descriptor_or_initial_value(DescriptorNameAndID const& descriptor_name_and_id) const
 {
-    if (auto value = descriptor(descriptor_name_and_id))
-        return value.release_nonnull();
-
-    return descriptor_initial_value(m_at_rule_id, descriptor_name_and_id.id());
+    return m_descriptors.descriptor_or_initial_value(m_at_rule_id, descriptor_name_and_id);
 }
 
 bool is_shorthand(AtRuleID at_rule, DescriptorNameAndID const& descriptor)

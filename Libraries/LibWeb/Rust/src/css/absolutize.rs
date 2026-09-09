@@ -20,6 +20,162 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+    use crate::css::css_tokenizer::{TokenizerInput, tokenize_for_parser};
+    use crate::css::parser::component_value::consume_a_list_of_component_values;
+    use crate::css::parser::value_parser::{ParseContext, ParseOutcome, parse_css_value};
+    use crate::css::property_metadata::property_id;
+
+    fn parse(property: u16, source: &str) -> Arc<StyleValueData> {
+        let units: Vec<_> = source.encode_utf16().collect();
+        let values = consume_a_list_of_component_values(tokenize_for_parser(TokenizerInput::Utf16(&units))).unwrap();
+        // All fields are scalars or nullable pointers.
+        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let ParseOutcome::Parsed(value) = parse_css_value(&context, property, &values) else {
+            panic!("invalid test value");
+        };
+        value
+    }
+
+    #[test]
+    fn composite_resolution_preserves_shared_shapes_and_easing() {
+        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            unsafe { Arc::increment_strong_count(value) };
+            value
+        }
+        for (property, source) in [
+            (property_id::CLIP_PATH, "inset(1px round 2px)"),
+            (property_id::CLIP_PATH, "circle(2px at 25% 75%)"),
+            (property_id::CLIP_PATH, "ellipse(2px 3px)"),
+            (property_id::CLIP_PATH, "polygon(1px 2px, 3px 4px, 5px 6px)"),
+            (property_id::D, "path(\"M0 0 L30 40\")"),
+            (property_id::ANIMATION_TIMING_FUNCTION, "linear(0, 1 50%)"),
+            (property_id::ANIMATION_TIMING_FUNCTION, "cubic-bezier(0, 0, 1, 1)"),
+            (property_id::ANIMATION_TIMING_FUNCTION, "steps(4, jump-start)"),
+        ] {
+            let parsed = parse(property, source);
+            let value = match &*parsed {
+                StyleValueData::ValueList { values, .. } => values.as_slice()[0].data(),
+                value => value,
+            };
+            let same = unsafe {
+                Arc::from_raw(rust_composite_style_value_absolutize(
+                    value,
+                    std::ptr::null(),
+                    unchanged,
+                ))
+            };
+            assert!(std::ptr::eq(value, &*same));
+            let mut children = Vec::new();
+            let mut retain_child = |child: &RetainedStyleValueData, _: &mut bool| {
+                if child.optional_data().is_some() {
+                    children.push((
+                        child.clone(),
+                        crate::css::serialize::serialize_style_value_to_utf16(child.data()).unwrap(),
+                    ));
+                }
+                Some(child.clone())
+            };
+            match value {
+                StyleValueData::BasicShape { .. } => {
+                    absolutize_basic_shape(value, &mut retain_child).unwrap();
+                }
+                StyleValueData::Easing { .. } => {
+                    absolutize_easing(value, &mut retain_child).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(same);
+            drop(parsed);
+            for (child, expected) in children {
+                assert_eq!(
+                    crate::css::serialize::serialize_style_value_to_utf16(child.data()).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grid_leaf_resolution_preserves_identity_and_retained_children() {
+        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            unsafe { Arc::increment_strong_count(value) };
+            value
+        }
+        for (property, source) in [
+            (property_id::GRID_ROW_START, "3"),
+            (
+                property_id::GRID_TEMPLATE_COLUMNS,
+                "[雪] repeat(2, minmax(10px, 1fr)) [雨]",
+            ),
+        ] {
+            let value = parse(property, source);
+            let original = crate::css::serialize::serialize_style_value_to_utf16(&value).unwrap();
+            let same = unsafe {
+                Arc::from_raw(rust_composite_style_value_absolutize(
+                    &value,
+                    std::ptr::null(),
+                    unchanged,
+                ))
+            };
+            assert!(Arc::ptr_eq(&value, &same));
+            let mut retained = Vec::new();
+            let mapped = map_grid_values(&value, &mut |child| {
+                if child.optional_data().is_some() {
+                    retained.push(child.clone());
+                }
+                Some(child.clone())
+            })
+            .unwrap();
+            drop(value);
+            drop(same);
+            assert!(!retained.is_empty());
+            assert_eq!(
+                crate::css::serialize::serialize_style_value_to_utf16(&mapped).unwrap(),
+                original
+            );
+            drop(mapped);
+            for child in retained {
+                assert!(crate::css::serialize::serialize_style_value_to_utf16(child.data()).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn grid_leaf_resolution_rebuilds_nested_tracks_without_changing_the_source() {
+        unsafe extern "C" fn resolve(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            match value {
+                StyleValueData::Length { value, unit } => Arc::into_raw(Arc::new(StyleValueData::Length {
+                    value: value * 2.0,
+                    unit: *unit,
+                })),
+                _ => {
+                    unsafe { Arc::increment_strong_count(value) };
+                    value
+                }
+            }
+        }
+        let value = parse(
+            property_id::GRID_TEMPLATE_COLUMNS,
+            "[雪] repeat(2, minmax(10px, 1fr)) [雨]",
+        );
+        let resolved =
+            unsafe { Arc::from_raw(rust_composite_style_value_absolutize(&value, std::ptr::null(), resolve)) };
+        assert!(!Arc::ptr_eq(&value, &resolved));
+        for (value, expected) in [
+            (&value, "[雪] repeat(2, minmax(10px, 1fr)) [雨]"),
+            (&resolved, "[雪] repeat(2, minmax(20px, 1fr)) [雨]"),
+        ] {
+            assert_eq!(
+                crate::css::serialize::serialize_style_value_to_utf16(value).unwrap(),
+                expected.encode_utf16().collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 use crate::css::color_resolution::{
     ColorResolutionInput, EMPTY_INPUT, PREFERRED_COLOR_SCHEME_DARK, RECTANGULAR_COLOR_SPACE_OKLAB,
     descriptor_for_color_type, normalize_percentage_pair, percentage_from_style_value, resolve_alpha,
@@ -28,7 +184,8 @@ use crate::css::color_resolution::{
 use crate::css::css_enums::keyword;
 use crate::css::style_compute::{FfiLengthResolutionContext, absolutize_length, keyword_is_color};
 use crate::css::style_value::{
-    ColorBase, RetainedStyleValueData, RetainedStyleValueDataList, RetainedUtf16FlyString, StyleValueData,
+    ColorBase, CssString, RetainedGridTrackEntryList, RetainedStyleValueData, RetainedStyleValueDataList,
+    StyleValueData,
 };
 
 pub(crate) struct AbsolutizationContext<'a> {
@@ -130,7 +287,7 @@ fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> 
     else {
         return None;
     };
-    if url.as_bytes().is_empty() {
+    if url.is_empty() {
         return Some(Absolutized::Unchanged);
     }
 
@@ -141,19 +298,19 @@ fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> 
         .or_else(|| {
             resource_context
                 .has_base_url
-                .then(|| resource_context.base_url.as_bytes())
+                .then(|| resource_context.base_url.ascii_bytes())
         })
         .unwrap_or(context.document_base_url);
     if base_url.is_empty() {
         return Some(Absolutized::Unchanged);
     }
 
-    let url_string = std::str::from_utf8(url.as_bytes()).ok()?;
+    let url_string = url.url_input();
     let should_absolutize_url_for_computed_value =
         context.style_sheet_resource_context.is_some() || resource_context.should_absolutize_url_for_computed_value;
     let absolutized_url = if should_absolutize_url_for_computed_value {
         if liburl_rust::basic_parse(url_string, liburl_rust::BasicParseOptions::new()).is_some() {
-            crate::css::style_value::RetainedString::from_utf8(url_string.to_owned())
+            url.clone()
         } else {
             let base_url = std::str::from_utf8(base_url).ok()?;
             let base_url = liburl_rust::basic_parse(base_url, liburl_rust::BasicParseOptions::new())?;
@@ -162,13 +319,13 @@ fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> 
             let Some(resolved_url) = resolved_url else {
                 return Some(Absolutized::Unchanged);
             };
-            crate::css::style_value::RetainedString::from_utf8(resolved_url.serialization())
+            crate::css::style_value::RetainedString::from_ascii(resolved_url.serialization())
         }
     } else {
-        crate::css::style_value::RetainedString::from_utf8(url_string.to_owned())
+        url.clone()
     };
     let base_url = std::str::from_utf8(base_url).ok()?;
-    let base_url = crate::css::style_value::RetainedString::from_utf8(base_url.to_owned());
+    let base_url = crate::css::style_value::RetainedString::from_ascii(base_url.to_owned());
 
     let (has_parent_style_sheet_origin_clean, parent_style_sheet_origin_clean) = context
         .style_sheet_resource_context
@@ -218,7 +375,7 @@ fn rgb_color_function(r: f64, g: f64, b: f64, alpha: f64, color_syntax: u8) -> S
         channel_2: retain_new(StyleValueData::Number { value: b }),
         alpha: retain_new(StyleValueData::Number { value: alpha }),
         has_name: false,
-        name: RetainedUtf16FlyString::none(),
+        name: CssString::none(),
         origin_color: retained_null(),
     }
 }
@@ -299,7 +456,7 @@ fn hwb_to_absolutized_rgb(
                 value: alpha_0_1.clamp(0.0, 1.0),
             }),
             has_name: false,
-            name: RetainedUtf16FlyString::none(),
+            name: CssString::none(),
             origin_color: retained_null(),
         };
     }
@@ -548,10 +705,9 @@ fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext)
     })))
 }
 
-/// The gradient absolutizers recurse the same children the C++ ports do, but the retained
-/// color-stop type has no Rust-side constructor yet, so a changed gradient still declines to
-/// the C++ fallback; only the identity outcome resolves natively. The C++ linear gradient
-/// absolutization leaves the direction untouched, so this does too.
+/// The gradient absolutizers recurse their Rust-owned children and rebuild the retained stop
+/// list in place. The C++ linear gradient absolutization leaves the direction untouched, so this
+/// does too.
 fn absolutize_gradient(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
     let mut changed = false;
     let absolutize_stops = |color_stop_list: &crate::css::style_value::RetainedColorStopList,
@@ -733,10 +889,13 @@ fn number_from_value(value: &StyleValueData, percentage_basis: f64) -> Option<f6
     }
 }
 
-/// Port of BasicShapeStyleValue::absolutized: structural recursion, with xywh() and rect()
+/// Compute basic shapes through structural recursion, with xywh() and rect()
 /// lowering to the equivalent inset() through 100%-minus calculations, and rect()'s auto
 /// edges resolving to 0% or 100%.
-fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
+fn absolutize_basic_shape(
+    value: &StyleValueData,
+    resolve: &mut impl FnMut(&RetainedStyleValueData, &mut bool) -> Option<RetainedStyleValueData>,
+) -> Option<Absolutized> {
     let StyleValueData::BasicShape {
         kind,
         v0,
@@ -746,17 +905,20 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
         v4,
         fill_rule,
         points,
-        path_string,
+        path,
     } = value
     else {
         return None;
     };
     // Absolutizes a freshly built 100%-minus calculation for the inset lowering.
-    let flipped = |values: &[&StyleValueData], changed: &mut bool| -> Option<RetainedStyleValueData> {
+    let flipped = |values: &[&StyleValueData],
+                   changed: &mut bool,
+                   resolve: &mut dyn FnMut(&RetainedStyleValueData, &mut bool) -> Option<RetainedStyleValueData>|
+     -> Option<RetainedStyleValueData> {
         *changed = true;
         let built = retain_new(crate::css::calc::one_hundred_percent_minus_value(values)?);
         let mut built_changed = false;
-        absolutize_child(&built, context, &mut built_changed)
+        resolve(&built, &mut built_changed)
     };
     // rect()'s auto edges coincide with the reference box edge: 0% for top/left,
     // 100% for right/bottom.
@@ -773,11 +935,11 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
     match kind {
         0 => {
             let mut changed = false;
-            let top = absolutize_child(v0, context, &mut changed)?;
-            let right = absolutize_child(v1, context, &mut changed)?;
-            let bottom = absolutize_child(v2, context, &mut changed)?;
-            let left = absolutize_child(v3, context, &mut changed)?;
-            let border_radius = absolutize_child(v4, context, &mut changed)?;
+            let top = resolve(v0, &mut changed)?;
+            let right = resolve(v1, &mut changed)?;
+            let bottom = resolve(v2, &mut changed)?;
+            let left = resolve(v3, &mut changed)?;
+            let border_radius = resolve(v4, &mut changed)?;
             if !changed {
                 return Some(Absolutized::Unchanged);
             }
@@ -790,7 +952,7 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 v4: border_radius,
                 fill_rule: *fill_rule,
                 points: points.clone(),
-                path_string: path_string.clone(),
+                path: path.clone(),
             })))
         }
         1 | 2 => {
@@ -803,10 +965,10 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 let width = v2.optional_data()?;
                 let height = v3.optional_data()?;
                 (
-                    absolutize_child(v1, context, &mut changed)?,
-                    flipped(&[x, width], &mut changed)?,
-                    flipped(&[y, height], &mut changed)?,
-                    absolutize_child(v0, context, &mut changed)?,
+                    resolve(v1, &mut changed)?,
+                    flipped(&[x, width], &mut changed, resolve)?,
+                    flipped(&[y, height], &mut changed, resolve)?,
+                    resolve(v0, &mut changed)?,
                 )
             } else {
                 let mut auto_changed = false;
@@ -816,14 +978,14 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 let left = resolve_auto(v3, 0.0, &mut auto_changed)?;
                 let mut child_changed = false;
                 (
-                    absolutize_child(&top, context, &mut child_changed)?,
-                    flipped(&[right.optional_data()?], &mut child_changed)?,
-                    flipped(&[bottom.optional_data()?], &mut child_changed)?,
-                    absolutize_child(&left, context, &mut child_changed)?,
+                    resolve(&top, &mut child_changed)?,
+                    flipped(&[right.optional_data()?], &mut child_changed, resolve)?,
+                    flipped(&[bottom.optional_data()?], &mut child_changed, resolve)?,
+                    resolve(&left, &mut child_changed)?,
                 )
             };
             let mut radius_changed = false;
-            let border_radius = absolutize_child(v4, context, &mut radius_changed)?;
+            let border_radius = resolve(v4, &mut radius_changed)?;
             let _ = changed;
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
                 kind: 0,
@@ -834,13 +996,13 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 v4: border_radius,
                 fill_rule: *fill_rule,
                 points: points.clone(),
-                path_string: path_string.clone(),
+                path: path.clone(),
             })))
         }
         3 | 4 => {
             let mut changed = false;
-            let radius = absolutize_child(v0, context, &mut changed)?;
-            let position = absolutize_child(v1, context, &mut changed)?;
+            let radius = resolve(v0, &mut changed)?;
+            let position = resolve(v1, &mut changed)?;
             if !changed {
                 return Some(Absolutized::Unchanged);
             }
@@ -853,7 +1015,7 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 v4: v4.clone_retained(),
                 fill_rule: *fill_rule,
                 points: points.clone(),
-                path_string: path_string.clone(),
+                path: path.clone(),
             })))
         }
         5 => {
@@ -861,8 +1023,8 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
             let mut absolutized_points = Vec::with_capacity(points.as_slice().len());
             for point in points.as_slice() {
                 let [x, y] = point.values();
-                let x = absolutize_child(x, context, &mut changed)?;
-                let y = absolutize_child(y, context, &mut changed)?;
+                let x = resolve(x, &mut changed)?;
+                let y = resolve(y, &mut changed)?;
                 absolutized_points.push(crate::css::style_value::RetainedShapePoint::from_retained_values(x, y));
             }
             if !changed {
@@ -877,49 +1039,167 @@ fn absolutize_basic_shape(value: &StyleValueData, context: &AbsolutizationContex
                 v4: v4.clone_retained(),
                 fill_rule: *fill_rule,
                 points: crate::css::style_value::RetainedShapePointList::from_retained_points(absolutized_points),
-                path_string: path_string.clone(),
+                path: path.clone(),
             })))
         }
         _ => Some(Absolutized::Unchanged),
     }
 }
 
+fn absolutize_easing(
+    value: &StyleValueData,
+    resolve: &mut impl FnMut(&RetainedStyleValueData, &mut bool) -> Option<RetainedStyleValueData>,
+) -> Option<Absolutized> {
+    let StyleValueData::Easing {
+        kind,
+        linear_stops,
+        x1,
+        y1,
+        x2,
+        y2,
+        number_of_intervals,
+        step_position,
+    } = value
+    else {
+        return None;
+    };
+    let mut changed = false;
+    let mut stops = Vec::with_capacity(linear_stops.as_slice().len());
+    for stop in linear_stops.as_slice() {
+        let [output, input] = stop.values();
+        let output = resolve(output, &mut changed)?;
+        let input = resolve(input, &mut changed)?;
+        stops.push(crate::css::style_value::RetainedLinearEasingStop::from_retained_values(
+            output, input,
+        ));
+    }
+    let x1 = resolve(x1, &mut changed)?;
+    let y1 = resolve(y1, &mut changed)?;
+    let x2 = resolve(x2, &mut changed)?;
+    let y2 = resolve(y2, &mut changed)?;
+    let number_of_intervals = resolve(number_of_intervals, &mut changed)?;
+    if !changed {
+        return Some(Absolutized::Unchanged);
+    }
+    Some(Absolutized::Changed(retain_new(StyleValueData::Easing {
+        kind: *kind,
+        linear_stops: crate::css::style_value::RetainedLinearEasingStopList::from_retained_elements(stops),
+        x1,
+        y1,
+        x2,
+        y2,
+        number_of_intervals,
+        step_position: *step_position,
+    })))
+}
+
 /// Absolutizes a grid track entry list, recursing through repeat() entries.
-fn absolutize_grid_track_entries(
+fn map_grid_track_entries(
     entries: &[crate::css::style_value::RetainedGridTrackEntry],
-    context: &AbsolutizationContext,
-    any_changed: &mut bool,
+    map: &mut impl FnMut(&RetainedStyleValueData) -> Option<RetainedStyleValueData>,
 ) -> Option<Vec<crate::css::style_value::RetainedGridTrackEntry>> {
     use crate::css::style_value::RetainedGridTrackEntry;
-    let mut absolutized = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let size_value = absolutize_child(&entry.size_value, context, any_changed)?;
-        let min_value = absolutize_child(&entry.min_value, context, any_changed)?;
-        let max_value = absolutize_child(&entry.max_value, context, any_changed)?;
-        let repeat_count = absolutize_child(&entry.repeat_count, context, any_changed)?;
-        let nested = absolutize_grid_track_entries(entry.repeat_entries(), context, any_changed)?;
-        let nested = nested.into_boxed_slice();
-        let repeat_entries_length = nested.len();
-        let repeat_entries_pointer = if repeat_entries_length == 0 {
-            std::ptr::null_mut()
-        } else {
-            Box::into_raw(nested) as *mut RetainedGridTrackEntry
-        };
-        absolutized.push(RetainedGridTrackEntry {
-            kind: entry.kind,
-            names: entry.names.clone(),
-            size_value,
-            min_value,
-            max_value,
-            repeat_type: entry.repeat_type,
-            repeat_count,
-            repeat_is_subgrid: entry.repeat_is_subgrid,
-            repeat_preserve_line_name_sets: entry.repeat_preserve_line_name_sets,
-            repeat_entries_pointer,
-            repeat_entries_length,
-        });
+    entries
+        .iter()
+        .map(|entry| {
+            Some(RetainedGridTrackEntry {
+                kind: entry.kind,
+                names: entry.names.clone(),
+                size_value: map(&entry.size_value)?,
+                min_value: map(&entry.min_value)?,
+                max_value: map(&entry.max_value)?,
+                repeat_type: entry.repeat_type,
+                repeat_count: map(&entry.repeat_count)?,
+                repeat_is_subgrid: entry.repeat_is_subgrid,
+                repeat_preserve_line_name_sets: entry.repeat_preserve_line_name_sets,
+                repeat_entries: RetainedGridTrackEntryList::from_retained_entries(map_grid_track_entries(
+                    entry.repeat_entries(),
+                    map,
+                )?),
+            })
+        })
+        .collect()
+}
+
+fn map_grid_values(
+    value: &StyleValueData,
+    map: &mut impl FnMut(&RetainedStyleValueData) -> Option<RetainedStyleValueData>,
+) -> Option<StyleValueData> {
+    Some(match value {
+        StyleValueData::GridTrackPlacement {
+            kind,
+            value,
+            has_name,
+            name,
+            implicit_start_name,
+            implicit_end_name,
+        } => StyleValueData::GridTrackPlacement {
+            kind: *kind,
+            value: map(value)?,
+            has_name: *has_name,
+            name: name.clone(),
+            implicit_start_name: implicit_start_name.clone(),
+            implicit_end_name: implicit_end_name.clone(),
+        },
+        StyleValueData::GridTrackSizeList {
+            is_subgrid,
+            preserve_line_name_sets,
+            entries,
+        } => StyleValueData::GridTrackSizeList {
+            is_subgrid: *is_subgrid,
+            preserve_line_name_sets: *preserve_line_name_sets,
+            entries: RetainedGridTrackEntryList::from_retained_entries(map_grid_track_entries(
+                entries.as_slice(),
+                map,
+            )?),
+        },
+        _ => unreachable!(),
+    })
+}
+
+/// Resolve context-dependent leaves without materializing a C++ composite value graph.
+///
+/// # Safety
+/// The value must be a live grid, easing, or basic-shape value. The callback must return one retained reference
+/// for each borrowed leaf and must not mutate the input graph.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_composite_style_value_absolutize(
+    value: &StyleValueData,
+    context: *const core::ffi::c_void,
+    resolve: unsafe extern "C" fn(*const core::ffi::c_void, &StyleValueData) -> *const StyleValueData,
+) -> *const StyleValueData {
+    let mut map = |child: &RetainedStyleValueData| {
+        Some(match child.optional_data() {
+            None => child.clone(),
+            Some(data) => unsafe { RetainedStyleValueData::from_retained_pointer(resolve(context, data)) },
+        })
+    };
+    let mut resolve_child = |child: &RetainedStyleValueData, changed: &mut bool| {
+        let mapped = map(child)?;
+        *changed |= mapped != *child;
+        Some(mapped)
+    };
+    let result = match value {
+        StyleValueData::BasicShape { .. } => absolutize_basic_shape(value, &mut resolve_child),
+        StyleValueData::Easing { .. } => absolutize_easing(value, &mut resolve_child),
+        _ => {
+            let mapped = map_grid_values(value, &mut map).unwrap();
+            Some(if mapped == *value {
+                Absolutized::Unchanged
+            } else {
+                Absolutized::Changed(retain_new(mapped))
+            })
+        }
     }
-    Some(absolutized)
+    .unwrap();
+    if let Absolutized::Changed(mapped) = result {
+        let pointer = mapped.pointer();
+        core::mem::forget(mapped);
+        pointer
+    } else {
+        unsafe { Arc::increment_strong_count(value) };
+        value
+    }
 }
 
 fn canonicalized_dimension(value: f64, unit: u8, ratios: &[f64]) -> Option<(f64, u8)> {
@@ -1387,7 +1667,9 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             rebuild!(changed, StyleValueData::Position { edge_x, edge_y })
         }
 
-        StyleValueData::BasicShape { .. } => absolutize_basic_shape(value, context),
+        StyleValueData::BasicShape { .. } => {
+            absolutize_basic_shape(value, &mut |child, changed| absolutize_child(child, context, changed))
+        }
 
         StyleValueData::Cursor { image, x, y } => {
             let mut changed = false;
@@ -1396,44 +1678,8 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             let y = absolutize_child(y, context, &mut changed)?;
             rebuild!(changed, StyleValueData::Cursor { image, x, y })
         }
-        StyleValueData::Easing {
-            kind,
-            linear_stops,
-            x1,
-            y1,
-            x2,
-            y2,
-            number_of_intervals,
-            step_position,
-        } => {
-            let mut changed = false;
-            let mut stops = Vec::with_capacity(linear_stops.as_slice().len());
-            for stop in linear_stops.as_slice() {
-                let [output, input] = stop.values();
-                let output = absolutize_child(output, context, &mut changed)?;
-                let input = absolutize_child(input, context, &mut changed)?;
-                stops.push(crate::css::style_value::RetainedLinearEasingStop::from_retained_values(
-                    output, input,
-                ));
-            }
-            let x1 = absolutize_child(x1, context, &mut changed)?;
-            let y1 = absolutize_child(y1, context, &mut changed)?;
-            let x2 = absolutize_child(x2, context, &mut changed)?;
-            let y2 = absolutize_child(y2, context, &mut changed)?;
-            let number_of_intervals = absolutize_child(number_of_intervals, context, &mut changed)?;
-            rebuild!(
-                changed,
-                StyleValueData::Easing {
-                    kind: *kind,
-                    linear_stops: crate::css::style_value::RetainedLinearEasingStopList::from_retained_elements(stops),
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    number_of_intervals,
-                    step_position: *step_position,
-                }
-            )
+        StyleValueData::Easing { .. } => {
+            absolutize_easing(value, &mut |child, changed| absolutize_child(child, context, changed))
         }
         StyleValueData::ImageSet { options } => {
             let mut changed = false;
@@ -1487,43 +1733,10 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
                 }
             )
         }
-        StyleValueData::GridTrackPlacement {
-            kind,
-            value,
-            has_name,
-            name,
-            implicit_start_name,
-            implicit_end_name,
-        } => {
+        StyleValueData::GridTrackPlacement { .. } | StyleValueData::GridTrackSizeList { .. } => {
             let mut changed = false;
-            let value = absolutize_child(value, context, &mut changed)?;
-            rebuild!(
-                changed,
-                StyleValueData::GridTrackPlacement {
-                    kind: *kind,
-                    value,
-                    has_name: *has_name,
-                    name: name.clone(),
-                    implicit_start_name: implicit_start_name.clone(),
-                    implicit_end_name: implicit_end_name.clone(),
-                }
-            )
-        }
-        StyleValueData::GridTrackSizeList {
-            is_subgrid,
-            preserve_line_name_sets,
-            entries,
-        } => {
-            let mut changed = false;
-            let entries = absolutize_grid_track_entries(entries.as_slice(), context, &mut changed)?;
-            rebuild!(
-                changed,
-                StyleValueData::GridTrackSizeList {
-                    is_subgrid: *is_subgrid,
-                    preserve_line_name_sets: *preserve_line_name_sets,
-                    entries: crate::css::style_value::RetainedGridTrackEntryList::from_retained_elements(entries),
-                }
-            )
+            let mapped = map_grid_values(value, &mut |child| absolutize_child(child, context, &mut changed))?;
+            rebuild!(changed, mapped)
         }
 
         // Tree-counting functions resolve from immutable sibling facts captured before the

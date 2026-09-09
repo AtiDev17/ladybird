@@ -10,7 +10,7 @@
 #include <AK/Utf16View.h>
 #include <LibWeb/CSS/CSSGroupingRule.h>
 #include <LibWeb/CSS/CSSPageDescriptors.h>
-#include <LibWeb/CSS/PageSelector.h>
+#include <LibWeb/CSS/RustPageSelectors.h>
 
 namespace Web::CSS {
 
@@ -20,38 +20,25 @@ class CSSPageRule final : public CSSGroupingRule {
     GC_DECLARE_ALLOCATOR(CSSPageRule);
 
 public:
-    static constexpr size_t style_offset() { return offsetof(CSSPageRule, m_style); }
-    [[nodiscard]] static GC::Ref<CSSPageRule> create(PageSelectorList&&, GC::Ref<CSSPageDescriptors>, CSSRuleList&);
+    [[nodiscard]] static GC::Ref<CSSPageRule> create(RustRule, CSSRuleList&);
 
     virtual ~CSSPageRule() override = default;
 
     Utf16String selector_text() const;
     void set_selector_text(Utf16View);
 
-    GC::Ref<CSSPageDescriptors> style() { return m_style; }
-    GC::Ref<CSSPageDescriptors const> descriptors() const { return m_style; }
+    GC::Ref<CSSPageDescriptors> style() const;
 
 private:
-    CSSPageRule(PageSelectorList&&, GC::Ref<CSSPageDescriptors>, CSSRuleList&);
+    CSSPageRule(RustRule, CSSRuleList&);
 
+    virtual size_t external_memory_size() const override;
     virtual Utf16String serialized() const override;
     virtual void visit_edges(Visitor&) override;
     virtual void dump(StringBuilder&, int indent_levels) const override;
 
-    PageSelectorList m_selectors;
-    GC::Ref<CSSPageDescriptors> m_style;
-};
-
-}
-
-namespace AK {
-
-template<>
-struct Formatter<Web::CSS::PageSelector> : Formatter<StringView> {
-    ErrorOr<void> format(FormatBuilder& builder, Web::CSS::PageSelector const& selector)
-    {
-        return Formatter<StringView>::format(builder, selector.serialize());
-    }
+    RustDescriptorBlock m_descriptors;
+    mutable GC::Ptr<CSSPageDescriptors> m_style;
 };
 
 }
