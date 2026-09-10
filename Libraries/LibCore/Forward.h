@@ -25,7 +25,6 @@ class File;
 class LocalServer;
 class LocalSocket;
 class MappedFile;
-class MimeData;
 class NetworkJob;
 class Notifier;
 class Process;
@@ -46,8 +45,6 @@ class TimeZoneWatcher;
 class UDPServer;
 class UDPSocket;
 class WeakEventLoopReference;
-
-struct ProxyData;
 
 #ifdef AK_OS_MACH
 class MachPort;

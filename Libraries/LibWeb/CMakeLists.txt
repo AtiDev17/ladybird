@@ -797,7 +797,6 @@ set(SOURCES
     Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
-    Loader/ProxyMappings.cpp
     Loader/ResourceLoader.cpp
     Loader/SiteCompatibility.cpp
     MathML/AttributeNames.cpp
@@ -1287,6 +1286,11 @@ build_rust_binary(
     BINARY_NAME style-replay
     FEATURES style-replay
 )
+# The replay tool currently requires POSIX memory mapping.
+if (UNIX)
+    add_custom_target(style-replay ALL)
+    add_dependencies(style-replay style-replay-build)
+endif()
 target_link_libraries(libweb_rust INTERFACE LibGfx)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 
