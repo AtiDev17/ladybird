@@ -35,7 +35,6 @@ WEB_API CSSPixelRect absolute_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_padding_box_rect(Layout::Node const&);
 WEB_API CSSPixelRect absolute_border_box_rect(Layout::Node const&);
 WEB_API CSSPixelPoint absolute_position(Layout::Node const&);
-WEB_API CSSPixelPoint offset(Layout::Node const&);
 WEB_API CSSPixelSize content_size(Layout::Node const&);
 WEB_API CSSPixels content_width(Layout::Node const&);
 WEB_API CSSPixels content_height(Layout::Node const&);
@@ -43,27 +42,21 @@ WEB_API CSSPixels border_box_width(Layout::Node const&);
 WEB_API CSSPixels border_box_height(Layout::Node const&);
 WEB_API BoxModelMetrics box_model(Layout::Node const&);
 WEB_API Optional<CSS::BorderData> outline_data(Layout::Node const&, CSS::ComputedValues const&);
-WEB_API CSSPixels outline_offset(Layout::Node const&);
 WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
-WEB_API Optional<OverflowData> overflow_data(Layout::Node const&);
 
 WEB_API bool is_visible(Layout::Node const&);
 WEB_API bool visible_for_hit_testing(Layout::Node const&);
 WEB_API bool has_stacking_context(Layout::Node const&);
 WEB_API CSS::Display display(Layout::Node const&);
 WEB_API bool is_positioned(Layout::Node const&);
-WEB_API bool is_fixed_position(Layout::Node const&);
-WEB_API SelectionState selection_state(Layout::Node const&);
 WEB_API CSS::StyleRecordID style_record_identity(Layout::Node const&);
 WEB_API bool is_navigable_container_viewport_paintable(Layout::Node const&);
 WEB_API bool is_viewport_paintable(Layout::Node const&);
 WEB_API bool is_paintable_with_lines(Layout::Node const&);
 WEB_API bool is_inline_paintable(Layout::Node const&);
-WEB_API bool is_svg_paintable(Layout::Node const&);
 WEB_API bool is_svg_svg_paintable(Layout::Node const&);
-WEB_API bool is_svg_path_paintable(Layout::Node const&);
 
 WEB_API CSSPixelRect transform_rect_to_viewport(Layout::Node const&, CSSPixelRect const&, AccumulatedVisualContextTree::IncludeVisualViewportTransform = AccumulatedVisualContextTree::IncludeVisualViewportTransform::Yes);
 WEB_API Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const&, CSSPixelPoint);
@@ -97,8 +90,6 @@ WEB_API void set_needs_repaint(Layout::Node const&, InvalidateDisplayList = Inva
 WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
 WEB_API void invalidate_paint_cache(Layout::Node const&);
 WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvalidationAfterStyleChange const&);
-WEB_API void clear_overflow_data(Layout::Node const&);
-WEB_API void clear_cached_overflow_data(Layout::Node const&);
 
 WEB_API Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform();
 WEB_API Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const&, AccumulatedVisualContextTree const&);

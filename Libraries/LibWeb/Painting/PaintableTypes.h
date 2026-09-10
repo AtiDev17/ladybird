@@ -6,11 +6,7 @@
 
 #pragma once
 
-#include <AK/Optional.h>
-#include <AK/Vector.h>
-#include <LibGfx/Color.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/PixelUnits.h>
+#include <AK/Types.h>
 
 namespace Web::Painting {
 
@@ -19,26 +15,12 @@ enum class PaintCommandCacheMode : u8 {
     ReadWrite,
 };
 
-enum class PaintPhase {
-    Background,
-    Border,
-    TableCollapsedBorder,
-    Foreground,
-    Outline,
-    Overlay,
-};
-
 enum class SelectionState : u8 {
     None,
     Start,
     End,
     StartAndEnd,
     Full,
-};
-
-struct OverflowData {
-    CSSPixelRect scrollable_overflow_rect_relative_to_padding_box;
-    bool has_scrollable_overflow { false };
 };
 
 }

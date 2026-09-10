@@ -111,11 +111,6 @@ CSSPixelPoint absolute_position(Layout::Node const& node)
     return absolute_rect(node).location();
 }
 
-CSSPixelPoint offset(Layout::Node const& node)
-{
-    return Layout::RustFFI::layout_arena_paintable_offset(node.arena_handle(), committed_row_slot(node));
-}
-
 CSSPixelSize content_size(Layout::Node const& node)
 {
     return Layout::RustFFI::layout_arena_paintable_content_size(node.arena_handle(), committed_row_slot(node));
@@ -152,14 +147,6 @@ CSSPixels border_box_height(Layout::Node const& node)
 {
     auto border_box = box_model(node).border_box();
     return content_height(node) + border_box.top + border_box.bottom;
-}
-
-Optional<OverflowData> overflow_data(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    if (!row || !row->overflow_measured_this_commit)
-        return {};
-    return OverflowData { row->overflow_relative_to_padding_box.rect, row->overflow_relative_to_padding_box.has_scrollable_overflow };
 }
 
 static bool overflow_is_valid(Layout::Node const& node)
@@ -236,19 +223,6 @@ bool is_positioned(Layout::Node const& node)
     return Layout::RustFFI::layout_arena_paintable_is_positioned(node.arena_handle(), committed_row_slot(node));
 }
 
-bool is_fixed_position(Layout::Node const& node)
-{
-    return has_committed_box(node) && as<Layout::NodeWithStyle>(node).is_fixed_position();
-}
-
-SelectionState selection_state(Layout::Node const& node)
-{
-    auto const* row = committed_row(node);
-    if (!row)
-        return {};
-    return static_cast<SelectionState>(row->selection_state);
-}
-
 CSS::StyleRecordID style_record_identity(Layout::Node const& node)
 {
     if (!has_committed_box(node))
@@ -293,42 +267,9 @@ bool is_inline_paintable(Layout::Node const& node)
     return has_committed_box(node) && node.is_fragmented_inline();
 }
 
-bool is_svg_paintable(Layout::Node const& node)
-{
-    if (!has_committed_box(node))
-        return false;
-    switch (node.kind()) {
-    case Layout::RustFFI::NodeKind::SVGGraphicsBox:
-    case Layout::RustFFI::NodeKind::SVGGeometryBox:
-    case Layout::RustFFI::NodeKind::SVGTextBox:
-    case Layout::RustFFI::NodeKind::SVGTextPathBox:
-    case Layout::RustFFI::NodeKind::SVGImageBox:
-    case Layout::RustFFI::NodeKind::SVGMaskBox:
-    case Layout::RustFFI::NodeKind::SVGClipBox:
-    case Layout::RustFFI::NodeKind::SVGPatternBox:
-        return true;
-    default:
-        return false;
-    }
-}
-
 bool is_svg_svg_paintable(Layout::Node const& node)
 {
     return has_committed_box(node) && node.kind() == Layout::RustFFI::NodeKind::SVGSVGBox;
-}
-
-bool is_svg_path_paintable(Layout::Node const& node)
-{
-    if (!has_committed_box(node))
-        return false;
-    switch (node.kind()) {
-    case Layout::RustFFI::NodeKind::SVGGeometryBox:
-    case Layout::RustFFI::NodeKind::SVGTextBox:
-    case Layout::RustFFI::NodeKind::SVGTextPathBox:
-        return true;
-    default:
-        return false;
-    }
 }
 
 bool has_accumulated_visual_context(Layout::Node const& node)
@@ -694,13 +635,6 @@ Optional<CSS::BorderData> outline_data(Layout::Node const& node, CSS::ComputedVa
     return border_data_for_outline(node, computed_values.outline_color(), computed_values.outline_style(), computed_values.outline_width());
 }
 
-CSSPixels outline_offset(Layout::Node const& node)
-{
-    if (!has_committed_box(node))
-        return {};
-    return as<Layout::NodeWithStyle>(node).outline_offset();
-}
-
 CSSPixelRect transform_reference_box(Layout::Node const& node)
 {
     return Layout::RustFFI::layout_arena_paintable_transform_reference_box(node.arena_handle(), committed_row_slot(node));
@@ -913,16 +847,6 @@ void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidat
         if (table_wrapper_carrying_the_moved_table_properties)
             document.schedule_accumulated_visual_context_update(*table_wrapper_carrying_the_moved_table_properties, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
     }
-}
-
-void clear_overflow_data(Layout::Node const& node)
-{
-    Layout::RustFFI::layout_arena_paintable_clear_overflow_data(node.arena_handle(), committed_row_slot(node));
-}
-
-void clear_cached_overflow_data(Layout::Node const& node)
-{
-    Layout::RustFFI::layout_arena_paintable_clear_cached_overflow_data(node.arena_handle(), committed_row_slot(node));
 }
 
 Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform()
