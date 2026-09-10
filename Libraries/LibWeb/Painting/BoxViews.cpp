@@ -23,6 +23,7 @@
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -53,27 +54,11 @@ static bool body_background_is_propagated_to_root(Layout::NodeWithStyle const& l
     return html_element && html_element->unsafe_layout_node() && html_element->should_use_body_background_properties();
 }
 
-ResolvedSvgFilter resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const& layout_node)
+GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const& layout_node)
 {
-    ResolvedSvgFilter result;
     auto fragment = CSS::ComputedFilterView::url_fragment(url_value);
     auto referenced_element = fragment.is_empty() ? nullptr : layout_node.document().get_element_by_id(fragment);
-    result.filter_element = referenced_element ? as_if<SVG::SVGFilterElement>(*referenced_element) : nullptr;
-    if (!result.filter_element) {
-        result.failed = true;
-        return result;
-    }
-    // The bounds live in the filtered element's user space; an element without
-    // geometry of its own falls back to the whole enclosing viewport rect there.
-    auto bounds = absolute_border_box_rect(layout_node);
-    if (bounds.is_empty()) {
-        auto viewport_rect = Layout::RustFFI::layout_arena_paintable_svg_viewport_user_rect(layout_node.arena_handle(), committed_row_slot(layout_node));
-        if (viewport_rect.has_value())
-            result.bounds = viewport_rect.value();
-    }
-    if (!bounds.is_empty())
-        result.bounds = bounds;
-    return result;
+    return referenced_element ? as_if<SVG::SVGFilterElement>(*referenced_element) : nullptr;
 }
 
 Layout::RustFFI::NodeSlotId committed_row_slot(Layout::Node const& node)
@@ -415,13 +400,6 @@ CSSPixelPoint box_type_agnostic_position(Layout::Node const& node)
             return { result.x, result.y };
     }
     return absolute_position(node);
-}
-
-SelectionStyle selection_style(Layout::Node const& node)
-{
-    if (!has_committed_box(node))
-        return {};
-    return selection_style_for_node(node, node.dom_node());
 }
 
 static bool has_content(Layout::Node const& node)
@@ -800,93 +778,77 @@ Optional<String> flex_layout_json(Layout::Node const& node, UniqueNodeID contain
     return result;
 }
 
-SelectionStyle selection_style_for_node(Layout::Node const& layout_node, GC::Ptr<DOM::Node const> node)
+struct SelectionPseudoStyleFacts {
+    bool has_styling { false };
+    Layout::RustFFI::FfiSelectionStyleFacts facts {};
+    Vector<Layout::RustFFI::FfiSelectionShadowLayer> shadows;
+};
+
+static SelectionPseudoStyleFacts selection_pseudo_style_facts_of_element(DOM::Element const& element)
 {
-    // Selections render in a muted color while the window does not have focus.
-    auto navigable = layout_node.document().navigable();
-    auto window_is_active = navigable && navigable->is_focused();
-    auto const* layout_node_with_style = as_if<Layout::NodeWithStyle>(layout_node);
-    auto const& style_source = layout_node_with_style ? *layout_node_with_style : *layout_node.parent();
+    auto computed_selection_style = element.computed_style(CSS::PseudoElement::Selection);
+    if (!computed_selection_style)
+        return {};
 
-    auto default_style_for_color_scheme = [&](CSS::PreferredColorScheme color_scheme, bool use_palette_for_normal_color_scheme = true) {
-        auto palette = layout_node.document().page().palette();
-        auto palette_color_scheme = palette.is_dark() ? CSS::PreferredColorScheme::Dark : CSS::PreferredColorScheme::Light;
-        if (color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme) {
-            auto background = window_is_active ? palette.selection() : palette.inactive_selection();
-            return SelectionStyle { CSS::SystemColor::transform_selection_background_color(background) };
-        }
+    SelectionPseudoStyleFacts result;
+    auto& facts = result.facts;
+    facts.background_color = computed_selection_style->background_color();
 
-        auto background = window_is_active ? CSS::SystemColor::highlight(color_scheme) : CSS::SystemColor::inactive_highlight(color_scheme);
-        return SelectionStyle { CSS::SystemColor::transform_selection_background_color(background) };
-    };
+    // Only use text color if it was explicitly set in the ::selection rule, not inherited.
+    if (!computed_selection_style->is_property_inherited(CSS::PropertyID::Color))
+        facts.text_color = computed_selection_style->color();
 
-    // For text nodes, check the parent element since text nodes don't have computed properties.
-    if (!node)
-        return default_style_for_color_scheme(style_source.color_scheme());
-
-    DOM::Element const* element = as_if<DOM::Element>(*node);
-    if (!element)
-        element = node->parent_element().ptr();
-    if (!element)
-        return default_style_for_color_scheme(style_source.color_scheme());
-
-    auto color_scheme_is_normal = style_source.color_schemes().is_empty();
-    auto use_palette_for_normal_color_scheme = color_scheme_is_normal && !layout_node.document().supported_color_schemes().has_value();
-    auto default_style = default_style_for_color_scheme(style_source.color_scheme(), use_palette_for_normal_color_scheme);
-
-    auto style_from_element = [&](DOM::Element const& element) -> Optional<SelectionStyle> {
-        auto computed_selection_style = element.computed_style(CSS::PseudoElement::Selection);
-        if (!computed_selection_style)
-            return {};
-
-        SelectionStyle style;
-        style.background_color = computed_selection_style->background_color();
-
-        // Only use text color if it was explicitly set in the ::selection rule, not inherited.
-        if (!computed_selection_style->is_property_inherited(CSS::PropertyID::Color))
-            style.text_color = computed_selection_style->color();
-
-        // Only use text-shadow if it was explicitly set in the ::selection rule, not inherited.
-        if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextShadow)) {
-            auto const& css_shadows = computed_selection_style->text_shadow();
-            Vector<ShadowData> shadows;
-            shadows.ensure_capacity(css_shadows.size());
-            for (auto const& shadow : css_shadows)
-                shadows.unchecked_append(ShadowData::from_css(shadow));
-            style.text_shadow = move(shadows);
-        }
-
-        // Only use text-decoration if it was explicitly set in the ::selection rule, not inherited.
-        if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextDecorationLine)) {
-            style.text_decoration = TextDecorationStyle {
-                .line = Vector<CSS::TextDecorationLine> { computed_selection_style->text_decoration_line() },
-                .style = computed_selection_style->text_decoration_style(),
-                .color = computed_selection_style->text_decoration_color(),
-            };
-        }
-
-        // Only return a style if there's a meaningful customization. This allows us to continue checking shadow hosts
-        // when the current element only has UA default styles.
-        if (!style.has_styling())
-            return {};
-
-        return style;
-    };
-
-    // Check the element itself.
-    if (auto style = style_from_element(*element); style.has_value())
-        return style.release_value();
-
-    // If inside a shadow tree, check the shadow host. This enables ::selection styling on elements like <input> to
-    // apply to text rendered inside their shadow DOM.
-    if (auto shadow_root = element->containing_shadow_root(); shadow_root && shadow_root->is_user_agent_internal()) {
-        if (auto const* host = shadow_root->host()) {
-            if (auto style = style_from_element(*host); style.has_value())
-                return style.release_value();
-        }
+    // Only use text-shadow if it was explicitly set in the ::selection rule, not inherited.
+    if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextShadow)) {
+        facts.has_text_shadow = true;
+        for (auto const& shadow : computed_selection_style->text_shadow())
+            result.shadows.append({ .color = shadow.color, .offset_x = shadow.offset_x, .offset_y = shadow.offset_y, .blur_radius = shadow.blur_radius });
     }
 
-    return default_style;
+    // Only use text-decoration if it was explicitly set in the ::selection rule, not inherited.
+    if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextDecorationLine)) {
+        facts.has_text_decoration = true;
+        auto lines = computed_selection_style->text_decoration_line();
+        facts.text_decoration_line_count = min(lines.size(), array_size(facts.text_decoration_lines));
+        for (size_t i = 0; i < facts.text_decoration_line_count; ++i)
+            facts.text_decoration_lines[i] = to_underlying(lines[i]);
+        facts.text_decoration_style = to_underlying(computed_selection_style->text_decoration_style());
+        facts.text_decoration_color = computed_selection_style->text_decoration_color();
+    }
+
+    result.has_styling = facts.background_color.alpha() > 0 || facts.text_color.has_value() || facts.has_text_shadow || facts.has_text_decoration;
+    return result;
+}
+
+static void push_selection_pseudo_style_onto(Layout::Node const& layout_node, SelectionPseudoStyleFacts const& style)
+{
+    Layout::RustFFI::layout_arena_set_node_selection_pseudo_style(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node), style.has_styling, style.facts, style.shadows.data(), style.shadows.size());
+}
+
+void push_selection_pseudo_style(DOM::Element const& element)
+{
+    auto style = selection_pseudo_style_facts_of_element(element);
+    if (auto const* layout_node = element.unsafe_layout_node()) {
+        push_selection_pseudo_style_onto(*layout_node, style);
+        return;
+    }
+    for (auto const* child = element.first_child(); child; child = child->next_sibling()) {
+        if (!is<DOM::Text>(*child))
+            continue;
+        if (auto const* text_layout_node = child->unsafe_layout_node())
+            push_selection_pseudo_style_onto(*text_layout_node, style);
+    }
+}
+
+void push_selection_pseudo_style_of_parent(Layout::TextNode& text_layout_node)
+{
+    auto const* text = text_layout_node.dom_text();
+    auto const* parent_element = text ? text->parent_element().ptr() : nullptr;
+    if (!parent_element || parent_element->unsafe_layout_node())
+        return;
+    if (!parent_element->computed_style(CSS::PseudoElement::Selection))
+        return;
+    push_selection_pseudo_style_onto(text_layout_node, selection_pseudo_style_facts_of_element(*parent_element));
 }
 
 class BoxViewRepaintAccess {

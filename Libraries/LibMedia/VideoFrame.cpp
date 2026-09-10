@@ -5,6 +5,7 @@
  */
 
 #include <LibMedia/VideoFramePool.h>
+#include <LibMedia/VideoSurface.h>
 
 #include "VideoFrame.h"
 
@@ -15,15 +16,36 @@ VideoFrame::VideoFrame(
     AK::Duration duration,
     Gfx::Size<u32> size,
     u8 bit_depth,
-    Gfx::YUVData yuv_data,
+    Subsampling subsampling,
+    CodingIndependentCodePoints cicp,
     BackingStorage backing_storage)
     : m_timestamp(timestamp)
     , m_duration(duration)
     , m_size(size)
     , m_bit_depth(bit_depth)
-    , m_yuv_data(yuv_data)
+    , m_subsampling(subsampling)
+    , m_cicp(cicp)
     , m_backing_storage(move(backing_storage))
 {
+}
+
+RefPtr<VideoSurface> VideoFrame::surface() const
+{
+    return m_backing_storage.visit(
+        [](NonnullRefPtr<PooledVideoFrameSlot> const& slot) -> RefPtr<VideoSurface> { return slot->ledger().slot_surface(slot->slot_index()); },
+        [](NonnullRefPtr<ResolvedVideoFrameSlot> const& slot) -> RefPtr<VideoSurface> { return slot->surface(); });
+}
+
+Optional<Gfx::YUVData> VideoFrame::yuv_data() const
+{
+    auto slot_buffer = m_backing_storage.visit(
+        [](NonnullRefPtr<PooledVideoFrameSlot> const& slot) { return slot->ledger().slot_buffer(slot->slot_index()); },
+        [](NonnullRefPtr<ResolvedVideoFrameSlot> const& slot) { return slot->slot_buffer(); });
+
+    auto yuv_data = yuv_data_in_slot_buffer(slot_buffer, m_size.to_type<int>(), m_bit_depth, m_subsampling, m_cicp);
+    if (yuv_data.is_error())
+        return {};
+    return yuv_data.release_value();
 }
 
 VideoFrame::~VideoFrame() = default;

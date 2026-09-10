@@ -91,6 +91,7 @@ enum class RootNodeComposed {
     X(LayoutTreeUpdate)                               \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
+    X(SVGResourceElementAttributeChange)              \
     X(SVGViewBoxChange)                               \
     X(StyleChange)                                    \
     X(TableSpanAttributeChange)
@@ -417,6 +418,7 @@ public:
 
     void clear_layout_node(Badge<Document>);
     void set_layout_node(Badge<Layout::Node>, Layout::Node&);
+    void rebind_layout_node(Badge<Layout::Node>, Layout::Node&);
     void detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>);
 
     virtual bool is_child_allowed(Node const&) const { return true; }

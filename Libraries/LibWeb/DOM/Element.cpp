@@ -1962,6 +1962,8 @@ bool Element::apply_box_presence_change_in_place(SetNeedsLayoutTreeUpdateReason 
 void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
     auto* layout_node = unsafe_layout_node();
+    if (auto* svg_element = as_if<SVG::SVGElement>(*this))
+        svg_element->note_svg_paint_resource_description_may_have_changed();
     if (invalidation.needs_layout_tree_rebuild())
         return;
 
@@ -1985,6 +1987,7 @@ void Element::apply_computed_pseudo_element_styles_to_layout_nodes_if_needed(CSS
         return;
 
     if (invalidation.repaint_selection) {
+        Painting::push_selection_pseudo_style(*this);
         // NB: A display:contents element has no box of its own. Invalidate the nearest
         //     painted ancestor's subtree so cached text commands take the new highlight.
         for (Node const* node = this; node; node = node->parent_or_shadow_host()) {

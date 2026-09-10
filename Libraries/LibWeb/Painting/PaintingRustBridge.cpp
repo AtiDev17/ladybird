@@ -14,9 +14,8 @@
 #include <LibGfx/Matrix4x4.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
+#include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/Document.h>
@@ -52,14 +51,13 @@
 #include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/ImagePaint.h>
-#include <LibWeb/Painting/PaintStyle.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/PaintingRustFFI.h>
 #include <LibWeb/Painting/ResizeHandle.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Painting/Scrolling.h>
-#include <LibWeb/Painting/ShadowData.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
@@ -323,79 +321,17 @@ static bool rust_painting_timing_enabled()
     return enabled;
 }
 
-static DisplayListResourceStorage* visual_context_filter_image_storage(DOM::Document const& document)
-{
-    auto navigable = document.navigable();
-    if (!navigable)
-        return nullptr;
-    return &navigable->display_list_resource_storage();
-}
-
-// Resolves one url() reference of a filter list and hands the referenced <filter>'s primitives to
-// the Rust graph builder the callback was handed as its sink. Frames an feImage draws are
-// registered with the display list resource storage under the id the primitives name them by.
-static Layout::RustFFI::FfiResolvedSvgFilter push_svg_filter_reference(void const* url_value, Layout::NodeWithStyle const& layout_node, DisplayListResourceStorage* image_storage, void* sink)
-{
-    auto resolved_reference = resolve_svg_filter_reference({ .pointer = url_value }, layout_node);
-    Layout::RustFFI::FfiResolvedSvgFilter result {};
-    result.failed = resolved_reference.failed;
-    if (resolved_reference.failed)
-        return result;
-    result.svg_filter_bounds = resolved_reference.bounds;
-    Vector<Gfx::DecodedImageFrame> image_frames;
-    resolved_reference.filter_element->push_primitives(sink, layout_node, image_frames);
-    // A document without a navigable has nowhere to register the frames an feImage draws, so its
-    // filter list is dropped rather than handed over unresolvable; such documents are not painted.
-    if (!image_storage && !image_frames.is_empty()) {
-        result.failed = true;
-        return result;
-    }
-    for (auto const& image_frame : image_frames)
-        image_storage->add_image_frame(image_frame);
-    return result;
-}
-
-struct LayerImage {
-    CSS::AbstractImageStyleValue const* value { nullptr };
-    GC::Ptr<HTML::DecodedImageData> decoded_image_data;
-};
-
-static GC::Ptr<HTML::DecodedImageData> decoded_image_data_of(Layout::NodeWithStyle::ImageObserver const* observer)
-{
-    if (!observer)
-        return nullptr;
-    return observer->decoded_image_data();
-}
-
-static LayerImage layer_image_for(Layout::NodeWithStyle const& layout_node, Layout::RustFFI::FfiLayerImageList list, u32 computed_index)
+static Layout::NodeWithStyle::ImageObserver const* layer_image_observer(Layout::NodeWithStyle const& layout_node, Layout::RustFFI::FfiLayerImageList list, u32 computed_index)
 {
     switch (list) {
-    case Layout::RustFFI::FfiLayerImageList::Background: {
-        auto const& layers = layout_node.background_layers();
-        if (computed_index >= layers.size())
-            return {};
-        return { layers[computed_index].background_image.ptr(), decoded_image_data_of(layout_node.background_image_observer(computed_index)) };
-    }
-    case Layout::RustFFI::FfiLayerImageList::Mask: {
-        auto const& layers = layout_node.mask_layers();
-        if (computed_index >= layers.size())
-            return {};
-        return { layers[computed_index].background_image.ptr(), decoded_image_data_of(layout_node.mask_image_observer(computed_index)) };
-    }
+    case Layout::RustFFI::FfiLayerImageList::Background:
+        return layout_node.background_image_observer(computed_index);
+    case Layout::RustFFI::FfiLayerImageList::Mask:
+        return layout_node.mask_image_observer(computed_index);
     case Layout::RustFFI::FfiLayerImageList::BorderImageSource:
-        return { layout_node.border_image().source.ptr(), decoded_image_data_of(layout_node.border_image_source_observer()) };
-    case Layout::RustFFI::FfiLayerImageList::DocumentBackground: {
-        auto* body_element = layout_node.document().body();
-        if (!body_element)
-            return {};
-        auto const* body_layout_node = body_element->unsafe_layout_node();
-        if (!body_layout_node)
-            return {};
-        return layer_image_for(*body_layout_node, Layout::RustFFI::FfiLayerImageList::Background, computed_index);
+        return layout_node.border_image_source_observer();
     }
-    default:
-        return {};
-    }
+    VERIFY_NOT_REACHED();
 }
 
 static Layout::RustFFI::FfiRootBackgroundSource rust_root_background_source(DOM::Document const& document)
@@ -429,32 +365,19 @@ Layout::RustFFI::FfiVisualContextHostCallbacks visual_context_host_callbacks(DOM
         .scroll_offset = [](void*, void* layout_node_shell) -> CSSPixelPoint {
             return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell));
         },
-        .svg_additional_element_transform = [](void*, void* layout_node_shell, Gfx::AffineTransform* out) -> bool {
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(layout_node.dom_node());
-            if (!graphics_element)
-                return false;
-            *out = graphics_element->additional_element_transform();
-            return true;
+        .scroll_node_identity = [](void*, void* layout_node_shell) -> i64 {
+            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
+            if (is_viewport_paintable(layout_node))
+                return layout_node.document().unique_id().value();
+            if (layout_node.generated_for_pseudo_element().has_value())
+                return layout_node.pseudo_element_generator()->unique_id().value();
+            if (auto dom_node = layout_node.dom_node(); dom_node && is<DOM::Element>(*dom_node))
+                return dom_node->unique_id().value();
+            return 0;
         },
         .root_background_source = [](void* context) -> Layout::RustFFI::FfiRootBackgroundSource {
             auto& document = *static_cast<DOM::Document*>(context);
             return rust_root_background_source(document);
-        },
-        .svg_mask_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiSvgMaskFacts {
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            Layout::RustFFI::FfiSvgMaskFacts facts {};
-            if (auto area = mask_area(layout_node); area.has_value()) {
-                facts.mask_area = *area;
-                facts.mask_kind = mask_type(layout_node).value_or(Gfx::MaskKind::Alpha);
-            }
-            facts.clip_area = clip_area(layout_node);
-            return facts;
-        },
-        .resolve_svg_filter = [](void* context, void* layout_node_shell, void const* url_value, void* sink) -> Layout::RustFFI::FfiResolvedSvgFilter {
-            auto& document = *static_cast<DOM::Document*>(context);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            return push_svg_filter_reference(url_value, layout_node, visual_context_filter_image_storage(document), sink);
         },
     };
 }
@@ -531,8 +454,7 @@ void const* retain_rust_main_visual_context_tree(DOM::Document const& document)
 
 CSSPixelRect rust_apply_css_transform_to_rect(Layout::Node const& box, CSSPixelRect const& rect)
 {
-    auto& document = const_cast<DOM::Document&>(box.document());
-    return Layout::RustFFI::layout_arena_apply_css_transform_to_rect(box.arena_handle(), committed_row_slot(box), visual_context_host_callbacks(document), rect);
+    return Layout::RustFFI::layout_arena_apply_css_transform_to_rect(box.arena_handle(), committed_row_slot(box), rect);
 }
 
 Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const& box)
@@ -563,7 +485,7 @@ void rust_measure_scrollable_overflow(Layout::Node const& box)
     auto& document = const_cast<DOM::Document&>(box.document());
     if (!document.has_committed_viewport_box())
         return;
-    Layout::RustFFI::layout_arena_measure_scrollable_overflow(box.arena_handle(), committed_row_slot(box), visual_context_host_callbacks(document), scrollable_overflow_host_callbacks());
+    Layout::RustFFI::layout_arena_measure_scrollable_overflow(box.arena_handle(), committed_row_slot(box), scrollable_overflow_host_callbacks());
 }
 
 Layout::RustFFI::FfiScrollableOverflowUpdateOutcome rust_update_scrollable_overflow(DOM::Document& document, bool handled_by_full_layout_commit)
@@ -580,7 +502,7 @@ Layout::RustFFI::FfiScrollableOverflowUpdateOutcome rust_update_scrollable_overf
 
     return Layout::RustFFI::layout_arena_update_scrollable_overflow(
         layout_arena_handle(document), viewport_row_slot(document), handled_by_full_layout_commit,
-        visual_context_host_callbacks(document), scrollable_overflow_host_callbacks(),
+        scrollable_overflow_host_callbacks(),
         nullptr, clamp_scroll_offset_if_nonzero);
 }
 
@@ -771,80 +693,10 @@ void dump_layout_tree(StringBuilder& builder, Layout::Node const& root, bool int
 
 namespace {
 
-Layout::RustFFI::FfiHitTestHostCallbacks hit_test_host_callbacks()
-{
-    return {
-        .context = nullptr,
-        .paintable_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiHitTestPaintableFacts {
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiHitTestPaintableFacts facts {};
-            auto dom_node = layout_node.dom_node();
-            facts.is_inert = dom_node && dom_node->is_inert();
-            facts.dom_node_has_parent = dom_node && dom_node->parent();
-            facts.is_editable_or_editing_host = dom_node && dom_node->is_editable_or_editing_host();
-            if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(dom_node); graphics_element && graphics_element->unsafe_layout_node()) {
-                for (auto child = graphics_element->unsafe_layout_node()->first_child(); child; child = child->next_sibling()) {
-                    if (child->kind() == Layout::RustFFI::NodeKind::SVGMaskBox)
-                        facts.svg_mask_content_units_object_bbox = as<SVG::SVGMaskElement>(*child->dom_node()).mask_content_units() == SVG::MaskContentUnits::ObjectBoundingBox;
-                    else if (child->kind() == Layout::RustFFI::NodeKind::SVGClipBox)
-                        facts.svg_clip_path_units_object_bbox = as<SVG::SVGClipPathElement>(*child->dom_node()).clip_path_units() == SVG::ClipPathUnits::ObjectBoundingBox;
-                }
-            }
-            facts.inside_blocking_wheel_event_handler = dom_node && dom_node->inside_blocking_wheel_event_handler();
-            return facts;
-        },
-        .text_node_facts = [](void*, void* node_shell) -> Layout::RustFFI::FfiHitTestTextNodeFacts {
-            auto const& text_node = *static_cast<Layout::TextNode const*>(node_shell);
-            auto const* dom_text = text_node.dom_text();
-            return {
-                .is_inert = dom_text && dom_text->is_inert(),
-            };
-        },
-        .line_break_caret_targets = [](void*, void* layout_node_shell, void* sink) {
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            auto* dom_node = layout_node.dom_node();
-            if (!dom_node)
-                return;
-            for (auto* child = dom_node->first_child(); child; child = child->next_sibling()) {
-                auto* br = as_if<HTML::HTMLBRElement>(*child);
-                if (!br || !br->represents_empty_line())
-                    continue;
-                Layout::RustFFI::FfiLineBreakCaretTarget target {};
-                target.caret_offset = br->index();
-                target.rect = caret_rect_for_child_offset(layout_node, br->index());
-                Layout::RustFFI::layout_arena_hit_test_push_line_break_caret_target(sink, target);
-            } },
-    };
-}
-
-}
-
-namespace {
-
-struct PaintHostContext {
+struct RecordingPublishContext {
     DisplayListResourceStorage& resource_storage;
     GC::Ref<DOM::Document const> document;
-    u64 paint_generation_id { 0 };
-    double device_pixels_per_css_pixel { 1 };
 };
-
-static void write_image_paint_facts(ImagePaint const& paint, PaintHostContext& context, Layout::RustFFI::FfiImagePaintFacts& facts)
-{
-    paint.value.visit(
-        [&](ImagePaint::DecodedFrame const& decoded_frame) {
-            facts.image_paint_kind = Layout::RustFFI::FfiImagePaintKind::DecodedFrame;
-            facts.frame_id = context.resource_storage.add_image_frame(decoded_frame.frame).value();
-            facts.natural_width = decoded_frame.natural_size.width();
-            facts.natural_height = decoded_frame.natural_size.height();
-        },
-        [&](ImagePaint::NestedDisplayList const& nested) {
-            facts.image_paint_kind = Layout::RustFFI::FfiImagePaintKind::NestedDisplayList;
-            facts.nested_display_list_id = context.resource_storage.add_display_list(nested.resource.display_list, nested.resource.visual_context_tree).value();
-            facts.list_width = nested.list_size.width();
-            facts.list_height = nested.list_size.height();
-        },
-        [](ImagePaint::Gradient const&) { VERIFY_NOT_REACHED(); });
-}
 
 static NonnullRefPtr<DisplayList> display_list_from_rust_recording(AccumulatedVisualContextTree const& visual_context_tree, Layout::RustFFI::FfiRecordedDisplayList const& recorded)
 {
@@ -854,363 +706,60 @@ static NonnullRefPtr<DisplayList> display_list_from_rust_recording(AccumulatedVi
     return DisplayList::create_from_command_bytes(visual_context_tree, move(command_bytes), move(command_runs));
 }
 
-static Optional<u64> composited_context_id_for_navigable_container(HTML::NavigableContainer const& navigable_container)
-{
-    auto content_navigable = navigable_container.content_navigable();
-    if (!content_navigable)
-        return {};
-    auto const& local_navigable = as<HTML::LocalNavigable>(*content_navigable);
-    if (local_navigable.has_been_destroyed())
-        return {};
-    auto context_id = navigable_container.document().page().client().compositor_context_id_for_remote_child_frame(content_navigable->id());
-    if (!context_id.has_value() && local_navigable.has_compositor_context()) {
-        auto const* hosted_document = navigable_container.content_document_without_origin_check();
-        if (!hosted_document || !hosted_document->is_render_blocked())
-            context_id = local_navigable.compositor_context().id();
-    }
-    if (!context_id.has_value())
-        return {};
-    return context_id->value();
-}
-
-static void invalidate_navigable_containers_whose_composited_context_changed(DOM::Document& document)
-{
-    if (!document.paint_state().has_painted_navigable_container_foreground())
-        return;
-    for (auto* container : HTML::NavigableContainer::all_instances()) {
-        if (&container->document() != &document || !container->has_painted_foreground())
-            continue;
-        auto const* layout_node = container->layout_node();
-        if (!layout_node || !has_committed_box(*layout_node))
-            continue;
-        if (container->compositor_context_id_at_last_paint() != composited_context_id_for_navigable_container(*container))
-            invalidate_paint_cache(*layout_node);
-    }
-}
-
-Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& context)
+static Layout::RustFFI::FfiRecordingPublishCallbacks recording_publish_callbacks(RecordingPublishContext& context)
 {
     return {
         .context = &context,
-        .debug_description = [](void*, void* shell, void* sink) {
-            auto description = static_cast<Layout::Node const*>(shell)->debug_description();
-            auto bytes = description.bytes();
-            Layout::RustFFI::layout_arena_paint_push_bytes(sink, bytes.data(), bytes.size()); },
-        .recording_trace = [](void* context_pointer, u8 const* bytes, size_t count) {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            const_cast<DOM::Document&>(*context.document).paint_state().append_recording_trace(MUST(String::from_utf8(ReadonlyBytes { bytes, count }))); },
-        .async_scroll_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiAsyncScrollFacts {
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiAsyncScrollFacts facts {};
-            auto dom_node = layout_node.dom_node();
-            facts.is_nested_navigable_container = dom_node && dom_node->is_navigable_container() && as<HTML::NavigableContainer const>(*dom_node).content_navigable();
-            if (is_viewport_paintable(layout_node)) {
-                facts.scroll_node_kind = Layout::RustFFI::FfiScrollNodeKind::Viewport;
-                facts.scrollable_node_id = layout_node.document().unique_id().value();
-            } else if (layout_node.generated_for_pseudo_element().has_value()) {
-                facts.scroll_node_kind = Layout::RustFFI::FfiScrollNodeKind::PseudoElement;
-                facts.scrollable_node_id = layout_node.pseudo_element_generator()->unique_id().value();
-            } else if (dom_node && is<DOM::Element>(*dom_node)) {
-                facts.scroll_node_kind = Layout::RustFFI::FfiScrollNodeKind::Element;
-                facts.scrollable_node_id = dom_node->unique_id().value();
-            }
-            facts.pseudo_element_type = layout_node.generated_for_pseudo_element().has_value() ? static_cast<u8>(to_underlying(*layout_node.generated_for_pseudo_element())) : 0;
-            if (facts.scroll_node_kind != Layout::RustFFI::FfiScrollNodeKind::None) {
-                auto snap_axes = snap_axes_of_scroll_container(layout_node);
-                facts.snaps_scroll_position_horizontally = snap_axes.x;
-                facts.snaps_scroll_position_vertically = snap_axes.y;
-            }
-            return facts;
-        },
-        .image_intrinsic_facts = [](void*, void* layout_node_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index) -> Layout::RustFFI::FfiImageIntrinsicFacts {
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiImageIntrinsicFacts facts {};
-            auto [image, decoded_image_data] = layer_image_for(layout_node, list, computed_index);
-            if (!image)
-                return facts;
-            facts.is_paintable = image->is_paintable(decoded_image_data);
-            if (decoded_image_data) {
-                auto natural_size = image->natural_size(*decoded_image_data);
-                facts.natural_width = natural_size.width;
-                facts.natural_height = natural_size.height;
-                if (natural_size.aspect_ratio.has_value()) {
-                    facts.has_natural_aspect_ratio = true;
-                    facts.natural_aspect_ratio_numerator = natural_size.aspect_ratio->numerator();
-                    facts.natural_aspect_ratio_denominator = natural_size.aspect_ratio->denominator();
-                }
-            }
-            if (auto const* image_set = as_if<CSS::ImageSetStyleValue>(*image)) {
-                if (auto const* selected_image = image_set->selected_image()) {
-                    facts.has_selected_image_value = true;
-                    facts.selected_image_value = selected_image->rust_style_value_data();
-                }
-            }
-            return facts;
-        },
-        .selection_style_facts = [](void*, void* layout_node_shell, void* shadow_sink) -> Layout::RustFFI::FfiSelectionStyleFacts {
-            Layout::RustFFI::FfiSelectionStyleFacts facts {};
-            auto const* text_node = as_if<Layout::TextNode>(static_cast<Layout::Node const*>(layout_node_shell));
-            if (!text_node)
-                return facts;
-            auto style = selection_style_for_node(*text_node, text_node->dom_text());
-            facts.background_color = style.background_color;
-            facts.text_color = style.text_color;
-            if (style.text_shadow.has_value()) {
-                facts.has_text_shadow = true;
-                for (auto const& layer : *style.text_shadow)
-                    Layout::RustFFI::layout_arena_paint_push_selection_shadow(shadow_sink, layer.color, layer.offset_x, layer.offset_y, layer.blur_radius);
-            }
-            if (style.text_decoration.has_value()) {
-                facts.has_text_decoration = true;
-                facts.text_decoration_line_count = min(style.text_decoration->line.size(), array_size(facts.text_decoration_lines));
-                for (size_t i = 0; i < facts.text_decoration_line_count; ++i)
-                    facts.text_decoration_lines[i] = to_underlying(style.text_decoration->line[i]);
-                facts.text_decoration_style = to_underlying(style.text_decoration->style);
-                facts.text_decoration_color = style.text_decoration->color;
-            }
-            return facts;
-        },
-        .register_font = [](void* context_pointer, void const* font) -> u64 {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            return context.resource_storage.add_font(*static_cast<Gfx::Font const*>(font)).value();
-        },
-        .layer_image_prepare = [](void*, void* layout_node_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index) -> Layout::RustFFI::FfiLayerImagePrepareFacts {
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiLayerImagePrepareFacts facts {};
-            auto [image, decoded_image_data] = layer_image_for(layout_node, list, computed_index);
-            if (!image)
-                return facts;
-            facts.is_image_style_value = is<CSS::ImageStyleValue>(*image);
-            if (decoded_image_data)
-                facts.single_pixel_color = decoded_image_data->color_if_single_pixel_bitmap();
-            return facts;
-        },
-        .layer_image_nested_display_list = [](void* context_pointer, void* layout_node_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index, Gfx::IntRect dest) -> Layout::RustFFI::FfiLayerImageNestedDisplayListFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiLayerImageNestedDisplayListFacts facts {};
-            auto [image, decoded_image_data] = layer_image_for(layout_node, list, computed_index);
-            if (!image || !is<CSS::ImageStyleValue>(*image) || !decoded_image_data)
-                return facts;
-            if (auto display_list = decoded_image_data->record_display_list(dest.size(), image_color_scheme(layout_node), context.resource_storage); display_list.has_value()) {
-                facts.has_nested_display_list = true;
-                facts.nested_display_list_id = context.resource_storage.add_display_list(display_list->display_list, display_list->visual_context_tree).value();
-            }
-            return facts;
-        },
-        .layer_image_current_frame = [](void* context_pointer, void* layout_node_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index, Gfx::IntRect dest) -> Layout::RustFFI::FfiLayerImageFrameFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiLayerImageFrameFacts facts {};
-            auto [image, decoded_image_data] = layer_image_for(layout_node, list, computed_index);
-            if (!image || !is<CSS::ImageStyleValue>(*image) || !decoded_image_data)
-                return facts;
-            if (auto frame = decoded_image_data->current_frame(dest.size()); frame.has_value()) {
-                facts.has_frame = true;
-                facts.frame_id = context.resource_storage.add_image_frame(*frame).value();
-                facts.frame_width = frame->size().width();
-                facts.frame_height = frame->size().height();
-            }
-            return facts;
-        },
-        .layer_image_paint = [](void* context_pointer, void* layout_node_shell, Layout::RustFFI::FfiLayerImageList list, u32 computed_index, Gfx::FloatRect dest_rect, u8 image_rendering_raw, Gfx::FloatSize accumulated_scale) -> Layout::RustFFI::FfiImagePaintFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            Layout::RustFFI::FfiImagePaintFacts facts {};
-            auto [image, decoded_image_data] = layer_image_for(layout_node, list, computed_index);
-            if (!image)
-                return facts;
-            ImagePaintRequest request {
-                .document = layout_node.document(),
-                .dest_rect = decoded_image_data ? dest_rect.to_type<int>().to_type<float>() : dest_rect,
-                .image_rendering = static_cast<CSS::ImageRendering>(image_rendering_raw),
-                .color_scheme = image_color_scheme(layout_node),
-                .gradient_stop_color_resolution_context = gradient_stop_color_resolution_context(layout_node),
-                .accumulated_scale = accumulated_scale,
-                .resource_storage = context.resource_storage,
+        .add_font = [](void* context_pointer, void const* font) {
+            auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
+            context.resource_storage.add_font(*static_cast<Gfx::Font const*>(font)); },
+        .add_image_frame = [](void* context_pointer, void const* frame) {
+            auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
+            context.resource_storage.add_image_frame(*static_cast<Gfx::DecodedImageFrame const*>(frame)); },
+        .resolve_vector_image_display_list = [](void* context_pointer, Layout::RustFFI::FfiVectorImageRenderRequest const* request) -> u64 {
+            auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
+            auto const& document = *context.document;
+            auto empty_display_list = [&] {
+                return context.resource_storage.add_display_list(DisplayList::create(document.paint_state().visual_context_tree(document)), document.paint_state().visual_context_tree(document)).value();
             };
-            auto paint = decoded_image_data ? decoded_image_data->image_paint(request) : image->image_paint(request);
-            if (paint.has_value())
-                write_image_paint_facts(*paint, context, facts);
-            return facts;
-        },
-        .replaced_paint_facts = [](void* context_pointer, void* layout_node_shell) -> Layout::RustFFI::FfiReplacedPaintFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            auto const* row = committed_row(layout_node);
-            VERIFY(row);
-            auto kind = layout_node.kind();
-            Layout::RustFFI::FfiReplacedPaintFacts facts {};
-            if (kind == Layout::RustFFI::NodeKind::ImageBox) {
-                auto const& image_provider = static_cast<Layout::Box const&>(layout_node).image_provider();
-                facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
-                facts.natural_width = image_provider.intrinsic_width();
-                facts.natural_height = image_provider.intrinsic_height();
-                if (auto aspect_ratio = image_provider.intrinsic_aspect_ratio(); aspect_ratio.has_value()) {
-                    facts.has_natural_aspect_ratio = true;
-                    facts.natural_aspect_ratio_numerator = aspect_ratio->numerator();
-                    facts.natural_aspect_ratio_denominator = aspect_ratio->denominator();
-                }
-                if (selection_state(layout_node) != SelectionState::None)
-                    facts.selection_background_color = selection_style(layout_node).background_color;
-            } else if (kind == Layout::RustFFI::NodeKind::CanvasBox) {
-                auto& canvas_element = as<HTML::HTMLCanvasElement>(*layout_node.dom_node());
-                if (auto content_size = canvas_element.canvas_surface_content_size(); content_size.has_value()) {
-                    facts.has_canvas_content = true;
-                    facts.canvas_content_width = content_size->width();
-                    facts.canvas_content_height = content_size->height();
-                    facts.canvas_id = canvas_element.canvas_id().value().value();
-                    facts.canvas_content_generation = canvas_element.content_generation();
-                }
-            } else if (kind == Layout::RustFFI::NodeKind::VideoBox) {
-                auto const& video_element = as<HTML::HTMLVideoElement>(*layout_node.dom_node());
-                switch (video_element.current_representation()) {
-                case HTML::HTMLVideoElement::Representation::FirstVideoFrame:
-                case HTML::HTMLVideoElement::Representation::VideoFrame: {
-                    facts.video_representation = Layout::RustFFI::FfiVideoRepresentation::VideoFrame;
-                    auto sink_handle = video_element.video_sink_handle();
-                    if (sink_handle.has_value() && video_element.natural_media_size().has_value()) {
-                        facts.has_video_frame = true;
-                        auto src_size = video_element.natural_media_size()->to_type<int>();
-                        facts.video_src_width = src_size.width();
-                        facts.video_src_height = src_size.height();
-                        facts.video_sink_storage_id = context.resource_storage.add_video_sink(video_element.video_sink_resource_id().value(), *sink_handle).value();
-                    }
-                    break;
-                }
-                case HTML::HTMLVideoElement::Representation::PosterFrame: {
-                    facts.video_representation = Layout::RustFFI::FfiVideoRepresentation::PosterFrame;
-                    if (auto const& poster_frame = video_element.poster_frame()) {
-                        facts.has_poster_frame = true;
-                        auto frame = Gfx::DecodedImageFrame { *poster_frame };
-                        facts.poster_width = frame.size().width();
-                        facts.poster_height = frame.size().height();
-                        facts.poster_frame_id = context.resource_storage.add_image_frame(move(frame)).value();
-                    }
-                    break;
-                }
-                case HTML::HTMLVideoElement::Representation::TransparentBlack:
-                    facts.video_representation = Layout::RustFFI::FfiVideoRepresentation::TransparentBlack;
-                    break;
-                }
-            } else if (is_navigable_container_viewport_paintable(layout_node)) {
-                auto& navigable_container = const_cast<HTML::NavigableContainer&>(as<HTML::NavigableContainer>(*layout_node.dom_node()));
-                auto context_id = composited_context_id_for_navigable_container(navigable_container);
-                navigable_container.set_compositor_context_id_at_last_paint(context_id);
-                const_cast<DOM::Document&>(*context.document).paint_state().set_has_painted_navigable_container_foreground();
-                if (context_id.has_value()) {
-                    facts.has_composited_context = true;
-                    facts.composited_context_id = *context_id;
-                }
-            } else if (kind == Layout::RustFFI::NodeKind::CheckBox || kind == Layout::RustFFI::NodeKind::RadioButton) {
-                auto const& input = as<HTML::HTMLInputElement const>(*layout_node.dom_node());
-                facts.enabled = input.enabled();
-                facts.checked = input.checked();
-                facts.indeterminate = input.indeterminate();
-                facts.being_activated = input.is_being_activated();
-                auto color_scheme = layout_node.color_scheme();
-                facts.canvas_color = CSS::SystemColor::canvas(color_scheme);
-                facts.canvas_text_color = CSS::SystemColor::canvas_text(color_scheme);
-                facts.accent_color = layout_node.accent_color().value_or(CSS::SystemColor::accent_color(color_scheme));
-            }
-            return facts;
-        },
-        .replaced_image_paint = [](void* context_pointer, void* layout_node_shell, Gfx::FloatRect dest_rect, Gfx::FloatSize accumulated_scale) -> Layout::RustFFI::FfiImagePaintFacts {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::NodeWithStyle const*>(layout_node_shell);
-            auto const* row = committed_row(layout_node);
-            VERIFY(row);
-            Layout::RustFFI::FfiImagePaintFacts facts {};
+            auto const* layout_node = static_cast<Layout::NodeWithStyle const*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_arena_handle(document), request->owner));
+            if (!layout_node)
+                return empty_display_list();
             GC::Ptr<HTML::DecodedImageData> decoded_image_data;
-            if (layout_node.kind() == Layout::RustFFI::NodeKind::ImageBox)
-                decoded_image_data = static_cast<Layout::Box const&>(layout_node).image_provider().decoded_image_data();
-            else if (layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox) {
-                auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
-                decoded_image_data = image_provider.decoded_image_data();
+            if (request->is_replaced_content) {
+                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox)
+                    decoded_image_data = static_cast<Layout::Box const&>(*layout_node).image_provider().decoded_image_data();
+                else if (layout_node->kind() == Layout::RustFFI::NodeKind::SVGImageBox)
+                    decoded_image_data = as<SVG::SVGImageElement>(*layout_node->dom_node()).decoded_image_data();
+            } else if (auto const* observer = layer_image_observer(*layout_node, request->list, request->computed_index)) {
+                decoded_image_data = observer->decoded_image_data();
             }
-            if (!decoded_image_data)
-                return facts;
-            ImagePaintRequest request {
-                .document = layout_node.document(),
-                .dest_rect = dest_rect,
-                .image_rendering = layout_node.image_rendering(),
-                .color_scheme = image_color_scheme(layout_node),
-                .gradient_stop_color_resolution_context = {},
-                .accumulated_scale = accumulated_scale,
-                .resource_storage = context.resource_storage,
-            };
-            auto paint = decoded_image_data->image_paint(request);
-            if (paint.has_value())
-                write_image_paint_facts(*paint, context, facts);
-            return facts;
+            auto const* svg_image_data = as_if<SVG::SVGDecodedImageData>(decoded_image_data.ptr());
+            if (!svg_image_data)
+                return empty_display_list();
+            auto display_list = svg_image_data->record_display_list_at_scale({ request->css_width, request->css_height }, request->raster_scale, image_color_scheme(*layout_node), context.resource_storage);
+            if (!display_list.has_value())
+                return empty_display_list();
+            return context.resource_storage.add_display_list(move(*display_list)).value();
         },
-        .svg_image_facts = [](void*, void* layout_node_shell) -> Layout::RustFFI::FfiSvgImageFacts {
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            auto const* row = committed_row(layout_node);
-            VERIFY(row);
-            VERIFY(layout_node.kind() == Layout::RustFFI::NodeKind::SVGImageBox);
-            Layout::RustFFI::FfiSvgImageFacts facts {};
-            auto const& image_provider = as<SVG::SVGImageElement>(*layout_node.dom_node());
-            facts.has_decoded_image_data = image_provider.decoded_image_data() != nullptr;
-            if (auto natural_size = image_provider.intrinsic_size(); natural_size.has_value())
-                facts.natural_size = natural_size->to_type<float>();
-            return facts;
-        },
-        .svg_paint_style = [](void* context_pointer, void* layout_node_shell, bool is_stroke, Layout::RustFFI::FfiSvgPaintContext const* ffi_paint_context, void* sink) -> Layout::RustFFI::FfiSvgPaintStyle {
-            auto& context = *static_cast<PaintHostContext*>(context_pointer);
-            auto const& layout_node = *static_cast<Layout::Node const*>(layout_node_shell);
-            Layout::RustFFI::FfiSvgPaintStyle style {};
-            SVG::SVGPaintContext paint_context {
-                .viewport = ffi_paint_context->viewport,
-                .path_bounding_box = ffi_paint_context->path_bounding_box,
-                .paint_transform = ffi_paint_context->paint_transform,
-                .content_scale = ffi_paint_context->content_scale,
-            };
-            auto const& graphics_element = as<SVG::SVGGraphicsElement>(*layout_node.dom_node());
-            auto paint_server = is_stroke ? graphics_element.stroke_paint_server(paint_context, context.device_pixels_per_css_pixel) : graphics_element.fill_paint_server(paint_context, context.device_pixels_per_css_pixel);
-            if (!paint_server.has_value())
-                return style;
-            auto write_gradient = [&](GradientPaintStyle const& gradient) {
-                style.gradient_transform = gradient.gradient_transform();
-                style.spread_method = static_cast<Layout::RustFFI::FfiSvgGradientSpreadMethod>(to_underlying(gradient.spread_method()));
-                style.color_space = gradient.color_space();
-                auto colors = gradient.color_stop_colors();
-                auto positions = gradient.color_stop_positions();
-                for (size_t i = 0; i < colors.size(); ++i)
-                    Layout::RustFFI::layout_arena_paint_push_color_stop(sink, colors[i], positions[i]);
-            };
-            paint_server->visit(
-                [&](PaintStyle const& paint_style) {
-                    paint_style.visit(
-                        [&](LinearGradientPaintStyle const& linear) {
-                            style.kind = Layout::RustFFI::FfiSvgPaintStyleKind::LinearGradient;
-                            write_gradient(linear);
-                            style.start = linear.start_point();
-                            style.end = linear.end_point();
-                        },
-                        [&](RadialGradientPaintStyle const& radial) {
-                            style.kind = Layout::RustFFI::FfiSvgPaintStyleKind::RadialGradient;
-                            write_gradient(radial);
-                            style.start = radial.start_center();
-                            style.start_radius = radial.start_radius();
-                            style.end = radial.end_center();
-                            style.end_radius = radial.end_radius();
-                        },
-                        [&](PatternPaintStyle const&) {
-                            VERIFY_NOT_REACHED();
-                        });
-                },
-                [&](SVG::SVGGraphicsElement::PatternPaintServer const& pattern) {
-                    style.kind = Layout::RustFFI::FfiSvgPaintStyleKind::Pattern;
-                    style.pattern_paintable = committed_row_slot(*pattern.pattern_layout_node);
-                    style.tile_content_transform = pattern.tile_content_transform;
-                    style.tile_rect = pattern.tile_rect;
-                    style.content_scale = pattern.content_scale;
-                    style.pattern_transform = pattern.device_pattern_transform;
-                });
-            return style;
-        },
+        .add_video_sink = [](void* context_pointer, u64 resource_id, u64 sink_handle) {
+            auto& context = *static_cast<RecordingPublishContext*>(context_pointer);
+            context.resource_storage.add_video_sink(VideoSinkResourceId { resource_id }, Media::VideoSinkHandle { sink_handle }); },
     };
+}
+
+static void take_recording_trace_if_pending(DOM::Document& document)
+{
+    StringBuilder trace;
+    bool has_pending_trace = Layout::RustFFI::layout_arena_take_recording_trace(
+        layout_arena_handle(document), &trace,
+        [](void*, void* layout_node_shell, void* description_sink) {
+            auto description = static_cast<Layout::Node const*>(layout_node_shell)->debug_description();
+            auto bytes = description.bytes();
+            Layout::RustFFI::layout_arena_paint_push_bytes(description_sink, bytes.data(), bytes.size()); },
+        append_bytes_to_string_builder);
+    if (has_pending_trace)
+        document.paint_state().append_recording_trace(MUST(trace.to_string()));
 }
 
 // The platform default font at an overlay label's CSS size and at that size in device pixels, kept alive for the
@@ -1236,8 +785,6 @@ static OverlayLabelFonts overlay_label_fonts(float css_size, double device_pixel
 
 RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayList const& placeholder_display_list, DisplayListResourceStorage& resource_storage, PaintCommandCacheMode cache_mode, HTML::PaintConfig const& config, InspectorOverlayInputs const& overlay_inputs)
 {
-    static u64 s_next_paint_generation_id = 0;
-    auto paint_generation_id = s_next_paint_generation_id++;
     auto* arena = layout_arena_handle(document);
     auto device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel();
     auto device_viewport_rect = document.page().css_to_device_rect(document.viewport_rect());
@@ -1319,6 +866,12 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
         auto navigable = document.navigable();
         inputs.window_is_focused = navigable && navigable->is_focused();
         inputs.outline_auto_color = CSS::SystemColor::accent_color(CSS::PreferredColorScheme::Auto);
+        auto palette = document.page().palette();
+        inputs.palette_is_dark = palette.is_dark();
+        inputs.selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(inputs.window_is_focused ? palette.selection() : palette.inactive_selection());
+        inputs.selection_background_light = CSS::SystemColor::transform_selection_background_color(inputs.window_is_focused ? CSS::SystemColor::highlight(CSS::PreferredColorScheme::Light) : CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Light));
+        inputs.selection_background_dark = CSS::SystemColor::transform_selection_background_color(inputs.window_is_focused ? CSS::SystemColor::highlight(CSS::PreferredColorScheme::Dark) : CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Dark));
+        inputs.document_has_supported_color_schemes = document.supported_color_schemes().has_value();
     }
     inputs.caret = resolve_document_caret_paint(document);
     inputs.focused_text_control = resolve_focused_text_control_selection(document);
@@ -1340,12 +893,13 @@ RefPtr<DisplayList> record_rust_display_list(DOM::Document& document, DisplayLis
         inputs.bitmap_rect = bitmap_rect;
         inputs.background_color = document.background_color();
     }
-    invalidate_navigable_containers_whose_composited_context_changed(document);
-    PaintHostContext paint_host_context { resource_storage, document, paint_generation_id, device_pixels_per_css_pixel };
+    reconcile_navigable_container_paint_facts(document);
+    RecordingPublishContext publish_context { resource_storage, document };
     auto rust_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
-    auto generation = Layout::RustFFI::layout_arena_record_display_list(arena, viewport_row_slot(document), hit_test_host_callbacks(), paint_host_callbacks(paint_host_context), visual_context_host_callbacks(document), inputs);
-    if (generation == 0)
+    if (!Layout::RustFFI::layout_arena_record_display_list(arena, viewport_row_slot(document), inputs))
         return nullptr;
+    Layout::RustFFI::layout_arena_publish_recording(arena, recording_publish_callbacks(publish_context));
+    take_recording_trace_if_pending(document);
     if (Layout::RustFFI::layout_arena_last_recording_has_blocking_wheel_event_listeners(arena))
         wheel_event_region_state.has_blocking_wheel_event_listeners = true;
     auto stamp_async_scrolling_metadata_with_current_viewport_rect = [&](DisplayList& display_list) {

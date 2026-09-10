@@ -15,6 +15,7 @@
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <LibMedia/CodecParameters.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 #include <LibMedia/Track.h>
 
@@ -129,6 +130,8 @@ public:
     void set_codec_id(String const& codec_id) { m_codec_id = codec_id; }
     ReadonlyBytes codec_private_data() const LIFETIME_BOUND { return m_codec_private_data.span(); }
     void set_codec_private_data(FixedArray<u8>&& codec_private_data) { m_codec_private_data = move(codec_private_data); }
+    Optional<ParsedCodec> const& parsed_codec() const { return m_parsed_codec; }
+    void set_parsed_codec(ParsedCodec parsed_codec) { m_parsed_codec = parsed_codec; }
     double timestamp_scale() const { return m_timestamp_scale; }
     void set_timestamp_scale(double timestamp_scale) { m_timestamp_scale = timestamp_scale; }
     u64 codec_delay() const { return m_codec_delay; }
@@ -155,6 +158,7 @@ private:
     Optional<String> m_language_bcp_47;
     String m_codec_id;
     FixedArray<u8> m_codec_private_data;
+    Optional<ParsedCodec> m_parsed_codec;
     double m_timestamp_scale { 1 };
     u64 m_codec_delay { 0 };
     u64 m_seek_pre_roll { 0 };
@@ -184,6 +188,63 @@ inline TrackType track_type_from_matroska_track_type(TrackEntry::TrackType type)
         break;
     }
     VERIFY_NOT_REACHED();
+}
+
+inline CodecID codec_id_from_matroska_track_entry(TrackEntry const& track)
+{
+    auto codec_id = track.codec_id();
+    if (codec_id == "V_VP8")
+        return CodecID::VP8;
+    if (codec_id == "V_VP9")
+        return CodecID::VP9;
+    if (codec_id == "V_MPEG4/ISO/AVC")
+        return CodecID::H264;
+    if (codec_id == "V_MPEGH/ISO/HEVC")
+        return CodecID::H265;
+    if (codec_id == "A_MPEG/L3")
+        return CodecID::MP3;
+    if (codec_id == "A_AAC" || codec_id == "A_AAC/MPEG4/LC"
+        || codec_id == "A_AAC/MPEG4/LC/SBR" || codec_id == "A_AAC/MPEG4/LTP"
+        || codec_id == "A_AAC/MPEG4/MAIN" || codec_id == "A_AAC/MPEG4/SSR")
+        return CodecID::AAC;
+    if (codec_id == "V_AV1")
+        return CodecID::AV1;
+    if (codec_id == "V_THEORA")
+        return CodecID::Theora;
+    if (codec_id == "A_VORBIS")
+        return CodecID::Vorbis;
+    if (codec_id == "A_OPUS")
+        return CodecID::Opus;
+    if (codec_id == "A_FLAC")
+        return CodecID::FLAC;
+
+    auto audio_track = track.audio_track();
+    if (!audio_track.has_value())
+        return CodecID::Unknown;
+
+    auto bit_depth = audio_track->bit_depth;
+    if (codec_id == "A_PCM/FLOAT/IEEE")
+        return bit_depth == 32 ? CodecID::F32LE : CodecID::Unknown;
+
+    if (codec_id == "A_PCM/INT/BIG")
+        return bit_depth == 8 ? CodecID::U8 : CodecID::Unknown;
+
+    if (codec_id == "A_PCM/INT/LIT") {
+        switch (bit_depth) {
+        case 8:
+            return CodecID::U8;
+        case 16:
+            return CodecID::S16LE;
+        case 24:
+            return CodecID::S24LE;
+        case 32:
+            return CodecID::S32LE;
+        default:
+            return CodecID::Unknown;
+        }
+    }
+
+    return CodecID::Unknown;
 }
 
 inline Track track_from_track_entry(TrackEntry const& track_entry, bool is_first_of_type)
@@ -229,14 +290,20 @@ inline Track track_from_track_entry(TrackEntry const& track_entry, bool is_first
         return Utf16String::from_utf8(track_entry.language());
     }();
     Track track(track_type_from_matroska_track_type(track_entry.track_type()), track_entry.track_number(), kind, name, language);
+    track.set_parsed_codec(track_entry.parsed_codec().value_or(ParsedCodec { codec_id_from_matroska_track_entry(track_entry) }));
 
     if (track.type() == TrackType::Video) {
         auto video_track = track_entry.video_track();
         if (video_track.has_value()) {
+            auto cicp = CodingIndependentCodePoints {};
+            if (track_entry.parsed_codec().has_value())
+                cicp = track_entry.parsed_codec()->color_information().value_or({});
+            cicp.adopt_specified_values(video_track->color_format.to_cicp());
+
             track.set_video_data({
                 .pixel_width = video_track->pixel_width,
                 .pixel_height = video_track->pixel_height,
-                .cicp = video_track->color_format.to_cicp(),
+                .cicp = cicp,
             });
         }
     }

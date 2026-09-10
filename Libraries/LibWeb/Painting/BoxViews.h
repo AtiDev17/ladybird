@@ -22,14 +22,7 @@ WEB_API void set_paint_viewport_scrollbars(bool enabled);
 bool should_paint_viewport_scrollbars();
 
 // One url() reference of a filter list, resolved against the SVG <filter> element it names.
-struct ResolvedSvgFilter {
-    // The reference named nothing usable as an SVG filter, which drops the whole filter list.
-    bool failed { false };
-    GC::Ptr<SVG::SVGFilterElement> filter_element;
-    // The referenced filter's region, in the filtered element's user space.
-    Optional<CSSPixelRect> bounds;
-};
-ResolvedSvgFilter resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const&);
+WEB_API GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const&);
 
 Layout::RustFFI::NodeSlotId committed_row_slot(Layout::Node const&);
 Layout::RustFFI::NodeSlotId viewport_row_slot(DOM::Document const&);
@@ -55,9 +48,6 @@ WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
 WEB_API Optional<OverflowData> overflow_data(Layout::Node const&);
-WEB_API Optional<CSSPixelRect> mask_area(Layout::Node const&);
-WEB_API Optional<Gfx::MaskKind> mask_type(Layout::Node const&);
-WEB_API Optional<CSSPixelRect> clip_area(Layout::Node const&);
 
 WEB_API bool is_visible(Layout::Node const&);
 WEB_API bool visible_for_hit_testing(Layout::Node const&);
@@ -100,8 +90,8 @@ WEB_API CSSPixelRect caret_rect_for_child_offset(Layout::Node const&, size_t off
 WEB_API Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(DOM::Document&);
 WEB_API Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(DOM::Document const&);
 WEB_API Layout::RustFFI::FfiFocusedAreaOutline resolve_focused_area_outline(DOM::Document const&, Vector<u8>& path_bytes);
-WEB_API SelectionStyle selection_style(Layout::Node const&);
-WEB_API SelectionStyle selection_style_for_node(Layout::Node const&, GC::Ptr<DOM::Node const>);
+WEB_API void push_selection_pseudo_style(DOM::Element const&);
+WEB_API void push_selection_pseudo_style_of_parent(Layout::TextNode&);
 
 WEB_API void set_needs_repaint(Layout::Node const&, InvalidateDisplayList = InvalidateDisplayList::Yes);
 WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);

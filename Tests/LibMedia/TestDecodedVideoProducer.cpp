@@ -5,6 +5,7 @@
  */
 
 #include <LibMedia/Producers/DecodedVideoProducer.h>
+#include <LibMedia/VideoFramePool.h>
 #include <Tests/LibMedia/TestMediaCommon.h>
 
 namespace {
@@ -112,7 +113,7 @@ struct DemuxerAndTrack {
     Media::Track track;
 };
 
-static DemuxerAndTrack demuxer_and_video_track_for(StringView path)
+DemuxerAndTrack demuxer_and_video_track_for(StringView path)
 {
     auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
@@ -127,6 +128,104 @@ static DemuxerAndTrack demuxer_and_video_track_for(StringView path)
     return { move(demuxer), tracks[0] };
 }
 
+NonnullRefPtr<Media::DecodedVideoProducer> create_started_producer(Core::EventLoop& loop, StringView path)
+{
+    auto [demuxer, track] = demuxer_and_video_track_for(path);
+    auto producer = MUST(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->set_error_handler([](Media::DecoderError&& error) {
+        FAIL(ByteString::formatted("An error occurred while decoding: {}", error.description()));
+    });
+    producer->start();
+    return producer;
+}
+
+RefPtr<Media::VideoFrame> take_frame_within_time_limit(Media::VideoProducer& producer, Core::EventLoop& loop, AK::Duration time_limit)
+{
+    auto start_time = MonotonicTime::now_coarse();
+    while (MonotonicTime::now_coarse() - start_time < time_limit) {
+        auto output = producer.peek();
+        if (output.status == Media::PipelineStatus::HaveData) {
+            producer.consume();
+            return output.frame;
+        }
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+    return nullptr;
+}
+
+}
+
+TEST_CASE(decoding_resumes_when_a_held_frame_releases_its_storage)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto [demuxer, track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->set_error_handler([&](Media::DecoderError&& error) {
+        FAIL(ByteString::formatted("An error occurred while decoding: {}", error.description()));
+    });
+    producer->start();
+
+    auto time_limit = AK::Duration::from_seconds(3);
+
+    // Holding a frame from every slot the pool can allocate leaves the decoder with nowhere to put its next one.
+    Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
+    for (u32 index = 0; index < Media::VideoFramePool::MAX_SLOT_COUNT; index++) {
+        auto frame = take_frame_within_time_limit(*producer, loop, time_limit);
+        if (frame == nullptr) {
+            FAIL(ByteString::formatted("Timed out waiting for frame {}", index));
+            return;
+        }
+        held_frames.append(frame.release_nonnull());
+    }
+
+    // No further frame can exist while every slot is held, however long the decoder is given to produce one.
+    auto backpressure_deadline = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(100);
+    while (MonotonicTime::now_coarse() < backpressure_deadline) {
+        EXPECT_NE(producer->peek().status, Media::PipelineStatus::HaveData);
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+
+    (void)held_frames.take_first();
+
+    if (take_frame_within_time_limit(*producer, loop, time_limit) == nullptr)
+        FAIL("Timed out waiting for decoding to resume after a frame was released");
+}
+
+// Once the last frame has been consumed, nothing downstream is guaranteed to still hold it, so a seek past it must
+// re-emit that same frame rather than resolve with none, however many times it is asked.
+TEST_CASE(a_seek_past_the_consumed_last_frame_re_emits_it)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto producer = create_started_producer(loop, "./vp9_in_webm.webm"sv);
+    auto time_limit = AK::Duration::from_seconds(10);
+
+    auto start_time = MonotonicTime::now_coarse();
+    RefPtr<Media::VideoFrame> last_frame;
+    while (true) {
+        auto output = producer->peek();
+        if (output.status == Media::PipelineStatus::HaveData) {
+            last_frame = output.frame;
+            producer->consume();
+        } else if (output.status == Media::PipelineStatus::EndOfStream) {
+            break;
+        }
+        if (MonotonicTime::now_coarse() - start_time >= time_limit) {
+            FAIL("Timed out decoding to the end of the stream");
+            return;
+        }
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+    EXPECT(last_frame != nullptr);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        producer->seek(last_frame->timestamp() + AK::Duration::from_seconds(1 + attempt));
+        auto output = producer->peek();
+        EXPECT_EQ(output.status, Media::PipelineStatus::HaveData);
+        EXPECT(output.frame.ptr() == last_frame.ptr());
+        producer->consume();
+        EXPECT_EQ(producer->peek().status, Media::PipelineStatus::EndOfStream);
+    }
 }
 
 TEST_CASE(a_codec_change_drains_the_previous_decoder)
@@ -169,4 +268,23 @@ TEST_CASE(a_codec_change_drains_the_previous_decoder)
     EXPECT(switching_demuxer->first_frame_count() > 0);
     EXPECT(switching_demuxer->second_frame_count() > 0);
     EXPECT_EQ(decoded_frame_count, switching_demuxer->first_frame_count() + switching_demuxer->second_frame_count());
+}
+
+// A stream can move to a format the decoder in use has no support for, and only the first frame after a seek carries
+// a codec configuration, so replacing that decoder means asking the demuxer for one again.
+TEST_CASE(a_decoder_that_cannot_decode_a_later_format_is_replaced)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto producer = create_started_producer(loop, "./vp9_profile_change.webm"sv);
+
+    auto time_limit = AK::Duration::from_seconds(5);
+    size_t frame_count = 0;
+    while (frame_count < 10) {
+        auto frame = take_frame_within_time_limit(*producer, loop, time_limit);
+        if (frame == nullptr) {
+            FAIL(ByteString::formatted("Timed out waiting for frame {}", frame_count));
+            return;
+        }
+        frame_count++;
+    }
 }

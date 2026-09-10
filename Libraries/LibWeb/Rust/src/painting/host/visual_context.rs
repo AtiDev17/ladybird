@@ -6,26 +6,16 @@
 
 use super::*;
 
-use crate::css::computed_value_types::ComputedStyleValueHandle;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
 use crate::painting::display_list::commands::OptionalF32;
-use crate::painting::svg_filter::SvgFilterGraphBuilder;
 use libgfx_rust::filter::Filter;
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect,
-    InterpolationColorSpace, MaskKind, ScalingMode,
+    InterpolationColorSpace,
 };
 use std::ffi::c_void;
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiSvgMaskFacts {
-    pub mask_area: OptionalCssPixelRect,
-    pub mask_kind: MaskKind,
-    pub clip_area: OptionalCssPixelRect,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -95,7 +85,7 @@ pub enum FfiSvgFilterPrimitiveKind {
 /// The plain-value attribute facts of one primitive of an SVG `<filter>`. Lengths are in the
 /// filtered element's user units; enumerations carry the IDL constant of the attribute. A kind
 /// leaves the fields it has no use for zero.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct SvgFilterPrimitiveValues {
     pub kind: FfiSvgFilterPrimitiveKind,
@@ -137,12 +127,7 @@ pub struct SvgFilterPrimitiveValues {
     pub scale: f32,
     pub x_channel_selector: u16,
     pub y_channel_selector: u16,
-    /// feImage: the frame under the id it is registered with the display list resource storage by,
-    /// and where it draws, in device pixels.
-    pub image_frame_id: u64,
     pub image_src_rect: IntRect,
-    pub image_dest_rect: IntRect,
-    pub image_scaling_mode: ScalingMode,
 }
 
 /// One primitive of an SVG `<filter>` as the host flattens it: its values, and the names, lists
@@ -163,16 +148,7 @@ pub struct FfiSvgFilterPrimitive {
     /// feComponentTransfer: 256-entry lookup tables for A, R, G and B, null where the channel has no
     /// transfer function.
     pub component_transfer_tables: [*const u8; 4],
-}
-
-/// What the host made of one `url()` reference in a filter list.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiResolvedSvgFilter {
-    /// The reference named nothing usable as an SVG filter, which drops the whole filter list.
-    pub failed: bool,
-    /// The referenced filter's region, in the filtered element's user space.
-    pub svg_filter_bounds: OptionalCssPixelRect,
+    pub image_frame: *const c_void,
 }
 
 #[derive(Default)]
@@ -184,41 +160,14 @@ pub(crate) struct ResolvedSvgFilter {
     pub svg_filter_bounds: OptionalCssPixelRect,
 }
 
-impl ResolvedSvgFilter {
-    /// Asks the host to resolve one `url()` reference of a layout node's filter list. The host
-    /// pushes the referenced primitives into the graph builder it is handed as its sink.
-    ///
-    /// SAFETY: `resolve` must answer synchronously from a live layout node shell and only push
-    /// into the builder whose pointer it receives as the sink.
-    pub(crate) unsafe fn from_host(
-        resolve: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) -> FfiResolvedSvgFilter,
-        context: *mut c_void,
-        layout_node_shell: *mut c_void,
-        url_value: &ComputedStyleValueHandle,
-        device_pixels_per_css_pixel: f64,
-    ) -> Self {
-        let mut builder = SvgFilterGraphBuilder::new(device_pixels_per_css_pixel);
-        let resolved = unsafe { resolve(context, layout_node_shell, url_value.pointer, (&raw mut builder).cast()) };
-        Self {
-            failed: resolved.failed,
-            filter: if resolved.failed { None } else { builder.finish() },
-            svg_filter_bounds: resolved.svg_filter_bounds,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiVisualContextHostCallbacks {
     pub context: *mut c_void,
     pub tree_inputs: unsafe extern "C" fn(*mut c_void) -> FfiVisualContextTreeInputs,
     pub scroll_offset: unsafe extern "C" fn(*mut c_void, *mut c_void) -> used_values::FfiCssPixelPoint,
-    pub svg_additional_element_transform:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut libgfx_rust::AffineTransform) -> bool,
+    pub scroll_node_identity: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64,
     pub root_background_source: unsafe extern "C" fn(*mut c_void) -> FfiRootBackgroundSource,
-    pub svg_mask_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgMaskFacts,
-    pub resolve_svg_filter:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) -> FfiResolvedSvgFilter,
 }
 
 impl FfiVisualContextHostCallbacks {
@@ -226,45 +175,17 @@ impl FfiVisualContextHostCallbacks {
         // SAFETY: The C++ host answers synchronously.
         unsafe { (self.tree_inputs)(self.context) }
     }
+    pub(crate) fn scroll_node_identity(&self, layout_node_shell: *mut c_void) -> i64 {
+        // SAFETY: The C++ host answers synchronously from a live layout node shell.
+        unsafe { (self.scroll_node_identity)(self.context, layout_node_shell) }
+    }
     pub(crate) fn scroll_offset(&self, layout_node_shell: *mut c_void) -> used_values::FfiCssPixelPoint {
         // SAFETY: The C++ host answers synchronously from a live layout node shell.
         unsafe { (self.scroll_offset)(self.context, layout_node_shell) }
     }
-    pub(crate) fn svg_additional_element_transform(
-        &self,
-        layout_node_shell: *mut c_void,
-    ) -> Option<libgfx_rust::AffineTransform> {
-        let mut transform = libgfx_rust::AffineTransform::default();
-        // SAFETY: The C++ host writes the transform synchronously when it returns true.
-        let has_transform =
-            unsafe { (self.svg_additional_element_transform)(self.context, layout_node_shell, &raw mut transform) };
-        has_transform.then_some(transform)
-    }
     pub(crate) fn root_background_source(&self) -> FfiRootBackgroundSource {
         // SAFETY: The C++ host answers synchronously.
         unsafe { (self.root_background_source)(self.context) }
-    }
-    pub(crate) fn svg_mask_facts(&self, layout_node_shell: *mut c_void) -> FfiSvgMaskFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.svg_mask_facts)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn resolve_svg_filter(
-        &self,
-        layout_node_shell: *mut c_void,
-        url_value: &ComputedStyleValueHandle,
-        device_pixels_per_css_pixel: f64,
-    ) -> ResolvedSvgFilter {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell and only pushes
-        // into the builder whose pointer it receives.
-        unsafe {
-            ResolvedSvgFilter::from_host(
-                self.resolve_svg_filter,
-                self.context,
-                layout_node_shell,
-                url_value,
-                device_pixels_per_css_pixel,
-            )
-        }
     }
 }
 

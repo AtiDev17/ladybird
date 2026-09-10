@@ -106,21 +106,34 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
         preserve_aspect_ratio = { SVG::PreserveAspectRatio::Align::None, {} };
 
     Gfx::AffineTransform element_transform;
+    Gfx::AffineTransform additional_element_transform;
     float visible_stroke_width = 0;
     CSSPixels viewport_percentage_basis = 0;
     if (auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(*dom_node)) {
         element_transform = node.used_svg_element_transform();
+        additional_element_transform = graphics_element->additional_element_transform();
         visible_stroke_width = graphics_element->visible_stroke_width();
         viewport_percentage_basis = graphics_element->viewport_percentage_basis();
     }
 
     SVG::SVGUnits content_units {};
     SVG::SVGUnits pattern_units {};
+    SVG::SVGUnits mask_units {};
+    SVG::NumberPercentage mask_x = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage mask_y = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage mask_width = SVG::NumberPercentage::create_number(0);
+    SVG::NumberPercentage mask_height = SVG::NumberPercentage::create_number(0);
     SVG::NumberPercentage pattern_width = SVG::NumberPercentage::create_number(0);
     SVG::NumberPercentage pattern_height = SVG::NumberPercentage::create_number(0);
-    if (node.is_svg_mask_box())
-        content_units = as<SVG::SVGMaskElement>(*node.dom_node()).mask_content_units();
-    else if (node.is_svg_clip_box())
+    if (node.is_svg_mask_box()) {
+        auto const& mask_element = as<SVG::SVGMaskElement>(*node.dom_node());
+        content_units = mask_element.mask_content_units();
+        mask_units = mask_element.mask_units();
+        mask_x = mask_element.mask_x();
+        mask_y = mask_element.mask_y();
+        mask_width = mask_element.mask_width();
+        mask_height = mask_element.mask_height();
+    } else if (node.is_svg_clip_box())
         content_units = as<SVG::SVGClipPathElement>(*node.dom_node()).clip_path_units();
     else if (node.is_svg_pattern_box()) {
         auto const& pattern_element = as<SVG::SVGPatternElement>(*node.dom_node());
@@ -139,18 +152,18 @@ static RustFFI::FfiSvgElementFacts build_svg_element_facts(NodeWithStyle const& 
         .preserve_aspect_ratio_align = static_cast<u8>(to_underlying(preserve_aspect_ratio.align)),
         .preserve_aspect_ratio_meet_or_slice = static_cast<u8>(to_underlying(preserve_aspect_ratio.meet_or_slice)),
         .element_transform = to_ffi_affine_transform(element_transform),
+        .additional_element_transform = to_ffi_affine_transform(additional_element_transform),
         .visible_stroke_width = visible_stroke_width,
         .viewport_percentage_basis = viewport_percentage_basis,
         .content_units = static_cast<u8>(to_underlying(content_units)),
         .pattern_units = static_cast<u8>(to_underlying(pattern_units)),
-        .pattern_width = {
-            .value = pattern_width.value(),
-            .is_percentage = pattern_width.is_percentage(),
-        },
-        .pattern_height = {
-            .value = pattern_height.value(),
-            .is_percentage = pattern_height.is_percentage(),
-        },
+        .pattern_width = to_ffi_number_percentage(pattern_width),
+        .pattern_height = to_ffi_number_percentage(pattern_height),
+        .mask_units = static_cast<u8>(to_underlying(mask_units)),
+        .mask_x = to_ffi_number_percentage(mask_x),
+        .mask_y = to_ffi_number_percentage(mask_y),
+        .mask_width = to_ffi_number_percentage(mask_width),
+        .mask_height = to_ffi_number_percentage(mask_height),
     };
 }
 
@@ -679,4 +692,9 @@ extern "C" WEB_API Web::Layout::RustFFI::FfiCodePointCategoryFacts ladybird_layo
 extern "C" WEB_API void ladybird_layout_node_shell_destroy(void* shell)
 {
     Web::Layout::Node::delete_arena_owned_shell(*static_cast<Web::Layout::Node*>(shell));
+}
+
+extern "C" WEB_API void ladybird_layout_node_rebind_dom_node(void* dom_node, void* shell)
+{
+    Web::Layout::Node::rebind_dom_node_to_surviving_shell(*static_cast<Web::DOM::Node*>(dom_node), *static_cast<Web::Layout::Node*>(shell));
 }

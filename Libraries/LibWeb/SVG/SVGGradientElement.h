@@ -8,34 +8,13 @@
 
 #include <AK/IterationDecision.h>
 #include <LibGC/RootHashTable.h>
-#include <LibWeb/Painting/PaintStyle.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 #include <LibWeb/SVG/SVGURIReference.h>
 
 namespace Web::SVG {
-
-struct SVGPaintContext {
-    Gfx::FloatRect viewport;
-    Gfx::FloatRect path_bounding_box;
-    Gfx::AffineTransform paint_transform;
-    Gfx::FloatSize content_scale;
-};
-
-inline Painting::GradientPaintStyle::SpreadMethod to_painting_spread_method(SpreadMethod spread_method)
-{
-    switch (spread_method) {
-    case SpreadMethod::Pad:
-        return Painting::GradientPaintStyle::SpreadMethod::Pad;
-    case SpreadMethod::Reflect:
-        return Painting::GradientPaintStyle::SpreadMethod::Reflect;
-    case SpreadMethod::Repeat:
-        return Painting::GradientPaintStyle::SpreadMethod::Repeat;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
 
 class SVGGradientElement
     : public SVGElement
@@ -47,7 +26,7 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Optional<Painting::PaintStyle> to_gfx_paint_style(SVGPaintContext const&) const = 0;
+    virtual void push_paint_server_description(void* sink) const = 0;
 
     GradientUnits gradient_units() const;
 
@@ -59,11 +38,11 @@ public:
 
 protected:
     SVGGradientElement(DOM::Document&, DOM::QualifiedName);
+
+    Layout::RustFFI::FfiSvgGradientDescription base_paint_server_description(Layout::RustFFI::FfiSvgGradientKind) const;
     virtual void visit_edges(Cell::Visitor&) override;
 
     GC::Ptr<SVGGradientElement const> linked_gradient(GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const;
-
-    Gfx::AffineTransform gradient_paint_transform(SVGPaintContext const&) const;
 
     template<VoidFunction<SVGStopElement> Callback>
     void for_each_color_stop(Callback const& callback) const
@@ -72,7 +51,7 @@ protected:
         return for_each_color_stop_impl(callback, seen_gradients);
     }
 
-    void add_color_stops(Painting::GradientPaintStyle&) const;
+    void push_color_stops(void* sink) const;
 
 private:
     virtual bool is_svg_gradient_element() const final { return true; }

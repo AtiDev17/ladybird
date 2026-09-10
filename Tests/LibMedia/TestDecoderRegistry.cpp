@@ -5,10 +5,18 @@
  */
 
 #include <LibMedia/DecoderRegistry.h>
+#include <LibMedia/FFmpeg/FFmpegAudioDecoder.h>
+#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
 #include <LibTest/TestCase.h>
 
 TEST_CASE(ffmpeg_decoder_capabilities)
 {
+    auto ffmpeg_capabilities = [](Media::ParsedCodec const& codec) {
+        if (Media::track_type_from_codec_id(codec.codec_id()) == Media::TrackType::Audio)
+            return Media::FFmpeg::FFmpegAudioDecoder::capabilities(codec);
+        return Media::FFmpeg::FFmpegVideoDecoder::capabilities(codec);
+    };
+
     for (auto codec_id : {
              Media::CodecID::VP8,
              Media::CodecID::VP9,
@@ -29,20 +37,64 @@ TEST_CASE(ffmpeg_decoder_capabilities)
              Media::CodecID::ALaw,
              Media::CodecID::MuLaw,
          }) {
-        auto capabilities = Media::decoder_capabilities(Media::ParsedCodec { codec_id });
+        auto capabilities = ffmpeg_capabilities(Media::ParsedCodec { codec_id });
         EXPECT(capabilities.has_value());
         EXPECT(capabilities->smooth);
         EXPECT(!capabilities->power_efficient);
     }
+}
 
+TEST_CASE(an_unknown_codec_has_no_capabilities)
+{
     EXPECT(!Media::decoder_capabilities(Media::ParsedCodec { Media::CodecID::Unknown }).has_value());
 }
 
-TEST_CASE(ffmpeg_decoder_creation)
+TEST_CASE(decoder_creation)
 {
-    auto audio_decoder = Media::create_audio_decoder(Media::CodecID::S16LE, Audio::SampleSpecification { 8'000, Audio::ChannelMap::mono() }, {});
+    auto audio_selection = Media::select_audio_decoder(Media::ParsedCodec { Media::CodecID::S16LE });
+    EXPECT(audio_selection.has_value());
+    auto audio_decoder = Media::create_audio_decoder(audio_selection, Media::CodecID::S16LE, Audio::SampleSpecification { 8'000, Audio::ChannelMap::mono() }, {});
     EXPECT(!audio_decoder.is_error());
 
-    auto video_decoder = Media::create_video_decoder(Media::CodecID::H264, {});
+    auto video_selection = Media::select_video_decoder(Media::ParsedCodec { Media::CodecID::H264 });
+    EXPECT(video_selection.has_value());
+    auto video_decoder = Media::create_video_decoder(video_selection, Media::CodecID::H264, {});
     EXPECT(!video_decoder.is_error());
+}
+
+TEST_CASE(selecting_past_the_last_decoder_finds_nothing)
+{
+    auto codec = Media::ParsedCodec { Media::CodecID::H264 };
+
+    auto selection = Media::select_video_decoder(codec);
+    EXPECT(selection.has_value());
+
+    // Every decoder below the last one that claimed the stream has been exhausted.
+    auto last = selection;
+    while (last.has_value())
+        last = Media::select_video_decoder(codec, last);
+    EXPECT(!last.has_value());
+}
+
+TEST_CASE(an_audio_codec_selects_no_video_decoder)
+{
+    EXPECT(!Media::select_video_decoder(Media::ParsedCodec { Media::CodecID::Vorbis }).has_value());
+}
+
+TEST_CASE(selecting_past_the_last_audio_decoder_finds_nothing)
+{
+    auto codec = Media::ParsedCodec { Media::CodecID::Vorbis };
+
+    auto selection = Media::select_audio_decoder(codec);
+    EXPECT(selection.has_value());
+
+    auto last = selection;
+    while (last.has_value())
+        last = Media::select_audio_decoder(codec, last);
+    EXPECT(!last.has_value());
+}
+
+TEST_CASE(a_video_codec_selects_no_audio_decoder)
+{
+    EXPECT(!Media::select_audio_decoder(Media::ParsedCodec { Media::CodecID::VP9 }).has_value());
 }

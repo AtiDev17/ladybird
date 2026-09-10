@@ -11,14 +11,12 @@ use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::builder::PendingInlineClip;
-use crate::painting::display_list::commands::{
-    CanvasId, CompositorContextId, ImageFrameResourceId, VideoSinkResourceId,
-};
+use crate::painting::display_list::commands::{CanvasId, CompositorContextId};
 use crate::painting::force_dark::ForceDarkRole;
-use crate::painting::host::FfiReplacedPaintFacts;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
-use crate::painting::record::paint::background::{paint_image, to_gfx_scaling_mode};
+use crate::painting::record::paint::background::{paint_image_content, to_gfx_scaling_mode};
+use crate::painting::replaced_paint_facts::VideoPaintFacts;
 use crate::painting::visual_context::node_values::padding_edge_border_radii;
 use libgfx_rust::{Color, CornerRadii, FloatRect, IntRect, ScalingMode};
 
@@ -41,7 +39,7 @@ fn replaced_content_clip_geometry<O: Observer>(
     (content_rect, corner_radii)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Fraction {
     pub numerator: CssPixels,
     pub denominator: CssPixels,
@@ -89,10 +87,24 @@ impl Fraction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct SizeWithAspectRatio {
     pub width: Option<CssPixels>,
     pub height: Option<CssPixels>,
     pub aspect_ratio: Option<Fraction>,
+}
+
+impl SizeWithAspectRatio {
+    pub(crate) fn from_ffi(natural: &crate::painting::host::FfiNaturalSize) -> Self {
+        Self {
+            width: natural.width.has_value.then_some(natural.width.value),
+            height: natural.height.has_value.then_some(natural.height.value),
+            aspect_ratio: natural.has_aspect_ratio.then_some(Fraction::of(
+                natural.aspect_ratio_numerator,
+                natural.aspect_ratio_denominator,
+            )),
+        }
+    }
 }
 
 pub(crate) fn run_default_sizing_algorithm(
@@ -242,10 +254,23 @@ pub(crate) fn get_replaced_box_painting_area<O: Observer>(
     ))
 }
 
-fn replaced_facts<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: NodeSlotId) -> FfiReplacedPaintFacts {
-    recorder
-        .paint_host
-        .replaced_paint_facts(recorder.layout_node_shell(paintable))
+pub(crate) fn paint_replaced_image_content<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    content: &crate::painting::image_content::ImageContent,
+    dest_rect: FloatRect,
+    image_rendering: u8,
+) {
+    let accumulated_scale = recorder.accumulated_2d_scale_at(recorder.recorder.accumulated_visual_context().spatial);
+    paint_image_content(
+        recorder,
+        crate::painting::record::vector_images::VectorImageSource::ReplacedContent { owner: paintable },
+        content,
+        dest_rect,
+        image_rendering,
+        accumulated_scale,
+        libgfx_rust::CompositingAndBlendingOperator::Normal,
+    );
 }
 
 fn replaced_style<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: NodeSlotId) -> (u8, u8) {
@@ -258,23 +283,17 @@ fn replaced_style<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: NodeS
 }
 
 pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
-    let facts = replaced_facts(recorder, paintable);
+    let facts = recorder
+        .layout_arena
+        .replaced_paint_facts(paintable)
+        .and_then(|facts| facts.image())
+        .unwrap_or_default();
     let (object_fit, image_rendering) = replaced_style(recorder, paintable);
     let image_rect = absolute_rect(recorder.layout_arena, paintable);
     let image_rect_device_pixels = recorder.converter.rounded_device_rect(image_rect);
-    if facts.has_decoded_image_data {
+    if facts.content != crate::painting::image_content::ImageContent::None {
         // https://drafts.csswg.org/css-images/#the-object-fit
-        let natural_size = SizeWithAspectRatio {
-            width: facts.natural_width.has_value.then_some(facts.natural_width.value),
-            height: facts.natural_height.has_value.then_some(facts.natural_height.value),
-            aspect_ratio: facts.has_natural_aspect_ratio.then(|| {
-                Fraction::of(
-                    facts.natural_aspect_ratio_numerator,
-                    facts.natural_aspect_ratio_denominator,
-                )
-            }),
-        };
-        let concrete_object_size = run_default_sizing_algorithm(None, None, &natural_size, image_rect.size());
+        let concrete_object_size = run_default_sizing_algorithm(None, None, &facts.natural, image_rect.size());
 
         let draw_rect = get_replaced_box_painting_area(recorder, paintable, object_fit, concrete_object_size);
         if !draw_rect.is_empty() {
@@ -288,22 +307,13 @@ pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'
             }
             let dest_rect = draw_rect.to_float();
             recorder.record_with_inline_clips(&inline_clips, |recorder| {
-                let accumulated_scale =
-                    recorder.accumulated_2d_scale_at(recorder.recorder.accumulated_visual_context().spatial);
-                let paint = recorder.paint_host.replaced_image_paint(
-                    recorder.layout_node_shell(paintable),
-                    dest_rect,
-                    accumulated_scale,
-                );
-                if paint.image_paint_kind != crate::painting::host::FfiImagePaintKind::None {
-                    paint_image(recorder, &paint, dest_rect, image_rendering);
-                }
+                paint_replaced_image_content(recorder, paintable, &facts.content, dest_rect, image_rendering);
             });
         }
     }
 
     if recorder.data(paintable).selection_state != 0 {
-        let selection_background_color = facts.selection_background_color;
+        let selection_background_color = recorder.element_selection_style(paintable).facts.background_color;
         if selection_background_color.alpha() > 0 {
             let backdrop = recorder
                 .layout_arena
@@ -321,12 +331,16 @@ pub(crate) fn paint_image_foreground<O: Observer>(recorder: &mut PaintRecorder<'
 }
 
 pub(crate) fn paint_canvas_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
-    let facts = replaced_facts(recorder, paintable);
+    let facts = recorder
+        .layout_arena
+        .replaced_paint_facts(paintable)
+        .and_then(|facts| facts.canvas())
+        .unwrap_or_default();
     let (_, image_rendering) = replaced_style(recorder, paintable);
     let canvas_rect = recorder
         .converter
         .rounded_device_rect(absolute_rect(recorder.layout_arena, paintable));
-    if !facts.has_canvas_content {
+    if !facts.has_content {
         return;
     }
     let (content_rect, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
@@ -335,20 +349,24 @@ pub(crate) fn paint_canvas_foreground<O: Observer>(recorder: &mut PaintRecorder<
     recorder.record_with_inline_clips(corner_clip.as_slice(), |recorder| {
         let scaling_mode = to_gfx_scaling_mode(
             image_rendering,
-            (facts.canvas_content_width, facts.canvas_content_height),
+            (facts.content_width, facts.content_height),
             (canvas_rect.width, canvas_rect.height),
         );
         recorder.recorder.draw_canvas(
             canvas_rect,
             CanvasId(facts.canvas_id),
-            facts.canvas_content_generation,
+            facts.content_generation,
             scaling_mode,
         );
     });
 }
 
 pub(crate) fn paint_video_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
-    let facts = replaced_facts(recorder, paintable);
+    let facts = recorder
+        .layout_arena
+        .replaced_paint_facts(paintable)
+        .and_then(|facts| facts.video())
+        .unwrap_or_default();
     let (object_fit, image_rendering) = replaced_style(recorder, paintable);
     let video_rect = recorder
         .converter
@@ -358,65 +376,48 @@ pub(crate) fn paint_video_foreground<O: Observer>(recorder: &mut PaintRecorder<'
     if let Some(corner_radii) = corner_radii {
         inline_clips.push(PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii));
     }
-    recorder.record_with_inline_clips(&inline_clips, |recorder| match facts.video_representation {
-        crate::painting::host::FfiVideoRepresentation::VideoFrame => {
-            if facts.has_video_frame {
-                let src_size = (facts.video_src_width, facts.video_src_height);
-                let dst_rect = get_replaced_box_painting_area(
-                    recorder,
-                    paintable,
-                    object_fit,
-                    CssPixelSize::new(
-                        CssPixels::from_integer(src_size.0 as i64),
-                        CssPixels::from_integer(src_size.1 as i64),
-                    ),
-                );
-                if !dst_rect.is_empty() {
-                    let scaling_mode =
-                        to_gfx_scaling_mode(image_rendering, src_size, (dst_rect.width, dst_rect.height));
-                    recorder.recorder.draw_video_frame(
-                        dst_rect,
-                        VideoSinkResourceId(facts.video_sink_storage_id),
-                        scaling_mode,
-                    );
-                }
+    recorder.record_with_inline_clips(&inline_clips, |recorder| match &facts {
+        VideoPaintFacts::VideoFrame(Some(video_frame)) => {
+            let src_size = (video_frame.src_width, video_frame.src_height);
+            let dst_rect = get_replaced_box_painting_area(
+                recorder,
+                paintable,
+                object_fit,
+                CssPixelSize::new(
+                    CssPixels::from_integer(src_size.0 as i64),
+                    CssPixels::from_integer(src_size.1 as i64),
+                ),
+            );
+            if !dst_rect.is_empty() {
+                let scaling_mode = to_gfx_scaling_mode(image_rendering, src_size, (dst_rect.width, dst_rect.height));
+                let sink_id = recorder.register_video_sink(video_frame.sink_resource_id, video_frame.sink_handle);
+                recorder.recorder.draw_video_frame(dst_rect, sink_id, scaling_mode);
             }
         }
-        crate::painting::host::FfiVideoRepresentation::PosterFrame => {
-            if facts.has_poster_frame {
-                let frame_size = (facts.poster_width, facts.poster_height);
-                let dst_rect = get_replaced_box_painting_area(
+        VideoPaintFacts::PosterFrame(Some(poster_frame)) => {
+            let frame_size = (poster_frame.width(), poster_frame.height());
+            let dst_rect = get_replaced_box_painting_area(
+                recorder,
+                paintable,
+                object_fit,
+                CssPixelSize::new(
+                    CssPixels::from_integer(frame_size.0 as i64),
+                    CssPixels::from_integer(frame_size.1 as i64),
+                ),
+            );
+            if !dst_rect.is_empty() {
+                crate::painting::record::paint::background::paint_decoded_image_frame(
                     recorder,
-                    paintable,
-                    object_fit,
-                    CssPixelSize::new(
-                        CssPixels::from_integer(frame_size.0 as i64),
-                        CssPixels::from_integer(frame_size.1 as i64),
-                    ),
+                    poster_frame,
+                    dst_rect.to_float(),
+                    image_rendering,
+                    libgfx_rust::CompositingAndBlendingOperator::Normal,
+                    ForceDarkRole::Foreground,
                 );
-                if !dst_rect.is_empty() {
-                    let scaling_mode =
-                        to_gfx_scaling_mode(image_rendering, frame_size, (dst_rect.width, dst_rect.height));
-                    let force_dark_role = crate::painting::force_dark::role_for_image(
-                        ForceDarkRole::Foreground,
-                        dst_rect.width as f32,
-                        dst_rect.height as f32,
-                        recorder.inputs.device_pixels_per_css_pixel,
-                        frame_size,
-                    );
-                    recorder.recorder.draw_scaled_decoded_image_frame(
-                        dst_rect.to_float(),
-                        None,
-                        ImageFrameResourceId(facts.poster_frame_id),
-                        scaling_mode,
-                        libgfx_rust::CompositingAndBlendingOperator::Normal,
-                        None,
-                        force_dark_role,
-                    );
-                }
             }
         }
-        crate::painting::host::FfiVideoRepresentation::TransparentBlack => {
+        VideoPaintFacts::VideoFrame(None) | VideoPaintFacts::PosterFrame(None) => {}
+        VideoPaintFacts::TransparentBlack => {
             recorder
                 .recorder
                 .fill_rect(video_rect, Color::TRANSPARENT, ForceDarkRole::Background);
@@ -428,7 +429,11 @@ pub(crate) fn paint_navigable_container_foreground<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
 ) {
-    let facts = replaced_facts(recorder, paintable);
+    let facts = recorder
+        .layout_arena
+        .replaced_paint_facts(paintable)
+        .and_then(|facts| facts.navigable_container())
+        .unwrap_or_default();
     if !facts.has_composited_context {
         return;
     }

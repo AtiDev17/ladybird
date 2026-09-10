@@ -73,12 +73,37 @@ pub struct FfiSvgElementFacts {
     pub preserve_aspect_ratio_align: u8,
     pub preserve_aspect_ratio_meet_or_slice: u8,
     pub element_transform: FfiAffineTransform,
+    pub additional_element_transform: FfiAffineTransform,
     pub visible_stroke_width: f32,
     pub viewport_percentage_basis: CssPixels,
     pub content_units: u8,
     pub pattern_units: u8,
     pub pattern_width: FfiSvgNumberPercentage,
     pub pattern_height: FfiSvgNumberPercentage,
+    pub mask_units: u8,
+    pub mask_x: FfiSvgNumberPercentage,
+    pub mask_y: FfiSvgNumberPercentage,
+    pub mask_width: FfiSvgNumberPercentage,
+    pub mask_height: FfiSvgNumberPercentage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SvgMaskAreaFacts {
+    pub units_are_object_bounding_box: bool,
+    pub x: FfiSvgNumberPercentage,
+    pub y: FfiSvgNumberPercentage,
+    pub width: FfiSvgNumberPercentage,
+    pub height: FfiSvgNumberPercentage,
+}
+
+impl FfiSvgNumberPercentage {
+    pub(crate) fn resolve_relative_to(self, length: f32) -> f32 {
+        if self.is_percentage {
+            self.value * length
+        } else {
+            self.value
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -156,6 +181,13 @@ impl SvgCssPixelRect {
         self.width += width;
         self.y -= height / 2;
         self.height += height;
+    }
+}
+
+impl From<FfiAffineTransform> for libgfx_rust::AffineTransform {
+    fn from(transform: FfiAffineTransform) -> Self {
+        let FfiAffineTransform { a, b, c, d, e, f } = transform;
+        Self::new(a, b, c, d, e, f)
     }
 }
 
@@ -464,18 +496,29 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     fn set_svg_viewport_transform(&self, node: Node, transform: FfiAffineTransform) {
-        self.used_values(node).rare_data_mut().svg_viewport_transform = Some(transform);
+        self.used_values(node).rare_data_mut().svg.viewport_transform = Some(transform);
     }
 
     fn set_svg_viewport_size(&self, node: Node, viewport_size: FfiCssPixelSize) {
-        self.used_values(node).rare_data_mut().svg_viewport_size = Some(viewport_size);
+        self.used_values(node).rare_data_mut().svg.viewport_size = Some(viewport_size);
     }
 
     fn commit_svg_element_facts(&self, node: Node, facts: FfiSvgElementFacts) {
         let used = self.used_values(node);
         let mut rare = used.rare_data_mut();
-        rare.svg_view_box = facts.has_active_view_box.then_some(facts.active_view_box);
-        rare.svg_viewport_percentage_basis = facts.viewport_percentage_basis;
+        rare.svg.view_box = facts.has_active_view_box.then_some(facts.active_view_box);
+        rare.svg.element_transform = (!facts.element_transform.is_identity()).then_some(facts.element_transform);
+        rare.svg.additional_element_transform =
+            (!facts.additional_element_transform.is_identity()).then_some(facts.additional_element_transform);
+        rare.svg.mask_area_facts = (self.node_kind(node) == NodeKind::SVGMaskBox).then_some(SvgMaskAreaFacts {
+            units_are_object_bounding_box: facts.mask_units == SVG_UNITS_OBJECT_BOUNDING_BOX,
+            x: facts.mask_x,
+            y: facts.mask_y,
+            width: facts.mask_width,
+            height: facts.mask_height,
+        });
+        rare.svg.viewport_percentage_basis = facts.viewport_percentage_basis;
+        rare.svg.resource_content_units_are_object_bounding_box = facts.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX;
     }
 
     fn place_child(&self, node: Node, x: CssPixels, y: CssPixels) {

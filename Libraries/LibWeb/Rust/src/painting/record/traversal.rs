@@ -17,13 +17,13 @@ use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
 use crate::painting::force_dark::{ForceDarkRole, ForceDarkSettings};
 use crate::painting::hit_test::*;
-use crate::painting::host::{FfiHitTestHostCallbacks, FfiPaintHostCallbacks, FfiVisualContextHostCallbacks};
 use crate::painting::node_painting;
 use crate::painting::record::RecordingInputs;
 use crate::painting::record::cache::{
     CachedSubtreeCapture, CaptureAddress, CaptureKind, CaptureSite, EnclosingCaptureAnchor, OpenCapture, RecordGen,
     SourceTapePosition, SubtreeCaptureWalkOutcome, narrow_record_gen, resolve_capture_address_in_source_tape,
 };
+use crate::painting::record::resources::RecordingResourceManifest;
 use crate::painting::record::svg_resources::MaskLayerSet;
 use crate::painting::record::trace::{Action, Operation};
 use crate::painting::record::verify::LoggedCapture;
@@ -68,24 +68,18 @@ pub(crate) fn record_display_list(
     layout_arena: &LayoutNodeArena,
     paint_state: &crate::painting::paint_state::PaintState,
     viewport: NodeSlotId,
-    host: &FfiHitTestHostCallbacks,
-    paint_host: &FfiPaintHostCallbacks,
-    visual_context_host: &FfiVisualContextHostCallbacks,
     inputs: RecordingInputs,
     hit_test_list_generation: u64,
     command_cache_source: Option<Rc<RecordingOutput>>,
     item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
     trace: bool,
-) -> RecordingOutput {
+) -> (RecordingOutput, RecordingResourceManifest) {
     macro_rules! record {
         ($observer:ty) => {
             record_display_list_impl::<$observer>(
                 layout_arena,
                 paint_state,
                 viewport,
-                host,
-                paint_host,
-                visual_context_host,
                 inputs,
                 hit_test_list_generation,
                 command_cache_source,
@@ -105,14 +99,11 @@ fn record_display_list_impl<O: Observer>(
     layout_arena: &LayoutNodeArena,
     paint_state: &crate::painting::paint_state::PaintState,
     viewport: NodeSlotId,
-    host: &FfiHitTestHostCallbacks,
-    paint_host: &FfiPaintHostCallbacks,
-    visual_context_host: &FfiVisualContextHostCallbacks,
     inputs: RecordingInputs,
     hit_test_list_generation: u64,
     command_cache_source: Option<Rc<RecordingOutput>>,
     item_cache_source: Option<Rc<crate::painting::record::cache::HitTestItemCacheSource>>,
-) -> RecordingOutput {
+) -> (RecordingOutput, RecordingResourceManifest) {
     let structural_epoch = paint_state.visual_context.structural_epoch();
     let command_cache_source = command_cache_source
         .filter(|source| source.recorded_device_pixels_per_css_pixel == inputs.device_pixels_per_css_pixel);
@@ -128,12 +119,9 @@ fn record_display_list_impl<O: Observer>(
     let mut recorder = PaintRecorder {
         layout_arena: &paintable_rows,
         paint_state,
-        host,
-        paint_host,
         inputs,
         recorder: DisplayListRecorder::new(force_dark_settings),
         converter: DevicePixelConverter::new(inputs.device_pixels_per_css_pixel),
-        visual_context_host,
         svg_resource_walk: None,
         pattern_tile_records: HashMap::new(),
         command_cache_source,
@@ -155,8 +143,7 @@ fn record_display_list_impl<O: Observer>(
         completed_record_gen: narrow_record_gen(layout_arena.paint_cache_completed_record_gen()),
         all_paint_caches_dirty: layout_arena.all_paint_caches_dirty(),
         all_descendant_subtree_caches_dirty: layout_arena.all_descendant_subtree_caches_dirty(),
-        text_node_facts_cache: HashMap::new(),
-        registered_font_ids: std::collections::HashSet::new(),
+        resources: RecordingResourceManifest::default(),
         selection_style_cache: HashMap::new(),
         wheel_hit_test_target_cache: HashMap::new(),
     };
@@ -199,7 +186,7 @@ fn record_display_list_impl<O: Observer>(
         Some(deferred) => Rc::new(materialize_deferred_whole_tape_splice(&recorded, &deferred)),
         None => Rc::new(recorded),
     };
-    RecordingOutput {
+    let output = RecordingOutput {
         recorded_structural_epoch: structural_epoch,
         recorded_device_pixels_per_css_pixel: inputs.device_pixels_per_css_pixel,
         hit_test_list,
@@ -208,7 +195,8 @@ fn record_display_list_impl<O: Observer>(
         wheel_event_listener_state_generation: inputs.wheel_event_listener_state_generation,
         is_identical_to_cache_source: false,
         capture_log_for_verification: recorder.observer.finish(),
-    }
+    };
+    (output, recorder.resources)
 }
 
 fn materialize_deferred_whole_tape_splice(

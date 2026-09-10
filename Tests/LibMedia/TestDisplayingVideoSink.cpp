@@ -26,13 +26,9 @@ NonnullRefPtr<Media::VideoFrame> create_test_frame(Media::VideoFramePool& pool, 
 
     auto plane_sizes = MUST(Gfx::YUVData::plane_sizes(frame_size, bit_depth, subsampling));
     auto acquired = pool.try_acquire(plane_sizes.total).release_value();
-    auto yuv_data = MUST(Gfx::YUVData::create(frame_size, bit_depth, subsampling, Media::CodingIndependentCodePoints {},
-        acquired.bytes.slice(0, plane_sizes.y),
-        acquired.bytes.slice(plane_sizes.y, plane_sizes.u),
-        acquired.bytes.slice(plane_sizes.y + plane_sizes.u, plane_sizes.v)));
     auto slot = MUST(pool.try_adopt_acquired_slot(acquired));
 
-    return make_ref_counted<Media::VideoFrame>(timestamp, duration, Gfx::Size<u32>(frame_size), bit_depth, yuv_data, move(slot));
+    return make_ref_counted<Media::VideoFrame>(timestamp, duration, Gfx::Size<u32>(frame_size), bit_depth, subsampling, Media::CodingIndependentCodePoints {}, move(slot));
 }
 
 }
@@ -67,7 +63,8 @@ TEST_CASE(suspension_wake_releases_the_prefetched_frame)
     never_destroyed_event_loop();
 
     size_t freed_slots = 0;
-    auto pool = MUST(Media::VideoFramePool::create([&freed_slots] { freed_slots++; }));
+    auto pool = MUST(Media::VideoFramePool::create());
+    pool->set_slot_freed_callback([&freed_slots] { freed_slots++; });
     auto clock = MUST(Media::MonotonicMediaClock::try_create());
     clock->seek(AK::Duration::from_milliseconds(1000));
 

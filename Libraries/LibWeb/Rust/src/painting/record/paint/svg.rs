@@ -15,12 +15,14 @@ use crate::painting::display_list::recorder::{
     ColorStops, FillPathParams, PaintStyle, PaintStyleOrColor, StrokePathParams,
 };
 use crate::painting::force_dark::ForceDarkRole;
-use crate::painting::host::{FfiSvgGradientSpreadMethod, FfiSvgPaintStyle, FfiSvgPaintStyleKind};
+use crate::painting::host::{FfiSvgGradientKind, FfiSvgGradientSpreadMethod};
 use crate::painting::node_painting;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::paintable_rows::PaintableRowsRead;
-use crate::painting::record::paint::background::paint_image;
 use crate::painting::record::{PaintPhase, PaintRecorder};
+use crate::painting::svg_paint_resources::{
+    PublishedSvgGradient, PublishedSvgPaintServer, PublishedSvgPattern, SvgPaintResourceKind,
+};
 use libgfx_rust::{AffineTransform, CapStyle, Color, FloatRect, JoinStyle, ShouldAntiAlias, WindingRule};
 
 #[derive(Clone, Copy, Default)]
@@ -43,12 +45,6 @@ struct SvgPaintFacts {
     paint_order_count: u32,
     has_viewport: bool,
     viewport: [f32; 4],
-    has_decoded_image_data: bool,
-    has_natural_size: bool,
-    natural_width: f32,
-    natural_height: f32,
-    overflow_is_visible: bool,
-    image_rendering: u8,
     references_paint_server: bool,
 }
 
@@ -64,10 +60,10 @@ fn svg_paint_facts<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
 ) -> (SvgPaintFacts, Vec<f32>) {
-    use crate::css::css_enums::{fill_rule, overflow, stroke_linecap, stroke_linejoin, vector_effect};
+    use crate::css::css_enums::{fill_rule, stroke_linecap, stroke_linejoin, vector_effect};
     let layout_arena = recorder.layout_arena;
-    let kind = layout_arena.node_kind_if_live(paintable);
-    let viewport = kind
+    let viewport = layout_arena
+        .node_kind_if_live(paintable)
         .is_some_and(node_painting::is_svg_path)
         .then(|| crate::painting::svg_viewport::nearest_svg_viewport_user_rect(layout_arena, paintable))
         .flatten();
@@ -76,15 +72,6 @@ fn svg_paint_facts<O: Observer>(
         viewport: viewport.map_or([0.0; 4], |rect| [rect.x, rect.y, rect.width, rect.height]),
         ..SvgPaintFacts::default()
     };
-    if kind == Some(NodeKind::SVGImageBox) {
-        let image = recorder
-            .paint_host
-            .svg_image_facts(recorder.layout_node_shell(paintable));
-        facts.has_decoded_image_data = image.has_decoded_image_data;
-        facts.has_natural_size = image.natural_size.has_value;
-        facts.natural_width = image.natural_size.value.width;
-        facts.natural_height = image.natural_size.value.height;
-    }
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return (facts, Vec::new());
     };
@@ -125,9 +112,6 @@ fn svg_paint_facts<O: Observer>(
     facts.non_scaling_stroke = style.svg_reset().vector_effect == vector_effect::NON_SCALING_STROKE;
     facts.paint_order = svg.paint_order;
     facts.paint_order_count = 3;
-    facts.overflow_is_visible =
-        style.box_values().overflow_x == overflow::VISIBLE && style.box_values().overflow_y == overflow::VISIBLE;
-    facts.image_rendering = style.image_rendering();
 
     let basis = crate::painting::paintable_geometry::committed_svg_viewport_percentage_basis(layout_arena, paintable);
     let resolve = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle, default: f32| {
@@ -171,49 +155,236 @@ fn affine(values: [f32; 6]) -> AffineTransform {
     AffineTransform { values }
 }
 
-fn paint_style_from_ffi<O: Observer>(
-    recorder: &mut PaintRecorder<'_, O>,
-    style: &FfiSvgPaintStyle,
-    stops: &crate::painting::host::ColorStopSink,
-) -> Option<PaintStyle> {
-    let color_stops = ColorStops {
-        colors: stops.colors.clone(),
-        positions: stops.positions.clone(),
-        repeating: false,
-    };
-    let gradient_transform = style.gradient_transform;
-    let spread_method = match style.spread_method {
+fn spread_method_of(spread_method: FfiSvgGradientSpreadMethod) -> DisplayListGradientSpreadMethod {
+    match spread_method {
         FfiSvgGradientSpreadMethod::Pad => DisplayListGradientSpreadMethod::Pad,
         FfiSvgGradientSpreadMethod::Repeat => DisplayListGradientSpreadMethod::Repeat,
         FfiSvgGradientSpreadMethod::Reflect => DisplayListGradientSpreadMethod::Reflect,
+    }
+}
+
+fn gradient_paint_transform(
+    gradient: &PublishedSvgGradient,
+    paint_context: &SvgPaintContext,
+) -> crate::painting::display_list::commands::OptionalAffineTransform {
+    use libgfx_rust::matrix::multiply_affine;
+    let mapped_bounding_box = paint_context.paint_transform.map_rect(paint_context.path_bounding_box);
+    let mut transform = AffineTransform::identity();
+    transform.values[4] = -mapped_bounding_box.x;
+    transform.values[5] = -mapped_bounding_box.y;
+    transform = multiply_affine(transform, paint_context.paint_transform);
+    if gradient.description.gradient_transform.has_value {
+        transform = multiply_affine(transform, gradient.description.gradient_transform.value);
+    }
+    crate::painting::display_list::commands::OptionalAffineTransform {
+        value: transform,
+        has_value: true,
+    }
+}
+
+fn gradient_paint_style(gradient: &PublishedSvgGradient, paint_context: &SvgPaintContext) -> PaintStyle {
+    let description = &gradient.description;
+    let bounding_box = paint_context.path_bounding_box;
+    let viewport = paint_context.viewport;
+    let point_in_bounding_box = |x: f32, y: f32| libgfx_rust::FloatPoint {
+        x: bounding_box.x + x * bounding_box.width,
+        y: bounding_box.y + y * bounding_box.height,
     };
-    let color_space = style.color_space;
-    match style.kind {
-        FfiSvgPaintStyleKind::LinearGradient => Some(PaintStyle::LinearGradient {
-            gradient_transform,
-            spread_method,
-            color_space,
-            color_stops,
-            start_point: style.start,
-            end_point: style.end,
-        }),
-        FfiSvgPaintStyleKind::RadialGradient => Some(PaintStyle::RadialGradient {
-            gradient_transform,
-            spread_method,
-            color_space,
-            color_stops,
-            start_center: style.start,
-            start_radius: style.start_radius,
-            end_center: style.end,
-            end_radius: style.end_radius,
-        }),
-        FfiSvgPaintStyleKind::Pattern => Some(PaintStyle::Pattern {
-            tile_records: recorder.pattern_tile_records(style.pattern_paintable, style.tile_content_transform),
-            tile_rect: style.tile_rect,
-            content_scale: style.content_scale,
-            pattern_transform: style.pattern_transform,
-        }),
-        FfiSvgPaintStyleKind::None => None,
+    let point_in_user_space =
+        |x: crate::layout::svg_formatting_context::FfiSvgNumberPercentage,
+         y: crate::layout::svg_formatting_context::FfiSvgNumberPercentage| {
+            libgfx_rust::FloatPoint {
+                x: x.resolve_relative_to(viewport.width),
+                y: y.resolve_relative_to(viewport.height),
+            }
+        };
+    let color_stops = ColorStops {
+        colors: gradient.stops.iter().map(|stop| stop.color).collect(),
+        positions: gradient.stops.iter().map(|stop| stop.position).collect(),
+        repeating: false,
+    };
+    let gradient_transform = gradient_paint_transform(gradient, paint_context);
+    let spread_method = spread_method_of(description.spread_method);
+    let color_space = description.color_space;
+    match description.kind {
+        FfiSvgGradientKind::Radial => {
+            let (start_center, start_radius, end_center, end_radius) = if description.units_are_object_bounding_box {
+                (
+                    point_in_bounding_box(description.fx.value, description.fy.value),
+                    description.fr.value * bounding_box.width,
+                    point_in_bounding_box(description.cx.value, description.cy.value),
+                    description.r.value * bounding_box.width,
+                )
+            } else {
+                (
+                    point_in_user_space(description.fx, description.fy),
+                    description.fr.resolve_relative_to(viewport.width),
+                    point_in_user_space(description.cx, description.cy),
+                    description.r.resolve_relative_to(viewport.width),
+                )
+            };
+            PaintStyle::RadialGradient {
+                gradient_transform,
+                spread_method,
+                color_space,
+                color_stops,
+                start_center,
+                start_radius,
+                end_center,
+                end_radius,
+            }
+        }
+        FfiSvgGradientKind::Linear => {
+            let (start_point, end_point) = if description.units_are_object_bounding_box {
+                (
+                    point_in_bounding_box(description.x1.value, description.y1.value),
+                    point_in_bounding_box(description.x2.value, description.y2.value),
+                )
+            } else {
+                (
+                    point_in_user_space(description.x1, description.y1),
+                    point_in_user_space(description.x2, description.y2),
+                )
+            };
+            PaintStyle::LinearGradient {
+                gradient_transform,
+                spread_method,
+                color_space,
+                color_stops,
+                start_point,
+                end_point,
+            }
+        }
+    }
+}
+
+pub(crate) struct SvgPaintContext {
+    pub viewport: FloatRect,
+    pub path_bounding_box: FloatRect,
+    pub paint_transform: AffineTransform,
+    pub content_scale: libgfx_rust::FloatSize,
+}
+
+fn pattern_paint_style<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    pattern: &PublishedSvgPattern,
+    paint_context: &SvgPaintContext,
+) -> Option<PaintStyle> {
+    use libgfx_rust::matrix::{affine_to_matrix, multiply_affine};
+    let description = &pattern.description;
+    let pattern_box = description.pattern_box;
+    if !recorder.layout_arena.paintable_row_is_populated(pattern_box) {
+        return None;
+    }
+    let bounding_box = paint_context.path_bounding_box;
+    let viewport = paint_context.viewport;
+    let (tile_x, tile_y, tile_width, tile_height) = if description.units_are_object_bounding_box {
+        (
+            description.x.value * bounding_box.width + bounding_box.x,
+            description.y.value * bounding_box.height + bounding_box.y,
+            description.width.value * bounding_box.width,
+            description.height.value * bounding_box.height,
+        )
+    } else {
+        (
+            description.x.resolve_relative_to(viewport.width),
+            description.y.resolve_relative_to(viewport.height),
+            description.width.resolve_relative_to(viewport.width),
+            description.height.resolve_relative_to(viewport.height),
+        )
+    };
+    if tile_width <= 0.0 || tile_height <= 0.0 {
+        return None;
+    }
+    let tile_rect = paint_context
+        .paint_transform
+        .map_rect(FloatRect::new(tile_x, tile_y, tile_width, tile_height));
+    if tile_rect.is_empty() {
+        return None;
+    }
+    let mut content_scale = paint_context.content_scale;
+    if !(content_scale.width > 0.0 && content_scale.height > 0.0) {
+        content_scale = libgfx_rust::FloatSize {
+            width: 1.0,
+            height: 1.0,
+        };
+    }
+    let device_scale = recorder.inputs.device_pixels_per_css_pixel as f32;
+    let mut recorded_to_surface = AffineTransform::identity().scaled(content_scale.width, content_scale.height);
+    if !description.has_view_box {
+        let mut content_to_tile_transform = AffineTransform::identity();
+        if description.content_units_are_object_bounding_box {
+            content_to_tile_transform = AffineTransform::identity()
+                .translated(bounding_box.x * device_scale, bounding_box.y * device_scale)
+                .scaled(bounding_box.width, bounding_box.height);
+        }
+        recorded_to_surface = multiply_affine(
+            recorded_to_surface.translated(-tile_rect.x, -tile_rect.y),
+            content_to_tile_transform,
+        );
+    }
+    let tile_content_transform = affine_to_matrix(recorded_to_surface);
+    let mut pattern_transform = crate::painting::display_list::commands::OptionalAffineTransform::default();
+    let user_space_pattern_transform = if pattern.css_transform.is_empty() {
+        description
+            .pattern_transform_attribute
+            .has_value
+            .then_some(description.pattern_transform_attribute.value)
+    } else {
+        let pattern_box_style = recorder.layout_arena.node_style_if_live(pattern_box)?;
+        let reference_box = crate::painting::visual_context::node_values::transform_reference_box(
+            pattern_box_style,
+            recorder.layout_arena,
+            pattern_box,
+        );
+        Some(
+            crate::painting::visual_context::node_values::multiply_transform_functions(
+                libgfx_rust::FloatMatrix4x4::identity(),
+                &pattern.css_transform,
+                reference_box,
+            )
+            .extract_2d_affine(),
+        )
+    };
+    if let Some(user_space_pattern_transform) = user_space_pattern_transform {
+        user_space_pattern_transform.inverse()?;
+        if let Some(inverse) = paint_context.paint_transform.inverse() {
+            pattern_transform = crate::painting::display_list::commands::OptionalAffineTransform {
+                value: multiply_affine(
+                    multiply_affine(paint_context.paint_transform, user_space_pattern_transform),
+                    inverse,
+                ),
+                has_value: true,
+            };
+        }
+    }
+    Some(PaintStyle::Pattern {
+        tile_records: recorder.pattern_tile_records(pattern_box, tile_content_transform),
+        tile_rect,
+        content_scale,
+        pattern_transform,
+    })
+}
+
+fn paint_server_style<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    is_stroke: bool,
+    paint_context: &SvgPaintContext,
+) -> Option<PaintStyle> {
+    let kind = if is_stroke {
+        SvgPaintResourceKind::Stroke
+    } else {
+        SvgPaintResourceKind::Fill
+    };
+    let published = recorder
+        .layout_arena
+        .svg_paint_resources()
+        .published_paint_server(paintable, kind)?;
+    match &*published {
+        PublishedSvgPaintServer::Gradient(gradient) => Some(gradient_paint_style(gradient, paint_context)),
+        PublishedSvgPaintServer::Pattern(pattern) => pattern_paint_style(recorder, pattern, paint_context),
+        PublishedSvgPaintServer::None => None,
     }
 }
 
@@ -224,8 +395,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
     };
     let (facts, dash_array) = svg_paint_facts(recorder, paintable);
     let output_is_resolved_through_another_element = facts.references_paint_server
-        || recorder.layout_arena.node_kind_if_live(paintable)
-            == Some(crate::layout::node_data::NodeKind::SVGTextPathBox);
+        || recorder.layout_arena.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
     if output_is_resolved_through_another_element {
         recorder.mark_open_captures_unsplicable();
     }
@@ -264,7 +434,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
         return;
     }
 
-    let paint_context = crate::painting::host::FfiSvgPaintContext {
+    let paint_context = SvgPaintContext {
         viewport: if facts.has_viewport {
             FloatRect::from_array(facts.viewport)
         } else {
@@ -280,11 +450,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
             paint_order::FILL => {
                 let fill_opacity = facts.fill_opacity;
                 let fill_winding = WindingRule::from_raw(facts.fill_winding);
-                let (style, stops) =
-                    recorder
-                        .paint_host
-                        .svg_paint_style(recorder.layout_node_shell(paintable), false, &paint_context);
-                if let Some(paint_style) = paint_style_from_ffi(recorder, &style, &stops) {
+                if let Some(paint_style) = paint_server_style(recorder, paintable, false, &paint_context) {
                     recorder.recorder.fill_path(FillPathParams {
                         force_dark_role: ForceDarkRole::Svg,
                         path: &path,
@@ -321,11 +487,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
                 let stroke_dashoffset = facts.stroke_dashoffset * stroke_scale;
                 let stroke_opacity = facts.stroke_opacity;
 
-                let (style, stops) =
-                    recorder
-                        .paint_host
-                        .svg_paint_style(recorder.layout_node_shell(paintable), true, &paint_context);
-                if let Some(paint_style) = paint_style_from_ffi(recorder, &style, &stops) {
+                if let Some(paint_style) = paint_server_style(recorder, paintable, true, &paint_context) {
                     recorder.recorder.stroke_path(StrokePathParams {
                         force_dark_role: ForceDarkRole::Svg,
                         cap_style: facts.cap_style,
@@ -397,8 +559,12 @@ pub(crate) fn paint_image_element<O: Observer>(
         return;
     }
 
-    let (facts, _) = svg_paint_facts(recorder, paintable);
-    if !facts.has_decoded_image_data {
+    let image = recorder
+        .layout_arena
+        .replaced_paint_facts(paintable)
+        .and_then(|facts| facts.image())
+        .unwrap_or_default();
+    if image.content == crate::painting::image_content::ImageContent::None {
         return;
     }
 
@@ -407,10 +573,9 @@ pub(crate) fn paint_image_element<O: Observer>(
         paintable,
         recorder.inputs.device_pixels_per_css_pixel,
     );
-    let natural_size = if facts.has_natural_size {
-        (facts.natural_width, facts.natural_height)
-    } else {
-        (image_rect.width, image_rect.height)
+    let natural_size = match (image.natural.width, image.natural.height) {
+        (Some(width), Some(height)) => (width.to_float(), height.to_float()),
+        _ => (image_rect.width, image_rect.height),
     };
     // FIXME: Respect the preserveAspectRatio attribute instead of assuming its default value.
     let mut draw_rect = image_rect;
@@ -432,18 +597,27 @@ pub(crate) fn paint_image_element<O: Observer>(
     // https://svgwg.org/svg2-draft/embedded.html#ImageElement
     // Unless over-ridden by the author, images will therefore be clipped to the positioning
     // rectangle defined by the geometry properties.
-    let draw_rect_needs_clip = !facts.overflow_is_visible && !image_rect.contains_rect(draw_rect);
+    let (overflow_is_visible, image_rendering) =
+        recorder
+            .layout_arena
+            .node_style_if_live(paintable)
+            .map_or((false, 0), |style| {
+                use crate::css::css_enums::overflow;
+                (
+                    style.box_values().overflow_x == overflow::VISIBLE
+                        && style.box_values().overflow_y == overflow::VISIBLE,
+                    style.image_rendering(),
+                )
+            });
+    let draw_rect_needs_clip = !overflow_is_visible && !image_rect.contains_rect(draw_rect);
     let image_rect_clip = draw_rect_needs_clip.then(|| PendingInlineClip::intersecting_float_rect(image_rect));
     recorder.record_with_inline_clips(image_rect_clip.as_slice(), |recorder| {
-        let accumulated_scale =
-            recorder.accumulated_2d_scale_at(recorder.recorder.accumulated_visual_context().spatial);
-        let paint = recorder.paint_host.replaced_image_paint(
-            recorder.layout_node_shell(paintable),
+        crate::painting::record::paint::replaced::paint_replaced_image_content(
+            recorder,
+            paintable,
+            &image.content,
             draw_rect,
-            accumulated_scale,
+            image_rendering,
         );
-        if paint.image_paint_kind != crate::painting::host::FfiImagePaintKind::None {
-            paint_image(recorder, &paint, draw_rect, facts.image_rendering);
-        }
     });
 }

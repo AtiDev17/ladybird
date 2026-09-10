@@ -10,10 +10,13 @@ pub mod async_scroll_metadata;
 pub mod cache;
 pub mod hit_test_items;
 pub mod paint;
+pub(crate) mod publish;
+pub(crate) mod resources;
 pub(crate) mod scratch;
 pub mod svg_resources;
 pub mod trace;
 pub mod traversal;
+pub(crate) mod vector_images;
 pub(crate) mod verify;
 
 use crate::css::css_enums;
@@ -25,16 +28,13 @@ use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
 use crate::painting::hit_test::HitTestList;
-use crate::painting::host::{
-    FfiHitTestHostCallbacks, FfiHitTestTextNodeFacts, FfiPaintHostCallbacks, FfiRecordingInputs,
-    FfiRootBackgroundSource, FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs,
-};
+use crate::painting::host::{FfiRecordingInputs, FfiRootBackgroundSource, FfiVisualContextTreeInputs};
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::paintable_rows::PaintableRowsRef;
 use crate::painting::record::cache::{OpenCapture, RecordGen};
 use crate::painting::record::svg_resources::SvgResourceWalk;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Clone, Copy)]
@@ -116,12 +116,9 @@ pub(crate) struct DeferredWholeTapeSplice {
 pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) layout_arena: &'a PaintableRowsRef<'a>,
     pub(crate) paint_state: &'a crate::painting::paint_state::PaintState,
-    pub(crate) host: &'a FfiHitTestHostCallbacks,
-    pub(crate) paint_host: &'a FfiPaintHostCallbacks,
     pub(crate) inputs: RecordingInputs,
     pub(crate) recorder: DisplayListRecorder,
     pub(crate) converter: DevicePixelConverter,
-    pub(crate) visual_context_host: &'a FfiVisualContextHostCallbacks,
     pub(crate) svg_resource_walk: Option<SvgResourceWalk>,
     pattern_tile_records: HashMap<PatternTileKey, Rc<Vec<u8>>>,
     pub(crate) viewport: NodeSlotId,
@@ -137,8 +134,7 @@ pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) completed_record_gen: RecordGen,
     pub(crate) all_paint_caches_dirty: bool,
     pub(crate) all_descendant_subtree_caches_dirty: bool,
-    text_node_facts_cache: HashMap<u32, FfiHitTestTextNodeFacts>,
-    registered_font_ids: HashSet<libgfx_rust::font::FontId>,
+    pub(crate) resources: resources::RecordingResourceManifest,
     selection_style_cache: HashMap<u32, Rc<paint::text::SelectionStyleAnswer>>,
     pub(crate) wheel_hit_test_target_cache: HashMap<NodeSlotId, SpatialNodeIndex>,
 }
@@ -165,10 +161,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.layout_arena.paintable_data(paintable)
     }
 
-    pub(crate) fn layout_node_shell(&self, paintable: NodeSlotId) -> *mut std::ffi::c_void {
-        self.layout_arena.shell_if_live(paintable)
-    }
-
     pub(crate) fn hit_test_facts(&mut self, paintable: NodeSlotId) -> hit_test_items::HitTestFacts {
         self.paintable_facts(paintable)
     }
@@ -177,18 +169,83 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(facts) = self.memo_tables.borrow().hit_test_facts(paintable) {
             return facts;
         }
-        let dom_facts = self.host.paintable_facts(self.layout_node_shell(paintable));
-        let facts = hit_test_items::hit_test_facts(self.layout_arena, paintable, &self.inputs, dom_facts);
+        let facts = hit_test_items::hit_test_facts(self.layout_arena, paintable, &self.inputs);
         self.memo_tables.borrow_mut().set_hit_test_facts(paintable, facts);
         facts
     }
 
     pub(crate) fn register_font(&mut self, font: &libgfx_rust::font::FontHandle) -> u64 {
-        if self.registered_font_ids.insert(font.id()) {
-            let resource_id = self.paint_host.register_font(font.as_raw());
-            debug_assert_eq!(resource_id, font.id().0, "font resource ids are Gfx::Font ids");
+        self.resources.note_font(font)
+    }
+
+    pub(crate) fn register_image_frame(
+        &mut self,
+        frame: &libgfx_rust::image_frame::ImageFrameHandle,
+    ) -> crate::painting::display_list::commands::ImageFrameResourceId {
+        self.resources.note_image_frame(frame)
+    }
+
+    pub(crate) fn register_video_sink(
+        &mut self,
+        resource_id: u64,
+        sink_handle: u64,
+    ) -> crate::painting::display_list::commands::VideoSinkResourceId {
+        self.resources.note_video_sink(resource_id, sink_handle)
+    }
+
+    pub(crate) fn paint_vector_image(
+        &mut self,
+        source: vector_images::VectorImageSource,
+        has_active_view_box: bool,
+        dest_rect: libgfx_rust::FloatRect,
+        accumulated_scale: libgfx_rust::FloatSize,
+        compositing_and_blending_operator: libgfx_rust::CompositingAndBlendingOperator,
+    ) {
+        use libgfx_rust::CompositingAndBlendingOperator;
+        let geometry = vector_images::vector_image_render_geometry(dest_rect, accumulated_scale, has_active_view_box);
+        let display_list_id = self
+            .resources
+            .vector_image_placeholder(vector_images::VectorImageRenderRequest::new(
+                source,
+                geometry.css_width,
+                geometry.css_height,
+                geometry.raster_scale,
+            ));
+        if compositing_and_blending_operator != CompositingAndBlendingOperator::Normal {
+            let dest_device_rect = libgfx_rust::enclosing_int_rect(dest_rect);
+            if dest_device_rect.is_empty() {
+                return;
+            }
+            let group = self.recorder.begin_repeated_tile();
+            self.recorder
+                .paint_nested_display_list(display_list_id, dest_device_rect.to_float(), geometry.list_size);
+            self.recorder.finish_repeated_tile(
+                group,
+                dest_device_rect,
+                dest_device_rect,
+                libgfx_rust::ScalingMode::Bilinear,
+                compositing_and_blending_operator,
+                crate::painting::display_list::commands::Repeat { x: false, y: false },
+            );
+            return;
         }
-        font.id().0
+        self.recorder
+            .paint_nested_display_list(display_list_id, dest_rect, geometry.list_size);
+    }
+
+    pub(crate) fn own_scroll_container_offset(&self, paintable: NodeSlotId) -> crate::css::css_pixels::CssPixelPoint {
+        use crate::painting::display_list::commands::VISUAL_VIEWPORT_NODE_INDEX;
+        let own_scroll_node = self.data(paintable).own_scroll_node_index;
+        if own_scroll_node == VISUAL_VIEWPORT_NODE_INDEX {
+            return crate::css::css_pixels::CssPixelPoint::default();
+        }
+        let visual_context = &self.paint_state.visual_context;
+        let Some(tree) = visual_context.tree.as_ref() else {
+            return crate::css::css_pixels::CssPixelPoint::default();
+        };
+        let slot = tree.scroll_state_slot_for_node(own_scroll_node);
+        let own_offset = visual_context.scroll_state.state_at_slot(slot).own_offset;
+        crate::css::css_pixels::CssPixelPoint::new(-own_offset.x, -own_offset.y)
     }
 
     /// The focused text control's selection as `(start, end)` when `node` is one of its text
@@ -213,12 +270,106 @@ impl<O: Observer> PaintRecorder<'_, O> {
         if let Some(answer) = self.selection_style_cache.get(&key) {
             return answer.clone();
         }
-        let (facts, shadows) = self
-            .paint_host
-            .selection_style_facts(self.layout_arena.shell_if_live(node));
-        let answer = Rc::new(paint::text::SelectionStyleAnswer { facts, shadows });
+        let style_source = self.layout_arena.data(node).parent.get();
+        let answer = self
+            .first_non_anonymous_ancestor_row(node)
+            .and_then(|element_row| self.committed_selection_pseudo_style(node, element_row))
+            .unwrap_or_else(|| Rc::new(self.default_selection_style(node, style_source)));
         self.selection_style_cache.insert(key, answer.clone());
         answer
+    }
+
+    pub(crate) fn element_selection_style(
+        &mut self,
+        element_row: crate::layout::node_data::NodeSlotId,
+    ) -> Rc<paint::text::SelectionStyleAnswer> {
+        let key = element_row.index;
+        if let Some(answer) = self.selection_style_cache.get(&key) {
+            return answer.clone();
+        }
+        let answer = self
+            .committed_selection_pseudo_style(element_row, element_row)
+            .unwrap_or_else(|| Rc::new(self.default_selection_style(element_row, element_row)));
+        self.selection_style_cache.insert(key, answer.clone());
+        answer
+    }
+
+    fn committed_selection_pseudo_style(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        element_row: crate::layout::node_data::NodeSlotId,
+    ) -> Option<Rc<paint::text::SelectionStyleAnswer>> {
+        let styles = &self.paint_state.selection_pseudo_styles;
+        if let Some(answer) = styles.get(&node) {
+            return Some(answer.clone());
+        }
+        if let Some(answer) = styles.get(&element_row) {
+            return Some(answer.clone());
+        }
+        if self.layout_arena.node_flags_if_live(element_row) & NodeFlag::IsInUserAgentShadowTree as u32 == 0 {
+            return None;
+        }
+        let mut host_row = self.layout_arena.data(element_row).parent.get();
+        while !host_row.is_invalid()
+            && self.layout_arena.node_flags_if_live(host_row) & NodeFlag::IsInUserAgentShadowTree as u32 != 0
+        {
+            host_row = self.layout_arena.data(host_row).parent.get();
+        }
+        if host_row.is_invalid() {
+            return None;
+        }
+        styles.get(&host_row).cloned()
+    }
+
+    fn first_non_anonymous_ancestor_row(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+    ) -> Option<crate::layout::node_data::NodeSlotId> {
+        let mut row = self.layout_arena.data(node).parent.get();
+        while !row.is_invalid() {
+            if self.layout_arena.node_flags_if_live(row) & NodeFlag::Anonymous as u32 == 0 {
+                return Some(row);
+            }
+            row = self.layout_arena.data(row).parent.get();
+        }
+        None
+    }
+
+    fn default_selection_style(
+        &self,
+        node: crate::layout::node_data::NodeSlotId,
+        style_source: crate::layout::node_data::NodeSlotId,
+    ) -> paint::text::SelectionStyleAnswer {
+        use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, PREFERRED_COLOR_SCHEME_LIGHT};
+        let inputs = &self.inputs;
+        let (color_scheme, color_scheme_is_normal) =
+            self.layout_arena
+                .node_style_if_live(style_source)
+                .map_or((0, true), |style| {
+                    let ui = style.inherited_ui();
+                    (ui.color_scheme, ui.color_schemes.as_slice().is_empty())
+                });
+        let use_palette_for_normal_color_scheme = self.layout_arena.node_dom_node(node).is_null()
+            || (color_scheme_is_normal && !inputs.document_has_supported_color_schemes);
+        let palette_color_scheme = if inputs.palette_is_dark {
+            PREFERRED_COLOR_SCHEME_DARK
+        } else {
+            PREFERRED_COLOR_SCHEME_LIGHT
+        };
+        let background_color = if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
+            inputs.selection_background_from_palette
+        } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
+            inputs.selection_background_dark
+        } else {
+            inputs.selection_background_light
+        };
+        paint::text::SelectionStyleAnswer {
+            facts: crate::painting::host::FfiSelectionStyleFacts {
+                background_color,
+                ..Default::default()
+            },
+            shadows: Vec::new(),
+        }
     }
 
     pub(crate) fn border_radii(&mut self, paintable: NodeSlotId) -> BorderRadii {

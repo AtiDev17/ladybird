@@ -9,12 +9,11 @@ use crate::painting::record::trace::Observer;
 use super::{PaintPhase, PaintRecorder};
 use crate::css::css_enums;
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::layout::node_data::{NodeFlag, NodeSlotId};
+use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::fragment_ownership;
 use crate::painting::hit_test::*;
-use crate::painting::host::FfiHitTestTextNodeFacts;
 use crate::painting::node_painting;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
@@ -25,33 +24,20 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HitTestFacts {
     pub(crate) visible_for_hit_testing: bool,
-    pub(crate) dom_node_has_parent: bool,
-    pub(crate) is_editable_or_editing_host: bool,
     pub(crate) has_resizer: bool,
     pub(crate) could_be_scrolled_horizontally: bool,
     pub(crate) could_be_scrolled_vertically: bool,
     pub(crate) svg_path_has_fill: bool,
     pub(crate) svg_path_winding_rule: WindingRule,
-    pub(crate) svg_mask_content_units_object_bbox: bool,
-    pub(crate) svg_clip_path_units_object_bbox: bool,
-    pub(crate) inside_blocking_wheel_event_handler: bool,
 }
 
 pub(crate) fn hit_test_facts(
     arena: &impl crate::painting::paintable_rows::PaintableRowsRead,
     paintable: NodeSlotId,
     inputs: &crate::painting::record::RecordingInputs,
-    dom: crate::painting::host::FfiHitTestPaintableFacts,
 ) -> HitTestFacts {
     let Some(style) = arena.node_style_if_live(paintable) else {
-        return HitTestFacts {
-            dom_node_has_parent: dom.dom_node_has_parent,
-            is_editable_or_editing_host: dom.is_editable_or_editing_host,
-            svg_mask_content_units_object_bbox: dom.svg_mask_content_units_object_bbox,
-            svg_clip_path_units_object_bbox: dom.svg_clip_path_units_object_bbox,
-            inside_blocking_wheel_event_handler: dom.inside_blocking_wheel_event_handler,
-            ..HitTestFacts::default()
-        };
+        return HitTestFacts::default();
     };
     let wheel_axes = crate::painting::chrome_geometry::wheel_scrollable_axes(
         arena,
@@ -65,10 +51,8 @@ pub(crate) fn hit_test_facts(
     let svg = style.inherited_svg();
     HitTestFacts {
         visible_for_hit_testing: arena.paintable_row_is_populated(paintable)
-            && !dom.is_inert
+            && !arena.node_has_dom_paint_fact(paintable, DomPaintFact::Inert)
             && style.inherited_ui().pointer_events != css_enums::pointer_events::NONE,
-        dom_node_has_parent: dom.dom_node_has_parent,
-        is_editable_or_editing_host: dom.is_editable_or_editing_host,
         has_resizer: crate::painting::chrome_geometry::has_resizer(arena, paintable),
         could_be_scrolled_horizontally: wheel_axes.horizontal,
         could_be_scrolled_vertically: wheel_axes.vertical,
@@ -78,23 +62,10 @@ pub(crate) fn hit_test_facts(
         } else {
             WindingRule::Nonzero
         },
-        svg_mask_content_units_object_bbox: dom.svg_mask_content_units_object_bbox,
-        svg_clip_path_units_object_bbox: dom.svg_clip_path_units_object_bbox,
-        inside_blocking_wheel_event_handler: dom.inside_blocking_wheel_event_handler,
     }
 }
 
 impl<'a, O: Observer> PaintRecorder<'a, O> {
-    fn text_node_facts(&mut self, text_node: NodeSlotId) -> FfiHitTestTextNodeFacts {
-        let key = text_node.index;
-        if let Some(facts) = self.text_node_facts_cache.get(&key) {
-            return *facts;
-        }
-        let facts = self.host.text_node_facts(self.layout_arena.shell_if_live(text_node));
-        self.text_node_facts_cache.insert(key, facts);
-        facts
-    }
-
     fn is_anonymous(&self, paintable: NodeSlotId) -> bool {
         crate::painting::style_queries::is_anonymous(self.layout_arena, paintable)
     }
@@ -204,12 +175,24 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
         for target in targets {
             self.append_empty_line_for_fragment(paintable, 0, target.offset, target.line_index, target.rect, context);
         }
-        if !self.layout_arena.paintable_side_data(paintable).fragments().is_empty() {
-            for target in self.host.line_break_caret_targets(self.layout_node_shell(paintable)) {
-                let rect = CssPixelRect::from(target.rect);
-                let caret_node = paintable;
-                self.append_empty_line_for_node(paintable, caret_node, target.caret_offset, rect, context);
+        let empty_lines_ended_by_forced_breaks: Vec<(usize, NodeSlotId, CssPixelRect)> = {
+            let side = self.layout_arena.paintable_side_data(paintable);
+            if side.fragments().is_empty() {
+                return;
             }
+            side.lines()
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.fragment_count == 0 && self.forced_break_node_is_caret_target(line.forced_break_node)
+                })
+                .map(|(line_index, line)| (line_index, line.forced_break_node, CssPixelRect::from(line.rect)))
+                .collect()
+        };
+        let block_position = paintable_geometry::absolute_position(self.layout_arena, paintable);
+        for (line_index, forced_break_node, line_rect) in empty_lines_ended_by_forced_breaks {
+            let line_rect = line_rect.translated_by(block_position);
+            self.append_empty_line_for_node(paintable, forced_break_node, line_index, line_rect, context);
         }
     }
 
@@ -349,7 +332,11 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     }
 
     fn record_empty_editable_hit_test_item(&mut self, paintable: NodeSlotId) {
-        if self.is_anonymous(paintable) || !self.paintable_facts(paintable).is_editable_or_editing_host {
+        if self.is_anonymous(paintable)
+            || !self
+                .layout_arena
+                .node_has_dom_paint_fact(paintable, DomPaintFact::EditableOrEditingHost)
+        {
             return;
         }
         let rect = paintable_geometry::absolute_border_box_rect(self.layout_arena, paintable);
@@ -369,6 +356,28 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
 
     // A text node has no style of its own, so its parent both decides whether the fragment can be hit and is what an
     // event dispatched from it resolves against. Returns that node, or None when the fragment is not hit-testable.
+    fn forced_break_node_is_caret_target(&self, break_node: NodeSlotId) -> bool {
+        if self.layout_arena.node_kind_if_live(break_node) != Some(NodeKind::BreakNode)
+            || self
+                .layout_arena
+                .node_has_dom_paint_fact(break_node, DomPaintFact::Inert)
+        {
+            return false;
+        }
+        let Some(style) = self.layout_arena.node_style_if_live(break_node) else {
+            return false;
+        };
+        if style.visibility() != css_enums::visibility::VISIBLE
+            || style.inherited_ui().pointer_events == css_enums::pointer_events::NONE
+        {
+            return false;
+        }
+        self.layout_arena
+            .node_parent_if_live(break_node)
+            .and_then(|parent| self.layout_arena.node_style_if_live(parent))
+            .is_none_or(|parent_style| parent_style.effects().opacity != 0.0)
+    }
+
     fn hit_node_for_text_fragment(&mut self, fragment: &FragmentRecord) -> Option<NodeSlotId> {
         let node = fragment.layout_node;
         if fragment.is_block_ellipsis || !node_facts::kind_is_text(self.layout_arena.node_kind_if_live(node)?) {
@@ -388,7 +397,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
         {
             return None;
         }
-        if self.text_node_facts(node).is_inert {
+        if self.layout_arena.node_has_dom_paint_fact(node, DomPaintFact::Inert) {
             return None;
         }
         // Resolving the hit needs a committed paintable row; without one there is nothing to resolve against.
@@ -452,8 +461,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
     }
 
     fn node_has_dom_node(&self, node: NodeSlotId) -> bool {
-        !self.layout_arena.shell_if_live(node).is_null()
-            && self.layout_arena.node_flags_if_live(node) & NodeFlag::Anonymous as u32 == 0
+        !self.layout_arena.node_dom_node(node).is_null()
     }
 
     fn absolute_containing_line_box_rect(&self, paintable: NodeSlotId) -> Option<CssPixelRect> {
@@ -496,8 +504,7 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
         let can_produce_caret_position = (self.is_atomic_inline(target) || self.is_replaced_box(target)) && {
             let negative_z =
                 crate::painting::style_queries::effective_z_index(self.layout_arena, target).unwrap_or(0) < 0;
-            let target_node = target;
-            !negative_z && self.node_has_dom_node(target_node) && self.paintable_facts(target).dom_node_has_parent
+            !negative_z && self.node_has_dom_node(target)
         };
         let block_container = self.block_container_of_paintable(paintable_box);
         let item = HitTestItem {
@@ -622,22 +629,22 @@ impl<'a, O: Observer> PaintRecorder<'a, O> {
 
     fn append_empty_line_for_node(
         &mut self,
-        owner: NodeSlotId,
+        block_container: NodeSlotId,
         caret_node: NodeSlotId,
-        caret_offset: usize,
+        caret_line_index: usize,
         line_rect: CssPixelRect,
         context: ContextRef,
     ) {
-        let block_container = self.block_container_of_paintable(owner);
         let item = HitTestItem {
             caret_node,
-            caret_offset,
+            caret_offset: 0,
             caret_rect: line_rect,
+            caret_line_index: Some(caret_line_index),
             caret_line_rect: Some(line_rect),
             block_container_margin_rect: self.containing_block_margin_rect(block_container),
             block_container,
             can_produce_caret_position: self.node_has_dom_node(caret_node),
-            ..self.base_hit_test_item(HitTestItemKind::EmptyLine, owner, context)
+            ..self.base_hit_test_item(HitTestItemKind::EmptyLine, block_container, context)
         };
         self.list.append(item);
     }

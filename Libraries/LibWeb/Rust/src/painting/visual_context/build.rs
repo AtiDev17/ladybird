@@ -8,7 +8,7 @@ use super::box_build::PaintableVisualContextAssignment;
 use super::scroll_state::NO_SCROLL_STATE_SLOT;
 use super::*;
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::host::{FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
+use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
@@ -49,10 +49,7 @@ pub(crate) fn svg_viewport_transform_of(
     layout_arena: &crate::layout::LayoutNodeArena,
     slot: NodeSlotId,
 ) -> Option<AffineTransform> {
-    let t = crate::painting::paintable_geometry::committed_svg_viewport_transform(layout_arena, slot)?;
-    Some(AffineTransform {
-        values: [t.a, t.b, t.c, t.d, t.e, t.f],
-    })
+    crate::painting::paintable_geometry::committed_svg_viewport_transform(layout_arena, slot).map(Into::into)
 }
 
 pub(crate) struct BoxFacts {
@@ -92,7 +89,6 @@ impl BoxFacts {
 
     pub(crate) fn gather(
         layout_arena: &impl PaintableRowsRead,
-        callbacks: &FfiVisualContextHostCallbacks,
         slot: NodeSlotId,
         pixel_ratio: f64,
         consults_default_scroll_shift_anchors: bool,
@@ -123,14 +119,13 @@ impl BoxFacts {
             },
         };
         if let Some((transform, transform_is_invertible)) =
-            super::node_values::compute_transform(layout_arena, callbacks, slot, pixel_ratio)
+            super::node_values::compute_transform(layout_arena, slot, pixel_ratio)
         {
             facts.transform = Some(transform);
             facts.transform_is_invertible = transform_is_invertible;
         }
         facts.perspective = super::node_values::compute_perspective_data(layout_arena, slot, pixel_ratio);
-        facts.effects =
-            super::node_values::compute_effects_data(layout_arena, callbacks, slot, pixel_ratio).map(std::rc::Rc::new);
+        facts.effects = super::node_values::compute_effects_data(layout_arena, slot, pixel_ratio).map(std::rc::Rc::new);
         facts.backface_hidden = super::node_values::backface_hidden(layout_arena, slot);
         let node = slot;
         facts.establishes_or_extends_3d_rendering_context =
@@ -142,7 +137,7 @@ impl BoxFacts {
         facts.clip_path = super::basic_shapes::compute_basic_shape_clip_path_data(layout_arena, slot, pixel_ratio)
             .map(|(path, bounding_rect, fill_rule)| (std::rc::Rc::new(path), bounding_rect, fill_rule));
         let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(pixel_ratio);
-        facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, callbacks, slot, true)
+        facts.mask_layers = super::node_values::mask_layer_presence(layout_arena, slot, true)
             .into_iter()
             .map(|layer| MaskData {
                 rect: converter.enclosing_device_rect(layer.area),

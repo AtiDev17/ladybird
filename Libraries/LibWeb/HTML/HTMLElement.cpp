@@ -54,6 +54,7 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/PointerEvent.h>
@@ -885,25 +886,33 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
     if (is_form_associated_element()) {
         form_node_attribute_changed(name, value);
         form_associated_element_attribute_changed(name, old_value, value, namespace_);
+        if (name == HTML::AttributeNames::disabled) {
+            if (auto* input = as_if<HTMLInputElement>(*this))
+                Painting::push_form_control_paint_facts(*input);
+            set_needs_repaint();
+        }
     }
 }
 
 void HTMLElement::set_subtree_inertness(bool is_inert)
 {
+    auto repaint_if_inertness_reaches_painted_output = [](DOM::Node& node) {
+        auto* layout_node = node.unsafe_layout_node();
+        if (layout_node && layout_node->refresh_dom_paint_facts())
+            node.set_needs_repaint();
+    };
     auto update_inertness = [&](HTMLElement& element) {
         if (element.is_inert() == is_inert)
             return;
         element.set_inert(is_inert);
-        element.set_needs_repaint();
+        repaint_if_inertness_reaches_painted_output(element);
     };
 
     update_inertness(*this);
-    for_each_in_subtree_of_type<Element>([&](auto& element) {
-        auto* html_element = as_if<HTMLElement>(element);
+    for_each_in_subtree([&](DOM::Node& node) {
+        auto* html_element = as_if<HTMLElement>(node);
         if (!html_element) {
-            // Non-HTML elements (SVG, MathML) carry no inert flag and resolve is_inert() through
-            // their nearest HTML ancestor, so their recorded hit-test output must be repainted here.
-            element.set_needs_repaint();
+            repaint_if_inertness_reaches_painted_output(node);
             return TraversalDecision::Continue;
         }
         if (html_element->has_attribute(HTML::AttributeNames::inert))

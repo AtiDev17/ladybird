@@ -5,13 +5,11 @@
  */
 
 use crate::css::css_pixels::CssPixelRect;
-use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::display_list::recorder::{IsolatedGroupEffects, OpenRecorderGroup};
 use crate::painting::node_painting;
-use crate::painting::paintable_geometry::absolute_border_box_rect;
 use crate::painting::record::cache::{CaptureKind, CaptureSite};
 use crate::painting::record::trace::{Action, Observer, Operation};
 use crate::painting::record::{PaintPhase, PaintRecorder};
@@ -106,12 +104,7 @@ fn transformed_int_rect_clip(transform: AffineTransform, rect: libgfx_rust::IntR
 
 impl<O: Observer> PaintRecorder<'_, O> {
     fn mask_layer_presence(&self, paintable: NodeSlotId, set: MaskLayerSet) -> Vec<MaskLayerPresenceEntry> {
-        mask_layer_presence(
-            self.layout_arena,
-            self.visual_context_host,
-            paintable,
-            set == MaskLayerSet::CssAndSvg,
-        )
+        mask_layer_presence(self.layout_arena, paintable, set == MaskLayerSet::CssAndSvg)
     }
 
     fn mask_effect_of_layer(
@@ -173,47 +166,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     fn first_child_paintable_of_kind(&self, paintable: NodeSlotId, kind: NodeKind) -> Option<NodeSlotId> {
-        let arena = self.layout_arena;
-        let mut child = arena.node_first_child_if_live(paintable);
-        while let Some(node) = child {
-            if arena.node_kind_if_live(node) == Some(kind) {
-                return self.layout_arena.paintable_row_is_populated(node).then_some(node);
-            }
-            child = arena.node_next_sibling_if_live(node);
-        }
-        None
-    }
-
-    fn target_user_space_object_bounding_box(&self, target: NodeSlotId) -> CssPixelRect {
-        if self
-            .layout_arena
-            .node_kind_if_live(target)
-            .is_some_and(node_painting::is_svg_path)
-            && let Some(path) = crate::painting::paintable_geometry::committed_svg_path(self.layout_arena, target)
-        {
-            let [x, y, width, height] = path.bounding_box();
-            return CssPixelRect::new(
-                CssPixels::nearest_value_for_f32(x),
-                CssPixels::nearest_value_for_f32(y),
-                CssPixels::nearest_value_for_f32(width),
-                CssPixels::nearest_value_for_f32(height),
-            );
-        }
-        absolute_border_box_rect(self.layout_arena, target)
+        crate::painting::svg_masking::first_child_paintable_of_kind(self.layout_arena, paintable, kind)
     }
 
     fn object_bounding_box_content_units_transform(&self, target: NodeSlotId) -> AffineTransform {
-        let bounding_box = self.target_user_space_object_bounding_box(target);
-        AffineTransform {
-            values: [
-                bounding_box.width.to_float(),
-                0.0,
-                0.0,
-                bounding_box.height.to_float(),
-                bounding_box.x.to_float(),
-                bounding_box.y.to_float(),
-            ],
-        }
+        crate::painting::svg_masking::object_bounding_box_content_units_transform(self.layout_arena, target)
     }
 
     fn record_referenced_svg_mask_or_clip_content(
@@ -222,24 +179,19 @@ impl<O: Observer> PaintRecorder<'_, O> {
         origin: MaskLayerOrigin,
         target_to_enclosing_space: AffineTransform,
     ) {
-        let (resource_kind, content_units_object_bbox, draws_clip_path_geometry, producer) = match origin {
-            MaskLayerOrigin::SvgMask => (
-                NodeKind::SVGMaskBox,
-                self.hit_test_facts(target).svg_mask_content_units_object_bbox,
-                false,
-                "svg-mask",
-            ),
-            MaskLayerOrigin::SvgClip => (
-                NodeKind::SVGClipBox,
-                self.hit_test_facts(target).svg_clip_path_units_object_bbox,
-                true,
-                "svg-clip",
-            ),
+        let (resource_kind, draws_clip_path_geometry, producer) = match origin {
+            MaskLayerOrigin::SvgMask => (NodeKind::SVGMaskBox, false, "svg-mask"),
+            MaskLayerOrigin::SvgClip => (NodeKind::SVGClipBox, true, "svg-clip"),
             MaskLayerOrigin::CssMaskLayers => unreachable!("CSS mask layers are painted, not walked"),
         };
         let Some(resource_box) = self.first_child_paintable_of_kind(target, resource_kind) else {
             return;
         };
+        let content_units_object_bbox =
+            crate::painting::paintable_geometry::committed_svg_resource_content_units_are_object_bounding_box(
+                self.layout_arena,
+                resource_box,
+            );
         let mut content_units_transform_in_recorded_space = if content_units_object_bbox {
             self.object_bounding_box_content_units_transform(target)
         } else {
@@ -330,7 +282,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         }
         let facts = BoxFacts::gather(
             self.layout_arena,
-            self.visual_context_host,
             svg_box,
             self.inputs.device_pixels_per_css_pixel,
             false,

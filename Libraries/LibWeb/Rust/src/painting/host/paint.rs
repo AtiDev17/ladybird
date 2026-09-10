@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::css_pixels::CssPixels;
+use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
 use crate::painting::display_list::builder::RecordedDisplayList;
 use crate::painting::display_list::commands::DisplayListCommandRun;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
-use libgfx_rust::{AffineTransform, Color, FloatMatrix4x4, FloatRect, FloatSize, IntRect, InterpolationColorSpace};
+use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +40,11 @@ pub struct FfiRecordingInputs {
     pub paint_command_cache_read_write: bool,
     pub window_is_focused: bool,
     pub outline_auto_color: Color,
+    pub selection_background_from_palette: Color,
+    pub selection_background_light: Color,
+    pub selection_background_dark: Color,
+    pub palette_is_dark: bool,
+    pub document_has_supported_color_schemes: bool,
     pub has_inspector_highlight: bool,
     pub inspector_highlight_paintable: crate::layout::node_data::NodeSlotId,
     pub tooltip_color: Color,
@@ -141,32 +148,51 @@ pub struct FfiFlexOverlayInput {
     pub color: Color,
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiImageIntrinsicFacts {
-    pub is_paintable: bool,
-    pub natural_width: used_values::OptionalCssPixels,
-    pub natural_height: used_values::OptionalCssPixels,
-    pub has_natural_aspect_ratio: bool,
-    pub natural_aspect_ratio_numerator: crate::css::css_pixels::CssPixels,
-    pub natural_aspect_ratio_denominator: crate::css::css_pixels::CssPixels,
-    pub has_selected_image_value: bool,
-    pub selected_image_value: *const c_void,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiImageContentKind {
+    #[default]
+    None,
+    Raster,
+    Vector,
 }
 
-impl Default for FfiImageIntrinsicFacts {
-    fn default() -> Self {
-        Self {
-            is_paintable: false,
-            natural_width: Default::default(),
-            natural_height: Default::default(),
-            has_natural_aspect_ratio: false,
-            natural_aspect_ratio_numerator: Default::default(),
-            natural_aspect_ratio_denominator: Default::default(),
-            has_selected_image_value: false,
-            selected_image_value: std::ptr::null(),
-        }
-    }
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiNaturalSize {
+    pub width: used_values::OptionalCssPixels,
+    pub height: used_values::OptionalCssPixels,
+    pub has_aspect_ratio: bool,
+    pub aspect_ratio_numerator: crate::css::css_pixels::CssPixels,
+    pub aspect_ratio_denominator: crate::css::css_pixels::CssPixels,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiImageContent {
+    pub kind: FfiImageContentKind,
+    pub vector_content_identity: u64,
+    pub vector_has_active_view_box: bool,
+    pub frame: *const c_void,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiLayerImagePaintFacts {
+    pub is_paintable: bool,
+    pub natural: FfiNaturalSize,
+    pub has_image_set_selected_option: bool,
+    pub image_set_selected_option_index: u32,
+    pub content: FfiImageContent,
+    pub single_pixel_color: OptionalColor,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiLayerImagePaintFactsEntry {
+    pub list: FfiLayerImageList,
+    pub computed_index: u32,
+    pub facts: FfiLayerImagePaintFacts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -178,65 +204,23 @@ pub enum FfiVideoRepresentation {
     TransparentBlack,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiReplacedPaintFacts {
-    pub has_decoded_image_data: bool,
-    pub natural_width: used_values::OptionalCssPixels,
-    pub natural_height: used_values::OptionalCssPixels,
-    pub has_natural_aspect_ratio: bool,
-    pub natural_aspect_ratio_numerator: crate::css::css_pixels::CssPixels,
-    pub natural_aspect_ratio_denominator: crate::css::css_pixels::CssPixels,
-    pub selection_background_color: Color,
-    pub has_canvas_content: bool,
-    pub canvas_content_width: i32,
-    pub canvas_content_height: i32,
-    pub canvas_id: u64,
-    pub canvas_content_generation: u64,
-    pub video_representation: FfiVideoRepresentation,
+pub struct FfiReplacedImagePaintFacts {
+    pub natural: FfiNaturalSize,
+    pub content: FfiImageContent,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiVideoPaintFacts {
+    pub representation: FfiVideoRepresentation,
     pub has_video_frame: bool,
     pub video_src_width: i32,
     pub video_src_height: i32,
-    pub video_sink_storage_id: u64,
-    pub has_poster_frame: bool,
-    pub poster_frame_id: u64,
-    pub poster_width: i32,
-    pub poster_height: i32,
-    pub has_composited_context: bool,
-    pub composited_context_id: u64,
-    pub enabled: bool,
-    pub checked: bool,
-    pub indeterminate: bool,
-    pub being_activated: bool,
-    pub canvas_color: Color,
-    pub canvas_text_color: Color,
-    pub accent_color: Color,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiSvgImageFacts {
-    pub has_decoded_image_data: bool,
-    pub natural_size: used_values::OptionalFloatSize,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiSvgPaintContext {
-    pub viewport: FloatRect,
-    pub path_bounding_box: FloatRect,
-    pub paint_transform: AffineTransform,
-    pub content_scale: FloatSize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiSvgPaintStyleKind {
-    #[default]
-    None,
-    LinearGradient,
-    RadialGradient,
-    Pattern,
+    pub video_sink_resource_id: u64,
+    pub video_sink_handle: u64,
+    pub poster_frame: *const c_void,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,43 +232,55 @@ pub enum FfiSvgGradientSpreadMethod {
     Reflect,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiSvgPaintStyle {
-    pub kind: FfiSvgPaintStyleKind,
-    pub gradient_transform: OptionalAffineTransform,
-    pub spread_method: FfiSvgGradientSpreadMethod,
-    pub color_space: InterpolationColorSpace,
-    pub start: libgfx_rust::FloatPoint,
-    pub end: libgfx_rust::FloatPoint,
-    pub start_radius: f32,
-    pub end_radius: f32,
-    pub pattern_paintable: crate::layout::node_data::NodeSlotId,
-    pub tile_content_transform: FloatMatrix4x4,
-    pub tile_rect: FloatRect,
-    pub content_scale: FloatSize,
-    pub pattern_transform: OptionalAffineTransform,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FfiScrollNodeKind {
+pub enum FfiSvgGradientKind {
     #[default]
-    None,
-    Viewport,
-    Element,
-    PseudoElement,
+    Linear,
+    Radial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FfiSvgGradientDescription {
+    pub kind: FfiSvgGradientKind,
+    pub units_are_object_bounding_box: bool,
+    pub spread_method: FfiSvgGradientSpreadMethod,
+    pub color_space: InterpolationColorSpace,
+    pub gradient_transform: OptionalAffineTransform,
+    pub x1: FfiSvgNumberPercentage,
+    pub y1: FfiSvgNumberPercentage,
+    pub x2: FfiSvgNumberPercentage,
+    pub y2: FfiSvgNumberPercentage,
+    pub cx: FfiSvgNumberPercentage,
+    pub cy: FfiSvgNumberPercentage,
+    pub r: FfiSvgNumberPercentage,
+    pub fx: FfiSvgNumberPercentage,
+    pub fy: FfiSvgNumberPercentage,
+    pub fr: FfiSvgNumberPercentage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FfiSvgPatternDescription {
+    pub pattern_box: crate::layout::node_data::NodeSlotId,
+    pub units_are_object_bounding_box: bool,
+    pub content_units_are_object_bounding_box: bool,
+    pub has_view_box: bool,
+    pub x: FfiSvgNumberPercentage,
+    pub y: FfiSvgNumberPercentage,
+    pub width: FfiSvgNumberPercentage,
+    pub height: FfiSvgNumberPercentage,
+    pub pattern_transform_attribute: OptionalAffineTransform,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub struct FfiAsyncScrollFacts {
-    pub is_nested_navigable_container: bool,
-    pub scroll_node_kind: FfiScrollNodeKind,
-    pub scrollable_node_id: i64,
-    pub pseudo_element_type: u8,
-    pub snaps_scroll_position_horizontally: bool,
-    pub snaps_scroll_position_vertically: bool,
+pub struct FfiSelectionShadowLayer {
+    pub color: Color,
+    pub offset_x: CssPixels,
+    pub offset_y: CssPixels,
+    pub blur_radius: CssPixels,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -300,57 +296,24 @@ pub struct FfiSelectionStyleFacts {
     pub text_decoration_color: Color,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FfiLayerImageList {
     Background,
     Mask,
     BorderImageSource,
-    DocumentBackground,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct FfiLayerImagePrepareFacts {
-    pub is_image_style_value: bool,
-    pub single_pixel_color: OptionalColor,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiLayerImageNestedDisplayListFacts {
-    pub has_nested_display_list: bool,
-    pub nested_display_list_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiLayerImageFrameFacts {
-    pub has_frame: bool,
-    pub frame_id: u64,
-    pub frame_width: i32,
-    pub frame_height: i32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiImagePaintKind {
-    #[default]
-    None,
-    DecodedFrame,
-    NestedDisplayList,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiImagePaintFacts {
-    pub image_paint_kind: FfiImagePaintKind,
-    pub frame_id: u64,
-    pub natural_width: i32,
-    pub natural_height: i32,
-    pub nested_display_list_id: u64,
-    pub list_width: i32,
-    pub list_height: i32,
+pub struct FfiVectorImageRenderRequest {
+    pub owner: crate::layout::node_data::NodeSlotId,
+    pub is_replaced_content: bool,
+    pub list: FfiLayerImageList,
+    pub computed_index: u32,
+    pub css_width: crate::css::css_pixels::CssPixels,
+    pub css_height: crate::css::css_pixels::CssPixels,
+    pub raster_scale: f32,
 }
 
 // A recording lent to C++ for the duration of one call. An empty Vec's pointer is dangling, so
@@ -386,184 +349,68 @@ impl From<&RecordedDisplayList> for FfiRecordedDisplayList {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiFormControlPaintFacts {
+    pub enabled: bool,
+    pub checked: bool,
+    pub indeterminate: bool,
+    pub being_activated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiCanvasPaintFacts {
+    pub has_content: bool,
+    pub content_width: i32,
+    pub content_height: i32,
+    pub canvas_id: u64,
+    pub content_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiNavigableContainerPaintFacts {
+    pub has_composited_context: bool,
+    pub composited_context_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiSnapAxes {
+    pub x: bool,
+    pub y: bool,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiPaintHostCallbacks {
+pub struct FfiRecordingPublishCallbacks {
     pub context: *mut c_void,
-    pub debug_description: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
-    pub recording_trace: unsafe extern "C" fn(*mut c_void, *const u8, usize),
-    pub async_scroll_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiAsyncScrollFacts,
-    pub image_intrinsic_facts:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, FfiLayerImageList, u32) -> FfiImageIntrinsicFacts,
-    pub selection_style_facts: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> FfiSelectionStyleFacts,
-    pub register_font: unsafe extern "C" fn(*mut c_void, *const c_void) -> u64,
-    pub layer_image_prepare:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, FfiLayerImageList, u32) -> FfiLayerImagePrepareFacts,
-    pub layer_image_nested_display_list: unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        FfiLayerImageList,
-        u32,
-        IntRect,
-    ) -> FfiLayerImageNestedDisplayListFacts,
-    pub layer_image_current_frame:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, FfiLayerImageList, u32, IntRect) -> FfiLayerImageFrameFacts,
-    pub layer_image_paint: unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        FfiLayerImageList,
-        u32,
-        FloatRect,
-        u8,
-        FloatSize,
-    ) -> FfiImagePaintFacts,
-    pub replaced_paint_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiReplacedPaintFacts,
-    pub replaced_image_paint:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, FloatRect, FloatSize) -> FfiImagePaintFacts,
-    pub svg_image_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgImageFacts,
-    pub svg_paint_style: unsafe extern "C" fn(
-        *mut c_void,
-        *mut c_void,
-        bool,
-        *const FfiSvgPaintContext,
-        *mut c_void,
-    ) -> FfiSvgPaintStyle,
+    pub add_font: unsafe extern "C" fn(*mut c_void, *const c_void),
+    pub add_image_frame: unsafe extern "C" fn(*mut c_void, *const c_void),
+    pub resolve_vector_image_display_list: unsafe extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
+    pub add_video_sink: unsafe extern "C" fn(*mut c_void, u64, u64),
 }
 
-#[derive(Default)]
-pub struct ColorStopSink {
-    pub colors: Vec<Color>,
-    pub positions: Vec<f32>,
-}
-
-impl FfiPaintHostCallbacks {
-    pub(crate) fn async_scroll_facts(&self, layout_node_shell: *mut c_void) -> FfiAsyncScrollFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.async_scroll_facts)(self.context, layout_node_shell) }
+impl FfiRecordingPublishCallbacks {
+    pub(crate) fn add_font(&self, font: &libgfx_rust::font::FontHandle) {
+        // SAFETY: The C++ host registers the live font synchronously.
+        unsafe { (self.add_font)(self.context, font.as_raw()) };
     }
 
-    pub(crate) fn selection_style_facts(
-        &self,
-        layout_node_shell: *mut c_void,
-    ) -> (
-        FfiSelectionStyleFacts,
-        Vec<crate::painting::record::paint::text::ShadowLayer>,
-    ) {
-        let mut shadows: Vec<crate::painting::record::paint::text::ShadowLayer> = Vec::new();
-        // SAFETY: The C++ host answers synchronously, pushing shadow layers into
-        // the sink through the exported function.
-        let facts = unsafe { (self.selection_style_facts)(self.context, layout_node_shell, (&raw mut shadows).cast()) };
-        (facts, shadows)
+    pub(crate) fn add_image_frame(&self, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
+        // SAFETY: The C++ host copies the live frame synchronously.
+        unsafe { (self.add_image_frame)(self.context, frame.as_raw()) };
     }
-    pub(crate) fn register_font(&self, font: *const c_void) -> u64 {
-        // SAFETY: The C++ host registers the live font in the recording's
-        // resource table synchronously.
-        unsafe { (self.register_font)(self.context, font) }
+
+    pub(crate) fn resolve_vector_image_display_list(&self, request: &FfiVectorImageRenderRequest) -> u64 {
+        // SAFETY: The C++ host records the image's display list synchronously and reads the
+        // request only for the duration of the call.
+        unsafe { (self.resolve_vector_image_display_list)(self.context, request) }
     }
-    pub(crate) fn layer_image_prepare(
-        &self,
-        layout_node_shell: *mut c_void,
-        list: FfiLayerImageList,
-        computed_index: u32,
-    ) -> FfiLayerImagePrepareFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.layer_image_prepare)(self.context, layout_node_shell, list, computed_index) }
-    }
-    pub(crate) fn layer_image_nested_display_list(
-        &self,
-        layout_node_shell: *mut c_void,
-        list: FfiLayerImageList,
-        computed_index: u32,
-        device_dest_rect: libgfx_rust::IntRect,
-    ) -> FfiLayerImageNestedDisplayListFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe {
-            (self.layer_image_nested_display_list)(
-                self.context,
-                layout_node_shell,
-                list,
-                computed_index,
-                device_dest_rect,
-            )
-        }
-    }
-    pub(crate) fn layer_image_current_frame(
-        &self,
-        layout_node_shell: *mut c_void,
-        list: FfiLayerImageList,
-        computed_index: u32,
-        device_dest_rect: libgfx_rust::IntRect,
-    ) -> FfiLayerImageFrameFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe {
-            (self.layer_image_current_frame)(self.context, layout_node_shell, list, computed_index, device_dest_rect)
-        }
-    }
-    pub(crate) fn layer_image_paint(
-        &self,
-        layout_node_shell: *mut c_void,
-        list: FfiLayerImageList,
-        computed_index: u32,
-        dest: FloatRect,
-        image_rendering: u8,
-        accumulated_scale: libgfx_rust::FloatSize,
-    ) -> FfiImagePaintFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe {
-            (self.layer_image_paint)(
-                self.context,
-                layout_node_shell,
-                list,
-                computed_index,
-                dest,
-                image_rendering,
-                accumulated_scale,
-            )
-        }
-    }
-    pub(crate) fn image_intrinsic_facts(
-        &self,
-        layout_node_shell: *mut c_void,
-        list: FfiLayerImageList,
-        computed_index: u32,
-    ) -> FfiImageIntrinsicFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.image_intrinsic_facts)(self.context, layout_node_shell, list, computed_index) }
-    }
-    pub(crate) fn replaced_paint_facts(&self, layout_node_shell: *mut c_void) -> FfiReplacedPaintFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.replaced_paint_facts)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn replaced_image_paint(
-        &self,
-        layout_node_shell: *mut c_void,
-        dest: FloatRect,
-        accumulated_scale: libgfx_rust::FloatSize,
-    ) -> FfiImagePaintFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.replaced_image_paint)(self.context, layout_node_shell, dest, accumulated_scale) }
-    }
-    pub(crate) fn svg_image_facts(&self, layout_node_shell: *mut c_void) -> FfiSvgImageFacts {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.svg_image_facts)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn svg_paint_style(
-        &self,
-        layout_node_shell: *mut c_void,
-        is_stroke: bool,
-        paint_context: &FfiSvgPaintContext,
-    ) -> (FfiSvgPaintStyle, ColorStopSink) {
-        let mut sink = ColorStopSink::default();
-        // SAFETY: The C++ host answers synchronously, pushing color stops into the sink through the exported function.
-        let style = unsafe {
-            (self.svg_paint_style)(
-                self.context,
-                layout_node_shell,
-                is_stroke,
-                paint_context,
-                (&raw mut sink).cast(),
-            )
-        };
-        (style, sink)
+
+    pub(crate) fn add_video_sink(&self, resource_id: u64, sink_handle: u64) {
+        // SAFETY: The C++ host registers the sink synchronously.
+        unsafe { (self.add_video_sink)(self.context, resource_id, sink_handle) };
     }
 }

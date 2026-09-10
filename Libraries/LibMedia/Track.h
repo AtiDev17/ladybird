@@ -8,12 +8,14 @@
 
 #include <AK/Assertions.h>
 #include <AK/HashFunctions.h>
+#include <AK/StdLibExtras.h>
 #include <AK/Time.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <LibMedia/Audio/SampleSpecification.h>
+#include <LibMedia/CodecParameters.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 #include <LibMedia/TrackType.h>
 
@@ -49,23 +51,25 @@ public:
 
     Track(TrackType type, size_t identifier, Kind kind, Utf16String const& label, Utf16String const& language)
         : m_type(type)
-        , m_identifier(identifier)
         , m_kind(kind)
+        , m_identifier(identifier)
         , m_label(label)
         , m_language(language)
     {
         switch (m_type) {
         case TrackType::Video:
-            m_track_data = VideoData {};
+            m_track_data.video = {};
             break;
         case TrackType::Audio:
-            m_track_data = AudioData {};
+            m_track_data.audio = {};
             break;
         default:
-            m_track_data = Empty {};
             break;
         }
     }
+
+    ParsedCodec const& parsed_codec() const { return m_parsed_codec; }
+    void set_parsed_codec(ParsedCodec parsed_codec) { m_parsed_codec = parsed_codec; }
 
     TrackType type() const { return m_type; }
     size_t identifier() const { return m_identifier; }
@@ -76,25 +80,25 @@ public:
     void set_video_data(VideoData data)
     {
         VERIFY(m_type == TrackType::Video);
-        m_track_data = data;
+        m_track_data.video = data;
     }
 
     VideoData const& video_data() const
     {
         VERIFY(m_type == TrackType::Video);
-        return m_track_data.get<VideoData>();
+        return m_track_data.video;
     }
 
     void set_audio_data(AudioData data)
     {
         VERIFY(m_type == TrackType::Audio);
-        m_track_data = data;
+        m_track_data.audio = data;
     }
 
     AudioData const& audio_data() const
     {
         VERIFY(m_type == TrackType::Audio);
-        return m_track_data.get<AudioData>();
+        return m_track_data.audio;
     }
 
     bool operator==(Track const& other) const
@@ -108,13 +112,22 @@ public:
     }
 
 private:
+    static_assert(IsTriviallyCopyable<VideoData>);
+    static_assert(IsTriviallyCopyable<AudioData>);
+
+    union TrackData {
+        Empty none;
+        VideoData video;
+        AudioData audio;
+    };
+
+    ParsedCodec m_parsed_codec { CodecID::Unknown };
     TrackType m_type { 0 };
-    size_t m_identifier { 0 };
     Kind m_kind { Kind::None };
+    size_t m_identifier { 0 };
     Utf16String m_label;
     Utf16String m_language;
-
-    Variant<Empty, VideoData, AudioData> m_track_data;
+    TrackData m_track_data { .none = {} };
 };
 
 constexpr Utf16View track_kind_to_string(Track::Kind kind)

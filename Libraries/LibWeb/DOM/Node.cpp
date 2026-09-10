@@ -2119,6 +2119,8 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         // (an editing host gains a minimum block size, an empty editable text node gains
         // a zero-width fragment), so the affected node also needs a relayout.
         if (auto* layout_node = node.unsafe_layout_node()) {
+            if (layout_node->refresh_dom_paint_facts())
+                node.set_needs_repaint();
             auto is_editing_host = node.is_editing_host();
             if (layout_node->is_editing_host() != is_editing_host) {
                 layout_node->set_is_editing_host(is_editing_host);
@@ -2220,6 +2222,11 @@ void Node::set_layout_node(Badge<Layout::Node>, Layout::Node& layout_node)
 {
     if (m_layout_node && m_layout_node.ptr() != &layout_node)
         m_layout_node->pin_style_record_for_detachment();
+    m_layout_node = layout_node;
+}
+
+void Node::rebind_layout_node(Badge<Layout::Node>, Layout::Node& layout_node)
+{
     m_layout_node = layout_node;
 }
 
@@ -2479,7 +2486,12 @@ bool Node::update_inside_blocking_wheel_event_handler_state()
     if (!m_inside_blocking_wheel_event_handler && !is_root_wheel_event_target(*this) && has_blocking_wheel_event_listener())
         m_inside_blocking_wheel_event_handler = true;
 
-    return was_inside_blocking_wheel_event_handler != m_inside_blocking_wheel_event_handler;
+    bool const flipped = was_inside_blocking_wheel_event_handler != m_inside_blocking_wheel_event_handler;
+    if (flipped) {
+        if (auto* layout_node = unsafe_layout_node())
+            layout_node->refresh_dom_paint_facts();
+    }
+    return flipped;
 }
 
 static void set_needs_repaint_of_top_layer_boxes(Element& element, Layout::Node const* layout_node_repainted_by_caller)

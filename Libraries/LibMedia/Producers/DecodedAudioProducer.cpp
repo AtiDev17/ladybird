@@ -7,6 +7,7 @@
 #include <AK/Debug.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/Audio/SampleSpecification.h>
+#include <LibMedia/CodecParameters.h>
 #include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
@@ -192,13 +193,44 @@ void DecodedAudioProducer::ThreadData::wait_for_queue_space_or_auto_suspend_whil
     m_auto_suspend_requested = true;
 }
 
+AudioDecoderSelection DecodedAudioProducer::ThreadData::select_decoder_for_frame(CodedFrame const& frame, AudioDecoderSelection after) const
+{
+    return select_audio_decoder(parsed_codec_for_coded_frame(frame, m_track.parsed_codec()), after);
+}
+
+void DecodedAudioProducer::ThreadData::replace_decoder_once_drained(CodedFrame const& frame)
+{
+    m_frame_awaiting_decoder_replacement = frame;
+    m_decoder->signal_end_of_stream();
+}
+
+DecoderErrorOr<void> DecodedAudioProducer::ThreadData::receive_into_decoder(CodedFrame const& frame)
+{
+    auto receive_result = m_decoder->receive_coded_data(frame);
+
+    if (receive_result.is_error() && receive_result.error().category() == DecoderErrorCategory::NotImplemented) {
+        m_decoder_that_failed_due_to_missing_features = m_decoder_selection;
+        replace_decoder_once_drained(frame);
+        return {};
+    }
+
+    return receive_result;
+}
+
 DecoderErrorOr<void> DecodedAudioProducer::ThreadData::create_decoder_for_frame(CodedFrame const& frame)
 {
     auto const& sample_specification = m_track.audio_data().sample_specification;
     auto codec_initialization_data = frame.new_codec_configuration();
     if (!codec_initialization_data.has_value())
         return DecoderError::with_description(DecoderErrorCategory::Corrupted, "Coded frame starting a decode sequence carries no codec configuration"sv);
-    m_decoder = TRY(create_audio_decoder(frame.codec_id(), sample_specification, *codec_initialization_data));
+
+    auto selection = select_decoder_for_frame(frame, m_decoder_that_failed_due_to_missing_features);
+    m_decoder_that_failed_due_to_missing_features = {};
+    if (!selection.has_value())
+        return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find an audio decoder for codec {}", frame.codec_id());
+
+    m_decoder = TRY(create_audio_decoder(selection, frame.codec_id(), sample_specification, *codec_initialization_data));
+    m_decoder_selection = selection;
     m_decoder_codec_id = frame.codec_id();
     return {};
 }
@@ -208,12 +240,17 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::receive_coded_frame(Coded
     VERIFY(!m_frame_awaiting_decoder_replacement.has_value());
     if (m_decoder == nullptr) [[unlikely]] {
         TRY(create_decoder_for_frame(frame));
-    } else if (m_decoder_codec_id != frame.codec_id()) [[unlikely]] {
-        m_frame_awaiting_decoder_replacement = frame;
-        m_decoder->signal_end_of_stream();
-        return {};
+    } else {
+        auto frame_carries_new_config = frame.new_codec_configuration().has_value();
+        auto decoder_needs_replacement = m_decoder_codec_id != frame.codec_id();
+        if (!decoder_needs_replacement && frame_carries_new_config)
+            decoder_needs_replacement = select_decoder_for_frame(frame) != m_decoder_selection;
+        if (decoder_needs_replacement) [[unlikely]] {
+            replace_decoder_once_drained(frame);
+            return {};
+        }
     }
-    return m_decoder->receive_coded_data(frame);
+    return receive_into_decoder(frame);
 }
 
 DecoderErrorOr<bool> DecodedAudioProducer::ThreadData::replace_drained_decoder()
@@ -222,8 +259,12 @@ DecoderErrorOr<bool> DecodedAudioProducer::ThreadData::replace_drained_decoder()
         return false;
     auto frame = m_frame_awaiting_decoder_replacement.release_value();
     m_converter->flush();
+    if (!frame.new_codec_configuration().has_value()) {
+        TRY(m_demuxer->seek_to_most_recent_keyframe(m_track, frame.presentation_timestamp(), DemuxerSeekOptions::Force | DemuxerSeekOptions::NeedCodecConfiguration));
+        frame = TRY(m_demuxer->get_next_sample_for_track(m_track));
+    }
     TRY(create_decoder_for_frame(frame));
-    TRY(m_decoder->receive_coded_data(frame));
+    TRY(receive_into_decoder(frame));
     return true;
 }
 
@@ -267,7 +308,6 @@ void DecodedAudioProducer::ThreadData::consume()
     note_consumer_activity_while_locked();
     if (m_queue.is_empty())
         return;
-    m_earliest_available_timestamp = m_queue.head().block.media_time_end();
     m_queue.dequeue();
     wake();
 }
@@ -332,7 +372,6 @@ bool DecodedAudioProducer::ThreadData::handle_auto_suspension()
     VERIFY(!m_auto_suspended);
 
     m_queue.clear();
-    m_latest_available_timestamp = m_earliest_available_timestamp;
     m_decoder.clear();
     m_decoder_needs_keyframe_next_seek = true;
     m_decoder_needs_codec_configuration_next_seek = true;
@@ -371,9 +410,6 @@ void DecodedAudioProducer::ThreadData::queue_block(AudioBlock const& block)
     // FIXME: Specify trailing samples in the demuxer, and drop them here or in the audio decoder implementation.
 
     VERIFY(!block.is_empty());
-    if (m_seek_id.load() != m_last_processed_seek_id)
-        return;
-    m_latest_available_timestamp = block.media_time_end();
     m_queue.enqueue({ block });
     VERIFY(!m_queue.tail().block.is_empty());
     dispatch_wake_if_needed_while_locked();
@@ -422,11 +458,9 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::retrieve_next_block(Audio
     }
 }
 
-void DecodedAudioProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
+void DecodedAudioProducer::ThreadData::resolve_seek(u32 seek_id)
 {
     m_last_processed_seek_id = seek_id;
-    if (moved_position)
-        m_current_halting_status = PipelineStatus::Pending;
 }
 
 bool DecodedAudioProducer::ThreadData::handle_seek()
@@ -438,15 +472,12 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
         return false;
 
     AK::Duration timestamp;
-    bool moved_position = false;
     AudioBlock last_block;
 
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
-        if (moved_position)
-            m_current_halting_status = PipelineStatus::Pending;
         enter_halting_state(PipelineStatus::Error, move(error));
-        m_last_processed_seek_id = seek_id;
+        resolve_seek(seek_id);
     };
 
     while (true) {
@@ -456,6 +487,7 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
             timestamp = m_seek_timestamp;
             m_demuxer->reset_blocking_reads_aborted_for_track(m_track);
             m_queue.clear();
+            m_current_halting_status = PipelineStatus::Pending;
             m_frame_awaiting_decoder_replacement.clear();
         }
 
@@ -479,7 +511,6 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
 
         if (demuxer_seek_result == DemuxerSeekResult::MovedPosition) {
             flush_decoder();
-            moved_position = true;
             last_block.clear();
         }
 
@@ -491,7 +522,7 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
                 if (coded_frame_result.error().category() == DecoderErrorCategory::EndOfStream) {
                     if (m_decoder == nullptr) {
                         auto locker = take_lock();
-                        resolve_seek(seek_id, moved_position);
+                        resolve_seek(seek_id);
                         return true;
                     }
                     m_decoder->signal_end_of_stream();
@@ -526,7 +557,7 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
                             continue;
 
                         auto locker = take_lock();
-                        resolve_seek(seek_id, moved_position);
+                        resolve_seek(seek_id);
                         if (!last_block.is_empty())
                             queue_block(last_block);
                         return true;
@@ -539,9 +570,16 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
                     return true;
                 }
 
+                if (current_block.contains_media_time(timestamp)) {
+                    auto locker = take_lock();
+                    resolve_seek(seek_id);
+                    queue_block(current_block);
+                    return true;
+                }
+
                 if (current_block.media_time_start() > timestamp) {
                     auto locker = take_lock();
-                    resolve_seek(seek_id, moved_position);
+                    resolve_seek(seek_id);
 
                     if (!last_block.is_empty())
                         queue_block(last_block);

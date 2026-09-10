@@ -61,6 +61,7 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -90,6 +91,11 @@ bool is_integral_multiple(double value, double step)
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLInputElement);
+
+Layout::Node const* HTMLInputElement::image_provider_layout_node() const
+{
+    return unsafe_layout_node();
+}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name, DOM::EventInit const& event_init = {})
 {
@@ -150,8 +156,10 @@ void HTMLInputElement::adopted_from(DOM::Document& old_document)
 void HTMLInputElement::set_being_activated(bool activated)
 {
     Base::set_being_activated(activated);
-    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
+    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton)) {
+        Painting::push_form_control_paint_facts(*this);
         set_needs_repaint();
+    }
 }
 
 Layout::Node* HTMLInputElement::create_layout_node(CSS::LayoutStyle style)
@@ -216,6 +224,7 @@ void HTMLInputElement::set_checked(bool checked)
     // that of every member of its radio button group.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
+    Painting::push_form_control_paint_facts(*this);
     set_needs_repaint();
 
     // NB: The registry unchecks the other members of the group and republishes their validity. The tree walks
@@ -253,6 +262,8 @@ void HTMLInputElement::set_indeterminate(bool value)
         return;
     m_indeterminateness = value;
     CSS::Invalidation::invalidate_style_after_indeterminate_state_change(*this, value);
+    Painting::push_form_control_paint_facts(*this);
+    set_needs_repaint();
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-list

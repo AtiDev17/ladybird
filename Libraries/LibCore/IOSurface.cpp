@@ -81,17 +81,41 @@ IOSurfaceHandle IOSurfaceHandle::create(int width, int height)
     return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
 }
 
+u32 IOSurfaceHandle::id() const
+{
+    return IOSurfaceGetID(m_ref_wrapper->ref);
+}
+
 MachPort IOSurfaceHandle::create_mach_port() const
 {
     auto port = IOSurfaceCreateMachPort(m_ref_wrapper->ref);
     return MachPort::adopt_right(port, MachPort::PortRight::Send);
 }
 
-IOSurfaceHandle IOSurfaceHandle::from_mach_port(MachPort const& port)
+IOSurfaceHandle IOSurfaceHandle::from_ref(void* io_surface_ref)
+{
+    auto* ref = static_cast<IOSurfaceRef>(io_surface_ref);
+    VERIFY(ref);
+    CFRetain(ref);
+    return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
+}
+
+void IOSurfaceHandle::increment_use_count()
+{
+    IOSurfaceIncrementUseCount(m_ref_wrapper->ref);
+}
+
+void IOSurfaceHandle::decrement_use_count()
+{
+    IOSurfaceDecrementUseCount(m_ref_wrapper->ref);
+}
+
+ErrorOr<IOSurfaceHandle> IOSurfaceHandle::from_mach_port(MachPort const& port)
 {
     // NOTE: This call does not destroy the port
     auto* ref = IOSurfaceLookupFromMachPort(port.port());
-    VERIFY(ref);
+    if (!ref)
+        return Error::from_string_literal("Port is not an IOSurface send right");
     return IOSurfaceHandle(make<IOSurfaceRefWrapper>(ref));
 }
 
@@ -103,6 +127,26 @@ size_t IOSurfaceHandle::width() const
 size_t IOSurfaceHandle::height() const
 {
     return IOSurfaceGetHeight(m_ref_wrapper->ref);
+}
+
+u32 IOSurfaceHandle::pixel_format() const
+{
+    return IOSurfaceGetPixelFormat(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::plane_count() const
+{
+    return IOSurfaceGetPlaneCount(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::plane_width(size_t plane) const
+{
+    return IOSurfaceGetWidthOfPlane(m_ref_wrapper->ref, plane);
+}
+
+size_t IOSurfaceHandle::plane_height(size_t plane) const
+{
+    return IOSurfaceGetHeightOfPlane(m_ref_wrapper->ref, plane);
 }
 
 size_t IOSurfaceHandle::bytes_per_element() const
@@ -118,6 +162,26 @@ size_t IOSurfaceHandle::bytes_per_row() const
 void* IOSurfaceHandle::data() const
 {
     return IOSurfaceGetBaseAddress(m_ref_wrapper->ref);
+}
+
+size_t IOSurfaceHandle::bytes_per_row_of_plane(size_t plane) const
+{
+    return IOSurfaceGetBytesPerRowOfPlane(m_ref_wrapper->ref, plane);
+}
+
+void* IOSurfaceHandle::data_of_plane(size_t plane) const
+{
+    return IOSurfaceGetBaseAddressOfPlane(m_ref_wrapper->ref, plane);
+}
+
+bool IOSurfaceHandle::lock_read_only() const
+{
+    return IOSurfaceLock(m_ref_wrapper->ref, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess;
+}
+
+void IOSurfaceHandle::unlock_read_only() const
+{
+    IOSurfaceUnlock(m_ref_wrapper->ref, kIOSurfaceLockReadOnly, nullptr);
 }
 
 void* IOSurfaceHandle::core_foundation_pointer() const

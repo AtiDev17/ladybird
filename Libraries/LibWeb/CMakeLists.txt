@@ -846,6 +846,7 @@ set(SOURCES
     Painting/Blending.cpp
     Painting/BoxModelMetrics.cpp
     Painting/BoxViews.cpp
+    Painting/PaintFacts.cpp
     Painting/Canvas2DCommandStream.cpp
     Painting/ChromeWidget.cpp
     Painting/DisplayList.cpp
@@ -855,15 +856,14 @@ set(SOURCES
     Painting/DisplayListResourceStorage.cpp
     Painting/DocumentPaintState.cpp
     Painting/HitTestDisplayList.cpp
-    Painting/PaintStyle.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/ScrollState.cpp
+    Painting/SvgPaintResources.cpp
     Painting/VisualContextTreeTestBuilder.cpp
-    Painting/SVGMasking.cpp
     PerformanceTimeline/EntryTypes.cpp
     PerformanceTimeline/EventNames.cpp
     PerformanceTimeline/PerformanceEntry.cpp

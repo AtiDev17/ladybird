@@ -23,6 +23,7 @@
 #include <LibWeb/HTML/HTMLTableCellElement.h>
 #include <LibWeb/HTML/HTMLTableColElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/BlockContainer.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
@@ -31,6 +32,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Painting/ScrollSnap.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
@@ -39,6 +41,22 @@
 #include <LibWeb/SVG/SVGTextContentElement.h>
 
 namespace Web::Layout {
+
+static u8 dom_paint_facts_of(GC::Ptr<DOM::Node const> node)
+{
+    if (!node)
+        return 0;
+    u8 facts = 0;
+    if (node->is_inert())
+        facts |= static_cast<u8>(RustFFI::DomPaintFact::Inert);
+    if (node->is_editable_or_editing_host())
+        facts |= static_cast<u8>(RustFFI::DomPaintFact::EditableOrEditingHost);
+    if (node->inside_blocking_wheel_event_handler())
+        facts |= static_cast<u8>(RustFFI::DomPaintFact::InsideBlockingWheelEventHandler);
+    if (auto const* navigable_container = as_if<HTML::NavigableContainer>(*node); navigable_container && navigable_container->content_navigable())
+        facts |= static_cast<u8>(RustFFI::DomPaintFact::NestedNavigableContainer);
+    return facts;
+}
 
 static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, void* shell)
 {
@@ -54,7 +72,13 @@ static RustFFI::FfiNodeConstructionFacts build_node_construction_facts(DOM::Docu
         .uses_button_layout = node && is<HTML::HTMLElement>(*node) && static_cast<HTML::HTMLElement const&>(*node).uses_button_layout(),
         .is_editing_host = node && node->is_editing_host(),
         .is_body = node && node == GC::Ptr { document.body() },
+        .dom_paint_facts = dom_paint_facts_of(node),
     };
+}
+
+bool Node::refresh_dom_paint_facts()
+{
+    return RustFFI::layout_arena_set_node_dom_paint_facts(m_arena->handle(), m_slot, dom_paint_facts_of(m_dom_node));
 }
 
 Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind kind, AttachToDOMNode attach_to_dom_node)
@@ -66,7 +90,11 @@ Node::Node(DOM::Document& document, GC::Ptr<DOM::Node> node, RustFFI::NodeKind k
     VERIFY(RustFFI::layout_arena_node_dom_node(m_arena->handle(), m_slot) == m_dom_node.ptr());
     update_has_scroll_offset_flag();
 
-    if (node && attach_to_dom_node == AttachToDOMNode::Yes)
+    if (!node)
+        return;
+    if (auto const* row_already_bound_to_dom_node = node->unsafe_layout_node())
+        RustFFI::layout_arena_note_rows_share_dom_node(m_arena->handle(), row_already_bound_to_dom_node->m_slot, m_slot, attach_to_dom_node == AttachToDOMNode::Yes);
+    if (attach_to_dom_node == AttachToDOMNode::Yes)
         node->set_layout_node({}, *this);
 }
 
@@ -88,6 +116,12 @@ void Node::delete_arena_owned_shell(Node& node)
 {
     node.m_arena_is_destroying_shell = true;
     delete &node;
+}
+
+void Node::rebind_dom_node_to_surviving_shell(DOM::Node& dom_node, Node& shell)
+{
+    VERIFY(shell.m_dom_node.ptr() == &dom_node);
+    dom_node.rebind_layout_node({}, shell);
 }
 
 RustFFI::NodeSlotId Node::slot_id(Node const* node)
@@ -414,6 +448,7 @@ void NodeWithStyle::ImageObserver::image_style_value_did_update(CSS::ImageStyleV
 {
     VERIFY(m_owner);
 
+    Painting::push_layer_image_paint_facts(*m_owner);
     if (Painting::has_committed_box(*m_owner))
         Painting::set_needs_repaint(*m_owner);
 }
@@ -518,6 +553,7 @@ void NodeWithStyle::attach_style_resources()
     if (!(dependency_flags & to_underlying(CSS::StyleRecordDependencyFlag::HoldsImageValues))) {
         m_cursor_style_values.clear();
         clear_image_observers();
+        Painting::push_paint_facts_after_style_attach(*this, Painting::StyleHoldsImageValues::No);
         return;
     }
 
@@ -542,6 +578,7 @@ void NodeWithStyle::attach_style_resources()
     load_image(list_style_image());
 
     rebuild_image_observers();
+    Painting::push_paint_facts_after_style_attach(*this, Painting::StyleHoldsImageValues::Yes);
 }
 
 CSS::StyleScope const& NodeWithStyle::style_scope() const
@@ -814,6 +851,8 @@ void NodeWithStyle::publish_style_record_to_node_data()
     VERIFY(payloads);
     m_style_payloads = payloads;
     RustFFI::layout_arena_set_node_style(arena_handle(), slot_id(this), m_style_record_identity.value(), payloads);
+    if (auto const* element = as_if<DOM::Element>(dom_node()); element && element->computed_style(CSS::PseudoElement::Selection))
+        Painting::push_selection_pseudo_style(*element);
     if (content_visibility() == CSS::ContentVisibility::Auto)
         document().note_content_visibility_auto_style();
 

@@ -159,7 +159,14 @@ SVGDecodedImageData::SVGDecodedImageData(GC::Ref<Page> page, GC::Ref<SVGPageClie
     , m_page_client(page_client)
     , m_document(document)
     , m_root_element(root_element)
+    , m_vector_content_identity(next_vector_content_identity())
 {
+}
+
+u64 SVGDecodedImageData::next_vector_content_identity()
+{
+    static u64 s_next_vector_content_identity = 1;
+    return s_next_vector_content_identity++;
 }
 
 SVGDecodedImageData::~SVGDecodedImageData() = default;
@@ -506,10 +513,16 @@ void SVGDecodedImageData::did_request_frame()
 
 void SVGDecodedImageData::invalidate_cached_rendering()
 {
+    m_vector_content_identity = next_vector_content_identity();
     m_cached_rendered_frames.clear();
     m_cached_rendered_surfaces.clear();
     m_cached_display_lists.clear();
     prune_cached_display_list_resources();
+}
+
+bool SVGDecodedImageData::has_active_view_box() const
+{
+    return m_root_element->active_view_box().has_value();
 }
 
 Optional<Painting::ImagePaint> SVGDecodedImageData::image_paint(Painting::ImagePaintRequest const& request) const

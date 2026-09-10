@@ -33,6 +33,7 @@ public:
     virtual Optional<CSSPixels> intrinsic_width() const override;
     virtual Optional<CSSPixels> intrinsic_height() const override;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
+    u64 vector_content_identity() const { return m_vector_content_identity; }
 
     virtual Optional<Painting::DisplayListResource> record_display_list(Gfx::IntSize, CSS::PreferredColorScheme, Painting::DisplayListResourceStorage&) const override;
     // Lays the inner document out at the CSS size and records at css × raster_scale resolution.
@@ -46,6 +47,7 @@ public:
     virtual size_t external_memory_size() const override;
 
     virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const override;
+    bool has_active_view_box() const;
 
     // The scheme the SVG document currently answers `prefers-color-scheme` with. Held on the image
     // rather than on the page, because the page is shared with every other image.
@@ -60,6 +62,7 @@ private:
     void append_paint_command_cache_source_resources(Painting::DisplayListResourceSet&) const;
     void did_request_frame();
     void invalidate_cached_rendering();
+    static u64 next_vector_content_identity();
 
     // FIXME: Remove this once everything is using surfaces instead.
     mutable HashMap<Gfx::IntSize, Gfx::DecodedImageFrame> m_cached_rendered_frames;
@@ -97,6 +100,7 @@ private:
 
     GC::Ref<DOM::Document> m_document;
     GC::Ref<SVG::SVGSVGElement> m_root_element;
+    u64 m_vector_content_identity { 0 };
 
     mutable bool m_is_recording_display_list { false };
     bool m_has_pending_client_notification { false };

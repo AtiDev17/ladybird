@@ -2,6 +2,7 @@ include(audio)
 
 set(TEST_SOURCES
     TestAudioBlockTimingRing.cpp
+    TestBitReader.cpp
     TestBufferedRanges.cpp
     TestCICP.cpp
     TestCodecConfigurations.cpp
@@ -32,6 +33,10 @@ set(TEST_SOURCES
     TestVP9Decode.cpp
     TestWav.cpp
 )
+
+if (APPLE)
+    list(APPEND TEST_SOURCES TestVideoToolboxDecode.cpp)
+endif()
 
 foreach(source IN LISTS TEST_SOURCES)
     ladybird_test("${source}" LibMedia LIBS LibMedia LibFileSystem LibSync)
