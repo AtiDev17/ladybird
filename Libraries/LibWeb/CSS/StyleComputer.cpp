@@ -3801,9 +3801,11 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
     auto groups_to_rebuild = sharing.computed_groups_to_rebuild.value_or(ComputedValues::all_style_groups);
     auto& element = abstract_element.element();
     if (groups_to_rebuild != ComputedValues::all_style_groups) {
-        if (element.has_relevant_animations()
+        if (element.has_relevant_animations_other_than_transitions()
             || element.has_css_defined_animations())
             groups_to_rebuild = ComputedValues::all_style_groups;
+        else if (auto animated_properties = computed_properties->animated_properties_snapshot(); animated_properties && !animated_properties->is_empty())
+            groups_to_rebuild |= animated_overlay_style_groups(*animated_properties, abstract_element).value_or(ComputedValues::all_style_groups);
     }
     auto computed_values = build_computed_values(
         *computed_properties,
@@ -3818,15 +3820,15 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
     // container unit or query asks about its container, `attr()` about its attributes, a
     // tree-counting function about its place among its siblings, and `if()` about the environment.
     // The monospace font-size recascade reads the whole ancestor chain rather than the inherited
-    // context, and unfixed random values read the element's random cache. Image URLs also need their
-    // declaration's resource context, which retained winner value identities do not distinguish.
-    // The full declaration key retains source identities for resource-dependent values, so it
-    // can still share their computed styles without enabling winner-only reuse.
-    // `var()` is not among them: what it resolves against is the cascaded custom properties, which
-    // the blocks in the record decide, and the inherited environment, which the
-    // parent in the record decides. Neither is an animation or transition: it carries state on the
-    // element itself, and its values are published by the animation refresh rather than derived here.
-    bool const computation_read_only_the_declaration_key = !element.has_relevant_animations()
+    // context, and unfixed random values read the element's random cache. `var()` is not among
+    // them: what it resolves against is the cascaded custom properties, which the blocks in the
+    // record decide, and the inherited environment, which the parent in the record decides. Neither
+    // is an image URL: its resource context is its declaration's, which the record names through
+    // the declaration's block and the sharing key through the declaration's identity. Only a winner
+    // record retained by value is refused for it. Neither is an animation or transition: it carries
+    // state on the element itself, and its values are published by the animation refresh rather
+    // than derived here.
+    bool const computation_read_only_the_record = !element.has_relevant_animations_other_than_transitions()
         && !element.has_css_defined_animations()
         && !element.style_uses_attr_css_function()
         && !element.style_uses_if_css_function()
@@ -3835,8 +3837,6 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
         && !element.style_depends_on_viewport_metrics()
         && !element.style_depends_on_size_container_query()
         && !element.style_depends_on_style_container_query()
-        && !sharing.computation_reads_element_context;
-    bool const computation_read_only_the_record = computation_read_only_the_declaration_key
         && !sharing.computation_reads_unkeyed_context;
     // The flags are cleared for the next computation, so the record is what has to answer whether
     // that computation can be skipped.
@@ -3844,6 +3844,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
         auto* record = element.style_input_record();
         VERIFY(record);
         record->read_beyond_the_record = !computation_read_only_the_record;
+        record->style_reads_resource_context = sharing.computation_reads_resource_context;
         record->style_uses_var_css_function = element.style_uses_var_css_function();
         record->style_uses_inherit_css_function = element.style_uses_inherit_css_function();
         record->explicitly_inherited_non_inherited_style_groups = sharing.explicitly_inherited_non_inherited_style_groups;
@@ -3851,7 +3852,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
     if (sharing.is_candidate && sharing.may_reuse_or_publish_shared_style) {
         // The result answers for another element only if it also holds no animated values: an
         // animation or transition is state of this element that the other element does not have.
-        bool const computation_read_only_the_key = computation_read_only_the_declaration_key
+        bool const computation_read_only_the_key = computation_read_only_the_record
             && !computed_values->animated_properties()
             && !computed_values->has_animated_values();
         if (computation_read_only_the_key) {
@@ -3885,6 +3886,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_and_share_computed_valu
                 .style_input_declaration_words = move(style_input_declaration_words),
                 .pinned_style_input_values = move(pinned_style_input_values),
                 .read_beyond_the_record = !computation_read_only_the_record,
+                .style_reads_resource_context = sharing.computation_reads_resource_context,
                 .style_uses_var_css_function = element.style_uses_var_css_function(),
                 .style_uses_inherit_css_function = element.style_uses_inherit_css_function(),
             });
@@ -4029,29 +4031,39 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_computed_values(Compute
     return style;
 }
 
+Optional<u32> StyleComputer::animated_overlay_style_groups(AnimatedProperties const& animated_properties, DOM::AbstractElement abstract_element) const
+{
+    u32 groups = 0;
+    for (auto const& entry : animated_properties.entries()) {
+        auto property_id = static_cast<PropertyID>(entry.property);
+        auto group = ComputedValues::style_group_of_property(property_id);
+        if (!group.has_value())
+            return {};
+        groups |= 1u << to_underlying(group.value());
+        if (property_id != PropertyID::Color)
+            continue;
+        auto style_node_id = abstract_element.element().style_node_id();
+        if (style_node_id == 0)
+            return {};
+        auto current_color_dependent_groups = m_style_engine.current_color_dependent_style_groups(style_node_id, pseudo_element_to_ffi(abstract_element.pseudo_element()));
+        if (!current_color_dependent_groups.has_value())
+            return {};
+        groups |= *current_color_dependent_groups;
+    }
+    return groups;
+}
+
 NonnullRefPtr<ComputedValues const> StyleComputer::build_animated_computed_values(ComputedStyleWorkingSet& computed_properties, DOM::AbstractElement abstract_element, StyleScope const& style_scope, ComputedValues const& previous_values) const
 {
     // The base half of an animated style does not move between frames, and everything the overlay
     // touches is named by the animated property set, so a frame keeps the previous base and
-    // rebuilds only the groups the animation writes. A property whose group is unknown takes the
-    // full build, and so does the color, because currentcolor consumers in other groups bake their
-    // resolved colors against it.
+    // rebuilds only the groups the animation writes.
     auto& counters = document().style_invalidation_counters();
     auto animated_properties = computed_properties.animated_properties_snapshot();
-    u32 groups_to_apply = 0;
-    bool touched_groups_known = animated_properties && !animated_properties->is_empty();
-    if (touched_groups_known) {
-        for (auto const& entry : animated_properties->entries()) {
-            auto property_id = static_cast<PropertyID>(entry.property);
-            auto group = ComputedValues::style_group_of_property(property_id);
-            if (!group.has_value() || property_id == PropertyID::Color) {
-                touched_groups_known = false;
-                break;
-            }
-            groups_to_apply |= 1u << to_underlying(group.value());
-        }
-    }
-    if (!touched_groups_known) {
+    Optional<u32> groups_to_apply;
+    if (animated_properties && !animated_properties->is_empty())
+        groups_to_apply = animated_overlay_style_groups(*animated_properties, abstract_element);
+    if (!groups_to_apply.has_value()) {
         counters.animated_style_full_builds++;
         return build_computed_values(computed_properties, abstract_element, style_scope);
     }
@@ -4060,7 +4072,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_animated_computed_value
     VERIFY(computation_context_cache_is_empty());
     ScopeGuard clear_computation_context_cache = [&] { clear_computation_context_caches(); };
     auto color_resolution_context = [&] {
-        if ((groups_to_apply & (1u << to_underlying(StyleGroupIndex::FontValues))) == 0) {
+        if ((*groups_to_apply & (1u << to_underlying(StyleGroupIndex::FontValues))) == 0) {
             return ColorResolutionContext {
                 .color_scheme = previous_values.color_scheme(),
                 .current_color = InitialValues::color(),
@@ -4078,7 +4090,7 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_animated_computed_value
     }();
 
     auto base_values = ComputedValues::Builder { previous_values.base_values() }.build();
-    auto animated_values = ComputedValues::create_over_base(computed_properties, document(), style_scope, move(color_resolution_context), *base_values, groups_to_apply);
+    auto animated_values = ComputedValues::create_over_base(computed_properties, document(), style_scope, move(color_resolution_context), *base_values, *groups_to_apply);
     ComputedValues::Builder builder { *animated_values };
     ComputedValuesFFI::FfiStyleFinalizationInput finalization_input {};
     finalization_input.mode = ComputedValuesFFI::FfiStyleFinalizationMode::Overflow;
@@ -4256,6 +4268,7 @@ void StyleComputer::remember_shared_computed_style_record(DOM::Element& element,
 {
     auto const* input = element.style_input_record();
     if (!input || input->read_beyond_the_record
+        || input->style_reads_resource_context
         || input->cascade_reads_custom_properties
         || input->style_uses_var_css_function
         || input->style_uses_inherit_css_function
@@ -4371,9 +4384,12 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         // rules matched.
         auto has_implicit_style = ComputedValuesFFI::rust_pseudo_element_has_implicit_style(to_underlying(*abstract_element.pseudo_element()));
 
+        // A highlight pseudo-element inherits from its parent element's, so it has a style whenever that does.
+        auto inherits_highlight_style = abstract_element.highlight_inheritance_parent().has_value();
+
         // Bail if no pseudo-element rules matched. Clear any stale custom property data so
         // getComputedStyle() doesn't return values from a previous match.
-        if (!did_match_any_pseudo_element_rules && !has_implicit_style) {
+        if (!did_match_any_pseudo_element_rules && !has_implicit_style && !inherits_highlight_style) {
             abstract_element.set_custom_property_data(nullptr);
             return {};
         }
@@ -4391,6 +4407,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
     auto const inheritance_parent = abstract_element.element_to_inherit_style_from();
     auto const inheritance_parent_style_record_identity = inheritance_parent.has_value() ? inheritance_parent->style_record_identity() : StyleRecordID {};
     auto const inheritance_parent_style_record = m_style_engine.style_record_view(inheritance_parent_style_record_identity);
+    auto const highlight_inheritance_parent = abstract_element.highlight_inheritance_parent();
     auto previous_style_record_identity = abstract_element.style_record_identity();
     auto const previous_style_record = m_style_engine.style_record_view(previous_style_record_identity);
     if (sharing) {
@@ -4438,7 +4455,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             sharing->key.computation_inputs.append(bit_cast<FlatPtr>(group));
         sharing->pinned_parent_groups.set(inherited_group_identities);
         sharing->pinned_parent_custom_property_data = inheritable_custom_property_data(*inheritance_parent);
-        sharing->key.computation_inputs.append(0);
+        sharing->key.computation_inputs.append(highlight_inheritance_parent.has_value() ? highlight_inheritance_parent->style_record_identity().value() : 0);
         if (previous_style_record.present) {
             auto const* inherited_box = static_cast<ComputedValuesFFI::InheritedBoxValues const*>(previous_style_record.payloads[to_underlying(StyleGroupIndex::InheritedBoxValues)]);
             sharing->key.computation_inputs.append(inherited_box->writing_mode + 1);
@@ -4484,6 +4501,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         bool style_depends_on_size_container_query { false };
         bool style_depends_on_style_container_query { false };
         u32 explicitly_inherited_non_inherited_style_groups { 0 };
+        bool style_reads_resource_context { false };
     };
     Optional<PreviousComputation> previous_computation;
     auto capture_previous_computation = [](StyleInputRecord const& previous) {
@@ -4499,6 +4517,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             .style_depends_on_size_container_query = previous.style_depends_on_size_container_query,
             .style_depends_on_style_container_query = previous.style_depends_on_style_container_query,
             .explicitly_inherited_non_inherited_style_groups = previous.explicitly_inherited_non_inherited_style_groups,
+            .style_reads_resource_context = previous.style_reads_resource_context,
         };
     };
     auto record_style_input = [&](StyleSharingEntry const* shared_entry = nullptr) {
@@ -4527,6 +4546,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         record->style_depends_on_viewport_metrics = false;
         record->style_depends_on_size_container_query = false;
         record->style_depends_on_style_container_query = false;
+        record->style_reads_resource_context = false;
         record->explicitly_inherited_non_inherited_style_groups = 0;
         record->cascade_reads_custom_properties = false;
         record->pinned_parent_custom_property_data = nullptr;
@@ -4661,6 +4681,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 record->style_uses_custom_function = previous->style_uses_custom_function;
                 record->style_uses_inherit_css_function = previous->style_uses_inherit_css_function;
                 record->style_uses_tree_counting_function = previous->style_uses_tree_counting_function;
+                record->style_reads_resource_context = previous->style_reads_resource_context;
                 record->style_depends_on_viewport_metrics = previous->style_depends_on_viewport_metrics;
                 record->style_depends_on_size_container_query = previous->style_depends_on_size_container_query;
                 record->style_depends_on_style_container_query = previous->style_depends_on_style_container_query;
@@ -4690,6 +4711,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
                 old_parent_custom_property_data = previous->pinned_parent_custom_property_data;
                 style_input_is_unchanged = true;
                 record->read_beyond_the_record = previous->read_beyond_the_record;
+                record->style_reads_resource_context = previous->style_reads_resource_context;
                 record->style_uses_attr_css_function = previous->style_uses_attr_css_function;
                 record->style_uses_var_css_function = previous->style_uses_var_css_function;
                 record->style_uses_if_css_function = previous->style_uses_if_css_function;
@@ -4932,11 +4954,12 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             }
             compute_transitioned_properties(*sharing->shared_values, abstract_element);
             // The declaration key can distinguish resource contexts that retained cascade winners
-            // cannot. Preserve that restriction for subsequent partial computation.
+            // cannot. Preserve that restriction for the winner records retained from this element.
             if (!abstract_element.pseudo_element().has_value()) {
                 auto* record = abstract_element.element().style_input_record();
                 VERIFY(record);
                 record->read_beyond_the_record = entry.read_beyond_the_record;
+                record->style_reads_resource_context = entry.style_reads_resource_context;
                 record->style_uses_var_css_function = entry.style_uses_var_css_function;
                 record->style_uses_inherit_css_function = entry.style_uses_inherit_css_function;
                 record->explicitly_inherited_non_inherited_style_groups = entry.explicitly_inherited_non_inherited_style_groups;
@@ -5080,7 +5103,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
             if (!bucket.has_value())
                 continue;
             for (auto const& entry : *bucket) {
-                if (entry.read_beyond_the_record || !entry.style_record_identity.has_value() || !entry.style_node_id)
+                if (entry.read_beyond_the_record || entry.style_reads_resource_context || !entry.style_record_identity.has_value() || !entry.style_node_id)
                     continue;
                 if (!entry.key.equals_without_values(sharing->key))
                     continue;
@@ -5167,6 +5190,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         new_style_input_record->style_depends_on_viewport_metrics = previous_computation->style_depends_on_viewport_metrics;
         new_style_input_record->style_depends_on_size_container_query = previous_computation->style_depends_on_size_container_query;
         new_style_input_record->style_depends_on_style_container_query = previous_computation->style_depends_on_style_container_query;
+        new_style_input_record->style_reads_resource_context = previous_computation->style_reads_resource_context;
         new_style_input_record->explicitly_inherited_non_inherited_style_groups = previous_computation->explicitly_inherited_non_inherited_style_groups;
         reuse_last_computed_style();
         return {};
@@ -5238,7 +5262,7 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_impl(DOM::AbstractE
         sharing ? sharing->computed_groups_to_rebuild.value_or(ComputedValues::all_style_groups) : ComputedValues::all_style_groups,
         use_retained_style_computation_selection, false, &computed_group_mask,
         sharing ? &sharing->computation_reads_unkeyed_context : nullptr,
-        sharing ? &sharing->computation_reads_element_context : nullptr);
+        sharing ? &sharing->computation_reads_resource_context : nullptr);
     if (new_style_input_record)
         new_style_input_record->bind_next_published_style = true;
     static bool const verify_computed_closure = getenv("LIBWEB_VERIFY_COMPUTED_CLOSURE") != nullptr;
@@ -5401,7 +5425,7 @@ void StyleComputer::ensure_style_metadata_tables_installed()
     (void)installed;
 }
 
-NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::AbstractElement abstract_element, CascadedProperties& cascaded_properties, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups, StyleRecordID previous_style_record, u32 initial_computed_group_mask, bool use_retained_style_computation_selection, bool stop_after_longhand_drive, u32* selected_computed_group_mask, bool* computation_reads_unkeyed_context, bool* computation_reads_element_context) const
+NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::AbstractElement abstract_element, CascadedProperties& cascaded_properties, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups, StyleRecordID previous_style_record, u32 initial_computed_group_mask, bool use_retained_style_computation_selection, bool stop_after_longhand_drive, u32* selected_computed_group_mask, bool* computation_reads_unkeyed_context, bool* computation_reads_resource_context) const
 {
     begin_style_update();
     ScopeGuard end_style_update = [&] { this->end_style_update(); };
@@ -5475,7 +5499,7 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
         bool stop_after_longhand_drive;
         u32* selected_computed_group_mask;
         bool* computation_reads_unkeyed_context;
-        bool* computation_reads_element_context;
+        bool* computation_reads_resource_context;
         PreparePhaseContext prepare_phase_context;
         OwnPtr<NativeLonghandState> state;
     };
@@ -5546,10 +5570,11 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
         .stop_after_longhand_drive = stop_after_longhand_drive,
         .selected_computed_group_mask = selected_computed_group_mask,
         .computation_reads_unkeyed_context = computation_reads_unkeyed_context,
-        .computation_reads_element_context = computation_reads_element_context,
+        .computation_reads_resource_context = computation_reads_resource_context,
         .prepare_phase_context = prepare_phase_context,
         .state = nullptr,
     };
+    auto const highlight_inheritance_parent = abstract_element.highlight_inheritance_parent();
     ComputedValuesFFI::FfiComputePropertiesInput const input {
         .store = cascaded_properties.rust_store(),
         .style_engine = m_style_engine.rust_handle(),
@@ -5557,12 +5582,13 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
         .pseudo_kind = pseudo_element_to_ffi(abstract_element.pseudo_element()),
         .previous_style_record = previous_style_record.value(),
         .inheritance_parent_style_record = inheritance_parent.has_value() ? inheritance_parent->style_record_identity().value() : 0,
+        .highlight_parent_style_record = highlight_inheritance_parent.has_value() ? highlight_inheritance_parent->style_record_identity().value() : 0,
         .initial_computed_group_mask = initial_computed_group_mask,
         .all_computed_groups = ComputedValues::all_style_groups,
         .use_retained_style_computation_selection = use_retained_style_computation_selection,
         .selected_transition_properties = selected_transition_properties.data(),
         .selected_transition_property_count = selected_transition_properties.size(),
-        .has_relevant_animations = abstract_element.element().has_relevant_animations(),
+        .has_relevant_animations_other_than_transitions = abstract_element.element().has_relevant_animations_other_than_transitions(),
         .has_css_defined_animations = abstract_element.element().has_css_defined_animations(),
         .stop_after_longhand_drive = stop_after_longhand_drive,
         .callback_context = &native_context,
@@ -5575,11 +5601,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_properties(DOM::Ab
                 *context.selected_computed_group_mask = computed_group_mask;
             if (context.computation_reads_unkeyed_context)
                 *context.computation_reads_unkeyed_context = computation_requirements->computation_reads_unkeyed_context;
-            if (context.computation_reads_element_context) {
-                auto random_sharings = ReadonlySpan<ComputedValuesFFI::FfiUnfixedRandomSharing> { computation_requirements->unfixed_random_sharings, computation_requirements->unfixed_random_sharing_count };
-                *context.computation_reads_element_context = computation_requirements->has_monospace_font_family
-                    || any_of(random_sharings, [](auto const& sharing) { return !sharing.element_shared; });
-            }
+            if (context.computation_reads_resource_context)
+                *context.computation_reads_resource_context = computation_requirements->computation_reads_resource_context;
             auto const* computed_properties_to_evaluate = computation_requirements->has_computed_property_selection
                 ? computation_requirements->computed_property_words
                 : nullptr;

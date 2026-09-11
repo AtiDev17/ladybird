@@ -38,8 +38,14 @@ pub(crate) struct RenderSpan {
     pub end_code_unit: usize,
     pub text_color: u32,
     pub background_color: u32,
+    /// The text's own `text-shadow`, which a highlight overlay paints over.
     pub shadow_layers: Vec<ShadowLayer>,
     pub selection_offsets: Option<SelectionOffsets>,
+    pub selected: bool,
+    pub highlight_shadow_layers: Vec<ShadowLayer>,
+    /// The highlight's color when it has one of its own, which its redraw of the text's original
+    /// decorations takes as well.
+    pub decoration_color: Option<u32>,
     pub selection_text_decoration: Option<SpanTextDecoration>,
 }
 
@@ -122,6 +128,9 @@ fn compute_render_spans<O: Observer>(
                 background_color: 0,
                 shadow_layers: base_shadows(),
                 selection_offsets: None,
+                selected: false,
+                highlight_shadow_layers: Vec::new(),
+                decoration_color: None,
                 selection_text_decoration: None,
             });
             continue;
@@ -148,6 +157,9 @@ fn compute_render_spans<O: Observer>(
                 background_color: 0,
                 shadow_layers: base_shadows(),
                 selection_offsets: Some(selection_offsets),
+                selected: false,
+                highlight_shadow_layers: Vec::new(),
+                decoration_color: None,
                 selection_text_decoration: None,
             });
         }
@@ -159,12 +171,15 @@ fn compute_render_spans<O: Observer>(
                 end_code_unit: selection_end,
                 text_color: selection_text_color,
                 background_color: facts.background_color.0,
-                shadow_layers: if facts.has_text_shadow {
+                shadow_layers: base_shadows(),
+                selection_offsets: Some(selection_offsets),
+                selected: true,
+                highlight_shadow_layers: if facts.has_text_shadow {
                     answer.shadows.clone()
                 } else {
-                    base_shadows()
+                    Vec::new()
                 },
-                selection_offsets: Some(selection_offsets),
+                decoration_color: facts.text_color.has_value.then_some(facts.text_color.value.0),
                 selection_text_decoration: facts.has_text_decoration.then_some(SpanTextDecoration {
                     lines: facts.text_decoration_lines,
                     line_count: facts.text_decoration_line_count,
@@ -183,6 +198,9 @@ fn compute_render_spans<O: Observer>(
                 background_color: 0,
                 shadow_layers: base_shadows(),
                 selection_offsets: Some(selection_offsets),
+                selected: false,
+                highlight_shadow_layers: Vec::new(),
+                decoration_color: None,
                 selection_text_decoration: None,
             });
         }
@@ -207,10 +225,24 @@ pub(crate) struct GlyphRunEmission {
     pub glyph_bounding_rect: IntRect,
 }
 
+/// The player draws a vertical run by shifting the horizontal blob right by the fragment rect's
+/// width and turning it a quarter turn clockwise about the rect's top-left corner, so the blob's
+/// bounds follow the same mapping.
+fn vertical_glyph_bounds(horizontal_bounds: IntRect, fragment_device_rect: IntRect) -> IntRect {
+    IntRect::new(
+        fragment_device_rect.x + fragment_device_rect.width
+            - (horizontal_bounds.y + horizontal_bounds.height - fragment_device_rect.y),
+        fragment_device_rect.y + (horizontal_bounds.x - fragment_device_rect.x),
+        horizontal_bounds.height,
+        horizontal_bounds.width,
+    )
+}
+
 pub(crate) fn glyph_run_emission(
     fragment: &crate::painting::paintable_data::FragmentRecord,
     run: &crate::painting::paintable_data::GlyphRunRecord,
     fragment_absolute_rect: CssPixelRect,
+    fragment_device_rect: IntRect,
     scale: f64,
 ) -> GlyphRunEmission {
     let bounds = run.bounding_box;
@@ -223,12 +255,16 @@ pub(crate) fn glyph_run_emission(
     } else {
         Orientation::Vertical
     };
-    let glyph_bounding_rect = IntRect::new(
+    let horizontal_bounds = IntRect::new(
         (bounds.x * scale as f32 + baseline_start.x).round_ties_even() as i32,
         (bounds.y * scale as f32 + baseline_start.y).round_ties_even() as i32,
         (bounds.width * scale as f32).round_ties_even() as i32,
         (bounds.height * scale as f32).round_ties_even() as i32,
     );
+    let glyph_bounding_rect = match orientation {
+        Orientation::Horizontal => horizontal_bounds,
+        Orientation::Vertical => vertical_glyph_bounds(horizontal_bounds, fragment_device_rect),
+    };
     GlyphRunEmission {
         glyphs: glyphs_of(run),
         baseline_start,
@@ -248,11 +284,26 @@ pub(crate) fn paint_fragments_foreground<O: Observer>(
     filter.for_each_owned_fragment_index(fragment_count, |index| owned_fragment_indices.push(index as u32));
     let spans = compute_render_spans(recorder, block, &owned_fragment_indices);
 
+    // https://drafts.csswg.org/css-pseudo-4/#highlight-painting
+    // A highlight pseudo-element suppresses the normal drawing of any associated text, and the text
+    // decorations (other than shadows) that had been applied to that text. Instead the topmost active
+    // highlight overlay redraws that text (and those decorations) over all the highlight overlay
+    // backgrounds using that highlight's own color.
+    for span in &spans {
+        paint_text_shadow(recorder, block, span, &span.shadow_layers);
+    }
+    for span in spans.iter().filter(|span| !span.selected) {
+        let sets = crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder, block, span);
+        paint_text_fragment(recorder, block, span, &sets);
+    }
+
+    // Each highlight pseudo-element draws its background over the corresponding portion of the
+    // highlight overlay, painting it immediately below any positioned descendants.
     let selection_backdrop = recorder
         .layout_arena
         .node_style_if_live(block)
         .map(|style| Color(style.background().background_color));
-    for span in &spans {
+    for span in spans.iter().filter(|span| span.selected) {
         if Color(span.background_color).alpha() > 0 {
             let selection_rect = selection_rect(recorder, block, span);
             let converter = recorder.converter;
@@ -266,10 +317,12 @@ pub(crate) fn paint_fragments_foreground<O: Observer>(
         }
     }
 
-    for span in &spans {
-        paint_text_shadow(recorder, block, span);
+    // Any text-shadow applying to a highlight pseudo-element is drawn over its corresponding
+    // highlight overlay background.
+    for span in spans.iter().filter(|span| span.selected) {
+        paint_text_shadow(recorder, block, span, &span.highlight_shadow_layers);
     }
-    for span in &spans {
+    for span in spans.iter().filter(|span| span.selected) {
         let sets = crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder, block, span);
         paint_text_fragment(recorder, block, span, &sets);
     }
@@ -286,8 +339,13 @@ fn selection_rect<O: Observer>(recorder: &PaintRecorder<'_, O>, block: NodeSlotI
     })
 }
 
-fn paint_text_shadow<O: Observer>(recorder: &mut PaintRecorder<'_, O>, block: NodeSlotId, span: &RenderSpan) {
-    if span.shadow_layers.is_empty() {
+fn paint_text_shadow<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    block: NodeSlotId,
+    span: &RenderSpan,
+    shadow_layers: &[ShadowLayer],
+) {
+    if shadow_layers.is_empty() {
         return;
     }
     let side = recorder.layout_arena.paintable_side_data(block);
@@ -299,8 +357,19 @@ fn paint_text_shadow<O: Observer>(recorder: &mut PaintRecorder<'_, O>, block: No
         return;
     }
 
+    let converter = recorder.converter;
+    let scale = recorder.inputs.device_pixels_per_css_pixel;
+    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, fragment);
+    let fragment_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
+    let font_id = recorder.register_font(&run.font);
+    let GlyphRunEmission {
+        glyphs,
+        baseline_start,
+        orientation,
+        ..
+    } = glyph_run_emission(fragment, run, fragment_absolute_rect, fragment_device_rect, scale);
+
     // If this is a partial span, slice the glyph run to only include the relevant glyphs.
-    let glyphs = glyphs_of(run);
     let mut span_glyphs = glyphs.as_slice();
     if span.start_code_unit != 0 || span.end_code_unit != fragment.length_in_code_units {
         let mut start_glyph = 0usize;
@@ -321,42 +390,34 @@ fn paint_text_shadow<O: Observer>(recorder: &mut PaintRecorder<'_, O>, block: No
         }
     }
 
-    let converter = recorder.converter;
-    let scale = recorder.inputs.device_pixels_per_css_pixel;
-    let fragment_width = converter.enclosing_device_pixels(fragment.physical_horizontal_extent());
-    let fragment_height = converter.enclosing_device_pixels(fragment.physical_vertical_extent());
-    let fragment_baseline = converter.rounded_device_pixels(fragment.baseline);
-    let fragment_absolute_rect = text_fragment::absolute_rect(recorder.layout_arena, fragment);
-    let font_id = recorder.register_font(&run.font);
-
     // Shadow layers are ordered front-to-back, so we paint them in reverse.
-    for layer in span.shadow_layers.iter().rev() {
+    for layer in shadow_layers.iter().rev() {
         let blur_radius = converter.rounded_device_pixels(layer.blur_radius);
         // Space around the painted text to allow it to blur.
         let margin = blur_radius * 2;
-        let text_rect = IntRect::new(margin, margin, fragment_width, fragment_height);
-        let bounding_rect = IntRect::new(
-            0,
-            0,
-            text_rect.width + margin + margin,
-            text_rect.height + margin + margin,
+        let offset_x = layer.offset_x.to_float() * scale as f32;
+        let offset_y = layer.offset_y.to_float() * scale as f32;
+        let rect = IntRect::new(
+            fragment_device_rect.x + offset_x.round() as i32,
+            fragment_device_rect.y + offset_y.round() as i32,
+            fragment_device_rect.width,
+            fragment_device_rect.height,
         );
-
-        // FIXME: this is close but not quite perfect. non integer scale values can be offset by tiny amounts.
-        let css_margin = layer.blur_radius * 2;
-        let draw_location = FloatPoint {
-            x: (fragment_absolute_rect.x + layer.offset_x - css_margin).to_float() * scale as f32,
-            y: (fragment_absolute_rect.y + layer.offset_y - css_margin).to_float() * scale as f32,
+        let shadow_bounding_rect = IntRect::new(
+            rect.x - margin,
+            rect.y - margin,
+            rect.width + margin * 2,
+            rect.height + margin * 2,
+        );
+        let translation = FloatPoint {
+            x: baseline_start.x + offset_x,
+            y: baseline_start.y + offset_y,
         };
         recorder.recorder.paint_text_shadow(
             blur_radius,
-            bounding_rect,
-            IntRect::new(
-                text_rect.x,
-                text_rect.y + fragment_baseline,
-                text_rect.width,
-                text_rect.height,
-            ),
+            shadow_bounding_rect,
+            rect,
+            translation,
             GlyphRunForRecording {
                 font_smoothing: recorder
                     .layout_arena
@@ -369,7 +430,7 @@ fn paint_text_shadow<O: Observer>(recorder: &mut PaintRecorder<'_, O>, block: No
             },
             scale,
             Color(layer.color),
-            draw_location,
+            orientation,
             ForceDarkRole::Foreground,
         );
     }
@@ -429,7 +490,7 @@ fn paint_text_fragment<O: Observer>(
         baseline_start,
         orientation,
         glyph_bounding_rect,
-    } = glyph_run_emission(fragment, run, fragment_absolute_rect, scale);
+    } = glyph_run_emission(fragment, run, fragment_absolute_rect, fragment_device_rect, scale);
     let run_for_recording = GlyphRunForRecording {
         font_smoothing: recorder
             .layout_arena
@@ -518,4 +579,20 @@ pub(crate) fn paint_cursor<O: Observer>(
         caret.blink_cycle_start_time_ns,
         caret.should_blink,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertical_glyph_bounds_follow_the_players_rotation() {
+        let fragment = IntRect::new(100, 50, 20, 60);
+        // A blob starting two pixels into the fragment, rising four pixels above its top.
+        let horizontal = IntRect::new(102, 46, 40, 24);
+        let vertical = vertical_glyph_bounds(horizontal, fragment);
+        // Its advance runs down the fragment from two pixels in, and its ascent side ends up on the
+        // right, four pixels short of the fragment's right edge.
+        assert_eq!(vertical, IntRect::new(100, 52, 24, 40));
+    }
 }

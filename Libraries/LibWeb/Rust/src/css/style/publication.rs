@@ -2836,8 +2836,6 @@ impl StyleEngine {
                 self.computed_group_sets
                     .current_color_dependency_properties(dependency_target)
             });
-        let mut computed_property_closure_is_exact = delta.properties().len() == 1
-            && current_color_dependency_properties.is_some_and(|properties| properties.is_some());
         if let Some(Some(dependencies)) = current_color_dependency_properties {
             for (word, dependencies) in computed_property_words.iter_mut().zip(dependencies) {
                 *word |= dependencies;
@@ -2869,10 +2867,6 @@ impl StyleEngine {
                 self.computed_group_sets
                     .color_scheme_dependency_properties(dependency_target)
             });
-        if delta.properties().len() == 1 {
-            computed_property_closure_is_exact |=
-                color_scheme_dependency_properties.is_some_and(|properties| properties.is_some());
-        }
         if let Some(Some(dependencies)) = color_scheme_dependency_properties {
             for (word, dependencies) in computed_property_words.iter_mut().zip(dependencies) {
                 *word |= dependencies;
@@ -2898,13 +2892,38 @@ impl StyleEngine {
                     .any(|property| computed_group_output_mask(property) == Some(font_group_mask)))
             .then(|| self.computed_group_sets.font_dependency_properties(dependency_target))
         });
-        if delta.properties().len() == 1 {
-            computed_property_closure_is_exact |=
-                font_dependency_properties.is_some_and(|properties| properties.is_some());
-        }
         if let Some(Some(dependencies)) = font_dependency_properties {
             for (word, dependencies) in computed_property_words.iter_mut().zip(dependencies) {
                 *word |= dependencies;
+            }
+        }
+        let property_closure_is_known = |property: u16| {
+            if property == crate::css::property_metadata::property_id::COLOR {
+                return current_color_dependency_properties.is_some_and(|properties| properties.is_some());
+            }
+            if property == crate::css::property_metadata::property_id::COLOR_SCHEME {
+                return color_scheme_dependency_properties.is_some_and(|properties| properties.is_some());
+            }
+            if font_group_mask.is_some() && computed_group_output_mask(property) == font_group_mask {
+                return font_dependency_properties.is_some_and(|properties| properties.is_some());
+            }
+            if !(crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID
+                ..=crate::css::property_metadata::LAST_LONGHAND_PROPERTY_ID)
+                .contains(&property)
+            {
+                return false;
+            }
+            crate::css::property_metadata::property_is_in_logical_group(property)
+                || crate::css::property_metadata::property_computed_dependents(property).is_some()
+        };
+        let mut computed_property_closure_is_exact =
+            !delta.properties().is_empty() && delta.properties().iter().copied().all(property_closure_is_known);
+        if computed_property_closure_is_exact {
+            for property in delta.properties().iter().copied() {
+                for &dependent in crate::css::property_metadata::property_computed_dependents(property).unwrap_or(&[]) {
+                    let index = usize::from(dependent - crate::css::property_metadata::FIRST_LONGHAND_PROPERTY_ID);
+                    computed_property_words[index / 64] |= 1 << (index % 64);
+                }
             }
         }
         const INHERITED_STATIC_GROUPS: u8 = (1 << 0) | (1 << 1) | (1 << 3);
@@ -3051,6 +3070,14 @@ impl StyleEngine {
             .iter()
             .find(|(kind, _)| *kind == pseudo_kind)
             .map(|(_, selection)| *selection)
+    }
+
+    pub(crate) fn current_color_dependent_group_mask(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<u32> {
+        let target = computed::ComputedStyleTarget::new(node, pseudo_kind);
+        let dependencies = self.computed_group_sets.current_color_dependency_mask(target)?;
+        let caret_color_group = computed_group_output_mask(crate::css::property_metadata::property_id::CARET_COLOR)?;
+        let accent_color_group = computed_group_output_mask(crate::css::property_metadata::property_id::ACCENT_COLOR)?;
+        Some(dependencies | caret_color_group | accent_color_group)
     }
 
     unsafe fn cascade_operator_of_style_value(value: *const StyleValueData) -> CascadeOperator {
@@ -3415,6 +3442,16 @@ mod pseudo_kind {
     pub(super) const MARKER: u8 = 5;
     pub(super) const SELECTION: u8 = 6;
     pub(super) const SYNTHETIC_COUNT: usize = 8;
+
+    pub(super) fn is_highlight(kind: usize) -> bool {
+        kind < SYNTHETIC_COUNT && crate::css::property_metadata::pseudo_element_is_highlight(kind as u8)
+    }
+
+    pub(super) fn highlight_mask() -> u64 {
+        (0..SYNTHETIC_COUNT)
+            .filter(|&kind| is_highlight(kind))
+            .fold(0, |mask, kind| mask | 1 << kind)
+    }
 }
 
 /// The element facts a pseudo-element's computation reads: the C++ adjustments for what the

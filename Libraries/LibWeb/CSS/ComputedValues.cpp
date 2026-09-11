@@ -692,36 +692,6 @@ bool ComputedValues::property_inheritance_is_standard() const
     return m_property_inherited == standard_inheritance_bitmap;
 }
 
-HashMap<PropertyID, NonnullRefPtr<StyleValue const>> ComputedValues::inheritance_dependent_specified_values_snapshot() const
-{
-    HashMap<PropertyID, NonnullRefPtr<StyleValue const>> values;
-    for (auto const& entry : m_inheritance_dependent_specified_values) {
-        auto const* data = static_cast<StyleValueFFI::StyleValueData const*>(entry.value);
-        values.set(
-            static_cast<PropertyID>(entry.property),
-            StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(data)));
-    }
-    return values;
-}
-
-bool ComputedValues::inheritance_dependent_specified_values_equal(ComputedValues const& other) const
-{
-    if (m_inheritance_dependent_specified_values.size() != other.m_inheritance_dependent_specified_values.size())
-        return false;
-    for (auto const& entry : m_inheritance_dependent_specified_values) {
-        auto other_entry = find_if(other.m_inheritance_dependent_specified_values.begin(), other.m_inheritance_dependent_specified_values.end(), [&](auto const& candidate) {
-            return candidate.property == entry.property;
-        });
-        if (other_entry == other.m_inheritance_dependent_specified_values.end())
-            return false;
-        auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(entry.value);
-        auto const* other_value = static_cast<StyleValueFFI::StyleValueData const*>(other_entry->value);
-        if (value != other_value && !StyleValueFFI::rust_style_value_equals(value, other_value))
-            return false;
-    }
-    return true;
-}
-
 bool ComputedValues::adopt_identical_group_payloads(ComputedValues const& previous) const
 {
     bool all_shared = true;
@@ -843,6 +813,8 @@ ComputedStyleRecordView::ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordV
     m_values.m_depends_on_viewport_metrics = view.dependency_flags & to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics);
     m_values.m_font_metrics_depend_on_viewport_metrics = view.dependency_flags & to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics);
     m_values.m_in_display_none_subtree = view.dependency_flags & to_underlying(StyleRecordDependencyFlag::InDisplayNoneSubtree);
+    m_values.m_highlight_colors_authored = view.dependency_flags & to_underlying(StyleRecordDependencyFlag::HighlightColorsAuthored);
+    m_values.m_highlight_color_is_current_color = view.dependency_flags & to_underlying(StyleRecordDependencyFlag::HighlightColorIsCurrentColor);
     m_values.m_computed_longhand_table = view.longhand_table;
     if (m_values.m_computed_longhand_table)
         m_values.refresh_computed_longhand_table_views();
@@ -855,6 +827,8 @@ ComputedStyleRecordView::ComputedStyleRecordView(StyleEngineFFI::FfiStyleRecordV
         m_base_values->m_depends_on_viewport_metrics = m_values.m_depends_on_viewport_metrics;
         m_base_values->m_font_metrics_depend_on_viewport_metrics = m_values.m_font_metrics_depend_on_viewport_metrics;
         m_base_values->m_in_display_none_subtree = m_values.m_in_display_none_subtree;
+        m_base_values->m_highlight_colors_authored = m_values.m_highlight_colors_authored;
+        m_base_values->m_highlight_color_is_current_color = m_values.m_highlight_color_is_current_color;
         m_base_values->m_inheritance_dependent_specified_values = m_values.m_inheritance_dependent_specified_values;
         m_base_values->m_computed_longhand_table = m_values.m_computed_longhand_table;
         if (m_base_values->m_computed_longhand_table)
@@ -1599,6 +1573,8 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create_internal(ComputedStyl
     computed_values.set_depends_on_viewport_metrics(computed_style.depends_on_viewport_metrics());
     computed_values.set_font_metrics_depend_on_viewport_metrics(computed_style.font_metrics_depend_on_viewport_metrics());
     computed_values.set_in_display_none_subtree(computed_style.in_display_none_subtree());
+    computed_values.set_highlight_colors_authored(computed_style.highlight_colors_authored());
+    computed_values.set_highlight_color_is_current_color(computed_style.highlight_color_is_current_color());
     u64 pseudo_element_styles = 0;
     for (auto i = 0; i < to_underlying(PseudoElement::KnownPseudoElementCount); ++i) {
         auto pseudo_element = static_cast<PseudoElement>(i);
@@ -1683,21 +1659,6 @@ void ComputedValues::copy_computed_longhand_table_from(ComputedValues const& oth
     for (auto const& entry : other.m_inheritance_dependent_specified_values)
         ComputedValuesFFI::rust_computed_longhand_table_add_inheritance_dependent_value(table, entry.property, entry.value);
     ComputedValuesFFI::rust_computed_longhand_table_freeze(table);
-    // The freshly created table already carries the one reference this style owns.
-    m_computed_longhand_table = table;
-    refresh_computed_longhand_table_views();
-}
-
-void ComputedValues::adopt_swapped_computed_longhand_table(ComputedValues const& old_values, ComputedValues const& inherited_source)
-{
-    auto const* old_table = static_cast<ComputedValuesFFI::ComputedLonghandTable const*>(old_values.computed_longhand_table());
-    auto const* inherited_source_table = static_cast<ComputedValuesFFI::ComputedLonghandTable const*>(inherited_source.computed_longhand_table());
-    if (!old_table || !inherited_source_table) {
-        clear_computed_longhand_table();
-        return;
-    }
-    auto* table = ComputedValuesFFI::rust_computed_longhand_table_create_with_inherited_values(old_table, inherited_source_table);
-    clear_computed_longhand_table();
     // The freshly created table already carries the one reference this style owns.
     m_computed_longhand_table = table;
     refresh_computed_longhand_table_views();
