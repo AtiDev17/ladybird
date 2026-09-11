@@ -465,7 +465,7 @@ unsafe impl Sync for RetainedStyleValueData where StyleValueData: Send + Sync {}
 impl PartialEq for RetainedStyleValueData {
     fn eq(&self, other: &Self) -> bool {
         match (self.optional_data(), other.optional_data()) {
-            (Some(first), Some(second)) => std::ptr::eq(first, second) || first == second,
+            (Some(first), Some(second)) => style_values_equal(first, second),
             (None, None) => true,
             _ => false,
         }
@@ -3077,24 +3077,6 @@ pub extern "C" fn rust_style_value_create_empty_optional() -> *const StyleValueD
     Arc::into_raw(Arc::new(StyleValueData::EmptyOptional))
 }
 
-/// Takes ownership of one strong reference to the color.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_contrast_color(
-    has_color_type: bool,
-    color_type: u8,
-    color_syntax: u8,
-    color: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ContrastColor {
-        color_base: ColorBase {
-            has_color_type,
-            color_type,
-            color_syntax,
-        },
-        color: unsafe { RetainedStyleValueData::from_retained_pointer(color) },
-    }))
-}
-
 /// Takes ownership of one strong reference to the parameter data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_superellipse(
@@ -3369,26 +3351,6 @@ pub unsafe extern "C" fn rust_style_value_create_counter(
     }))
 }
 
-/// Takes ownership of one strong reference to each color.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_light_dark(
-    has_color_type: bool,
-    color_type: u8,
-    color_syntax: u8,
-    light: *const StyleValueData,
-    dark: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::LightDark {
-        color_base: ColorBase {
-            has_color_type,
-            color_type,
-            color_syntax,
-        },
-        light: unsafe { RetainedStyleValueData::from_retained_pointer(light) },
-        dark: unsafe { RetainedStyleValueData::from_retained_pointer(dark) },
-    }))
-}
-
 /// Takes ownership of one strong reference to the fixed value and one leaked reference to the
 /// name when they are present.
 #[unsafe(no_mangle)]
@@ -3405,19 +3367,6 @@ pub unsafe extern "C" fn rust_style_value_create_random_value_sharing(
         has_name,
         name: unsafe { CssString::from_leaked_raw(name) },
         element_shared,
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_color_interpolation_method(
-    is_polar: bool,
-    color_space: u8,
-    hue_interpolation_method: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ColorInterpolationMethod {
-        is_polar,
-        color_space,
-        hue_interpolation_method,
     }))
 }
 
@@ -3685,34 +3634,6 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
     }))
 }
 
-/// Takes ownership of one strong reference to each non-null value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_color_mix(
-    has_color_type: bool,
-    color_type: u8,
-    color_syntax: u8,
-    color_interpolation_method: *const StyleValueData,
-    first_color: *const StyleValueData,
-    first_percentage: *const StyleValueData,
-    second_color: *const StyleValueData,
-    second_percentage: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ColorMix {
-        color_base: ColorBase {
-            has_color_type,
-            color_type,
-            color_syntax,
-        },
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        first_color: unsafe { RetainedStyleValueData::from_retained_pointer(first_color) },
-        first_percentage: unsafe { RetainedStyleValueData::from_retained_optional_pointer(first_percentage) },
-        second_color: unsafe { RetainedStyleValueData::from_retained_pointer(second_color) },
-        second_percentage: unsafe { RetainedStyleValueData::from_retained_optional_pointer(second_percentage) },
-    }))
-}
-
 /// Takes ownership of the options' retained values and strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_image_set(
@@ -3895,7 +3816,48 @@ pub unsafe extern "C" fn rust_style_value_equals(first: *const StyleValueData, s
     if replay_style_value_dependency_flags(first).is_some() || replay_style_value_dependency_flags(second).is_some() {
         return false;
     }
-    unsafe { *first == *second }
+    style_values_equal(unsafe { &*first }, unsafe { &*second })
+}
+
+fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
+    if std::ptr::eq(first, second) {
+        return true;
+    }
+    match (first, second) {
+        (
+            StyleValueData::ColorFunction {
+                color_base: first_base,
+                channel_0: first_channel_0,
+                channel_1: first_channel_1,
+                channel_2: first_channel_2,
+                alpha: first_alpha,
+                has_name: first_has_name,
+                name: first_name,
+                origin_color: first_origin_color,
+            },
+            StyleValueData::ColorFunction {
+                color_base: second_base,
+                channel_0: second_channel_0,
+                channel_1: second_channel_1,
+                channel_2: second_channel_2,
+                alpha: second_alpha,
+                has_name: second_has_name,
+                name: second_name,
+                origin_color: second_origin_color,
+            },
+        ) => {
+            first_base.has_color_type == second_base.has_color_type
+                && (!first_base.has_color_type || first_base.color_type == second_base.color_type)
+                && first_channel_0 == second_channel_0
+                && first_channel_1 == second_channel_1
+                && first_channel_2 == second_channel_2
+                && first_alpha == second_alpha
+                && first_has_name == second_has_name
+                && (!first_has_name || first_name == second_name)
+                && first_origin_color == second_origin_color
+        }
+        _ => first == second,
+    }
 }
 
 /// Retains one reference to a shared style value allocation.
@@ -3957,6 +3919,62 @@ mod substitution_clone_tests {
             rust_style_value_release(shorthand);
             rust_style_value_release(cloned_shorthand);
         }
+    }
+}
+
+#[cfg(test)]
+mod equality_tests {
+    use super::*;
+
+    fn retained_number(value: f64) -> RetainedStyleValueData {
+        let value = Arc::into_raw(Arc::new(StyleValueData::Number { value }));
+        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+    }
+
+    fn retained(value: StyleValueData) -> RetainedStyleValueData {
+        let value = Arc::into_raw(Arc::new(value));
+        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+    }
+
+    fn color_function(color_syntax: u8) -> StyleValueData {
+        StyleValueData::ColorFunction {
+            color_base: ColorBase {
+                has_color_type: true,
+                color_type: 0,
+                color_syntax,
+            },
+            channel_0: retained_number(1.0),
+            channel_1: retained_number(2.0),
+            channel_2: retained_number(3.0),
+            alpha: RetainedStyleValueData::none(),
+            has_name: false,
+            name: CssString::none(),
+            origin_color: RetainedStyleValueData::none(),
+        }
+    }
+
+    #[test]
+    fn color_function_equality_ignores_syntax() {
+        let legacy = color_function(0);
+        let modern = color_function(1);
+        assert!(legacy != modern);
+        assert!(style_values_equal(&legacy, &modern));
+    }
+
+    #[test]
+    fn color_equality_rejects_different_variants() {
+        let color = color_function(0);
+        let light_dark = StyleValueData::LightDark {
+            color_base: ColorBase {
+                has_color_type: false,
+                color_type: 0,
+                color_syntax: 1,
+            },
+            light: retained(color_function(0)),
+            dark: retained(color_function(0)),
+        };
+        assert!(!style_values_equal(&color, &light_dark));
+        assert!(!style_values_equal(&light_dark, &color));
     }
 }
 

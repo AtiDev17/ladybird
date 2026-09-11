@@ -51,7 +51,7 @@ mod grid_tests {
             (property_id::CLIP_PATH, "ellipse(2px 3px)"),
             (property_id::CLIP_PATH, "polygon(1px 2px, 3px 4px, 5px 6px)"),
             (property_id::D, "path(\"M0 0 L30 40\")"),
-            (property_id::ANIMATION_TIMING_FUNCTION, "linear(0, 1 50%)"),
+            (property_id::ANIMATION_TIMING_FUNCTION, "linear(0 0%, 1 50%)"),
             (property_id::ANIMATION_TIMING_FUNCTION, "cubic-bezier(0, 0, 1, 1)"),
             (property_id::ANIMATION_TIMING_FUNCTION, "steps(4, jump-start)"),
         ] {
@@ -96,6 +96,86 @@ mod grid_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn composite_resolution_preserves_color_mix_with_currentcolor() {
+        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            unsafe { Arc::increment_strong_count(value) };
+            value
+        }
+        let parsed = parse(property_id::COLOR, "color-mix(in srgb, currentcolor 20%, red 20%)");
+        let resolved = unsafe {
+            Arc::from_raw(rust_composite_style_value_absolutize(
+                &parsed,
+                std::ptr::null(),
+                unchanged,
+            ))
+        };
+        let StyleValueData::ColorMix {
+            first_percentage,
+            second_percentage,
+            ..
+        } = &*resolved
+        else {
+            unreachable!();
+        };
+        assert_eq!(percentage_from_style_value(first_percentage.data()), Some(20.0));
+        assert_eq!(percentage_from_style_value(second_percentage.data()), Some(20.0));
+    }
+
+    #[test]
+    fn composite_resolution_resolves_contrast_color() {
+        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            unsafe { Arc::increment_strong_count(value) };
+            value
+        }
+        let parsed = parse(property_id::COLOR, "contrast-color(red)");
+        let resolved = unsafe {
+            Arc::from_raw(rust_composite_style_value_absolutize(
+                &parsed,
+                std::ptr::null(),
+                unchanged,
+            ))
+        };
+        assert!(matches!(&*resolved, StyleValueData::ColorFunction { .. }));
+        assert_eq!(
+            to_color(&resolved, &EMPTY_INPUT),
+            Some(crate::css::color_resolution::Rgba::BLACK)
+        );
+    }
+
+    #[test]
+    fn composite_resolution_canonicalizes_linear_easing_control_points() {
+        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
+            unsafe { Arc::increment_strong_count(value) };
+            value
+        }
+        let parsed = parse(property_id::ANIMATION_TIMING_FUNCTION, "linear(0, 0.25, 0.5 60%, 1)");
+        let StyleValueData::ValueList { values, .. } = &*parsed else {
+            unreachable!();
+        };
+        let resolved = unsafe {
+            Arc::from_raw(rust_composite_style_value_absolutize(
+                values.as_slice()[0].data(),
+                std::ptr::null(),
+                unchanged,
+            ))
+        };
+        let StyleValueData::Easing { linear_stops, .. } = &*resolved else {
+            unreachable!();
+        };
+        let inputs = linear_stops
+            .as_slice()
+            .iter()
+            .map(|stop| {
+                let StyleValueData::Percentage { value } = stop.input().data() else {
+                    unreachable!();
+                };
+                *value
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs, [0.0, 30.0, 60.0, 100.0]);
     }
 
     #[test]
@@ -185,7 +265,7 @@ use crate::css::css_enums::keyword;
 use crate::css::style_compute::{FfiLengthResolutionContext, absolutize_length, keyword_is_color};
 use crate::css::style_value::{
     ColorBase, CssString, RetainedGridTrackEntryList, RetainedStyleValueData, RetainedStyleValueDataList,
-    StyleValueData,
+    StyleValueData, value_depends_on_current_color,
 };
 
 pub(crate) struct AbsolutizationContext<'a> {
@@ -591,9 +671,9 @@ fn absolutize_color_function(value: &StyleValueData, context: &AbsolutizationCon
     Some(Absolutized::Changed(retain_new(rebuilt)))
 }
 
-/// Port of ColorMixStyleValue::absolutized: normalizes the mix percentages, resolves relative
-/// color forms, and interpolates to a concrete color; when interpolation cannot complete the
-/// color-mix rebuilds around its absolutized parts instead.
+/// Normalize the mix percentages, resolve relative color forms, and interpolate to a concrete
+/// color. When interpolation cannot complete, rebuild the color mix around its absolutized parts.
+// FIXME: Follow the spec algorithm. https://drafts.csswg.org/css-color-5/#calculate-a-color-mix
 fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
     let StyleValueData::ColorMix {
         color_interpolation_method,
@@ -654,22 +734,14 @@ fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext)
     let interpolated = (|| -> Option<RetainedStyleValueData> {
         let resolved_from = resolve_color_for_interpolation(resolved_first, &input)?;
         let resolved_to = resolve_color_for_interpolation(resolved_second, &input)?;
-        // SAFETY: All pointers stay live for the duration of the call; the non-null result
-        // owns exactly one strong reference.
-        let result = unsafe {
-            crate::css::color_interpolation::rust_interpolate_color(
-                &raw const resolved_from,
-                &raw const resolved_to,
-                std::ptr::from_ref(method),
-                delta as f32,
-                normalized.alpha_multiplier as f32,
-            )
-        };
-        if result.is_null() {
-            return None;
-        }
-        // SAFETY: The returned pointer owns exactly one strong reference.
-        Some(unsafe { RetainedStyleValueData::from_retained_pointer(result) })
+        let result = crate::css::color_interpolation::interpolate_color(
+            &resolved_from,
+            &resolved_to,
+            method,
+            delta as f32,
+            normalized.alpha_multiplier as f32,
+        )?;
+        Some(retain_new(result))
     })();
     if let Some(result) = interpolated {
         return Some(Absolutized::Changed(result));
@@ -703,6 +775,56 @@ fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext)
             value: normalized.second_percentage,
         }),
     })))
+}
+
+// FIXME: Follow the spec algorithm. https://drafts.csswg.org/css-color-5/#calculate-a-color-mix
+fn absolutize_color_mix_with_resolved_children(
+    value: &StyleValueData,
+    map: &mut impl FnMut(&RetainedStyleValueData) -> Option<RetainedStyleValueData>,
+) -> Option<Absolutized> {
+    let StyleValueData::ColorMix {
+        color_interpolation_method,
+        first_color,
+        first_percentage,
+        second_color,
+        second_percentage,
+        ..
+    } = value
+    else {
+        return None;
+    };
+
+    let color_interpolation_method = map(color_interpolation_method)?;
+    let first_color = map(first_color)?;
+    let first_percentage = map(first_percentage)?;
+    let second_color = map(second_color)?;
+    let second_percentage = map(second_percentage)?;
+
+    let rebuilt = StyleValueData::ColorMix {
+        color_base: ColorBase {
+            has_color_type: false,
+            color_type: 0,
+            color_syntax: COLOR_SYNTAX_MODERN,
+        },
+        color_interpolation_method,
+        first_color,
+        first_percentage,
+        second_color,
+        second_percentage,
+    };
+
+    if !value_depends_on_current_color(&rebuilt)
+        && let Some(color) =
+            crate::css::color_resolution::resolve_color_mix(&rebuilt, &crate::css::color_resolution::EMPTY_INPUT)
+    {
+        return Some(Absolutized::Changed(retain_new(color)));
+    }
+
+    if rebuilt == *value {
+        Some(Absolutized::Unchanged)
+    } else {
+        Some(Absolutized::Changed(retain_new(rebuilt)))
+    }
 }
 
 /// The gradient absolutizers recurse their Rust-owned children and rebuild the retained stop
@@ -1046,6 +1168,96 @@ fn absolutize_basic_shape(
     }
 }
 
+fn canonicalize_linear_easing_control_points(
+    stops: Vec<crate::css::style_value::RetainedLinearEasingStop>,
+) -> Option<(Vec<crate::css::style_value::RetainedLinearEasingStop>, bool)> {
+    struct ControlPoint {
+        output: RetainedStyleValueData,
+        original_input: RetainedStyleValueData,
+        input: Option<f64>,
+    }
+
+    let mut control_points = stops
+        .into_iter()
+        .map(|stop| {
+            let [output, input] = stop.values();
+            let resolved_input = match input.optional_data() {
+                Some(input) => Some(number_from_value(input, 1.0)?),
+                None => None,
+            };
+            Some(ControlPoint {
+                output: output.clone_retained(),
+                original_input: input.clone_retained(),
+                input: resolved_input,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // https://drafts.csswg.org/css-easing/#linear-canonicalization
+    // To canonicalize a linear() function’s control points, perform the following:
+
+    // 1. If the first control point lacks an input progress value, set its input progress value to 0.
+    if control_points.first()?.input.is_none() {
+        control_points.first_mut()?.input = Some(0.0);
+    }
+
+    // 2. If the last control point lacks an input progress value, set its input progress value to 1.
+    if control_points.last()?.input.is_none() {
+        control_points.last_mut()?.input = Some(1.0);
+    }
+
+    // 3. If any control point has an input progress value that is less than
+    // the input progress value of any preceding control point,
+    // set its input progress value to the largest input progress value of any preceding control point.
+    let mut largest_input = f64::NEG_INFINITY;
+    for control_point in &mut control_points {
+        if let Some(input) = control_point.input {
+            if input < largest_input {
+                control_point.input = Some(largest_input);
+            } else {
+                largest_input = input;
+            }
+        }
+    }
+
+    // 4. If any control point still lacks an input progress value,
+    // then for each contiguous run of such control points,
+    // set their input progress values so that they are evenly spaced
+    // between the preceding and following control points with input progress values.
+    let mut run_start_index: Option<usize> = None;
+    for index in 0..control_points.len() {
+        if control_points[index].input.is_some() && run_start_index.is_some() {
+            let run_start_index = run_start_index.take()?;
+            let start_input = control_points[run_start_index - 1].input?;
+            let end_input = control_points[index].input?;
+            let run_stop_count = index - run_start_index + 1;
+            let delta = (end_input - start_input) / run_stop_count as f64;
+            for run_index in 0..run_stop_count {
+                control_points[run_index + run_start_index - 1].input = Some(start_input + delta * run_index as f64);
+            }
+        } else if control_points[index].input.is_none() && run_start_index.is_none() {
+            run_start_index = Some(index);
+        }
+    }
+
+    let mut changed = false;
+    let stops = control_points
+        .into_iter()
+        .map(|control_point| {
+            let input = control_point.input?;
+            changed |= !matches!(
+                control_point.original_input.optional_data(),
+                Some(StyleValueData::Percentage { value }) if *value == input * 100.0
+            );
+            Some(crate::css::style_value::RetainedLinearEasingStop::from_retained_values(
+                control_point.output,
+                retain_new(StyleValueData::Percentage { value: input * 100.0 }),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((stops, changed))
+}
+
 fn absolutize_easing(
     value: &StyleValueData,
     resolve: &mut impl FnMut(&RetainedStyleValueData, &mut bool) -> Option<RetainedStyleValueData>,
@@ -1072,6 +1284,11 @@ fn absolutize_easing(
         stops.push(crate::css::style_value::RetainedLinearEasingStop::from_retained_values(
             output, input,
         ));
+    }
+    if *kind == 0 {
+        let (canonicalized_stops, canonicalization_changed) = canonicalize_linear_easing_control_points(stops)?;
+        stops = canonicalized_stops;
+        changed |= canonicalization_changed;
     }
     let x1 = resolve(x1, &mut changed)?;
     let y1 = resolve(y1, &mut changed)?;
@@ -1160,7 +1377,7 @@ fn map_grid_values(
 /// Resolve context-dependent leaves without materializing a C++ composite value graph.
 ///
 /// # Safety
-/// The value must be a live grid, easing, or basic-shape value. The callback must return one retained reference
+/// The value must be a live supported composite value. The callback must return one retained reference
 /// for each borrowed leaf and must not mutate the input graph.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_composite_style_value_absolutize(
@@ -1174,24 +1391,59 @@ pub unsafe extern "C" fn rust_composite_style_value_absolutize(
             Some(data) => unsafe { RetainedStyleValueData::from_retained_pointer(resolve(context, data)) },
         })
     };
+    let color_result = match value {
+        StyleValueData::ColorMix { .. } => absolutize_color_mix_with_resolved_children(value, &mut map),
+        StyleValueData::ContrastColor { color, .. } => map(color).map(|mapped| {
+            let rebuilt = StyleValueData::ContrastColor {
+                color_base: ColorBase {
+                    has_color_type: false,
+                    color_type: 0,
+                    color_syntax: COLOR_SYNTAX_MODERN,
+                },
+                color: mapped,
+            };
+            if !value_depends_on_current_color(&rebuilt)
+                && let Some(resolved) = to_color(&rebuilt, &EMPTY_INPUT)
+            {
+                return Absolutized::Changed(retain_new(rgb_color_function(
+                    f64::from(resolved.r),
+                    f64::from(resolved.g),
+                    f64::from(resolved.b),
+                    f64::from(resolved.a) / 255.0,
+                    COLOR_SYNTAX_MODERN,
+                )));
+            }
+            if rebuilt == *value {
+                Absolutized::Unchanged
+            } else {
+                Absolutized::Changed(retain_new(rebuilt))
+            }
+        }),
+        _ => None,
+    };
     let mut resolve_child = |child: &RetainedStyleValueData, changed: &mut bool| {
         let mapped = map(child)?;
         *changed |= mapped != *child;
         Some(mapped)
     };
-    let result = match value {
-        StyleValueData::BasicShape { .. } => absolutize_basic_shape(value, &mut resolve_child),
-        StyleValueData::Easing { .. } => absolutize_easing(value, &mut resolve_child),
-        _ => {
-            let mapped = map_grid_values(value, &mut map).unwrap();
-            Some(if mapped == *value {
-                Absolutized::Unchanged
-            } else {
-                Absolutized::Changed(retain_new(mapped))
-            })
+    let result = if let Some(result) = color_result {
+        result
+    } else {
+        match value {
+            StyleValueData::BasicShape { .. } => absolutize_basic_shape(value, &mut resolve_child),
+            StyleValueData::Easing { .. } => absolutize_easing(value, &mut resolve_child),
+            StyleValueData::ColorMix { .. } | StyleValueData::ContrastColor { .. } => unreachable!(),
+            _ => {
+                let mapped = map_grid_values(value, &mut map).unwrap();
+                Some(if mapped == *value {
+                    Absolutized::Unchanged
+                } else {
+                    Absolutized::Changed(retain_new(mapped))
+                })
+            }
         }
-    }
-    .unwrap();
+        .unwrap()
+    };
     if let Absolutized::Changed(mapped) = result {
         let pointer = mapped.pointer();
         core::mem::forget(mapped);
@@ -1764,8 +2016,9 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
         | StyleValueData::RadialGradient { .. }
         | StyleValueData::ConicGradient { .. } => absolutize_gradient(value, context),
 
-        // Port of ContrastColorStyleValue::absolutized: a resolvable contrast-color computes
-        // to its picked foreground color; otherwise the inner color absolutizes in place.
+        // https://drafts.csswg.org/css-color-5/#contrast-color
+        // A resolvable contrast-color computes to its picked foreground color; otherwise the
+        // inner color absolutizes in place.
         StyleValueData::ContrastColor { color, .. } => {
             let input = color_resolution_input(context);
             if let Some(resolved) = to_color(value, &input) {
@@ -1792,8 +2045,9 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             )
         }
 
-        // Port of LightDarkStyleValue::absolutized: with no scheme the value computes to
-        // itself; otherwise it collapses to the matching branch's absolutized value.
+        // https://drafts.csswg.org/css-color-5/#funcdef-light-dark
+        // With no scheme the value computes to itself; otherwise it collapses to the matching
+        // branch's absolutized value.
         StyleValueData::LightDark { light, dark, .. } => {
             let Some(scheme) = context.scheme else {
                 return Some(Absolutized::Unchanged);

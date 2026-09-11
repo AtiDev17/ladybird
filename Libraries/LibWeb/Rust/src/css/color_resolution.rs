@@ -20,7 +20,7 @@ use crate::css::calc::{
     resolve_calculated_number_with_channels, resolve_calculated_percentage_with_channels,
 };
 use crate::css::color_conversion::{self, Components};
-use crate::css::color_interpolation::{FfiResolvedColor, rust_interpolate_color};
+use crate::css::color_interpolation::{ResolvedColor, interpolate_color};
 use crate::css::css_enums::channel_keyword;
 use crate::css::css_enums::keyword;
 use crate::css::css_enums::keyword_to_channel_keyword;
@@ -391,8 +391,7 @@ const fn color_function(name: &'static str) -> ColorFunctionDescriptor {
     }
 }
 
-/// Transcribed from ColorFunctionDescriptor.cpp, indexed by the frozen color-type codes
-/// (the color_conversion constants, asserted against C++ in ColorMixStyleValue.cpp).
+/// Color function metadata indexed by the frozen color-type codes.
 static COLOR_FUNCTION_DESCRIPTORS: [ColorFunctionDescriptor; 16] = [
     // RGB
     ColorFunctionDescriptor {
@@ -646,7 +645,7 @@ pub(crate) fn system_color_for_keyword(keyword_code: u16, dark: bool) -> Option<
 pub(crate) const PREFERRED_COLOR_SCHEME_DARK: u8 = 1;
 pub(crate) const PREFERRED_COLOR_SCHEME_LIGHT: u8 = 2;
 
-// Gfx::RectangularColorSpace::Oklab, asserted against C++ in ColorMixStyleValue.cpp.
+// Gfx::RectangularColorSpace::Oklab.
 pub(crate) const RECTANGULAR_COLOR_SPACE_OKLAB: u8 = 8;
 
 /// Mirror of Web::CSS::ColorResolutionContext: the preferred color scheme, the used value of
@@ -841,21 +840,19 @@ fn retained_null() -> RetainedStyleValueData {
     unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) }
 }
 
-/// Port of clamp_to_byte() in ColorFunctionStyleValue.cpp: NaN becomes 0, then llround
-/// (round half away from zero, which f64::round matches) after clamping.
+/// Clamp a legacy RGB channel to a byte. NaN becomes 0, then values round half away from zero.
 fn clamp_to_byte(value: f64) -> u8 {
     let value = if value.is_nan() { 0.0 } else { value };
     value.clamp(0.0, 255.0).round() as u8
 }
 
-/// Port of fraction_to_byte() in ColorFunctionStyleValue.cpp.
+/// Convert a normalized channel to a byte.
 fn fraction_to_byte(fraction_0_1: f64) -> u8 {
     // Match CSS Color 4 "resolve to sRGB" rounding: round half away from zero,
     // not the default round-half-to-even that cvtsd2si uses.
     (fraction_0_1 * 255.0).clamp(0.0, 255.0).round() as u8
 }
 
-/// Port of ResolvedChannels in ColorFunctionStyleValue.cpp.
 struct ResolvedChannels {
     c1: f64,
     c2: f64,
@@ -863,7 +860,6 @@ struct ResolvedChannels {
     alpha: f64,
 }
 
-/// Port of resolve_channels_for() in ColorFunctionStyleValue.cpp.
 fn resolve_channels_for(
     descriptor: &ColorFunctionDescriptor,
     channels: [&StyleValueData; 3],
@@ -894,7 +890,6 @@ fn resolve_channels_for(
     })
 }
 
-/// Port of the per-color-type construction switch in ColorFunctionStyleValue::to_color().
 fn construct_color(color_type: u8, c1: f64, c2: f64, c3: f64, alpha: f64) -> Option<Rgba> {
     use color_conversion as ct;
     Some(match color_type {
@@ -964,12 +959,10 @@ fn construct_color(color_type: u8, c1: f64, c2: f64, c3: f64, alpha: f64) -> Opt
         ct::REC2020 => Rgba::from_rec2020(c1 as f32, c2 as f32, c3 as f32, alpha as f32),
         ct::XYZ_D50 => Rgba::from_xyz50(c1 as f32, c2 as f32, c3 as f32, alpha as f32),
         ct::XYZ_D65 => Rgba::from_xyz65(c1 as f32, c2 as f32, c3 as f32, alpha as f32),
-        // The C++ switch is exhaustive over ColorType and VERIFYs past its end.
         _ => return None,
     })
 }
 
-/// Port of ColorFunctionStyleValue::to_color().
 fn color_function_to_color(value: &StyleValueData, input: &ColorResolutionInput) -> Option<Rgba> {
     let StyleValueData::ColorFunction {
         color_base,
@@ -983,7 +976,6 @@ fn color_function_to_color(value: &StyleValueData, input: &ColorResolutionInput)
     else {
         return None;
     };
-    // The C++ code dereferences color_type() unconditionally.
     if !color_base.has_color_type {
         return None;
     }
@@ -1405,14 +1397,13 @@ pub(crate) fn percentage_from_style_value(value: &StyleValueData) -> Option<f64>
     }
 }
 
-/// Port of ColorMixStyleValue::NormalizedPercentages; percentages are 0-100 values.
+/// Percentages are represented as values from 0 to 100.
 pub(crate) struct NormalizedPercentages {
     pub(crate) first_percentage: f64,
     pub(crate) second_percentage: f64,
     pub(crate) alpha_multiplier: f64,
 }
 
-/// Port of ColorMixStyleValue::normalize_percentage_pair().
 // https://drafts.csswg.org/css-color-5/#color-mix-percent-norm
 pub(crate) fn normalize_percentage_pair(p1: Option<f64>, p2: Option<f64>) -> NormalizedPercentages {
     let mut alpha_multiplier = 1.0;
@@ -1457,7 +1448,6 @@ pub(crate) fn normalize_percentage_pair(p1: Option<f64>, p2: Option<f64>) -> Nor
     }
 }
 
-/// Port of resolve_native_color_components() in ColorMixStyleValue.cpp.
 fn resolve_native_color_components(
     style_value: &StyleValueData,
     input: &ColorResolutionInput,
@@ -1554,11 +1544,10 @@ fn resolve_native_color_components(
     Some((color_base.color_type, components))
 }
 
-/// Port of resolve_color_for_rust_interpolation() in ColorMixStyleValue.cpp.
 pub(crate) fn resolve_color_for_interpolation(
     input_value: &StyleValueData,
     input: &ColorResolutionInput,
-) -> Option<FfiResolvedColor> {
+) -> Option<ResolvedColor> {
     let resolved_relative_storage;
     let mut style_value = input_value;
     if let StyleValueData::ColorFunction { origin_color, .. } = input_value
@@ -1580,7 +1569,7 @@ pub(crate) fn resolve_color_for_interpolation(
             // resolve_native_color_components() only accepts color functions.
             return None;
         };
-        return Some(FfiResolvedColor {
+        return Some(ResolvedColor {
             color_type,
             components,
             missing: [
@@ -1595,7 +1584,7 @@ pub(crate) fn resolve_color_for_interpolation(
 
     let color = to_color(style_value, input)?;
     // Gfx::color_to_srgb(): the u8 channels back to fractions.
-    Some(FfiResolvedColor {
+    Some(ResolvedColor {
         color_type: color_conversion::SRGB,
         components: [
             f32::from(color.r) / 255.0,
@@ -1608,10 +1597,8 @@ pub(crate) fn resolve_color_for_interpolation(
     })
 }
 
-/// Port of ColorMixStyleValue::to_color() and interpolate_color_in_rust(), reaching the
-/// interpolation entry point in-crate instead of through the C++ round trip.
 // https://drafts.csswg.org/css-color-5/#color-mix-result
-fn color_mix_to_color(value: &StyleValueData, input: &ColorResolutionInput) -> Option<Rgba> {
+pub(crate) fn resolve_color_mix(value: &StyleValueData, input: &ColorResolutionInput) -> Option<StyleValueData> {
     let StyleValueData::ColorMix {
         color_interpolation_method,
         first_color,
@@ -1645,22 +1632,17 @@ fn color_mix_to_color(value: &StyleValueData, input: &ColorResolutionInput) -> O
     let resolved_from = resolve_color_for_interpolation(first_color.data(), input)?;
     let resolved_to = resolve_color_for_interpolation(second_color.data(), input)?;
     let delta = (normalized.second_percentage / 100.0) as f32;
-    // SAFETY: All pointers stay live for the duration of the call.
-    let result = unsafe {
-        rust_interpolate_color(
-            &raw const resolved_from,
-            &raw const resolved_to,
-            std::ptr::from_ref(method),
-            delta,
-            normalized.alpha_multiplier as f32,
-        )
-    };
-    if result.is_null() {
-        return None;
-    }
-    // SAFETY: The returned pointer owns exactly one strong reference.
-    let result = unsafe { Arc::from_raw(result) };
-    to_color(&result, input)
+    interpolate_color(
+        &resolved_from,
+        &resolved_to,
+        method,
+        delta,
+        normalized.alpha_multiplier as f32,
+    )
+}
+
+fn color_mix_to_color(value: &StyleValueData, input: &ColorResolutionInput) -> Option<Rgba> {
+    to_color(&resolve_color_mix(value, input)?, input)
 }
 
 /// The color-resolution fan-out over the color-bearing style value variants: the union of
@@ -1678,11 +1660,12 @@ pub(crate) fn to_color(value: &StyleValueData, input: &ColorResolutionInput) -> 
         }
         StyleValueData::ColorFunction { .. } => color_function_to_color(value, input),
         StyleValueData::ColorMix { .. } => color_mix_to_color(value, input),
-        // Port of ContrastColorStyleValue::to_color().
+        // https://drafts.csswg.org/css-color-5/#contrast-color
         StyleValueData::ContrastColor { color, .. } => {
             Some(to_color(color.data(), input)?.suggested_foreground_color())
         }
-        // Port of LightDarkStyleValue::to_color(): a missing scheme takes the light branch.
+        // https://drafts.csswg.org/css-color-5/#funcdef-light-dark
+        // A missing scheme takes the light branch.
         StyleValueData::LightDark { light, dark, .. } => {
             if input.scheme == Some(PREFERRED_COLOR_SCHEME_DARK) {
                 to_color(dark.data(), input)

@@ -15,10 +15,7 @@
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorFunctionStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ColorMixStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ContrastColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LightDarkStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 
@@ -78,18 +75,7 @@ Optional<Color> ColorStyleValue::to_color(ColorResolutionContext color_resolutio
         if (resolved.resolved)
             return Color(resolved.rgba[0], resolved.rgba[1], resolved.rgba[2], resolved.rgba[3]);
     }
-    switch (m_value->tag) {
-    case StyleValueFFI::StyleValueData::Tag::ColorFunction:
-        return static_cast<ColorFunctionStyleValue const&>(*this).to_color(color_resolution_context);
-    case StyleValueFFI::StyleValueData::Tag::ColorMix:
-        return static_cast<ColorMixStyleValue const&>(*this).to_color(color_resolution_context);
-    case StyleValueFFI::StyleValueData::Tag::ContrastColor:
-        return static_cast<ContrastColorStyleValue const&>(*this).to_color(color_resolution_context);
-    case StyleValueFFI::StyleValueData::Tag::LightDark:
-        return static_cast<LightDarkStyleValue const&>(*this).to_color(color_resolution_context);
-    default:
-        VERIFY_NOT_REACHED();
-    }
+    return {};
 }
 
 ValueComparingNonnullRefPtr<StyleValue const> ColorStyleValue::absolutized(ComputationContext const& context) const
@@ -98,30 +84,12 @@ ValueComparingNonnullRefPtr<StyleValue const> ColorStyleValue::absolutized(Compu
     case StyleValueFFI::StyleValueData::Tag::ColorFunction:
         return static_cast<ColorFunctionStyleValue const&>(*this).absolutized(context);
     case StyleValueFFI::StyleValueData::Tag::ColorMix:
-        return static_cast<ColorMixStyleValue const&>(*this).absolutized(context);
     case StyleValueFFI::StyleValueData::Tag::ContrastColor:
-        return static_cast<ContrastColorStyleValue const&>(*this).absolutized(context);
     case StyleValueFFI::StyleValueData::Tag::LightDark:
-        return static_cast<LightDarkStyleValue const&>(*this).absolutized(context);
+        VERIFY_NOT_REACHED();
     default:
         VERIFY_NOT_REACHED();
     }
-}
-
-bool ColorStyleValue::equals(StyleValue const& other) const
-{
-    if (type() != other.type())
-        return false;
-
-    auto const& other_color = static_cast<ColorStyleValue const&>(other);
-    if (m_value->tag != other_color.m_value->tag)
-        return false;
-
-    // Color functions deliberately ignore the legacy/modern syntax flag the data carries, so
-    // structural data equality would be too strict for them; everything else compares by data.
-    if (m_value->tag == StyleValueFFI::StyleValueData::Tag::ColorFunction)
-        return static_cast<ColorFunctionStyleValue const&>(*this).equals(other);
-    return StyleValueFFI::rust_style_value_equals(rust_style_value_data(), other.rust_style_value_data());
 }
 
 ValueComparingNonnullRefPtr<ColorStyleValue const> ColorStyleValue::create_from_color(Color color, ColorSyntax color_syntax, Optional<Utf16FlyString> name)

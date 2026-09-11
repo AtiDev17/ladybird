@@ -59,10 +59,7 @@ public:
 
     ColorFunctionDescriptor const& descriptor() const { return color_function_descriptor_for(*color_type()); }
 
-    Optional<Color> to_color(ColorResolutionContext) const;
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-    bool equals(StyleValue const&) const;
-
     ValueComparingRefPtr<StyleValue const> resolve_relative_form(ColorResolutionContext const&) const;
 
     ValueComparingNonnullRefPtr<StyleValue const> computed_value_form() const;
