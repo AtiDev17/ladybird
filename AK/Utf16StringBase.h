@@ -286,6 +286,16 @@ public:
         }
     }
 
+    [[nodiscard]] ALWAYS_INLINE bool has_fly_string_storage() const
+    {
+        if (has_short_ascii_storage())
+            return true;
+        auto const* data = data_without_union_member_assertion();
+        return !data || data->is_fly_string();
+    }
+
+    [[nodiscard]] constexpr FlatPtr raw_identity() const { return raw(); }
+
     // This is primarily interesting to unit tests.
     [[nodiscard]] ALWAYS_INLINE bool has_long_ascii_storage() const
     {

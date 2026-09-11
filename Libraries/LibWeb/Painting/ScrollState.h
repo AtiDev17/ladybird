@@ -20,8 +20,8 @@
 namespace Web::Painting {
 
 // Device-pixel offsets keyed by SpatialNodeIndex: the scroll containers' offsets as produced by
-// the document, plus the sticky nodes' offsets that resolve_sticky_offsets() derives from them
-// and the tree. Stored dense in process so display list replay and hit testing index it directly;
+// the document, plus the sticky nodes' offsets derived from them and the tree (by the document's
+// scroll state refresh in process, by resolve_sticky_offsets() in the compositor). Stored dense in process so display list replay and hit testing index it directly;
 // indices that are not scroll-like nodes read as zero offsets. The IPC representation is sparse
 // (index, offset) pairs.
 //
@@ -53,6 +53,14 @@ public:
         if (index.value() >= m_device_offsets.size())
             m_device_offsets.resize(index.value() + 1);
         m_device_offsets[index.value()] = offset;
+    }
+
+    // Replaces every offset with a freshly derived dense array, keeping the adopted async scroll
+    // sequence and the node count bound.
+    void assign_device_offsets(ReadonlySpan<Gfx::FloatPoint> offsets)
+    {
+        m_device_offsets.clear_with_capacity();
+        m_device_offsets.append(offsets.data(), min(offsets.size(), m_node_count));
     }
 
     // Bind the snapshot to the authoritative node count from the AccumulatedVisualContextTree that owns these nodes.

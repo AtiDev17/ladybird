@@ -4382,7 +4382,7 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
     }
 
     if (auto document = active_document()) {
-        if (invalidate_display_list == InvalidateDisplayList::Yes)
+        if (invalidate_display_list == InvalidateDisplayList::PaintCommandsAndHitTestList)
             document->record_style_environment_change();
         else
             document->invalidate_style_for_viewport_change();
@@ -4431,7 +4431,7 @@ void LocalNavigable::perform_scroll_of_viewport_scrolling_box(CSSPixelPoint new_
 
         if (auto document = active_document()) {
             document->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::No);
-            document->set_needs_to_refresh_scroll_state(true);
+            document->invalidate_scroll_state();
             document->inform_all_viewport_clients_about_the_current_viewport_rect();
         }
     }
@@ -4494,7 +4494,6 @@ static GC::Ptr<DOM::Element> adopt_async_element_scroll_delta(DOM::Document& doc
 
     element->set_scroll_offset(pseudo_element, scroll_offset);
 
-    document.set_needs_to_refresh_scroll_state(true);
     document.append_pending_scroll_event({ *element, EventNames::scroll });
     element->set_needs_repaint(InvalidateDisplayList::No);
     return element;
@@ -6039,7 +6038,7 @@ void LocalNavigable::set_should_show_caret_hit_test_debug_overlay(bool value)
 
     if (auto document = active_document()) {
         if (value)
-            document->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::Yes);
+            document->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::PaintCommands);
         else
             document->set_caret_hit_test_debug_rect({});
     }
@@ -6172,7 +6171,6 @@ bool LocalNavigable::record_display_list_and_scroll_state(PaintConfig paint_conf
 
     VERIFY(document->has_committed_viewport_box());
     auto visual_context_tree_needs_compositor_update = document_paint_state.visual_context_tree_needs_compositor_update();
-    document_paint_state.refresh_scroll_state(*document);
 
     Painting::ScrollStateSnapshot scroll_state_snapshot { document_paint_state.scroll_state_snapshot() };
     scroll_state_snapshot.set_adopted_async_scroll_sequence(m_adopted_async_scroll_sequence);

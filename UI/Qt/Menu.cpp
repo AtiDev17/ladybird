@@ -237,7 +237,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Delete));
 #endif
         break;
-    case WebView::ActionID::OpenProcessesPage:
+    case WebView::ActionID::OpenTaskManager:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
         break;
     case WebView::ActionID::OpenSettingsPage:

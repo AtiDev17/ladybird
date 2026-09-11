@@ -45,6 +45,7 @@ public:
 
     [[nodiscard]] Utf16String utf16_string() const;
     [[nodiscard]] Utf16View utf16_string_view() const;
+    [[nodiscard]] PropertyKey property_key(VM&) const;
     bool has_utf16_string() const { return m_utf16_string.has_value(); }
 
     size_t length_in_utf16_code_units() const;
@@ -69,8 +70,6 @@ protected:
 
     mutable Optional<Utf16String> m_utf16_string;
 
-    bool m_utf16_string_is_in_cache { false };
-
 private:
     friend class RopeString;
     friend class Substring;
@@ -81,6 +80,7 @@ private:
     explicit PrimitiveString(Utf16String);
 
     void resolve_if_needed() const;
+    static size_t fly_string_cache_hash(Utf16FlyString const&);
     Optional<StringView> short_flat_string_storage_view() const;
     static GC::Ptr<PrimitiveString> try_create_short_flat_concatenated_string(VM&, PrimitiveString const& lhs, PrimitiveString const& rhs);
 };

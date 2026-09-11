@@ -38,6 +38,8 @@ target_sources(ladybird PRIVATE
     LocationEdit.cpp
     Menu.cpp
     NativeWindowContainer.cpp
+    ProcessManagerWindow.cpp
+    PerformanceMonitorWidget.cpp
     SelectDropdown.cpp
     Settings.cpp
     StringUtils.cpp
@@ -147,4 +149,16 @@ qt_deploy_runtime_dependencies(
             -P ${ladybird_deploy_script}
         COMMAND_EXPAND_LISTS
     )
+endif()
+
+if (BUILD_TESTING)
+    add_executable(TestPerformanceMonitorWidget
+        ${LADYBIRD_SOURCE_DIR}/Tests/LibWebView/TestPerformanceMonitorWidget.cpp
+        PerformanceMonitorWidget.cpp
+        StringUtils.cpp
+    )
+    target_include_directories(TestPerformanceMonitorWidget PRIVATE ${LADYBIRD_SOURCE_DIR})
+    target_link_libraries(TestPerformanceMonitorWidget PRIVATE Qt6::Widgets LibWebView LibURL AK)
+    add_test(NAME TestPerformanceMonitorWidget COMMAND TestPerformanceMonitorWidget)
+    set_tests_properties(TestPerformanceMonitorWidget PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

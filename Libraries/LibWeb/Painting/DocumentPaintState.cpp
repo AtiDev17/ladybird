@@ -72,44 +72,32 @@ BlockingWheelEventRegionState DocumentPaintState::collect_root_blocking_wheel_ev
     return {};
 }
 
-void DocumentPaintState::viewport_row_was_reset(DOM::Document& document)
+void DocumentPaintState::viewport_row_was_reset()
 {
-    clear_scroll_state(document);
+    m_scroll_state_snapshot = {};
     m_boxes_with_auto_content_visibility.clear();
     m_visual_context_tree_needs_compositor_update = false;
 }
 
 void DocumentPaintState::refresh_sticky_constraints(DOM::Document& document)
 {
-    m_needs_to_refresh_scroll_state = true;
     if (mirror_rust_refresh_sticky_constraints(document))
         m_visual_context_tree_needs_compositor_update = true;
 }
 
-void DocumentPaintState::set_needs_to_refresh_scroll_state(DOM::Document& document, bool value)
+void DocumentPaintState::invalidate_scroll_state(DOM::Document& document)
 {
-    m_needs_to_refresh_scroll_state = value;
-    mirror_rust_set_needs_to_refresh_scroll_state(document, value);
-}
-
-void DocumentPaintState::clear_scroll_state(DOM::Document& document)
-{
-    m_scroll_state_snapshot = {};
-    m_needs_to_refresh_scroll_state = true;
-    mirror_rust_clear_scroll_state(document);
+    rust_invalidate_scroll_state(document);
 }
 
 void DocumentPaintState::update_accumulated_visual_contexts(DOM::Document& document)
 {
     bool svg_paint_resources_changed = sync_svg_paint_resources(document);
     auto result = rust_update_accumulated_visual_contexts(document);
-    if (result.performed_full_build) {
-        m_scroll_state_snapshot = {};
+    if (result.performed_full_build)
         ++m_accumulated_visual_context_tree_build_count;
-    } else {
+    else
         ++m_accumulated_visual_context_tree_incremental_update_count;
-    }
-    set_needs_to_refresh_scroll_state(document, true);
     if (result.requires_display_list_recording || svg_paint_resources_changed)
         document.set_needs_to_record_display_list();
     if (result.structural_epoch_changed)
@@ -180,14 +168,18 @@ void DocumentPaintState::invalidate_all_cached_paint(DOM::Document& document)
 
 void DocumentPaintState::refresh_scroll_state(DOM::Document& document)
 {
-    if (!m_needs_to_refresh_scroll_state)
+    if (rust_refresh_scroll_state(document, m_scroll_state_snapshot))
         return;
-    m_needs_to_refresh_scroll_state = false;
-    // https://drafts.csswg.org/css-position/#sticky-pos
-    rust_refresh_scroll_state(document);
-    m_scroll_state_snapshot = rust_scroll_state_snapshot(document);
-    if (has_visual_context_tree())
-        resolve_sticky_offsets(visual_context_tree_without_update(document), m_scroll_state_snapshot);
+
+    // LIBWEB_VERIFY_SCROLL_STATE: a skipped refresh must have been skippable. Every producer of a
+    // scroll offset invalidates the state, so re-deriving the snapshot from scratch has to
+    // reproduce the one kept.
+    static bool const verify_scroll_state = getenv("LIBWEB_VERIFY_SCROLL_STATE") != nullptr;
+    if (!verify_scroll_state)
+        return;
+    ScrollStateSnapshot rederived_snapshot;
+    rust_refresh_scroll_state(document, rederived_snapshot, ForceScrollStateRefresh::Yes);
+    VERIFY(rederived_snapshot.device_offsets() == m_scroll_state_snapshot.device_offsets());
 }
 
 void DocumentPaintState::reset_selection_states(DOM::Document& document)

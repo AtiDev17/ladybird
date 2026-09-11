@@ -49,9 +49,8 @@ static bool body_background_is_propagated_to_root(Layout::NodeWithStyle const& l
 {
     if (!layout_node.is_body())
         return false;
-    // Reachable at invalidation time, when the root element's layout node may already be detached.
     auto const* html_element = layout_node.document().html_element();
-    return html_element && html_element->unsafe_layout_node() && html_element->should_use_body_background_properties();
+    return html_element && html_element->should_use_body_background_properties();
 }
 
 GC::Ptr<SVG::SVGFilterElement> resolve_svg_filter_reference(CSS::ComputedValuesFFI::ComputedStyleValueHandle const& url_value, Layout::NodeWithStyle const& layout_node)
@@ -799,7 +798,7 @@ void set_needs_repaint(Layout::Node const& node, InvalidateDisplayList should_in
         return;
 
     auto& document = const_cast<DOM::Document&>(node.document());
-    if (should_invalidate_display_list == InvalidateDisplayList::Yes) {
+    if (should_invalidate_display_list != InvalidateDisplayList::No) {
         Layout::RustFFI::layout_arena_paintable_invalidate_for_repaint(node.arena_handle(), committed_row_slot(node));
 
         // The root element paints the body's propagated background, so a body repaint must also refresh the
@@ -836,7 +835,7 @@ void invalidate_paint_cache(Layout::Node const& node)
 void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
     if (invalidation.needs_repaint())
-        set_needs_repaint(node);
+        set_needs_repaint(node, invalidation.invalidates_hit_test_display_list() ? InvalidateDisplayList::PaintCommandsAndHitTestList : InvalidateDisplayList::PaintCommands);
     if (invalidation.repaint_propagated_text_decorations)
         rust_invalidate_propagated_text_decoration_caches(node);
     if (invalidation.needs_stacking_context_tree_rebuild()) {

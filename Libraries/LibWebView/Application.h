@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/JsonValue.h>
@@ -113,6 +114,14 @@ public:
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+    void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+    void content_blocker_settings_changed(Badge<ApplicationSettingsObserver>);
+    bool content_blocker_list_update_in_progress() const;
+    void update_content_blocker_lists(Badge<SettingsUI>);
+    void download_content_blocker_list_if_needed(Badge<SettingsUI>, StringView identifier);
+    ErrorOr<void> import_local_content_blocker_list(String name, String contents);
+    void remove_content_blocker_list(Badge<SettingsUI>, StringView identifier);
+    Optional<UnixDateTime> content_blocker_list_last_updated_at(StringView identifier) const;
 
     struct BookmarkID {
         String id;
@@ -322,6 +331,7 @@ protected:
 
     virtual void process_did_exit(Process&&, Optional<int> exit_status);
 
+    virtual void add_platform_inspect_menu_items() { }
     virtual void create_platform_arguments(Core::ArgsParser&) { }
     virtual void create_platform_options(BrowserOptions&, RequestServerOptions&, WebContentOptions&) { }
     virtual bool should_coordinate_browser_process() const { return true; }
@@ -360,6 +370,19 @@ private:
 #endif
     ErrorOr<void> launch_devtools_server();
     ErrorOr<void> load_content_blocker_lists();
+    void apply_content_blocker_settings();
+    void rebuild_content_blocker_list_paths();
+    ByteString content_blocker_list_path(StringView identifier) const;
+    ErrorOr<void> save_content_blocker_list(ByteString const& path, ReadonlyBytes);
+    enum class ContentBlockerListUpdateTrigger {
+        Automatic,
+        UserInitiated,
+    };
+    void start_content_blocker_list_update(ContentBlockerListUpdateTrigger, Optional<StringView> requested_identifier = {});
+    void start_next_content_blocker_list_update();
+    void did_receive_content_blocker_list_update_data(ReadonlyBytes);
+    void stop_current_content_blocker_list_update_and_continue();
+    void finish_current_content_blocker_list_update();
     ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> ensure_geolocation_provider();
 
     void initialize_actions();
@@ -488,6 +511,24 @@ private:
     OwnPtr<FontService> m_font_service;
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
+    RefPtr<Core::Timer> m_content_blocker_list_update_timer;
+    struct PendingContentBlockerListUpdate {
+        String identifier;
+        String name;
+        URL::URL url;
+        ByteString path;
+        ContentBlockerListUpdateTrigger trigger;
+        u8 redirect_count { 0 };
+    };
+    Vector<ByteString> m_explicit_content_blocker_list_paths;
+    ByteString m_content_blocker_lists_directory;
+    Vector<PendingContentBlockerListUpdate> m_pending_content_blocker_list_updates;
+    Optional<PendingContentBlockerListUpdate> m_active_content_blocker_list_update;
+    ByteBuffer m_content_blocker_list_update_payload;
+    bool m_content_blocker_list_update_response_ok { false };
+    RefPtr<Requests::Request> m_content_blocker_list_update_request;
+    bool m_content_blocker_list_update_cancelled { false };
+    bool m_content_blocker_list_update_had_success { false };
 
     RefPtr<WebDriverBrowserConnection> m_webdriver_browser_connection;
     bool m_webdriver_browser_connection_failed { false };

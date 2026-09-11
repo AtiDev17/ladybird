@@ -21,13 +21,14 @@
 
 namespace JS {
 
-// Strings shorter than or equal to this length are cached in the VM and deduplicated.
-// Longer strings are not cached to avoid excessive hashing and lookup costs.
-static constexpr size_t MAX_LENGTH_FOR_STRING_CACHE = 256;
-
 GC_DEFINE_ALLOCATOR(PrimitiveString);
 GC_DEFINE_ALLOCATOR(RopeString);
 GC_DEFINE_ALLOCATOR(Substring);
+
+size_t PrimitiveString::fly_string_cache_hash(Utf16FlyString const& string)
+{
+    return u64_hash(string.raw_identity());
+}
 
 Optional<StringView> PrimitiveString::short_flat_string_storage_view() const
 {
@@ -67,25 +68,15 @@ GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16String const& stri
     if (string.is_empty())
         return vm.empty_string();
 
-    auto const length_in_code_units = string.length_in_code_units();
-
-    if (length_in_code_units == 1) {
+    if (string.length_in_code_units() == 1) {
         if (auto code_unit = string.code_unit_at(0); is_ascii(code_unit))
             return vm.single_ascii_character_string(static_cast<u8>(code_unit));
     }
 
-    if (length_in_code_units > MAX_LENGTH_FOR_STRING_CACHE) {
-        return vm.heap().allocate<PrimitiveString>(string);
-    }
+    if (string.has_short_ascii_storage())
+        return create(vm, Utf16FlyString { string });
 
-    auto& string_cache = vm.utf16_string_cache();
-    if (auto it = string_cache.find(string); it != string_cache.end())
-        return *it->value;
-
-    auto new_string = vm.heap().allocate<PrimitiveString>(string);
-    new_string->m_utf16_string_is_in_cache = true;
-    string_cache.set(move(string), new_string);
-    return *new_string;
+    return vm.heap().allocate<PrimitiveString>(string);
 }
 
 GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16View const& string)
@@ -95,7 +86,22 @@ GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16View const& string
 
 GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, Utf16FlyString const& string)
 {
-    return create(vm, string.to_utf16_string());
+    if (string.is_empty())
+        return vm.empty_string();
+
+    if (string.length_in_code_units() == 1) {
+        if (auto code_unit = string.code_unit_at(0); is_ascii(code_unit))
+            return vm.single_ascii_character_string(static_cast<u8>(code_unit));
+    }
+
+    auto& string_cache = vm.fly_string_cache();
+    auto& cache_slot = string_cache[fly_string_cache_hash(string) & (string_cache.size() - 1)];
+    if (cache_slot && cache_slot->m_utf16_string->raw_identity() == string.raw_identity())
+        return *cache_slot;
+
+    auto new_string = vm.heap().allocate<PrimitiveString>(string.to_utf16_string());
+    cache_slot = new_string;
+    return *new_string;
 }
 
 GC::Ref<PrimitiveString> PrimitiveString::create_from_unsigned_integer(VM& vm, u64 number)
@@ -104,11 +110,19 @@ GC::Ref<PrimitiveString> PrimitiveString::create_from_unsigned_integer(VM& vm, u
         auto& cache_slot = vm.numeric_string_cache()[number];
         if (!cache_slot) {
             auto string = Utf16String::number(number);
-            cache_slot = create(vm, string);
+            cache_slot = create(vm, Utf16FlyString { string });
         }
         return *cache_slot;
     }
-    return create(vm, Utf16String::number(number));
+
+    auto& large_cache = vm.large_numeric_string_cache();
+    auto& cache_entry = large_cache[number & (large_cache.size() - 1)];
+    if (!cache_entry.string || cache_entry.number != number) {
+        cache_entry.number = number;
+        auto string = Utf16String::number(number);
+        cache_entry.string = create(vm, Utf16FlyString { string });
+    }
+    return *cache_entry.string;
 }
 
 GC::Ref<PrimitiveString> PrimitiveString::create(VM& vm, PrimitiveString& lhs, PrimitiveString& rhs)
@@ -175,11 +189,19 @@ size_t PrimitiveString::external_memory_size() const
 void PrimitiveString::finalize()
 {
     Base::finalize();
-    if (m_utf16_string_is_in_cache) {
-        auto const& string = *m_utf16_string;
-        if (string.length_in_code_units() <= MAX_LENGTH_FOR_STRING_CACHE)
-            vm().utf16_string_cache().remove(string);
+    for (auto& entry : vm().string_to_atom_cache()) {
+        if (entry.string.ptr() == this)
+            entry = {};
     }
+
+    if (!m_utf16_string.has_value() || !m_utf16_string->has_fly_string_storage())
+        return;
+
+    auto fly_string = Utf16FlyString { *m_utf16_string };
+    auto& string_cache = vm().fly_string_cache();
+    auto& cache_slot = string_cache[fly_string_cache_hash(fly_string) & (string_cache.size() - 1)];
+    if (cache_slot.ptr() == this)
+        cache_slot = nullptr;
 }
 
 bool PrimitiveString::is_empty() const
@@ -202,6 +224,32 @@ Utf16String PrimitiveString::utf16_string() const
 
     VERIFY(has_utf16_string());
     return *m_utf16_string;
+}
+
+PropertyKey PrimitiveString::property_key(VM& vm) const
+{
+    resolve_if_needed();
+
+    VERIFY(has_utf16_string());
+    auto& string = *m_utf16_string;
+    if (string.has_fly_string_storage())
+        return Utf16FlyString { string };
+
+    auto& string_to_atom_cache = vm.string_to_atom_cache();
+    for (size_t i = 0; i < string_to_atom_cache.size(); ++i) {
+        if (string_to_atom_cache[i].string.ptr() != this)
+            continue;
+        if (i != 0)
+            swap(string_to_atom_cache[0], string_to_atom_cache[i]);
+        return *string_to_atom_cache[0].atom;
+    }
+
+    Utf16FlyString fly_string { string };
+    if (!string.has_fly_string_storage()) {
+        string_to_atom_cache[1] = move(string_to_atom_cache[0]);
+        string_to_atom_cache[0] = { *this, fly_string };
+    }
+    return fly_string;
 }
 
 Utf16View PrimitiveString::utf16_string_view() const

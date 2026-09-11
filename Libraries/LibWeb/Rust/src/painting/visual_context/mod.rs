@@ -662,7 +662,6 @@ pub struct VisualContextState {
     pub tree: Option<Rc<VisualContextTree>>,
     pub paintables_with_mask_nodes: Vec<crate::layout::node_data::NodeSlotId>,
     pub scroll_state: scroll_state::ScrollState,
-    pub scroll_state_snapshot: Vec<FloatPoint>,
     pub needs_to_refresh_scroll_state: bool,
     pub build_count: u64,
     pub dirty_boxes: dirty::VisualContextDirtySet,
@@ -676,6 +675,11 @@ pub struct VisualContextState {
 impl VisualContextState {
     pub fn structural_epoch(&self) -> u64 {
         self.tree.as_ref().map_or(0, |tree| tree.structural_epoch)
+    }
+
+    pub fn clear_scroll_state(&mut self) {
+        self.scroll_state.clear();
+        self.needs_to_refresh_scroll_state = true;
     }
 
     pub fn release_quarantined_slots_while_no_handle_is_retained(&mut self) {

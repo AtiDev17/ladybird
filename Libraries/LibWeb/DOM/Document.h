@@ -856,7 +856,7 @@ public:
     // root set; the layout node arena keeps the escape bit next to those roots.
     void record_partial_relayout_escape(PartialRelayoutEscapeReason);
 
-    void set_needs_to_refresh_scroll_state(bool b);
+    void invalidate_scroll_state();
 
     bool has_active_favicon() const { return !!m_active_favicon; }
     void check_favicon_after_loading_link_resource();
@@ -1285,7 +1285,7 @@ public:
     GC::Ptr<HTML::LocalNavigable> navigable() const;
     void set_navigable(GC::Ptr<HTML::LocalNavigable>);
 
-    void set_needs_repaint(Badge<Node, Painting::BoxViewRepaintAccess, HTML::LocalNavigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::Yes)
+    void set_needs_repaint(Badge<Node, Painting::BoxViewRepaintAccess, HTML::LocalNavigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::PaintCommandsAndHitTestList)
     {
         set_needs_repaint(should_invalidate_display_list);
     }
@@ -1307,6 +1307,7 @@ public:
     void set_caret_hit_test_debug_rect(Optional<CSSPixelRect>);
 
     void set_needs_to_record_display_list();
+    void set_needs_to_record_display_list_keeping_hit_test_display_list();
 
     Unicode::Segmenter& grapheme_segmenter() const;
     Unicode::Segmenter& line_segmenter() const;
@@ -1488,7 +1489,7 @@ private:
 
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
-    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
+    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
 
     // ^JS::Object
     virtual bool is_dom_document() const final { return true; }

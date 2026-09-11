@@ -1,5 +1,6 @@
 set(TEST_SOURCES
     TestApplyHistoryStep.cpp
+    TestBackgroundNetworking.cpp
     TestAutocompleteMuxer.cpp
     TestAutocompleteRanker.cpp
     TestCanonicalBrowsingContextGroup.cpp
@@ -20,6 +21,7 @@ set(TEST_SOURCES
     TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
     TestStorageJar.cpp
+    TestTabPerformanceStats.cpp
     TestWebViewURL.cpp
 )
 
@@ -102,6 +104,12 @@ if (NOT WIN32)
     if (APPLE)
         target_compile_definitions(TestInputMethodState PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
+    add_executable(TestTabPerformanceMonitor TestTabPerformanceMonitor.cpp)
+    add_dependencies(TestTabPerformanceMonitor ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestTabPerformanceMonitor PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestTabPerformanceMonitor PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
 endif()
 
 if (BUILD_TESTING AND NOT WIN32)
@@ -132,6 +140,12 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestWebDriverDeleteSession PROPERTIES TIMEOUT 120)
 
     add_test(
+        NAME TestWebDriverContentBlockers
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-content-blockers.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverContentBlockers PROPERTIES TIMEOUT 180)
+
+    add_test(
         NAME TestWebDriverSessionHistory
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-session-history.py $<TARGET_FILE:WebDriver>
     )
@@ -157,4 +171,6 @@ if (BUILD_TESTING AND NOT WIN32)
 
     add_test(NAME TestInputMethodState COMMAND $<TARGET_FILE:TestInputMethodState>)
     set_tests_properties(TestInputMethodState PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestTabPerformanceMonitor COMMAND $<TARGET_FILE:TestTabPerformanceMonitor>)
+    set_tests_properties(TestTabPerformanceMonitor PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
 endif()

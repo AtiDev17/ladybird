@@ -94,6 +94,7 @@ pub enum FfiStyleInvalidationField {
     NonInheritedInheritanceSource = 1 << 19,
     AnyComputedValueChanged = 1 << 20,
     CacheHit = 1 << 21,
+    AffectsHitTesting = 1 << 22,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2343,8 +2344,10 @@ pub unsafe extern "C" fn style_engine_publish_computed_groups(
     let publication = if engine.computed_record_verification_counters.is_none()
         && let Some(node) = StyleNodeID::from_raw(node)
     {
+        let target = super::computed::ComputedStyleTarget::new(node, pseudo_kind);
+        engine.forget_engine_computed_record(target);
         engine.publish_computed_groups(
-            super::computed::ComputedStyleTarget::new(node, pseudo_kind),
+            target,
             payloads,
             inherited_group_count,
             custom_property_environment,
@@ -2575,6 +2578,7 @@ pub unsafe extern "C" fn style_engine_assign_shared_style_record(
             new_style_record: style_record,
         };
     }
+    engine.forget_engine_computed_record(target);
     let publication = engine.assign_shared_style_record(
         target,
         style_record,

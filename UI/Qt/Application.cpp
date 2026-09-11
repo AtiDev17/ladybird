@@ -13,6 +13,7 @@
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/Settings.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/WebContentView.h>
@@ -366,6 +367,22 @@ private:
 
 Application::Application() = default;
 Application::~Application() = default;
+
+void Application::add_platform_inspect_menu_items()
+{
+    inspect_menu().add_action(WebView::Action::create("Open Task Manager"sv, WebView::ActionID::OpenTaskManager, [this]() {
+        show_process_manager();
+    }));
+}
+
+void Application::show_process_manager()
+{
+    if (!m_process_manager_window)
+        m_process_manager_window = make<ProcessManagerWindow>(process_manager());
+    m_process_manager_window->show();
+    m_process_manager_window->raise();
+    m_process_manager_window->activateWindow();
+}
 
 void Application::create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options)
 {

@@ -38,12 +38,13 @@ list(TRANSFORM SITE_COMPATIBILITY_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/WebC
 
 set(ABOUT_PAGES
     about.html
+    blocking.html
     bookmarks.html
     downloads.html
     history.html
     newtab.html
-    processes.html
     settings.html
+    services.html
     version.html
     webui.css
 )
@@ -52,6 +53,7 @@ list(TRANSFORM ABOUT_PAGES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/abo
 set(ABOUT_SETTINGS_RESOURCES
     advanced.js
     browsing-behavior.js
+    blocking.js
     default-zoom-level.js
     dialog-deep-link.js
     force-dark.js
@@ -62,6 +64,7 @@ set(ABOUT_SETTINGS_RESOURCES
     permissions.js
     privacy.js
     search.js
+    services.js
     tabs.js
 )
 list(TRANSFORM ABOUT_SETTINGS_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/about-pages/settings/")

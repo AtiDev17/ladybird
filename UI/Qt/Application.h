@@ -20,6 +20,8 @@ class QWidget;
 
 namespace Ladybird {
 
+class ProcessManagerWindow;
+
 struct WindowConfiguration {
     Optional<Web::DevicePixels> x {};
     Optional<Web::DevicePixels> y {};
@@ -49,6 +51,8 @@ public:
     void focus_location_editor();
     void reopen_recently_closed_tab();
     void open_file();
+    void show_process_manager();
+    virtual void add_platform_inspect_menu_items() override;
     void quit();
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
     void initialize_macos_application_menu();
@@ -124,6 +128,7 @@ private:
 
     OwnPtr<QApplication> m_application;
     BrowserWindow* m_active_window { nullptr };
+    OwnPtr<ProcessManagerWindow> m_process_manager_window;
 };
 
 }

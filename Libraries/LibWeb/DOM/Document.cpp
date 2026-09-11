@@ -699,7 +699,7 @@ Layout::NodeArena& Document::layout_node_arena()
                 auto& document = *static_cast<Document*>(context);
                 document.chrome_widget_registry().drop_widgets_for_slot(slot);
                 if (kind == Layout::RustFFI::PaintableRowResetKind::Recommitted && Painting::viewport_row_slot(document).index == slot.index)
-                    document.paint_state().viewport_row_was_reset(document);
+                    document.paint_state().viewport_row_was_reset();
             });
     }
     return *m_layout_node_arena;
@@ -1913,7 +1913,6 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     m_layout_root->invalidate_text_blocks_cache();
 
     set_needs_to_record_display_list();
-    set_needs_to_refresh_scroll_state(true);
 
     // A commit that changed the tree can have replaced boxes referenced by the cached
     // contained-boxes index; refresh it before overflow measurement follows them. A pending full
@@ -2888,13 +2887,13 @@ void Document::set_highlighted_node(GC::Ptr<Node> node, Optional<CSS::PseudoElem
         return;
 
     if (auto layout_node = highlighted_layout_node(); layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node);
+        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
 
     m_highlighted_node = node;
     m_highlighted_pseudo_element = pseudo_element;
 
     if (auto layout_node = highlighted_layout_node(); layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node);
+        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
 }
 
 void Document::set_grid_highlighted_node(GC::Ptr<Node> node, Painting::GridInspectorOverlayOptions options)
@@ -2907,12 +2906,12 @@ void Document::set_grid_highlighted_node(GC::Ptr<Node> node, Painting::GridInspe
             continue;
 
         grid_highlight.options = options;
-        node->set_needs_repaint();
+        node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
         return;
     }
 
     m_grid_highlights.append({ node, options });
-    node->set_needs_repaint();
+    node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void Document::set_flexbox_highlighted_node(GC::Ptr<Node> node, Painting::FlexboxInspectorOverlayOptions options)
@@ -2925,12 +2924,12 @@ void Document::set_flexbox_highlighted_node(GC::Ptr<Node> node, Painting::Flexbo
             continue;
 
         flexbox_highlight.options = options;
-        node->set_needs_repaint();
+        node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
         return;
     }
 
     m_flexbox_highlights.append({ node, options });
-    node->set_needs_repaint();
+    node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void Document::clear_flexbox_highlighted_node(GC::Ptr<Node> node)
@@ -2938,7 +2937,7 @@ void Document::clear_flexbox_highlighted_node(GC::Ptr<Node> node)
     if (!node) {
         for (auto const& flexbox_highlight : m_flexbox_highlights) {
             if (flexbox_highlight.node)
-                flexbox_highlight.node->set_needs_repaint();
+                flexbox_highlight.node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
         }
         m_flexbox_highlights.clear();
         return;
@@ -2950,7 +2949,7 @@ void Document::clear_flexbox_highlighted_node(GC::Ptr<Node> node)
     });
 
     if (m_flexbox_highlights.size() != old_size)
-        node->set_needs_repaint();
+        node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void Document::clear_grid_highlighted_node(GC::Ptr<Node> node)
@@ -2958,7 +2957,7 @@ void Document::clear_grid_highlighted_node(GC::Ptr<Node> node)
     if (!node) {
         for (auto const& grid_highlight : m_grid_highlights) {
             if (grid_highlight.node)
-                grid_highlight.node->set_needs_repaint();
+                grid_highlight.node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
         }
         m_grid_highlights.clear();
         return;
@@ -2970,7 +2969,7 @@ void Document::clear_grid_highlighted_node(GC::Ptr<Node> node)
     });
 
     if (m_grid_highlights.size() != old_size)
-        node->set_needs_repaint();
+        node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 Layout::Node* Document::highlighted_layout_node()
@@ -3881,7 +3880,7 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
 
     reset_cursor_blink_cycle();
 
-    set_needs_repaint();
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     update_active_element();
 }
@@ -3898,7 +3897,7 @@ void Document::set_active_element(GC::Ptr<Element> element)
 
     m_active_element = element;
 
-    set_needs_repaint();
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void Document::set_target_element(GC::Ptr<Element> element)
@@ -3912,7 +3911,7 @@ void Document::set_target_element(GC::Ptr<Element> element)
 
     m_target_element = element;
 
-    set_needs_repaint();
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#flush-autofocus-candidates
@@ -9732,11 +9731,11 @@ GC::Ptr<HTML::HTMLElement> Document::topmost_auto_or_hint_popover()
     return {};
 }
 
-void Document::set_needs_to_refresh_scroll_state(bool b)
+void Document::invalidate_scroll_state()
 {
     // NB: Propagating scroll state invalidation.
     if (has_committed_viewport_box())
-        paint_state().set_needs_to_refresh_scroll_state(*this, b);
+        paint_state().invalidate_scroll_state(*this);
 }
 
 Vector<GC::Root<Range>> Document::find_matching_text(Utf16View query, CaseSensitivity case_sensitivity)
@@ -9831,7 +9830,7 @@ void Document::remove_render_blocking_element(GC::Ref<Element> element)
 
     if (auto navigable = this->navigable()) {
         if (auto container = navigable->container())
-            container->set_needs_repaint(InvalidateDisplayList::Yes);
+            container->set_needs_repaint(InvalidateDisplayList::PaintCommandsAndHitTestList);
     }
 
     page().client().request_frame();
@@ -10232,10 +10231,10 @@ void Document::set_cursor_position_needs_repaint()
         auto node = position.node();
         if (auto* text = as_if<DOM::Text>(*node)) {
             if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
-                layout_text_node->set_needs_repaint();
+                layout_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
             return;
         }
-        node->set_needs_repaint();
+        node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
     };
 
     auto position = cursor_position();
@@ -10285,8 +10284,15 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
 {
     auto navigable = this->navigable();
 
-    if (should_invalidate_display_list == InvalidateDisplayList::Yes) {
+    switch (should_invalidate_display_list) {
+    case InvalidateDisplayList::No:
+        break;
+    case InvalidateDisplayList::PaintCommands:
+        set_needs_to_record_display_list_keeping_hit_test_display_list();
+        break;
+    case InvalidateDisplayList::PaintCommandsAndHitTestList:
         set_needs_to_record_display_list();
+        break;
     }
 
     if (!navigable)
@@ -10445,6 +10451,11 @@ Vector<WeakPtr<Layout::Node const>> Document::collect_scroll_snap_containers()
 void Document::set_needs_to_record_display_list()
 {
     m_hit_test_display_list = nullptr;
+    set_needs_to_record_display_list_keeping_hit_test_display_list();
+}
+
+void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
+{
     if (auto navigable = this->navigable())
         navigable->set_needs_to_record_display_list();
 }
@@ -10470,8 +10481,6 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         placeholder_display_list->set_surface_clear_color(canvas_background_color);
         page().client().page_did_change_background_color(canvas_background_color);
     }
-
-    document_paint_state.refresh_scroll_state(*this);
 
     Painting::InspectorOverlayInputs overlay_inputs;
     if (auto const* layout_node = highlighted_layout_node(); layout_node && Painting::has_committed_box(*layout_node))
@@ -10512,7 +10521,7 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
         return;
 
     m_caret_hit_test_debug_rect = rect;
-    set_needs_repaint(InvalidateDisplayList::Yes);
+    set_needs_repaint(InvalidateDisplayList::PaintCommands);
     page().client().request_frame();
 }
 
@@ -10547,7 +10556,6 @@ Optional<Painting::HitTestResult> Document::hit_test(CSSPixelPoint position)
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     // https://w3c.github.io/pointerevents/#hit-test
     // 1. Let pos be the x,y coordinates relative to the viewport
     // 2. Return [CSSOM-View]'s elementFromPoint() with pos (the frontmost DOM element at pos)
@@ -10576,7 +10584,6 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point(CSSPixelPo
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Normal);
 }
 
@@ -10585,7 +10592,6 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point_for_select
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::SelectionStart);
 }
 
@@ -10594,7 +10600,6 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point_for_select
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_position_from_point(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection, constraint_scope);
 }
 
@@ -10603,7 +10608,6 @@ Optional<Painting::CaretPosition> Document::caret_position_at_line_edge(Node con
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_position_at_line_edge(node, offset, affinity, edge);
 }
 
@@ -10612,7 +10616,6 @@ Optional<Painting::CaretPosition> Document::caret_position_on_adjacent_line(Node
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_position_on_adjacent_line(node, offset, affinity, direction, inline_coordinate, scope);
 }
 
@@ -10621,7 +10624,6 @@ Optional<CSSPixels> Document::caret_line_block_coordinate(Node const& node, size
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return {};
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->caret_line_block_coordinate(node, offset, affinity);
 }
 
@@ -10630,7 +10632,6 @@ TraversalDecision Document::hit_test_all(CSSPixelPoint position, Function<Traver
     auto hit_test_display_list = ensure_hit_test_display_list();
     if (!hit_test_display_list)
         return TraversalDecision::Continue;
-    paint_state().refresh_scroll_state(*this);
     return hit_test_display_list->hit_test_all(position, *this, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), callback);
 }
 
